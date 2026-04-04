@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 3, 2026 (Session 245 — Editor action menu, richer syntax highlighting, explorer colors) | **Tests:** 5282
+**Last updated:** Apr 4, 2026 (Session 246 — Explorer overhaul, diagnostic filtering, tree UX) | **Tests:** 5292
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 245 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 246 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,6 +26,7 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 245 archived in **SESSION_HISTORY.md**.
+> All sessions through 246 archived in **SESSION_HISTORY.md**.
 
-- **Session 245**: Editor action menu (`⋯`) button, richer tree-sitter highlighting, explorer color overhaul. Action menu: 8-item dropdown at right edge of each tab bar; both GTK (PopoverMenu) and TUI. Tree-sitter: 12 new Theme fields (`control_flow`, `operator`, `punctuation`, `macro_call`, `attribute`, `lifetime`, `constant`, `escape`, `boolean`, `property`, `parameter`, `module`); all 20 language queries expanded with operators, punctuation, numbers, booleans, method calls, parameters, escape sequences; keywords split into storage vs control flow; `semantic_token_style()` handles `controlFlow` modifier; fixed tree-sitter reparse (always full parse — old tree without `tree.edit()` produced garbled byte offsets); insert mode immediate re-parse instead of 150ms debounce. Explorer: same base color for files/dirs; git status + diagnostics propagate recursively to parents; GTK indicator column in own TreeViewColumn. Fixes: split-down icon, midline ellipsis, GTK tab bar clip, `gtk_editor_bottom()` shared helper, divider drag excluded from tab bars, GTK menu dropdown padding, LSP status no longer downgrades Running→Initializing on empty semantic tokens. 7 new tests.
+- **Session 246**: Explorer overhaul, diagnostic filtering, tree UX. Removed explorer toolbar + TUI "EXPLORER" header row. Right-click in empty explorer space → root context menu. Inline rename: stem pre-selection, Ctrl-C/V/X/A, horizontal scroll, both backends. Diagnostic source filtering: `ignore_error_sources` now filters at storage time (not just explorer counts); `refilter_diagnostics()` on registry update; `ext_refresh()` at startup; `initialization_options` field on `LspConfig`/`LspServerConfig` for per-server LSP init config. Explorer tree UX: `explorer_file_fg` theme field (muted grey for file names); TUI indent guide lines (`│`); GTK name column ellipsizes with `...` + Fixed sizing; case-insensitive sort (`explorer_sort_case_insensitive` setting, default true). Fix: `LineEnding::detect()` byte-boundary crash on multi-byte chars at 8KB boundary. Bug fixes: GTK inline rename/new-file cancelled by `update_tree_indicators` (skip while `is_editing()`), SIGSEGV on marker rows, popover focus steal, TUI context menu from empty space, GTK rename stem selection. 10 new tests.
+- **Session 245**: Editor action menu (`⋯`) button, richer tree-sitter highlighting, explorer color overhaul. Action menu: 8-item dropdown at right edge of each tab bar; both GTK (PopoverMenu) and TUI. Tree-sitter: 12 new Theme fields; all 20 language queries expanded; keywords split into storage vs control flow; fixed tree-sitter reparse; insert mode immediate re-parse. Explorer: same base color for files/dirs; git status + diagnostics propagate recursively to parents; GTK indicator column in own TreeViewColumn. 7 new tests.

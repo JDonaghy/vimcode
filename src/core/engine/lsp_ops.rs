@@ -193,6 +193,8 @@ impl Engine {
                     let count = entries.len();
                     registry::save_cache(&entries);
                     self.ext_registry = Some(entries);
+                    // Re-filter stored diagnostics with updated ignore_error_sources.
+                    self.refilter_diagnostics();
                     self.message = format!("Extension registry updated ({count} extensions)");
                 }
                 None => {

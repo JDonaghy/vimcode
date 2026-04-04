@@ -8,8 +8,6 @@
 
 - **(Medium) TUI: Settings button in activity bar not clickable** — The Settings gear icon at the bottom of the TUI activity bar does not respond to clicks. Separate from the GTK "debug output tab" overlap issue above.
 
-- **(Medium) GTK: Inline rename in explorer disappears immediately** — When triggering rename (F2 or context menu) on a file in the GTK explorer tree, the editable text field appears for about one second then disappears before the user can type anything. The CellRenderer editable state is being cancelled prematurely, likely by a focus change or tree refresh event.
-
 - **(Medium) Spell check underline misaligned** — Misspelled words show underlines that start several characters before the word and end in the middle of it. The underline span offsets appear wrong. May be a byte-vs-char index mismatch in `SpellMark` positioning, or an interaction with tree-sitter/LSP spans shifting offsets.
 
 - **(Low) Hardcoded colors in rendering code — 59 instances across 5 files.** These colors don't adapt to the user's chosen theme. Should all use `Theme` struct fields instead. Breakdown:
@@ -21,6 +19,8 @@
 
 ## Resolved
 
+- **GTK: Inline rename in explorer disappears immediately** — Root cause: periodic `update_tree_indicators` (every 1s) called `set_value` on TreeStore rows, cancelling the active GTK cell editor. Also `RefreshFileTree` could clear the store during editing. Fixed by skipping indicator updates and tree refreshes while `name_cell.is_editing()` is true. Also fixed related SIGSEGV from `__NEW_FILE__`/`__NEW_FOLDER__` marker rows in the indicator walk, context menu popover stealing focus (explicit `popdown()` + 50ms delay), and GTK rename pre-selecting entire filename instead of stem only (`connect_editing_started` + `Entry::select_region()`).
+- **LineEnding::detect() crash on multi-byte chars** — `&text[..8192]` panicked when byte 8192 landed inside a multi-byte character (e.g. `─` at bytes 8190..8193). Fixed by backing up to nearest char boundary via `is_char_boundary()` loop.
 - **VSCode mode undo granularity** — Every character typed created its own undo entry. Fixed by keeping the undo group open across consecutive character insertions in `handle_vscode_key()`, breaking only on non-character actions (cursor movement, Backspace, Return, Ctrl+* commands) or external cursor moves (mouse clicks). `vscode_undo_group_open` + `vscode_undo_cursor` fields on Engine. 5 new tests.
 - **Search `/` results land at viewport bottom** — `jump_to_search_match()` called `ensure_cursor_visible()` which with `scrolloff=0` placed the match at the absolute bottom edge. Fixed by centering the match when it lands in the bottom quarter of the viewport.
 - **Tab bar hides tabs when there's room** — `tab_visible_count` feedback loop: TUI renderer returned tab **count** but `set_tab_visible_count()` stored it as `tab_bar_width` (column width). With 5 tabs visible, engine thought it had 5 columns of space, causing a death spiral where each frame hid more tabs. Fixed by returning actual available width in columns (`tab_end_for_content - area.x`), matching the GTK backend. Also fixed `tab_display_width()` off-by-one (+3→+2 for close+separator).

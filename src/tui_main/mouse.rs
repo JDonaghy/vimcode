@@ -815,14 +815,16 @@ pub(super) fn handle_mouse(
         if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
             if sidebar.active_panel == TuiPanel::Explorer {
                 let sidebar_row = row.saturating_sub(menu_rows);
-                if sidebar_row >= 1 {
-                    let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
-                    if tree_row < sidebar.rows.len() {
-                        sidebar.selected = tree_row;
-                        let path = sidebar.rows[tree_row].path.clone();
-                        let is_dir = sidebar.rows[tree_row].is_dir;
-                        engine.open_explorer_context_menu(path, is_dir, col, row);
-                    }
+                let tree_row = sidebar_row as usize + sidebar.scroll_top;
+                if tree_row < sidebar.rows.len() {
+                    sidebar.selected = tree_row;
+                    let path = sidebar.rows[tree_row].path.clone();
+                    let is_dir = sidebar.rows[tree_row].is_dir;
+                    engine.open_explorer_context_menu(path, is_dir, col, row);
+                } else {
+                    // Empty space below last entry → context menu for root folder
+                    let root = sidebar.root.clone();
+                    engine.open_explorer_context_menu(root, true, col, row);
                 }
             }
             return sidebar_width;
@@ -907,13 +909,18 @@ pub(super) fn handle_mouse(
                         if visual_row == inner_row {
                             if item.enabled {
                                 engine.context_menu.as_mut().unwrap().selected = idx;
+                                let ctx = engine.context_menu_target_path();
                                 if let Some(act) = engine.context_menu_confirm() {
-                                    handle_explorer_context_action(
-                                        &act,
-                                        engine,
-                                        sidebar,
-                                        *terminal_size,
-                                    );
+                                    if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                        handle_explorer_context_action(
+                                            &act,
+                                            engine,
+                                            sidebar,
+                                            *terminal_size,
+                                            ctx_path,
+                                            ctx_is_dir,
+                                        );
+                                    }
                                 }
                             }
                             return sidebar_width;
@@ -1726,65 +1733,26 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
-            // tree_height = (total height - 2 status rows) - 1 header row
-            let tree_height = term_height.saturating_sub(3) as usize;
+            // tree_height = total height - 2 status rows (no header)
+            let tree_height = term_height.saturating_sub(2) as usize;
             let total_rows = sidebar.rows.len();
 
             // Click on the scrollbar column → jump-scroll + arm drag
-            if col == sb_col && total_rows > tree_height && sidebar_row >= 1 {
-                let rel_row = sidebar_row.saturating_sub(1) as usize;
+            if col == sb_col && total_rows > tree_height {
+                let rel_row = sidebar_row as usize;
                 let ratio = rel_row as f64 / tree_height as f64;
                 let new_top = (ratio * total_rows as f64) as usize;
                 sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                 *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: 1 + menu_rows,
+                    track_abs_start: menu_rows,
                     track_len: tree_height as u16,
                     total: total_rows,
                 });
                 return sidebar_width;
             }
 
-            if sidebar_row == 0 {
-                // Header row: check if a toolbar button was clicked.
-                // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
-                let toolbar_start = ab_width + sidebar_width - EXPLORER_TOOLBAR_LEN;
-                if col >= toolbar_start {
-                    let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete
-                    let idx = sidebar.selected;
-                    let selected_is_dir = idx < sidebar.rows.len() && sidebar.rows[idx].is_dir;
-                    match btn {
-                        0 | 1 if idx < sidebar.rows.len() => {
-                            let target = if selected_is_dir {
-                                sidebar.rows[idx].path.clone()
-                            } else {
-                                sidebar.rows[idx]
-                                    .path
-                                    .parent()
-                                    .unwrap_or(&sidebar.root)
-                                    .to_path_buf()
-                            };
-                            // Expand the target dir so the new entry row is visible
-                            sidebar.expanded.insert(target.clone());
-                            sidebar.build_rows();
-                            if btn == 0 {
-                                engine.start_explorer_new_file(target);
-                            } else {
-                                engine.start_explorer_new_folder(target);
-                            }
-                        }
-                        2 => {
-                            if idx < sidebar.rows.len() {
-                                let path = sidebar.rows[idx].path.clone();
-                                engine.confirm_delete_file(&path);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                return sidebar_width;
-            }
-            let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
+            let tree_row = sidebar_row as usize + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
                 // Record potential drag source for DnD.
                 *explorer_drag_src = Some(tree_row);

@@ -278,6 +278,7 @@ impl Engine {
                         command: bin.to_string(),
                         args: manifest.lsp.args.clone(),
                         languages: vec![lsp_lang.clone()],
+                        ..Default::default()
                     };
                     if let Some(mgr) = &mut self.lsp_manager {
                         mgr.add_registry_entry(config);

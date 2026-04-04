@@ -45,27 +45,36 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
             command: "rust-analyzer".to_string(),
             args: vec![],
             languages: vec!["rust".to_string()],
+            ..Default::default()
         },
         // Python — ordered fallbacks (first binary found on PATH/Mason wins)
         LspServerConfig {
             command: "pyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "basedpyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "pylsp".to_string(),
             args: vec![],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "jedi-language-server".to_string(),
             args: vec![],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "typescript-language-server".to_string(),
@@ -76,81 +85,113 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
                 "javascriptreact".to_string(),
                 "typescriptreact".to_string(),
             ],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "gopls".to_string(),
             args: vec![],
             languages: vec!["go".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "clangd".to_string(),
             args: vec![],
             languages: vec!["c".to_string(), "cpp".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "csharp-ls".to_string(),
             args: vec![],
             languages: vec!["csharp".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "lua-language-server".to_string(),
             args: vec![],
             languages: vec!["lua".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "bash-language-server".to_string(),
             args: vec!["start".to_string()],
             languages: vec!["shellscript".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "yaml-language-server".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["yaml".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "kotlin-language-server".to_string(),
             args: vec![],
             languages: vec!["kotlin".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "zls".to_string(),
             args: vec![],
             languages: vec!["zig".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "elixir-ls".to_string(),
             args: vec![],
             languages: vec!["elixir".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "ruby-lsp".to_string(),
             args: vec![],
             languages: vec!["ruby".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "terraform-ls".to_string(),
             args: vec!["serve".to_string()],
             languages: vec!["terraform".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "marksman".to_string(),
             args: vec!["server".to_string()],
             languages: vec!["markdown".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "taplo".to_string(),
             args: vec!["lsp".to_string(), "stdio".to_string()],
             languages: vec!["toml".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "sourcekit-lsp".to_string(),
             args: vec![],
             languages: vec!["swift".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "metals".to_string(),
             args: vec![],
             languages: vec!["scala".to_string()],
+
+            ..Default::default()
         },
     ]
 }
@@ -173,17 +214,20 @@ fn server_configs_from_manifest(
     } else {
         manifest.language_ids.clone()
     };
+    let init_opts = manifest.lsp.initialization_options.clone();
     let mut configs = Vec::new();
     configs.push(LspServerConfig {
         command: manifest.lsp.binary.clone(),
         args: args.clone(),
         languages: languages.clone(),
+        initialization_options: init_opts.clone(),
     });
     for fb in &manifest.lsp.fallback_binaries {
         configs.push(LspServerConfig {
             command: fb.clone(),
             args: args.clone(),
             languages: languages.clone(),
+            initialization_options: init_opts.clone(),
         });
     }
     configs

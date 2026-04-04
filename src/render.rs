@@ -1953,6 +1953,8 @@ pub struct Theme {
     // Explorer sidebar (TUI)
     /// Foreground for directory names in the file explorer.
     pub explorer_dir_fg: Color,
+    /// Foreground for file names in the file explorer (muted grey).
+    pub explorer_file_fg: Color,
     /// Background tint for rows whose file is open in a buffer.
     pub explorer_active_bg: Color,
 }
@@ -2128,6 +2130,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
+            explorer_file_fg: Color::from_hex("#aab1be"), // muted grey (matches OneDark sidebar)
             explorer_active_bg: Color::from_hex("#333842"), // current-file tint
         }
     }
@@ -2270,6 +2273,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
+            explorer_file_fg: Color::from_hex("#bdae93"), // gruvbox muted
             explorer_active_bg: Color::from_hex("#45403d"), // current-file tint
         }
     }
@@ -2412,6 +2416,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
+            explorer_file_fg: Color::from_hex("#a9b1d6"), // tokyo muted
             explorer_active_bg: Color::from_hex("#2f3550"), // current-file tint
         }
     }
@@ -2554,6 +2559,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
+            explorer_file_fg: Color::from_hex("#93a1a1"), // solarized base1
             explorer_active_bg: Color::from_hex("#0a4050"), // current-file tint
         }
     }
@@ -2696,6 +2702,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
+            explorer_file_fg: Color::from_hex("#bbbbbb"), // VSCode default sidebar fg
             explorer_active_bg: Color::from_hex("#2a2d3e"), // current-file tint
         }
     }
@@ -2837,6 +2844,7 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
+            explorer_file_fg: Color::from_hex("#3b3b3b"), // VSCode light sidebar fg
             explorer_active_bg: Color::from_hex("#dce5f0"), // current-file tint
         }
     }
@@ -3039,6 +3047,9 @@ impl Theme {
         if let Some(c) = color("list.inactiveSelectionBackground") {
             theme.sidebar_sel_bg_inactive = c;
             theme.explorer_active_bg = c;
+        }
+        if let Some(c) = color("sideBar.foreground") {
+            theme.explorer_file_fg = c;
         }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────

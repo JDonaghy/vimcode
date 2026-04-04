@@ -842,57 +842,6 @@ impl SimpleComponent for App {
                             #[watch]
                             set_visible: model.active_panel == SidebarPanel::Explorer,
 
-                        // Toolbar with file operation buttons
-                        #[name = "explorer_toolbar"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Horizontal,
-                            set_margin_all: 5,
-                            set_spacing: 5,
-                            set_css_classes: &["explorer-toolbar"],
-
-                            gtk4::Button {
-                                set_label: icons::FILE_GENERIC.nerd,
-                                set_tooltip_text: Some("New File"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    let parent_dir = selected_parent_dir(&file_tree_view);
-                                    sender.input(Msg::StartInlineNewFile(parent_dir));
-                                }
-                            },
-
-                            gtk4::Button {
-                                set_label: icons::FOLDER.nerd,
-                                set_tooltip_text: Some("New Folder"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    let parent_dir = selected_parent_dir(&file_tree_view);
-                                    sender.input(Msg::StartInlineNewFolder(parent_dir));
-                                }
-                            },
-
-                            gtk4::Button {
-                                set_label: icons::TRASH.nerd,
-                                set_tooltip_text: Some("Delete"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    // Get selected row
-                                    if let Some(selection) = file_tree_view.selection().selected() {
-                                        let (model, iter) = selection;
-                                        // Column 2 contains the full path
-                                        let path_str: String = model.get_value(&iter, 2).get().unwrap_or_default();
-                                        if !path_str.is_empty() {
-                                            let path = PathBuf::from(path_str);
-                                            sender.input(Msg::ConfirmDeletePath(path));
-                                        }
-                                    }
-                                }
-                            },
-
-                        },
-
                         // Scrollable tree view
                         #[name = "file_tree_scroll"]
                         gtk4::ScrolledWindow {
@@ -1919,6 +1868,8 @@ impl SimpleComponent for App {
             let mut e = Engine::new();
             icons::set_nerd_fonts(e.settings.use_nerd_fonts);
             e.plugin_init();
+            // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
+            e.ext_refresh();
             if let Some(ref path) = file_path {
                 // CLI argument: open only the specified file/directory, skip session restore
                 if path.is_dir() {
@@ -3179,17 +3130,16 @@ impl SimpleComponent for App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (dir_fg_hex, file_fg_hex) = {
             let theme = Theme::from_name(&engine.borrow().settings.colorscheme);
-            let file_fg = if theme.is_light() {
-                theme.foreground.to_hex()
-            } else {
-                theme.status_fg.to_hex()
-            };
-            (theme.explorer_dir_fg.to_hex(), file_fg)
+            (
+                theme.explorer_dir_fg.to_hex(),
+                theme.explorer_file_fg.to_hex(),
+            )
         };
         build_file_tree_with_root(
             &tree_store,
             &cwd,
             engine.borrow().settings.show_hidden_files,
+            engine.borrow().settings.explorer_sort_case_insensitive,
             &dir_fg_hex,
             &file_fg_hex,
         );
@@ -3201,7 +3151,7 @@ impl SimpleComponent for App {
         let nf_font = format!("Symbols Nerd Font, {user_font}");
 
         // Setup TreeView columns
-        // Single column with icon + filename (so they indent together)
+        // Icon + filename column (indent together via GTK expander)
         let col = gtk4::TreeViewColumn::new();
 
         // Icon cell renderer (non-expanding) — uses bundled nerd font for glyph support
@@ -3213,6 +3163,7 @@ impl SimpleComponent for App {
 
         // Filename cell renderer (expanding) — made editable on demand for inline rename
         let name_cell = gtk4::CellRendererText::new();
+        name_cell.set_property("ellipsize", gtk4::pango::EllipsizeMode::End);
         col.pack_start(&name_cell, true);
         col.add_attribute(&name_cell, "text", 1);
         col.add_attribute(&name_cell, "foreground", 3);
@@ -3260,6 +3211,49 @@ impl SimpleComponent for App {
                     }
                 }
             });
+            {
+                let ts = tree_store.clone();
+                name_cell.connect_editing_started(move |_cell, editable, tree_path| {
+                    // For renames, pre-select only the stem (filename without
+                    // extension) so the user can type a new name while keeping
+                    // the extension.  New-file entries start empty, so no selection.
+                    use gtk4::prelude::{EditableExt, TreeModelExt};
+                    let path_str: String = ts
+                        .iter(&tree_path)
+                        .and_then(|iter| ts.get_value(&iter, 2).get::<String>().ok())
+                        .unwrap_or_default();
+                    // Skip marker rows (new file/folder creation)
+                    if path_str.starts_with("__NEW_FILE__")
+                        || path_str.starts_with("__NEW_FOLDER__")
+                        || path_str.is_empty()
+                    {
+                        return;
+                    }
+                    // Get filename from path
+                    let name = std::path::Path::new(&path_str)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        return;
+                    }
+                    let is_dir = std::path::Path::new(&path_str).is_dir();
+                    let stem_end = if is_dir {
+                        name.len()
+                    } else {
+                        name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len())
+                    };
+                    // The editable widget is typically an Entry implementing Editable.
+                    // Upcast to Object then try downcasting to Editable.
+                    let widget: gtk4::Widget = editable.clone().upcast();
+                    if let Ok(e) = widget.dynamic_cast::<gtk4::Entry>() {
+                        // Defer selection to idle so GTK finishes setting up the editor.
+                        gtk4::glib::idle_add_local_once(move || {
+                            e.select_region(0, stem_end as i32);
+                        });
+                    }
+                });
+            }
             name_cell.connect_editing_canceled(move |_cell| {
                 // Disable editable when editing is cancelled
                 name_cell_for_cancel.set_property("editable", false);
@@ -3272,6 +3266,9 @@ impl SimpleComponent for App {
         }
 
         col.set_expand(true);
+        // Fixed sizing lets the column shrink to fit available space
+        // instead of growing to the natural width of the longest filename.
+        col.set_sizing(gtk4::TreeViewColumnSizing::Fixed);
         widgets.file_tree_view.append_column(&col);
 
         // Separate right-aligned column for indicators (M/error/warning badges).
@@ -3297,18 +3294,16 @@ impl SimpleComponent for App {
                 .connect_row_expanded(move |_tree_view, iter, _tree_path| {
                     let e = engine_ref.borrow();
                     let show_hidden = e.settings.show_hidden_files;
+                    let case_insensitive = e.settings.explorer_sort_case_insensitive;
                     let theme = Theme::from_name(&e.settings.colorscheme);
                     let dir_fg_hex = theme.explorer_dir_fg.to_hex();
-                    let file_fg_hex = if theme.is_light() {
-                        theme.foreground.to_hex()
-                    } else {
-                        theme.status_fg.to_hex()
-                    };
+                    let file_fg_hex = theme.explorer_file_fg.to_hex();
                     drop(e);
                     tree_row_expanded(
                         &tree_store_ref,
                         iter,
                         show_hidden,
+                        case_insensitive,
                         &dir_fg_hex,
                         &file_fg_hex,
                     );
@@ -3406,8 +3401,14 @@ impl SimpleComponent for App {
                             Some(PathBuf::from(s))
                         }
                     });
-                let Some(target) = selected_path else { return };
-                let is_dir = target.is_dir();
+                // If clicking empty space below last entry, use workspace root
+                let (target, is_dir) = if let Some(path) = selected_path {
+                    let d = path.is_dir();
+                    (path, d)
+                } else {
+                    let root = engine_ctx.borrow().cwd.clone();
+                    (root, true)
+                };
 
                 // Build gio::Menu from engine-generated items (single source of truth).
                 engine_ctx
@@ -3450,8 +3451,13 @@ impl SimpleComponent for App {
                 {
                     let s = sender_rc.clone();
                     let pd = parent_dir.clone();
+                    let pop_ref = ctx_pop_rc.clone();
                     let a = gtk4::gio::SimpleAction::new("new_file", None);
                     a.connect_activate(move |_, _| {
+                        // Close popover first so it doesn't steal focus from inline editor
+                        if let Some(ref p) = *pop_ref.borrow() {
+                            p.popdown();
+                        }
                         s.input(Msg::StartInlineNewFile(pd.clone()));
                     });
                     add_action(&actions, &a);
@@ -3459,8 +3465,13 @@ impl SimpleComponent for App {
                 {
                     let s = sender_rc.clone();
                     let pd = parent_dir.clone();
+                    let pop_ref = ctx_pop_rc.clone();
                     let a = gtk4::gio::SimpleAction::new("new_folder", None);
                     a.connect_activate(move |_, _| {
+                        // Close popover first so it doesn't steal focus from inline editor
+                        if let Some(ref p) = *pop_ref.borrow() {
+                            p.popdown();
+                        }
                         s.input(Msg::StartInlineNewFolder(pd.clone()));
                     });
                     add_action(&actions, &a);
@@ -3476,24 +3487,28 @@ impl SimpleComponent for App {
                         if let Some(ref p) = *pop_ref.borrow() {
                             p.popdown();
                         }
-                        // Start inline cell editing on idle so the popover
-                        // has time to close and release focus.
+                        // Delay editing start so the popover has time to
+                        // fully close — otherwise GTK fires editing_canceled
+                        // immediately when focus shifts.
                         let tv2 = tv.clone();
                         let nc2 = nc.clone();
-                        gtk4::glib::idle_add_local_once(move || {
-                            nc2.set_property("editable", true);
-                            if let Some(column) = tv2.column(0) {
-                                if let Some((model, iter)) = tv2.selection().selected() {
-                                    let tree_path = model.path(&iter);
-                                    gtk4::prelude::TreeViewExt::set_cursor(
-                                        &tv2,
-                                        &tree_path,
-                                        Some(&column),
-                                        true,
-                                    );
+                        gtk4::glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(50),
+                            move || {
+                                nc2.set_property("editable", true);
+                                if let Some(column) = tv2.column(0) {
+                                    if let Some((model, iter)) = tv2.selection().selected() {
+                                        let tree_path = model.path(&iter);
+                                        gtk4::prelude::TreeViewExt::set_cursor(
+                                            &tv2,
+                                            &tree_path,
+                                            Some(&column),
+                                            true,
+                                        );
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     });
                     add_action(&actions, &a);
                 }
@@ -5730,8 +5745,17 @@ impl App {
                 da.queue_draw();
             }
         }
+        // Check whether the explorer cell renderer is actively being edited.
+        // Many tree operations (indicator update, refresh) must be deferred
+        // while editing is active or they destroy the GTK cell editor widget.
+        let cell_editing = self.name_cell.borrow().as_ref().is_some_and(|nc| {
+            use gtk4::prelude::CellRendererExt;
+            nc.is_editing()
+        });
         // Explorer refresh after confirmed file move.
-        if self.engine.borrow().explorer_needs_refresh {
+        // Defer while a cell is being inline-edited — store.clear() would
+        // destroy the active editor widget.
+        if !cell_editing && self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             sender.input(Msg::RefreshFileTree);
         }
@@ -5847,17 +5871,16 @@ impl App {
         // Tick swap file writes (only does work when updatetime elapsed).
         self.engine.borrow_mut().tick_swap_files();
         // Update explorer tree indicators (modified/diagnostics) every ~1s.
-        if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
+        // Skip while a cell is being edited (guard computed above).
+        if !cell_editing
+            && self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1)
+        {
             self.last_tree_indicator_update = std::time::Instant::now();
             if let Some(ref store) = self.tree_store {
                 let engine = self.engine.borrow();
                 let (git_statuses, diag_counts) = engine.explorer_indicators();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
-                let default_fg = if theme.is_light() {
-                    theme.foreground.to_hex()
-                } else {
-                    theme.status_fg.to_hex()
-                };
+                let default_fg = theme.explorer_file_fg.to_hex();
                 update_tree_indicators(
                     store,
                     &git_statuses,
@@ -8895,27 +8918,33 @@ impl App {
                             }
                         }
                         ExplorerAction::Rename => {
-                            // Trigger GTK native inline cell editing
+                            // Trigger GTK native inline cell editing.
+                            // Slight delay so any pending focus changes settle.
                             let tv_ref = self.file_tree_view.clone();
                             let nc_ref = self.name_cell.clone();
-                            gtk4::glib::idle_add_local_once(move || {
-                                if let Some(ref tv) = *tv_ref.borrow() {
-                                    if let Some(ref nc) = *nc_ref.borrow() {
-                                        nc.set_property("editable", true);
-                                        if let Some(column) = tv.column(0) {
-                                            if let Some((model, iter)) = tv.selection().selected() {
-                                                let tree_path = model.path(&iter);
-                                                gtk4::prelude::TreeViewExt::set_cursor(
-                                                    tv,
-                                                    &tree_path,
-                                                    Some(&column),
-                                                    true,
-                                                );
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(50),
+                                move || {
+                                    if let Some(ref tv) = *tv_ref.borrow() {
+                                        if let Some(ref nc) = *nc_ref.borrow() {
+                                            nc.set_property("editable", true);
+                                            if let Some(column) = tv.column(0) {
+                                                if let Some((model, iter)) =
+                                                    tv.selection().selected()
+                                                {
+                                                    let tree_path = model.path(&iter);
+                                                    gtk4::prelude::TreeViewExt::set_cursor(
+                                                        tv,
+                                                        &tree_path,
+                                                        Some(&column),
+                                                        true,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
                         }
                         ExplorerAction::MoveFile => {
                             // Move not yet supported via keyboard in GTK
@@ -8933,18 +8962,17 @@ impl App {
                     let cwd = self.engine.borrow().cwd.clone();
                     let (dir_fg_hex, file_fg_hex) = {
                         let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-                        let file_fg = if theme.is_light() {
-                            theme.foreground.to_hex()
-                        } else {
-                            theme.status_fg.to_hex()
-                        };
-                        (theme.explorer_dir_fg.to_hex(), file_fg)
+                        (
+                            theme.explorer_dir_fg.to_hex(),
+                            theme.explorer_file_fg.to_hex(),
+                        )
                     };
                     store.clear();
                     build_file_tree_with_root(
                         store,
                         &cwd,
                         self.engine.borrow().settings.show_hidden_files,
+                        self.engine.borrow().settings.explorer_sort_case_insensitive,
                         &dir_fg_hex,
                         &file_fg_hex,
                     );
@@ -9098,27 +9126,31 @@ impl App {
                     );
 
                     // Start inline editing on the new row.
-                    // Wrapped in catch_unwind because GTK set_cursor with
-                    // start_editing=true can abort the process if it panics
-                    // inside an extern "C" callback.
+                    // Delay slightly so the context menu popover has time to
+                    // fully close and release focus — otherwise GTK fires
+                    // `editing_canceled` immediately when focus shifts from
+                    // the popover to the cell editor.
                     let tv = tree_view.clone();
                     let name_cell_ref = self.name_cell.clone();
                     let new_row_path = tree_store.path(&new_iter);
-                    gtk4::glib::idle_add_local_once(move || {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Some(ref nc) = *name_cell_ref.borrow() {
-                                nc.set_property("editable", true);
-                                if let Some(column) = tv.column(0) {
-                                    gtk4::prelude::TreeViewExt::set_cursor(
-                                        &tv,
-                                        &new_row_path,
-                                        Some(&column),
-                                        true,
-                                    );
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(50),
+                        move || {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Some(ref nc) = *name_cell_ref.borrow() {
+                                    nc.set_property("editable", true);
+                                    if let Some(column) = tv.column(0) {
+                                        gtk4::prelude::TreeViewExt::set_cursor(
+                                            &tv,
+                                            &new_row_path,
+                                            Some(&column),
+                                            true,
+                                        );
+                                    }
                                 }
-                            }
-                        }));
-                    });
+                            }));
+                        },
+                    );
                 }
             }
         }

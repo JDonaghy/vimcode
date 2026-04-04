@@ -1,7 +1,27 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 245 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 246 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 246 — Explorer overhaul, diagnostic filtering, tree UX (5292 tests):**
+
+Removed explorer toolbar (New File/New Folder/Delete buttons) from both TUI (`EXPLORER_TOOLBAR_LEN` constant, toolbar rendering in `panels.rs`, click handling in `mouse.rs`) and GTK (`explorer-toolbar` Box widget + CSS). Removed TUI "EXPLORER" header row — tree rows now start at `area.y` instead of `area.y + 1`; `tree_height` uses full `area.height`; mouse click/scrollbar calculations adjusted (no header offset).
+
+Right-click in empty explorer space opens root folder context menu. TUI: when `tree_row >= sidebar.rows.len()`, uses `sidebar.root` as directory target. GTK: when `path_at_pos()` returns None and no selection, falls back to `engine.cwd`.
+
+Inline rename improvements: `ExplorerRenameState.selection_anchor: Option<usize>` field for text selection. `start_explorer_rename()` pre-selects filename stem (rfind `.` excluding position 0 for dotfiles). `handle_explorer_rename_key()` rewritten: selection-aware Backspace/Delete/typing (delete selection first); Ctrl-A select all, Ctrl-C/X copy/cut via `clipboard_write`, Ctrl-V paste via `clipboard_read`; arrow keys clear selection; single Escape cancels (no two-press). TUI rendering: `sel_bg` (fuzzy_selected_bg) for selected text; horizontal scroll offset when cursor exceeds available width. New-entry input also gets Ctrl-V paste and scroll. GTK: `connect_editing_started` handler on `CellRendererText` — downcasts editable to `Entry`, calls `select_region(0, stem_end)` via idle callback.
+
+Bug fixes: (1) GTK inline rename/new-file disappears immediately — `update_tree_indicators` (every 1s) called `set_value` on TreeStore rows, cancelling active GTK cell editor; `RefreshFileTree` could `store.clear()` during editing. Fix: `cell_editing` guard via `name_cell.is_editing()` skips both operations. (2) GTK SIGSEGV in `gtk_tree_store_set_value` — `__NEW_FILE__`/`__NEW_FOLDER__` marker rows in TreeStore caused crash; fix: skip marker rows in `update_tree_indicators::walk`. (3) GTK context menu new file/folder popover steals focus — explicit `popover.popdown()` before sending messages; `timeout_add_local_once(50ms)` instead of `idle_add_local_once` for all inline edit start operations. (4) TUI context menu "New File" from empty space did nothing — `handle_explorer_context_action` got path from `sidebar.rows[sidebar.selected]` instead of context menu target; fix: new `Engine::context_menu_target_path()` method; callers extract target before `context_menu_confirm()` consumes menu.
+
+Diagnostic source filtering: `ignore_error_sources` from extension manifests now filters error-severity diagnostics at storage time in `poll_lsp()` (not just explorer counts). `refilter_diagnostics()` method retroactively filters when registry updates. `ext_refresh()` called at startup in both GTK and TUI to fetch fresh registry. `initialization_options: Option<serde_json::Value>` field added to `LspConfig` (extensions.rs) and `LspServerConfig` (lsp.rs); merged into LSP `initialize` request's `initializationOptions`. Rust extension in registry declares `ignore_error_sources: ["rust-analyzer"]` to suppress rust-analyzer's native type-check false positives (real errors come from `rustc` via cargo check).
+
+Explorer tree UX: `explorer_file_fg` theme field on all 6 built-in themes (muted grey for file names, distinct from bright `foreground`). VSCode JSON importer reads `sideBar.foreground`. TUI indent guide lines: `│` drawn at each indent level > 0 using `line_number_fg` (dim grey). TUI explorer layout restructured: `[chevron (2 cols)] [icon] [space] [name]` — both dirs and files align icons at the same column. GTK name column: `ellipsize: End` on `CellRendererText` + `Fixed` column sizing prevents long filenames from pushing indicators off-screen.
+
+Case-insensitive explorer sort: `explorer_sort_case_insensitive` setting (default true); `:set noesci` to disable. Applied to TUI `collect_rows`, GTK `build_file_tree_shallow` and `tree_row_expanded`. `TuiSidebar.sort_case_insensitive` mirrors engine setting.
+
+Fix: `LineEnding::detect()` byte-boundary crash — slicing at byte 8192 could land inside a multi-byte character (e.g. `─` at bytes 8190..8193). Now backs up to nearest char boundary via `is_char_boundary()` loop. 10 new tests.
 
 ---
 

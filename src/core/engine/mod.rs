@@ -1165,6 +1165,9 @@ pub struct ExplorerRenameState {
     pub input: String,
     /// Byte-offset cursor position within `input`.
     pub cursor: usize,
+    /// Byte-offset selection anchor (if different from cursor, text between
+    /// `selection_anchor` and `cursor` is selected).  `None` = no selection.
+    pub selection_anchor: Option<usize>,
 }
 
 /// State for inline new-file/folder creation in the explorer sidebar.

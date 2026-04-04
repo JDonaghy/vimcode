@@ -17959,3 +17959,147 @@ fn test_close_all_tabs_method() {
     // close_tab always leaves at least 1 scratch buffer.
     assert_eq!(e.active_group().tabs.len(), 1);
 }
+
+// ── Explorer inline rename improvements ──────────────────────────────────────
+
+#[test]
+fn test_explorer_rename_preselects_stem() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "hello.rs");
+    // Stem "hello" is selected (anchor=0, cursor=5)
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, 5);
+}
+
+#[test]
+fn test_explorer_rename_preselects_dotfile_fully() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/.gitignore"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, ".gitignore");
+    // Dotfiles: '.' at pos 0, so rfind('.') returns 0 which is filtered out
+    // → selects entire name
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, ".gitignore".len());
+}
+
+#[test]
+fn test_explorer_rename_preselects_no_extension() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/Makefile"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "Makefile");
+    // No extension → selects entire name
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, "Makefile".len());
+}
+
+#[test]
+fn test_explorer_rename_backspace_deletes_selection() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Pre-selected: "hello" (anchor=0, cursor=5)
+    e.handle_explorer_rename_key("BackSpace", None, false);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    // Selection deleted, only ".rs" remains
+    assert_eq!(rename.input, ".rs");
+    assert_eq!(rename.cursor, 0);
+    assert_eq!(rename.selection_anchor, None);
+}
+
+#[test]
+fn test_explorer_rename_typing_replaces_selection() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Type 'w' — should replace the selected "hello" with "w"
+    e.handle_explorer_rename_key("w", Some('w'), false);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "w.rs");
+    assert_eq!(rename.cursor, 1);
+    assert_eq!(rename.selection_anchor, None);
+}
+
+#[test]
+fn test_explorer_rename_escape_cancels_immediately() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Escape cancels rename immediately, even with active selection
+    assert!(e
+        .explorer_rename
+        .as_ref()
+        .unwrap()
+        .selection_anchor
+        .is_some());
+    e.handle_explorer_rename_key("Escape", None, false);
+    assert!(e.explorer_rename.is_none(), "Escape should cancel rename");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_a_selects_all() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Clear initial selection first
+    e.handle_explorer_rename_key("Right", None, false);
+    // Ctrl-A selects all
+    e.handle_explorer_rename_key("a", Some('a'), true);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, "hello.rs".len());
+}
+
+#[test]
+fn test_explorer_rename_ctrl_v_paste() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new("pasted_name".to_string()));
+    let cc = clipboard_content.clone();
+    e.clipboard_read = Some(Box::new(move || Ok(cc.lock().unwrap().clone())));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello" (anchor=0, cursor=5). Ctrl-V should replace it.
+    e.handle_explorer_rename_key("v", Some('v'), true);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "pasted_name.rs");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_c_copies_selection() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new(String::new()));
+    let cc = clipboard_content.clone();
+    e.clipboard_write = Some(Box::new(move |text: &str| {
+        *cc.lock().unwrap() = text.to_string();
+        Ok(())
+    }));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello". Ctrl-C should copy it.
+    e.handle_explorer_rename_key("c", Some('c'), true);
+    assert_eq!(*clipboard_content.lock().unwrap(), "hello");
+    // Input unchanged
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "hello.rs");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_x_cuts_selection() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new(String::new()));
+    let cc = clipboard_content.clone();
+    e.clipboard_write = Some(Box::new(move |text: &str| {
+        *cc.lock().unwrap() = text.to_string();
+        Ok(())
+    }));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello". Ctrl-X should cut it.
+    e.handle_explorer_rename_key("x", Some('x'), true);
+    assert_eq!(*clipboard_content.lock().unwrap(), "hello");
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, ".rs");
+    assert_eq!(rename.cursor, 0);
+}

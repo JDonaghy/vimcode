@@ -241,6 +241,9 @@ pub struct Settings {
     /// Show hidden files (dotfiles) in the file explorer (default: false).
     #[serde(default)]
     pub show_hidden_files: bool,
+    /// Sort explorer entries case-insensitively (default: true).
+    #[serde(default = "default_true")]
+    pub explorer_sort_case_insensitive: bool,
 
     // ── Swap files ────────────────────────────────────────────────────────────
     /// Enable swap file crash recovery (default: true).
@@ -325,6 +328,10 @@ fn default_explorer_visible() -> bool {
 
 fn default_incremental_search() -> bool {
     true // Default: enabled
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_auto_indent() -> bool {
@@ -701,6 +708,7 @@ impl Default for Settings {
             ai_base_url: String::new(),
             ai_completions: false,
             show_hidden_files: false,
+            explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
             breadcrumbs: default_breadcrumbs(),
@@ -957,6 +965,7 @@ impl Settings {
             "ai_completions" => self.ai_completions = enable,
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
+            "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
             "swapfile" => self.swap_file = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
@@ -1146,6 +1155,11 @@ impl Settings {
             } else {
                 "noshowhiddenfiles".to_string()
             }),
+            "explorersortcaseinsensitive" | "esci" => Ok(if self.explorer_sort_case_insensitive {
+                "explorersortcaseinsensitive".to_string()
+            } else {
+                "noexplorersortcaseinsensitive".to_string()
+            }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
             } else {
@@ -1274,6 +1288,9 @@ impl Settings {
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
+            "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
+                self.explorer_sort_case_insensitive.to_string()
+            }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
@@ -1371,6 +1388,9 @@ impl Settings {
             "ai_completions" => self.ai_completions = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
+            }
+            "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
+                self.explorer_sort_case_insensitive = value == "true"
             }
             "swapfile" | "swap_file" => self.swap_file = value == "true",
             "updatetime" | "ut" => {

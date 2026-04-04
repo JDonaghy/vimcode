@@ -9,7 +9,6 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
     } else {
         theme.status_fg.to_hex()
     };
-    let active_bg = theme.status_bg.to_hex();
     let editor_bg = theme.background.to_hex();
     let text_fg = theme.foreground.to_hex();
     let accent = theme.function.to_hex();
@@ -80,12 +79,6 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
 
         .sidebar label {{
             color: {bar_fg};
-        }}
-
-        /* Explorer Toolbar */
-        .explorer-toolbar {{
-            background-color: {active_bg};
-            border-bottom: 1px solid {border_col};
         }}
 
         /* Tree View */
@@ -327,24 +320,6 @@ pub(super) const STATIC_CSS: &str = "
         }
 
         /* Activity bar, sidebar, treeview: see make_theme_css() — applied dynamically */
-        
-        .explorer-toolbar button {
-            background: transparent;
-            border: 1px solid transparent;
-            border-radius: 2px;
-            color: #cccccc;
-            font-size: 16px;
-            padding: 4px;
-        }
-        
-        .explorer-toolbar button:hover {
-            background-color: #2a2d2e;
-            border-color: #0e639c;
-        }
-        
-        .explorer-toolbar button:active {
-            background-color: #094771;
-        }
         
         /* treeview: see make_theme_css() — applied dynamically */
 

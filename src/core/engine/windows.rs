@@ -1034,6 +1034,15 @@ impl Engine {
         self.context_menu = None;
     }
 
+    /// Return the (path, is_dir) of the current context menu target, if any.
+    pub fn context_menu_target_path(&self) -> Option<(PathBuf, bool)> {
+        self.context_menu.as_ref().and_then(|cm| match &cm.target {
+            ContextMenuTarget::ExplorerFile { path } => Some((path.clone(), false)),
+            ContextMenuTarget::ExplorerDir { path } => Some((path.clone(), true)),
+            _ => None,
+        })
+    }
+
     /// Confirm the currently selected context menu item. Returns the action string.
     pub fn context_menu_confirm(&mut self) -> Option<String> {
         let menu = self.context_menu.take()?;

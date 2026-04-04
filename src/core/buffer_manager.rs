@@ -17,7 +17,12 @@ pub enum LineEnding {
 impl LineEnding {
     /// Detect line ending from file content bytes. Scans up to 8KB.
     pub fn detect(text: &str) -> Self {
-        let scan = &text[..text.len().min(8192)];
+        let mut end = text.len().min(8192);
+        // Back up to a valid char boundary (multi-byte chars may straddle 8KB)
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let scan = &text[..end];
         if scan.contains("\r\n") {
             LineEnding::Crlf
         } else {

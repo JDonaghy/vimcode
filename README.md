@@ -37,7 +37,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 5,282 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 5,292 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -696,6 +696,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
+| `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
 - `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all

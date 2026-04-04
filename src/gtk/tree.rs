@@ -10,6 +10,7 @@ pub(super) fn build_file_tree_with_root(
     store: &gtk4::TreeStore,
     root: &Path,
     show_hidden: bool,
+    case_insensitive: bool,
     dir_fg_hex: &str,
     file_fg_hex: &str,
 ) {
@@ -35,6 +36,7 @@ pub(super) fn build_file_tree_with_root(
         Some(&root_iter),
         root,
         show_hidden,
+        case_insensitive,
         dir_fg_hex,
         file_fg_hex,
     );
@@ -48,6 +50,7 @@ pub(super) fn build_file_tree_shallow(
     parent: Option<&gtk4::TreeIter>,
     path: &Path,
     show_hidden: bool,
+    case_insensitive: bool,
     dir_fg_hex: &str,
     file_fg_hex: &str,
 ) {
@@ -65,7 +68,15 @@ pub(super) fn build_file_tree_shallow(
         match (a_is_dir, b_is_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.file_name().cmp(&b.file_name()),
+            _ => {
+                if case_insensitive {
+                    let an = a.file_name().to_string_lossy().to_lowercase();
+                    let bn = b.file_name().to_string_lossy().to_lowercase();
+                    an.cmp(&bn)
+                } else {
+                    a.file_name().cmp(&b.file_name())
+                }
+            }
         }
     });
 
@@ -126,6 +137,7 @@ pub(super) fn tree_row_expanded(
     store: &gtk4::TreeStore,
     iter: &gtk4::TreeIter,
     show_hidden: bool,
+    case_insensitive: bool,
     dir_fg_hex: &str,
     file_fg_hex: &str,
 ) {
@@ -146,6 +158,7 @@ pub(super) fn tree_row_expanded(
                 Some(iter),
                 Path::new(&dir_path),
                 show_hidden,
+                case_insensitive,
                 dir_fg_hex,
                 file_fg_hex,
             );
@@ -188,7 +201,11 @@ pub(super) fn update_tree_indicators(
         };
         loop {
             let path_str: String = store.get_value(&iter, 2).get().unwrap_or_default();
-            if !path_str.is_empty() && path_str != TREE_DUMMY_PATH {
+            if !path_str.is_empty()
+                && path_str != TREE_DUMMY_PATH
+                && !path_str.starts_with("__NEW_FILE__")
+                && !path_str.starts_with("__NEW_FOLDER__")
+            {
                 let p = PathBuf::from(&path_str);
                 let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
                 let git_label = git_statuses.get(&canon).copied();

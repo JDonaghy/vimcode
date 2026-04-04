@@ -1933,11 +1933,20 @@ impl Engine {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let cursor = name.len();
+        // Pre-select the stem (filename without extension) so Backspace
+        // removes just the name, preserving the extension.
+        let stem_end = if path.is_dir() {
+            // Directories: select entire name
+            name.len()
+        } else {
+            // Find last '.' that isn't at position 0 (dotfiles like .gitignore)
+            name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len())
+        };
         self.explorer_rename = Some(ExplorerRenameState {
             path,
+            cursor: stem_end,
+            selection_anchor: if stem_end > 0 { Some(0) } else { None },
             input: name,
-            cursor,
         });
     }
 
@@ -1956,6 +1965,30 @@ impl Engine {
             Some(s) => s,
             None => return false,
         };
+
+        // Helper: get sorted selection range (start, end) or None.
+        let sel_range = |s: &ExplorerRenameState| -> Option<(usize, usize)> {
+            s.selection_anchor.map(|a| {
+                let lo = a.min(s.cursor);
+                let hi = a.max(s.cursor);
+                (lo, hi)
+            })
+        };
+
+        // Helper: delete selected text, place cursor at selection start.
+        // Returns true if there was a selection to delete.
+        fn delete_selection(s: &mut ExplorerRenameState) -> bool {
+            if let Some(anchor) = s.selection_anchor.take() {
+                let lo = anchor.min(s.cursor);
+                let hi = anchor.max(s.cursor);
+                if lo != hi {
+                    s.input.drain(lo..hi);
+                    s.cursor = lo;
+                    return true;
+                }
+            }
+            false
+        }
 
         match key_name {
             "Escape" => {
@@ -1983,7 +2016,7 @@ impl Engine {
                 return true;
             }
             "BackSpace" => {
-                if state.cursor > 0 {
+                if !delete_selection(state) && state.cursor > 0 {
                     let prev = state.input[..state.cursor]
                         .char_indices()
                         .next_back()
@@ -1995,7 +2028,7 @@ impl Engine {
                 return true;
             }
             "Delete" => {
-                if state.cursor < state.input.len() {
+                if !delete_selection(state) && state.cursor < state.input.len() {
                     state.input.remove(state.cursor);
                 }
                 return true;
@@ -2008,6 +2041,7 @@ impl Engine {
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                 }
+                state.selection_anchor = None;
                 return true;
             }
             "Right" => {
@@ -2019,27 +2053,83 @@ impl Engine {
                         .map(|(i, _)| state.cursor + i)
                         .unwrap_or(state.input.len());
                 }
+                state.selection_anchor = None;
                 return true;
             }
             "Home" => {
                 state.cursor = 0;
+                state.selection_anchor = None;
                 return true;
             }
             "End" => {
                 state.cursor = state.input.len();
+                state.selection_anchor = None;
                 return true;
             }
             _ => {}
         }
 
-        // Printable character insertion
-        if !ctrl {
-            if let Some(ch) = unicode {
-                if !ch.is_control() {
-                    state.input.insert(state.cursor, ch);
-                    state.cursor += ch.len_utf8();
+        // Ctrl shortcuts
+        if ctrl {
+            match key_name {
+                "a" => {
+                    // Select all
+                    state.selection_anchor = Some(0);
+                    state.cursor = state.input.len();
                     return true;
                 }
+                "c" => {
+                    // Copy selection to clipboard
+                    if let Some((lo, hi)) = sel_range(state) {
+                        if lo != hi {
+                            let text = state.input[lo..hi].to_string();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                    }
+                    return true;
+                }
+                "x" => {
+                    // Cut selection to clipboard
+                    if let Some((lo, hi)) = sel_range(state) {
+                        if lo != hi {
+                            let text = state.input[lo..hi].to_string();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            delete_selection(state);
+                        }
+                    }
+                    return true;
+                }
+                "v" => {
+                    // Paste from clipboard
+                    delete_selection(state);
+                    let paste = if let Some(ref cb) = self.clipboard_read {
+                        cb().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    // Only use first line
+                    let line = paste.lines().next().unwrap_or("");
+                    state.input.insert_str(state.cursor, line);
+                    state.cursor += line.len();
+                    return true;
+                }
+                _ => {}
+            }
+            // Consume other ctrl combos
+            return true;
+        }
+
+        // Printable character insertion (replaces selection if any)
+        if let Some(ch) = unicode {
+            if !ch.is_control() {
+                delete_selection(state);
+                state.input.insert(state.cursor, ch);
+                state.cursor += ch.len_utf8();
+                return true;
             }
         }
 
@@ -2187,14 +2277,37 @@ impl Engine {
             _ => {}
         }
 
-        // Printable character insertion
-        if !ctrl {
-            if let Some(ch) = unicode {
-                if !ch.is_control() {
-                    state.input.insert(state.cursor, ch);
-                    state.cursor += ch.len_utf8();
+        // Ctrl shortcuts for new-entry input
+        if ctrl {
+            match key_name {
+                "v" => {
+                    // Paste from clipboard
+                    let paste = if let Some(ref cb) = self.clipboard_read {
+                        cb().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let line = paste.lines().next().unwrap_or("");
+                    state.input.insert_str(state.cursor, line);
+                    state.cursor += line.len();
                     return true;
                 }
+                "a" => {
+                    // Select all — no selection support in new-entry, just move to end
+                    state.cursor = state.input.len();
+                    return true;
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Printable character insertion
+        if let Some(ch) = unicode {
+            if !ch.is_control() {
+                state.input.insert(state.cursor, ch);
+                state.cursor += ch.len_utf8();
+                return true;
             }
         }
 
