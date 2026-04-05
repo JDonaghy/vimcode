@@ -26,9 +26,16 @@ pub(super) fn build_screen_for_tui(
     } else {
         0
     };
-    let content_rows = area
-        .height
-        .saturating_sub(2 + qf_height + term_height + menu_height + dbg_height + wildmenu_height); // status + cmd + panels
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
+    let content_rows = area.height.saturating_sub(
+        1 + global_status_rows
+            + qf_height
+            + term_height
+            + menu_height
+            + dbg_height
+            + wildmenu_height,
+    ); // cmd(1) + optional status(1) + panels
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -102,46 +109,17 @@ pub(super) fn draw_frame(
 ) {
     let area = frame.area();
 
-    // ── Global vertical split: [menu] / [main] / [qf?] / [tabs?] / [term?] / [dbg?] / [status] / [cmd] ──
-    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let terminal_open = screen.bottom_tabs.terminal.is_some();
-    // Show the bottom panel when terminal is open OR when Debug Output tab is
-    // active and there are lines to display (DAP diagnostic output).
-    let debug_output_open = engine.bottom_panel_kind == render::BottomPanelKind::DebugOutput
-        && !screen.bottom_tabs.output_lines.is_empty();
-    let bottom_panel_open = terminal_open || debug_output_open;
-    // 1 tab bar row + 1 header row + content rows
-    let bottom_panel_height: u16 = if bottom_panel_open {
-        engine.session.terminal_panel_rows + 2
-    } else {
-        0
-    };
+    // ── Top-level: [menu] / [content_area] ──
     let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
-    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
-    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
-    let v_chunks = Layout::default()
+    let top_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(menu_bar_height),
-            Constraint::Min(0),
-            Constraint::Length(qf_height),
-            Constraint::Length(bottom_panel_height),
-            Constraint::Length(debug_toolbar_height),
-            Constraint::Length(wildmenu_height),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(menu_bar_height), Constraint::Min(0)])
         .split(area);
-    let menu_bar_area = v_chunks[0];
-    let main_area = v_chunks[1];
-    let quickfix_area = v_chunks[2];
-    let bottom_panel_area = v_chunks[3];
-    let debug_toolbar_area = v_chunks[4];
-    let wildmenu_area = v_chunks[5];
-    let status_area = v_chunks[6];
-    let cmd_area = v_chunks[7];
+    let menu_bar_area = top_chunks[0];
+    let content_area = top_chunks[1];
 
-    // ── Horizontal split of main_area: [activity_bar] [sidebar?] [editor_col] ─
+    // ── Horizontal split: [activity_bar] [sidebar?] [editor_col] ─
+    // Activity bar and sidebar span full height (like GTK layout).
     let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
         0
     } else {
@@ -159,10 +137,42 @@ pub(super) fn draw_frame(
             sidebar_constraint,
             Constraint::Min(0),
         ])
-        .split(main_area);
+        .split(content_area);
     let activity_area = h_chunks[0];
     let sidebar_sep_area = h_chunks[1];
-    let editor_col = h_chunks[2];
+    let right_col = h_chunks[2];
+
+    // ── Vertical split of editor column: [editor] / [qf?] / [bottom?] / [dbg?] / [wildmenu?] / [status?] / [cmd] ──
+    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let bottom_panel_height: u16 = if bottom_panel_open {
+        engine.session.terminal_panel_rows + 2
+    } else {
+        0
+    };
+    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
+    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_height: u16 = if per_window_status { 0 } else { 1 };
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(qf_height),
+            Constraint::Length(bottom_panel_height),
+            Constraint::Length(debug_toolbar_height),
+            Constraint::Length(wildmenu_height),
+            Constraint::Length(global_status_height),
+            Constraint::Length(1),
+        ])
+        .split(right_col);
+    let editor_col = v_chunks[0];
+    let quickfix_area = v_chunks[1];
+    let bottom_panel_area = v_chunks[2];
+    let debug_toolbar_area = v_chunks[3];
+    let wildmenu_area = v_chunks[4];
+    let status_area = v_chunks[5];
+    let cmd_area = v_chunks[6];
 
     // The editor column includes the tab bar row(s).  Window rects from
     // calculate_group_window_rects already have y >= 1 (tab_bar_height offset),
@@ -536,6 +546,8 @@ pub(super) fn draw_frame(
             frame.buffer_mut(),
             tab_bar_area,
             engine.bottom_panel_kind.clone(),
+            engine.terminal_open,
+            !screen.bottom_tabs.output_lines.is_empty(),
             theme,
         );
         match engine.bottom_panel_kind {
@@ -567,13 +579,15 @@ pub(super) fn draw_frame(
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
-    render_status_line(
-        frame.buffer_mut(),
-        status_area,
-        &screen.status_left,
-        &screen.status_right,
-        theme,
-    );
+    if !per_window_status {
+        render_status_line(
+            frame.buffer_mut(),
+            status_area,
+            &screen.status_left,
+            &screen.status_right,
+            theme,
+        );
+    }
 
     render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
     // Highlight command-line mouse selection (invert fg/bg for selected cells)
@@ -647,11 +661,14 @@ pub(super) const TAB_CLOSE_CHAR: char = '×'; // U+00D7 MULTIPLICATION SIGN
 /// Terminal columns used by each tab's close button (the × itself + trailing space).
 pub(super) const TAB_CLOSE_COLS: u16 = 2;
 
-// Split button glyphs: \u{F0932} (split-right), \u{F0931} (split-down).
+// Split button glyphs: \u{F0932} (split-right), \u{f0d7} (caret-down / split-down).
 /// Terminal columns occupied by each split button (1 space + 2-wide NF glyph).
 pub(super) const TAB_SPLIT_BTN_COLS: u16 = 3;
 /// Total columns reserved for both split buttons.
 pub(super) const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+
+/// Terminal columns for the editor action menu button ("…").
+pub(super) const TAB_ACTION_BTN_COLS: u16 = 3;
 
 /// Terminal columns per diff toolbar button (1 space + 1 char + 1 space).
 pub(super) const DIFF_BTN_COLS: u16 = 3;
@@ -1023,7 +1040,8 @@ pub(super) fn render_tab_bar(
     } else {
         0
     };
-    let reserved = diff_cols + split_cols;
+    let action_cols = TAB_ACTION_BTN_COLS;
+    let reserved = diff_cols + split_cols + action_cols;
 
     // Reserve columns at the right edge for buttons.
     let tab_end = if area.width >= reserved {
@@ -1124,17 +1142,27 @@ pub(super) fn render_tab_bar(
         }
     }
 
-    // Draw split-right then split-down buttons at the right edge.
-    if show_split_btns && area.width >= split_cols {
+    // Draw split-right then split-down buttons, then the action menu button.
+    if show_split_btns && area.width >= split_cols + action_cols {
         let btn_fg = rc(theme.tab_inactive_fg);
-        let mut bx = area.x + area.width - split_cols;
+        let mut bx = area.x + area.width - split_cols - action_cols;
         // Split-right button (space + 2-wide NF glyph = 3 cols)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
         set_cell_wide(buf, bx + 1, area.y, '\u{F0932}', btn_fg, bar_bg);
         bx += TAB_SPLIT_BTN_COLS;
-        // Split-down button
+        // Split-down button (caret-down ▾)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell_wide(buf, bx + 1, area.y, '\u{F0931}', btn_fg, bar_bg);
+        set_cell(buf, bx + 1, area.y, '\u{f0d7}', btn_fg, bar_bg);
+        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
+    }
+
+    // Draw the editor action menu button ("…") at the far right.
+    if area.width >= action_cols {
+        let btn_fg = rc(theme.tab_inactive_fg);
+        let bx = area.x + area.width - action_cols;
+        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
+        set_cell(buf, bx + 1, area.y, '\u{22EF}', btn_fg, bar_bg); // ⋯
+        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
     }
 
     // Return the available tab bar width in columns so the engine can compute
@@ -2578,6 +2606,21 @@ pub(super) fn render_window(
     window: &RenderedWindow,
     theme: &Theme,
 ) {
+    // Reserve bottom row for per-window status line when present
+    let status_bar_row = if window.status_line.is_some() && area.height > 1 {
+        Some(area.y + area.height - 1)
+    } else {
+        None
+    };
+    let area = if status_bar_row.is_some() {
+        Rect {
+            height: area.height - 1,
+            ..area
+        }
+    } else {
+        area
+    };
+
     let window_bg = rc(if window.show_active_bg {
         theme.active_background
     } else {
@@ -2776,11 +2819,13 @@ pub(super) fn render_window(
                 DiagnosticSeverity::Information => theme.diagnostic_info,
                 DiagnosticSeverity::Hint => theme.diagnostic_hint,
             });
-            for col in dm.start_col..dm.end_col {
-                if col < window.scroll_left {
+            let vis_start = char_col_to_visual(&line.raw_text, dm.start_col, window.tabstop);
+            let vis_end = char_col_to_visual(&line.raw_text, dm.end_col, window.tabstop);
+            for vcol in vis_start..vis_end {
+                if vcol < window.scroll_left {
                     continue;
                 }
-                let vis_col = (col - window.scroll_left) as u16;
+                let vis_col = (vcol - window.scroll_left) as u16;
                 if vis_col >= text_width {
                     break;
                 }
@@ -2797,11 +2842,13 @@ pub(super) fn render_window(
         // Spell error underlines
         let spell_fg = rc(theme.spell_error);
         for sm in &line.spell_errors {
-            for col in sm.start_col..sm.end_col {
-                if col < window.scroll_left {
+            let vis_start = char_col_to_visual(&line.raw_text, sm.start_col, window.tabstop);
+            let vis_end = char_col_to_visual(&line.raw_text, sm.end_col, window.tabstop);
+            for vcol in vis_start..vis_end {
+                if vcol < window.scroll_left {
                     continue;
                 }
-                let vis_col = (col - window.scroll_left) as u16;
+                let vis_col = (vcol - window.scroll_left) as u16;
                 if vis_col >= text_width {
                     break;
                 }
@@ -2984,6 +3031,73 @@ pub(super) fn render_window(
             ));
         }
     }
+
+    // ── Per-window status bar ────────────────────────────────────────────────
+    if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
+        render_window_status_line(frame.buffer_mut(), area.x, sy, area.width, status, theme);
+    }
+}
+
+/// Draw a per-window status line into the given row.
+fn render_window_status_line(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    status: &crate::render::WindowStatusLine,
+    theme: &crate::render::Theme,
+) {
+    use crate::render::StatusSegment;
+
+    // Use the first segment's bg to fill any gaps in the row
+    let fill_bg = status
+        .left_segments
+        .first()
+        .or(status.right_segments.first())
+        .map(|s| s.bg)
+        .unwrap_or(theme.background);
+    let bg = rc(fill_bg);
+    // Fill row with per-window status background
+    for col in 0..width {
+        set_cell(buf, x + col, y, ' ', bg, bg);
+    }
+
+    let draw_segments =
+        |buf: &mut ratatui::buffer::Buffer, segments: &[StatusSegment], start_x: u16| {
+            let mut cx = start_x;
+            for seg in segments {
+                let fg = rc(seg.fg);
+                let seg_bg = rc(seg.bg);
+                for ch in seg.text.chars() {
+                    if cx >= x + width {
+                        return cx;
+                    }
+                    set_cell(buf, cx, y, ch, fg, seg_bg);
+                    if seg.bold {
+                        if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
+                            cell.set_style(
+                                ratatui::style::Style::default()
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            );
+                        }
+                    }
+                    cx += 1;
+                }
+            }
+            cx
+        };
+
+    // Draw left segments from left edge
+    draw_segments(buf, &status.left_segments, x);
+
+    // Draw right segments right-aligned
+    let right_width: u16 = status
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count() as u16)
+        .sum();
+    let right_start = (x + width).saturating_sub(right_width);
+    draw_segments(buf, &status.right_segments, right_start);
 }
 
 pub(super) fn render_scrollbar(
@@ -3000,7 +3114,7 @@ pub(super) fn render_scrollbar(
         return;
     }
     let track_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
     // Track height: reserve last row for h-scrollbar if present
     let track_h = if has_h_scrollbar {
@@ -3040,7 +3154,7 @@ pub(super) fn render_h_scrollbar(
     if area.height == 0 || max_col == 0 || viewport_cols == 0 {
         return;
     }
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
     let corner_fg = rc(theme.separator);
 
@@ -3281,7 +3395,7 @@ pub(super) fn render_separators(
         return;
     }
     let sep_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let track_fg = sep_fg;
     let sep_bg = rc(theme.background);
 
@@ -3335,9 +3449,17 @@ pub(super) fn render_separators(
             }
 
             // Horizontal separator — also require horizontal overlap.
+            // Skip when the upper window has a per-window status bar (it replaces the separator).
             let h_overlap =
                 a.rect.x.max(b.rect.x) < (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width);
-            if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 && h_overlap {
+            let upper_has_status = if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 {
+                a.status_line.is_some()
+            } else if (b.rect.y + b.rect.height - a.rect.y).abs() < 1.0 {
+                b.status_line.is_some()
+            } else {
+                false
+            };
+            if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 && h_overlap && !upper_has_status {
                 let sep_y = editor_area.y + (a.rect.y + a.rect.height) as u16;
                 let x_start = editor_area.x + a.rect.x.max(b.rect.x) as u16;
                 let x_end =

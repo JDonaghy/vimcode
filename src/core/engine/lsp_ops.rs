@@ -193,6 +193,8 @@ impl Engine {
                     let count = entries.len();
                     registry::save_cache(&entries);
                     self.ext_registry = Some(entries);
+                    // Re-filter stored diagnostics with updated ignore_error_sources.
+                    self.refilter_diagnostics();
                     self.message = format!("Extension registry updated ({count} extensions)");
                 }
                 None => {
@@ -279,6 +281,10 @@ impl Engine {
                     ext_name: ext_name.clone(),
                     install_key: lsp_key,
                 });
+                self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Installing {}…", manifest.lsp.binary),
+                );
                 status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
             }
         }
@@ -707,5 +713,28 @@ impl Engine {
             }
         }
         false
+    }
+
+    /// Get the LSP status for a specific buffer's language.
+    /// Returns `LspStatus::None` if no LSP is configured or the manager isn't started.
+    pub fn lsp_status_for_buffer(
+        &self,
+        buffer_id: crate::core::buffer::BufferId,
+    ) -> crate::core::lsp_manager::LspStatus {
+        use crate::core::lsp_manager::LspStatus;
+        let lang = match self.buffer_manager.get(buffer_id) {
+            Some(s) => match s.lsp_language_id.as_deref() {
+                Some(l) => l,
+                None => return LspStatus::None,
+            },
+            None => return LspStatus::None,
+        };
+        if self.lsp_installing.contains(lang) {
+            return LspStatus::Installing;
+        }
+        match &self.lsp_manager {
+            Some(mgr) => mgr.lsp_status_for_language(lang),
+            None => LspStatus::None,
+        }
     }
 }

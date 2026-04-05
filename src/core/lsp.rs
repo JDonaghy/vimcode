@@ -458,12 +458,17 @@ pub struct LspPosition {
     pub character: u32,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LspServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     pub languages: Vec<String>,
+    /// JSON object merged into the `initializationOptions` field of the LSP
+    /// `initialize` request.  Allows per-server configuration (e.g.
+    /// rust-analyzer diagnostic settings).
+    #[serde(default)]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +569,52 @@ pub fn language_id_from_path(path: &Path) -> Option<String> {
         _ => return None,
     };
     Some(lang.to_string())
+}
+
+/// Return a sorted, deduplicated list of all known language identifiers.
+pub fn all_known_language_ids() -> Vec<&'static str> {
+    let mut langs = vec![
+        "bicep",
+        "bibtex",
+        "c",
+        "cpp",
+        "csharp",
+        "css",
+        "dockerfile",
+        "elixir",
+        "go",
+        "graphql",
+        "haskell",
+        "html",
+        "java",
+        "javascript",
+        "javascriptreact",
+        "json",
+        "kotlin",
+        "latex",
+        "lua",
+        "markdown",
+        "nix",
+        "ocaml",
+        "php",
+        "python",
+        "ruby",
+        "rust",
+        "scala",
+        "shellscript",
+        "solidity",
+        "sql",
+        "swift",
+        "terraform",
+        "toml",
+        "typescript",
+        "typescriptreact",
+        "yaml",
+        "zig",
+    ];
+    langs.sort_unstable();
+    langs.dedup();
+    langs
 }
 
 /// Convert a UTF-16 offset to a char (grapheme-unaware) column index within a line.
@@ -887,7 +938,7 @@ impl LspServer {
 
         // Send initialize request
         let root_uri = path_to_uri(root_path);
-        let init_params = serde_json::json!({
+        let mut init_params = serde_json::json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
@@ -956,6 +1007,13 @@ impl LspServer {
                 }
             }
         });
+        // Merge per-extension initializationOptions into the request.
+        if let Some(ref opts) = config.initialization_options {
+            init_params
+                .as_object_mut()
+                .unwrap()
+                .insert("initializationOptions".to_string(), opts.clone());
+        }
         server.send_request("initialize", init_params);
 
         Ok(server)

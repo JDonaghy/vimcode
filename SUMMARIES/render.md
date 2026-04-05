@@ -1,4 +1,4 @@
-# src/render.rs — 6,463 lines
+# src/render.rs — 7,384 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -6,11 +6,14 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `Color` — RGB color with hex parsing, lighten/darken, `cursorline_tint()`, Cairo/Pango conversion
 - `Style` — fg/bg/bold/italic/underline
 - `StyledSpan` — text span with style + column range
-- `Theme` — complete color scheme (70+ color fields incl. `cursorline_bg`); 6 built-ins (OneDark, Gruvbox, TokyoNight, Solarized, VSCode Dark/Light) + VSCode JSON import
+- `Theme` — complete color scheme (95+ color fields incl. `scrollbar_thumb`, `scrollbar_track`, `terminal_bg`, `activity_bar_fg`); 6 built-ins + VSCode JSON import; `scope_color()` maps 23 tree-sitter capture names; `semantic_token_style()` handles LSP semantic tokens with `controlFlow` modifier
 
 ## Key Types — Editor Content
 - `RenderedLine` — single visual line with spans, gutter, diagnostics, git markers, fold state, wrap info
-- `RenderedWindow` — complete window render data (lines, cursor, selection, scrollbars, etc.)
+- `StatusAction` — re-exported from core; action enum for clickable status segments (GoToLine, ChangeLanguage, etc.)
+- `StatusSegment` — styled segment of a per-window status line (text, fg, bg, bold, action)
+- `WindowStatusLine` — per-window status bar (left/right segment vectors)
+- `RenderedWindow` — complete window render data (lines, cursor, selection, scrollbars, `status_line: Option<WindowStatusLine>`, etc.)
 - `CursorPos` / `CursorShape` — cursor position and shape
 - `SelectionRange` / `SelectionKind` — visual selection data
 - `DiagnosticMark` / `SpellMark` — underline markers

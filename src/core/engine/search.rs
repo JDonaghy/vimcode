@@ -307,6 +307,10 @@ impl Engine {
             return;
         }
         self.project_search_running = true;
+        self.notify(
+            NotificationKind::ProjectSearch,
+            &format!("Searching for \"{query}\"…"),
+        );
         self.message = format!("Searching for \"{}\"…", query);
         let opts = self.project_search_options.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -331,6 +335,7 @@ impl Engine {
         let query = self.project_search_query.clone();
         self.project_search_receiver = None;
         self.project_search_running = false;
+        self.notify_done_by_kind(&NotificationKind::ProjectSearch, Some("Search complete"));
         match result {
             Ok(results) => self.apply_search_results(results, &query),
             Err(e) => {
@@ -447,6 +452,10 @@ impl Engine {
             return;
         }
         self.project_replace_running = true;
+        self.notify(
+            NotificationKind::ProjectReplace,
+            &format!("Replacing \"{query}\" → \"{replacement}\"…"),
+        );
         self.message = format!("Replacing \"{}\" → \"{}\"…", query, replacement);
         let opts = self.project_search_options.clone();
         let skip = self.dirty_buffer_paths();
@@ -472,6 +481,7 @@ impl Engine {
         };
         self.project_replace_receiver = None;
         self.project_replace_running = false;
+        self.notify_done_by_kind(&NotificationKind::ProjectReplace, Some("Replace complete"));
         match result {
             Ok(rr) => self.apply_replace_result(rr),
             Err(e) => {

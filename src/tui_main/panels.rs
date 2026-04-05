@@ -9,12 +9,7 @@ pub(super) fn render_activity_bar(
     engine: &Engine,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
-    // Icon color adapts to theme brightness for readability.
-    let icon_fg = if theme.is_light() {
-        RColor::Rgb(100, 100, 110)
-    } else {
-        RColor::Rgb(200, 200, 210)
-    };
+    let icon_fg = rc(theme.activity_bar_fg);
     let accent_fg = rc(theme.cursor); // left-edge accent bar for active panel
     let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
@@ -127,11 +122,8 @@ pub(super) fn render_sidebar(
     theme: &Theme,
     explorer_drop_target: Option<usize>,
 ) {
-    let header_fg = rc(theme.status_fg);
-    let header_bg = rc(theme.status_bg);
-    let default_fg = rc(theme.foreground);
+    let default_fg = rc(theme.explorer_file_fg);
     let row_bg = rc(theme.tab_bar_bg);
-    let dir_fg = rc(theme.explorer_dir_fg);
     let active_bg = rc(theme.explorer_active_bg);
 
     // The single active buffer path (the file shown in the active window)
@@ -143,7 +135,6 @@ pub(super) fn render_sidebar(
     } else {
         rc(theme.sidebar_sel_bg_inactive)
     };
-    let sel_fg = default_fg;
 
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
@@ -197,55 +188,6 @@ pub(super) fn render_sidebar(
         }
     }
 
-    let header_y = area.y;
-    // Fill header
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, header_y, ' ', header_fg, header_bg);
-    }
-    // " EXPLORER" label
-    let label = " EXPLORER";
-    let mut x = area.x;
-    for ch in label.chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, header_y, ch, header_fg, header_bg);
-        x += 1;
-    }
-    // Toolbar buttons (right-aligned, Nerd Font icons):
-    //   new-file  new-folder  delete  refresh  explorer-mode
-    // Each icon occupies 2 terminal cols (Nerd Font) + 1 space = 3 cols per button.
-    // EXPLORER_TOOLBAR_LEN = 9 (3 NF icons × 3 cols each).
-    // When a file (not folder) is selected, new-file/new-folder icons are dimmed.
-    let selected_is_dir = {
-        let idx = sidebar.selected;
-        idx < sidebar.rows.len() && sidebar.rows[idx].is_dir
-    };
-    let dim_fg = rc(theme.line_number_fg); // dimmed color for unavailable buttons
-    let icons: &[(char, bool, ratatui::style::Color)] = &[
-        (
-            '\u{f15b}',
-            selected_is_dir,
-            if selected_is_dir { header_fg } else { dim_fg },
-        ), // new file
-        (
-            '\u{f07b}',
-            selected_is_dir,
-            if selected_is_dir { header_fg } else { dim_fg },
-        ), // new folder
-        ('\u{f1f8}', true, header_fg), // delete
-    ];
-    let toolbar_len = EXPLORER_TOOLBAR_LEN;
-    if toolbar_len < area.width {
-        let mut tx = area.x + area.width - toolbar_len;
-        for &(icon, _enabled, fg) in icons {
-            set_cell(buf, tx, header_y, icon, fg, header_bg);
-            tx += 2; // icon is 2-cols wide (Nerd Font)
-            set_cell(buf, tx, header_y, ' ', header_fg, header_bg);
-            tx += 1;
-        }
-    }
-
     // ── Explorer indicators (git status + diagnostics) ─────────────────
     let (git_statuses, diag_counts) = engine.explorer_indicators();
     let git_added_fg = rc(theme.git_added);
@@ -255,7 +197,7 @@ pub(super) fn render_sidebar(
     let diag_warning_fg = rc(theme.diagnostic_warning);
 
     // ── Tree rows ────────────────────────────────────────────────────────
-    let tree_height = area.height.saturating_sub(1) as usize;
+    let tree_height = area.height as usize;
 
     // Determine where a new-entry row should be inserted (right after parent dir).
     // `new_entry_after_row` is the sidebar.rows index after which we inject the
@@ -281,7 +223,7 @@ pub(super) fn render_sidebar(
     // Handle new-entry-at-top: if scroll_top == 0, render the new entry first
     if new_entry_at_top && !new_entry_rendered && sidebar.scroll_top == 0 {
         let ne = engine.explorer_new_entry.as_ref().unwrap();
-        let screen_y = area.y + 1;
+        let screen_y = area.y;
         // depth 0: parent is root, so child is at depth 0
         render_new_entry_row(buf, area, screen_y, ne, 0, theme);
         visual_row += 1;
@@ -294,7 +236,7 @@ pub(super) fn render_sidebar(
         row_iter_idx += 1;
 
         let i = visual_row;
-        let screen_y = area.y + 1 + i as u16;
+        let screen_y = area.y + i as u16;
         if screen_y >= area.y + area.height {
             break;
         }
@@ -318,68 +260,97 @@ pub(super) fn render_sidebar(
             g: 60,
             b: 80,
         }); // muted blue highlight
-        let (fg, bg) = if is_drop_target {
-            (sel_fg, drop_bg)
-        } else if is_selected {
-            let fg = if row.is_dir { dir_fg } else { sel_fg };
-            (fg, sel_bg)
-        } else if is_active {
-            (default_fg, active_bg)
-        } else if row.is_dir {
-            (dir_fg, row_bg)
-        } else {
-            (default_fg, row_bg)
-        };
-
-        // Build row string: indent + chevron/icon + name
-        let indent = "  ".repeat(row.depth);
-        let prefix = if row.is_dir {
-            if row.is_expanded {
-                "\u{25be} " // ▾
+            // Determine name color: error > warning > git modified > default.
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+        let name_fg = if let Some(&(errors, warnings)) = diag_counts.get(&canon) {
+            if errors > 0 {
+                diag_error_fg
+            } else if warnings > 0 {
+                diag_warning_fg
             } else {
-                "\u{25b8} " // ▸
+                default_fg
+            }
+        } else if let Some(&label) = git_statuses.get(&canon) {
+            match label {
+                'A' | '?' => git_added_fg,
+                'D' => git_deleted_fg,
+                _ => git_modified_fg,
             }
         } else {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            // We format as "  {icon} " — two spaces, icon, space
-            // Rendered char-by-char below
-            let _ = ext; // used in the render step
-            "  "
+            default_fg
+        };
+
+        let (fg, bg) = if is_drop_target {
+            (name_fg, drop_bg)
+        } else if is_selected {
+            (name_fg, sel_bg)
+        } else if is_active {
+            (name_fg, active_bg)
+        } else {
+            (name_fg, row_bg)
         };
 
         let mut x = area.x;
-        // Indent
-        for ch in indent.chars() {
+        // Indent with subtle vertical guide lines (skip outermost levels)
+        let guide_fg = rc(theme.line_number_fg);
+        for level in 0..row.depth {
             if x >= area.x + area.width {
                 break;
             }
-            set_cell(buf, x, screen_y, ch, fg, bg);
-            x += 1;
-        }
-        // Prefix (chevron or spaces)
-        for ch in prefix.chars() {
-            if x >= area.x + area.width {
-                break;
+            // Show guide lines (skip level 0 = root indent)
+            if level > 0 {
+                set_cell(buf, x, screen_y, '│', guide_fg, bg);
+            } else {
+                set_cell(buf, x, screen_y, ' ', fg, bg);
             }
-            set_cell(buf, x, screen_y, ch, fg, bg);
             x += 1;
-        }
-        // File icon (only for files)
-        if !row.is_dir {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let icon = crate::icons::file_icon(ext);
-            for ch in icon.chars() {
-                if x >= area.x + area.width {
-                    break;
-                }
-                set_cell(buf, x, screen_y, ch, fg, bg);
-                x += 1;
-            }
-            // Space after icon
+            // One space after guide = 2-col indent per level
             if x < area.x + area.width {
                 set_cell(buf, x, screen_y, ' ', fg, bg);
                 x += 1;
             }
+        }
+        // Layout: [chevron (2 cols)] [icon (2 cols)] [space] [name]
+        // Dirs: ▾/▸ + space, then folder icon
+        // Files: 2 spaces (no chevron), then file icon
+        // This keeps icons aligned at the same column for siblings.
+        if row.is_dir {
+            let chevron = if row.is_expanded { '▾' } else { '▸' };
+            if x < area.x + area.width {
+                set_cell(buf, x, screen_y, chevron, fg, bg);
+                x += 1;
+            }
+            if x < area.x + area.width {
+                set_cell(buf, x, screen_y, ' ', fg, bg);
+                x += 1;
+            }
+        } else {
+            // No chevron — 2 blank cols to align with dirs
+            for _ in 0..2 {
+                if x < area.x + area.width {
+                    set_cell(buf, x, screen_y, ' ', fg, bg);
+                    x += 1;
+                }
+            }
+        }
+        // Icon (file or folder)
+        let icon_str = if row.is_dir {
+            crate::icons::FOLDER.s()
+        } else {
+            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            crate::icons::file_icon(ext)
+        };
+        for ch in icon_str.chars() {
+            if x >= area.x + area.width {
+                break;
+            }
+            set_cell(buf, x, screen_y, ch, fg, bg);
+            x += 1;
+        }
+        // Space after icon
+        if x < area.x + area.width {
+            set_cell(buf, x, screen_y, ' ', fg, bg);
+            x += 1;
         }
         // Name — or inline rename input when active on this row
         let is_renaming = engine
@@ -390,20 +361,47 @@ pub(super) fn render_sidebar(
             let rename = engine.explorer_rename.as_ref().unwrap();
             let input_bg = rc(theme.background);
             let input_fg = rc(theme.foreground);
-            let input_start_x = x;
-            // Render the input text
-            for (byte_idx, ch) in rename.input.char_indices() {
+            let sel_bg = rc(theme.fuzzy_selected_bg);
+            // Compute selection range (byte offsets)
+            let (sel_lo, sel_hi) = rename
+                .selection_anchor
+                .map(|a| (a.min(rename.cursor), a.max(rename.cursor)))
+                .unwrap_or((0, 0));
+            let has_selection = sel_lo != sel_hi;
+            // Available columns for the input text
+            let avail = (area.x + area.width).saturating_sub(x) as usize;
+            // Cursor char position (0-based)
+            let cursor_char = rename.input[..rename.cursor].chars().count();
+            let total_chars = rename.input.chars().count();
+            // Compute horizontal scroll offset (in chars) to keep cursor visible.
+            // Reserve 1 col for the cursor-at-end block.
+            let scroll = if total_chars < avail || cursor_char < avail.saturating_sub(1) {
+                0
+            } else {
+                cursor_char.saturating_sub(avail.saturating_sub(2))
+            };
+            // Render the input text starting from scroll offset
+            for (char_idx, (byte_idx, ch)) in rename.input.char_indices().enumerate() {
+                if char_idx < scroll {
+                    continue;
+                }
                 if x >= area.x + area.width {
                     break;
                 }
-                let is_cursor = byte_idx == rename.cursor;
-                let cell_fg = if is_cursor { input_bg } else { input_fg };
-                let cell_bg = if is_cursor { input_fg } else { input_bg };
+                let in_sel = has_selection && byte_idx >= sel_lo && byte_idx < sel_hi;
+                let is_cursor = byte_idx == rename.cursor && !has_selection;
+                let (cell_fg, cell_bg) = if is_cursor {
+                    (input_bg, input_fg)
+                } else if in_sel {
+                    (input_fg, sel_bg)
+                } else {
+                    (input_fg, input_bg)
+                };
                 set_cell(buf, x, screen_y, ch, cell_fg, cell_bg);
                 x += 1;
             }
-            // Cursor at end of input (append position)
-            if rename.cursor >= rename.input.len() && x < area.x + area.width {
+            // Cursor at end of input (append position) — only when no selection
+            if !has_selection && rename.cursor >= rename.input.len() && x < area.x + area.width {
                 set_cell(buf, x, screen_y, ' ', input_bg, input_fg);
                 x += 1;
             }
@@ -412,7 +410,6 @@ pub(super) fn render_sidebar(
                 set_cell(buf, x, screen_y, ' ', input_fg, input_bg);
                 x += 1;
             }
-            let _ = input_start_x;
         } else {
             for ch in row.name.chars() {
                 if x >= area.x + area.width {
@@ -492,7 +489,7 @@ pub(super) fn render_sidebar(
                 if row_idx == after_idx && visual_row < tree_height {
                     let ne = engine.explorer_new_entry.as_ref().unwrap();
                     let parent_depth = row.depth;
-                    let screen_y = area.y + 1 + visual_row as u16;
+                    let screen_y = area.y + visual_row as u16;
                     if screen_y < area.y + area.height {
                         render_new_entry_row(buf, area, screen_y, ne, parent_depth, theme);
                         visual_row += 1;
@@ -517,7 +514,7 @@ pub(super) fn render_sidebar(
         let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor() as u16;
         let sb_x = area.x + area.width - 1;
         for dy in 0..visible_rows_count as u16 {
-            let y = area.y + 1 + dy; // +1 for header row
+            let y = area.y + dy;
             if y >= area.y + area.height {
                 break;
             }
@@ -550,7 +547,7 @@ fn render_new_entry_row(
 
     let mut x = area.x;
 
-    // Indent (child of parent, so depth + 1)
+    // Indent (child of parent, so depth + 1) — 2-col per level
     let indent = "  ".repeat(depth + 1);
     for ch in indent.chars() {
         if x >= area.x + area.width {
@@ -574,8 +571,19 @@ fn render_new_entry_row(
         x += 1;
     }
 
-    // Editable input with inverted cursor
-    for (byte_idx, ch) in entry.input.char_indices() {
+    // Editable input with inverted cursor — scroll if needed
+    let avail = (area.x + area.width).saturating_sub(x) as usize;
+    let cursor_char = entry.input[..entry.cursor].chars().count();
+    let total_chars = entry.input.chars().count();
+    let scroll = if total_chars < avail || cursor_char < avail.saturating_sub(1) {
+        0
+    } else {
+        cursor_char.saturating_sub(avail.saturating_sub(2))
+    };
+    for (char_idx, (byte_idx, ch)) in entry.input.char_indices().enumerate() {
+        if char_idx < scroll {
+            continue;
+        }
         if x >= area.x + area.width {
             break;
         }
@@ -1536,9 +1544,9 @@ pub(super) fn render_source_control(
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
     let row_bg = rc(theme.tab_bar_bg);
-    let add_fg = RColor::Rgb(90, 180, 90);
-    let del_fg = RColor::Rgb(220, 70, 60);
-    let mod_fg = RColor::Rgb(220, 180, 80);
+    let add_fg = rc(theme.git_added);
+    let del_fg = rc(theme.git_deleted);
+    let mod_fg = rc(theme.git_modified);
 
     // Build SC data from engine state via the render abstraction.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
@@ -1717,9 +1725,9 @@ pub(super) fn render_source_control(
             let (fg, bg) = if is_focused {
                 (hdr_bg, hdr_fg) // inverted = highlighted
             } else if is_hovered {
-                (item_fg, hover_bg)
+                (hdr_fg, hover_bg)
             } else {
-                (item_fg, btn_bg)
+                (hdr_fg, btn_bg)
             };
             for px in bx..seg_end {
                 set_cell(buf, px, btn_y, ' ', fg, bg);
@@ -3002,11 +3010,7 @@ pub(super) fn render_ext_sidebar(
 
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
-    let sec_bg = ratatui::style::Color::Rgb(
-        (theme.status_bg.r as f64 * 0.85) as u8,
-        (theme.status_bg.g as f64 * 0.85) as u8,
-        (theme.status_bg.b as f64 * 0.85) as u8,
-    );
+    let sec_bg = rc(theme.status_bg.darken(0.15));
     let default_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
@@ -3375,7 +3379,7 @@ pub(super) fn render_debug_sidebar(
     let hdr_bg = rc(theme.status_bg);
     let item_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
-    let act_fg = rc(theme.tab_active_fg);
+    let act_fg = rc(theme.status_fg.lighten(0.2));
     let row_bg = rc(theme.tab_bar_bg);
 
     // ── Row 0: header strip ──────────────────────────────────────────────────
@@ -3398,21 +3402,21 @@ pub(super) fn render_debug_sidebar(
 
     // ── Row 1: Run / Stop button ─────────────────────────────────────────────
     let btn_y = area.y + 1;
-    let (btn_label, btn_fg) = if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-        ("\u{f04b}  Continue", rc(Color::from_rgb(97, 186, 115)))
-    } else if engine.dap_session_active {
-        ("\u{f04d}  Stop", rc(Color::from_rgb(220, 70, 56)))
-    } else {
-        (
-            "\u{f04b}  Start Debugging",
-            rc(Color::from_rgb(97, 186, 115)),
-        )
-    };
+    let (btn_label, btn_icon_fg) =
+        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+            ("\u{f04b}  Continue", rc(theme.git_added))
+        } else if engine.dap_session_active {
+            ("\u{f04d}  Stop", rc(theme.diagnostic_error))
+        } else {
+            ("\u{f04b}  Start Debugging", rc(theme.git_added))
+        };
     for x in area.x..area.x + area.width {
-        set_cell(buf, x, btn_y, ' ', btn_fg, hdr_bg);
+        set_cell(buf, x, btn_y, ' ', hdr_fg, hdr_bg);
     }
+    // Icon character gets the semantic color; label text uses status_fg for readability.
     for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, btn_y, ch, btn_fg, hdr_bg);
+        let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
+        set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
     }
 
     // ── Sections with fixed-height allocation + per-section scrolling ──────
@@ -3473,7 +3477,7 @@ pub(super) fn render_debug_sidebar(
     // are also stored on the sidebar data for reference.)
 
     let track_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
 
     let mut row_y = area.y + 2;
@@ -3576,6 +3580,8 @@ pub(super) fn render_bottom_panel_tabs(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     active: render::BottomPanelKind,
+    has_terminal: bool,
+    has_debug_output: bool,
     theme: &Theme,
 ) {
     if area.height == 0 {
@@ -3590,12 +3596,23 @@ pub(super) fn render_bottom_panel_tabs(
         set_cell(buf, x, area.y, ' ', inactive_fg, tab_bg);
     }
 
-    let tabs = [
-        ("  Terminal  ", render::BottomPanelKind::Terminal),
-        ("  Debug Output  ", render::BottomPanelKind::DebugOutput),
+    let all_tabs = [
+        (
+            "  Terminal  ",
+            render::BottomPanelKind::Terminal,
+            has_terminal,
+        ),
+        (
+            "  Debug Output  ",
+            render::BottomPanelKind::DebugOutput,
+            has_debug_output,
+        ),
     ];
     let mut cur_x = area.x;
-    for (label, kind) in &tabs {
+    for (label, kind, visible) in &all_tabs {
+        if !visible {
+            continue;
+        }
         let fg = if *kind == active {
             active_fg
         } else {
@@ -3612,6 +3629,12 @@ pub(super) fn render_bottom_panel_tabs(
         if cur_x >= area.x + area.width {
             break;
         }
+    }
+
+    // Close button (×) at right edge
+    let close_x = area.x + area.width.saturating_sub(2);
+    if close_x > cur_x {
+        set_cell(buf, close_x, area.y, '\u{00d7}', inactive_fg, tab_bg); // ×
     }
 }
 
@@ -3632,7 +3655,7 @@ pub(super) fn render_debug_output(
     let hdr_bg = rc(theme.status_bg);
     let item_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
-    let sb_active = RColor::Rgb(128, 128, 128);
+    let sb_active = rc(theme.scrollbar_thumb);
     let sb_track = rc(theme.separator);
 
     // Header row
@@ -3883,7 +3906,7 @@ pub(super) fn render_terminal_panel(
             if screen_row >= area.y + area.height {
                 break;
             }
-            let term_bg = RColor::Rgb(30, 30, 30);
+            let term_bg = rc(theme.terminal_bg);
 
             // Clear both halves.
             for x in area.x..area.x + area.width.saturating_sub(1) {
@@ -3891,18 +3914,26 @@ pub(super) fn render_terminal_panel(
             }
 
             // Left pane cells.
-            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx);
+            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx, theme);
 
             // Divider column.
             let div_fg = rc(theme.separator);
             set_cell(buf, div_col, screen_row, '│', div_fg, term_bg);
 
             // Right pane cells.
-            render_terminal_pane_cells(buf, &panel.rows, div_col + 1, screen_row, half_w, row_idx);
+            render_terminal_pane_cells(
+                buf,
+                &panel.rows,
+                div_col + 1,
+                screen_row,
+                half_w,
+                row_idx,
+                theme,
+            );
 
             // Scrollbar in the last column.
             let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-                ('█', RColor::Rgb(128, 128, 128))
+                ('█', rc(theme.scrollbar_thumb))
             } else {
                 ('░', rc(theme.separator))
             };
@@ -3926,17 +3957,25 @@ pub(super) fn render_terminal_panel(
         if screen_row >= area.y + area.height {
             break;
         }
-        let term_bg_default = RColor::Rgb(30, 30, 30);
+        let term_bg_default = rc(theme.terminal_bg);
         // Clear row with terminal default background (excluding scrollbar col).
         for x in area.x..area.x + cell_width {
             set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
         }
 
-        render_terminal_pane_cells(buf, &panel.rows, area.x, screen_row, cell_width, row_idx);
+        render_terminal_pane_cells(
+            buf,
+            &panel.rows,
+            area.x,
+            screen_row,
+            cell_width,
+            row_idx,
+            theme,
+        );
 
         // Scrollbar column — same colors as the editor scrollbar.
         let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-            ('█', RColor::Rgb(128, 128, 128))
+            ('█', rc(theme.scrollbar_thumb))
         } else {
             ('░', rc(theme.separator))
         };
@@ -3959,6 +3998,7 @@ pub(super) fn render_terminal_pane_cells(
     screen_row: u16,
     max_cols: u16,
     row_idx: usize,
+    theme: &Theme,
 ) {
     if row_idx >= rows.len() {
         return;
@@ -3974,9 +4014,9 @@ pub(super) fn render_terminal_pane_cells(
         let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
             (bg, fg)
         } else if cell.is_find_active {
-            (RColor::Rgb(0, 0, 0), RColor::Rgb(255, 165, 0))
+            (rc(theme.search_match_fg), rc(theme.search_current_match_bg))
         } else if cell.is_find_match {
-            (RColor::Rgb(255, 220, 0), RColor::Rgb(80, 65, 0))
+            (rc(theme.search_match_fg), rc(theme.search_match_bg))
         } else {
             (fg, bg)
         };

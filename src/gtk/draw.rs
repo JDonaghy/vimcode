@@ -18,17 +18,21 @@ pub(super) fn draw_editor(
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
+    action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     mouse_pos: (f64, f64),
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
+    status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
     // Clear cached button positions from previous frame.
     diff_btn_map_out.borrow_mut().clear();
     split_btn_map_out.borrow_mut().clear();
+    action_btn_map_out.borrow_mut().clear();
+    status_segment_map_out.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -74,7 +78,9 @@ pub(super) fn draw_editor(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
 
     // Reserve space for the quickfix panel when open
     const QUICKFIX_ROWS: usize = 6; // 1 header + 5 result rows
@@ -173,7 +179,7 @@ pub(super) fn draw_editor(
             // an inactive group's toolbar doesn't cause a visual shift.
             let show_split = is_active || engine.is_in_diff_view();
             cr.save().ok();
-            cr.rectangle(tab_x, tab_y, tab_w, line_height);
+            cr.rectangle(tab_x, tab_y, tab_w, tab_row_height);
             cr.clip();
             cr.translate(tab_x, tab_y);
             let hover_idx = tab_close_hover.and_then(|(gid, tidx)| {
@@ -188,7 +194,7 @@ pub(super) fn draw_editor(
             } else {
                 None
             };
-            let (positions, dbp, sbp, vis_count) = draw_tab_bar(
+            let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
                 cr,
                 &layout,
                 &theme,
@@ -211,6 +217,9 @@ pub(super) fn draw_editor(
             if let Some(sp) = sbp {
                 split_btn_map_out.borrow_mut().insert(gtb.group_id.0, sp);
             }
+            if let Some(ap) = abp {
+                action_btn_map_out.borrow_mut().insert(gtb.group_id.0, ap);
+            }
             tab_visible_counts_out
                 .borrow_mut()
                 .push((gtb.group_id, vis_count));
@@ -219,7 +228,7 @@ pub(super) fn draw_editor(
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp, sbp, vis_count) = draw_tab_bar(
+        let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -246,6 +255,11 @@ pub(super) fn draw_editor(
             split_btn_map_out
                 .borrow_mut()
                 .insert(engine.active_group.0, sp);
+        }
+        if let Some(ap) = abp {
+            action_btn_map_out
+                .borrow_mut()
+                .insert(engine.active_group.0, ap);
         }
         tab_visible_counts_out
             .borrow_mut()
@@ -283,6 +297,7 @@ pub(super) fn draw_editor(
         draw_tab_drag_overlay(
             cr,
             engine,
+            &theme,
             width as f64,
             height as f64,
             line_height,
@@ -422,6 +437,8 @@ pub(super) fn draw_editor(
             term_y,
             width as f64,
             line_height,
+            engine.terminal_open,
+            !screen.bottom_tabs.output_lines.is_empty(),
         );
         match screen.bottom_tabs.active {
             render::BottomPanelKind::Terminal => {
@@ -475,6 +492,7 @@ pub(super) fn draw_editor(
     draw_h_scrollbars(
         cr,
         engine,
+        &theme,
         &window_rects,
         char_width,
         line_height,
@@ -482,21 +500,52 @@ pub(super) fn draw_editor(
         h_sb_dragging_window,
     );
 
-    // 6. Status Line
+    // 5j. Draw per-window status bars (after scrollbars so they paint on top)
+    if per_window_status {
+        for rendered_window in &screen.windows {
+            if let Some(ref status) = rendered_window.status_line {
+                let wr = &rendered_window.rect;
+                let bar_y = wr.y + wr.height - line_height;
+                let mut zones = Vec::new();
+                draw_window_status_bar(
+                    cr,
+                    &layout,
+                    &theme,
+                    status,
+                    wr.x,
+                    bar_y,
+                    wr.width,
+                    line_height,
+                    &mut zones,
+                );
+                status_segment_map_out
+                    .borrow_mut()
+                    .insert(rendered_window.window_id.0, zones);
+            }
+        }
+    }
+
+    // 6. Status Line (global — only when per-window status is off)
     let status_y = height as f64 - status_bar_height;
-    draw_status_line(
-        cr,
-        &layout,
-        &theme,
-        &screen.status_left,
-        &screen.status_right,
-        width as f64,
-        status_y,
-        line_height,
-    );
+    if !per_window_status {
+        draw_status_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.status_left,
+            &screen.status_right,
+            width as f64,
+            status_y,
+            line_height,
+        );
+    }
 
     // 6b. Wildmenu bar (between status and command line)
-    let mut next_y = status_y + line_height;
+    let mut next_y = if per_window_status {
+        status_y // no global status row — cmd line starts where status_y is
+    } else {
+        status_y + line_height // skip past the global status row
+    };
     if let Some(ref wm) = screen.wildmenu {
         draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
         next_y += line_height;
@@ -518,9 +567,11 @@ pub(super) fn draw_editor(
 /// window (VSCode style). Only shown when content is wider than the viewport.
 /// `hovered` — mouse is over any scrollbar track (brightens the thumb).
 /// `dragging_window` — window being dragged (shows the active/dragging colour).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_h_scrollbars(
     cr: &Context,
     engine: &Engine,
+    theme: &Theme,
     window_rects: &[(core::WindowId, core::WindowRect)],
     char_width: f64,
     line_height: f64,
@@ -538,7 +589,8 @@ pub(super) fn draw_h_scrollbars(
 
         // Track background (slightly darker when hovered/active)
         let track_alpha = if hovered || is_active { 0.35 } else { 0.20 };
-        cr.set_source_rgba(0.0, 0.0, 0.0, track_alpha);
+        let (tr, tg, tb) = theme.scrollbar_track.to_cairo();
+        cr.set_source_rgba(tr, tg, tb, track_alpha);
         cr.rectangle(track_x, track_y, track_w, sb_height);
         cr.fill().ok();
 
@@ -550,7 +602,8 @@ pub(super) fn draw_h_scrollbars(
         } else {
             0.50
         };
-        cr.set_source_rgba(0.65, 0.65, 0.65, thumb_alpha);
+        let (thr, thg, thb) = theme.scrollbar_thumb.to_cairo();
+        cr.set_source_rgba(thr, thg, thb, thumb_alpha);
         cr.rectangle(thumb_x, track_y, thumb_w, sb_height);
         cr.fill().ok();
     }
@@ -562,6 +615,7 @@ pub(super) fn draw_h_scrollbars(
 pub(super) fn draw_tab_drag_overlay(
     cr: &Context,
     engine: &Engine,
+    theme: &Theme,
     width: f64,
     height: f64,
     line_height: f64,
@@ -581,7 +635,9 @@ pub(super) fn draw_tab_drag_overlay(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
     let qf_px = if engine.quickfix_open {
         let n = engine.quickfix_items.len().clamp(1, 10) as f64;
         (n + 1.0) * line_height
@@ -651,10 +707,11 @@ pub(super) fn draw_tab_drag_overlay(
 
     // Draw the highlight rectangle.
     if let Some((hx, hy, hw, hh)) = highlight {
-        cr.set_source_rgba(0.3, 0.5, 0.9, 0.15);
+        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+        cr.set_source_rgba(cr_r, cr_g, cr_b, 0.15);
         cr.rectangle(hx, hy, hw, hh);
         cr.fill().ok();
-        cr.set_source_rgba(0.3, 0.5, 0.9, 0.5);
+        cr.set_source_rgba(cr_r, cr_g, cr_b, 0.5);
         cr.set_line_width(2.0);
         cr.rectangle(hx, hy, hw, hh);
         cr.stroke().ok();
@@ -669,7 +726,8 @@ pub(super) fn draw_tab_drag_overlay(
             let gx = mx + 12.0;
             let gy = my - th as f64 / 2.0;
             let pad = 4.0;
-            cr.set_source_rgba(0.15, 0.15, 0.15, 0.85);
+            let (gbr, gbg, gbb) = theme.background.to_cairo();
+            cr.set_source_rgba(gbr, gbg, gbb, 0.85);
             cr.rectangle(
                 gx - pad,
                 gy - pad,
@@ -677,7 +735,8 @@ pub(super) fn draw_tab_drag_overlay(
                 th as f64 + pad * 2.0,
             );
             cr.fill().ok();
-            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            let (gfr, gfg, gfb) = theme.foreground.to_cairo();
+            cr.set_source_rgba(gfr, gfg, gfb, 0.9);
             cr.move_to(gx, gy);
             pangocairo::show_layout(cr, layout);
         }
@@ -722,8 +781,8 @@ pub(super) fn draw_tab_bar(
     italic_font.set_style(pango::Style::Italic);
 
     // Measure both split buttons so tabs don't overlap them.
-    let btn_right_s = format!(" {}", icons::SPLIT_RIGHT.nerd);
-    let btn_down_s = format!(" {}", icons::SPLIT_DOWN.nerd);
+    let btn_right_s = format!(" {} ", icons::SPLIT_RIGHT.nerd);
+    let btn_down_s = format!(" {} ", icons::SPLIT_DOWN.nerd);
     let btn_right_text = btn_right_s.as_str();
     let btn_down_text = btn_down_s.as_str();
     let (both_btns_px, btn_right_px) = if show_split_btn {
@@ -765,7 +824,14 @@ pub(super) fn draw_tab_bar(
     };
     let diff_total_px = diff_btns_px + diff_label_px;
 
-    let tab_area_width = width - both_btns_px - diff_total_px;
+    // Measure the action menu button ("…").
+    let action_btn_s = " \u{22EF} "; // " ⋯ " (midline ellipsis)
+    layout.set_font_description(Some(&normal_font));
+    layout.set_text(action_btn_s);
+    let (action_w_i, _) = layout.pixel_size();
+    let action_btn_px = action_w_i as f64;
+
+    let tab_area_width = width - both_btns_px - diff_total_px - action_btn_px;
 
     // Measure the close button (×) once for use in every tab.
     layout.set_font_description(Some(&normal_font));
@@ -926,7 +992,7 @@ pub(super) fn draw_tab_bar(
     let diff_btn_pos: Option<(f64, f64, f64, f64, f64, f64)> = if let Some(dt) = diff_toolbar {
         layout.set_font_description(Some(&normal_font));
         let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        let mut dx = width - both_btns_px - diff_total_px;
+        let mut dx = width - both_btns_px - diff_total_px - action_btn_px;
         // Change label (e.g. " 2 of 5")
         if let Some(lbl) = &dt.change_label {
             let (fr2, fg2, fb2) = theme.foreground.to_cairo();
@@ -976,13 +1042,16 @@ pub(super) fn draw_tab_bar(
         layout.set_font_description(Some(&normal_font));
         let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
         cr.set_source_rgb(fr, fg_g, fb);
-        // Split-right button
+        // Split-right button (shifted left to make room for action button)
         layout.set_text(btn_right_text);
-        cr.move_to(width - both_btns_px, text_y_offset);
+        cr.move_to(width - both_btns_px - action_btn_px, text_y_offset);
         pangocairo::show_layout(cr, layout);
         // Split-down button
         layout.set_text(btn_down_text);
-        cr.move_to(width - both_btns_px + btn_right_px, text_y_offset);
+        cr.move_to(
+            width - both_btns_px - action_btn_px + btn_right_px,
+            text_y_offset,
+        );
         pangocairo::show_layout(cr, layout);
     }
 
@@ -1001,9 +1070,27 @@ pub(super) fn draw_tab_bar(
     let char_w = (char_px as f64).max(1.0);
     let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
 
+    // Draw the editor action menu button ("…") at the far right.
+    let action_btn_info = {
+        layout.set_font_description(Some(&normal_font));
+        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
+        cr.set_source_rgb(fr, fg_g, fb);
+        let ax = width - action_btn_px;
+        layout.set_text(action_btn_s);
+        cr.move_to(ax, text_y_offset);
+        pangocairo::show_layout(cr, layout);
+        Some((ax, width))
+    };
+
     // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
-    (slot_positions, diff_btn_pos, split_btn_info, available_cols)
+    (
+        slot_positions,
+        diff_btn_pos,
+        split_btn_info,
+        available_cols,
+        action_btn_info,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1350,6 +1437,12 @@ pub(super) fn draw_window(
             }
         }
 
+        // Restore layout to match rendered text (needed for correct
+        // index_to_pos when font_scale != 1.0, e.g. markdown headings).
+        layout.set_text(&rl.raw_text);
+        let line_attrs = build_pango_attrs(&rl.spans);
+        layout.set_attributes(Some(&line_attrs));
+
         // Diagnostic underlines (wavy squiggles)
         for dm in &rl.diagnostics {
             let diag_color = match dm.severity {
@@ -1374,9 +1467,6 @@ pub(super) fn draw_window(
                 .nth(dm.end_col)
                 .map(|(i, _)| i)
                 .unwrap_or(rl.raw_text.len());
-
-            layout.set_text(&rl.raw_text);
-            layout.set_attributes(None);
 
             let start_pos = layout.index_to_pos(start_byte as i32);
             let end_pos = layout.index_to_pos(end_byte as i32);
@@ -1430,9 +1520,6 @@ pub(super) fn draw_window(
                 .map(|(i, _)| i)
                 .unwrap_or(rl.raw_text.len());
 
-            layout.set_text(&rl.raw_text);
-            layout.set_attributes(None);
-
             let start_pos = layout.index_to_pos(start_byte as i32);
             let end_pos = layout.index_to_pos(end_byte as i32);
             let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
@@ -1455,7 +1542,8 @@ pub(super) fn draw_window(
     if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
         if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
             layout.set_text(&rl.raw_text);
-            layout.set_attributes(None);
+            let cursor_attrs = build_pango_attrs(&rl.spans);
+            layout.set_attributes(Some(&cursor_attrs));
 
             // When Ctrl+D selections are active, draw bar at right edge (col+1)
             let render_col = if !rw.extra_selections.is_empty() && *cursor_shape == CursorShape::Bar
@@ -1508,7 +1596,8 @@ pub(super) fn draw_window(
         if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
             if let Some(ghost) = &rl.ghost_suffix {
                 layout.set_text(&rl.raw_text);
-                layout.set_attributes(None);
+                let ghost_line_attrs = build_pango_attrs(&rl.spans);
+                layout.set_attributes(Some(&ghost_line_attrs));
                 let byte_offset: usize = rl
                     .raw_text
                     .char_indices()
@@ -1540,7 +1629,8 @@ pub(super) fn draw_window(
     for extra_pos in &rw.extra_cursors {
         if let Some(rl) = rw.lines.get(extra_pos.view_line) {
             layout.set_text(&rl.raw_text);
-            layout.set_attributes(None);
+            let extra_attrs = build_pango_attrs(&rl.spans);
+            layout.set_attributes(Some(&extra_attrs));
             // When Ctrl+D selections are active, draw bar at right edge (col+1)
             let render_col = if has_extra_sels && extra_cursor_shape == CursorShape::Bar {
                 extra_pos.col + 1
@@ -2990,6 +3080,8 @@ pub(super) fn draw_bottom_panel_tabs(
     y: f64,
     w: f64,
     line_height: f64,
+    has_terminal: bool,
+    has_debug_output: bool,
 ) {
     let (br, bg, bb) = theme.tab_bar_bg.to_cairo();
     let (fr, fg2, fb) = theme.status_fg.to_cairo();
@@ -3012,14 +3104,21 @@ pub(super) fn draw_bottom_panel_tabs(
     layout.set_font_description(Some(&ui_font_desc));
     layout.set_attributes(None);
 
-    let tabs: &[(&str, render::BottomPanelKind)] = &[
-        ("TERMINAL", render::BottomPanelKind::Terminal),
-        ("DEBUG CONSOLE", render::BottomPanelKind::DebugOutput),
+    let all_tabs: &[(&str, render::BottomPanelKind, bool)] = &[
+        ("TERMINAL", render::BottomPanelKind::Terminal, has_terminal),
+        (
+            "DEBUG CONSOLE",
+            render::BottomPanelKind::DebugOutput,
+            has_debug_output,
+        ),
     ];
 
     let padding = 12.0;
     let mut cursor_x = x + padding;
-    for (label, kind) in tabs {
+    for (label, kind, visible) in all_tabs {
+        if !visible {
+            continue;
+        }
         let is_active = screen.bottom_tabs.active == *kind;
         let (lr, lg, lb) = if is_active {
             (ar, ag, ab)
@@ -3040,6 +3139,13 @@ pub(super) fn draw_bottom_panel_tabs(
         }
         cursor_x += tab_w + padding * 2.0;
     }
+
+    // Close button (×) at right edge
+    let close_x = x + w - padding - 10.0;
+    cr.set_source_rgb(fr, fg2, fb);
+    layout.set_text("\u{00d7}"); // ×
+    cr.move_to(close_x, y);
+    pangocairo::show_layout(cr, layout);
 
     // Restore the original monospace font.
     layout.set_font_description(Some(&saved_font));
@@ -3280,7 +3386,8 @@ pub(super) fn draw_debug_sidebar(
                 0.0
             };
             // Track background.
-            cr.set_source_rgba(0.3, 0.3, 0.3, 0.3);
+            let (st_r, st_g, st_b) = theme.scrollbar_track.to_cairo();
+            cr.set_source_rgba(st_r, st_g, st_b, 0.3);
             cr.rectangle(sb_x, section_start_y, sb_w, track_h);
             cr.fill().ok();
             // Thumb.
@@ -3496,7 +3603,8 @@ pub(super) fn draw_terminal_panel(
         let div_x = x + half_w;
 
         // Fill both halves with terminal default bg.
-        cr.set_source_rgb(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0);
+        let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
+        cr.set_source_rgb(tbgr, tbgg, tbgb);
         cr.rectangle(x, content_y, w - SB_W, content_h);
         cr.fill().ok();
 
@@ -3539,7 +3647,8 @@ pub(super) fn draw_terminal_panel(
     let cell_area_w = w - SB_W;
 
     // Fill the entire content area with the default terminal background first.
-    cr.set_source_rgb(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0);
+    let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
+    cr.set_source_rgb(tbgr, tbgg, tbgb);
     cr.rectangle(x, content_y, cell_area_w, content_h);
     cr.fill().ok();
 
@@ -3684,6 +3793,112 @@ pub(super) fn draw_status_line(
     layout.set_text(right);
     cr.move_to(width - right_w as f64, y);
     pangocairo::show_layout(cr, layout);
+}
+
+/// Draw a per-window status bar with styled segments.
+#[allow(clippy::too_many_arguments)]
+fn draw_window_status_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    theme: &Theme,
+    status: &render::WindowStatusLine,
+    x: f64,
+    y: f64,
+    width: f64,
+    line_height: f64,
+    segment_zones: &mut Vec<(f64, f64, crate::core::engine::StatusAction)>,
+) {
+    // Fill background using the first segment's bg (derived from theme, not status_bg)
+    let fill_bg = status
+        .left_segments
+        .first()
+        .or(status.right_segments.first())
+        .map(|s| s.bg)
+        .unwrap_or(theme.background);
+    let (br, bg, bb) = fill_bg.to_cairo();
+    cr.set_source_rgb(br, bg, bb);
+    cr.rectangle(x, y, width, line_height);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    layout.set_width(-1);
+    layout.set_ellipsize(pango::EllipsizeMode::None);
+
+    // Draw left segments
+    segment_zones.clear();
+    let mut cx = x;
+    for seg in &status.left_segments {
+        let (sr, sg, sb) = seg.bg.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        // Measure segment width
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        let seg_w = seg_w as f64;
+        if let Some(ref action) = seg.action {
+            segment_zones.push((cx - x, cx - x + seg_w, action.clone()));
+        }
+        // Draw segment background
+        cr.rectangle(cx, y, seg_w, line_height);
+        cr.fill().ok();
+        // Draw segment text
+        let (fr, fg, fb) = seg.fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(cx, y);
+        pangocairo::show_layout(cr, layout);
+        cx += seg_w;
+        if cx >= x + width {
+            break;
+        }
+    }
+
+    // Draw right segments, right-aligned
+    let mut right_total_w = 0.0;
+    for seg in &status.right_segments {
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        right_total_w += seg_w as f64;
+    }
+    let mut rx = (x + width - right_total_w).max(cx);
+    for seg in &status.right_segments {
+        let (sr, sg, sb) = seg.bg.to_cairo();
+        cr.set_source_rgb(sr, sg, sb);
+        layout.set_text(&seg.text);
+        if seg.bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+        let (seg_w, _) = layout.pixel_size();
+        let seg_w = seg_w as f64;
+        if let Some(ref action) = seg.action {
+            segment_zones.push((rx - x, rx - x + seg_w, action.clone()));
+        }
+        cr.rectangle(rx, y, seg_w, line_height);
+        cr.fill().ok();
+        let (fr, fg, fb) = seg.fg.to_cairo();
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(rx, y);
+        pangocairo::show_layout(cr, layout);
+        rx += seg_w;
+    }
+
+    layout.set_attributes(None);
 }
 
 pub(super) fn draw_wildmenu(
@@ -3981,7 +4196,8 @@ pub(super) fn draw_menu_dropdown(
     }
     let item_count = data.open_items.len() as f64;
     let popup_width = 220.0_f64;
-    let popup_height = (item_count + 1.0) * line_height;
+    let pad = 4.0; // small top/bottom padding
+    let popup_height = item_count * line_height + pad * 2.0;
     let popup_y = anchor_y;
 
     // Background — use hover_bg (adapts to light/dark themes).
@@ -3996,13 +4212,12 @@ pub(super) fn draw_menu_dropdown(
     cr.rectangle(popup_x, popup_y, popup_width, popup_height);
     let _ = cr.stroke();
 
-    // Items — each occupies one line_height row starting at popup_y + line_height
-    // (row 0 is the "header" behind the menu bar).
+    // Items — each occupies one line_height row starting at popup_y + pad.
     let (fr, fg_c, fb) = theme.foreground.to_cairo();
     let (sr, sg, sb) = theme.line_number_fg.to_cairo();
     cr.set_source_rgb(fr, fg_c, fb);
     for (i, item) in data.open_items.iter().enumerate() {
-        let row_top = popup_y + (i as f64 + 1.0) * line_height;
+        let row_top = popup_y + pad + i as f64 * line_height;
         if item.separator {
             cr.set_source_rgb(sr, sg, sb);
             let sep_y = row_top + line_height * 0.5;
@@ -5753,7 +5968,7 @@ pub(super) fn draw_debug_toolbar(
             cursor_x += 8.0;
         }
         cr.move_to(cursor_x, y + height * 0.7);
-        let text = format!("{} ({}) ", btn.icon, btn.key_hint);
+        let text = format!("{} ({}) ", btn.label, btn.key_hint);
         let _ = cr.show_text(&text);
         cursor_x += text.len() as f64 * 7.0;
     }

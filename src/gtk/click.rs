@@ -18,6 +18,10 @@ pub(super) enum ClickTarget {
     DiffToolbarNext,
     /// Click was on a diff toolbar toggle-fold button.
     DiffToolbarToggleFold,
+    /// Click was on a per-window status bar segment with an action.
+    StatusBarAction(crate::core::engine::StatusAction),
+    /// Click was on the editor action menu button ("…").
+    ActionMenuButton(core::window::GroupId),
     /// Click was outside any actionable area.
     None,
 }
@@ -36,6 +40,8 @@ pub(super) fn pixel_to_click_target(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) -> ClickTarget {
     let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
@@ -52,7 +58,9 @@ pub(super) fn pixel_to_click_target(
         } else {
             line_height
         };
-        let status_bar_height = line_height * 2.0 + wildmenu_px;
+        let per_window_status = engine.settings.window_status_line;
+        let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
+        let status_bar_height = line_height * global_status_rows + wildmenu_px;
         let qf_px = if engine.quickfix_open {
             let n = engine.quickfix_items.len().clamp(1, 10) as f64;
             (n + 1.0) * line_height
@@ -76,7 +84,7 @@ pub(super) fn pixel_to_click_target(
             .calculate_group_rects(content_bounds, tab_bar_height);
         engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
-        // Check if click is in any group's tab bar (the first line_height of the tab_bar_height region).
+        // Check if click is in any group's tab bar row.
         for (gid, grect) in &group_rects {
             if engine.is_tab_bar_hidden(*gid) {
                 continue;
@@ -85,7 +93,7 @@ pub(super) fn pixel_to_click_target(
             let tab_x_start = grect.x;
             let bar_width = grect.width;
             if y >= tab_y
-                && y < tab_y + tab_row_height
+                && y < tab_y + tab_bar_height
                 && x >= tab_x_start
                 && x < tab_x_start + bar_width
             {
@@ -108,20 +116,35 @@ pub(super) fn pixel_to_click_target(
                 }
 
                 // Hit-test split buttons using cached Pango-measured widths.
-                // Only check if this group actually has split buttons drawn.
+                // Split buttons sit to the left of the action menu button.
                 if let Some(&(both_btns_px, btn_right_px)) = split_btn_map.get(&group_id.0) {
+                    let action_offset = action_btn_map
+                        .get(&group_id.0)
+                        .map(|&(start, end)| end - start)
+                        .unwrap_or(0.0);
                     let btn_down_px = both_btns_px - btn_right_px;
-                    if local_x >= bar_width - btn_down_px {
+                    if local_x >= bar_width - btn_down_px - action_offset
+                        && local_x < bar_width - action_offset
+                    {
                         return ClickTarget::SplitButton(
                             group_id,
                             crate::core::window::SplitDirection::Horizontal,
                         );
                     }
-                    if local_x >= bar_width - both_btns_px {
+                    if local_x >= bar_width - both_btns_px - action_offset
+                        && local_x < bar_width - btn_down_px - action_offset
+                    {
                         return ClickTarget::SplitButton(
                             group_id,
                             crate::core::window::SplitDirection::Vertical,
                         );
+                    }
+                }
+
+                // Hit-test action menu button ("…") at the far right.
+                if let Some(&(start_x, end_x)) = action_btn_map.get(&group_id.0) {
+                    if local_x >= start_x && local_x < end_x {
+                        return ClickTarget::ActionMenuButton(group_id);
                     }
                 }
 
@@ -163,8 +186,29 @@ pub(super) fn pixel_to_click_target(
     } else {
         line_height
     };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let editor_bottom = height - status_bar_height;
+    let global_status_rows = if engine.settings.window_status_line {
+        1.0
+    } else {
+        2.0
+    };
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
+    let qf_px2 = if engine.quickfix_open {
+        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    };
+    let term_px2 = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
+    } else {
+        0.0
+    };
+    let dbg_px2 = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    let editor_bottom = height - status_bar_height - dbg_px2 - qf_px2 - term_px2;
 
     if y >= editor_bottom {
         return ClickTarget::None;
@@ -233,14 +277,25 @@ pub(super) fn pixel_to_click_target(
     );
     let gutter_width = gutter_char_width as f64 * char_width;
 
-    let per_window_status = if engine.windows.len() > 1 {
+    let per_window_status_px = if engine.settings.window_status_line {
         line_height
     } else {
         0.0
     };
-    let text_area_height = rect.height - per_window_status;
+    let text_area_height = rect.height - per_window_status_px;
 
     if y >= rect.y + text_area_height {
+        // Click is in the per-window status bar area — use Pango-measured cached zones
+        if engine.settings.window_status_line {
+            let local_x = x - rect.x;
+            if let Some(zones) = status_segment_map.get(&window_id.0) {
+                for (start, end, action) in zones {
+                    if local_x >= *start && local_x < *end {
+                        return ClickTarget::StatusBarAction(action.clone());
+                    }
+                }
+            }
+        }
         return ClickTarget::None;
     }
 
@@ -341,9 +396,9 @@ pub(super) fn pixel_to_click_target(
 }
 
 /// Handle mouse click by converting coordinates to buffer position.
-/// Returns: `None` = non-buffer click (tab bar, split button, etc.);
-/// `Some(true)` = close-tab on dirty buffer (show confirm dialog);
-/// `Some(false)` = normal buffer click.
+/// Returns: `(click, engine_action)` where click is `None` = non-buffer click,
+/// `Some(true)` = close-tab on dirty buffer, `Some(false)` = normal buffer click;
+/// `engine_action` is an optional action the caller must dispatch (e.g. sidebar toggle).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_click(
     engine: &mut Engine,
@@ -357,7 +412,9 @@ pub(super) fn handle_mouse_click(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
-) -> Option<bool> {
+    action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
+) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
         x,
@@ -369,6 +426,8 @@ pub(super) fn handle_mouse_click(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
+        status_segment_map,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -377,28 +436,28 @@ pub(super) fn handle_mouse_click(
             } else {
                 engine.mouse_click(wid, line, col);
             }
-            Some(false)
+            (Some(false), None)
         }
         ClickTarget::SplitButton(group_id, dir) => {
             engine.active_group = group_id;
             engine.open_editor_group(dir);
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarPrev => {
             if engine.windows.contains_key(&engine.active_window_id()) {
                 engine.jump_prev_hunk();
             }
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarNext => {
             if engine.windows.contains_key(&engine.active_window_id()) {
                 engine.jump_next_hunk();
             }
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarToggleFold => {
             engine.diff_toggle_hide_unchanged();
-            None
+            (None, None)
         }
         ClickTarget::CloseTab(group_id, tab_idx) => {
             if let Some(g) = engine.editor_groups.get_mut(&group_id) {
@@ -407,12 +466,20 @@ pub(super) fn handle_mouse_click(
             engine.active_group = group_id;
             engine.line_annotations.clear();
             if engine.dirty() {
-                return Some(true);
+                return (Some(true), None);
             }
             engine.close_tab();
-            None
+            (None, None)
         }
-        _ => None,
+        ClickTarget::StatusBarAction(action) => {
+            let ea = engine.handle_status_action(&action);
+            (None, ea)
+        }
+        ClickTarget::ActionMenuButton(group_id) => {
+            engine.open_editor_action_menu(group_id, 0, 0);
+            (None, None)
+        }
+        _ => (None, None),
     }
 }
 
@@ -540,6 +607,8 @@ pub(super) fn handle_mouse_double_click(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -552,6 +621,8 @@ pub(super) fn handle_mouse_double_click(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
+        status_segment_map,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -570,6 +641,8 @@ pub(super) fn handle_mouse_drag(
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
+    action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -582,6 +655,8 @@ pub(super) fn handle_mouse_drag(
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
+        action_btn_map,
+        status_segment_map,
     ) {
         engine.mouse_drag(wid, line, col);
     }

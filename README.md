@@ -1,5 +1,7 @@
 # VimCode
 
+**[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
+
 High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX, no GPU required.
 
 ### Who's this for?
@@ -35,7 +37,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
 - **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 5,199 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core, 5,304 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -283,7 +285,7 @@ VimCode has three spatial layers that combine Vim and VSCode concepts:
 - **Tabs** — pages within an editor group, like Vim tabs or browser tabs (`gt`/`gT`, `:tabnew`)
 - **Editor Groups** — VSCode-style side-by-side tab bars (`Ctrl+\`, `Ctrl-W e/E`), each with its own set of tabs
 
-The tab context menu offers both: "Split Right/Down" creates a Vim window split inside the current tab, while "Split Right/Down to New Group" creates a new editor group with its own tab bar.
+The tab context menu offers both: "Split Right/Down" creates a Vim window split inside the current tab, while "Split Right/Down to New Group" creates a new editor group with its own tab bar. Each tab bar also has a `…` (more actions) button at the right edge with Close All, Close Others, Close Saved, Close to Right/Left, Toggle Word Wrap, Change Language Mode, and Reveal in File Explorer.
 
 **Buffers**
 - `:bn` / `:bp` — next/previous buffer
@@ -683,6 +685,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
 | `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
+| `windowstatusline` / `nowindowstatusline` | `wsl` | on | Per-window status line instead of single global bar (includes layout toggle icons) |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
 | `textwidth=N` | `tw` | 0 | Auto-wrap inserted text at column N (0=off) |
 | `wrap` / `nowrap` | | off | Soft-wrap long lines at viewport edge |
@@ -693,6 +696,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
+| `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
 - `:set option?` — query current value; `:set option!` — toggle boolean; `:set` — show all
@@ -777,6 +781,8 @@ All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/s
 - Per-window vertical scrollbar with cursor position indicator
 - Per-window horizontal scrollbar (shown when content is wider than viewport)
 - Scrollbar click-to-jump and drag support
+
+**Per-window status line** — mode, filename, branch, filetype, indentation, encoding, line ending, Ln:Col, LSP status; clickable segments open pickers (language, indentation, line ending, branch); layout toggle icons (sidebar, terminal, menu bar) with Nerd Font glyphs or `[S]`/`[T]`/`[M]` fallbacks — dimmed when inactive
 
 **Font** — configurable family and size via `settings.json`
 

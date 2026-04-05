@@ -107,16 +107,18 @@ Buffer storage and management.
 - `BufferManager::create(path)` / `get(id)` / `get_mut(id)` / `remove(id)`
 - `BufferState::from_text(text)` / `from_file(path)` — buffer creation
 
-## syntax.rs — 1,525 lines
-Tree-sitter syntax highlighting for 20 languages.
+## syntax.rs — 1,703 lines
+Tree-sitter syntax highlighting for 20 languages. Comprehensive highlight queries with 23 capture names: keyword, keyword.control, operator, string, comment, function, function.call, method.call, type, variable, number, boolean, constant, punctuation.bracket, punctuation.delimiter, macro, attribute, lifetime, escape, module, parameter, property, field.
 ### Types
-- `SyntaxHighlighter` — tree-sitter parser + tree per buffer
+- `Syntax` — tree-sitter parser + query + tree per buffer
 - `SyntaxLanguage` — enum of 20 supported languages
 ### Key Functions
-- `SyntaxHighlighter::new(language)` — create parser for language
-- `parse(text)` / `edit_and_reparse(text, edit)` — incremental parsing
-- `highlight_line(line, text)` — get syntax spans for a line
-- `language_for_extension(ext)` / `language_for_path(path)` — language detection
+- `Syntax::new_for_language(lang)` / `new_from_path(path)` — create parser
+- `parse(text)` — full parse + highlight extraction (always fresh, no incremental tree reuse)
+- `reparse(text)` — re-parse tree only (always full, not incremental — no tree.edit() support)
+- `extract_highlights(text)` / `extract_highlights_range(text, start, end)` — query captures
+- `SyntaxLanguage::from_path(path)` / `from_extension(ext)` — language detection
+- `query_source()` — per-language tree-sitter highlight query strings (inline)
 
 ## spell.rs — 379 lines
 Spell checking via spellbook (Hunspell format).

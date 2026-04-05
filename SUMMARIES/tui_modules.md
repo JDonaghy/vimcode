@@ -10,18 +10,19 @@ TUI application shell using ratatui + crossterm. Contains setup, event loop, key
 - Clipboard via `copypasta_ext::x11_bin::ClipboardContext`
 - Keyboard enhancement flags for Kitty/WezTerm (disambiguate Ctrl+Shift combos)
 
-## src/tui_main/render_impl.rs — 3,845 lines
+## src/tui_main/render_impl.rs — 3,944 lines
 All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 - `draw_frame(frame, engine, theme)` — top-level render function
 - `build_screen_for_tui(engine, cols, rows)` — compute layout geometry
 - Tab bar rendering per editor group
 - Editor window rendering (syntax spans → ratatui Spans)
 - Popup rendering: completion, hover, picker, dialog, context menu, diff peek, signature help
-- Status line + command line + wildmenu rendering
+- Per-window status line rendering (`render_window_status_line`)
+- Global status line + command line + wildmenu rendering
 - Menu bar + dropdown rendering (centered nav arrows + Command Center search box)
 - Debug toolbar rendering
 
-## src/tui_main/panels.rs — 4,048 lines
+## src/tui_main/panels.rs — 4,034 lines
 Sidebar panel rendering for all TUI panels.
 - Activity bar (icon column, panel switching)
 - Explorer file tree with git/diagnostic indicators + inline new-entry rows (`render_new_entry_row()`)
@@ -34,13 +35,13 @@ Sidebar panel rendering for all TUI panels.
 - Extension dynamic panels (Lua-registered panels)
 - Panel hover popup rendering
 
-## src/tui_main/mouse.rs — 2,459 lines
+## src/tui_main/mouse.rs — 2,661 lines
 All TUI mouse interaction handling.
 - `handle_mouse(event, engine, layout)` — top-level mouse dispatcher
 - Activity bar clicks (panel switching)
 - Explorer tree clicks (file open, expand/collapse, context menu)
 - Editor clicks (cursor placement, selection, drag)
-- Tab bar clicks (tab switch, close button, drag between groups)
+- Tab bar clicks (tab switch, close button, action menu `…` button, drag between groups)
 - Sidebar resize drag (Alt+Left/Right or mouse drag on border)
 - Scrollbar drag (vertical + horizontal, editor + panel)
 - Status bar clicks (branch name click opens branch picker)

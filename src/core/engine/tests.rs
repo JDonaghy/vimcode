@@ -9124,6 +9124,137 @@ fn test_picker_palette_command_opens_picker() {
     assert_eq!(engine.picker_source, PickerSource::Commands);
 }
 
+// ─── Picker search history tests ─────────────────────────────────────────
+
+#[test]
+fn test_picker_history_saved_on_confirm() {
+    let mut e = Engine::new();
+    // Open picker, type a query, confirm.
+    e.open_picker(PickerSource::Grep);
+    e.handle_picker_key("", Some('f'), false);
+    e.handle_picker_key("", Some('o'), false);
+    e.handle_picker_key("", Some('o'), false);
+    e.handle_picker_key("Return", None, false);
+    assert!(!e.picker_open);
+    let hist = e.picker_history.get(&PickerSource::Grep).unwrap();
+    assert_eq!(hist, &["foo"]);
+}
+
+#[test]
+fn test_picker_history_no_duplicate_consecutive() {
+    let mut e = Engine::new();
+    // Confirm same query twice — should only appear once.
+    for _ in 0..2 {
+        e.open_picker(PickerSource::Grep);
+        for c in "foo".chars() {
+            e.handle_picker_key("", Some(c), false);
+        }
+        e.handle_picker_key("Return", None, false);
+    }
+    let hist = e.picker_history.get(&PickerSource::Grep).unwrap();
+    assert_eq!(hist, &["foo"]);
+}
+
+#[test]
+fn test_picker_history_per_source() {
+    let mut e = Engine::new();
+    // Add history for Grep.
+    e.open_picker(PickerSource::Grep);
+    for c in "grep_q".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Add history for Files.
+    e.open_picker(PickerSource::Files);
+    for c in "file_q".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Each source has its own history.
+    assert_eq!(
+        e.picker_history.get(&PickerSource::Grep).unwrap(),
+        &["grep_q"]
+    );
+    assert_eq!(
+        e.picker_history.get(&PickerSource::Files).unwrap(),
+        &["file_q"]
+    );
+}
+
+#[test]
+fn test_picker_history_up_recalls_at_top() {
+    let mut e = Engine::new();
+    // Build some history.
+    for q in &["alpha", "beta"] {
+        e.open_picker(PickerSource::Grep);
+        for c in q.chars() {
+            e.handle_picker_key("", Some(c), false);
+        }
+        e.handle_picker_key("Return", None, false);
+    }
+    // Open fresh picker, press Up at top to recall history.
+    e.open_picker(PickerSource::Grep);
+    assert_eq!(e.picker_query, "");
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "beta"); // most recent
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "alpha"); // older
+                                         // Up at oldest stays at oldest.
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "alpha");
+}
+
+#[test]
+fn test_picker_history_down_restores_typing() {
+    let mut e = Engine::new();
+    // Build history.
+    e.open_picker(PickerSource::Grep);
+    for c in "old".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Open picker, type something, then browse history and come back.
+    e.open_picker(PickerSource::Grep);
+    for c in "new".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    // Move down to selected=0 first (results have items since "new" matches nothing in grep).
+    // Actually picker_selected starts at 0, so Up enters history.
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "old");
+    // Down past newest restores the typed query.
+    e.handle_picker_key("Down", None, false);
+    assert_eq!(e.picker_query, "new");
+    assert!(e.picker_history_index.is_none());
+}
+
+#[test]
+fn test_picker_history_typing_exits_history_mode() {
+    let mut e = Engine::new();
+    e.open_picker(PickerSource::Grep);
+    for c in "old".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Browse history, then type — should exit history mode.
+    e.open_picker(PickerSource::Grep);
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "old");
+    assert!(e.picker_history_index.is_some());
+    e.handle_picker_key("", Some('x'), false);
+    assert!(e.picker_history_index.is_none());
+    assert_eq!(e.picker_query, "oldx");
+}
+
+#[test]
+fn test_picker_history_empty_query_not_saved() {
+    let mut e = Engine::new();
+    e.open_picker(PickerSource::Grep);
+    // Confirm with empty query — nothing saved.
+    e.handle_picker_key("Return", None, false);
+    assert!(e.picker_history.get(&PickerSource::Grep).is_none());
+}
+
 // ─── Command Center tests ────────────────────────────────────────────────
 
 #[test]
@@ -14265,6 +14396,17 @@ fn test_spell_toggle_via_palette_action() {
     assert!(e.spell_checker.is_some());
 }
 
+#[test]
+fn test_spell_set_spell_command_initializes_checker() {
+    let mut e = engine_with_text("the quik fox");
+    assert!(!e.settings.spell);
+    assert!(e.spell_checker.is_none());
+    // :set spell should lazy-init the checker
+    e.execute_command("set spell");
+    assert!(e.settings.spell);
+    assert!(e.spell_checker.is_some());
+}
+
 // ── LaTeX text objects and motions ────────────────────────────────────────
 
 fn latex_engine(text: &str) -> Engine {
@@ -17868,4 +18010,395 @@ fn test_symbol_tree_synthetic_container() {
         .find(|i| i.filter_text == "method_a")
         .expect("Should have method_a");
     assert_eq!(method_a.depth, 1);
+}
+
+// ── Editor action menu tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_editor_action_menu_opens() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    assert!(e.context_menu.is_some());
+    let cm = e.context_menu.as_ref().unwrap();
+    assert!(matches!(
+        cm.target,
+        ContextMenuTarget::EditorActionMenu { .. }
+    ));
+    // Should have 8 items.
+    assert_eq!(cm.items.len(), 8);
+    assert_eq!(cm.items[0].action, "close_all");
+    assert_eq!(cm.items[1].action, "close_others");
+    assert_eq!(cm.items[5].action, "toggle_wrap");
+    assert_eq!(cm.items[6].action, "change_language");
+    assert_eq!(cm.items[7].action, "reveal");
+}
+
+#[test]
+fn test_editor_action_menu_close_others_disabled_with_one_tab() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    let cm = e.context_menu.as_ref().unwrap();
+    // "Close Others" disabled with only 1 tab.
+    let close_others = cm
+        .items
+        .iter()
+        .find(|i| i.action == "close_others")
+        .unwrap();
+    assert!(!close_others.enabled);
+    // "Close to the Left" disabled when active_tab == 0.
+    let close_left = cm.items.iter().find(|i| i.action == "close_left").unwrap();
+    assert!(!close_left.enabled);
+}
+
+#[test]
+fn test_editor_action_menu_toggle_wrap() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    let gid = e.active_group;
+    assert!(!e.settings.wrap);
+    e.open_editor_action_menu(gid, 0, 0);
+    // Select "toggle_wrap" and confirm.
+    if let Some(ref mut cm) = e.context_menu {
+        if let Some(idx) = cm.items.iter().position(|i| i.action == "toggle_wrap") {
+            cm.selected = idx;
+        }
+    }
+    e.context_menu_confirm();
+    assert!(e.settings.wrap);
+    assert!(e.message.contains("on"));
+}
+
+#[test]
+fn test_editor_action_menu_close_all() {
+    let mut e = Engine::new();
+    e.buffer_mut().insert(0, "hello\n");
+    // Open a second tab.
+    e.new_tab(None);
+    assert!(e.active_group().tabs.len() >= 2);
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0);
+    if let Some(ref mut cm) = e.context_menu {
+        if let Some(idx) = cm.items.iter().position(|i| i.action == "close_all") {
+            cm.selected = idx;
+        }
+    }
+    e.context_menu_confirm();
+    // After closing all, should have 1 scratch tab (close_tab creates one).
+    assert_eq!(e.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_close_all_tabs_method() {
+    let mut e = Engine::new();
+    e.new_tab(None);
+    e.new_tab(None);
+    assert_eq!(e.active_group().tabs.len(), 3);
+    e.close_all_tabs();
+    // close_tab always leaves at least 1 scratch buffer.
+    assert_eq!(e.active_group().tabs.len(), 1);
+}
+
+// ── Explorer inline rename improvements ──────────────────────────────────────
+
+#[test]
+fn test_explorer_rename_preselects_stem() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "hello.rs");
+    // Stem "hello" is selected (anchor=0, cursor=5)
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, 5);
+}
+
+#[test]
+fn test_explorer_rename_preselects_dotfile_fully() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/.gitignore"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, ".gitignore");
+    // Dotfiles: '.' at pos 0, so rfind('.') returns 0 which is filtered out
+    // → selects entire name
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, ".gitignore".len());
+}
+
+#[test]
+fn test_explorer_rename_preselects_no_extension() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/Makefile"));
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "Makefile");
+    // No extension → selects entire name
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, "Makefile".len());
+}
+
+#[test]
+fn test_explorer_rename_backspace_deletes_selection() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Pre-selected: "hello" (anchor=0, cursor=5)
+    e.handle_explorer_rename_key("BackSpace", None, false);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    // Selection deleted, only ".rs" remains
+    assert_eq!(rename.input, ".rs");
+    assert_eq!(rename.cursor, 0);
+    assert_eq!(rename.selection_anchor, None);
+}
+
+#[test]
+fn test_explorer_rename_typing_replaces_selection() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Type 'w' — should replace the selected "hello" with "w"
+    e.handle_explorer_rename_key("w", Some('w'), false);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "w.rs");
+    assert_eq!(rename.cursor, 1);
+    assert_eq!(rename.selection_anchor, None);
+}
+
+#[test]
+fn test_explorer_rename_escape_cancels_immediately() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Escape cancels rename immediately, even with active selection
+    assert!(e
+        .explorer_rename
+        .as_ref()
+        .unwrap()
+        .selection_anchor
+        .is_some());
+    e.handle_explorer_rename_key("Escape", None, false);
+    assert!(e.explorer_rename.is_none(), "Escape should cancel rename");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_a_selects_all() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Clear initial selection first
+    e.handle_explorer_rename_key("Right", None, false);
+    // Ctrl-A selects all
+    e.handle_explorer_rename_key("a", Some('a'), true);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.selection_anchor, Some(0));
+    assert_eq!(rename.cursor, "hello.rs".len());
+}
+
+#[test]
+fn test_explorer_rename_ctrl_v_paste() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new("pasted_name".to_string()));
+    let cc = clipboard_content.clone();
+    e.clipboard_read = Some(Box::new(move || Ok(cc.lock().unwrap().clone())));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello" (anchor=0, cursor=5). Ctrl-V should replace it.
+    e.handle_explorer_rename_key("v", Some('v'), true);
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "pasted_name.rs");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_c_copies_selection() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new(String::new()));
+    let cc = clipboard_content.clone();
+    e.clipboard_write = Some(Box::new(move |text: &str| {
+        *cc.lock().unwrap() = text.to_string();
+        Ok(())
+    }));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello". Ctrl-C should copy it.
+    e.handle_explorer_rename_key("c", Some('c'), true);
+    assert_eq!(*clipboard_content.lock().unwrap(), "hello");
+    // Input unchanged
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "hello.rs");
+}
+
+#[test]
+fn test_explorer_rename_ctrl_x_cuts_selection() {
+    use std::sync::{Arc, Mutex};
+    let mut e = Engine::new();
+    let clipboard_content = Arc::new(Mutex::new(String::new()));
+    let cc = clipboard_content.clone();
+    e.clipboard_write = Some(Box::new(move |text: &str| {
+        *cc.lock().unwrap() = text.to_string();
+        Ok(())
+    }));
+
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello". Ctrl-X should cut it.
+    e.handle_explorer_rename_key("x", Some('x'), true);
+    assert_eq!(*clipboard_content.lock().unwrap(), "hello");
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, ".rs");
+    assert_eq!(rename.cursor, 0);
+}
+
+// ─── Layout toggle button tests ─────────────────────────────────────────────
+
+#[test]
+fn test_status_action_toggle_panel() {
+    let mut e = Engine::new();
+    assert!(!e.terminal_open);
+    // When no terminal panes exist, returns OpenTerminal for the backend to create a PTY
+    let result = e.handle_status_action(&StatusAction::TogglePanel);
+    assert_eq!(result, Some(EngineAction::OpenTerminal));
+}
+
+#[test]
+fn test_status_action_toggle_menu_bar() {
+    let mut e = Engine::new();
+    assert!(!e.menu_bar_visible);
+    let result = e.handle_status_action(&StatusAction::ToggleMenuBar);
+    assert!(result.is_none());
+    assert!(e.menu_bar_visible);
+    // Toggle again
+    let result = e.handle_status_action(&StatusAction::ToggleMenuBar);
+    assert!(result.is_none());
+    assert!(!e.menu_bar_visible);
+}
+
+#[test]
+fn test_status_action_toggle_sidebar_returns_engine_action() {
+    let mut e = Engine::new();
+    let result = e.handle_status_action(&StatusAction::ToggleSidebar);
+    assert_eq!(result, Some(EngineAction::ToggleSidebar));
+}
+
+#[test]
+fn test_status_action_existing_actions_return_none() {
+    let mut e = Engine::new();
+    // Existing actions should return None (handled internally by engine)
+    assert!(e.handle_status_action(&StatusAction::GoToLine).is_none());
+    assert!(e
+        .handle_status_action(&StatusAction::ChangeLanguage)
+        .is_none());
+    assert!(e
+        .handle_status_action(&StatusAction::ChangeEncoding)
+        .is_none());
+}
+
+// ── Notification system tests ───────────────────────────────────────────
+
+#[test]
+fn test_notify_creates_notification() {
+    let mut e = Engine::new();
+    assert!(e.notifications.is_empty());
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].id, id);
+    assert_eq!(e.notifications[0].message, "Searching…");
+    assert!(!e.notifications[0].done);
+    assert!(e.has_active_notifications());
+    assert!(!e.has_done_notifications());
+}
+
+#[test]
+fn test_notify_done_marks_complete() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.notify_done(id, Some("Done!"));
+    assert_eq!(e.notifications.len(), 1);
+    assert!(e.notifications[0].done);
+    assert_eq!(e.notifications[0].message, "Done!");
+    assert!(!e.has_active_notifications());
+    assert!(e.has_done_notifications());
+}
+
+#[test]
+fn test_notify_done_by_kind() {
+    let mut e = Engine::new();
+    e.notify(NotificationKind::ProjectSearch, "Search 1…");
+    e.notify(NotificationKind::ProjectSearch, "Search 2…");
+    e.notify(NotificationKind::LspInstall, "Installing…");
+    e.notify_done_by_kind(&NotificationKind::ProjectSearch, Some("Search complete"));
+    // Both ProjectSearch notifications should be done, LspInstall still active
+    let search_done = e
+        .notifications
+        .iter()
+        .filter(|n| n.kind == NotificationKind::ProjectSearch && n.done)
+        .count();
+    let lsp_active = e
+        .notifications
+        .iter()
+        .filter(|n| n.kind == NotificationKind::LspInstall && !n.done)
+        .count();
+    assert_eq!(search_done, 2);
+    assert_eq!(lsp_active, 1);
+}
+
+#[test]
+fn test_dismiss_notification_by_id() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let _id2 = e.notify(NotificationKind::LspInstall, "B");
+    assert_eq!(e.notifications.len(), 2);
+    e.dismiss_notification(id1);
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].message, "B");
+}
+
+#[test]
+fn test_dismiss_done_notifications() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let _id2 = e.notify(NotificationKind::LspInstall, "B");
+    e.notify_done(id1, None);
+    e.dismiss_done_notifications();
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].message, "B");
+    assert!(!e.notifications[0].done);
+}
+
+#[test]
+fn test_tick_notifications_auto_dismiss() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.notify_done(id, Some("Done"));
+    // Manually backdate the done_at to simulate time passing
+    e.notifications[0].done_at =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+    e.tick_notifications();
+    assert!(e.notifications.is_empty(), "Should auto-dismiss after 5s");
+}
+
+#[test]
+fn test_tick_notifications_keeps_active() {
+    let mut e = Engine::new();
+    e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.tick_notifications();
+    assert_eq!(
+        e.notifications.len(),
+        1,
+        "In-progress notifications should not be auto-dismissed"
+    );
+}
+
+#[test]
+fn test_status_action_dismiss_notifications() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Done");
+    e.notify_done(id, None);
+    e.handle_status_action(&StatusAction::DismissNotifications);
+    assert!(e.notifications.is_empty());
+}
+
+#[test]
+fn test_notification_ids_increment() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let id2 = e.notify(NotificationKind::LspInstall, "B");
+    assert!(id2 > id1);
 }

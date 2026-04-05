@@ -26,6 +26,59 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
+    /// Map an LSP language identifier (e.g. "rust", "python") to a SyntaxLanguage.
+    pub fn from_language_id(id: &str) -> Option<Self> {
+        match id {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "javascript" | "javascriptreact" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
+            "typescriptreact" => Some(Self::TypeScriptReact),
+            "go" => Some(Self::Go),
+            "c" => Some(Self::C),
+            "cpp" => Some(Self::Cpp),
+            "csharp" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            "ruby" => Some(Self::Ruby),
+            "lua" => Some(Self::Lua),
+            "shellscript" => Some(Self::Bash),
+            "json" => Some(Self::Json),
+            "toml" => Some(Self::Toml),
+            "yaml" => Some(Self::Yaml),
+            "html" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "markdown" => Some(Self::Markdown),
+            "latex" | "bibtex" => Some(Self::Latex),
+            _ => None,
+        }
+    }
+
+    /// Return the LSP language ID for this language.
+    pub fn language_id(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+            Self::TypeScriptReact => "typescriptreact",
+            Self::Go => "go",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Java => "java",
+            Self::Ruby => "ruby",
+            Self::Lua => "lua",
+            Self::Bash => "shellscript",
+            Self::Json => "json",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Markdown => "markdown",
+            Self::Latex => "latex",
+        }
+    }
+
     /// Detect language from file extension
     pub fn from_path(path: &str) -> Option<Self> {
         let path_lower = path.to_lowercase();
@@ -164,304 +217,309 @@ impl SyntaxLanguage {
         match self {
             Self::Rust => "
                 (function_item name: (identifier) @function)
-                (string_literal) @string
-                (line_comment) @comment
-                (mod_item name: (identifier) @module)
-                [
-                  \"fn\"
-                  \"struct\"
-                  \"enum\"
-                  \"impl\"
-                  \"pub\"
-                  \"use\"
-                  \"mod\"
-                  \"let\"
-                  \"if\"
-                  \"else\"
-                  \"match\"
-                ] @keyword
+                (call_expression function: (identifier) @function.call)
+                (call_expression function: (field_expression field: (field_identifier) @method.call))
+                (call_expression function: (scoped_identifier name: (identifier) @function.call))
+                (macro_invocation macro: (identifier) @macro)
+                (macro_invocation macro: (scoped_identifier name: (identifier) @macro))
+                (macro_definition name: (identifier) @macro)
                 (type_identifier) @type
                 (primitive_type) @type
+                (scoped_type_identifier name: (type_identifier) @type)
+                (string_literal) @string
+                (raw_string_literal) @string
+                (char_literal) @string
+                (integer_literal) @number
+                (float_literal) @number
+                (boolean_literal) @boolean
+                (line_comment) @comment
+                (block_comment) @comment
+                (attribute_item) @attribute
+                (inner_attribute_item) @attribute
+                (lifetime (identifier) @lifetime)
+                (mod_item name: (identifier) @module)
+                (scoped_identifier path: (identifier) @module)
+                (field_expression field: (field_identifier) @property)
+                (field_declaration name: (field_identifier) @property)
+                (shorthand_field_initializer (identifier) @property)
+                (parameter pattern: (identifier) @parameter)
+                (self) @variable
+                (mutable_specifier) @keyword
+                (escape_sequence) @escape
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\";\" \",\" \"::\" \".\"] @punctuation.delimiter
+                [\"=\" \"+=\" \"-=\" \"*=\" \"/=\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \"+\" \"-\" \"*\" \"/\" \"%\" \"..\" \"?\" ] @operator
+                [\"->\" \"=>\"] @operator
+                [
+                  \"fn\" \"struct\" \"enum\" \"impl\" \"pub\" \"use\" \"mod\" \"let\"
+                  \"const\" \"static\" \"trait\" \"where\" \"type\" \"as\" \"dyn\"
+                  \"async\" \"await\" \"move\" \"ref\" \"unsafe\" \"extern\"
+                ] @keyword
+                [
+                  \"if\" \"else\" \"match\" \"for\" \"while\" \"loop\" \"return\"
+                  \"in\" \"break\" \"continue\" \"yield\"
+                ] @keyword.control
             ",
             Self::Python => "
                 (function_definition name: (identifier) @function)
                 (class_definition name: (identifier) @type)
+                (call function: (identifier) @function.call)
+                (call function: (attribute attribute: (identifier) @method.call))
                 (string) @string
+                (integer) @number
+                (float) @number
+                (true) @boolean
+                (false) @boolean
+                (none) @constant
                 (comment) @comment
-                [
-                  \"def\"
-                  \"class\"
-                  \"if\"
-                  \"elif\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"return\"
-                  \"import\"
-                  \"from\"
-                  \"as\"
-                  \"try\"
-                  \"except\"
-                  \"finally\"
-                  \"with\"
-                  \"lambda\"
-                  \"pass\"
-                  \"break\"
-                  \"continue\"
-                  \"raise\"
-                  \"yield\"
-                  \"async\"
-                  \"await\"
+                (decorator) @attribute
+                (escape_sequence) @escape
+                (attribute attribute: (identifier) @property)
+                (parameters (identifier) @parameter)
+                (default_parameter name: (identifier) @parameter)
+                (typed_parameter (identifier) @parameter)
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \":\" \";\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"//\" \"%\" \"**\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"+=\" \"-=\" \"*=\" \"/=\"] @operator
+                [\"and\" \"or\" \"not\" \"in\" \"is\"] @operator
+                [\"def\" \"class\" \"import\" \"from\" \"as\" \"with\" \"lambda\"
+                  \"async\" \"await\" \"global\" \"nonlocal\" \"del\" \"assert\"
                 ] @keyword
-                (call function: (identifier) @function)
+                [\"if\" \"elif\" \"else\" \"for\" \"while\" \"return\" \"try\" \"except\"
+                  \"finally\" \"pass\" \"break\" \"continue\" \"raise\" \"yield\"
+                ] @keyword.control
             ",
             Self::JavaScript => "
                 (function_declaration name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
+                (call_expression function: (identifier) @function.call)
+                (call_expression function: (member_expression property: (property_identifier) @method.call))
                 (class_declaration name: (identifier) @type)
                 (string) @string
                 (template_string) @string
+                (number) @number
+                (true) @boolean
+                (false) @boolean
+                (null) @constant
                 (comment) @comment
-                [
-                  \"function\"
-                  \"class\"
-                  \"const\"
-                  \"let\"
-                  \"var\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"do\"
-                  \"return\"
-                  \"import\"
-                  \"export\"
-                  \"from\"
-                  \"default\"
-                  \"try\"
-                  \"catch\"
-                  \"finally\"
-                  \"throw\"
-                  \"new\"
-                  \"async\"
-                  \"await\"
-                  \"break\"
-                  \"continue\"
-                  \"switch\"
-                  \"case\"
+                (regex) @string
+                (member_expression property: (property_identifier) @property)
+                (pair key: (property_identifier) @property)
+                (shorthand_property_identifier) @property
+                (formal_parameters (identifier) @parameter)
+                (escape_sequence) @escape
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"===\" \"!=\" \"!==\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"+=\" \"-=\" \"*=\" \"/=\"] @operator
+                [\"=>\" \"...\" \"??\" \"instanceof\" \"typeof\"] @operator
+                (this) @variable
+                [\"function\" \"class\" \"const\" \"let\" \"var\" \"new\" \"async\" \"await\"
+                  \"import\" \"export\" \"from\" \"default\" \"void\" \"delete\" \"of\" \"in\"
                 ] @keyword
+                [\"if\" \"else\" \"for\" \"while\" \"do\" \"return\" \"try\" \"catch\" \"finally\"
+                  \"throw\" \"break\" \"continue\" \"switch\" \"case\" \"yield\"
+                ] @keyword.control
             ",
             Self::Go => "
                 (function_declaration name: (identifier) @function)
                 (method_declaration name: (field_identifier) @function)
+                (call_expression function: (identifier) @function.call)
+                (call_expression function: (selector_expression field: (field_identifier) @method.call))
                 (type_declaration (type_spec name: (type_identifier) @type))
+                (type_identifier) @type
                 (interpreted_string_literal) @string
                 (raw_string_literal) @string
+                (rune_literal) @string
+                (int_literal) @number
+                (float_literal) @number
+                (imaginary_literal) @number
+                (true) @boolean
+                (false) @boolean
+                (nil) @constant
                 (comment) @comment
-                [
-                  \"func\"
-                  \"package\"
-                  \"import\"
-                  \"type\"
-                  \"struct\"
-                  \"interface\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"range\"
-                  \"return\"
-                  \"go\"
-                  \"defer\"
-                  \"var\"
-                  \"const\"
-                  \"switch\"
-                  \"case\"
-                  \"default\"
-                  \"break\"
-                  \"continue\"
-                  \"fallthrough\"
-                  \"select\"
-                  \"chan\"
-                  \"map\"
+                (selector_expression field: (field_identifier) @property)
+                (field_declaration name: (field_identifier) @property)
+                (package_identifier) @module
+                (parameter_declaration name: (identifier) @parameter)
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \":=\" \"+=\" \"-=\" \"<-\"] @operator
+                [\"func\" \"package\" \"import\" \"type\" \"struct\" \"interface\"
+                  \"go\" \"defer\" \"var\" \"const\" \"chan\" \"map\"
                 ] @keyword
-                (type_identifier) @type
+                [\"if\" \"else\" \"for\" \"range\" \"return\" \"switch\" \"case\" \"default\"
+                  \"break\" \"continue\" \"fallthrough\" \"select\"
+                ] @keyword.control
             ",
             Self::Cpp => "
                 (function_definition declarator: (function_declarator declarator: (identifier) @function))
                 (declaration declarator: (function_declarator declarator: (identifier) @function))
+                (call_expression function: (identifier) @function.call)
+                (call_expression function: (field_expression field: (field_identifier) @method.call))
                 (class_specifier name: (type_identifier) @type)
                 (struct_specifier name: (type_identifier) @type)
-                (string_literal) @string
-                (comment) @comment
-                [
-                  \"class\"
-                  \"struct\"
-                  \"enum\"
-                  \"namespace\"
-                  \"public\"
-                  \"private\"
-                  \"protected\"
-                  \"virtual\"
-                  \"static\"
-                  \"const\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"do\"
-                  \"return\"
-                  \"break\"
-                  \"continue\"
-                  \"switch\"
-                  \"case\"
-                  \"default\"
-                  \"template\"
-                  \"typename\"
-                  \"using\"
-                  \"new\"
-                  \"delete\"
-                  \"try\"
-                  \"catch\"
-                  \"throw\"
-                ] @keyword
                 (type_identifier) @type
                 (primitive_type) @type
+                (namespace_identifier) @module
+                (string_literal) @string
+                (char_literal) @string
+                (raw_string_literal) @string
+                (number_literal) @number
+                (true) @boolean
+                (false) @boolean
+                (null) @constant
+                (comment) @comment
+                (field_expression field: (field_identifier) @property)
+                (field_declaration declarator: (field_identifier) @property)
+                (parameter_declaration declarator: (identifier) @parameter)
+                (preproc_include) @macro
+                (preproc_def name: (identifier) @macro)
+                (preproc_function_def name: (identifier) @macro)
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\" \"::\" \"->\" ] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \"+=\" \"-=\"] @operator
+                [\"++\" \"--\"] @operator
+                [\"class\" \"struct\" \"enum\" \"namespace\" \"public\" \"private\" \"protected\"
+                  \"virtual\" \"static\" \"const\" \"template\" \"typename\" \"using\" \"new\" \"delete\"
+                  \"constexpr\" \"noexcept\" \"override\" \"final\" \"explicit\"
+                  \"inline\" \"volatile\" \"extern\"
+                ] @keyword
+                [\"if\" \"else\" \"for\" \"while\" \"do\" \"return\" \"break\" \"continue\"
+                  \"switch\" \"case\" \"default\" \"try\" \"catch\" \"throw\"
+                ] @keyword.control
             ",
             Self::C => "
                 (function_definition declarator: (function_declarator declarator: (identifier) @function))
                 (declaration declarator: (function_declarator declarator: (identifier) @function))
+                (call_expression function: (identifier) @function.call)
                 (struct_specifier name: (type_identifier) @type)
                 (enum_specifier name: (type_identifier) @type)
-                (string_literal) @string
-                (comment) @comment
-                [
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"do\"
-                  \"return\"
-                  \"break\"
-                  \"continue\"
-                  \"switch\"
-                  \"case\"
-                  \"default\"
-                  \"struct\"
-                  \"enum\"
-                  \"typedef\"
-                  \"static\"
-                  \"const\"
-                  \"sizeof\"
-                ] @keyword
                 (type_identifier) @type
                 (primitive_type) @type
+                (string_literal) @string
+                (char_literal) @string
+                (number_literal) @number
+                (true) @boolean
+                (false) @boolean
+                (null) @constant
+                (comment) @comment
+                (field_expression field: (field_identifier) @property)
+                (field_declaration declarator: (field_identifier) @property)
+                (parameter_declaration declarator: (identifier) @parameter)
+                (preproc_include) @macro
+                (preproc_def name: (identifier) @macro)
+                (preproc_function_def name: (identifier) @macro)
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \"+=\" \"-=\"] @operator
+                [\"->\" \"++\" \"--\"] @operator
+                [\"struct\" \"enum\" \"typedef\" \"static\" \"const\" \"sizeof\"
+                  \"extern\" \"inline\" \"volatile\" \"unsigned\" \"signed\" \"union\"
+                ] @keyword
+                [\"if\" \"else\" \"for\" \"while\" \"do\" \"return\" \"break\" \"continue\"
+                  \"switch\" \"case\" \"default\" \"goto\"
+                ] @keyword.control
             ",
             Self::TypeScript | Self::TypeScriptReact => "
                 (function_declaration name: (identifier) @function)
                 (method_definition name: (property_identifier) @function)
+                (call_expression function: (identifier) @function.call)
+                (call_expression function: (member_expression property: (property_identifier) @method.call))
                 (class_declaration name: (type_identifier) @type)
                 (interface_declaration name: (type_identifier) @type)
                 (type_alias_declaration name: (type_identifier) @type)
+                (type_identifier) @type
                 (string) @string
                 (template_string) @string
+                (number) @number
                 (comment) @comment
-                [
-                  \"function\"
-                  \"class\"
-                  \"interface\"
-                  \"type\"
-                  \"const\"
-                  \"let\"
-                  \"var\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"do\"
-                  \"return\"
-                  \"import\"
-                  \"export\"
-                  \"from\"
-                  \"default\"
-                  \"try\"
-                  \"catch\"
-                  \"finally\"
-                  \"throw\"
-                  \"new\"
-                  \"async\"
-                  \"await\"
-                  \"break\"
-                  \"continue\"
-                  \"switch\"
-                  \"case\"
-                  \"as\"
-                  \"extends\"
-                  \"implements\"
+                (member_expression property: (property_identifier) @property)
+                (pair key: (property_identifier) @property)
+                (shorthand_property_identifier) @property
+                (required_parameter pattern: (identifier) @parameter)
+                (optional_parameter pattern: (identifier) @parameter)
+                (escape_sequence) @escape
+                (this) @variable
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"===\" \"!=\" \"!==\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"+=\" \"-=\" \"*=\" \"/=\"] @operator
+                [\"=>\" \"...\" \"??\" \"instanceof\" \"typeof\"] @operator
+                [\"function\" \"class\" \"interface\" \"type\" \"const\" \"let\" \"var\"
+                  \"new\" \"async\" \"await\" \"import\" \"export\" \"from\" \"default\"
+                  \"as\" \"extends\" \"implements\" \"void\" \"delete\" \"of\" \"in\"
+                  \"declare\" \"enum\" \"namespace\" \"readonly\" \"abstract\" \"override\"
                 ] @keyword
-                (type_identifier) @type
+                [\"if\" \"else\" \"for\" \"while\" \"do\" \"return\" \"try\" \"catch\" \"finally\"
+                  \"throw\" \"break\" \"continue\" \"switch\" \"case\" \"yield\"
+                ] @keyword.control
             ",
             Self::Css => "
                 (tag_name) @function
                 (class_selector) @type
                 (id_selector) @type
-                (property_name) @keyword
+                (property_name) @property
                 (string_value) @string
+                (color_value) @number
+                (integer_value) @number
+                (float_value) @number
+                (plain_value) @variable
                 (comment) @comment
+                [\"{\" \"}\" \"(\" \")\" \"[\" \"]\"] @punctuation.bracket
+                [\";\" \":\" \",\"] @punctuation.delimiter
+                (important) @keyword
             ",
             Self::Json => "
-                (pair key: (string) @type)
+                (pair key: (string) @property)
                 (string) @string
                 (number) @number
-                (true) @keyword
-                (false) @keyword
-                (null) @keyword
+                (true) @boolean
+                (false) @boolean
+                (null) @constant
+                [\"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \":\"] @punctuation.delimiter
             ",
             Self::Bash => "
                 (function_definition name: (word) @function)
+                (command_name (word) @function.call)
                 (string) @string
+                (raw_string) @string
+                (number) @number
                 (comment) @comment
-                (variable_name) @type
-                [
-                  \"if\"
-                  \"then\"
-                  \"else\"
-                  \"elif\"
-                  \"fi\"
-                  \"for\"
-                  \"while\"
-                  \"do\"
-                  \"done\"
-                  \"case\"
-                  \"esac\"
-                  \"function\"
-                  \"in\"
-                ] @keyword
+                (variable_name) @variable
+                (simple_expansion) @variable
+                (expansion) @variable
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\" \"((\" \"))\" \"[[\" \"]]\"] @punctuation.bracket
+                [\";\" \";;\" \"|\" \"||\" \"&&\" \"&\"] @punctuation.delimiter
+                [\"=\" \"==\" \"!=\"] @operator
+                [\">\" \">>\" \"<\" \"<<\"] @operator
+                [\"function\" \"local\" \"export\" \"unset\" \"declare\"] @keyword
+                [\"if\" \"then\" \"else\" \"elif\" \"fi\" \"for\" \"while\" \"do\" \"done\"
+                  \"case\" \"esac\" \"in\" \"select\" \"until\"
+                ] @keyword.control
             ",
             Self::Ruby => "
                 (method name: (identifier) @function)
+                (call method: (identifier) @method.call)
                 (class name: (constant) @type)
                 (constant) @type
                 (string) @string
+                (integer) @number
+                (float) @number
+                (nil) @constant
+                (true) @boolean
+                (false) @boolean
+                (self) @variable
                 (comment) @comment
-                [
-                  \"def\"
-                  \"end\"
-                  \"class\"
-                  \"module\"
-                  \"if\"
-                  \"else\"
-                  \"elsif\"
-                  \"unless\"
-                  \"while\"
-                  \"until\"
-                  \"for\"
-                  \"do\"
-                  \"return\"
-                ] @keyword
-                (nil) @keyword
-                (true) @keyword
-                (false) @keyword
-                (self) @keyword
+                (simple_symbol) @string
+                (escape_sequence) @escape
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\"] @operator
+                [\"and\" \"or\" \"not\"] @operator
+                [\"def\" \"end\" \"class\" \"module\"] @keyword
+                [\"if\" \"else\" \"elsif\" \"unless\" \"while\" \"until\" \"for\" \"do\"
+                  \"return\" \"begin\" \"rescue\" \"ensure\" \"yield\" \"break\" \"next\"
+                ] @keyword.control
             ",
             Self::CSharp => "
                 (method_declaration name: (identifier) @function)
@@ -502,124 +560,95 @@ impl SyntaxLanguage {
                 (comment) @comment
                 (member_access_expression name: (identifier) @variable)
                 (attribute name: (identifier) @function)
-                [
-                  \"class\"
-                  \"interface\"
-                  \"struct\"
-                  \"namespace\"
-                  \"using\"
-                  \"public\"
-                  \"private\"
-                  \"protected\"
-                  \"internal\"
-                  \"static\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"foreach\"
-                  \"while\"
-                  \"do\"
-                  \"return\"
-                  \"new\"
-                  \"override\"
-                  \"virtual\"
-                  \"abstract\"
-                  \"sealed\"
-                  \"async\"
-                  \"await\"
-                  \"readonly\"
-                  \"const\"
-                  \"base\"
-                  \"this\"
-                  \"throw\"
-                  \"try\"
-                  \"catch\"
-                  \"finally\"
-                  \"switch\"
-                  \"case\"
-                  \"default\"
-                  \"break\"
-                  \"continue\"
-                  \"enum\"
-                  \"delegate\"
-                  \"event\"
-                  \"get\"
-                  \"set\"
-                  \"in\"
-                  \"out\"
-                  \"ref\"
-                  \"params\"
-                  \"is\"
-                  \"as\"
-                  \"typeof\"
-                  \"partial\"
+                [\"class\" \"interface\" \"struct\" \"namespace\" \"using\"
+                  \"public\" \"private\" \"protected\" \"internal\" \"static\"
+                  \"new\" \"override\" \"virtual\" \"abstract\" \"sealed\"
+                  \"async\" \"await\" \"readonly\" \"const\" \"base\" \"this\"
+                  \"enum\" \"delegate\" \"event\" \"get\" \"set\"
+                  \"in\" \"out\" \"ref\" \"params\" \"is\" \"as\" \"typeof\" \"partial\"
                 ] @keyword
-                (boolean_literal) @keyword
-                (null_literal) @keyword
+                [\"if\" \"else\" \"for\" \"foreach\" \"while\" \"do\" \"return\"
+                  \"throw\" \"try\" \"catch\" \"finally\" \"switch\" \"case\" \"default\"
+                  \"break\" \"continue\"
+                ] @keyword.control
+                (boolean_literal) @boolean
+                (null_literal) @constant
                 (predefined_type) @type
+                (escape_sequence) @escape
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \"+=\" \"-=\" \"*=\" \"/=\"] @operator
+                [\"++\" \"--\"] @operator
             ",
             Self::Java => "
                 (method_declaration name: (identifier) @function)
+                (method_invocation name: (identifier) @method.call)
                 (class_declaration name: (identifier) @type)
                 (interface_declaration name: (identifier) @type)
+                (type_identifier) @type
                 (string_literal) @string
+                (character_literal) @string
+                (decimal_integer_literal) @number
+                (hex_integer_literal) @number
+                (decimal_floating_point_literal) @number
+                (true) @boolean
+                (false) @boolean
+                (null_literal) @constant
                 (line_comment) @comment
                 (block_comment) @comment
-                [
-                  \"class\"
-                  \"interface\"
-                  \"extends\"
-                  \"implements\"
-                  \"public\"
-                  \"private\"
-                  \"protected\"
-                  \"static\"
-                  \"if\"
-                  \"else\"
-                  \"for\"
-                  \"while\"
-                  \"return\"
-                  \"new\"
-                  \"import\"
-                  \"package\"
+                (field_access field: (identifier) @property)
+                (formal_parameter name: (identifier) @parameter)
+                (marker_annotation name: (identifier) @attribute)
+                (annotation name: (identifier) @attribute)
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"!=\" \"<\" \">\" \"<=\" \">=\" \"&&\" \"||\" \"!\" \"&\" \"|\" \"^\" \"+=\" \"-=\" \"*=\" \"/=\"] @operator
+                [\"++\" \"--\" \"instanceof\"] @operator
+                [\"class\" \"interface\" \"extends\" \"implements\" \"public\" \"private\"
+                  \"protected\" \"static\" \"new\" \"import\" \"package\"
+                  \"abstract\" \"final\" \"synchronized\" \"enum\"
                 ] @keyword
-                (true) @keyword
-                (false) @keyword
-                (null_literal) @keyword
-                (type_identifier) @type
+                [\"if\" \"else\" \"for\" \"while\" \"return\" \"throw\" \"throws\"
+                  \"try\" \"catch\" \"finally\" \"break\" \"continue\" \"do\"
+                  \"switch\" \"case\" \"default\"
+                ] @keyword.control
             ",
             Self::Toml => "
-                (bare_key) @type
-                (quoted_key) @type
+                (bare_key) @property
+                (quoted_key) @property
                 (string) @string
                 (integer) @number
                 (float) @number
-                (boolean) @keyword
+                (boolean) @boolean
                 (comment) @comment
+                [\"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\"=\" \",\" \".\"] @punctuation.delimiter
             ",
             Self::Yaml => "
-                (block_mapping_pair key: (flow_node) @type)
-                (flow_mapping (_ key: (flow_node) @type))
+                (block_mapping_pair key: (flow_node) @property)
+                (flow_mapping (_ key: (flow_node) @property))
                 (double_quote_scalar) @string
                 (single_quote_scalar) @string
                 (block_scalar) @string
                 (integer_scalar) @number
                 (float_scalar) @number
-                (boolean_scalar) @keyword
-                (null_scalar) @keyword
+                (boolean_scalar) @boolean
+                (null_scalar) @constant
                 (comment) @comment
                 (anchor_name) @function
                 (alias_name) @function
-                (tag) @function
+                (tag) @attribute
             ",
             Self::Html => "
                 (tag_name) @keyword
-                (attribute_name) @type
+                (attribute_name) @attribute
                 (attribute_value) @string
                 (quoted_attribute_value) @string
                 (comment) @comment
                 (doctype) @keyword
                 (raw_text) @string
+                [\"<\" \">\" \"</\" \"/>\" ] @punctuation.bracket
+                [\"=\"] @operator
             ",
             Self::Latex => "
                 (line_comment) @comment
@@ -644,20 +673,25 @@ impl SyntaxLanguage {
             ",
             Self::Lua => "
                 (function_declaration name: (identifier) @function)
-                (function_call name: (identifier) @function)
+                (function_call name: (identifier) @function.call)
+                (function_call name: (dot_index_expression field: (identifier) @method.call))
                 (string) @string
                 (comment) @comment
                 (number) @number
-                [
-                  \"function\" \"end\" \"local\" \"return\" \"if\" \"then\" \"else\" \"elseif\"
-                  \"for\" \"while\" \"do\" \"repeat\" \"until\" \"in\" \"not\"
-                  \"and\" \"or\"
-                ] @keyword
+                (true) @boolean
+                (false) @boolean
+                (nil) @constant
+                (dot_index_expression field: (identifier) @property)
                 (break_statement) @keyword
                 (goto_statement) @keyword
-                (true) @keyword
-                (false) @keyword
-                (nil) @keyword
+                [\"(\" \")\" \"[\" \"]\" \"{\" \"}\"] @punctuation.bracket
+                [\",\" \".\" \";\" \":\"] @punctuation.delimiter
+                [\"=\" \"+\" \"-\" \"*\" \"/\" \"%\" \"==\" \"~=\" \"<\" \">\" \"<=\" \">=\" \"..\" \"#\"] @operator
+                [\"and\" \"or\" \"not\"] @operator
+                [\"function\" \"end\" \"local\"] @keyword
+                [\"return\" \"if\" \"then\" \"else\" \"elseif\"
+                  \"for\" \"while\" \"do\" \"repeat\" \"until\" \"in\"
+                ] @keyword.control
             ",
             Self::Markdown => "
                 (atx_heading) @function
@@ -695,14 +729,30 @@ pub struct Syntax {
 impl Syntax {
     /// Create a new Syntax highlighter for a specific language
     pub fn new_for_language(language: SyntaxLanguage) -> Self {
+        Self::new_for_language_with_query(language, None)
+    }
+
+    /// Create a Syntax highlighter, optionally using a custom highlight query.
+    /// Falls back to the built-in query if `override_query` is None or fails to compile.
+    pub fn new_for_language_with_query(
+        language: SyntaxLanguage,
+        override_query: Option<&str>,
+    ) -> Self {
         let mut parser = Parser::new();
         let ts_language = language.language();
         parser
             .set_language(&ts_language)
             .expect("Error loading grammar");
 
-        let query_source = language.query_source();
-        let query = Query::new(&ts_language, query_source).expect("Error compiling query");
+        let query = if let Some(oq) = override_query {
+            Query::new(&ts_language, oq).unwrap_or_else(|_| {
+                // Override failed to compile; fall back to built-in
+                Query::new(&ts_language, language.query_source())
+                    .expect("Error compiling built-in query")
+            })
+        } else {
+            Query::new(&ts_language, language.query_source()).expect("Error compiling query")
+        };
 
         Self {
             parser,
@@ -712,10 +762,40 @@ impl Syntax {
         }
     }
 
-    /// Create a new Syntax highlighter, detecting language from file path
+    /// Create a new Syntax highlighter, detecting language from file path.
+    /// Looks up override queries from the provided map keyed by language ID.
     pub fn new_from_path(path: Option<&str>) -> Option<Self> {
-        path.and_then(SyntaxLanguage::from_path)
-            .map(Self::new_for_language)
+        Self::new_from_path_with_overrides(path, None)
+    }
+
+    /// Create a new Syntax highlighter with optional highlight query overrides.
+    pub fn new_from_path_with_overrides(
+        path: Option<&str>,
+        overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<Self> {
+        let lang = path.and_then(SyntaxLanguage::from_path)?;
+        let override_query = overrides
+            .and_then(|m| m.get(lang.language_id()))
+            .map(|s| s.as_str());
+        Some(Self::new_for_language_with_query(lang, override_query))
+    }
+
+    /// Create a Syntax from an LSP language identifier (e.g. "rust", "python").
+    #[allow(dead_code)]
+    pub fn new_from_language_id(id: &str) -> Option<Self> {
+        Self::new_from_language_id_with_overrides(id, None)
+    }
+
+    /// Create a Syntax from an LSP language ID with optional highlight query overrides.
+    pub fn new_from_language_id_with_overrides(
+        id: &str,
+        overrides: Option<&std::collections::HashMap<String, String>>,
+    ) -> Option<Self> {
+        let lang = SyntaxLanguage::from_language_id(id)?;
+        let override_query = overrides
+            .and_then(|m| m.get(lang.language_id()))
+            .map(|s| s.as_str());
+        Some(Self::new_for_language_with_query(lang, override_query))
     }
 }
 
@@ -734,20 +814,14 @@ impl Syntax {
     /// This is fast (tree-sitter reuses unchanged subtrees) and should be
     /// called on every keystroke. Highlight extraction can be deferred.
     pub fn reparse(&mut self, text: &str) {
-        // Skip incremental parsing for Markdown: tree-sitter-md's external
-        // scanner can corrupt the parser's logger struct when reusing an old
-        // tree, causing a SIGSEGV in ts_parser__log.
-        let old_tree = if matches!(
-            self.language,
-            SyntaxLanguage::Markdown | SyntaxLanguage::Yaml
-        ) {
-            None
-        } else {
-            self.last_tree.as_ref()
-        };
+        // Always do a full parse (no old_tree).  Passing the old tree for
+        // incremental parsing requires calling tree.edit() with precise byte
+        // offset deltas BEFORE reparsing.  Without tree.edit(), tree-sitter
+        // assumes the text is unchanged and reuses stale nodes, producing
+        // highlights with wrong byte offsets (garbled partial-word coloring).
         let tree = self
             .parser
-            .parse(text, old_tree)
+            .parse(text, None)
             .expect("tree-sitter parse failed");
         self.last_tree = Some(tree);
     }
@@ -1431,9 +1505,21 @@ mod tests {
     #[test]
     fn test_syntax_rust_basic() {
         let mut syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
-        let code = "fn main() { let x = 42; }";
+        let code = "fn main() { let x = 42; }\nstruct Foo { bar: u32 }\nimpl Foo { fn baz(&self) -> bool { true } }";
         let highlights = syntax.parse(code);
         assert!(!highlights.is_empty());
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(kinds.contains("keyword"), "missing keyword");
+        assert!(kinds.contains("function"), "missing function");
+        assert!(kinds.contains("number"), "missing number");
+        assert!(kinds.contains("type"), "missing type");
+        assert!(
+            kinds.contains("punctuation.bracket"),
+            "missing punctuation.bracket"
+        );
+        assert!(kinds.contains("operator"), "missing operator");
+        assert!(kinds.contains("boolean"), "missing boolean");
     }
 
     #[test]
@@ -1466,6 +1552,52 @@ mod tests {
         let code = "int main() { return 0; }";
         let highlights = syntax.parse(code);
         assert!(!highlights.is_empty());
+    }
+
+    #[test]
+    fn test_reparse_preserves_captures() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
+        let code1 = "fn main() { if true { let x = 42; } }";
+        let h1 = syntax.parse(code1);
+        let kinds1: std::collections::HashSet<&str> =
+            h1.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(
+            kinds1.contains("keyword.control"),
+            "initial missing keyword.control"
+        );
+        assert!(kinds1.contains("keyword"), "initial missing keyword");
+        assert!(kinds1.contains("boolean"), "initial missing boolean");
+
+        // Simulate edit and re-parse
+        let code2 = "fn main() { if true { let x = 43; } }";
+        let h2 = syntax.parse(code2);
+        let kinds2: std::collections::HashSet<&str> =
+            h2.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(
+            kinds2.contains("keyword.control"),
+            "reparse missing keyword.control"
+        );
+        assert!(kinds2.contains("keyword"), "reparse missing keyword");
+        assert!(kinds2.contains("boolean"), "reparse missing boolean");
+    }
+
+    #[test]
+    fn test_highlights_sorted_by_start_byte() {
+        let mut syntax = Syntax::new_for_language(SyntaxLanguage::Rust);
+        let code = "fn main() { if true { let x = 42; } }\nstruct Foo { bar: u32 }";
+        let highlights = syntax.parse(code);
+        for pair in highlights.windows(2) {
+            assert!(
+                pair[0].0 <= pair[1].0,
+                "highlights not sorted by start_byte: ({}, {}, {}) before ({}, {}, {})",
+                pair[0].0,
+                pair[0].1,
+                pair[0].2,
+                pair[1].0,
+                pair[1].1,
+                pair[1].2,
+            );
+        }
     }
 
     #[test]
@@ -1549,20 +1681,20 @@ mod tests {
         let kinds: Vec<&str> = highlights.iter().map(|(_, _, k)| k.as_str()).collect();
         assert!(kinds.contains(&"comment"), "should highlight comments");
         assert!(kinds.contains(&"string"), "should highlight quoted strings");
-        assert!(kinds.contains(&"type"), "should highlight keys as type");
-        assert!(kinds.contains(&"number"), "should highlight numbers");
         assert!(
-            kinds.contains(&"keyword"),
-            "should highlight booleans as keyword"
+            kinds.contains(&"property"),
+            "should highlight keys as property"
         );
+        assert!(kinds.contains(&"number"), "should highlight numbers");
+        assert!(kinds.contains(&"boolean"), "should highlight booleans");
         // Keys must not be overridden by string — check that key byte range has type, not string
         let key_highlights: Vec<_> = highlights
             .iter()
             .filter(|(s, e, _)| *s == 10 && *e == 18)
             .collect();
         assert!(
-            key_highlights.iter().any(|(_, _, k)| k == "type"),
-            "key should be type"
+            key_highlights.iter().any(|(_, _, k)| k == "property"),
+            "key should be property"
         );
         assert!(
             !key_highlights.iter().any(|(_, _, k)| k == "string"),
@@ -1634,5 +1766,89 @@ mod tests {
         let scopes = syntax.enclosing_scopes(code, 2, 1);
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].name, "hello");
+    }
+
+    #[test]
+    fn test_language_id_round_trip() {
+        // Every variant should round-trip through language_id → from_language_id
+        let langs = [
+            SyntaxLanguage::Rust,
+            SyntaxLanguage::Python,
+            SyntaxLanguage::JavaScript,
+            SyntaxLanguage::TypeScript,
+            SyntaxLanguage::Go,
+            SyntaxLanguage::C,
+            SyntaxLanguage::Cpp,
+            SyntaxLanguage::CSharp,
+            SyntaxLanguage::Java,
+            SyntaxLanguage::Ruby,
+            SyntaxLanguage::Lua,
+            SyntaxLanguage::Bash,
+            SyntaxLanguage::Json,
+            SyntaxLanguage::Toml,
+            SyntaxLanguage::Yaml,
+            SyntaxLanguage::Html,
+            SyntaxLanguage::Css,
+            SyntaxLanguage::Markdown,
+            SyntaxLanguage::Latex,
+        ];
+        for lang in &langs {
+            let id = lang.language_id();
+            let back = SyntaxLanguage::from_language_id(id);
+            assert_eq!(
+                back,
+                Some(*lang),
+                "round-trip failed for {:?} (id={id})",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn test_override_query_used() {
+        // A valid override query should be used instead of the built-in
+        let override_q = "(line_comment) @comment";
+        let mut syntax =
+            Syntax::new_for_language_with_query(SyntaxLanguage::Rust, Some(override_q));
+        let highlights = syntax.parse("// hello\nfn main() {}");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        // Should have comment from override but NOT keyword (override doesn't capture keywords)
+        assert!(
+            kinds.contains("comment"),
+            "override should capture comments"
+        );
+        assert!(
+            !kinds.contains("keyword"),
+            "override should NOT capture keywords"
+        );
+    }
+
+    #[test]
+    fn test_malformed_override_falls_back() {
+        // A malformed override should fall back to the built-in query
+        let bad_query = "THIS IS NOT A VALID QUERY !!!";
+        let mut syntax = Syntax::new_for_language_with_query(SyntaxLanguage::Rust, Some(bad_query));
+        let highlights = syntax.parse("fn main() { let x = 42; }");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        // Should fall back to built-in and have keywords
+        assert!(
+            kinds.contains("keyword"),
+            "fallback should capture keywords"
+        );
+    }
+
+    #[test]
+    fn test_override_map_lookup() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("rust".to_string(), "(line_comment) @comment".to_string());
+        let mut syntax =
+            Syntax::new_from_path_with_overrides(Some("test.rs"), Some(&overrides)).unwrap();
+        let highlights = syntax.parse("// hello\nfn main() {}");
+        let kinds: std::collections::HashSet<&str> =
+            highlights.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(kinds.contains("comment"));
+        assert!(!kinds.contains("keyword"));
     }
 }

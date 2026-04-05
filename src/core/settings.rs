@@ -171,6 +171,10 @@ pub struct Settings {
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
 
+    /// Per-window status lines instead of a single global status bar (default true).
+    #[serde(default = "default_window_status_line")]
+    pub window_status_line: bool,
+
     /// Automatically reload files when changed externally (default true).
     /// Vim: `autoread`.
     #[serde(default = "default_autoread")]
@@ -237,6 +241,9 @@ pub struct Settings {
     /// Show hidden files (dotfiles) in the file explorer (default: false).
     #[serde(default)]
     pub show_hidden_files: bool,
+    /// Sort explorer entries case-insensitively (default: true).
+    #[serde(default = "default_true")]
+    pub explorer_sort_case_insensitive: bool,
 
     // ── Swap files ────────────────────────────────────────────────────────────
     /// Enable swap file crash recovery (default: true).
@@ -323,6 +330,10 @@ fn default_incremental_search() -> bool {
     true // Default: enabled
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_auto_indent() -> bool {
     true // Default: enabled
 }
@@ -352,6 +363,10 @@ fn default_plugins_enabled() -> bool {
 }
 
 fn default_hlsearch() -> bool {
+    true
+}
+
+fn default_window_status_line() -> bool {
     true
 }
 
@@ -678,6 +693,7 @@ impl Default for Settings {
             smartcase: false,
             scrolloff: 0,
             cursorline: default_cursorline(),
+            window_status_line: default_window_status_line(),
             autoread: default_autoread(),
             splitbelow: false,
             splitright: false,
@@ -692,6 +708,7 @@ impl Default for Settings {
             ai_base_url: String::new(),
             ai_completions: false,
             show_hidden_files: false,
+            explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
             breadcrumbs: default_breadcrumbs(),
@@ -941,12 +958,14 @@ impl Settings {
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
             "cursorline" | "cul" => self.cursorline = enable,
+            "windowstatusline" | "wsl" => self.window_status_line = enable,
             "autoread" | "ar" => self.autoread = enable,
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
+            "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
             "swapfile" => self.swap_file = enable,
             "breadcrumbs" => self.breadcrumbs = enable,
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
@@ -1109,6 +1128,11 @@ impl Settings {
             } else {
                 "nocursorline".to_string()
             }),
+            "windowstatusline" | "wsl" => Ok(if self.window_status_line {
+                "windowstatusline".to_string()
+            } else {
+                "nowindowstatusline".to_string()
+            }),
             "splitbelow" | "sb" => Ok(if self.splitbelow {
                 "splitbelow".to_string()
             } else {
@@ -1130,6 +1154,11 @@ impl Settings {
                 "showhiddenfiles".to_string()
             } else {
                 "noshowhiddenfiles".to_string()
+            }),
+            "explorersortcaseinsensitive" | "esci" => Ok(if self.explorer_sort_case_insensitive {
+                "explorersortcaseinsensitive".to_string()
+            } else {
+                "noexplorersortcaseinsensitive".to_string()
             }),
             "swapfile" => Ok(if self.swap_file {
                 "swapfile".to_string()
@@ -1226,6 +1255,7 @@ impl Settings {
                 LineNumberMode::Hybrid => "hybrid".to_string(),
             },
             "cursorline" => self.cursorline.to_string(),
+            "window_status_line" => self.window_status_line.to_string(),
             "tabstop" => self.tabstop.to_string(),
             "shift_width" => self.shift_width.to_string(),
             "expand_tab" => self.expand_tab.to_string(),
@@ -1258,6 +1288,9 @@ impl Settings {
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
+            "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
+                self.explorer_sort_case_insensitive.to_string()
+            }
             "swapfile" | "swap_file" => self.swap_file.to_string(),
             "updatetime" | "ut" => self.updatetime.to_string(),
             "breadcrumbs" => self.breadcrumbs.to_string(),
@@ -1295,6 +1328,7 @@ impl Settings {
                 };
             }
             "cursorline" => self.cursorline = value == "true",
+            "window_status_line" => self.window_status_line = value == "true",
             "tabstop" => {
                 self.tabstop = value
                     .parse()
@@ -1354,6 +1388,9 @@ impl Settings {
             "ai_completions" => self.ai_completions = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
+            }
+            "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
+                self.explorer_sort_case_insensitive = value == "true"
             }
             "swapfile" | "swap_file" => self.swap_file = value == "true",
             "updatetime" | "ut" => {
@@ -1508,6 +1545,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "cursorline",
         label: "Cursor Line",
         description: "Highlight the line containing the cursor",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "window_status_line",
+        label: "Per-Window Status Line",
+        description: "Show a status line at the bottom of each window instead of a single global bar",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },

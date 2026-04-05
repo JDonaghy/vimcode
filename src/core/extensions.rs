@@ -66,6 +66,10 @@ pub struct ExtensionManifest {
     /// Optional comment style override for languages handled by this extension.
     #[serde(default)]
     pub comment: Option<CommentConfig>,
+    /// Tree-sitter highlight query (S-expression) for this language.
+    /// Overrides the built-in query in `syntax.rs` when present.
+    #[serde(default)]
+    pub highlights: Option<String>,
     /// User-configurable settings declared by this extension.
     #[serde(default)]
     pub settings: Vec<ExtSettingDef>,
@@ -113,12 +117,17 @@ pub struct LspConfig {
     /// Checked before starting the server; a helpful message is shown if missing.
     #[serde(default)]
     pub dependencies: Vec<String>,
-    /// Diagnostic sources whose errors should be excluded from explorer counts.
-    /// E.g. `["rust-analyzer"]` — its internal analysis produces false-positive
-    /// errors; real errors come from `"rustc"` (cargo check). Warnings from
-    /// these sources are still counted.
+    /// Diagnostic sources whose errors should be excluded from editor display
+    /// and explorer counts.  E.g. `["rust-analyzer"]` — its internal analysis
+    /// produces false-positive errors; real errors come from `"rustc"` (cargo
+    /// check).  Warnings from these sources are still shown.
     #[serde(default)]
     pub ignore_error_sources: Vec<String>,
+    /// JSON object merged into the LSP `initialize` request's
+    /// `initializationOptions`.  Allows per-server configuration (e.g.
+    /// `{"diagnostics": {"enable": false}}` for rust-analyzer).
+    #[serde(default)]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 impl LspConfig {

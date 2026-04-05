@@ -741,7 +741,56 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
 // ─── Unified Picker Types ────────────────────────────────────────────────────
 
 /// Identifies the data source backing a picker modal.
+/// Action triggered when a status bar segment is clicked.
 #[derive(Debug, Clone, PartialEq)]
+pub enum StatusAction {
+    GoToLine,
+    ChangeLanguage,
+    ChangeIndentation,
+    ChangeLineEnding,
+    ChangeEncoding,
+    SwitchBranch,
+    LspInfo,
+    ToggleSidebar,
+    TogglePanel,
+    ToggleMenuBar,
+    /// Dismiss all completed notifications (click on bell icon).
+    DismissNotifications,
+}
+
+// ─── Notification System ────────────────────────────────────────────────────
+
+/// Kind of background operation being tracked by a notification.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum NotificationKind {
+    LspInstall,
+    LspIndexing,
+    ExtensionInstall,
+    GitOperation,
+    ProjectSearch,
+    ProjectReplace,
+}
+
+/// A single notification tracking a background operation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Notification {
+    /// Unique ID for this notification.
+    pub id: u64,
+    /// Kind of operation (for dedup/grouping).
+    pub kind: NotificationKind,
+    /// Short message displayed in the status bar (e.g. "Installing rust-analyzer…").
+    pub message: String,
+    /// `true` once the operation is done (switches from spinner to bell).
+    pub done: bool,
+    /// When the notification was created.
+    pub created_at: std::time::Instant,
+    /// When the notification was marked done (for auto-dismiss after a delay).
+    pub done_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PickerSource {
     Files,
@@ -755,6 +804,12 @@ pub enum PickerSource {
     GitBranches,
     /// Command Center: dynamic prefix routing (>, @, #, :, ?).
     CommandCenter,
+    /// Language/filetype picker (click on language segment in status bar).
+    Languages,
+    /// Indentation picker (click on indent segment in status bar).
+    Indentation,
+    /// Line ending picker (LF / CRLF).
+    LineEndings,
     Custom(String),
 }
 
@@ -812,6 +867,12 @@ pub enum PickerAction {
     GotoLine(usize),
     /// Jump to a symbol location (file, line, col).
     GotoSymbol(PathBuf, usize, usize),
+    /// Set language/filetype for the active buffer.
+    SetLanguage(String),
+    /// Set indentation: (expand_tab, tabstop/shift_width).
+    SetIndentation(bool, u8),
+    /// Set line ending format: true = CRLF, false = LF.
+    SetLineEnding(bool),
     Custom(String),
 }
 
@@ -957,6 +1018,7 @@ pub enum ContextMenuTarget {
     ExplorerFile { path: PathBuf },
     ExplorerDir { path: PathBuf },
     Editor,
+    EditorActionMenu { group_id: GroupId },
     ExtPanel { panel_name: String, item_id: String },
 }
 
@@ -1140,6 +1202,9 @@ pub struct ExplorerRenameState {
     pub input: String,
     /// Byte-offset cursor position within `input`.
     pub cursor: usize,
+    /// Byte-offset selection anchor (if different from cursor, text between
+    /// `selection_anchor` and `cursor` is selected).  `None` = no selection.
+    pub selection_anchor: Option<usize>,
 }
 
 /// State for inline new-file/folder creation in the explorer sidebar.
@@ -2078,6 +2143,8 @@ pub struct Engine {
     /// Runtime overrides for comment styles, keyed by LSP language ID.
     /// Populated from extension manifests and `vimcode.set_comment_style()` Lua API.
     pub comment_overrides: HashMap<String, comment::CommentStyleOwned>,
+    /// Highlight query overrides from extension manifests, keyed by LSP language ID.
+    pub highlight_overrides: HashMap<String, String>,
 
     // --- Fuzzy file finder ---
     /// Project root directory for the fuzzy finder.
@@ -2131,6 +2198,12 @@ pub struct Engine {
     pub picker_title: String,
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
+    /// Per-source search history (session-scoped, not persisted).
+    pub picker_history: std::collections::HashMap<PickerSource, Vec<String>>,
+    /// Current position in history when navigating (None = not browsing history).
+    pub picker_history_index: Option<usize>,
+    /// Saves the user's in-progress query when they start browsing history.
+    pub picker_history_typing_buffer: String,
 
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
@@ -2189,6 +2262,8 @@ pub struct Engine {
     // --- Menu bar / debug toolbar ---
     /// Whether the VSCode-style menu bar strip is visible.
     pub menu_bar_visible: bool,
+    /// Whether the menu bar can be fully hidden (true in TUI, false in GTK where it's the title bar).
+    pub menu_bar_toggleable: bool,
     /// Index of the currently open top-level menu dropdown (None = bar visible but no dropdown).
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
@@ -2554,6 +2629,12 @@ pub struct Engine {
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
 
+    // --- Notifications (background operation progress) ---
+    /// Active notifications (spinner/bell indicators in status bar).
+    pub notifications: Vec<Notification>,
+    /// Counter for generating unique notification IDs.
+    next_notification_id: u64,
+
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
     pub editor_hover: Option<EditorHoverPopup>,
@@ -2769,6 +2850,7 @@ impl Engine {
             sc_help_open: false,
             plugin_manager: None,
             comment_overrides: HashMap::new(),
+            highlight_overrides: HashMap::new(),
             cwd,
             tab_switcher_open: false,
             tab_switcher_selected: 0,
@@ -2790,6 +2872,9 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            picker_history: std::collections::HashMap::new(),
+            picker_history_index: None,
+            picker_history_typing_buffer: String::new(),
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
@@ -2820,6 +2905,7 @@ impl Engine {
             terminal_split: false,
             terminal_split_left_cols: 0,
             menu_bar_visible: false,
+            menu_bar_toggleable: false,
             menu_open_idx: None,
             debug_toolbar_visible: false,
             dap_session_active: false,
@@ -2944,6 +3030,8 @@ impl Engine {
             ext_panel_focus_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            notifications: Vec::new(),
+            next_notification_id: 1,
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -3016,6 +3104,84 @@ impl Engine {
 
         engine.plugin_init();
         engine
+    }
+
+    // ── Notification helpers ─────────────────────────────────────────────────
+
+    /// Push a new in-progress notification. Returns the notification ID.
+    pub fn notify(&mut self, kind: NotificationKind, message: &str) -> u64 {
+        let id = self.next_notification_id;
+        self.next_notification_id += 1;
+        self.notifications.push(Notification {
+            id,
+            kind,
+            message: message.to_string(),
+            done: false,
+            created_at: std::time::Instant::now(),
+            done_at: None,
+        });
+        id
+    }
+
+    /// Mark a notification as done (switches from spinner to bell).
+    /// If `new_message` is `Some`, updates the display text.
+    #[allow(dead_code)]
+    pub fn notify_done(&mut self, id: u64, new_message: Option<&str>) {
+        if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
+            n.done = true;
+            n.done_at = Some(std::time::Instant::now());
+            if let Some(msg) = new_message {
+                n.message = msg.to_string();
+            }
+        }
+    }
+
+    /// Mark a notification as done by kind (useful when the caller didn't store the ID).
+    pub fn notify_done_by_kind(&mut self, kind: &NotificationKind, new_message: Option<&str>) {
+        for n in &mut self.notifications {
+            if &n.kind == kind && !n.done {
+                n.done = true;
+                n.done_at = Some(std::time::Instant::now());
+                if let Some(msg) = new_message {
+                    n.message = msg.to_string();
+                }
+            }
+        }
+    }
+
+    /// Remove a specific notification by ID.
+    #[allow(dead_code)]
+    pub fn dismiss_notification(&mut self, id: u64) {
+        self.notifications.retain(|n| n.id != id);
+    }
+
+    /// Remove all completed notifications (bell icon click).
+    pub fn dismiss_done_notifications(&mut self) {
+        self.notifications.retain(|n| !n.done);
+    }
+
+    /// Auto-dismiss completed notifications after 5 seconds.
+    /// Call from the backend poll loop.
+    pub fn tick_notifications(&mut self) {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        self.notifications.retain(|n| {
+            if let Some(done_at) = n.done_at {
+                now.duration_since(done_at) < timeout
+            } else {
+                true // in-progress notifications never auto-dismiss
+            }
+        });
+    }
+
+    /// Returns true if there are any active (in-progress) notifications.
+    pub fn has_active_notifications(&self) -> bool {
+        self.notifications.iter().any(|n| !n.done)
+    }
+
+    /// Returns true if there are any completed notifications waiting to be dismissed.
+    pub fn has_done_notifications(&self) -> bool {
+        self.notifications.iter().any(|n| n.done)
     }
 }
 

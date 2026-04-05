@@ -45,27 +45,36 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
             command: "rust-analyzer".to_string(),
             args: vec![],
             languages: vec!["rust".to_string()],
+            ..Default::default()
         },
         // Python — ordered fallbacks (first binary found on PATH/Mason wins)
         LspServerConfig {
             command: "pyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "basedpyright-langserver".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "pylsp".to_string(),
             args: vec![],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "jedi-language-server".to_string(),
             args: vec![],
             languages: vec!["python".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "typescript-language-server".to_string(),
@@ -76,81 +85,113 @@ pub fn default_server_registry() -> Vec<LspServerConfig> {
                 "javascriptreact".to_string(),
                 "typescriptreact".to_string(),
             ],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "gopls".to_string(),
             args: vec![],
             languages: vec!["go".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "clangd".to_string(),
             args: vec![],
             languages: vec!["c".to_string(), "cpp".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "csharp-ls".to_string(),
             args: vec![],
             languages: vec!["csharp".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "lua-language-server".to_string(),
             args: vec![],
             languages: vec!["lua".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "bash-language-server".to_string(),
             args: vec!["start".to_string()],
             languages: vec!["shellscript".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "yaml-language-server".to_string(),
             args: vec!["--stdio".to_string()],
             languages: vec!["yaml".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "kotlin-language-server".to_string(),
             args: vec![],
             languages: vec!["kotlin".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "zls".to_string(),
             args: vec![],
             languages: vec!["zig".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "elixir-ls".to_string(),
             args: vec![],
             languages: vec!["elixir".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "ruby-lsp".to_string(),
             args: vec![],
             languages: vec!["ruby".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "terraform-ls".to_string(),
             args: vec!["serve".to_string()],
             languages: vec!["terraform".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "marksman".to_string(),
             args: vec!["server".to_string()],
             languages: vec!["markdown".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "taplo".to_string(),
             args: vec!["lsp".to_string(), "stdio".to_string()],
             languages: vec!["toml".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "sourcekit-lsp".to_string(),
             args: vec![],
             languages: vec!["swift".to_string()],
+
+            ..Default::default()
         },
         LspServerConfig {
             command: "metals".to_string(),
             args: vec![],
             languages: vec!["scala".to_string()],
+
+            ..Default::default()
         },
     ]
 }
@@ -173,17 +214,20 @@ fn server_configs_from_manifest(
     } else {
         manifest.language_ids.clone()
     };
+    let init_opts = manifest.lsp.initialization_options.clone();
     let mut configs = Vec::new();
     configs.push(LspServerConfig {
         command: manifest.lsp.binary.clone(),
         args: args.clone(),
         languages: languages.clone(),
+        initialization_options: init_opts.clone(),
     });
     for fb in &manifest.lsp.fallback_binaries {
         configs.push(LspServerConfig {
             command: fb.clone(),
             args: args.clone(),
             languages: languages.clone(),
+            initialization_options: init_opts.clone(),
         });
     }
     configs
@@ -300,6 +344,9 @@ pub struct LspManager {
     /// covered by an extension, so we don't fall back to the built-in registry for languages
     /// that have a (not-yet-installed) extension.
     all_ext_manifests: Vec<extensions::ExtensionManifest>,
+    /// Servers that have returned at least one non-empty response (symbols, hover, etc.).
+    /// This indicates the server has finished indexing and is truly "ready".
+    server_has_responded: HashMap<LspServerId, bool>,
     /// Servers that crashed or exited (for display in :LspInfo).
     crashed_servers: Vec<String>,
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
@@ -307,7 +354,62 @@ pub struct LspManager {
     pub last_start_error: Option<String>,
 }
 
+/// LSP server status for a given language (used by status bar indicator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspStatus {
+    /// No LSP server configured or applicable for this language.
+    None,
+    /// Server binary is being installed.
+    Installing,
+    /// Server is spawned but hasn't completed initialization handshake.
+    Initializing(String),
+    /// Server is running and ready. Contains the server command name.
+    Running(String),
+    /// Server crashed or exited unexpectedly.
+    Crashed,
+}
+
 impl LspManager {
+    /// Mark a server as responsive (ready for requests).
+    pub fn mark_server_responded(&mut self, server_id: LspServerId) {
+        self.server_has_responded.insert(server_id, true);
+    }
+
+    /// Get the LSP status for a given language identifier.
+    pub fn lsp_status_for_language(&self, lang: &str) -> LspStatus {
+        // Check if a server exists for this language
+        if let Some(&server_id) = self.language_to_server.get(lang) {
+            let cmd = self
+                .servers
+                .get(server_id)
+                .map(|s| {
+                    let c = s.command();
+                    c.rsplit('/').next().unwrap_or(c).to_string()
+                })
+                .unwrap_or_default();
+            let handshake_done = self.initialized.get(&server_id).copied().unwrap_or(false);
+            let has_responded = self
+                .server_has_responded
+                .get(&server_id)
+                .copied()
+                .unwrap_or(false);
+            if handshake_done && has_responded {
+                LspStatus::Running(cmd)
+            } else {
+                // Still initializing (handshake pending) or indexing (no responses yet)
+                LspStatus::Initializing(cmd)
+            }
+        } else {
+            // Check if it crashed
+            let crashed = self.crashed_servers.iter().any(|s| s.contains(lang));
+            if crashed {
+                LspStatus::Crashed
+            } else {
+                LspStatus::None
+            }
+        }
+    }
+
     pub fn new(root_path: PathBuf, user_servers: &[LspServerConfig]) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
 
@@ -336,6 +438,7 @@ impl LspManager {
             semantic_legends: HashMap::new(),
             ext_manifests: Vec::new(),
             all_ext_manifests: Vec::new(),
+            server_has_responded: HashMap::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
         }

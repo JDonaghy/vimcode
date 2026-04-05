@@ -437,6 +437,30 @@ pub struct EditorGroupSplitData {
     pub num_groups: usize,
 }
 
+// ─── Per-window status line ──────────────────────────────────────────────────
+
+// Re-export from core for use by backends.
+pub use crate::core::engine::StatusAction;
+
+/// A styled segment of a per-window status line (e.g. mode badge, filename, cursor position).
+#[derive(Debug, Clone)]
+pub struct StatusSegment {
+    pub text: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    /// Action triggered when this segment is clicked, or `None` for non-interactive segments.
+    pub action: Option<StatusAction>,
+}
+
+/// Per-window status line data (Vim-style). Active windows get a rich,
+/// colorful bar; inactive windows get a dimmed minimal bar.
+#[derive(Debug, Clone)]
+pub struct WindowStatusLine {
+    pub left_segments: Vec<StatusSegment>,
+    pub right_segments: Vec<StatusSegment>,
+}
+
 // ─── RenderedWindow ───────────────────────────────────────────────────────────
 
 /// All data needed to render one editor window (pane).
@@ -492,6 +516,8 @@ pub struct RenderedWindow {
     pub tabstop: usize,
     /// Whether to draw cursorline highlight (from `settings.cursorline`).
     pub cursorline: bool,
+    /// Per-window status line (Vim-style), or `None` when the setting is off.
+    pub status_line: Option<WindowStatusLine>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -1243,7 +1269,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 label: "Toggle Terminal",
                 shortcut: "Ctrl+T",
                 vscode_shortcut: "",
-                action: "term",
+                action: "terminal",
                 enabled: true,
                 separator: false,
             },
@@ -1509,7 +1535,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
                 label: "New Terminal",
                 shortcut: "",
                 vscode_shortcut: "",
-                action: "term",
+                action: "terminal",
                 enabled: true,
                 separator: false,
             },
@@ -1548,30 +1574,32 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
 ];
 
 /// Static debug toolbar button definitions.
+/// Icons use the Unicode fallback glyphs (▶ ⏸ ⏹ ↻ etc.) which render
+/// correctly in both TUI (any font) and GTK (no Nerd Font subset needed).
 pub static DEBUG_BUTTONS: &[DebugButton] = &[
     DebugButton {
-        icon: icons::DBG_CONTINUE.nerd,
+        icon: icons::DBG_CONTINUE.fallback,
         label: "Continue",
         key_hint: "F5",
         action: "continue",
         enabled: true,
     },
     DebugButton {
-        icon: icons::DBG_PAUSE.nerd,
+        icon: icons::DBG_PAUSE.fallback,
         label: "Pause",
         key_hint: "F6",
         action: "pause",
         enabled: true,
     },
     DebugButton {
-        icon: icons::DBG_STOP.nerd,
+        icon: icons::DBG_STOP.fallback,
         label: "Stop",
         key_hint: "Shift+F5",
         action: "stop",
         enabled: true,
     },
     DebugButton {
-        icon: icons::DBG_RESTART.nerd,
+        icon: icons::DBG_RESTART.fallback,
         label: "Restart",
         key_hint: "Ctrl+Shift+F5",
         action: "restart",
@@ -1579,21 +1607,21 @@ pub static DEBUG_BUTTONS: &[DebugButton] = &[
     },
     // separator goes here (rendered between index 3 and 4)
     DebugButton {
-        icon: icons::DBG_STEP_OVER.nerd,
+        icon: icons::DBG_STEP_OVER.fallback,
         label: "Step Over",
         key_hint: "F10",
         action: "stepover",
         enabled: true,
     },
     DebugButton {
-        icon: icons::DBG_RESTART.nerd,
+        icon: icons::DBG_RESTART.fallback,
         label: "Step Into",
         key_hint: "F11",
         action: "stepin",
         enabled: true,
     },
     DebugButton {
-        icon: icons::DBG_STEP_OUT.nerd,
+        icon: icons::DBG_STEP_OUT.fallback,
         label: "Step Out",
         key_hint: "Shift+F11",
         action: "stepout",
@@ -1759,6 +1787,18 @@ pub struct Theme {
     pub type_name: Color,
     pub variable: Color,
     pub number: Color,
+    pub control_flow: Color,
+    pub operator: Color,
+    pub punctuation: Color,
+    pub macro_call: Color,
+    pub attribute: Color,
+    pub lifetime: Color,
+    pub constant: Color,
+    pub escape: Color,
+    pub boolean: Color,
+    pub property: Color,
+    pub parameter: Color,
+    pub module: Color,
     /// Fallback foreground for unrecognised scopes.
     pub default_fg: Color,
 
@@ -1798,6 +1838,14 @@ pub struct Theme {
     // Status line
     pub status_bg: Color,
     pub status_fg: Color,
+
+    // Per-window status line mode text tints
+    pub status_mode_normal_bg: Color,
+    pub status_mode_insert_bg: Color,
+    pub status_mode_visual_bg: Color,
+    pub status_mode_replace_bg: Color,
+    pub status_inactive_bg: Color,
+    pub status_inactive_fg: Color,
 
     // Wildmenu (command Tab completion bar)
     pub wildmenu_bg: Color,
@@ -1905,8 +1953,24 @@ pub struct Theme {
     // Explorer sidebar (TUI)
     /// Foreground for directory names in the file explorer.
     pub explorer_dir_fg: Color,
+    /// Foreground for file names in the file explorer (muted grey).
+    pub explorer_file_fg: Color,
     /// Background tint for rows whose file is open in a buffer.
     pub explorer_active_bg: Color,
+
+    // Scrollbar
+    /// Scrollbar thumb (draggable part).
+    pub scrollbar_thumb: Color,
+    /// Scrollbar track (gutter behind thumb).
+    pub scrollbar_track: Color,
+
+    // Integrated terminal
+    /// Default background for the integrated terminal pane.
+    pub terminal_bg: Color,
+
+    // Activity bar
+    /// Foreground for activity bar icons.
+    pub activity_bar_fg: Color,
 }
 
 impl Theme {
@@ -1923,12 +1987,24 @@ impl Theme {
             foreground: Color::from_hex("#e5e5e5"),
 
             keyword: Color::from_hex("#c678dd"),
+            control_flow: Color::from_hex("#c678dd"),
             string_lit: Color::from_hex("#98c379"),
             comment: Color::from_hex("#5c6370"),
             function: Color::from_hex("#61afef"),
             type_name: Color::from_hex("#e5c07b"),
             variable: Color::from_hex("#e06c75"),
             number: Color::from_hex("#d19a66"),
+            operator: Color::from_hex("#56b6c2"),
+            punctuation: Color::from_hex("#abb2bf"),
+            macro_call: Color::from_hex("#61afef"),
+            attribute: Color::from_hex("#e5c07b"),
+            lifetime: Color::from_hex("#e06c75"),
+            constant: Color::from_hex("#d19a66"),
+            escape: Color::from_hex("#56b6c2"),
+            boolean: Color::from_hex("#d19a66"),
+            property: Color::from_hex("#e06c75"),
+            parameter: Color::from_hex("#e06c75"),
+            module: Color::from_hex("#e5c07b"),
             default_fg: Color::from_hex("#abb2bf"),
 
             // (0.3, 0.5, 0.7) with alpha 0.3
@@ -1959,10 +2035,15 @@ impl Theme {
             tab_preview_inactive_fg: Color::from_hex("#7f7f7f"),
             tab_active_accent: Color::from_hex("#61afef"),
 
-            // (0.2, 0.2, 0.3)
             status_bg: Color::from_hex("#33334c"),
-            // (0.9, 0.9, 0.9)
             status_fg: Color::from_hex("#e5e5e5"),
+
+            status_mode_normal_bg: Color::from_hex("#61afef"),
+            status_mode_insert_bg: Color::from_hex("#98c379"),
+            status_mode_visual_bg: Color::from_hex("#c678dd"),
+            status_mode_replace_bg: Color::from_hex("#e06c75"),
+            status_inactive_bg: Color::from_hex("#262626"),
+            status_inactive_fg: Color::from_hex("#808080"),
 
             wildmenu_bg: Color::from_hex("#33334c"),
             wildmenu_fg: Color::from_hex("#abb2bf"),
@@ -2063,7 +2144,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
+            explorer_file_fg: Color::from_hex("#aab1be"), // muted grey (matches OneDark sidebar)
             explorer_active_bg: Color::from_hex("#333842"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#5a5a5a"),
+            scrollbar_track: Color::from_hex("#1a1a1a"),
+            terminal_bg: Color::from_hex("#1e1e1e"),
+            activity_bar_fg: Color::from_hex("#c8c8d2"),
         }
     }
 
@@ -2075,12 +2162,24 @@ impl Theme {
             foreground: Color::from_hex("#ebdbb2"),
 
             keyword: Color::from_hex("#fb4934"),
+            control_flow: Color::from_hex("#fb4934"),
             string_lit: Color::from_hex("#b8bb26"),
             comment: Color::from_hex("#928374"),
             function: Color::from_hex("#8ec07c"),
             type_name: Color::from_hex("#fabd2f"),
             variable: Color::from_hex("#83a598"),
             number: Color::from_hex("#d3869b"),
+            operator: Color::from_hex("#8ec07c"),
+            punctuation: Color::from_hex("#ebdbb2"),
+            macro_call: Color::from_hex("#8ec07c"),
+            attribute: Color::from_hex("#fabd2f"),
+            lifetime: Color::from_hex("#fb4934"),
+            constant: Color::from_hex("#d3869b"),
+            escape: Color::from_hex("#8ec07c"),
+            boolean: Color::from_hex("#d3869b"),
+            property: Color::from_hex("#83a598"),
+            parameter: Color::from_hex("#83a598"),
+            module: Color::from_hex("#fabd2f"),
             default_fg: Color::from_hex("#ebdbb2"),
 
             selection: Color::from_hex("#458588"),
@@ -2103,6 +2202,13 @@ impl Theme {
 
             status_bg: Color::from_hex("#504945"),
             status_fg: Color::from_hex("#ebdbb2"),
+
+            status_mode_normal_bg: Color::from_hex("#83a598"),
+            status_mode_insert_bg: Color::from_hex("#b8bb26"),
+            status_mode_visual_bg: Color::from_hex("#d3869b"),
+            status_mode_replace_bg: Color::from_hex("#fb4934"),
+            status_inactive_bg: Color::from_hex("#303030"),
+            status_inactive_fg: Color::from_hex("#808080"),
 
             wildmenu_bg: Color::from_hex("#504945"),
             wildmenu_fg: Color::from_hex("#ebdbb2"),
@@ -2186,7 +2292,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
+            explorer_file_fg: Color::from_hex("#bdae93"), // gruvbox muted
             explorer_active_bg: Color::from_hex("#45403d"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#665c54"),
+            scrollbar_track: Color::from_hex("#282828"),
+            terminal_bg: Color::from_hex("#282828"),
+            activity_bar_fg: Color::from_hex("#bdae93"),
         }
     }
 
@@ -2198,12 +2310,24 @@ impl Theme {
             foreground: Color::from_hex("#c0caf5"),
 
             keyword: Color::from_hex("#bb9af7"),
+            control_flow: Color::from_hex("#bb9af7"),
             string_lit: Color::from_hex("#9ece6a"),
             comment: Color::from_hex("#565f89"),
             function: Color::from_hex("#7aa2f7"),
             type_name: Color::from_hex("#e0af68"),
             variable: Color::from_hex("#f7768e"),
             number: Color::from_hex("#ff9e64"),
+            operator: Color::from_hex("#89ddff"),
+            punctuation: Color::from_hex("#a9b1d6"),
+            macro_call: Color::from_hex("#7aa2f7"),
+            attribute: Color::from_hex("#e0af68"),
+            lifetime: Color::from_hex("#f7768e"),
+            constant: Color::from_hex("#ff9e64"),
+            escape: Color::from_hex("#89ddff"),
+            boolean: Color::from_hex("#ff9e64"),
+            property: Color::from_hex("#73daca"),
+            parameter: Color::from_hex("#e0af68"),
+            module: Color::from_hex("#e0af68"),
             default_fg: Color::from_hex("#a9b1d6"),
 
             selection: Color::from_hex("#364a82"),
@@ -2226,6 +2350,13 @@ impl Theme {
 
             status_bg: Color::from_hex("#292e42"),
             status_fg: Color::from_hex("#c0caf5"),
+
+            status_mode_normal_bg: Color::from_hex("#7aa2f7"),
+            status_mode_insert_bg: Color::from_hex("#9ece6a"),
+            status_mode_visual_bg: Color::from_hex("#bb9af7"),
+            status_mode_replace_bg: Color::from_hex("#f7768e"),
+            status_inactive_bg: Color::from_hex("#262626"),
+            status_inactive_fg: Color::from_hex("#808080"),
 
             wildmenu_bg: Color::from_hex("#292e42"),
             wildmenu_fg: Color::from_hex("#c0caf5"),
@@ -2309,7 +2440,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
+            explorer_file_fg: Color::from_hex("#a9b1d6"), // tokyo muted
             explorer_active_bg: Color::from_hex("#2f3550"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#565f89"),
+            scrollbar_track: Color::from_hex("#1a1b26"),
+            terminal_bg: Color::from_hex("#1a1b26"),
+            activity_bar_fg: Color::from_hex("#a9b1d6"),
         }
     }
 
@@ -2321,12 +2458,24 @@ impl Theme {
             foreground: Color::from_hex("#839496"),
 
             keyword: Color::from_hex("#859900"),
+            control_flow: Color::from_hex("#859900"),
             string_lit: Color::from_hex("#2aa198"),
             comment: Color::from_hex("#586e75"),
             function: Color::from_hex("#268bd2"),
             type_name: Color::from_hex("#b58900"),
             variable: Color::from_hex("#dc322f"),
             number: Color::from_hex("#2aa198"),
+            operator: Color::from_hex("#859900"),
+            punctuation: Color::from_hex("#93a1a1"),
+            macro_call: Color::from_hex("#268bd2"),
+            attribute: Color::from_hex("#b58900"),
+            lifetime: Color::from_hex("#dc322f"),
+            constant: Color::from_hex("#2aa198"),
+            escape: Color::from_hex("#cb4b16"),
+            boolean: Color::from_hex("#2aa198"),
+            property: Color::from_hex("#268bd2"),
+            parameter: Color::from_hex("#93a1a1"),
+            module: Color::from_hex("#b58900"),
             default_fg: Color::from_hex("#93a1a1"),
 
             selection: Color::from_hex("#073642"),
@@ -2349,6 +2498,13 @@ impl Theme {
 
             status_bg: Color::from_hex("#073642"),
             status_fg: Color::from_hex("#93a1a1"),
+
+            status_mode_normal_bg: Color::from_hex("#268bd2"),
+            status_mode_insert_bg: Color::from_hex("#859900"),
+            status_mode_visual_bg: Color::from_hex("#6c71c4"),
+            status_mode_replace_bg: Color::from_hex("#dc322f"),
+            status_inactive_bg: Color::from_hex("#121212"),
+            status_inactive_fg: Color::from_hex("#6c6c6c"),
 
             wildmenu_bg: Color::from_hex("#073642"),
             wildmenu_fg: Color::from_hex("#93a1a1"),
@@ -2432,7 +2588,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
+            explorer_file_fg: Color::from_hex("#93a1a1"), // solarized base1
             explorer_active_bg: Color::from_hex("#0a4050"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#586e75"),
+            scrollbar_track: Color::from_hex("#002b36"),
+            terminal_bg: Color::from_hex("#002b36"),
+            activity_bar_fg: Color::from_hex("#93a1a1"),
         }
     }
 
@@ -2443,13 +2605,25 @@ impl Theme {
             active_background: Color::from_hex("#252526"),
             foreground: Color::from_hex("#d4d4d4"),
 
-            keyword: Color::from_hex("#569cd6"),    // blue
+            keyword: Color::from_hex("#569cd6"), // blue (storage: let, fn, struct)
+            control_flow: Color::from_hex("#c586c0"), // purple (if, else, for, return)
             string_lit: Color::from_hex("#ce9178"), // salmon
-            comment: Color::from_hex("#6a9955"),    // green
-            function: Color::from_hex("#dcdcaa"),   // yellow
-            type_name: Color::from_hex("#4ec9b0"),  // teal
-            variable: Color::from_hex("#9cdcfe"),   // light blue
-            number: Color::from_hex("#b5cea8"),     // light green
+            comment: Color::from_hex("#6a9955"), // green
+            function: Color::from_hex("#dcdcaa"), // yellow
+            type_name: Color::from_hex("#4ec9b0"), // teal
+            variable: Color::from_hex("#9cdcfe"), // light blue
+            number: Color::from_hex("#b5cea8"),  // light green
+            operator: Color::from_hex("#d4d4d4"),
+            punctuation: Color::from_hex("#d4d4d4"),
+            macro_call: Color::from_hex("#dcdcaa"),
+            attribute: Color::from_hex("#4ec9b0"),
+            lifetime: Color::from_hex("#569cd6"),
+            constant: Color::from_hex("#4fc1ff"),
+            escape: Color::from_hex("#d7ba7d"),
+            boolean: Color::from_hex("#569cd6"),
+            property: Color::from_hex("#9cdcfe"),
+            parameter: Color::from_hex("#9cdcfe"),
+            module: Color::from_hex("#4ec9b0"),
             default_fg: Color::from_hex("#d4d4d4"),
 
             selection: Color::from_hex("#264f78"),
@@ -2472,6 +2646,13 @@ impl Theme {
 
             status_bg: Color::from_hex("#007acc"),
             status_fg: Color::from_hex("#ffffff"),
+
+            status_mode_normal_bg: Color::from_hex("#007acc"),
+            status_mode_insert_bg: Color::from_hex("#16825d"),
+            status_mode_visual_bg: Color::from_hex("#68217a"),
+            status_mode_replace_bg: Color::from_hex("#c72e0f"),
+            status_inactive_bg: Color::from_hex("#262626"),
+            status_inactive_fg: Color::from_hex("#808080"),
 
             wildmenu_bg: Color::from_hex("#252526"),
             wildmenu_fg: Color::from_hex("#d4d4d4"),
@@ -2555,7 +2736,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
+            explorer_file_fg: Color::from_hex("#bbbbbb"), // VSCode default sidebar fg
             explorer_active_bg: Color::from_hex("#2a2d3e"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#5a5a5a"),
+            scrollbar_track: Color::from_hex("#1e1e1e"),
+            terminal_bg: Color::from_hex("#1e1e1e"),
+            activity_bar_fg: Color::from_hex("#c8c8d2"),
         }
     }
 
@@ -2566,13 +2753,25 @@ impl Theme {
             active_background: Color::from_hex("#f3f3f3"),
             foreground: Color::from_hex("#333333"),
 
-            keyword: Color::from_hex("#0000ff"),    // blue
+            keyword: Color::from_hex("#0000ff"), // blue (storage)
+            control_flow: Color::from_hex("#af00db"), // purple (if, else, for, return)
             string_lit: Color::from_hex("#a31515"), // red
-            comment: Color::from_hex("#008000"),    // green
-            function: Color::from_hex("#795e26"),   // brown
-            type_name: Color::from_hex("#267f99"),  // teal
-            variable: Color::from_hex("#001080"),   // dark blue
-            number: Color::from_hex("#098658"),     // green
+            comment: Color::from_hex("#008000"), // green
+            function: Color::from_hex("#795e26"), // brown
+            type_name: Color::from_hex("#267f99"), // teal
+            variable: Color::from_hex("#001080"), // dark blue
+            number: Color::from_hex("#098658"),  // green
+            operator: Color::from_hex("#333333"),
+            punctuation: Color::from_hex("#333333"),
+            macro_call: Color::from_hex("#795e26"),
+            attribute: Color::from_hex("#267f99"),
+            lifetime: Color::from_hex("#0000ff"),
+            constant: Color::from_hex("#0070c1"),
+            escape: Color::from_hex("#ee0000"),
+            boolean: Color::from_hex("#0000ff"),
+            property: Color::from_hex("#001080"),
+            parameter: Color::from_hex("#001080"),
+            module: Color::from_hex("#267f99"),
             default_fg: Color::from_hex("#333333"),
 
             selection: Color::from_hex("#add6ff"),
@@ -2595,6 +2794,13 @@ impl Theme {
 
             status_bg: Color::from_hex("#007acc"),
             status_fg: Color::from_hex("#ffffff"),
+
+            status_mode_normal_bg: Color::from_hex("#007acc"),
+            status_mode_insert_bg: Color::from_hex("#16825d"),
+            status_mode_visual_bg: Color::from_hex("#68217a"),
+            status_mode_replace_bg: Color::from_hex("#c72e0f"),
+            status_inactive_bg: Color::from_hex("#e0e0e0"),
+            status_inactive_fg: Color::from_hex("#666666"),
 
             wildmenu_bg: Color::from_hex("#f3f3f3"),
             wildmenu_fg: Color::from_hex("#333333"),
@@ -2677,7 +2883,13 @@ impl Theme {
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
+            explorer_file_fg: Color::from_hex("#3b3b3b"), // VSCode light sidebar fg
             explorer_active_bg: Color::from_hex("#dce5f0"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#b0b0b0"),
+            scrollbar_track: Color::from_hex("#f3f3f3"),
+            terminal_bg: Color::from_hex("#ffffff"),
+            activity_bar_fg: Color::from_hex("#646e6e"),
         }
     }
 
@@ -2880,6 +3092,22 @@ impl Theme {
             theme.sidebar_sel_bg_inactive = c;
             theme.explorer_active_bg = c;
         }
+        if let Some(c) = color("sideBar.foreground") {
+            theme.explorer_file_fg = c;
+        }
+
+        // ── Scrollbar / terminal / activity bar ─────────────────────────
+        if let Some(c) = color("scrollbarSlider.background") {
+            theme.scrollbar_thumb = c;
+            // VSCode doesn't have a separate track colour; derive from background
+            theme.scrollbar_track = theme.background;
+        }
+        if let Some(c) = color("terminal.background") {
+            theme.terminal_bg = c;
+        }
+        if let Some(c) = color("activityBar.foreground") {
+            theme.activity_bar_fg = c;
+        }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────
         if let Some(c) = color("breadcrumb.background") {
@@ -2979,9 +3207,16 @@ impl Theme {
                 };
                 for scope in &scopes {
                     match *scope {
-                        "keyword" | "keyword.control" | "keyword.operator" | "storage"
-                        | "storage.type" | "storage.modifier" => {
+                        "keyword" | "storage" | "storage.type" | "storage.modifier" => {
                             theme.keyword = fg;
+                        }
+                        "keyword.control"
+                        | "keyword.control.flow"
+                        | "keyword.control.conditional"
+                        | "keyword.control.loop"
+                        | "keyword.control.trycatch"
+                        | "keyword.control.import" => {
+                            theme.control_flow = fg;
                         }
                         "string"
                         | "string.quoted"
@@ -3028,6 +3263,34 @@ impl Theme {
                         }
                         "entity.name.function.macro" | "support.function.macro" => {
                             theme.semantic_macro = fg;
+                            theme.macro_call = fg;
+                        }
+                        "keyword.operator"
+                        | "keyword.operator.expression"
+                        | "keyword.operator.logical" => {
+                            theme.operator = fg;
+                        }
+                        "punctuation"
+                        | "punctuation.definition"
+                        | "punctuation.bracket"
+                        | "punctuation.separator" => {
+                            theme.punctuation = fg;
+                        }
+                        "entity.other.attribute-name" | "meta.attribute" => {
+                            theme.attribute = fg;
+                        }
+                        "storage.modifier.lifetime" | "punctuation.definition.lifetime" => {
+                            theme.lifetime = fg;
+                        }
+                        "constant" | "constant.language" | "constant.other" => {
+                            theme.constant = fg;
+                            theme.boolean = fg;
+                        }
+                        "constant.character.escape" => {
+                            theme.escape = fg;
+                        }
+                        "entity.name.namespace" | "entity.name.module" => {
+                            theme.module = fg;
                         }
                         _ => {}
                     }
@@ -3053,13 +3316,28 @@ impl Theme {
     /// Return the foreground colour for a Tree-sitter scope name.
     pub fn scope_color(&self, scope: &str) -> Color {
         match scope {
-            "keyword" | "operator" => self.keyword,
+            "keyword" => self.keyword,
+            "keyword.control" => self.control_flow,
+            "operator" => self.operator,
             "string" => self.string_lit,
             "comment" => self.comment,
-            "function" | "method" => self.function,
-            "type" | "class" | "struct" => self.type_name,
+            "function" | "function.call" | "method" | "method.call" => self.function,
+            "type" | "class" | "struct" | "enum" | "interface" => self.type_name,
             "variable" => self.variable,
             "number" => self.number,
+            "boolean" => self.boolean,
+            "constant" => self.constant,
+            "punctuation"
+            | "punctuation.bracket"
+            | "punctuation.delimiter"
+            | "punctuation.special" => self.punctuation,
+            "macro" | "macro_call" => self.macro_call,
+            "attribute" => self.attribute,
+            "lifetime" => self.lifetime,
+            "escape" => self.escape,
+            "module" | "namespace" => self.module,
+            "parameter" => self.parameter,
+            "property" | "field" => self.property,
             _ => self.default_fg,
         }
     }
@@ -3077,14 +3355,25 @@ impl Theme {
             "decorator" => self.semantic_decorator,
             "macro" => self.semantic_macro,
             // Reuse existing syntax colors for standard token types
-            "keyword" | "modifier" => self.keyword,
+            "keyword" | "modifier" => {
+                // rust-analyzer sends "controlFlow" modifier for if/else/for/while/return etc.
+                if modifiers.iter().any(|m| m == "controlFlow") {
+                    self.control_flow
+                } else {
+                    self.keyword
+                }
+            }
             "function" | "method" => self.function,
             "type" | "class" | "struct" | "enum" => self.type_name,
             "variable" => self.variable,
             "string" | "regexp" => self.string_lit,
             "comment" => self.comment,
             "number" => self.number,
-            "operator" => self.keyword,
+            "operator" => self.operator,
+            "boolean" => self.boolean,
+            "lifetime" => self.lifetime,
+            "attribute" | "attributeBracket" => self.attribute,
+            "builtinType" => self.type_name,
             _ => return None,
         };
         let bold = modifiers
@@ -3130,12 +3419,17 @@ pub fn build_screen_layout(
 
     let tab_bar = build_tab_bar(engine);
 
+    let per_window_status = engine.settings.window_status_line;
+
     let windows = window_rects
         .iter()
         .map(|(window_id, rect)| {
-            let visible_lines = (rect.height / line_height).floor() as usize;
+            let mut visible_lines = (rect.height / line_height).floor() as usize;
+            if per_window_status && visible_lines > 1 {
+                visible_lines -= 1; // reserve bottom row for per-window status bar
+            }
             let is_active = *window_id == active_window_id;
-            build_rendered_window(
+            let mut rw = build_rendered_window(
                 engine,
                 theme,
                 *window_id,
@@ -3145,11 +3439,21 @@ pub fn build_screen_layout(
                 is_active,
                 multi_window,
                 color_headings,
-            )
+            );
+            if per_window_status {
+                rw.status_line = Some(build_window_status_line(
+                    engine, theme, *window_id, is_active,
+                ));
+            }
+            rw
         })
         .collect();
 
-    let (status_left, status_right, status_branch_range) = build_status_line(engine);
+    let (status_left, status_right, status_branch_range) = if per_window_status {
+        (String::new(), String::new(), None)
+    } else {
+        build_status_line(engine)
+    };
     let command = build_command_line(engine);
 
     let wildmenu = if engine.wildmenu_items.is_empty() {
@@ -4612,6 +4916,7 @@ fn build_rendered_window(
         active_indent_col: None,
         tabstop: engine.settings.tabstop.max(1) as usize,
         cursorline: engine.settings.cursorline,
+        status_line: None,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -5458,6 +5763,7 @@ fn build_rendered_window(
             }
         },
         cursorline: engine.settings.cursorline,
+        status_line: None,
     }
 }
 
@@ -6211,6 +6517,335 @@ fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>
     (left, right, branch_range)
 }
 
+/// Build a per-window status line for a given window.
+/// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
+pub fn build_window_status_line(
+    engine: &Engine,
+    theme: &Theme,
+    window_id: WindowId,
+    is_active: bool,
+) -> WindowStatusLine {
+    let window = engine.windows.get(&window_id);
+    let buffer_state = window.and_then(|w| engine.buffer_manager.get(w.buffer_id));
+    let view = window.map(|w| &w.view);
+
+    // Filename
+    let filename = buffer_state
+        .and_then(|s| s.file_path.as_ref())
+        .and_then(|p| p.file_name())
+        .map(|f| f.to_string_lossy().into_owned())
+        .or_else(|| buffer_state.and_then(|s| s.scratch_name.as_ref()).cloned())
+        .unwrap_or_else(|| "[No Name]".to_string());
+
+    let dirty = buffer_state.is_some_and(|s| s.dirty);
+    let cursor = view.map(|v| &v.cursor);
+    // Filetype from path
+    let filetype = buffer_state
+        .and_then(|s| s.file_path.as_ref())
+        .and_then(|p| crate::core::lsp::language_id_from_path(p))
+        .unwrap_or_default();
+
+    // Derive per-window status bar colors from the editor background.
+    // Active: bg shifted ~10% from editor bg (lighter on dark themes, darker on light).
+    // Inactive: uses theme's status_inactive_bg/fg.
+    let lum = 0.299 * theme.background.r as f64
+        + 0.587 * theme.background.g as f64
+        + 0.114 * theme.background.b as f64;
+    let bar_bg = if lum < 128.0 {
+        theme.background.lighten(0.10)
+    } else {
+        theme.background.darken(0.10)
+    };
+    let bar_fg = theme.foreground;
+
+    // Mode text color — use the mode badge color as a subtle text tint
+    let mode_color = match engine.mode {
+        Mode::Insert => theme.status_mode_insert_bg,
+        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => theme.status_mode_visual_bg,
+        Mode::Replace => theme.status_mode_replace_bg,
+        _ => bar_fg, // normal mode: just use regular fg
+    };
+
+    // Indentation display text
+    let indent_text = if engine.settings.expand_tab {
+        format!("Spaces: {} ", engine.settings.tabstop)
+    } else {
+        format!("Tab Size: {} ", engine.settings.tabstop)
+    };
+
+    // Line ending display
+    let line_ending_str = buffer_state.map(|s| s.line_ending.as_str()).unwrap_or("LF");
+
+    if is_active {
+        // ── Active: MODE filename [+] branch | filetype indent encoding eol Ln:Col ──
+        let mode_str = engine.mode_str();
+
+        let mut left = vec![
+            StatusSegment {
+                text: format!(" {} ", mode_str),
+                fg: mode_color,
+                bg: bar_bg,
+                bold: true,
+                action: None,
+            },
+            StatusSegment {
+                text: format!(" {}", filename),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: true,
+                action: None,
+            },
+        ];
+
+        if dirty {
+            left.push(StatusSegment {
+                text: " [+]".to_string(),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: None,
+            });
+        }
+
+        // Recording indicator
+        if let Some(reg) = engine.macro_recording {
+            left.push(StatusSegment {
+                text: format!(" [rec @{}]", reg),
+                fg: theme.status_mode_replace_bg,
+                bg: bar_bg,
+                bold: true,
+                action: None,
+            });
+        }
+
+        // Git branch
+        if let Some(b) = engine.git_branch.as_deref() {
+            let mut branch_text = b.to_string();
+            if engine.sc_ahead > 0 || engine.sc_behind > 0 {
+                let mut parts = Vec::new();
+                if engine.sc_ahead > 0 {
+                    parts.push(format!("↑{}", engine.sc_ahead));
+                }
+                if engine.sc_behind > 0 {
+                    parts.push(format!("↓{}", engine.sc_behind));
+                }
+                branch_text = format!("{} {}", branch_text, parts.join(" "));
+            }
+            left.push(StatusSegment {
+                text: format!("  {}", branch_text),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::SwitchBranch),
+            });
+        }
+
+        // LSP status segment — server_has_responded in LspManager already tracks
+        // whether the server is fully ready (responded to hover/definition/etc.).
+        let lsp_status = window
+            .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
+            .unwrap_or(crate::core::lsp_manager::LspStatus::None);
+
+        // Right side: LSP  filetype  indent  utf-8  LF/CRLF  Ln:Col
+        let mut right = Vec::new();
+        {
+            use crate::core::lsp_manager::LspStatus;
+            let (lsp_text, lsp_fg) = match &lsp_status {
+                LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
+                LspStatus::Initializing(name) => {
+                    let label = if name.is_empty() { "LSP" } else { name };
+                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
+                }
+                LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
+                LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
+                LspStatus::None => (None, bar_fg),
+            };
+            if let Some(text) = lsp_text {
+                right.push(StatusSegment {
+                    text,
+                    fg: lsp_fg,
+                    bg: bar_bg,
+                    bold: false,
+                    action: Some(StatusAction::LspInfo),
+                });
+            }
+        }
+        if !filetype.is_empty() {
+            right.push(StatusSegment {
+                text: format!("{} ", filetype),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::ChangeLanguage),
+            });
+        }
+        right.push(StatusSegment {
+            text: indent_text.clone(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeIndentation),
+        });
+        right.push(StatusSegment {
+            text: "utf-8 ".to_string(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeEncoding),
+        });
+        right.push(StatusSegment {
+            text: format!("{} ", line_ending_str),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeLineEnding),
+        });
+        if let Some(c) = cursor {
+            right.push(StatusSegment {
+                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::GoToLine),
+            });
+        }
+
+        // Notification indicator — spinner for in-progress, bell for done
+        if !engine.notifications.is_empty() {
+            let nf = crate::icons::nerd_fonts_enabled();
+            let has_active = engine.has_active_notifications();
+            let has_done = engine.has_done_notifications();
+            let (icon, fg_color) = if has_active {
+                // Spinner icon for in-progress operations
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let elapsed = engine
+                    .notifications
+                    .iter()
+                    .filter(|n| !n.done)
+                    .map(|n| n.created_at)
+                    .min()
+                    .map(|t| t.elapsed().as_millis() as usize / 100)
+                    .unwrap_or(0);
+                let frame = frames[elapsed % frames.len()];
+                (format!("{frame}"), theme.function) // use function color (blue-ish) for spinner
+            } else if has_done {
+                // Bell icon for completed notifications
+                let bell: &str = if nf { "󰂞" } else { "*" };
+                (bell.to_string(), theme.string_lit) // use string color (green-ish) for done
+            } else {
+                (String::new(), bar_fg)
+            };
+            if !icon.is_empty() {
+                // Show the most recent notification message (truncated)
+                let msg = engine
+                    .notifications
+                    .last()
+                    .map(|n| {
+                        if n.message.len() > 30 {
+                            format!("{}…", &n.message[..29])
+                        } else {
+                            n.message.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                let action = if has_done {
+                    Some(StatusAction::DismissNotifications)
+                } else {
+                    None
+                };
+                right.push(StatusSegment {
+                    text: format!(" {icon} {msg} "),
+                    fg: fg_color,
+                    bg: bar_bg,
+                    bold: false,
+                    action,
+                });
+            }
+        }
+
+        // Layout toggle buttons — dim when inactive, normal when active
+        let toggle_fg = |active: bool| {
+            if active {
+                bar_fg
+            } else {
+                theme.status_inactive_fg
+            }
+        };
+
+        let nf = crate::icons::nerd_fonts_enabled();
+
+        let sidebar_active = engine.session.explorer_visible;
+        right.push(StatusSegment {
+            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            fg: toggle_fg(sidebar_active),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ToggleSidebar),
+        });
+
+        let panel_active = engine.terminal_open || engine.bottom_panel_open;
+        right.push(StatusSegment {
+            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            fg: toggle_fg(panel_active),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::TogglePanel),
+        });
+
+        if engine.menu_bar_toggleable {
+            let menu_active = engine.menu_bar_visible;
+            right.push(StatusSegment {
+                text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
+                fg: toggle_fg(menu_active),
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::ToggleMenuBar),
+            });
+        }
+
+        WindowStatusLine {
+            left_segments: left,
+            right_segments: right,
+        }
+    } else {
+        // ── Inactive window: filename [+]  |  Ln:Col ──
+        let mut left = vec![StatusSegment {
+            text: format!(" {}", filename),
+            fg: theme.status_inactive_fg,
+            bg: theme.status_inactive_bg,
+            bold: false,
+            action: None,
+        }];
+
+        if dirty {
+            left.push(StatusSegment {
+                text: " [+]".to_string(),
+                fg: theme.status_inactive_fg,
+                bg: theme.status_inactive_bg,
+                bold: false,
+                action: None,
+            });
+        }
+
+        let right = if let Some(c) = cursor {
+            vec![StatusSegment {
+                text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
+                fg: theme.status_inactive_fg,
+                bg: theme.status_inactive_bg,
+                bold: false,
+                action: None,
+            }]
+        } else {
+            vec![]
+        };
+
+        WindowStatusLine {
+            left_segments: left,
+            right_segments: right,
+        }
+    }
+}
+
 fn build_command_line(engine: &Engine) -> CommandLineData {
     let (text, right_align, show_cursor, cursor_anchor_text) = match engine.mode {
         Mode::Command if engine.history_search_active => {
@@ -6459,5 +7094,291 @@ mod tests {
         );
         assert_eq!(first_line.spell_errors[0].start_col, 4);
         assert_eq!(first_line.spell_errors[0].end_col, 8);
+    }
+
+    // ── Per-window status line tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_window_status_line_active() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello world\nsecond line\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        // Active window should have a mode badge as the first left segment
+        assert!(!status.left_segments.is_empty());
+        assert!(
+            status.left_segments[0].text.contains("NORMAL"),
+            "expected NORMAL mode badge, got '{}'",
+            status.left_segments[0].text
+        );
+        assert!(status.left_segments[0].bold);
+
+        // Should have right segments with cursor position
+        assert!(!status.right_segments.is_empty());
+        let right_text: String = status
+            .right_segments
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+        assert!(
+            right_text.contains("Ln 1"),
+            "expected cursor position, got '{}'",
+            right_text
+        );
+    }
+
+    #[test]
+    fn test_window_status_line_inactive() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, false);
+
+        // Inactive should NOT have mode badge
+        assert!(!status.left_segments.is_empty());
+        assert!(
+            !status.left_segments[0].text.contains("NORMAL"),
+            "inactive status should not contain mode badge"
+        );
+        // All segments should use inactive colors
+        for seg in &status.left_segments {
+            assert_eq!(seg.fg, theme.status_inactive_fg);
+        }
+    }
+
+    #[test]
+    fn test_window_status_line_dirty_indicator() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "text\n");
+        engine
+            .buffer_manager
+            .get_mut(engine.active_buffer_id())
+            .unwrap()
+            .dirty = true;
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let left_text: String = status
+            .left_segments
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+        assert!(
+            left_text.contains("[+]"),
+            "expected dirty indicator, got '{}'",
+            left_text
+        );
+    }
+
+    #[test]
+    fn test_window_status_line_insert_mode() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.mode = crate::core::Mode::Insert;
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        assert!(status.left_segments[0].text.contains("INSERT"));
+        // Mode color used as text tint, not background
+        assert_eq!(status.left_segments[0].fg, theme.status_mode_insert_bg);
+        // Background is derived from theme.background.lighten(0.10)
+        assert_eq!(status.left_segments[0].bg, theme.background.lighten(0.10));
+    }
+
+    #[test]
+    fn test_build_screen_layout_per_window_status() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine
+            .buffer_mut()
+            .insert(0, "line 1\nline 2\nline 3\nline 4\nline 5\n");
+
+        let wid = engine.active_window_id();
+        let rects = vec![(wid, WindowRect::new(0.0, 0.0, 80.0, 24.0))];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        // Each window should have a status_line
+        assert!(layout.windows[0].status_line.is_some());
+
+        // visible_lines should be rect height - 1 (status bar takes 1 row)
+        assert_eq!(
+            layout.windows[0].lines.len(),
+            5, // only 5 lines of content, less than 23 visible lines
+            "lines should contain the buffer's actual lines"
+        );
+
+        // Global status bar should be empty
+        assert!(layout.status_left.is_empty());
+        assert!(layout.status_right.is_empty());
+    }
+
+    #[test]
+    fn test_build_screen_layout_no_per_window_status() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = false;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let wid = engine.active_window_id();
+        let rects = vec![(wid, WindowRect::new(0.0, 0.0, 80.0, 24.0))];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        // No per-window status line
+        assert!(layout.windows[0].status_line.is_none());
+
+        // Global status bar should be populated
+        assert!(!layout.status_left.is_empty());
+    }
+
+    #[test]
+    fn test_status_segments_have_actions() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        // Right segments should include GoToLine on cursor position
+        let goto = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::GoToLine));
+        assert!(goto.is_some(), "expected GoToLine action on Ln/Col segment");
+
+        // Right segments should include ChangeIndentation
+        let indent = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeIndentation));
+        assert!(
+            indent.is_some(),
+            "expected ChangeIndentation action on indent segment"
+        );
+
+        // Right segments should include ChangeEncoding
+        let enc = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeEncoding));
+        assert!(enc.is_some(), "expected ChangeEncoding action");
+
+        // Right segments should include ChangeLineEnding
+        let eol = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeLineEnding));
+        assert!(eol.is_some(), "expected ChangeLineEnding action");
+
+        // Inactive window segments should have no actions
+        let inactive = build_window_status_line(&engine, &theme, wid, false);
+        for seg in inactive
+            .left_segments
+            .iter()
+            .chain(inactive.right_segments.iter())
+        {
+            assert_eq!(seg.action, None, "inactive segments should have no actions");
+        }
+    }
+
+    #[test]
+    fn test_status_line_ending_segment() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        // Default is LF
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+        let eol_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeLineEnding))
+            .expect("expected line ending segment");
+        assert!(
+            eol_seg.text.contains("LF"),
+            "expected LF, got '{}'",
+            eol_seg.text
+        );
+    }
+
+    #[test]
+    fn test_status_indentation_segment() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.settings.expand_tab = true;
+        engine.settings.tabstop = 4;
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+        let indent_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeIndentation))
+            .expect("expected indent segment");
+        assert!(
+            indent_seg.text.contains("Spaces: 4"),
+            "expected 'Spaces: 4', got '{}'",
+            indent_seg.text
+        );
+    }
+
+    #[test]
+    fn test_line_ending_detection() {
+        use crate::core::buffer_manager::LineEnding;
+        assert_eq!(LineEnding::detect("hello\nworld\n"), LineEnding::LF);
+        assert_eq!(LineEnding::detect("hello\r\nworld\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("no newline"), LineEnding::LF);
+        assert_eq!(LineEnding::detect(""), LineEnding::LF);
+    }
+
+    #[test]
+    fn test_lsp_status_no_manager() {
+        use crate::core::engine::Engine;
+        // Engine::new() has no lsp_manager — LSP segment should not appear
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        // No LSP segment when no manager is running
+        let lsp_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::LspInfo));
+        assert!(
+            lsp_seg.is_none(),
+            "should not show LSP segment without lsp_manager"
+        );
     }
 }

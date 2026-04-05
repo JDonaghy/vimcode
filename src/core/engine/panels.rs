@@ -568,6 +568,29 @@ impl Engine {
         self.lsp_dirty_buffers.remove(&buffer_id);
     }
 
+    /// Re-filter all stored diagnostics using the current extension manifests'
+    /// `ignore_error_sources`. Called when the registry updates (the initial
+    /// cache may lack the field, so diagnostics stored before the fetch need
+    /// retroactive filtering).
+    pub(crate) fn refilter_diagnostics(&mut self) {
+        let ignored: HashSet<String> = self
+            .ext_available_manifests()
+            .iter()
+            .flat_map(|m| m.lsp.ignore_error_sources.clone())
+            .collect();
+        if ignored.is_empty() {
+            return;
+        }
+        for diagnostics in self.lsp_diagnostics.values_mut() {
+            diagnostics.retain(|d| {
+                if d.severity != DiagnosticSeverity::Error {
+                    return true;
+                }
+                !d.source.as_deref().is_some_and(|s| ignored.contains(s))
+            });
+        }
+    }
+
     /// Notify LSP that a file was closed.
     pub(crate) fn lsp_did_close(&mut self, buffer_id: BufferId) {
         let path = self
@@ -655,10 +678,26 @@ impl Engine {
             })
             .collect();
 
+        // Pre-compute ignored diagnostic error sources (once per poll batch).
+        // Extensions can declare sources whose error-severity diagnostics should
+        // be suppressed (e.g. "rust-analyzer" — its native type-check produces
+        // false positives; real errors come from "rustc" via cargo check).
+        let ignored_error_sources: HashSet<String> = self
+            .ext_available_manifests()
+            .iter()
+            .flat_map(|m| m.lsp.ignore_error_sources.clone())
+            .collect();
+
         let mut redraw = false;
         for event in events {
             match event {
-                LspEvent::Initialized(..) => {
+                LspEvent::Initialized(server_id, ..) => {
+                    // Mark server as responsive — initialization handshake is
+                    // sufficient proof for servers that don't support semantic
+                    // tokens (e.g. marksman).
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
+                    }
                     // Server is ready — re-open any already-open buffers
                     let buffers: Vec<(PathBuf, String)> = self
                         .buffer_manager
@@ -691,7 +730,25 @@ impl Engine {
                     if !redraw && visible_paths.contains(&path) {
                         redraw = true;
                     }
-                    self.lsp_diagnostics.insert(path, diagnostics);
+                    // Filter out error-severity diagnostics from ignored sources
+                    // (e.g. rust-analyzer native errors — real errors come from rustc).
+                    let filtered = if ignored_error_sources.is_empty() {
+                        diagnostics
+                    } else {
+                        diagnostics
+                            .into_iter()
+                            .filter(|d| {
+                                if d.severity != DiagnosticSeverity::Error {
+                                    return true; // keep non-errors from all sources
+                                }
+                                // Drop errors from ignored sources
+                                !d.source
+                                    .as_deref()
+                                    .is_some_and(|s| ignored_error_sources.contains(s))
+                            })
+                            .collect()
+                    };
+                    self.lsp_diagnostics.insert(path, filtered);
                 }
                 LspEvent::CompletionResponse {
                     request_id, items, ..
@@ -723,7 +780,14 @@ impl Engine {
                     }
                     // else: stale response (request already superseded) — ignore
                 }
-                LspEvent::DefinitionResponse { locations, .. } => {
+                LspEvent::DefinitionResponse {
+                    server_id,
+                    locations,
+                    ..
+                } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
+                    }
                     self.lsp_pending_definition = None;
                     self.message.clear();
                     if let Some(loc) = locations.first() {
@@ -750,7 +814,14 @@ impl Engine {
                         self.message = "No definition found".to_string();
                     }
                 }
-                LspEvent::HoverResponse { contents, .. } => {
+                LspEvent::HoverResponse {
+                    server_id,
+                    contents,
+                    ..
+                } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
+                    }
                     self.lsp_pending_hover = None;
                     // Treat empty/whitespace-only hover as "no hover".
                     let text = contents.filter(|t| !t.trim().is_empty());
@@ -829,6 +900,15 @@ impl Engine {
                     output,
                 } => {
                     self.lsp_installing.remove(&lang_id);
+                    // Mark any matching LSP install notification as done.
+                    self.notify_done_by_kind(
+                        &NotificationKind::LspInstall,
+                        if success {
+                            Some("Install complete")
+                        } else {
+                            Some("Install failed")
+                        },
+                    );
                     // preLaunchTask completion: resume debug session after build task.
                     if let Some(task_label) = lang_id.strip_prefix("dap_task:") {
                         // Append task output to Debug Output panel.
@@ -900,6 +980,7 @@ impl Engine {
                                     command: binary.clone(),
                                     args: manifest_args.clone(),
                                     languages: vec![lsp_lang.clone()],
+                                    ..Default::default()
                                 };
                                 if let Some(mgr) = &mut self.lsp_manager {
                                     mgr.add_registry_entry(config);

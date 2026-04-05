@@ -86,6 +86,8 @@ impl Engine {
         self.picker_items.clear();
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.picker_history_index = None;
+        self.picker_history_typing_buffer.clear();
 
         match source {
             PickerSource::Files => {
@@ -116,6 +118,18 @@ impl Engine {
             PickerSource::GitBranches => {
                 self.picker_title = "Switch Branch".to_string();
                 self.picker_populate_branches();
+            }
+            PickerSource::Languages => {
+                self.picker_title = "Select Language Mode".to_string();
+                self.picker_populate_languages();
+            }
+            PickerSource::Indentation => {
+                self.picker_title = "Select Indentation".to_string();
+                self.picker_populate_indentation();
+            }
+            PickerSource::LineEndings => {
+                self.picker_title = "Select Line Ending Sequence".to_string();
+                self.picker_populate_line_endings();
             }
             _ => {
                 self.picker_title = format!("{:?}", source);
@@ -553,6 +567,110 @@ impl Engine {
                     filter_text: b.name.clone(),
                     detail,
                     action: PickerAction::CheckoutBranch(b.name),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_languages(&mut self) {
+        let current = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .and_then(|s| s.lsp_language_id.as_deref())
+            .unwrap_or("");
+        self.picker_all_items = crate::core::lsp::all_known_language_ids()
+            .into_iter()
+            .map(|lang| {
+                let detail = if lang == current {
+                    Some("● current".to_string())
+                } else {
+                    None
+                };
+                PickerItem {
+                    display: lang.to_string(),
+                    filter_text: lang.to_string(),
+                    detail,
+                    action: PickerAction::SetLanguage(lang.to_string()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_indentation(&mut self) {
+        let et = self.settings.expand_tab;
+        let ts = self.settings.tabstop;
+        let items = [
+            ("Spaces: 2", true, 2u8),
+            ("Spaces: 4", true, 4),
+            ("Spaces: 8", true, 8),
+            ("Tabs (width 2)", false, 2),
+            ("Tabs (width 4)", false, 4),
+            ("Tabs (width 8)", false, 8),
+        ];
+        self.picker_all_items = items
+            .iter()
+            .map(|(label, expand, width)| {
+                let is_current = *expand == et && *width == ts;
+                PickerItem {
+                    display: label.to_string(),
+                    filter_text: label.to_string(),
+                    detail: if is_current {
+                        Some("● current".to_string())
+                    } else {
+                        None
+                    },
+                    action: PickerAction::SetIndentation(*expand, *width),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    fn picker_populate_line_endings(&mut self) {
+        use crate::core::buffer_manager::LineEnding;
+        let current = self
+            .buffer_manager
+            .get(self.active_buffer_id())
+            .map(|s| s.line_ending)
+            .unwrap_or(LineEnding::LF);
+        let items = [
+            ("LF", false),  // is_crlf = false
+            ("CRLF", true), // is_crlf = true
+        ];
+        self.picker_all_items = items
+            .iter()
+            .map(|(label, is_crlf)| {
+                let le = if *is_crlf {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::LF
+                };
+                PickerItem {
+                    display: label.to_string(),
+                    filter_text: label.to_string(),
+                    detail: if le == current {
+                        Some("● current".to_string())
+                    } else {
+                        None
+                    },
+                    action: PickerAction::SetLineEnding(*is_crlf),
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
@@ -1535,6 +1653,7 @@ impl Engine {
 
     /// Execute the currently selected picker item.
     pub fn picker_confirm(&mut self) -> EngineAction {
+        self.picker_push_history();
         let Some(item) = self.picker_items.get(self.picker_selected).cloned() else {
             self.close_picker();
             return EngineAction::None;
@@ -1651,6 +1770,47 @@ impl Engine {
             PickerAction::CheckoutBranch(branch) => {
                 self.execute_command(&format!("Gswitch {}", branch))
             }
+            PickerAction::SetLanguage(lang) => {
+                // Set the language ID on the active buffer and re-run syntax
+                let bid = self.active_buffer_id();
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    state.lsp_language_id = Some(lang.clone());
+                    // Update syntax parser for the new language
+                    state.syntax = crate::core::syntax::Syntax::new_from_language_id_with_overrides(
+                        &lang,
+                        Some(&self.highlight_overrides),
+                    );
+                    state.update_syntax();
+                }
+                self.message = format!("Language mode: {}", lang);
+                EngineAction::None
+            }
+            PickerAction::SetIndentation(expand, width) => {
+                self.settings.expand_tab = expand;
+                self.settings.tabstop = width;
+                self.settings.shift_width = width;
+                let _ = self.settings.save();
+                self.message = if expand {
+                    format!("Spaces: {}", width)
+                } else {
+                    format!("Tab Size: {}", width)
+                };
+                EngineAction::None
+            }
+            PickerAction::SetLineEnding(is_crlf) => {
+                use crate::core::buffer_manager::LineEnding;
+                let new = if is_crlf {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::LF
+                };
+                let bid = self.active_buffer_id();
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    state.set_line_ending(new);
+                }
+                self.message = format!("Line endings: {}", new.as_str());
+                EngineAction::None
+            }
             PickerAction::JumpToMark(_mark) => {
                 // Phase 3: mark jumping via picker
                 EngineAction::None
@@ -1755,6 +1915,31 @@ impl Engine {
         }
     }
 
+    /// Save the current picker query to per-source history (dedup consecutive).
+    fn picker_push_history(&mut self) {
+        let q = self.picker_query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let hist = self
+            .picker_history
+            .entry(self.picker_source.clone())
+            .or_default();
+        if hist.last().is_none_or(|last| *last != q) {
+            hist.push(q);
+            // Cap at 100 entries.
+            if hist.len() > 100 {
+                hist.remove(0);
+            }
+        }
+    }
+
+    /// Exit history browsing mode, resetting the index.
+    fn picker_exit_history(&mut self) {
+        self.picker_history_index = None;
+        self.picker_history_typing_buffer.clear();
+    }
+
     /// Route a key press when the unified picker is open.
     pub fn handle_picker_key(
         &mut self,
@@ -1810,16 +1995,63 @@ impl Engine {
                 EngineAction::None
             }
             "Down" | "Tab" => {
-                let max = self.picker_items.len().saturating_sub(1);
-                self.picker_selected = (self.picker_selected + 1).min(max);
-                self.picker_update_scroll();
-                self.picker_load_preview();
+                if self.picker_history_index.is_some() {
+                    // Navigate forward in history or exit history mode.
+                    let hist = self
+                        .picker_history
+                        .get(&self.picker_source)
+                        .cloned()
+                        .unwrap_or_default();
+                    let idx = self.picker_history_index.unwrap();
+                    if idx + 1 < hist.len() {
+                        self.picker_history_index = Some(idx + 1);
+                        self.picker_query = hist[idx + 1].clone();
+                    } else {
+                        // Past newest entry — restore the original typed query.
+                        self.picker_query = std::mem::take(&mut self.picker_history_typing_buffer);
+                        self.picker_history_index = None;
+                    }
+                    self.picker_selected = 0;
+                    self.picker_scroll_top = 0;
+                    self.picker_filter();
+                    self.picker_load_preview();
+                } else {
+                    let max = self.picker_items.len().saturating_sub(1);
+                    self.picker_selected = (self.picker_selected + 1).min(max);
+                    self.picker_update_scroll();
+                    self.picker_load_preview();
+                }
                 EngineAction::None
             }
             "Up" => {
-                self.picker_selected = self.picker_selected.saturating_sub(1);
-                self.picker_update_scroll();
-                self.picker_load_preview();
+                if self.picker_selected == 0 {
+                    // At top of results — enter or continue history browsing.
+                    let hist_len = self
+                        .picker_history
+                        .get(&self.picker_source)
+                        .map_or(0, |h| h.len());
+                    if hist_len > 0 {
+                        let hist = &self.picker_history[&self.picker_source];
+                        let new_idx = match self.picker_history_index {
+                            None => {
+                                // Enter history mode — save current query.
+                                self.picker_history_typing_buffer = self.picker_query.clone();
+                                hist_len - 1
+                            }
+                            Some(idx) => idx.saturating_sub(1),
+                        };
+                        self.picker_history_index = Some(new_idx);
+                        self.picker_query = hist[new_idx].clone();
+                        self.picker_selected = 0;
+                        self.picker_scroll_top = 0;
+                        self.picker_filter();
+                        self.picker_load_preview();
+                    }
+                } else {
+                    self.picker_selected = self.picker_selected.saturating_sub(1);
+                    self.picker_update_scroll();
+                    self.picker_load_preview();
+                }
                 EngineAction::None
             }
             "n" if ctrl => {
@@ -1845,6 +2077,7 @@ impl Engine {
                             self.picker_query.push(c);
                         }
                     }
+                    self.picker_exit_history();
                     self.picker_selected = 0;
                     self.picker_scroll_top = 0;
                     self.picker_filter();
@@ -1853,6 +2086,7 @@ impl Engine {
                 EngineAction::None
             }
             "BackSpace" => {
+                self.picker_exit_history();
                 self.picker_query.pop();
                 self.picker_selected = 0;
                 self.picker_scroll_top = 0;
@@ -1864,6 +2098,7 @@ impl Engine {
                 if !ctrl {
                     if let Some(c) = unicode {
                         if !c.is_control() {
+                            self.picker_exit_history();
                             self.picker_query.push(c);
                             self.picker_selected = 0;
                             self.picker_scroll_top = 0;

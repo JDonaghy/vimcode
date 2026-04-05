@@ -68,8 +68,15 @@ type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
 /// Only populated when split buttons are visible (active group in multi-group, or single-group mode).
 type SplitBtnMap = HashMap<usize, (f64, f64)>;
 
+/// Cached action menu button pixel range per group: group_id -> (start_x, end_x).
+type ActionBtnMap = HashMap<usize, (f64, f64)>;
+
 /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
 type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
+
+/// Cached per-window status segment hit zones: window_id -> Vec<(start_x, end_x, action)>.
+/// Populated by draw_window_status_bar, consumed by click hit-testing.
+type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
 
 /// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths, visible_tab_count).
 type TabBarDrawResult = (
@@ -77,6 +84,7 @@ type TabBarDrawResult = (
     Option<(f64, f64, f64, f64, f64, f64)>,
     Option<(f64, f64)>,
     usize,
+    Option<(f64, f64)>, // action menu button (start_x, end_x)
 );
 
 struct App {
@@ -176,6 +184,9 @@ struct App {
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
+    action_btn_map: Rc<RefCell<ActionBtnMap>>,
+    /// Cached per-window status bar segment hit zones from draw_window_status_bar.
+    status_segment_map: Rc<RefCell<StatusSegmentMap>>,
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
@@ -837,57 +848,6 @@ impl SimpleComponent for App {
                             #[watch]
                             set_visible: model.active_panel == SidebarPanel::Explorer,
 
-                        // Toolbar with file operation buttons
-                        #[name = "explorer_toolbar"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Horizontal,
-                            set_margin_all: 5,
-                            set_spacing: 5,
-                            set_css_classes: &["explorer-toolbar"],
-
-                            gtk4::Button {
-                                set_label: icons::FILE_GENERIC.nerd,
-                                set_tooltip_text: Some("New File"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    let parent_dir = selected_parent_dir(&file_tree_view);
-                                    sender.input(Msg::StartInlineNewFile(parent_dir));
-                                }
-                            },
-
-                            gtk4::Button {
-                                set_label: icons::FOLDER.nerd,
-                                set_tooltip_text: Some("New Folder"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    let parent_dir = selected_parent_dir(&file_tree_view);
-                                    sender.input(Msg::StartInlineNewFolder(parent_dir));
-                                }
-                            },
-
-                            gtk4::Button {
-                                set_label: icons::TRASH.nerd,
-                                set_tooltip_text: Some("Delete"),
-                                set_width_request: 32,
-                                set_height_request: 32,
-                                connect_clicked[sender, file_tree_view] => move |_| {
-                                    // Get selected row
-                                    if let Some(selection) = file_tree_view.selection().selected() {
-                                        let (model, iter) = selection;
-                                        // Column 2 contains the full path
-                                        let path_str: String = model.get_value(&iter, 2).get().unwrap_or_default();
-                                        if !path_str.is_empty() {
-                                            let path = PathBuf::from(path_str);
-                                            sender.input(Msg::ConfirmDeletePath(path));
-                                        }
-                                    }
-                                }
-                            },
-
-                        },
-
                         // Scrollable tree view
                         #[name = "file_tree_scroll"]
                         gtk4::ScrolledWindow {
@@ -928,9 +888,14 @@ impl SimpleComponent for App {
                                             sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
-                                        // Arrow keys + Enter: let TreeView handle natively
-                                        // (Enter fires row_activated which handles dirs+files)
-                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "KP_Enter" | "space") {
+                                        // Enter: use our handler that syncs cursor→selection first
+                                        // (native row_activated uses selection which lags behind arrow-key cursor)
+                                        if matches!(key_name.as_str(), "Return" | "KP_Enter") {
+                                            sender.input(Msg::ExplorerActivateSelected);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Arrow keys + space: let TreeView handle natively
+                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "space") {
                                             return gtk4::glib::Propagation::Proceed;
                                         }
 
@@ -1914,6 +1879,8 @@ impl SimpleComponent for App {
             let mut e = Engine::new();
             icons::set_nerd_fonts(e.settings.use_nerd_fonts);
             e.plugin_init();
+            // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
+            e.ext_refresh();
             if let Some(ref path) = file_path {
                 // CLI argument: open only the specified file/directory, skip session restore
                 if path.is_dir() {
@@ -2035,6 +2002,9 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(HashMap::new()));
         let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let status_segment_map_cell: Rc<RefCell<StatusSegmentMap>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let tab_visible_counts_cell: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>> =
             Rc::new(RefCell::new(Vec::new()));
         #[allow(clippy::type_complexity)]
@@ -2152,6 +2122,8 @@ impl SimpleComponent for App {
             tab_slot_positions: tab_slot_positions_cell.clone(),
             diff_btn_map: diff_btn_map_cell.clone(),
             split_btn_map: split_btn_map_cell.clone(),
+            action_btn_map: action_btn_map_cell.clone(),
+            status_segment_map: status_segment_map_cell.clone(),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
             tab_visible_counts: tab_visible_counts_cell.clone(),
             terminal_sb_dragging: false,
@@ -2418,22 +2390,20 @@ impl SimpleComponent for App {
                         }
                         let popup_w = 220.0_f64;
                         let popup_y = 0.0;
-                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        let menu_pad = 4.0;
+                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
                         if y >= popup_y
                             && y < popup_y + popup_h
                             && x >= popup_x
                             && x < popup_x + popup_w
                         {
-                            let raw_idx = ((y - popup_y) / line_height) as usize;
-                            let item_real = raw_idx.saturating_sub(1);
-                            if raw_idx >= 1
-                                && item_real < items.len()
-                                && !items[item_real].separator
-                            {
-                                let action = items[item_real].action.to_string();
+                            let item_idx =
+                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
+                            if item_idx < items.len() && !items[item_idx].separator {
+                                let action = items[item_idx].action.to_string();
                                 drop(engine);
                                 sender_dd
-                                    .send(Msg::MenuActivateItem(open_idx, item_real, action))
+                                    .send(Msg::MenuActivateItem(open_idx, item_idx, action))
                                     .ok();
                             } else {
                                 drop(engine);
@@ -2473,21 +2443,19 @@ impl SimpleComponent for App {
                         }
                         let popup_w = 220.0_f64;
                         let popup_y = 0.0;
-                        let popup_h = (items.len() as f64 + 1.0) * line_height;
+                        let menu_pad = 4.0;
+                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
                         if y >= popup_y
                             && y < popup_y + popup_h
                             && x >= popup_x
                             && x < popup_x + popup_w
                         {
-                            let raw_idx = ((y - popup_y) / line_height) as usize;
-                            let item_real = raw_idx.saturating_sub(1);
-                            if raw_idx >= 1
-                                && item_real < items.len()
-                                && !items[item_real].separator
-                            {
-                                if engine.menu_highlighted_item != Some(item_real) {
+                            let item_idx =
+                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
+                            if item_idx < items.len() && !items[item_idx].separator {
+                                if engine.menu_highlighted_item != Some(item_idx) {
                                     drop(engine);
-                                    sender_motion.send(Msg::MenuHighlight(Some(item_real))).ok();
+                                    sender_motion.send(Msg::MenuHighlight(Some(item_idx))).ok();
                                 }
                             } else if engine.menu_highlighted_item.is_some() {
                                 drop(engine);
@@ -3176,17 +3144,16 @@ impl SimpleComponent for App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (dir_fg_hex, file_fg_hex) = {
             let theme = Theme::from_name(&engine.borrow().settings.colorscheme);
-            let file_fg = if theme.is_light() {
-                theme.foreground.to_hex()
-            } else {
-                theme.status_fg.to_hex()
-            };
-            (theme.explorer_dir_fg.to_hex(), file_fg)
+            (
+                theme.explorer_dir_fg.to_hex(),
+                theme.explorer_file_fg.to_hex(),
+            )
         };
         build_file_tree_with_root(
             &tree_store,
             &cwd,
             engine.borrow().settings.show_hidden_files,
+            engine.borrow().settings.explorer_sort_case_insensitive,
             &dir_fg_hex,
             &file_fg_hex,
         );
@@ -3198,7 +3165,7 @@ impl SimpleComponent for App {
         let nf_font = format!("Symbols Nerd Font, {user_font}");
 
         // Setup TreeView columns
-        // Single column with icon + filename (so they indent together)
+        // Icon + filename column (indent together via GTK expander)
         let col = gtk4::TreeViewColumn::new();
 
         // Icon cell renderer (non-expanding) — uses bundled nerd font for glyph support
@@ -3210,6 +3177,7 @@ impl SimpleComponent for App {
 
         // Filename cell renderer (expanding) — made editable on demand for inline rename
         let name_cell = gtk4::CellRendererText::new();
+        name_cell.set_property("ellipsize", gtk4::pango::EllipsizeMode::End);
         col.pack_start(&name_cell, true);
         col.add_attribute(&name_cell, "text", 1);
         col.add_attribute(&name_cell, "foreground", 3);
@@ -3257,6 +3225,49 @@ impl SimpleComponent for App {
                     }
                 }
             });
+            {
+                let ts = tree_store.clone();
+                name_cell.connect_editing_started(move |_cell, editable, tree_path| {
+                    // For renames, pre-select only the stem (filename without
+                    // extension) so the user can type a new name while keeping
+                    // the extension.  New-file entries start empty, so no selection.
+                    use gtk4::prelude::{EditableExt, TreeModelExt};
+                    let path_str: String = ts
+                        .iter(&tree_path)
+                        .and_then(|iter| ts.get_value(&iter, 2).get::<String>().ok())
+                        .unwrap_or_default();
+                    // Skip marker rows (new file/folder creation)
+                    if path_str.starts_with("__NEW_FILE__")
+                        || path_str.starts_with("__NEW_FOLDER__")
+                        || path_str.is_empty()
+                    {
+                        return;
+                    }
+                    // Get filename from path
+                    let name = std::path::Path::new(&path_str)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        return;
+                    }
+                    let is_dir = std::path::Path::new(&path_str).is_dir();
+                    let stem_end = if is_dir {
+                        name.len()
+                    } else {
+                        name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len())
+                    };
+                    // The editable widget is typically an Entry implementing Editable.
+                    // Upcast to Object then try downcasting to Editable.
+                    let widget: gtk4::Widget = editable.clone().upcast();
+                    if let Ok(e) = widget.dynamic_cast::<gtk4::Entry>() {
+                        // Defer selection to idle so GTK finishes setting up the editor.
+                        gtk4::glib::idle_add_local_once(move || {
+                            e.select_region(0, stem_end as i32);
+                        });
+                    }
+                });
+            }
             name_cell.connect_editing_canceled(move |_cell| {
                 // Disable editable when editing is cancelled
                 name_cell_for_cancel.set_property("editable", false);
@@ -3268,14 +3279,22 @@ impl SimpleComponent for App {
             });
         }
 
-        // Indicator cell renderer (right-aligned, non-expanding) for M/error/warning badges
+        col.set_expand(true);
+        // Fixed sizing lets the column shrink to fit available space
+        // instead of growing to the natural width of the longest filename.
+        col.set_sizing(gtk4::TreeViewColumnSizing::Fixed);
+        widgets.file_tree_view.append_column(&col);
+
+        // Separate right-aligned column for indicators (M/error/warning badges).
+        // A dedicated column ensures indicators are always visible regardless of
+        // tree width — packing them into the name column caused clipping.
+        let indicator_col = gtk4::TreeViewColumn::new();
         let indicator_cell = gtk4::CellRendererText::new();
         indicator_cell.set_property("xalign", 1.0f32);
-        col.pack_end(&indicator_cell, false);
-        col.add_attribute(&indicator_cell, "text", 4);
-        col.add_attribute(&indicator_cell, "foreground", 5);
-
-        widgets.file_tree_view.append_column(&col);
+        indicator_col.pack_start(&indicator_cell, false);
+        indicator_col.add_attribute(&indicator_cell, "text", 4);
+        indicator_col.add_attribute(&indicator_cell, "foreground", 5);
+        widgets.file_tree_view.append_column(&indicator_col);
 
         // Set the model on the TreeView
         widgets.file_tree_view.set_model(Some(&tree_store));
@@ -3289,18 +3308,16 @@ impl SimpleComponent for App {
                 .connect_row_expanded(move |_tree_view, iter, _tree_path| {
                     let e = engine_ref.borrow();
                     let show_hidden = e.settings.show_hidden_files;
+                    let case_insensitive = e.settings.explorer_sort_case_insensitive;
                     let theme = Theme::from_name(&e.settings.colorscheme);
                     let dir_fg_hex = theme.explorer_dir_fg.to_hex();
-                    let file_fg_hex = if theme.is_light() {
-                        theme.foreground.to_hex()
-                    } else {
-                        theme.status_fg.to_hex()
-                    };
+                    let file_fg_hex = theme.explorer_file_fg.to_hex();
                     drop(e);
                     tree_row_expanded(
                         &tree_store_ref,
                         iter,
                         show_hidden,
+                        case_insensitive,
                         &dir_fg_hex,
                         &file_fg_hex,
                     );
@@ -3398,8 +3415,14 @@ impl SimpleComponent for App {
                             Some(PathBuf::from(s))
                         }
                     });
-                let Some(target) = selected_path else { return };
-                let is_dir = target.is_dir();
+                // If clicking empty space below last entry, use workspace root
+                let (target, is_dir) = if let Some(path) = selected_path {
+                    let d = path.is_dir();
+                    (path, d)
+                } else {
+                    let root = engine_ctx.borrow().cwd.clone();
+                    (root, true)
+                };
 
                 // Build gio::Menu from engine-generated items (single source of truth).
                 engine_ctx
@@ -3442,8 +3465,13 @@ impl SimpleComponent for App {
                 {
                     let s = sender_rc.clone();
                     let pd = parent_dir.clone();
+                    let pop_ref = ctx_pop_rc.clone();
                     let a = gtk4::gio::SimpleAction::new("new_file", None);
                     a.connect_activate(move |_, _| {
+                        // Close popover first so it doesn't steal focus from inline editor
+                        if let Some(ref p) = *pop_ref.borrow() {
+                            p.popdown();
+                        }
                         s.input(Msg::StartInlineNewFile(pd.clone()));
                     });
                     add_action(&actions, &a);
@@ -3451,8 +3479,13 @@ impl SimpleComponent for App {
                 {
                     let s = sender_rc.clone();
                     let pd = parent_dir.clone();
+                    let pop_ref = ctx_pop_rc.clone();
                     let a = gtk4::gio::SimpleAction::new("new_folder", None);
                     a.connect_activate(move |_, _| {
+                        // Close popover first so it doesn't steal focus from inline editor
+                        if let Some(ref p) = *pop_ref.borrow() {
+                            p.popdown();
+                        }
                         s.input(Msg::StartInlineNewFolder(pd.clone()));
                     });
                     add_action(&actions, &a);
@@ -3468,24 +3501,28 @@ impl SimpleComponent for App {
                         if let Some(ref p) = *pop_ref.borrow() {
                             p.popdown();
                         }
-                        // Start inline cell editing on idle so the popover
-                        // has time to close and release focus.
+                        // Delay editing start so the popover has time to
+                        // fully close — otherwise GTK fires editing_canceled
+                        // immediately when focus shifts.
                         let tv2 = tv.clone();
                         let nc2 = nc.clone();
-                        gtk4::glib::idle_add_local_once(move || {
-                            nc2.set_property("editable", true);
-                            if let Some(column) = tv2.column(0) {
-                                if let Some((model, iter)) = tv2.selection().selected() {
-                                    let tree_path = model.path(&iter);
-                                    gtk4::prelude::TreeViewExt::set_cursor(
-                                        &tv2,
-                                        &tree_path,
-                                        Some(&column),
-                                        true,
-                                    );
+                        gtk4::glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(50),
+                            move || {
+                                nc2.set_property("editable", true);
+                                if let Some(column) = tv2.column(0) {
+                                    if let Some((model, iter)) = tv2.selection().selected() {
+                                        let tree_path = model.path(&iter);
+                                        gtk4::prelude::TreeViewExt::set_cursor(
+                                            &tv2,
+                                            &tree_path,
+                                            Some(&column),
+                                            true,
+                                        );
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     });
                     add_action(&actions, &a);
                 }
@@ -3779,38 +3816,18 @@ impl SimpleComponent for App {
                 let widget = g.widget();
                 let width = widget.width() as f64;
                 let height = widget.height() as f64;
-                let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                    0.0
+                let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
+                let tab_row_h = (lh * 1.6).ceil();
+                let tab_bar_h = if engine.settings.breadcrumbs {
+                    tab_row_h + lh
                 } else {
-                    lh
+                    tab_row_h
                 };
-                let status_h = lh * 2.0 + wildmenu_px;
-                let dbg_px = if engine.debug_toolbar_visible {
-                    lh
-                } else {
-                    0.0
-                };
-                let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                    6.0 * lh
-                } else {
-                    0.0
-                };
-                let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                    (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                } else {
-                    0.0
-                };
-                let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
                 let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                 let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
                 // Check if click is in a scrollbar zone (rightmost 10px of any
                 // window rect). If so, skip divider claim to let the scrollbar
                 // handle the click instead.
-                let tab_bar_h = if engine.settings.breadcrumbs {
-                    lh * 2.0
-                } else {
-                    lh
-                };
                 let (window_rects, _) =
                     engine.calculate_group_window_rects(content_bounds, tab_bar_h);
                 let in_scrollbar = window_rects.iter().any(|(_, r)| {
@@ -3820,7 +3837,18 @@ impl SimpleComponent for App {
                         && y >= r.y
                         && y < r.y + r.height
                 });
-                if !in_scrollbar {
+                // Check if click is in any group's tab bar region.
+                let group_rects = engine
+                    .group_layout
+                    .calculate_group_rects(content_bounds, tab_bar_h);
+                let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
+                    if engine.is_tab_bar_hidden(*gid) {
+                        return false;
+                    }
+                    let ty = grect.y - tab_bar_h;
+                    y >= ty && y < ty + tab_bar_h && x >= grect.x && x < grect.x + grect.width
+                });
+                if !in_scrollbar && !in_tab_bar {
                     for div in &dividers {
                         let hit = match div.direction {
                             core::window::SplitDirection::Vertical => {
@@ -3979,11 +4007,13 @@ impl SimpleComponent for App {
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
         let diff_btn_for_draw = diff_btn_map_cell.clone();
         let split_btn_for_draw = split_btn_map_cell.clone();
+        let action_btn_for_draw = action_btn_map_cell.clone();
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let mouse_pos_for_draw = mouse_pos_cell.clone();
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
+        let status_seg_for_draw = model.status_segment_map.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -4003,11 +4033,13 @@ impl SimpleComponent for App {
                         &tab_slots_for_draw,
                         &diff_btn_for_draw,
                         &split_btn_for_draw,
+                        &action_btn_for_draw,
                         &dialog_btn_for_draw,
                         &editor_hover_rect_for_draw,
                         &editor_hover_links_for_draw,
                         mouse_pos_for_draw.get(),
                         &tab_vis_for_draw,
+                        &status_seg_for_draw,
                     );
                 }));
                 if let Err(e) = result {
@@ -4039,6 +4071,8 @@ impl SimpleComponent for App {
             let tab_slots_rc = tab_slot_positions_cell.clone();
             let diff_btn_rc = diff_btn_map_cell.clone();
             let split_btn_rc = split_btn_map_cell.clone();
+            let action_btn_rc = action_btn_map_cell.clone();
+            let status_seg_rc = status_segment_map_cell.clone();
             let rc_gesture = gtk4::GestureClick::new();
             rc_gesture.set_button(3);
             rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
@@ -4058,6 +4092,8 @@ impl SimpleComponent for App {
                     &tab_slots_rc.borrow(),
                     &diff_btn_rc.borrow(),
                     &split_btn_rc.borrow(),
+                    &action_btn_rc.borrow(),
+                    &status_seg_rc.borrow(),
                 );
                 match target {
                     ClickTarget::TabBar => {
@@ -4232,6 +4268,8 @@ impl SimpleComponent for App {
                         &self.tab_slot_positions.borrow(),
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
+                        &self.action_btn_map.borrow(),
+                        &self.status_segment_map.borrow(),
                     ) {
                         engine.add_cursor_at_pos(line, col);
                     }
@@ -4294,6 +4332,8 @@ impl SimpleComponent for App {
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
+                            &self.action_btn_map.borrow(),
+                            &self.status_segment_map.borrow(),
                         );
                     }
                 }
@@ -4476,6 +4516,7 @@ impl SimpleComponent for App {
                 if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
                     let mut engine = self.engine.borrow_mut();
                     engine.settings = new_settings;
+                    engine.ensure_spell_checker();
                     engine.message = "Settings reloaded from disk".to_string();
                     drop(engine);
 
@@ -4941,6 +4982,7 @@ impl App {
             return;
         }
 
+        let theme = Theme::from_name(&engine.settings.colorscheme);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut last_file: Option<PathBuf> = None;
 
@@ -4951,7 +4993,8 @@ impl App {
                 let rel = m.file.strip_prefix(&cwd).unwrap_or(&m.file);
                 let file_label = gtk4::Label::new(None);
                 let header_markup = format!(
-                    "<b><span foreground='#569cd6'>{}</span></b>",
+                    "<b><span foreground='{}'>{}</span></b>",
+                    theme.function.to_hex(),
                     gtk4::glib::markup_escape_text(&rel.display().to_string())
                 );
                 file_label.set_markup(&header_markup);
@@ -4968,7 +5011,8 @@ impl App {
             let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
             let row_label = gtk4::Label::new(None);
             let result_markup = format!(
-                "<span foreground='#cccccc'>{}</span>",
+                "<span foreground='{}'>{}</span>",
+                theme.foreground.to_hex(),
                 gtk4::glib::markup_escape_text(&snippet)
             );
             row_label.set_markup(&result_markup);
@@ -5188,8 +5232,13 @@ impl App {
         cursor_indicator.set_valign(gtk4::Align::Start);
         cursor_indicator.set_hexpand(false);
         cursor_indicator.set_vexpand(false);
-        cursor_indicator.set_draw_func(|_, cr, w, h| {
-            cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
+        let thumb_color = {
+            let engine = self.engine.borrow();
+            Theme::from_name(&engine.settings.colorscheme).scrollbar_thumb
+        };
+        cursor_indicator.set_draw_func(move |_, cr, w, h| {
+            let (r, g, b) = thumb_color.to_cairo();
+            cr.set_source_rgba(r, g, b, 0.8);
             cr.rectangle(0.0, 0.0, w as f64, h as f64);
             let _ = cr.fill();
         });
@@ -5725,8 +5774,17 @@ impl App {
                 da.queue_draw();
             }
         }
+        // Check whether the explorer cell renderer is actively being edited.
+        // Many tree operations (indicator update, refresh) must be deferred
+        // while editing is active or they destroy the GTK cell editor widget.
+        let cell_editing = self.name_cell.borrow().as_ref().is_some_and(|nc| {
+            use gtk4::prelude::CellRendererExt;
+            nc.is_editing()
+        });
         // Explorer refresh after confirmed file move.
-        if self.engine.borrow().explorer_needs_refresh {
+        // Defer while a cell is being inline-edited — store.clear() would
+        // destroy the active editor widget.
+        if !cell_editing && self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             sender.input(Msg::RefreshFileTree);
         }
@@ -5841,13 +5899,29 @@ impl App {
         }
         // Tick swap file writes (only does work when updatetime elapsed).
         self.engine.borrow_mut().tick_swap_files();
+        // Auto-dismiss completed notifications after timeout; force redraw for spinner animation.
+        {
+            let mut engine = self.engine.borrow_mut();
+            if engine.has_active_notifications() {
+                self.draw_needed.set(true);
+            }
+            let had_notifs = !engine.notifications.is_empty();
+            engine.tick_notifications();
+            if had_notifs && engine.notifications.is_empty() {
+                self.draw_needed.set(true);
+            }
+        }
         // Update explorer tree indicators (modified/diagnostics) every ~1s.
-        if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
+        // Skip while a cell is being edited (guard computed above).
+        if !cell_editing
+            && self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1)
+        {
             self.last_tree_indicator_update = std::time::Instant::now();
             if let Some(ref store) = self.tree_store {
                 let engine = self.engine.borrow();
                 let (git_statuses, diag_counts) = engine.explorer_indicators();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
+                let default_fg = theme.explorer_file_fg.to_hex();
                 update_tree_indicators(
                     store,
                     &git_statuses,
@@ -5857,6 +5931,7 @@ impl App {
                     &theme.git_deleted.to_hex(),
                     &theme.diagnostic_error.to_hex(),
                     &theme.diagnostic_warning.to_hex(),
+                    &default_fg,
                 );
             }
         }
@@ -6067,15 +6142,18 @@ impl App {
             self.draw_needed.set(true);
         } else {
             // ── Status bar branch click — open branch picker ─────────────
+            // (only when per-window status is off — global bar exists)
             if self.cached_line_height > 0.0 {
                 let lh = self.cached_line_height;
                 let engine = self.engine.borrow();
+                let per_window_status = engine.settings.window_status_line;
                 let wildmenu_px = if engine.wildmenu_items.is_empty() {
                     0.0
                 } else {
                     lh
                 };
-                let status_bar_height = lh * 2.0 + wildmenu_px;
+                let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
+                let status_bar_height = lh * global_status_rows + wildmenu_px;
                 let status_y = height - status_bar_height;
                 if y >= status_y && y < status_y + lh && engine.git_branch.is_some() {
                     // Reconstruct branch column range (matching build_status_line logic)
@@ -6136,7 +6214,12 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     let term_px =
                         (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
-                    let status_h = 2.0 * self.cached_line_height;
+                    let global_status_rows = if engine.settings.window_status_line {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                     let toolbar_px = if engine.debug_toolbar_visible {
                         self.cached_line_height
                     } else {
@@ -6168,6 +6251,15 @@ impl App {
                     // Sans-serif chars are ~60% of monospace width; use that estimate.
                     let cw = self.cached_char_width.max(1.0) * 0.6;
                     let padding = 12.0;
+                    // Close button (×) at right edge
+                    if x >= width - padding - 10.0 {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.bottom_panel_open = false;
+                        engine.close_terminal();
+                        drop(engine);
+                        sender.input(Msg::Resize);
+                        return;
+                    }
                     let terminal_label = "TERMINAL";
                     let debug_label = "DEBUG CONSOLE";
                     let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
@@ -6298,49 +6390,53 @@ impl App {
                     let engine = self.engine.borrow();
                     if !engine.group_layout.is_single_group() {
                         let lh = self.cached_line_height;
-                        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                            0.0
+                        let tab_row_h = (lh * 1.6).ceil();
+                        let tab_bar_h = if engine.settings.breadcrumbs {
+                            tab_row_h + lh
                         } else {
-                            lh
+                            tab_row_h
                         };
-                        let status_h = lh * 2.0 + wildmenu_px;
-                        let dbg_px = if engine.debug_toolbar_visible {
-                            lh
-                        } else {
-                            0.0
-                        };
-                        let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                            6.0 * lh
-                        } else {
-                            0.0
-                        };
-                        let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                            (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                        } else {
-                            0.0
-                        };
-                        let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                        let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
                         let content_bounds =
                             core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-                        let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                        for div in &dividers {
-                            let hit = match div.direction {
-                                core::window::SplitDirection::Vertical => {
-                                    (x - div.position).abs() < 6.0
-                                        && y >= div.cross_start
-                                        && y < div.cross_start + div.cross_size
+
+                        // Compute tab bar regions so we can exclude them from
+                        // divider drag — tab bar clicks should go to tab handlers.
+                        let group_rects = engine
+                            .group_layout
+                            .calculate_group_rects(content_bounds, tab_bar_h);
+                        let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
+                            if engine.is_tab_bar_hidden(*gid) {
+                                return false;
+                            }
+                            let ty = grect.y - tab_bar_h;
+                            y >= ty
+                                && y < ty + tab_bar_h
+                                && x >= grect.x
+                                && x < grect.x + grect.width
+                        });
+
+                        if !in_tab_bar {
+                            let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+                            for div in &dividers {
+                                let hit = match div.direction {
+                                    core::window::SplitDirection::Vertical => {
+                                        (x - div.position).abs() < 6.0
+                                            && y >= div.cross_start
+                                            && y < div.cross_start + div.cross_size
+                                    }
+                                    core::window::SplitDirection::Horizontal => {
+                                        (y - div.position).abs() < 6.0
+                                            && x >= div.cross_start
+                                            && x < div.cross_start + div.cross_size
+                                    }
+                                };
+                                if hit {
+                                    let si = div.split_index;
+                                    drop(engine);
+                                    self.group_divider_dragging = Some(si);
+                                    return;
                                 }
-                                core::window::SplitDirection::Horizontal => {
-                                    (y - div.position).abs() < 6.0
-                                        && x >= div.cross_start
-                                        && x < div.cross_start + div.cross_size
-                                }
-                            };
-                            if hit {
-                                let si = div.split_index;
-                                drop(engine);
-                                self.group_divider_dragging = Some(si);
-                                return;
                             }
                         }
                     }
@@ -6384,7 +6480,7 @@ impl App {
                         if engine.is_vscode_mode() {
                             engine.vscode_clear_selection();
                         }
-                        let click_result = handle_mouse_click(
+                        let (click_result, engine_action) = handle_mouse_click(
                             &mut engine,
                             x,
                             y,
@@ -6396,7 +6492,24 @@ impl App {
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
+                            &self.action_btn_map.borrow(),
+                            &self.status_segment_map.borrow(),
                         );
+                        match engine_action {
+                            Some(core::engine::EngineAction::ToggleSidebar) => {
+                                drop(engine);
+                                sender.input(Msg::ToggleSidebar);
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                            Some(core::engine::EngineAction::OpenTerminal) => {
+                                drop(engine);
+                                sender.input(Msg::ToggleTerminal);
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                            _ => {}
+                        }
                         match click_result {
                             Some(true) => {
                                 drop(engine);
@@ -6408,6 +6521,25 @@ impl App {
                                 // Buffer click — fire hooks and reveal file
                             }
                             None => {
+                                // Check if the click opened an editor action menu.
+                                if engine.context_menu.as_ref().is_some_and(|cm| {
+                                    matches!(
+                                        cm.target,
+                                        core::engine::ContextMenuTarget::EditorActionMenu { .. }
+                                    )
+                                }) {
+                                    let group_id =
+                                        match &engine.context_menu.as_ref().unwrap().target {
+                                            core::engine::ContextMenuTarget::EditorActionMenu {
+                                                group_id,
+                                            } => *group_id,
+                                            _ => unreachable!(),
+                                        };
+                                    drop(engine);
+                                    self.show_action_menu_popover(group_id, x, y, sender);
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                                 // Tab bar / split button click — skip hooks.
                                 // Record drag start position for tab drag-and-drop.
                                 self.tab_drag_start = Some((x, y));
@@ -6525,6 +6657,8 @@ impl App {
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
+                    &self.action_btn_map.borrow(),
+                    &self.status_segment_map.borrow(),
                 );
                 if let ClickTarget::TabBar = target {
                     // The tab was already switched by pixel_to_click_target.
@@ -6624,7 +6758,12 @@ impl App {
         // Terminal panel resize drag.
         } else if self.terminal_resize_dragging {
             if self.cached_line_height > 0.0 {
-                let status_h = 2.0 * self.cached_line_height;
+                let global_status_rows = if self.engine.borrow().settings.window_status_line {
+                    0.0
+                } else {
+                    1.0
+                };
+                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let available = (height - y - status_h).max(0.0);
                 let new_rows = ((available / self.cached_line_height) as u16)
                     .saturating_sub(2)
@@ -6644,7 +6783,12 @@ impl App {
             if term_rows > 0 {
                 let term_px = (self.engine.borrow().session.terminal_panel_rows as f64 + 2.0)
                     * self.cached_line_height;
-                let status_h = 2.0 * self.cached_line_height;
+                let global_status_rows = if self.engine.borrow().settings.window_status_line {
+                    0.0
+                } else {
+                    1.0
+                };
+                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let toolbar_px = if self.engine.borrow().debug_toolbar_visible {
                     self.cached_line_height
                 } else {
@@ -6671,7 +6815,12 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     let term_px =
                         (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
-                    let status_h = 2.0 * self.cached_line_height;
+                    let global_status_rows = if engine.settings.window_status_line {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                     let toolbar_px = if engine.debug_toolbar_visible {
                         self.cached_line_height
                     } else {
@@ -6713,6 +6862,8 @@ impl App {
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
+                    &self.action_btn_map.borrow(),
+                    &self.status_segment_map.borrow(),
                 );
                 self.draw_needed.set(true);
             }
@@ -6781,6 +6932,84 @@ impl App {
         engine.mouse_drag_active = false;
         engine.mouse_drag_origin_window = None;
         self.draw_needed.set(true);
+    }
+
+    fn show_action_menu_popover(
+        &mut self,
+        group_id: core::window::GroupId,
+        x: f64,
+        y: f64,
+        _sender: &ComponentSender<Self>,
+    ) {
+        let da = match self.drawing_area.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return,
+        };
+
+        // Extract the items from the engine context menu (already populated).
+        let items: Vec<core::engine::ContextMenuItem> = {
+            let engine = self.engine.borrow();
+            engine
+                .context_menu
+                .as_ref()
+                .map(|cm| cm.items.clone())
+                .unwrap_or_default()
+        };
+        // Close the engine-side context menu; GTK handles it natively.
+        self.engine.borrow_mut().close_context_menu();
+
+        let menu = build_gio_menu_from_engine_items(&items, "actmenu");
+
+        let enabled_map: std::collections::HashMap<String, bool> = items
+            .iter()
+            .map(|it| (it.action.clone(), it.enabled))
+            .collect();
+
+        let actions = gtk4::gio::SimpleActionGroup::new();
+
+        // Register an action for each menu item that delegates to engine.
+        for item in &items {
+            let action_name = item.action.clone();
+            let engine_ref = self.engine.clone();
+            let draw_ref = self.draw_needed.clone();
+            let gid = group_id;
+            let a = gtk4::gio::SimpleAction::new(&action_name, None);
+            let act = action_name.clone();
+            a.connect_activate(move |_, _| {
+                let mut e = engine_ref.borrow_mut();
+                e.active_group = gid;
+                // Re-open the context menu so confirm() can find items.
+                e.open_editor_action_menu(gid, 0, 0);
+                // Find and select the matching item.
+                if let Some(ref mut cm) = e.context_menu {
+                    if let Some(idx) = cm.items.iter().position(|i| i.action == act) {
+                        cm.selected = idx;
+                    }
+                }
+                e.context_menu_confirm();
+                draw_ref.set(true);
+            });
+            if enabled_map.get(&action_name) == Some(&false) {
+                a.set_enabled(false);
+            }
+            actions.add_action(&a);
+        }
+
+        da.insert_action_group("actmenu", Some(&actions));
+
+        let n_rows = menu_row_count(&menu);
+        swap_ctx_popover(&self.active_ctx_popover, {
+            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&da);
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+            popover.set_position(gtk4::PositionType::Bottom);
+            popover.set_size_request(-1, n_rows * 22 + 14);
+            popover
+        });
+        if let Some(ref p) = *self.active_ctx_popover.borrow() {
+            p.popup();
+        }
     }
 
     fn handle_tab_right_click(
@@ -7441,6 +7670,9 @@ impl App {
                             }
                             EngineAction::ToggleSidebar => {
                                 sender.input(Msg::ToggleSidebar);
+                            }
+                            EngineAction::OpenTerminal => {
+                                sender.input(Msg::NewTerminalTab);
                             }
                             _ => {}
                         }
@@ -8745,27 +8977,33 @@ impl App {
                             }
                         }
                         ExplorerAction::Rename => {
-                            // Trigger GTK native inline cell editing
+                            // Trigger GTK native inline cell editing.
+                            // Slight delay so any pending focus changes settle.
                             let tv_ref = self.file_tree_view.clone();
                             let nc_ref = self.name_cell.clone();
-                            gtk4::glib::idle_add_local_once(move || {
-                                if let Some(ref tv) = *tv_ref.borrow() {
-                                    if let Some(ref nc) = *nc_ref.borrow() {
-                                        nc.set_property("editable", true);
-                                        if let Some(column) = tv.column(0) {
-                                            if let Some((model, iter)) = tv.selection().selected() {
-                                                let tree_path = model.path(&iter);
-                                                gtk4::prelude::TreeViewExt::set_cursor(
-                                                    tv,
-                                                    &tree_path,
-                                                    Some(&column),
-                                                    true,
-                                                );
+                            gtk4::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(50),
+                                move || {
+                                    if let Some(ref tv) = *tv_ref.borrow() {
+                                        if let Some(ref nc) = *nc_ref.borrow() {
+                                            nc.set_property("editable", true);
+                                            if let Some(column) = tv.column(0) {
+                                                if let Some((model, iter)) =
+                                                    tv.selection().selected()
+                                                {
+                                                    let tree_path = model.path(&iter);
+                                                    gtk4::prelude::TreeViewExt::set_cursor(
+                                                        tv,
+                                                        &tree_path,
+                                                        Some(&column),
+                                                        true,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            });
+                                },
+                            );
                         }
                         ExplorerAction::MoveFile => {
                             // Move not yet supported via keyboard in GTK
@@ -8783,18 +9021,17 @@ impl App {
                     let cwd = self.engine.borrow().cwd.clone();
                     let (dir_fg_hex, file_fg_hex) = {
                         let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-                        let file_fg = if theme.is_light() {
-                            theme.foreground.to_hex()
-                        } else {
-                            theme.status_fg.to_hex()
-                        };
-                        (theme.explorer_dir_fg.to_hex(), file_fg)
+                        (
+                            theme.explorer_dir_fg.to_hex(),
+                            theme.explorer_file_fg.to_hex(),
+                        )
                     };
                     store.clear();
                     build_file_tree_with_root(
                         store,
                         &cwd,
                         self.engine.borrow().settings.show_hidden_files,
+                        self.engine.borrow().settings.explorer_sort_case_insensitive,
                         &dir_fg_hex,
                         &file_fg_hex,
                     );
@@ -8803,6 +9040,11 @@ impl App {
                         let engine = self.engine.borrow();
                         let (git_statuses, diag_counts) = engine.explorer_indicators();
                         let theme = Theme::from_name(&engine.settings.colorscheme);
+                        let default_fg = if theme.is_light() {
+                            theme.foreground.to_hex()
+                        } else {
+                            theme.status_fg.to_hex()
+                        };
                         update_tree_indicators(
                             store,
                             &git_statuses,
@@ -8812,6 +9054,7 @@ impl App {
                             &theme.git_deleted.to_hex(),
                             &theme.diagnostic_error.to_hex(),
                             &theme.diagnostic_warning.to_hex(),
+                            &default_fg,
                         );
                     }
                     if let Some(ref tv) = *self.file_tree_view.borrow() {
@@ -8942,27 +9185,31 @@ impl App {
                     );
 
                     // Start inline editing on the new row.
-                    // Wrapped in catch_unwind because GTK set_cursor with
-                    // start_editing=true can abort the process if it panics
-                    // inside an extern "C" callback.
+                    // Delay slightly so the context menu popover has time to
+                    // fully close and release focus — otherwise GTK fires
+                    // `editing_canceled` immediately when focus shifts from
+                    // the popover to the cell editor.
                     let tv = tree_view.clone();
                     let name_cell_ref = self.name_cell.clone();
                     let new_row_path = tree_store.path(&new_iter);
-                    gtk4::glib::idle_add_local_once(move || {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Some(ref nc) = *name_cell_ref.borrow() {
-                                nc.set_property("editable", true);
-                                if let Some(column) = tv.column(0) {
-                                    gtk4::prelude::TreeViewExt::set_cursor(
-                                        &tv,
-                                        &new_row_path,
-                                        Some(&column),
-                                        true,
-                                    );
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(50),
+                        move || {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Some(ref nc) = *name_cell_ref.borrow() {
+                                    nc.set_property("editable", true);
+                                    if let Some(column) = tv.column(0) {
+                                        gtk4::prelude::TreeViewExt::set_cursor(
+                                            &tv,
+                                            &new_row_path,
+                                            Some(&column),
+                                            true,
+                                        );
+                                    }
                                 }
-                            }
-                        }));
-                    });
+                            }));
+                        },
+                    );
                 }
             }
         }
@@ -9499,6 +9746,38 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
     }
 }
 
+/// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
+/// so that group rects and divider positions are consistent across draw and click.
+fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        line_height
+    };
+    let global_status_rows = if engine.settings.window_status_line {
+        1.0
+    } else {
+        2.0
+    };
+    let status_bar_height = line_height * global_status_rows + wildmenu_px;
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * line_height
+    } else {
+        0.0
+    };
+    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        line_height
+    } else {
+        0.0
+    };
+    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px
+}
+
 /// Compute editor window rects with the same formula used by draw_editor and
 /// sync_scrollbar, so event handlers can do hit-testing without duplicating the
 /// layout logic.
@@ -9514,32 +9793,11 @@ fn compute_editor_window_rects(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-    } else {
-        0.0
-    };
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
         da_width,
-        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        gtk_editor_bottom(engine, da_width, da_height, line_height),
     );
     let (rects, _dividers) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
     rects

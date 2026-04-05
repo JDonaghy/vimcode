@@ -125,9 +125,6 @@ fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
 
 const SIDEBAR_WIDTH: u16 = 30;
 const ACTIVITY_BAR_WIDTH: u16 = 3;
-/// Number of terminal columns the explorer toolbar occupies:
-/// 3 Nerd Font icons × 3 cols each (2-col icon + 1 space) = 9.
-const EXPLORER_TOOLBAR_LEN: u16 = 9;
 
 // ─── Activity bar panels ──────────────────────────────────────────────────────
 
@@ -170,6 +167,8 @@ struct TuiSidebar {
     search_scroll_top: usize,
     /// Whether to show dotfiles in the explorer (mirrors Settings.show_hidden_files).
     show_hidden_files: bool,
+    /// Sort explorer entries case-insensitively (mirrors Settings.explorer_sort_case_insensitive).
+    sort_case_insensitive: bool,
     /// When true, the activity bar (toolbar) has keyboard focus.
     toolbar_focused: bool,
     /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
@@ -198,6 +197,7 @@ impl TuiSidebar {
             replace_input_focused: false,
             search_scroll_top: 0,
             show_hidden_files: false,
+            sort_case_insensitive: true,
             toolbar_focused: false,
             toolbar_selected: 1, // Start on Explorer
             pending_ctrl_w: false,
@@ -229,6 +229,7 @@ impl TuiSidebar {
                 1,
                 &self.expanded,
                 self.show_hidden_files,
+                self.sort_case_insensitive,
                 &mut self.rows,
             );
         }
@@ -295,6 +296,7 @@ fn collect_rows(
     depth: usize,
     expanded: &HashSet<PathBuf>,
     show_hidden: bool,
+    case_insensitive: bool,
     out: &mut Vec<ExplorerRow>,
 ) {
     let entries = match fs::read_dir(dir) {
@@ -302,14 +304,22 @@ fn collect_rows(
         Err(_) => return,
     };
     let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    // Dirs first, then alphabetical
+    // Dirs first, then alphabetical (optionally case-insensitive)
     entries.sort_by(|a, b| {
         let ad = a.path().is_dir();
         let bd = b.path().is_dir();
         match (ad, bd) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.file_name().cmp(&b.file_name()),
+            _ => {
+                if case_insensitive {
+                    let an = a.file_name().to_string_lossy().to_lowercase();
+                    let bn = b.file_name().to_string_lossy().to_lowercase();
+                    an.cmp(&bn)
+                } else {
+                    a.file_name().cmp(&b.file_name())
+                }
+            }
         }
     });
     for entry in entries {
@@ -329,7 +339,14 @@ fn collect_rows(
             is_expanded,
         });
         if is_expanded {
-            collect_rows(&path, depth + 1, expanded, show_hidden, out);
+            collect_rows(
+                &path,
+                depth + 1,
+                expanded,
+                show_hidden,
+                case_insensitive,
+                out,
+            );
         }
     }
 }
@@ -824,6 +841,8 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     let mut engine = Engine::new();
     icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
     engine.plugin_init();
+    // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
+    engine.ext_refresh();
     if let Some(path) = file_path {
         // CLI argument: open only the specified file/directory, skip session restore
         if path.is_dir() {
@@ -948,6 +967,9 @@ fn event_loop(
 ) {
     let mut theme = Theme::from_name(&engine.settings.colorscheme);
 
+    // TUI menu bar can be fully hidden (unlike GTK where it's the title bar).
+    engine.menu_bar_toggleable = true;
+
     // Initialise sidebar from session/settings
     let initial_visible = if engine.settings.autohide_panels {
         false
@@ -957,6 +979,7 @@ fn event_loop(
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut sidebar = TuiSidebar::new(root, initial_visible);
     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+    sidebar.sort_case_insensitive = engine.settings.explorer_sort_case_insensitive;
 
     // Optional active prompt (for sidebar CRUD operations)
 
@@ -1025,6 +1048,10 @@ fn event_loop(
     let mut close_tab_confirm = false;
 
     let mut needs_redraw = true;
+    // Track whether a large overlay popup was visible last frame so we can
+    // force a full redraw when it disappears (prevents stale characters from
+    // the popup lingering due to ratatui's incremental diff).
+    let mut had_popup_overlay = false;
     // Link hit rects from the hover popup render: (x, y, w, h, url).
     let mut hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
     // Bounding rect of the panel hover popup (x, y, w, h) — used to suppress dismiss on mouse-over.
@@ -1183,6 +1210,17 @@ fn event_loop(
                 }
             }
 
+            // Detect when a large overlay popup (picker, folder picker, dialog)
+            // was visible last frame but isn't now.  Force a full redraw so
+            // ratatui's incremental diff doesn't leave stale popup characters
+            // in the editor area.
+            let has_popup =
+                screen.map(|s| s.picker.is_some()).unwrap_or(false) || folder_picker.is_some();
+            if had_popup_overlay && !has_popup {
+                terminal.clear().ok();
+            }
+            had_popup_overlay = has_popup;
+
             let mut tab_visible_counts: Vec<(crate::core::window::GroupId, usize)> = Vec::new();
             terminal
                 .draw(|frame| {
@@ -1263,6 +1301,9 @@ fn event_loop(
         let poll_timeout = if engine.tab_switcher_open {
             // Short poll when tab switcher is open so we can auto-confirm quickly
             Duration::from_millis(10)
+        } else if engine.has_active_notifications() {
+            // Animate spinner at ~10fps when background operations are running
+            Duration::from_millis(100)
         } else if needs_redraw {
             min_frame
                 .saturating_sub(last_draw.elapsed())
@@ -1327,6 +1368,7 @@ fn event_loop(
             // Auto-refresh explorer and SC panel to reflect external filesystem changes.
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
                 sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                sidebar.sort_case_insensitive = engine.settings.explorer_sort_case_insensitive;
                 sidebar.build_rows();
                 if sidebar.active_panel == TuiPanel::Git
                     || sidebar.active_panel == TuiPanel::Explorer
@@ -1355,6 +1397,7 @@ fn event_loop(
                                 crate::core::settings::Settings::load_with_validation()
                             {
                                 engine.settings = new_settings;
+                                engine.ensure_spell_checker();
                                 engine.message = "Settings reloaded".to_string();
                                 needs_redraw = true;
                             }
@@ -1429,6 +1472,12 @@ fn event_loop(
             }
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
+            // Auto-dismiss completed notifications after timeout.
+            // Force redraw every idle tick when notifications are visible (spinner animation).
+            if !engine.notifications.is_empty() {
+                needs_redraw = true;
+            }
+            engine.tick_notifications();
             continue;
         }
 
@@ -1659,6 +1708,8 @@ fn event_loop(
                                     engine.open_folder(&path);
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    sidebar.sort_case_insensitive =
+                                        engine.settings.explorer_sort_case_insensitive;
                                     if let Some(fp) = engine.file_path().cloned() {
                                         let h = terminal
                                             .size()
@@ -1686,6 +1737,8 @@ fn event_loop(
                                     }
                                     sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                                     sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                    sidebar.sort_case_insensitive =
+                                        engine.settings.explorer_sort_case_insensitive;
                                     // Reveal the active file from the restored session
                                     if let Some(path) = engine.file_path().cloned() {
                                         let h = terminal
@@ -3310,15 +3363,20 @@ fn event_loop(
                         } else {
                             key_name.clone()
                         };
+                        let ctx = engine.context_menu_target_path();
                         let (consumed, action) = engine.handle_context_menu_key(&effective_key);
                         if consumed {
                             if let Some(act) = action {
-                                handle_explorer_context_action(
-                                    &act,
-                                    engine,
-                                    &sidebar,
-                                    terminal.size().ok(),
-                                );
+                                if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                    handle_explorer_context_action(
+                                        &act,
+                                        engine,
+                                        &sidebar,
+                                        terminal.size().ok(),
+                                        ctx_path,
+                                        ctx_is_dir,
+                                    );
+                                }
                             }
                             needs_redraw = true;
                             continue;
@@ -3378,6 +3436,8 @@ fn event_loop(
                             // just refresh the sidebar to reflect the new cwd.
                             sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
                             sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                            sidebar.sort_case_insensitive =
+                                engine.settings.explorer_sort_case_insensitive;
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
                             // For TUI, save workspace to current directory immediately
@@ -3713,6 +3773,11 @@ fn event_loop(
                 // Resize the terminal PTY to match the full new terminal width.
                 let term_rows = engine.session.terminal_panel_rows;
                 engine.terminal_resize(new_w, term_rows);
+                // Force ratatui to do a full redraw.  Terminal emulators reflow
+                // screen content on resize, which can leave the physical display
+                // out of sync with ratatui's previous-frame buffer.  Clearing
+                // resets both buffers so the next draw emits every cell.
+                terminal.clear().ok();
             }
             _ => {}
         }
@@ -3725,21 +3790,19 @@ fn event_loop(
 /// Process explorer-specific context menu actions that need sidebar prompts.
 /// Tab context menu actions (close, split, etc.) are handled directly by
 /// `context_menu_confirm()` in the engine.
+///
+/// `ctx_path` / `ctx_is_dir` come from the context menu target — callers
+/// extract them *before* `context_menu_confirm()` consumes the menu.
 fn handle_explorer_context_action(
     action: &str,
     engine: &mut Engine,
     sidebar: &TuiSidebar,
     terminal_size: Option<Size>,
+    ctx_path: PathBuf,
+    ctx_is_dir: bool,
 ) {
-    // Get the path from the engine's last context menu target.
-    // Note: context_menu_confirm() already took the menu, so we reconstruct
-    // the path from the sidebar's selected row.
-    let idx = sidebar.selected;
-    let (path, is_dir) = if idx < sidebar.rows.len() {
-        (sidebar.rows[idx].path.clone(), sidebar.rows[idx].is_dir)
-    } else {
-        return;
-    };
+    let path = ctx_path;
+    let is_dir = ctx_is_dir;
 
     match action {
         "new_file" | "new_folder" => {
@@ -3784,7 +3847,10 @@ fn handle_explorer_context_action(
 fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RColor, bg: RColor) {
     let area = buf.area;
     if x < area.x + area.width && y < area.y + area.height {
-        buf[(x, y)].set_char(ch).set_fg(fg).set_bg(bg);
+        let cell = &mut buf[(x, y)];
+        cell.set_char(ch).set_fg(fg).set_bg(bg);
+        cell.modifier = Modifier::empty();
+        cell.underline_color = RColor::Reset;
     }
 }
 
@@ -3809,11 +3875,19 @@ fn set_cell_wide(
         // column).
         let mut s = String::with_capacity(4);
         s.push(ch);
-        buf[(x, y)].set_symbol(&s).set_fg(fg).set_bg(bg);
+        let cell = &mut buf[(x, y)];
+        cell.set_symbol(&s).set_fg(fg).set_bg(bg);
+        cell.modifier = Modifier::empty();
+        cell.underline_color = RColor::Reset;
         if x + 1 < area.x + area.width {
-            let next = &mut buf[(x + 1, y)];
-            next.reset();
-            next.set_skip(true);
+            // Mark as wide-char continuation: empty symbol tells ratatui this
+            // cell is the trailing half of a double-width glyph.  Unlike
+            // set_skip(true), ratatui WILL emit the background colour so the
+            // terminal doesn't show a black rectangle.
+            let cont = &mut buf[(x + 1, y)];
+            cont.set_symbol("").set_fg(fg).set_bg(bg);
+            cont.modifier = Modifier::empty();
+            cont.underline_color = RColor::Reset;
         }
     }
 }
@@ -3834,9 +3908,7 @@ fn set_cell_styled(
         let cell = &mut buf[(x, y)];
         cell.set_char(ch).set_fg(fg).set_bg(bg);
         cell.modifier = modifier;
-        if let Some(ul) = underline_color {
-            cell.underline_color = ul;
-        }
+        cell.underline_color = underline_color.unwrap_or(RColor::Reset);
     }
 }
 

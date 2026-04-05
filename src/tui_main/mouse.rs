@@ -493,6 +493,10 @@ pub(super) fn handle_mouse(
                             && editor_row >= wy
                             && editor_row < wy + wh
                         {
+                            // Skip per-window status bar row
+                            if rw.status_line.is_some() && wh > 1 && editor_row == wy + wh - 1 {
+                                break;
+                            }
                             let view_row = (editor_row - wy) as usize;
                             let drag_rl = rw.lines.get(view_row);
                             let buf_line = drag_rl
@@ -811,14 +815,16 @@ pub(super) fn handle_mouse(
         if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
             if sidebar.active_panel == TuiPanel::Explorer {
                 let sidebar_row = row.saturating_sub(menu_rows);
-                if sidebar_row >= 1 {
-                    let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
-                    if tree_row < sidebar.rows.len() {
-                        sidebar.selected = tree_row;
-                        let path = sidebar.rows[tree_row].path.clone();
-                        let is_dir = sidebar.rows[tree_row].is_dir;
-                        engine.open_explorer_context_menu(path, is_dir, col, row);
-                    }
+                let tree_row = sidebar_row as usize + sidebar.scroll_top;
+                if tree_row < sidebar.rows.len() {
+                    sidebar.selected = tree_row;
+                    let path = sidebar.rows[tree_row].path.clone();
+                    let is_dir = sidebar.rows[tree_row].is_dir;
+                    engine.open_explorer_context_menu(path, is_dir, col, row);
+                } else {
+                    // Empty space below last entry → context menu for root folder
+                    let root = sidebar.root.clone();
+                    engine.open_explorer_context_menu(root, true, col, row);
                 }
             }
             return sidebar_width;
@@ -903,13 +909,18 @@ pub(super) fn handle_mouse(
                         if visual_row == inner_row {
                             if item.enabled {
                                 engine.context_menu.as_mut().unwrap().selected = idx;
+                                let ctx = engine.context_menu_target_path();
                                 if let Some(act) = engine.context_menu_confirm() {
-                                    handle_explorer_context_action(
-                                        &act,
-                                        engine,
-                                        sidebar,
-                                        *terminal_size,
-                                    );
+                                    if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                        handle_explorer_context_action(
+                                            &act,
+                                            engine,
+                                            sidebar,
+                                            *terminal_size,
+                                            ctx_path,
+                                            ctx_is_dir,
+                                        );
+                                    }
                                 }
                             }
                             return sidebar_width;
@@ -1191,9 +1202,13 @@ pub(super) fn handle_mouse(
     }
 
     // ── Command line click — start text selection ──────────────────────────────
+    // Skip when click is in the activity bar column (settings button lives there).
     {
         use crate::core::Mode;
-        if row + 1 == term_height && matches!(engine.mode, Mode::Command | Mode::Search) {
+        if row + 1 == term_height
+            && col >= ab_width
+            && matches!(engine.mode, Mode::Command | Mode::Search)
+        {
             let char_idx = col as usize;
             let buf_len = engine.command_buffer.chars().count();
             engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
@@ -1203,6 +1218,7 @@ pub(super) fn handle_mouse(
         }
         // Also allow selection on the message/command line in Normal mode.
         if row + 1 == term_height
+            && col >= ab_width
             && matches!(
                 engine.mode,
                 Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -1222,7 +1238,9 @@ pub(super) fn handle_mouse(
     }
 
     // ── Status bar branch click — open branch picker ───────────────────────
-    if row + 2 == term_height {
+    // (only when global status bar exists — per-window status replaces it)
+    // Skip when click is in the activity bar column (settings button lives there).
+    if row + 2 == term_height && !engine.settings.window_status_line && col >= ab_width {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             if let Some(layout) = last_layout {
                 if let Some((start, end)) = layout.status_branch_range {
@@ -1237,8 +1255,8 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // Bottom row is cmd — ignore
-    if row + 1 >= term_height {
+    // Bottom row is cmd — ignore (but not in the activity bar column)
+    if row + 1 >= term_height && col >= ab_width {
         return sidebar_width;
     }
 
@@ -1392,6 +1410,46 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
+    {
+        let bottom_panel_visible = engine.terminal_open || engine.bottom_panel_open;
+        if bottom_panel_visible && col >= editor_left {
+            let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+            let wildmenu_rows: u16 = if !engine.wildmenu_items.is_empty() {
+                1
+            } else {
+                0
+            };
+            let global_status_rows: u16 = if engine.settings.window_status_line {
+                0
+            } else {
+                1
+            };
+            let panel_height = engine.session.terminal_panel_rows + 2;
+            // Bottom panel y = term_height - cmd(1) - status - wildmenu - debug_toolbar - panel
+            let tab_bar_row = term_height
+                .saturating_sub(1 + global_status_rows + wildmenu_rows + dt_rows + panel_height);
+            if row == tab_bar_row {
+                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
+                let rel_col = col - editor_left; // column relative to editor area
+                                                 // Close button (×) at rightmost 2 cols of editor area
+                if col >= term_width.saturating_sub(2) {
+                    engine.bottom_panel_open = false;
+                    engine.close_terminal();
+                    return sidebar_width;
+                }
+                // Tab label click — switch between Terminal and Debug Output.
+                // Labels: "  Terminal  " (12 chars), "  Debug Output  " (16 chars)
+                if rel_col < 12 {
+                    engine.bottom_panel_kind = render::BottomPanelKind::Terminal;
+                } else if rel_col < 28 {
+                    engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+                }
+                return sidebar_width;
+            }
+        }
+    }
+
     // ── Debug output panel click (scrollbar) ──────────────────────────────────
     {
         let debug_output_open = engine.bottom_panel_kind == render::BottomPanelKind::DebugOutput
@@ -1509,23 +1567,14 @@ pub(super) fn handle_mouse(
 
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ab_width {
-        // Activity bar is in the main content area, below the menu bar row (if visible)
-        // and above the debug toolbar row (if visible).
-        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
-        } else {
-            0
-        };
+        // Activity bar spans full height below the menu bar row (matching GTK layout).
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        let dbg_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
         // Activity bar starts at row `menu_rows` in absolute terminal coordinates.
         if row < menu_rows {
             return sidebar_width; // click in menu bar area, ignore
         }
         let bar_row = row - menu_rows; // row relative to activity bar start
-        let bar_height =
-            term_height.saturating_sub(2 + qf_rows + strip_rows + menu_rows + dbg_rows);
+        let bar_height = term_height.saturating_sub(menu_rows);
         let settings_row = bar_height.saturating_sub(1);
         // Row 0: hamburger (menu bar toggle)
         if bar_row == 0 {
@@ -1690,65 +1739,26 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
-            // tree_height = (total height - 2 status rows) - 1 header row
-            let tree_height = term_height.saturating_sub(3) as usize;
+            // tree_height = total height - 2 status rows (no header)
+            let tree_height = term_height.saturating_sub(2) as usize;
             let total_rows = sidebar.rows.len();
 
             // Click on the scrollbar column → jump-scroll + arm drag
-            if col == sb_col && total_rows > tree_height && sidebar_row >= 1 {
-                let rel_row = sidebar_row.saturating_sub(1) as usize;
+            if col == sb_col && total_rows > tree_height {
+                let rel_row = sidebar_row as usize;
                 let ratio = rel_row as f64 / tree_height as f64;
                 let new_top = (ratio * total_rows as f64) as usize;
                 sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                 *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: 1 + menu_rows,
+                    track_abs_start: menu_rows,
                     track_len: tree_height as u16,
                     total: total_rows,
                 });
                 return sidebar_width;
             }
 
-            if sidebar_row == 0 {
-                // Header row: check if a toolbar button was clicked.
-                // Toolbar is right-aligned: 5 NF icons × 3 cols = 15.
-                let toolbar_start = ab_width + sidebar_width - EXPLORER_TOOLBAR_LEN;
-                if col >= toolbar_start {
-                    let btn = (col - toolbar_start) / 3; // 0=new-file 1=new-folder 2=delete
-                    let idx = sidebar.selected;
-                    let selected_is_dir = idx < sidebar.rows.len() && sidebar.rows[idx].is_dir;
-                    match btn {
-                        0 | 1 if idx < sidebar.rows.len() => {
-                            let target = if selected_is_dir {
-                                sidebar.rows[idx].path.clone()
-                            } else {
-                                sidebar.rows[idx]
-                                    .path
-                                    .parent()
-                                    .unwrap_or(&sidebar.root)
-                                    .to_path_buf()
-                            };
-                            // Expand the target dir so the new entry row is visible
-                            sidebar.expanded.insert(target.clone());
-                            sidebar.build_rows();
-                            if btn == 0 {
-                                engine.start_explorer_new_file(target);
-                            } else {
-                                engine.start_explorer_new_folder(target);
-                            }
-                        }
-                        2 => {
-                            if idx < sidebar.rows.len() {
-                                let path = sidebar.rows[idx].path.clone();
-                                engine.confirm_delete_file(&path);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                return sidebar_width;
-            }
-            let tree_row = (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
+            let tree_row = sidebar_row as usize + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
                 // Record potential drag source for DnD.
                 *explorer_drag_src = Some(tree_row);
@@ -2248,7 +2258,7 @@ pub(super) fn handle_mouse(
                     // Split buttons exist on active group, or all groups in diff mode.
                     let had_split = was_active || engine.is_in_diff_view();
                     let split_cols = if had_split { TAB_SPLIT_BOTH_COLS } else { 0 };
-                    let split_end = bar_width;
+                    let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
                     let split_start = split_end.saturating_sub(split_cols);
                     let diff_end = split_start;
                     let diff_start = diff_end.saturating_sub(diff_total_cols);
@@ -2277,15 +2287,19 @@ pub(super) fn handle_mouse(
                         }
                     } else if had_split
                         && local_col >= split_start
+                        && local_col < split_start + TAB_SPLIT_BOTH_COLS
                         && bar_width >= TAB_SPLIT_BOTH_COLS
                     {
-                        // Hit-test split buttons (rightmost).
+                        // Hit-test split buttons.
                         let in_split = local_col - split_start;
                         if in_split >= TAB_SPLIT_BTN_COLS {
                             engine.open_editor_group(SplitDirection::Horizontal);
                         } else {
                             engine.open_editor_group(SplitDirection::Vertical);
                         }
+                    } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
+                        // Editor action menu button ("…") at far right.
+                        engine.open_editor_action_menu(group_id, col, row + 1);
                     }
                 }
                 return sidebar_width;
@@ -2346,7 +2360,7 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let split_end = bar_width;
+                let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
                 let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
                 let diff_end = split_start;
                 let diff_start = diff_end.saturating_sub(diff_total_cols);
@@ -2369,13 +2383,19 @@ pub(super) fn handle_mouse(
                     } else {
                         engine.diff_toggle_hide_unchanged();
                     }
-                } else if local_col >= split_start && bar_width >= TAB_SPLIT_BOTH_COLS {
+                } else if local_col >= split_start
+                    && local_col < split_start + TAB_SPLIT_BOTH_COLS
+                    && bar_width >= TAB_SPLIT_BOTH_COLS
+                {
                     let in_split = local_col - split_start;
                     if in_split >= TAB_SPLIT_BTN_COLS {
                         engine.open_editor_group(SplitDirection::Horizontal);
                     } else {
                         engine.open_editor_group(SplitDirection::Vertical);
                     }
+                } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
+                    // Editor action menu button ("…") at far right.
+                    engine.open_editor_action_menu(engine.active_group, col, row + 1);
                 }
             }
             return sidebar_width;
@@ -2422,6 +2442,35 @@ pub(super) fn handle_mouse(
             let wh = rw.rect.height as u16;
 
             if rel_col >= wx && rel_col < wx + ww && editor_row >= wy && editor_row < wy + wh {
+                // Per-window status bar click — hit-test segments for actions.
+                if rw.status_line.is_some() && wh > 1 && editor_row == wy + wh - 1 {
+                    if let Some(ref status) = rw.status_line {
+                        let click_col = (rel_col - wx) as usize;
+                        if let Some(action) =
+                            status_segment_hit_test(status, ww as usize, click_col)
+                        {
+                            if let Some(ea) = engine.handle_status_action(&action) {
+                                use crate::core::engine::EngineAction;
+                                match ea {
+                                    EngineAction::ToggleSidebar => {
+                                        sidebar.visible = !sidebar.visible;
+                                    }
+                                    EngineAction::OpenTerminal => {
+                                        let cols =
+                                            terminal_size.as_ref().map(|s| s.width).unwrap_or(80);
+                                        engine.terminal_new_tab(
+                                            cols,
+                                            engine.session.terminal_panel_rows,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    return sidebar_width;
+                }
+
                 let viewport_lines = wh as usize;
                 let has_v_scrollbar = rw.total_lines > viewport_lines;
                 let gutter = rw.gutter_char_width as u16;
@@ -2562,4 +2611,41 @@ pub(super) fn handle_mouse(
     }
 
     sidebar_width
+}
+
+/// Walk status line segments and find which action (if any) is at `click_col`.
+fn status_segment_hit_test(
+    status: &crate::render::WindowStatusLine,
+    width: usize,
+    click_col: usize,
+) -> Option<crate::render::StatusAction> {
+    // Compute right-side total width
+    let right_width: usize = status
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count())
+        .sum();
+    let right_start = width.saturating_sub(right_width);
+
+    // Check left segments
+    let mut col = 0;
+    for seg in &status.left_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    // Check right segments
+    let mut col = right_start;
+    for seg in &status.right_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    None
 }
