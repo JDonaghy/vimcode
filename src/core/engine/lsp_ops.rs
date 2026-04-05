@@ -281,6 +281,10 @@ impl Engine {
                     ext_name: ext_name.clone(),
                     install_key: lsp_key,
                 });
+                self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Installing {}…", manifest.lsp.binary),
+                );
                 status_parts.push(format!("LSP: installing {}…", manifest.lsp.binary));
             }
         }

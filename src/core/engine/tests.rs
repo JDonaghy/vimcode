@@ -18289,3 +18289,116 @@ fn test_status_action_existing_actions_return_none() {
         .handle_status_action(&StatusAction::ChangeEncoding)
         .is_none());
 }
+
+// ── Notification system tests ───────────────────────────────────────────
+
+#[test]
+fn test_notify_creates_notification() {
+    let mut e = Engine::new();
+    assert!(e.notifications.is_empty());
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].id, id);
+    assert_eq!(e.notifications[0].message, "Searching…");
+    assert!(!e.notifications[0].done);
+    assert!(e.has_active_notifications());
+    assert!(!e.has_done_notifications());
+}
+
+#[test]
+fn test_notify_done_marks_complete() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.notify_done(id, Some("Done!"));
+    assert_eq!(e.notifications.len(), 1);
+    assert!(e.notifications[0].done);
+    assert_eq!(e.notifications[0].message, "Done!");
+    assert!(!e.has_active_notifications());
+    assert!(e.has_done_notifications());
+}
+
+#[test]
+fn test_notify_done_by_kind() {
+    let mut e = Engine::new();
+    e.notify(NotificationKind::ProjectSearch, "Search 1…");
+    e.notify(NotificationKind::ProjectSearch, "Search 2…");
+    e.notify(NotificationKind::LspInstall, "Installing…");
+    e.notify_done_by_kind(&NotificationKind::ProjectSearch, Some("Search complete"));
+    // Both ProjectSearch notifications should be done, LspInstall still active
+    let search_done = e
+        .notifications
+        .iter()
+        .filter(|n| n.kind == NotificationKind::ProjectSearch && n.done)
+        .count();
+    let lsp_active = e
+        .notifications
+        .iter()
+        .filter(|n| n.kind == NotificationKind::LspInstall && !n.done)
+        .count();
+    assert_eq!(search_done, 2);
+    assert_eq!(lsp_active, 1);
+}
+
+#[test]
+fn test_dismiss_notification_by_id() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let _id2 = e.notify(NotificationKind::LspInstall, "B");
+    assert_eq!(e.notifications.len(), 2);
+    e.dismiss_notification(id1);
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].message, "B");
+}
+
+#[test]
+fn test_dismiss_done_notifications() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let _id2 = e.notify(NotificationKind::LspInstall, "B");
+    e.notify_done(id1, None);
+    e.dismiss_done_notifications();
+    assert_eq!(e.notifications.len(), 1);
+    assert_eq!(e.notifications[0].message, "B");
+    assert!(!e.notifications[0].done);
+}
+
+#[test]
+fn test_tick_notifications_auto_dismiss() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.notify_done(id, Some("Done"));
+    // Manually backdate the done_at to simulate time passing
+    e.notifications[0].done_at =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+    e.tick_notifications();
+    assert!(e.notifications.is_empty(), "Should auto-dismiss after 5s");
+}
+
+#[test]
+fn test_tick_notifications_keeps_active() {
+    let mut e = Engine::new();
+    e.notify(NotificationKind::ProjectSearch, "Searching…");
+    e.tick_notifications();
+    assert_eq!(
+        e.notifications.len(),
+        1,
+        "In-progress notifications should not be auto-dismissed"
+    );
+}
+
+#[test]
+fn test_status_action_dismiss_notifications() {
+    let mut e = Engine::new();
+    let id = e.notify(NotificationKind::ProjectSearch, "Done");
+    e.notify_done(id, None);
+    e.handle_status_action(&StatusAction::DismissNotifications);
+    assert!(e.notifications.is_empty());
+}
+
+#[test]
+fn test_notification_ids_increment() {
+    let mut e = Engine::new();
+    let id1 = e.notify(NotificationKind::ProjectSearch, "A");
+    let id2 = e.notify(NotificationKind::LspInstall, "B");
+    assert!(id2 > id1);
+}

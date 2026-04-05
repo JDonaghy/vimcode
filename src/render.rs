@@ -6710,6 +6710,59 @@ pub fn build_window_status_line(
             });
         }
 
+        // Notification indicator — spinner for in-progress, bell for done
+        if !engine.notifications.is_empty() {
+            let nf = crate::icons::nerd_fonts_enabled();
+            let has_active = engine.has_active_notifications();
+            let has_done = engine.has_done_notifications();
+            let (icon, fg_color) = if has_active {
+                // Spinner icon for in-progress operations
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let elapsed = engine
+                    .notifications
+                    .iter()
+                    .filter(|n| !n.done)
+                    .map(|n| n.created_at)
+                    .min()
+                    .map(|t| t.elapsed().as_millis() as usize / 100)
+                    .unwrap_or(0);
+                let frame = frames[elapsed % frames.len()];
+                (format!("{frame}"), theme.function) // use function color (blue-ish) for spinner
+            } else if has_done {
+                // Bell icon for completed notifications
+                let bell: &str = if nf { "󰂞" } else { "*" };
+                (bell.to_string(), theme.string_lit) // use string color (green-ish) for done
+            } else {
+                (String::new(), bar_fg)
+            };
+            if !icon.is_empty() {
+                // Show the most recent notification message (truncated)
+                let msg = engine
+                    .notifications
+                    .last()
+                    .map(|n| {
+                        if n.message.len() > 30 {
+                            format!("{}…", &n.message[..29])
+                        } else {
+                            n.message.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                let action = if has_done {
+                    Some(StatusAction::DismissNotifications)
+                } else {
+                    None
+                };
+                right.push(StatusSegment {
+                    text: format!(" {icon} {msg} "),
+                    fg: fg_color,
+                    bg: bar_bg,
+                    bold: false,
+                    action,
+                });
+            }
+        }
+
         // Layout toggle buttons — dim when inactive, normal when active
         let toggle_fg = |active: bool| {
             if active {

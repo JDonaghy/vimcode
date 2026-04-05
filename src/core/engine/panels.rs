@@ -900,6 +900,15 @@ impl Engine {
                     output,
                 } => {
                     self.lsp_installing.remove(&lang_id);
+                    // Mark any matching LSP install notification as done.
+                    self.notify_done_by_kind(
+                        &NotificationKind::LspInstall,
+                        if success {
+                            Some("Install complete")
+                        } else {
+                            Some("Install failed")
+                        },
+                    );
                     // preLaunchTask completion: resume debug session after build task.
                     if let Some(task_label) = lang_id.strip_prefix("dap_task:") {
                         // Append task output to Debug Output panel.

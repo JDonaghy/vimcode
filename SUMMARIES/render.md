@@ -1,4 +1,4 @@
-# src/render.rs — 7,291 lines
+# src/render.rs — 7,384 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 

@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 252 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 253 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 253 — Notification / progress indicator (5313 tests):**
+
+New feature: background operation progress indicator in the per-window status bar. `Notification` struct + `NotificationKind` enum (LspInstall, LspIndexing, ExtensionInstall, GitOperation, ProjectSearch, ProjectReplace) on Engine. Lifecycle methods: `notify()` (push in-progress, returns ID), `notify_done(id, msg)` (mark complete by ID), `notify_done_by_kind(kind, msg)` (mark all of a kind complete), `dismiss_notification(id)` (remove by ID), `dismiss_done_notifications()` (remove all completed), `tick_notifications()` (auto-dismiss after 5s timeout). Rendered as `StatusSegment` in `build_window_status_line()` between Ln:Col and layout toggle buttons — spinner animation (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ braille frames at ~10fps) for in-progress ops using `theme.function` color, bell icon (󰂞 nerd / `*` ASCII) for completed ops using `theme.string_lit` color. `StatusAction::DismissNotifications` click-to-clear all done notifications. TUI: 100ms poll timeout when active notifications for smooth spinner; `needs_redraw = true` in idle loop when notifications present. GTK: `draw_needed.set(true)` on active notifications in poll tick handler. Wired up: LSP install start (lsp_ops.rs), LSP install complete (panels.rs via `notify_done_by_kind`), project search start/complete (search.rs), project replace start/complete (search.rs). Message truncated to 30 chars in status bar. 9 new tests covering lifecycle, auto-dismiss, click-to-dismiss, ID incrementing. Files changed: `engine/mod.rs` (+120), `engine/execute.rs` (+3), `engine/lsp_ops.rs` (+1), `engine/panels.rs` (+6), `engine/search.rs` (+4), `engine/tests.rs` (+100), `render.rs` (+49), `gtk/mod.rs` (+12), `tui_main/mod.rs` (+9).
 
 ---
 

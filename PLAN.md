@@ -23,6 +23,7 @@
 ---
 
 ## Recently Completed
+- **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops (LSP install, project search/replace); auto-dismiss; click-to-clear; 9 tests.
 - **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` and `underline_color` so spell underlines don't bleed into picker overlays. Added remote editing research item.
 > Sessions 251 and earlier in **SESSION_HISTORY.md**.
 
@@ -228,7 +229,7 @@
 
 ### Layout & Chrome
 - [x] **Layout toggle buttons** — Clickable nerd-font icon segments (󰘖/󰆍/󰍜 with `[S]`/`[P]`/`[M]` ASCII fallbacks) in per-window status bar (right side, after Ln:Col) toggle sidebar and terminal panel visibility; dim when inactive. Menu bar toggle only shown in TUI (`menu_bar_toggleable` field). GTK click detection uses Pango-measured `StatusSegmentMap` cache instead of `char_width` approximation. 4 new tests.
-- [ ] **Notification / progress indicator** — Show a subtle indicator in the status bar or menu bar during background operations: LSP indexing, extension install, git operations, project search. Bell icon for completed notifications. Clicking opens an output log or dismisses. Prevents "is it working?" uncertainty during long operations.
+- [x] **Notification / progress indicator** — Spinner (⠋⠙⠹…) in per-window status bar during background operations (LSP install, project search/replace); bell icon (󰂞/*) for completed; auto-dismiss after 5s; click bell to clear; `NotificationKind` enum + `Notification` struct on Engine; `notify()`/`notify_done_by_kind()`/`tick_notifications()` lifecycle; both GTK + TUI backends (animated via poll tick). 9 tests.
 
 ### Editor Features
 - [x] **Richer tree-sitter highlight queries** — Expanded all 20 language grammars with comprehensive highlight queries. 11 new Theme fields (`operator`, `punctuation`, `macro_call`, `attribute`, `lifetime`, `constant`, `escape`, `boolean`, `property`, `parameter`, `module`) with colors for all 6 built-in themes + VSCode JSON importer. `scope_color()` now handles 22 capture names (was 8). Rust: macros, attributes, lifetimes, field access, method calls, numbers, booleans, operators, punctuation, escape sequences, 30+ keywords. Python: decorators, method calls, parameters, operators, booleans, numbers. JS/TS: method calls, properties, parameters, regex, operators, punctuation. Go: method calls, field access, package names, parameters, operators. C/C++: function calls, preprocessor macros, field access, operators, punctuation. Java: annotations, method calls, field access, operators. Ruby: method calls, symbols, operators. C#: operators, punctuation, booleans→boolean, nulls→constant. JSON/TOML/YAML: keys→property, booleans→boolean, nulls→constant, punctuation. Bash: command calls, variables, operators. Lua: method calls, properties, operators. HTML: attributes, punctuation. CSS: property names, color/number values, punctuation.

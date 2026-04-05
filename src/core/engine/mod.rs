@@ -754,6 +754,40 @@ pub enum StatusAction {
     ToggleSidebar,
     TogglePanel,
     ToggleMenuBar,
+    /// Dismiss all completed notifications (click on bell icon).
+    DismissNotifications,
+}
+
+// ─── Notification System ────────────────────────────────────────────────────
+
+/// Kind of background operation being tracked by a notification.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum NotificationKind {
+    LspInstall,
+    LspIndexing,
+    ExtensionInstall,
+    GitOperation,
+    ProjectSearch,
+    ProjectReplace,
+}
+
+/// A single notification tracking a background operation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Notification {
+    /// Unique ID for this notification.
+    pub id: u64,
+    /// Kind of operation (for dedup/grouping).
+    pub kind: NotificationKind,
+    /// Short message displayed in the status bar (e.g. "Installing rust-analyzer…").
+    pub message: String,
+    /// `true` once the operation is done (switches from spinner to bell).
+    pub done: bool,
+    /// When the notification was created.
+    pub created_at: std::time::Instant,
+    /// When the notification was marked done (for auto-dismiss after a delay).
+    pub done_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2595,6 +2629,12 @@ pub struct Engine {
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
 
+    // --- Notifications (background operation progress) ---
+    /// Active notifications (spinner/bell indicators in status bar).
+    pub notifications: Vec<Notification>,
+    /// Counter for generating unique notification IDs.
+    next_notification_id: u64,
+
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
     pub editor_hover: Option<EditorHoverPopup>,
@@ -2990,6 +3030,8 @@ impl Engine {
             ext_panel_focus_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            notifications: Vec::new(),
+            next_notification_id: 1,
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -3062,6 +3104,84 @@ impl Engine {
 
         engine.plugin_init();
         engine
+    }
+
+    // ── Notification helpers ─────────────────────────────────────────────────
+
+    /// Push a new in-progress notification. Returns the notification ID.
+    pub fn notify(&mut self, kind: NotificationKind, message: &str) -> u64 {
+        let id = self.next_notification_id;
+        self.next_notification_id += 1;
+        self.notifications.push(Notification {
+            id,
+            kind,
+            message: message.to_string(),
+            done: false,
+            created_at: std::time::Instant::now(),
+            done_at: None,
+        });
+        id
+    }
+
+    /// Mark a notification as done (switches from spinner to bell).
+    /// If `new_message` is `Some`, updates the display text.
+    #[allow(dead_code)]
+    pub fn notify_done(&mut self, id: u64, new_message: Option<&str>) {
+        if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
+            n.done = true;
+            n.done_at = Some(std::time::Instant::now());
+            if let Some(msg) = new_message {
+                n.message = msg.to_string();
+            }
+        }
+    }
+
+    /// Mark a notification as done by kind (useful when the caller didn't store the ID).
+    pub fn notify_done_by_kind(&mut self, kind: &NotificationKind, new_message: Option<&str>) {
+        for n in &mut self.notifications {
+            if &n.kind == kind && !n.done {
+                n.done = true;
+                n.done_at = Some(std::time::Instant::now());
+                if let Some(msg) = new_message {
+                    n.message = msg.to_string();
+                }
+            }
+        }
+    }
+
+    /// Remove a specific notification by ID.
+    #[allow(dead_code)]
+    pub fn dismiss_notification(&mut self, id: u64) {
+        self.notifications.retain(|n| n.id != id);
+    }
+
+    /// Remove all completed notifications (bell icon click).
+    pub fn dismiss_done_notifications(&mut self) {
+        self.notifications.retain(|n| !n.done);
+    }
+
+    /// Auto-dismiss completed notifications after 5 seconds.
+    /// Call from the backend poll loop.
+    pub fn tick_notifications(&mut self) {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        self.notifications.retain(|n| {
+            if let Some(done_at) = n.done_at {
+                now.duration_since(done_at) < timeout
+            } else {
+                true // in-progress notifications never auto-dismiss
+            }
+        });
+    }
+
+    /// Returns true if there are any active (in-progress) notifications.
+    pub fn has_active_notifications(&self) -> bool {
+        self.notifications.iter().any(|n| !n.done)
+    }
+
+    /// Returns true if there are any completed notifications waiting to be dismissed.
+    pub fn has_done_notifications(&self) -> bool {
+        self.notifications.iter().any(|n| n.done)
     }
 }
 

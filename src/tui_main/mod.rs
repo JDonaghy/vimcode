@@ -1301,6 +1301,9 @@ fn event_loop(
         let poll_timeout = if engine.tab_switcher_open {
             // Short poll when tab switcher is open so we can auto-confirm quickly
             Duration::from_millis(10)
+        } else if engine.has_active_notifications() {
+            // Animate spinner at ~10fps when background operations are running
+            Duration::from_millis(100)
         } else if needs_redraw {
             min_frame
                 .saturating_sub(last_draw.elapsed())
@@ -1469,6 +1472,12 @@ fn event_loop(
             }
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
+            // Auto-dismiss completed notifications after timeout.
+            // Force redraw every idle tick when notifications are visible (spinner animation).
+            if !engine.notifications.is_empty() {
+                needs_redraw = true;
+            }
+            engine.tick_notifications();
             continue;
         }
 

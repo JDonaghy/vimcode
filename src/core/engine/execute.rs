@@ -3078,6 +3078,9 @@ impl Engine {
             StatusAction::ToggleMenuBar => {
                 self.toggle_menu_bar();
             }
+            StatusAction::DismissNotifications => {
+                self.dismiss_done_notifications();
+            }
         }
         None
     }

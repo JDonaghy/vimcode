@@ -5899,6 +5899,18 @@ impl App {
         }
         // Tick swap file writes (only does work when updatetime elapsed).
         self.engine.borrow_mut().tick_swap_files();
+        // Auto-dismiss completed notifications after timeout; force redraw for spinner animation.
+        {
+            let mut engine = self.engine.borrow_mut();
+            if engine.has_active_notifications() {
+                self.draw_needed.set(true);
+            }
+            let had_notifs = !engine.notifications.is_empty();
+            engine.tick_notifications();
+            if had_notifs && engine.notifications.is_empty() {
+                self.draw_needed.set(true);
+            }
+        }
         // Update explorer tree indicators (modified/diagnostics) every ~1s.
         // Skip while a cell is being edited (guard computed above).
         if !cell_editing
