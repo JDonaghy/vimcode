@@ -133,6 +133,17 @@ jobs:
 
           > GUI binary requires GTK 4.10+. Ubuntu 22.04 ships GTK 4.6 which is too old; Ubuntu 24.04+ recommended.
 
+          ### Windows
+
+          **TUI-only binary (no installer needed)**
+          Download `vcd-windows-x86_64.exe`, place anywhere on your PATH, and run:
+          ```
+          vcd-windows-x86_64.exe
+          ```
+          Or rename to `vcd.exe` for convenience. Works in Windows Terminal, PowerShell, and cmd.exe.
+
+          > No GUI binary for Windows (requires GTK4 which is not available on Windows).
+
           ### macOS (Apple Silicon)
 
           **Option A — Homebrew (recommended)**
@@ -216,6 +227,43 @@ jobs:
           vimcode-macos-arm64.tar.gz
           vcd-macos-arm64.tar.gz
 
+  # ── Windows TUI ─────────────────────────────────────────────────────────────
+  build-windows:
+    name: Build Windows TUI binary
+    runs-on: windows-latest
+    needs: build-and-release  # wait for release to be created
+
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: windows-cargo-
+
+    - name: Build release TUI binary (no GTK)
+      run: cargo build --release --bin vcd --no-default-features
+
+    - name: Prepare artifact
+      run: |
+        Copy-Item target\release\vcd.exe vcd-windows-x86_64.exe
+
+    - name: Upload to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.build-and-release.outputs.version }}
+        files: vcd-windows-x86_64.exe
+
   # ── Flatpak ────────────────────────────────────────────────────────────────
   flatpak:
     name: Build Flatpak bundle
@@ -258,7 +306,7 @@ jobs:
   update-homebrew:
     name: Update Homebrew tap
     runs-on: ubuntu-latest
-    needs: [build-and-release, build-macos]
+    needs: [build-and-release, build-macos, build-windows]
 
     steps:
     - name: Trigger tap formula update
