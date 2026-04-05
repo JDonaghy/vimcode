@@ -3838,7 +3838,10 @@ fn handle_explorer_context_action(
 fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RColor, bg: RColor) {
     let area = buf.area;
     if x < area.x + area.width && y < area.y + area.height {
-        buf[(x, y)].set_char(ch).set_fg(fg).set_bg(bg);
+        let cell = &mut buf[(x, y)];
+        cell.set_char(ch).set_fg(fg).set_bg(bg);
+        cell.modifier = Modifier::empty();
+        cell.underline_color = RColor::Reset;
     }
 }
 
@@ -3863,13 +3866,19 @@ fn set_cell_wide(
         // column).
         let mut s = String::with_capacity(4);
         s.push(ch);
-        buf[(x, y)].set_symbol(&s).set_fg(fg).set_bg(bg);
+        let cell = &mut buf[(x, y)];
+        cell.set_symbol(&s).set_fg(fg).set_bg(bg);
+        cell.modifier = Modifier::empty();
+        cell.underline_color = RColor::Reset;
         if x + 1 < area.x + area.width {
             // Mark as wide-char continuation: empty symbol tells ratatui this
             // cell is the trailing half of a double-width glyph.  Unlike
             // set_skip(true), ratatui WILL emit the background colour so the
             // terminal doesn't show a black rectangle.
-            buf[(x + 1, y)].set_symbol("").set_fg(fg).set_bg(bg);
+            let cont = &mut buf[(x + 1, y)];
+            cont.set_symbol("").set_fg(fg).set_bg(bg);
+            cont.modifier = Modifier::empty();
+            cont.underline_color = RColor::Reset;
         }
     }
 }
@@ -3890,9 +3899,7 @@ fn set_cell_styled(
         let cell = &mut buf[(x, y)];
         cell.set_char(ch).set_fg(fg).set_bg(bg);
         cell.modifier = modifier;
-        if let Some(ul) = underline_color {
-            cell.underline_color = ul;
-        }
+        cell.underline_color = underline_color.unwrap_or(RColor::Reset);
     }
 }
 

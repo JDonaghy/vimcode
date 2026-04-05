@@ -2,12 +2,12 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
-- **TUI spell underlines bleed into fuzzy finder** — When a buffer has misspelled words with underline decorations, horizontal lines appear in the fuzzy find (picker) dialogs at the exact screen positions where the underlines were rendered. The picker clear/redraw doesn't fully reset underline styling from the previous frame. Likely a ratatui style leak — underline attributes on cells from the editor render persist through the picker overlay.
-
 - **GTK terminal panel toggle requires two clicks** — The `[P]` layout toggle button in the GTK status bar requires two clicks to show the terminal panel on the first use. Subsequent toggles work with a single click. Likely a timing issue between the `EngineAction::OpenTerminal` dispatch and the GTK layout recomputation.
 
 
 ## Resolved
+
+- **TUI spell underlines bleed into fuzzy finder** — `set_cell()` and `set_cell_wide()` only reset character/fg/bg but not `cell.modifier` or `cell.underline_color`, so `Modifier::UNDERLINED` from spell rendering survived into the picker overlay. Fixed by resetting both fields in `set_cell()`, `set_cell_wide()`, and `set_cell_styled()` (which left stale `underline_color` when passed `None`).
 
 - **Marksman LSP status indicator stuck on "initializing"** — `mark_server_responded()` was only called on non-empty hover/definition responses, so servers like `marksman` that don't support semantic tokens (and may return empty hover content for many positions) stayed stuck at "Initializing". Fixed by marking the server as responsive on `Initialized` event (handshake completion is sufficient proof of readiness), and removing the empty-result guards on hover/definition responses.
 

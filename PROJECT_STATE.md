@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 5, 2026 (Session 251 — Layout toggle buttons) | **Tests:** 5304
+**Last updated:** Apr 5, 2026 (Session 252 — TUI spell underline bleed fix) | **Tests:** 5304
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 251 are in **SESSION_HISTORY.md**.
@@ -28,4 +28,4 @@ When implementing a new key/command, add tests covering:
 
 > All sessions through 251 archived in **SESSION_HISTORY.md**.
 
-- **Session 251**: Layout toggle buttons — clickable nerd-font icon segments (󰘖/󰆍/󰍜 with `[S]`/`[P]`/`[M]` ASCII fallbacks) in per-window status bar to toggle sidebar, terminal panel, and menu bar visibility; dim when inactive. GTK status bar click hit-testing overhauled: Pango-measured `StatusSegmentMap` cache replaces `char_width`-based approximation (fixes nerd font glyph width mismatch). Menu bar toggle hidden in GTK (title bar can't be hidden). `EngineAction::OpenTerminal` returned when no PTY panes exist. `menu_bar_toggleable` engine field. 4 new tests (5304 total).
+- **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()` in TUI backend only reset char/fg/bg but not `cell.modifier` or `cell.underline_color`, so spell check underlines bled through into picker/fuzzy finder overlays. Fixed by resetting `modifier` to `Modifier::empty()` and `underline_color` to `RColor::Reset` in all three cell-setting functions. Added remote editing research item to PLAN.md.

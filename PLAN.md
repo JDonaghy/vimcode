@@ -23,10 +23,11 @@
 ---
 
 ## Recently Completed
-- **Session 251**: Layout toggle buttons — nerd-font icon segments in per-window status bar; GTK Pango-measured `StatusSegmentMap` cache for accurate click zones; menu toggle hidden in GTK; `menu_bar_toggleable` field. 4 new tests (5304 total).
-> Sessions 250 and earlier in **SESSION_HISTORY.md**.
+- **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` and `underline_color` so spell underlines don't bleed into picker overlays. Added remote editing research item.
+> Sessions 251 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
+- [x] TUI spell underlines bleed into fuzzy finder — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` + `underline_color`
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
 - [x] GStrInteriorNulError crash from NUL byte in dialog button hotkey
 - [x] Lightbulb code action icon duplicated on wrapped lines
@@ -261,6 +262,9 @@
 - [ ] **Announce on Reddit & Hacker News** — "Show HN: VimCode — Vim+VSCode hybrid editor in Rust"; post to r/rust, r/vim, r/neovim. Wait until the editor feels stable enough for first impressions.
 - [ ] **Publish on Flathub** — Submit the Flatpak to Flathub for discoverability and a trusted backlink.
 - [ ] **Additional website pages** — Getting Started guide, screenshots gallery, extension registry browser. Add each to sitemap.
+
+### Remote Editing
+- [ ] **Remote editing over SSH** — Research and design a remote editing story for VimCode. Key questions: (1) **Neovim's approach** — Neovim supports `--remote`, `--server`, and `--headless` modes with a msgpack RPC API; clients connect over stdio/TCP/Unix socket; how much of this is worth emulating? (2) **SSH tunneling** — can VimCode run headless on a remote host with the TUI/GTK frontend on the local machine, forwarding over SSH (à la VS Code Remote SSH)? What's the protocol between frontend and engine? (3) **Headless VimCode** — a `vcd --headless` mode that exposes the engine over a socket/pipe for scripting, testing, or remote frontends; what API surface is needed? (4) **sshfs / FUSE alternative** — simpler approach: open remote files via sshfs mount; what are the LSP/git/terminal implications? (5) **Latency** — how to handle input latency, optimistic rendering, reconnection. Study Neovim's `--headless` + `nvim --listen`, VS Code Remote SSH extension architecture, and Mosh's approach to latency compensation.
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki

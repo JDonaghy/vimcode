@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 251 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 252 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 252 — TUI spell underline bleed fix (5304 tests):**
+
+Bug fix: TUI spell check underlines bled into fuzzy finder (picker) popup overlays. Root cause: `set_cell()` (346 call sites across TUI rendering) only reset character, fg, and bg colors but never cleared `cell.modifier` or `cell.underline_color`. When spell checking added `Modifier::UNDERLINED` + `underline_color` to editor cells, the picker overlay's clear pass via `set_cell()` left those attributes intact, causing horizontal underlines at the same screen positions in the popup. Fixed by resetting `modifier = Modifier::empty()` and `underline_color = RColor::Reset` in `set_cell()`, `set_cell_wide()` (both main and continuation cells), and `set_cell_styled()` (which left stale `underline_color` when passed `None`). Files changed: `src/tui_main/mod.rs`. Also added "Remote editing over SSH" research item to PLAN.md.
 
 ---
 
