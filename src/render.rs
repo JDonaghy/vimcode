@@ -1957,6 +1957,20 @@ pub struct Theme {
     pub explorer_file_fg: Color,
     /// Background tint for rows whose file is open in a buffer.
     pub explorer_active_bg: Color,
+
+    // Scrollbar
+    /// Scrollbar thumb (draggable part).
+    pub scrollbar_thumb: Color,
+    /// Scrollbar track (gutter behind thumb).
+    pub scrollbar_track: Color,
+
+    // Integrated terminal
+    /// Default background for the integrated terminal pane.
+    pub terminal_bg: Color,
+
+    // Activity bar
+    /// Foreground for activity bar icons.
+    pub activity_bar_fg: Color,
 }
 
 impl Theme {
@@ -2132,6 +2146,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
             explorer_file_fg: Color::from_hex("#aab1be"), // muted grey (matches OneDark sidebar)
             explorer_active_bg: Color::from_hex("#333842"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#5a5a5a"),
+            scrollbar_track: Color::from_hex("#1a1a1a"),
+            terminal_bg: Color::from_hex("#1e1e1e"),
+            activity_bar_fg: Color::from_hex("#c8c8d2"),
         }
     }
 
@@ -2275,6 +2294,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
             explorer_file_fg: Color::from_hex("#bdae93"), // gruvbox muted
             explorer_active_bg: Color::from_hex("#45403d"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#665c54"),
+            scrollbar_track: Color::from_hex("#282828"),
+            terminal_bg: Color::from_hex("#282828"),
+            activity_bar_fg: Color::from_hex("#bdae93"),
         }
     }
 
@@ -2418,6 +2442,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
             explorer_file_fg: Color::from_hex("#a9b1d6"), // tokyo muted
             explorer_active_bg: Color::from_hex("#2f3550"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#565f89"),
+            scrollbar_track: Color::from_hex("#1a1b26"),
+            terminal_bg: Color::from_hex("#1a1b26"),
+            activity_bar_fg: Color::from_hex("#a9b1d6"),
         }
     }
 
@@ -2561,6 +2590,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
             explorer_file_fg: Color::from_hex("#93a1a1"), // solarized base1
             explorer_active_bg: Color::from_hex("#0a4050"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#586e75"),
+            scrollbar_track: Color::from_hex("#002b36"),
+            terminal_bg: Color::from_hex("#002b36"),
+            activity_bar_fg: Color::from_hex("#93a1a1"),
         }
     }
 
@@ -2704,6 +2738,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
             explorer_file_fg: Color::from_hex("#bbbbbb"), // VSCode default sidebar fg
             explorer_active_bg: Color::from_hex("#2a2d3e"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#5a5a5a"),
+            scrollbar_track: Color::from_hex("#1e1e1e"),
+            terminal_bg: Color::from_hex("#1e1e1e"),
+            activity_bar_fg: Color::from_hex("#c8c8d2"),
         }
     }
 
@@ -2846,6 +2885,11 @@ impl Theme {
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
             explorer_file_fg: Color::from_hex("#3b3b3b"), // VSCode light sidebar fg
             explorer_active_bg: Color::from_hex("#dce5f0"), // current-file tint
+
+            scrollbar_thumb: Color::from_hex("#b0b0b0"),
+            scrollbar_track: Color::from_hex("#f3f3f3"),
+            terminal_bg: Color::from_hex("#ffffff"),
+            activity_bar_fg: Color::from_hex("#646e6e"),
         }
     }
 
@@ -3050,6 +3094,19 @@ impl Theme {
         }
         if let Some(c) = color("sideBar.foreground") {
             theme.explorer_file_fg = c;
+        }
+
+        // ── Scrollbar / terminal / activity bar ─────────────────────────
+        if let Some(c) = color("scrollbarSlider.background") {
+            theme.scrollbar_thumb = c;
+            // VSCode doesn't have a separate track colour; derive from background
+            theme.scrollbar_track = theme.background;
+        }
+        if let Some(c) = color("terminal.background") {
+            theme.terminal_bg = c;
+        }
+        if let Some(c) = color("activityBar.foreground") {
+            theme.activity_bar_fg = c;
         }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────

@@ -1391,6 +1391,7 @@ fn event_loop(
                                 crate::core::settings::Settings::load_with_validation()
                             {
                                 engine.settings = new_settings;
+                                engine.ensure_spell_checker();
                                 engine.message = "Settings reloaded".to_string();
                                 needs_redraw = true;
                             }
@@ -3861,9 +3862,11 @@ fn set_cell_wide(
         s.push(ch);
         buf[(x, y)].set_symbol(&s).set_fg(fg).set_bg(bg);
         if x + 1 < area.x + area.width {
-            let next = &mut buf[(x + 1, y)];
-            next.reset();
-            next.set_skip(true);
+            // Mark as wide-char continuation: empty symbol tells ratatui this
+            // cell is the trailing half of a double-width glyph.  Unlike
+            // set_skip(true), ratatui WILL emit the background colour so the
+            // terminal doesn't show a black rectangle.
+            buf[(x + 1, y)].set_symbol("").set_fg(fg).set_bg(bg);
         }
     }
 }

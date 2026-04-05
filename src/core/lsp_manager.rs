@@ -370,7 +370,7 @@ pub enum LspStatus {
 }
 
 impl LspManager {
-    /// Mark a server as having returned a meaningful response (indexing complete).
+    /// Mark a server as responsive (ready for requests).
     pub fn mark_server_responded(&mut self, server_id: LspServerId) {
         self.server_has_responded.insert(server_id, true);
     }

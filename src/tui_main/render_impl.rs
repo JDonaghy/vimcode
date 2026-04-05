@@ -3114,7 +3114,7 @@ pub(super) fn render_scrollbar(
         return;
     }
     let track_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
     // Track height: reserve last row for h-scrollbar if present
     let track_h = if has_h_scrollbar {
@@ -3154,7 +3154,7 @@ pub(super) fn render_h_scrollbar(
     if area.height == 0 || max_col == 0 || viewport_cols == 0 {
         return;
     }
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
     let corner_fg = rc(theme.separator);
 
@@ -3395,7 +3395,7 @@ pub(super) fn render_separators(
         return;
     }
     let sep_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let track_fg = sep_fg;
     let sep_bg = rc(theme.background);
 

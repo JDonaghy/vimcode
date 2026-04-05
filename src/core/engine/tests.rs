@@ -9124,6 +9124,137 @@ fn test_picker_palette_command_opens_picker() {
     assert_eq!(engine.picker_source, PickerSource::Commands);
 }
 
+// ─── Picker search history tests ─────────────────────────────────────────
+
+#[test]
+fn test_picker_history_saved_on_confirm() {
+    let mut e = Engine::new();
+    // Open picker, type a query, confirm.
+    e.open_picker(PickerSource::Grep);
+    e.handle_picker_key("", Some('f'), false);
+    e.handle_picker_key("", Some('o'), false);
+    e.handle_picker_key("", Some('o'), false);
+    e.handle_picker_key("Return", None, false);
+    assert!(!e.picker_open);
+    let hist = e.picker_history.get(&PickerSource::Grep).unwrap();
+    assert_eq!(hist, &["foo"]);
+}
+
+#[test]
+fn test_picker_history_no_duplicate_consecutive() {
+    let mut e = Engine::new();
+    // Confirm same query twice — should only appear once.
+    for _ in 0..2 {
+        e.open_picker(PickerSource::Grep);
+        for c in "foo".chars() {
+            e.handle_picker_key("", Some(c), false);
+        }
+        e.handle_picker_key("Return", None, false);
+    }
+    let hist = e.picker_history.get(&PickerSource::Grep).unwrap();
+    assert_eq!(hist, &["foo"]);
+}
+
+#[test]
+fn test_picker_history_per_source() {
+    let mut e = Engine::new();
+    // Add history for Grep.
+    e.open_picker(PickerSource::Grep);
+    for c in "grep_q".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Add history for Files.
+    e.open_picker(PickerSource::Files);
+    for c in "file_q".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Each source has its own history.
+    assert_eq!(
+        e.picker_history.get(&PickerSource::Grep).unwrap(),
+        &["grep_q"]
+    );
+    assert_eq!(
+        e.picker_history.get(&PickerSource::Files).unwrap(),
+        &["file_q"]
+    );
+}
+
+#[test]
+fn test_picker_history_up_recalls_at_top() {
+    let mut e = Engine::new();
+    // Build some history.
+    for q in &["alpha", "beta"] {
+        e.open_picker(PickerSource::Grep);
+        for c in q.chars() {
+            e.handle_picker_key("", Some(c), false);
+        }
+        e.handle_picker_key("Return", None, false);
+    }
+    // Open fresh picker, press Up at top to recall history.
+    e.open_picker(PickerSource::Grep);
+    assert_eq!(e.picker_query, "");
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "beta"); // most recent
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "alpha"); // older
+                                         // Up at oldest stays at oldest.
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "alpha");
+}
+
+#[test]
+fn test_picker_history_down_restores_typing() {
+    let mut e = Engine::new();
+    // Build history.
+    e.open_picker(PickerSource::Grep);
+    for c in "old".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Open picker, type something, then browse history and come back.
+    e.open_picker(PickerSource::Grep);
+    for c in "new".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    // Move down to selected=0 first (results have items since "new" matches nothing in grep).
+    // Actually picker_selected starts at 0, so Up enters history.
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "old");
+    // Down past newest restores the typed query.
+    e.handle_picker_key("Down", None, false);
+    assert_eq!(e.picker_query, "new");
+    assert!(e.picker_history_index.is_none());
+}
+
+#[test]
+fn test_picker_history_typing_exits_history_mode() {
+    let mut e = Engine::new();
+    e.open_picker(PickerSource::Grep);
+    for c in "old".chars() {
+        e.handle_picker_key("", Some(c), false);
+    }
+    e.handle_picker_key("Return", None, false);
+    // Browse history, then type — should exit history mode.
+    e.open_picker(PickerSource::Grep);
+    e.handle_picker_key("Up", None, false);
+    assert_eq!(e.picker_query, "old");
+    assert!(e.picker_history_index.is_some());
+    e.handle_picker_key("", Some('x'), false);
+    assert!(e.picker_history_index.is_none());
+    assert_eq!(e.picker_query, "oldx");
+}
+
+#[test]
+fn test_picker_history_empty_query_not_saved() {
+    let mut e = Engine::new();
+    e.open_picker(PickerSource::Grep);
+    // Confirm with empty query — nothing saved.
+    e.handle_picker_key("Return", None, false);
+    assert!(e.picker_history.get(&PickerSource::Grep).is_none());
+}
+
 // ─── Command Center tests ────────────────────────────────────────────────
 
 #[test]
@@ -14261,6 +14392,17 @@ fn test_spell_toggle_via_palette_action() {
     // Simulate palette toggle
     e.settings.spell = !e.settings.spell;
     e.ensure_spell_checker();
+    assert!(e.settings.spell);
+    assert!(e.spell_checker.is_some());
+}
+
+#[test]
+fn test_spell_set_spell_command_initializes_checker() {
+    let mut e = engine_with_text("the quik fox");
+    assert!(!e.settings.spell);
+    assert!(e.spell_checker.is_none());
+    // :set spell should lazy-init the checker
+    e.execute_command("set spell");
     assert!(e.settings.spell);
     assert!(e.spell_checker.is_some());
 }

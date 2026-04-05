@@ -9,12 +9,7 @@ pub(super) fn render_activity_bar(
     engine: &Engine,
 ) {
     let bar_bg = rc(theme.tab_bar_bg);
-    // Icon color adapts to theme brightness for readability.
-    let icon_fg = if theme.is_light() {
-        RColor::Rgb(100, 100, 110)
-    } else {
-        RColor::Rgb(200, 200, 210)
-    };
+    let icon_fg = rc(theme.activity_bar_fg);
     let accent_fg = rc(theme.cursor); // left-edge accent bar for active panel
     let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
 
@@ -1549,9 +1544,9 @@ pub(super) fn render_source_control(
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
     let row_bg = rc(theme.tab_bar_bg);
-    let add_fg = RColor::Rgb(90, 180, 90);
-    let del_fg = RColor::Rgb(220, 70, 60);
-    let mod_fg = RColor::Rgb(220, 180, 80);
+    let add_fg = rc(theme.git_added);
+    let del_fg = rc(theme.git_deleted);
+    let mod_fg = rc(theme.git_modified);
 
     // Build SC data from engine state via the render abstraction.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
@@ -1730,9 +1725,9 @@ pub(super) fn render_source_control(
             let (fg, bg) = if is_focused {
                 (hdr_bg, hdr_fg) // inverted = highlighted
             } else if is_hovered {
-                (item_fg, hover_bg)
+                (hdr_fg, hover_bg)
             } else {
-                (item_fg, btn_bg)
+                (hdr_fg, btn_bg)
             };
             for px in bx..seg_end {
                 set_cell(buf, px, btn_y, ' ', fg, bg);
@@ -3015,11 +3010,7 @@ pub(super) fn render_ext_sidebar(
 
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
-    let sec_bg = ratatui::style::Color::Rgb(
-        (theme.status_bg.r as f64 * 0.85) as u8,
-        (theme.status_bg.g as f64 * 0.85) as u8,
-        (theme.status_bg.b as f64 * 0.85) as u8,
-    );
+    let sec_bg = rc(theme.status_bg.darken(0.15));
     let default_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
@@ -3388,7 +3379,7 @@ pub(super) fn render_debug_sidebar(
     let hdr_bg = rc(theme.status_bg);
     let item_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
-    let act_fg = rc(theme.tab_active_fg);
+    let act_fg = rc(theme.status_fg.lighten(0.2));
     let row_bg = rc(theme.tab_bar_bg);
 
     // ── Row 0: header strip ──────────────────────────────────────────────────
@@ -3411,21 +3402,21 @@ pub(super) fn render_debug_sidebar(
 
     // ── Row 1: Run / Stop button ─────────────────────────────────────────────
     let btn_y = area.y + 1;
-    let (btn_label, btn_fg) = if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-        ("\u{f04b}  Continue", rc(Color::from_rgb(97, 186, 115)))
-    } else if engine.dap_session_active {
-        ("\u{f04d}  Stop", rc(Color::from_rgb(220, 70, 56)))
-    } else {
-        (
-            "\u{f04b}  Start Debugging",
-            rc(Color::from_rgb(97, 186, 115)),
-        )
-    };
+    let (btn_label, btn_icon_fg) =
+        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+            ("\u{f04b}  Continue", rc(theme.git_added))
+        } else if engine.dap_session_active {
+            ("\u{f04d}  Stop", rc(theme.diagnostic_error))
+        } else {
+            ("\u{f04b}  Start Debugging", rc(theme.git_added))
+        };
     for x in area.x..area.x + area.width {
-        set_cell(buf, x, btn_y, ' ', btn_fg, hdr_bg);
+        set_cell(buf, x, btn_y, ' ', hdr_fg, hdr_bg);
     }
+    // Icon character gets the semantic color; label text uses status_fg for readability.
     for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, btn_y, ch, btn_fg, hdr_bg);
+        let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
+        set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
     }
 
     // ── Sections with fixed-height allocation + per-section scrolling ──────
@@ -3486,7 +3477,7 @@ pub(super) fn render_debug_sidebar(
     // are also stored on the sidebar data for reference.)
 
     let track_fg = rc(theme.separator);
-    let thumb_fg = RColor::Rgb(128, 128, 128);
+    let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
 
     let mut row_y = area.y + 2;
@@ -3664,7 +3655,7 @@ pub(super) fn render_debug_output(
     let hdr_bg = rc(theme.status_bg);
     let item_fg = rc(theme.foreground);
     let row_bg = rc(theme.tab_bar_bg);
-    let sb_active = RColor::Rgb(128, 128, 128);
+    let sb_active = rc(theme.scrollbar_thumb);
     let sb_track = rc(theme.separator);
 
     // Header row
@@ -3915,7 +3906,7 @@ pub(super) fn render_terminal_panel(
             if screen_row >= area.y + area.height {
                 break;
             }
-            let term_bg = RColor::Rgb(30, 30, 30);
+            let term_bg = rc(theme.terminal_bg);
 
             // Clear both halves.
             for x in area.x..area.x + area.width.saturating_sub(1) {
@@ -3923,18 +3914,26 @@ pub(super) fn render_terminal_panel(
             }
 
             // Left pane cells.
-            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx);
+            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx, theme);
 
             // Divider column.
             let div_fg = rc(theme.separator);
             set_cell(buf, div_col, screen_row, '│', div_fg, term_bg);
 
             // Right pane cells.
-            render_terminal_pane_cells(buf, &panel.rows, div_col + 1, screen_row, half_w, row_idx);
+            render_terminal_pane_cells(
+                buf,
+                &panel.rows,
+                div_col + 1,
+                screen_row,
+                half_w,
+                row_idx,
+                theme,
+            );
 
             // Scrollbar in the last column.
             let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-                ('█', RColor::Rgb(128, 128, 128))
+                ('█', rc(theme.scrollbar_thumb))
             } else {
                 ('░', rc(theme.separator))
             };
@@ -3958,17 +3957,25 @@ pub(super) fn render_terminal_panel(
         if screen_row >= area.y + area.height {
             break;
         }
-        let term_bg_default = RColor::Rgb(30, 30, 30);
+        let term_bg_default = rc(theme.terminal_bg);
         // Clear row with terminal default background (excluding scrollbar col).
         for x in area.x..area.x + cell_width {
             set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
         }
 
-        render_terminal_pane_cells(buf, &panel.rows, area.x, screen_row, cell_width, row_idx);
+        render_terminal_pane_cells(
+            buf,
+            &panel.rows,
+            area.x,
+            screen_row,
+            cell_width,
+            row_idx,
+            theme,
+        );
 
         // Scrollbar column — same colors as the editor scrollbar.
         let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-            ('█', RColor::Rgb(128, 128, 128))
+            ('█', rc(theme.scrollbar_thumb))
         } else {
             ('░', rc(theme.separator))
         };
@@ -3991,6 +3998,7 @@ pub(super) fn render_terminal_pane_cells(
     screen_row: u16,
     max_cols: u16,
     row_idx: usize,
+    theme: &Theme,
 ) {
     if row_idx >= rows.len() {
         return;
@@ -4006,9 +4014,9 @@ pub(super) fn render_terminal_pane_cells(
         let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
             (bg, fg)
         } else if cell.is_find_active {
-            (RColor::Rgb(0, 0, 0), RColor::Rgb(255, 165, 0))
+            (rc(theme.search_match_fg), rc(theme.search_current_match_bg))
         } else if cell.is_find_match {
-            (RColor::Rgb(255, 220, 0), RColor::Rgb(80, 65, 0))
+            (rc(theme.search_match_fg), rc(theme.search_match_bg))
         } else {
             (fg, bg)
         };

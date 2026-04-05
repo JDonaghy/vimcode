@@ -753,7 +753,7 @@ pub enum StatusAction {
     LspInfo,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PickerSource {
     Files,
@@ -2161,6 +2161,12 @@ pub struct Engine {
     pub picker_title: String,
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
+    /// Per-source search history (session-scoped, not persisted).
+    pub picker_history: std::collections::HashMap<PickerSource, Vec<String>>,
+    /// Current position in history when navigating (None = not browsing history).
+    pub picker_history_index: Option<usize>,
+    /// Saves the user's in-progress query when they start browsing history.
+    pub picker_history_typing_buffer: String,
 
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
@@ -2821,6 +2827,9 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            picker_history: std::collections::HashMap::new(),
+            picker_history_index: None,
+            picker_history_typing_buffer: String::new(),
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),

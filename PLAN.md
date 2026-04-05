@@ -23,9 +23,9 @@
 ---
 
 ## Recently Completed
-- **Session 246**: Explorer overhaul, diagnostic filtering, tree UX. Removed explorer toolbar + TUI header row. Right-click in empty space → root context menu. Inline rename: stem pre-selection, Ctrl-C/V/X/A, horizontal scroll. Diagnostic source filtering via `ignore_error_sources` at storage time + `initialization_options` for per-server LSP config. Explorer: `explorer_file_fg` theme field, TUI indent guide lines, GTK ellipsized names, case-insensitive sort setting. Fixes: GTK inline edit cancelled by indicator update, SIGSEGV on marker rows, `LineEnding::detect()` byte-boundary crash. 10 new tests (5292 total).
-- **Session 245**: Editor action menu, richer tree-sitter highlighting, explorer color overhaul. Action menu: `⋯` button with 8-item dropdown, both GTK+TUI. Tree-sitter: 12 new Theme fields, all 20 language queries expanded, keywords split into storage vs control flow, fixed reparse, insert mode immediate re-parse. Explorer: same base color for files/dirs, recursive git/diagnostic propagation, GTK indicator in own column. 7 new tests (5282 total).
-> Sessions 244 and earlier in **SESSION_HISTORY.md**.
+- **Session 250**: Marksman LSP status indicator fix — `mark_server_responded()` on `Initialized` event; removed empty-result guards on hover/definition.
+- **Session 249**: Spell check underline misalignment fix, spell checker lazy-init, inline rename test fix for CI (5300 total).
+> Sessions 248 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
@@ -246,7 +246,7 @@
 - [ ] **GTK explorer indent guide lines** — TUI has vertical `│` indent guides; GTK TreeView doesn't support vertical-only guides (built-in `enable_tree_lines` draws horizontal connectors too). Needs custom rendering — either a cell data function with guide characters or Cairo custom drawing in a separate column.
 
 ### Picker / Fuzzy Finder
-- [ ] **Search history in picker dialogs** — Up arrow in the picker query input (live grep, fuzzy find, etc.) should recall previous searches from the current session. Maintain a per-source history stack (e.g., separate history for grep vs files vs symbols). Down arrow navigates forward. History is session-scoped (not persisted to disk).
+- [x] **Search history in picker dialogs** — Up arrow at top of results recalls previous searches from the current session. Per-source history stack (`picker_history: HashMap<PickerSource, Vec<String>>`); Down navigates forward or restores the in-progress query; typing/backspace/paste exits history mode; consecutive duplicates deduplicated; capped at 100 entries; session-scoped (not persisted). 7 new tests.
 
 ### CI & Distribution
 - [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.

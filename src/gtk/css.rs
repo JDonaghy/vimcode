@@ -15,7 +15,7 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
     let sel_bg = theme.fuzzy_selected_bg.to_hex();
     // Selected item text: white on dark selection bg for both light/dark themes.
     let sel_fg = if theme.is_light() {
-        "#ffffff".to_string()
+        theme.foreground.darken(0.9).to_hex()
     } else {
         bar_fg.clone()
     };
@@ -23,6 +23,8 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
     let dim_fg = theme.line_number_fg.to_hex();
     let entry_bg = theme.active_background.to_hex();
     let border_col = theme.separator.to_hex();
+    let sb_thumb = theme.scrollbar_thumb.to_hex();
+    let comment_fg = theme.comment.to_hex();
     format!(
         r#"
         /* Activity Bar */
@@ -259,6 +261,46 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
             background-color: {entry_bg};
             color: {text_fg};
             border: 1px solid {border_col};
+        }}
+
+        /* Scrollbar — theme-aware overrides */
+        scrollbar slider {{
+            background: alpha({sb_thumb}, 0.5);
+        }}
+        scrollbar slider:hover {{
+            background: alpha({sb_thumb}, 0.7);
+        }}
+        scrollbar slider:active {{
+            background: alpha({sb_thumb}, 0.9);
+        }}
+
+        /* Horizontal editor scrollbar — theme-aware */
+        .h-editor-scrollbar slider {{
+            background: alpha({sb_thumb}, 0.45);
+        }}
+        .h-editor-scrollbar slider:hover {{
+            background: alpha({sb_thumb}, 0.7);
+        }}
+
+        /* Find/Replace dialog — theme-aware */
+        .find-dialog {{
+            background-color: {editor_bg};
+            border: 1px solid {border_col};
+        }}
+        .find-dialog entry {{
+            background-color: {entry_bg};
+            color: {text_fg};
+            border: 1px solid {border_col};
+        }}
+        .find-dialog button {{
+            border: 1px solid {border_col};
+            color: {text_fg};
+        }}
+        .find-dialog button:hover {{
+            background-color: {hover_bg};
+        }}
+        .find-match-count {{
+            color: {comment_fg};
         }}
         "#
     )

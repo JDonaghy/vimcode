@@ -1,9 +1,57 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 246 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 250 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 250 — Marksman LSP status indicator fix (5300 tests):**
+
+Bug fix: LSP status bar indicator stuck on "Initializing" for Marksman (Markdown LSP) and potentially other servers that don't support semantic tokens. Root cause: `mark_server_responded()` was only called on non-empty hover/definition responses. Marksman doesn't return semantic tokens and often returns empty hover content, so the readiness flag never got set. Fixed by: (1) calling `mark_server_responded()` on `LspEvent::Initialized` — the initialization handshake completing is sufficient proof of readiness; (2) removing `if !locations.is_empty()` guard on `DefinitionResponse` handler; (3) removing `if contents.is_some()` guard on `HoverResponse` handler. Files changed: `src/core/engine/panels.rs`, `src/core/lsp_manager.rs`.
+
+---
+
+**Session 249 — Spell underline fix, spell checker init, CI rename test fix (5300 tests):**
+
+Bug fix: GTK spell check underline misaligned. Root cause: `draw_editor` in `draw.rs` called `layout.set_attributes(None)` before computing positions via `index_to_pos()` for diagnostic underlines, spell underlines, cursor, ghost text, and extra cursors. This stripped `font_scale` attributes (markdown headings use 1.1–1.4×), causing character positions to be computed at normal font width while text was rendered at scaled width. Underlines started before the word and ended in the middle. Fixed by restoring correct Pango attributes via `build_pango_attrs(&rl.spans)` before all `index_to_pos` calls. 5 sites fixed in `draw.rs`: line-level restore (diagnostics + spell), cursor, ghost text, extra cursors.
+
+Bug fix: Spell checker not initializing when `spell` setting enabled via Settings sidebar (Bool toggle or text entry in `ext_panel.rs`) or via `settings.json` file reload (both GTK `mod.rs` and TUI `mod.rs`). Added `ensure_spell_checker()` calls after `set_value_str` for the `spell` key and after settings reload from disk.
+
+Bug fix: CI failure — 2 inline rename integration tests (`test_inline_rename_start`, `test_inline_rename_typing_and_cursor`) in `tests/context_menu.rs` expected cursor at full filename length (e.g., 7 for "old.txt"), but `start_explorer_rename()` positions cursor at stem end (3 for "old"). Tests updated to match. Failure was on macOS ARM64 CI runner, also reproducible locally.
+
+Files changed: `src/gtk/draw.rs` (5960 lines, +3), `src/core/engine/ext_panel.rs`, `src/gtk/mod.rs`, `src/tui_main/mod.rs`, `src/core/engine/tests.rs` (+1 test), `tests/context_menu.rs` (2 test fixes).
+
+---
+
+**Session 248 — TUI settings button fix, hardcoded colors cleanup, wide-char rendering fix (5299 tests):**
+
+Bug fix: TUI Settings button in activity bar not clickable. Four early-return click handlers in `mouse.rs` (command line input, message line selection, status bar branch click, bottom-row guard) intercepted ALL clicks on the bottom two terminal rows regardless of column, before the activity bar handler at line 1562 could process them. The settings button is rendered at the bottom of the activity bar, which coincides with the command line row. Fixed by adding `col >= ab_width` guards to all four checks.
+
+Hardcoded colors cleanup: Added 4 new Theme fields (`scrollbar_thumb`, `scrollbar_track`, `terminal_bg`, `activity_bar_fg`) with values for all 6 built-in themes (onedark, gruvbox_dark, tokyo_night, solarized_dark, vscode_dark, vscode_light) + VSCode JSON theme importer (`scrollbarSlider.background`, `terminal.background`, `activityBar.foreground`). Replaced ~50 hardcoded color values across 5 files:
+- `render_impl.rs`: 3× `RColor::Rgb(128,128,128)` scrollbar thumbs → `theme.scrollbar_thumb`
+- `panels.rs`: activity bar icons → `theme.activity_bar_fg`; git status colors → `theme.git_added/modified/deleted`; debug buttons → `theme.git_added`/`theme.diagnostic_error`; scrollbar thumbs → `theme.scrollbar_thumb`; terminal bg → `theme.terminal_bg`; terminal find-match → `theme.search_match_*`; ext panel secondary bg → `theme.status_bg.darken(0.15)`
+- `mod.rs` (GTK): search result markup → `theme.function`/`theme.foreground`; cursor indicator → `theme.scrollbar_thumb`
+- `draw.rs` (GTK): h-scrollbar track/thumb → `theme.scrollbar_track`/`theme.scrollbar_thumb`; tab drag overlay → `theme.cursor`/`theme.background`/`theme.foreground`; picker scrollbar track → `theme.scrollbar_track`; terminal bg → `theme.terminal_bg`
+- `css.rs` (GTK): scrollbar slider, h-editor-scrollbar, find dialog, find-match-count colors now theme-aware via `make_theme_css()` overrides
+
+Wide-char rendering fix: `set_cell_wide()` in `tui_main/mod.rs` used `reset()` + `set_skip(true)` on the continuation cell of double-width Nerd Font glyphs. `set_skip(true)` prevented ratatui from emitting anything for that cell, leaving the terminal's default black background visible as a black rectangle next to wide glyphs. Fixed by using `set_symbol("")` + `set_fg(fg)` + `set_bg(bg)` instead — ratatui's convention for wide-char continuation cells that correctly emits the background color.
+
+Theme consistency fixes found during smoke testing:
+- Git commit bar buttons used `theme.foreground` (dark on light themes) instead of `theme.status_fg` — illegible against blue `status_bg`. Fixed to use `hdr_fg` (status_fg).
+- Debug sidebar active section header used `theme.tab_active_fg` (#333333 on light themes) — black on blue status_bg. Fixed to use `theme.status_fg.lighten(0.2)`.
+- Debug "Start Debugging" button: full label was green (`theme.git_added`) which is hard to read on blue status_bg. Fixed: icon char gets semantic green/red, label text uses `hdr_fg` (status_fg) for readability.
+
+Files changed: `src/render.rs` (4 new Theme fields + 6 themes + VSCode importer), `src/tui_main/mouse.rs` (activity bar click fix), `src/tui_main/render_impl.rs` (scrollbar thumbs), `src/tui_main/panels.rs` (activity bar, git, debug, terminal, scrollbar colors), `src/tui_main/mod.rs` (set_cell_wide fix), `src/gtk/mod.rs` (search result markup, cursor indicator), `src/gtk/draw.rs` (scrollbar, tab drag, terminal bg), `src/gtk/css.rs` (theme-aware CSS overrides), `BUGS.md`.
+
+**Session 247 — GTK explorer first-click bug fix, picker search history (5299 tests):**
+
+Bug fix: GTK TreeView folders required two clicks/Enter presses to expand the first time. Root cause: `tree_row_expanded()` in `tree.rs` removed the dummy placeholder child (`__vimcode_loading__`) before calling `build_file_tree_shallow()` to populate real children. Between remove and populate, the directory had zero children, causing GTK to auto-collapse the row. Fix: populate real children first, then remove the dummy. Also fixed Enter after arrow-key navigation — intercept Return/KP_Enter in the TreeView key handler and send `Msg::ExplorerActivateSelected` (which syncs cursor→selection via `select_path()`) instead of relying on native `row_activated` (which uses the stale selection, not the arrow-key cursor position).
+
+Picker search history: `picker_history: HashMap<PickerSource, Vec<String>>` on Engine (session-scoped, not persisted). `picker_push_history()` saves non-empty trimmed query on confirm; consecutive duplicates deduplicated; capped at 100 entries. `picker_history_index: Option<usize>` + `picker_history_typing_buffer: String` for browsing state. Up at `picker_selected == 0` enters history mode (saves current query, recalls most recent entry); subsequent Ups go to older entries; `saturating_sub(1)` at oldest. Down in history mode navigates newer; past newest restores original typed query and exits history mode. Typing, backspace, paste all call `picker_exit_history()` to reset. History state reset on `open_picker()`. Added `Eq + Hash` derives to `PickerSource` for HashMap key usage. 7 new tests.
+
+New bug filed: Marksman (Markdown LSP) status bar indicator stuck on "initializing" — greyed out with `…` suffix persists. Likely because marksman doesn't support `textDocument/semanticTokens`, and the render-side readiness heuristic downgrades `Running` to `Initializing` when `BufferState.semantic_tokens` is empty.
+
+Files changed: `src/gtk/tree.rs` (lazy-load ordering), `src/gtk/mod.rs` (Enter key handler), `src/core/engine/mod.rs` (PickerSource derives + history fields), `src/core/engine/picker.rs` (history helpers + key handler modifications), `src/core/engine/tests.rs` (7 new tests), `BUGS.md`, `PLAN.md`.
 
 **Session 246 — Explorer overhaul, diagnostic filtering, tree UX (5292 tests):**
 

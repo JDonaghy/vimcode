@@ -151,8 +151,10 @@ pub(super) fn tree_row_expanded(
     if let Some(child) = store.iter_children(Some(iter)) {
         let child_path: String = store.get_value(&child, 2).get().unwrap_or_default();
         if child_path == TREE_DUMMY_PATH {
-            // Remove the dummy and populate real children.
-            store.remove(&child);
+            // Populate real children BEFORE removing the dummy so the
+            // directory never has zero children — GTK auto-collapses a
+            // row the instant its last child is removed, which caused
+            // the "first click swallowed" bug.
             build_file_tree_shallow(
                 store,
                 Some(iter),
@@ -162,6 +164,7 @@ pub(super) fn tree_row_expanded(
                 dir_fg_hex,
                 file_fg_hex,
             );
+            store.remove(&child);
         }
         // If the first child is NOT the dummy, the directory was already
         // populated (e.g. collapsed and re-expanded) — nothing to do.

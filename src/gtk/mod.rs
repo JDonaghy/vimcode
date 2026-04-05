@@ -882,9 +882,14 @@ impl SimpleComponent for App {
                                             sender.input(Msg::ToggleFocusSearch);
                                             return gtk4::glib::Propagation::Stop;
                                         }
-                                        // Arrow keys + Enter: let TreeView handle natively
-                                        // (Enter fires row_activated which handles dirs+files)
-                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "Return" | "KP_Enter" | "space") {
+                                        // Enter: use our handler that syncs cursor→selection first
+                                        // (native row_activated uses selection which lags behind arrow-key cursor)
+                                        if matches!(key_name.as_str(), "Return" | "KP_Enter") {
+                                            sender.input(Msg::ExplorerActivateSelected);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Arrow keys + space: let TreeView handle natively
+                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "space") {
                                             return gtk4::glib::Propagation::Proceed;
                                         }
 
@@ -4496,6 +4501,7 @@ impl SimpleComponent for App {
                 if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
                     let mut engine = self.engine.borrow_mut();
                     engine.settings = new_settings;
+                    engine.ensure_spell_checker();
                     engine.message = "Settings reloaded from disk".to_string();
                     drop(engine);
 
@@ -4961,6 +4967,7 @@ impl App {
             return;
         }
 
+        let theme = Theme::from_name(&engine.settings.colorscheme);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut last_file: Option<PathBuf> = None;
 
@@ -4971,7 +4978,8 @@ impl App {
                 let rel = m.file.strip_prefix(&cwd).unwrap_or(&m.file);
                 let file_label = gtk4::Label::new(None);
                 let header_markup = format!(
-                    "<b><span foreground='#569cd6'>{}</span></b>",
+                    "<b><span foreground='{}'>{}</span></b>",
+                    theme.function.to_hex(),
                     gtk4::glib::markup_escape_text(&rel.display().to_string())
                 );
                 file_label.set_markup(&header_markup);
@@ -4988,7 +4996,8 @@ impl App {
             let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
             let row_label = gtk4::Label::new(None);
             let result_markup = format!(
-                "<span foreground='#cccccc'>{}</span>",
+                "<span foreground='{}'>{}</span>",
+                theme.foreground.to_hex(),
                 gtk4::glib::markup_escape_text(&snippet)
             );
             row_label.set_markup(&result_markup);
@@ -5208,8 +5217,13 @@ impl App {
         cursor_indicator.set_valign(gtk4::Align::Start);
         cursor_indicator.set_hexpand(false);
         cursor_indicator.set_vexpand(false);
-        cursor_indicator.set_draw_func(|_, cr, w, h| {
-            cr.set_source_rgba(0.5, 0.5, 0.5, 0.8);
+        let thumb_color = {
+            let engine = self.engine.borrow();
+            Theme::from_name(&engine.settings.colorscheme).scrollbar_thumb
+        };
+        cursor_indicator.set_draw_func(move |_, cr, w, h| {
+            let (r, g, b) = thumb_color.to_cairo();
+            cr.set_source_rgba(r, g, b, 0.8);
             cr.rectangle(0.0, 0.0, w as f64, h as f64);
             let _ = cr.fill();
         });

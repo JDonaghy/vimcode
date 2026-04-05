@@ -691,7 +691,13 @@ impl Engine {
         let mut redraw = false;
         for event in events {
             match event {
-                LspEvent::Initialized(..) => {
+                LspEvent::Initialized(server_id, ..) => {
+                    // Mark server as responsive — initialization handshake is
+                    // sufficient proof for servers that don't support semantic
+                    // tokens (e.g. marksman).
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
+                    }
                     // Server is ready — re-open any already-open buffers
                     let buffers: Vec<(PathBuf, String)> = self
                         .buffer_manager
@@ -779,10 +785,8 @@ impl Engine {
                     locations,
                     ..
                 } => {
-                    if !locations.is_empty() {
-                        if let Some(mgr) = self.lsp_manager.as_mut() {
-                            mgr.mark_server_responded(server_id);
-                        }
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
                     }
                     self.lsp_pending_definition = None;
                     self.message.clear();
@@ -815,10 +819,8 @@ impl Engine {
                     contents,
                     ..
                 } => {
-                    if contents.is_some() {
-                        if let Some(mgr) = self.lsp_manager.as_mut() {
-                            mgr.mark_server_responded(server_id);
-                        }
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.mark_server_responded(server_id);
                     }
                     self.lsp_pending_hover = None;
                     // Treat empty/whitespace-only hover as "no hover".

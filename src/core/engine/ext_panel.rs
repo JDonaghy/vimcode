@@ -2038,6 +2038,10 @@ impl Engine {
                     if self.settings.set_value_str(def.key, &val).is_ok() {
                         let _ = self.settings.save();
                     }
+                    // Lazy-init spell checker when toggled on via text entry
+                    if def.key == "spell" && self.settings.spell {
+                        self.ensure_spell_checker();
+                    }
                     self.settings_editing = None;
                     self.settings_edit_buf.clear();
                 }
@@ -2139,6 +2143,10 @@ impl Engine {
                                         let new_val = if cur == "true" { "false" } else { "true" };
                                         if self.settings.set_value_str(def.key, new_val).is_ok() {
                                             let _ = self.settings.save();
+                                        }
+                                        // Lazy-init spell checker when toggled on
+                                        if def.key == "spell" && self.settings.spell {
+                                            self.ensure_spell_checker();
                                         }
                                     }
                                 }

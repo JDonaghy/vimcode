@@ -712,7 +712,7 @@ fn test_inline_rename_start() {
     let state = e.explorer_rename.as_ref().unwrap();
     assert_eq!(state.path, path);
     assert_eq!(state.input, "old.txt");
-    assert_eq!(state.cursor, 7); // "old.txt".len()
+    assert_eq!(state.cursor, 3); // "old" stem len (extension not selected)
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -842,11 +842,14 @@ fn test_inline_rename_typing_and_cursor() {
     let state = e.explorer_rename.as_ref().unwrap();
     assert_eq!(state.input, "dummy_rename_cursor.txt");
     let initial_len = state.input.len();
+    // Cursor starts at stem end (before ".txt"), not full name end
+    let stem_len = "dummy_rename_cursor".len(); // 19
+    assert_eq!(state.cursor, stem_len);
 
     // Left arrow moves cursor back
     e.handle_explorer_rename_key("Left", None, false);
     let state = e.explorer_rename.as_ref().unwrap();
-    assert_eq!(state.cursor, initial_len - 1);
+    assert_eq!(state.cursor, stem_len - 1);
 
     // Home moves cursor to start
     e.handle_explorer_rename_key("Home", None, false);

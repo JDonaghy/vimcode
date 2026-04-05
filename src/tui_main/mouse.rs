@@ -1202,9 +1202,13 @@ pub(super) fn handle_mouse(
     }
 
     // ── Command line click — start text selection ──────────────────────────────
+    // Skip when click is in the activity bar column (settings button lives there).
     {
         use crate::core::Mode;
-        if row + 1 == term_height && matches!(engine.mode, Mode::Command | Mode::Search) {
+        if row + 1 == term_height
+            && col >= ab_width
+            && matches!(engine.mode, Mode::Command | Mode::Search)
+        {
             let char_idx = col as usize;
             let buf_len = engine.command_buffer.chars().count();
             engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
@@ -1214,6 +1218,7 @@ pub(super) fn handle_mouse(
         }
         // Also allow selection on the message/command line in Normal mode.
         if row + 1 == term_height
+            && col >= ab_width
             && matches!(
                 engine.mode,
                 Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
@@ -1234,7 +1239,8 @@ pub(super) fn handle_mouse(
 
     // ── Status bar branch click — open branch picker ───────────────────────
     // (only when global status bar exists — per-window status replaces it)
-    if row + 2 == term_height && !engine.settings.window_status_line {
+    // Skip when click is in the activity bar column (settings button lives there).
+    if row + 2 == term_height && !engine.settings.window_status_line && col >= ab_width {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             if let Some(layout) = last_layout {
                 if let Some((start, end)) = layout.status_branch_range {
@@ -1249,8 +1255,8 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // Bottom row is cmd — ignore
-    if row + 1 >= term_height {
+    // Bottom row is cmd — ignore (but not in the activity bar column)
+    if row + 1 >= term_height && col >= ab_width {
         return sidebar_width;
     }
 

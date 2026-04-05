@@ -86,6 +86,8 @@ impl Engine {
         self.picker_items.clear();
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.picker_history_index = None;
+        self.picker_history_typing_buffer.clear();
 
         match source {
             PickerSource::Files => {
@@ -1651,6 +1653,7 @@ impl Engine {
 
     /// Execute the currently selected picker item.
     pub fn picker_confirm(&mut self) -> EngineAction {
+        self.picker_push_history();
         let Some(item) = self.picker_items.get(self.picker_selected).cloned() else {
             self.close_picker();
             return EngineAction::None;
@@ -1912,6 +1915,31 @@ impl Engine {
         }
     }
 
+    /// Save the current picker query to per-source history (dedup consecutive).
+    fn picker_push_history(&mut self) {
+        let q = self.picker_query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let hist = self
+            .picker_history
+            .entry(self.picker_source.clone())
+            .or_default();
+        if hist.last().is_none_or(|last| *last != q) {
+            hist.push(q);
+            // Cap at 100 entries.
+            if hist.len() > 100 {
+                hist.remove(0);
+            }
+        }
+    }
+
+    /// Exit history browsing mode, resetting the index.
+    fn picker_exit_history(&mut self) {
+        self.picker_history_index = None;
+        self.picker_history_typing_buffer.clear();
+    }
+
     /// Route a key press when the unified picker is open.
     pub fn handle_picker_key(
         &mut self,
@@ -1967,16 +1995,63 @@ impl Engine {
                 EngineAction::None
             }
             "Down" | "Tab" => {
-                let max = self.picker_items.len().saturating_sub(1);
-                self.picker_selected = (self.picker_selected + 1).min(max);
-                self.picker_update_scroll();
-                self.picker_load_preview();
+                if self.picker_history_index.is_some() {
+                    // Navigate forward in history or exit history mode.
+                    let hist = self
+                        .picker_history
+                        .get(&self.picker_source)
+                        .cloned()
+                        .unwrap_or_default();
+                    let idx = self.picker_history_index.unwrap();
+                    if idx + 1 < hist.len() {
+                        self.picker_history_index = Some(idx + 1);
+                        self.picker_query = hist[idx + 1].clone();
+                    } else {
+                        // Past newest entry — restore the original typed query.
+                        self.picker_query = std::mem::take(&mut self.picker_history_typing_buffer);
+                        self.picker_history_index = None;
+                    }
+                    self.picker_selected = 0;
+                    self.picker_scroll_top = 0;
+                    self.picker_filter();
+                    self.picker_load_preview();
+                } else {
+                    let max = self.picker_items.len().saturating_sub(1);
+                    self.picker_selected = (self.picker_selected + 1).min(max);
+                    self.picker_update_scroll();
+                    self.picker_load_preview();
+                }
                 EngineAction::None
             }
             "Up" => {
-                self.picker_selected = self.picker_selected.saturating_sub(1);
-                self.picker_update_scroll();
-                self.picker_load_preview();
+                if self.picker_selected == 0 {
+                    // At top of results — enter or continue history browsing.
+                    let hist_len = self
+                        .picker_history
+                        .get(&self.picker_source)
+                        .map_or(0, |h| h.len());
+                    if hist_len > 0 {
+                        let hist = &self.picker_history[&self.picker_source];
+                        let new_idx = match self.picker_history_index {
+                            None => {
+                                // Enter history mode — save current query.
+                                self.picker_history_typing_buffer = self.picker_query.clone();
+                                hist_len - 1
+                            }
+                            Some(idx) => idx.saturating_sub(1),
+                        };
+                        self.picker_history_index = Some(new_idx);
+                        self.picker_query = hist[new_idx].clone();
+                        self.picker_selected = 0;
+                        self.picker_scroll_top = 0;
+                        self.picker_filter();
+                        self.picker_load_preview();
+                    }
+                } else {
+                    self.picker_selected = self.picker_selected.saturating_sub(1);
+                    self.picker_update_scroll();
+                    self.picker_load_preview();
+                }
                 EngineAction::None
             }
             "n" if ctrl => {
@@ -2002,6 +2077,7 @@ impl Engine {
                             self.picker_query.push(c);
                         }
                     }
+                    self.picker_exit_history();
                     self.picker_selected = 0;
                     self.picker_scroll_top = 0;
                     self.picker_filter();
@@ -2010,6 +2086,7 @@ impl Engine {
                 EngineAction::None
             }
             "BackSpace" => {
+                self.picker_exit_history();
                 self.picker_query.pop();
                 self.picker_selected = 0;
                 self.picker_scroll_top = 0;
@@ -2021,6 +2098,7 @@ impl Engine {
                 if !ctrl {
                     if let Some(c) = unicode {
                         if !c.is_control() {
+                            self.picker_exit_history();
                             self.picker_query.push(c);
                             self.picker_selected = 0;
                             self.picker_scroll_top = 0;

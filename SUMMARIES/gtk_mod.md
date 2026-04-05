@@ -1,4 +1,4 @@
-# src/gtk/mod.rs — 10,003 lines
+# src/gtk/mod.rs — 10,048 lines
 
 GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleComponent` impl (init/view/update). Contains the main event loop, window setup, input handling, and all GTK widget wiring.
 

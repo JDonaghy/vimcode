@@ -1,4 +1,4 @@
-# src/gtk/draw.rs — 5,944 lines
+# src/gtk/draw.rs — 5,960 lines
 
 All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function renders one UI component onto a Cairo context using data from `ScreenLayout`.
 
