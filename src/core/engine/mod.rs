@@ -751,6 +751,9 @@ pub enum StatusAction {
     ChangeEncoding,
     SwitchBranch,
     LspInfo,
+    ToggleSidebar,
+    TogglePanel,
+    ToggleMenuBar,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2225,6 +2228,8 @@ pub struct Engine {
     // --- Menu bar / debug toolbar ---
     /// Whether the VSCode-style menu bar strip is visible.
     pub menu_bar_visible: bool,
+    /// Whether the menu bar can be fully hidden (true in TUI, false in GTK where it's the title bar).
+    pub menu_bar_toggleable: bool,
     /// Index of the currently open top-level menu dropdown (None = bar visible but no dropdown).
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
@@ -2860,6 +2865,7 @@ impl Engine {
             terminal_split: false,
             terminal_split_left_cols: 0,
             menu_bar_visible: false,
+            menu_bar_toggleable: false,
             menu_open_idx: None,
             debug_toolbar_visible: false,
             dap_session_active: false,

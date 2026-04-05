@@ -3038,7 +3038,9 @@ impl Engine {
     }
 
     /// Handle a click on an interactive status bar segment.
-    pub fn handle_status_action(&mut self, action: &StatusAction) {
+    /// Handle a status bar segment click. Returns an `EngineAction` if the
+    /// caller (backend) must perform it (e.g. sidebar toggle lives on the UI).
+    pub fn handle_status_action(&mut self, action: &StatusAction) -> Option<EngineAction> {
         match action {
             StatusAction::GoToLine => {
                 self.open_picker(PickerSource::CommandCenter);
@@ -3064,6 +3066,19 @@ impl Engine {
             StatusAction::LspInfo => {
                 let _ = self.execute_command("LspInfo");
             }
+            StatusAction::ToggleSidebar => {
+                return Some(EngineAction::ToggleSidebar);
+            }
+            StatusAction::TogglePanel => {
+                if self.terminal_panes.is_empty() {
+                    return Some(EngineAction::OpenTerminal);
+                }
+                self.toggle_terminal();
+            }
+            StatusAction::ToggleMenuBar => {
+                self.toggle_menu_bar();
+            }
         }
+        None
     }
 }

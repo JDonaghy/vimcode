@@ -2449,7 +2449,23 @@ pub(super) fn handle_mouse(
                         if let Some(action) =
                             status_segment_hit_test(status, ww as usize, click_col)
                         {
-                            engine.handle_status_action(&action);
+                            if let Some(ea) = engine.handle_status_action(&action) {
+                                use crate::core::engine::EngineAction;
+                                match ea {
+                                    EngineAction::ToggleSidebar => {
+                                        sidebar.visible = !sidebar.visible;
+                                    }
+                                    EngineAction::OpenTerminal => {
+                                        let cols =
+                                            terminal_size.as_ref().map(|s| s.width).unwrap_or(80);
+                                        engine.terminal_new_tab(
+                                            cols,
+                                            engine.session.terminal_panel_rows,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                     return sidebar_width;

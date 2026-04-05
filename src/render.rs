@@ -6710,6 +6710,46 @@ pub fn build_window_status_line(
             });
         }
 
+        // Layout toggle buttons — dim when inactive, normal when active
+        let toggle_fg = |active: bool| {
+            if active {
+                bar_fg
+            } else {
+                theme.status_inactive_fg
+            }
+        };
+
+        let nf = crate::icons::nerd_fonts_enabled();
+
+        let sidebar_active = engine.session.explorer_visible;
+        right.push(StatusSegment {
+            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            fg: toggle_fg(sidebar_active),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ToggleSidebar),
+        });
+
+        let panel_active = engine.terminal_open || engine.bottom_panel_open;
+        right.push(StatusSegment {
+            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            fg: toggle_fg(panel_active),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::TogglePanel),
+        });
+
+        if engine.menu_bar_toggleable {
+            let menu_active = engine.menu_bar_visible;
+            right.push(StatusSegment {
+                text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
+                fg: toggle_fg(menu_active),
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::ToggleMenuBar),
+            });
+        }
+
         WindowStatusLine {
             left_segments: left,
             right_segments: right,

@@ -41,6 +41,7 @@ pub(super) fn pixel_to_click_target(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) -> ClickTarget {
     let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
@@ -284,17 +285,15 @@ pub(super) fn pixel_to_click_target(
     let text_area_height = rect.height - per_window_status_px;
 
     if y >= rect.y + text_area_height {
-        // Click is in the per-window status bar area — do segment hit-testing
+        // Click is in the per-window status bar area — use Pango-measured cached zones
         if engine.settings.window_status_line {
-            let theme = crate::render::Theme::from_name(&engine.settings.colorscheme);
-            let is_active = window_id == engine.active_window_id();
-            let status =
-                crate::render::build_window_status_line(engine, &theme, window_id, is_active);
             let local_x = x - rect.x;
-            if let Some(action) =
-                gtk_status_segment_hit_test(&status, local_x, rect.width, char_width)
-            {
-                return ClickTarget::StatusBarAction(action);
+            if let Some(zones) = status_segment_map.get(&window_id.0) {
+                for (start, end, action) in zones {
+                    if local_x >= *start && local_x < *end {
+                        return ClickTarget::StatusBarAction(action.clone());
+                    }
+                }
             }
         }
         return ClickTarget::None;
@@ -397,9 +396,9 @@ pub(super) fn pixel_to_click_target(
 }
 
 /// Handle mouse click by converting coordinates to buffer position.
-/// Returns: `None` = non-buffer click (tab bar, split button, etc.);
-/// `Some(true)` = close-tab on dirty buffer (show confirm dialog);
-/// `Some(false)` = normal buffer click.
+/// Returns: `(click, engine_action)` where click is `None` = non-buffer click,
+/// `Some(true)` = close-tab on dirty buffer, `Some(false)` = normal buffer click;
+/// `engine_action` is an optional action the caller must dispatch (e.g. sidebar toggle).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_click(
     engine: &mut Engine,
@@ -414,7 +413,8 @@ pub(super) fn handle_mouse_click(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
-) -> Option<bool> {
+    status_segment_map: &StatusSegmentMap,
+) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
         x,
@@ -427,6 +427,7 @@ pub(super) fn handle_mouse_click(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
+        status_segment_map,
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -435,28 +436,28 @@ pub(super) fn handle_mouse_click(
             } else {
                 engine.mouse_click(wid, line, col);
             }
-            Some(false)
+            (Some(false), None)
         }
         ClickTarget::SplitButton(group_id, dir) => {
             engine.active_group = group_id;
             engine.open_editor_group(dir);
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarPrev => {
             if engine.windows.contains_key(&engine.active_window_id()) {
                 engine.jump_prev_hunk();
             }
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarNext => {
             if engine.windows.contains_key(&engine.active_window_id()) {
                 engine.jump_next_hunk();
             }
-            None
+            (None, None)
         }
         ClickTarget::DiffToolbarToggleFold => {
             engine.diff_toggle_hide_unchanged();
-            None
+            (None, None)
         }
         ClickTarget::CloseTab(group_id, tab_idx) => {
             if let Some(g) = engine.editor_groups.get_mut(&group_id) {
@@ -465,20 +466,20 @@ pub(super) fn handle_mouse_click(
             engine.active_group = group_id;
             engine.line_annotations.clear();
             if engine.dirty() {
-                return Some(true);
+                return (Some(true), None);
             }
             engine.close_tab();
-            None
+            (None, None)
         }
         ClickTarget::StatusBarAction(action) => {
-            engine.handle_status_action(&action);
-            None
+            let ea = engine.handle_status_action(&action);
+            (None, ea)
         }
         ClickTarget::ActionMenuButton(group_id) => {
             engine.open_editor_action_menu(group_id, 0, 0);
-            None
+            (None, None)
         }
-        _ => None,
+        _ => (None, None),
     }
 }
 
@@ -607,6 +608,7 @@ pub(super) fn handle_mouse_double_click(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -620,6 +622,7 @@ pub(super) fn handle_mouse_double_click(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
+        status_segment_map,
     ) {
         engine.mouse_double_click(wid, line, col);
     }
@@ -639,6 +642,7 @@ pub(super) fn handle_mouse_drag(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
+    status_segment_map: &StatusSegmentMap,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -652,46 +656,8 @@ pub(super) fn handle_mouse_drag(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
+        status_segment_map,
     ) {
         engine.mouse_drag(wid, line, col);
     }
-}
-
-/// Hit-test a click at `local_x` (relative to window rect) against status bar segments.
-/// Uses pixel-based measurement with `char_width` to approximate segment positions.
-fn gtk_status_segment_hit_test(
-    status: &crate::render::WindowStatusLine,
-    local_x: f64,
-    bar_width: f64,
-    char_width: f64,
-) -> Option<crate::core::engine::StatusAction> {
-    // Compute right-side total width in pixels
-    let right_px: f64 = status
-        .right_segments
-        .iter()
-        .map(|s| s.text.chars().count() as f64 * char_width)
-        .sum();
-    let right_start = (bar_width - right_px).max(0.0);
-
-    // Check left segments
-    let mut px = 0.0;
-    for seg in &status.left_segments {
-        let seg_px = seg.text.chars().count() as f64 * char_width;
-        if local_x >= px && local_x < px + seg_px {
-            return seg.action.clone();
-        }
-        px += seg_px;
-    }
-
-    // Check right segments
-    let mut px = right_start;
-    for seg in &status.right_segments {
-        let seg_px = seg.text.chars().count() as f64 * char_width;
-        if local_x >= px && local_x < px + seg_px {
-            return seg.action.clone();
-        }
-        px += seg_px;
-    }
-
-    None
 }

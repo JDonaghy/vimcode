@@ -74,6 +74,10 @@ type ActionBtnMap = HashMap<usize, (f64, f64)>;
 /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
 type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
 
+/// Cached per-window status segment hit zones: window_id -> Vec<(start_x, end_x, action)>.
+/// Populated by draw_window_status_bar, consumed by click hit-testing.
+type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
+
 /// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths, visible_tab_count).
 type TabBarDrawResult = (
     Vec<(f64, f64)>,
@@ -181,6 +185,8 @@ struct App {
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
     action_btn_map: Rc<RefCell<ActionBtnMap>>,
+    /// Cached per-window status bar segment hit zones from draw_window_status_bar.
+    status_segment_map: Rc<RefCell<StatusSegmentMap>>,
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
@@ -1997,6 +2003,8 @@ impl SimpleComponent for App {
         let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
+        let status_segment_map_cell: Rc<RefCell<StatusSegmentMap>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let tab_visible_counts_cell: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>> =
             Rc::new(RefCell::new(Vec::new()));
         #[allow(clippy::type_complexity)]
@@ -2115,6 +2123,7 @@ impl SimpleComponent for App {
             diff_btn_map: diff_btn_map_cell.clone(),
             split_btn_map: split_btn_map_cell.clone(),
             action_btn_map: action_btn_map_cell.clone(),
+            status_segment_map: status_segment_map_cell.clone(),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
             tab_visible_counts: tab_visible_counts_cell.clone(),
             terminal_sb_dragging: false,
@@ -4004,6 +4013,7 @@ impl SimpleComponent for App {
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let mouse_pos_for_draw = mouse_pos_cell.clone();
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
+        let status_seg_for_draw = model.status_segment_map.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -4029,6 +4039,7 @@ impl SimpleComponent for App {
                         &editor_hover_links_for_draw,
                         mouse_pos_for_draw.get(),
                         &tab_vis_for_draw,
+                        &status_seg_for_draw,
                     );
                 }));
                 if let Err(e) = result {
@@ -4061,6 +4072,7 @@ impl SimpleComponent for App {
             let diff_btn_rc = diff_btn_map_cell.clone();
             let split_btn_rc = split_btn_map_cell.clone();
             let action_btn_rc = action_btn_map_cell.clone();
+            let status_seg_rc = status_segment_map_cell.clone();
             let rc_gesture = gtk4::GestureClick::new();
             rc_gesture.set_button(3);
             rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
@@ -4081,6 +4093,7 @@ impl SimpleComponent for App {
                     &diff_btn_rc.borrow(),
                     &split_btn_rc.borrow(),
                     &action_btn_rc.borrow(),
+                    &status_seg_rc.borrow(),
                 );
                 match target {
                     ClickTarget::TabBar => {
@@ -4256,6 +4269,7 @@ impl SimpleComponent for App {
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
                         &self.action_btn_map.borrow(),
+                        &self.status_segment_map.borrow(),
                     ) {
                         engine.add_cursor_at_pos(line, col);
                     }
@@ -4319,6 +4333,7 @@ impl SimpleComponent for App {
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
                             &self.action_btn_map.borrow(),
+                            &self.status_segment_map.borrow(),
                         );
                     }
                 }
@@ -6453,7 +6468,7 @@ impl App {
                         if engine.is_vscode_mode() {
                             engine.vscode_clear_selection();
                         }
-                        let click_result = handle_mouse_click(
+                        let (click_result, engine_action) = handle_mouse_click(
                             &mut engine,
                             x,
                             y,
@@ -6466,7 +6481,23 @@ impl App {
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
                             &self.action_btn_map.borrow(),
+                            &self.status_segment_map.borrow(),
                         );
+                        match engine_action {
+                            Some(core::engine::EngineAction::ToggleSidebar) => {
+                                drop(engine);
+                                sender.input(Msg::ToggleSidebar);
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                            Some(core::engine::EngineAction::OpenTerminal) => {
+                                drop(engine);
+                                sender.input(Msg::ToggleTerminal);
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                            _ => {}
+                        }
                         match click_result {
                             Some(true) => {
                                 drop(engine);
@@ -6615,6 +6646,7 @@ impl App {
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
+                    &self.status_segment_map.borrow(),
                 );
                 if let ClickTarget::TabBar = target {
                     // The tab was already switched by pixel_to_click_target.
@@ -6819,6 +6851,7 @@ impl App {
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
+                    &self.status_segment_map.borrow(),
                 );
                 self.draw_needed.set(true);
             }

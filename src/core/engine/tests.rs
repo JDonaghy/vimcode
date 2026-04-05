@@ -18245,3 +18245,47 @@ fn test_explorer_rename_ctrl_x_cuts_selection() {
     assert_eq!(rename.input, ".rs");
     assert_eq!(rename.cursor, 0);
 }
+
+// ─── Layout toggle button tests ─────────────────────────────────────────────
+
+#[test]
+fn test_status_action_toggle_panel() {
+    let mut e = Engine::new();
+    assert!(!e.terminal_open);
+    // When no terminal panes exist, returns OpenTerminal for the backend to create a PTY
+    let result = e.handle_status_action(&StatusAction::TogglePanel);
+    assert_eq!(result, Some(EngineAction::OpenTerminal));
+}
+
+#[test]
+fn test_status_action_toggle_menu_bar() {
+    let mut e = Engine::new();
+    assert!(!e.menu_bar_visible);
+    let result = e.handle_status_action(&StatusAction::ToggleMenuBar);
+    assert!(result.is_none());
+    assert!(e.menu_bar_visible);
+    // Toggle again
+    let result = e.handle_status_action(&StatusAction::ToggleMenuBar);
+    assert!(result.is_none());
+    assert!(!e.menu_bar_visible);
+}
+
+#[test]
+fn test_status_action_toggle_sidebar_returns_engine_action() {
+    let mut e = Engine::new();
+    let result = e.handle_status_action(&StatusAction::ToggleSidebar);
+    assert_eq!(result, Some(EngineAction::ToggleSidebar));
+}
+
+#[test]
+fn test_status_action_existing_actions_return_none() {
+    let mut e = Engine::new();
+    // Existing actions should return None (handled internally by engine)
+    assert!(e.handle_status_action(&StatusAction::GoToLine).is_none());
+    assert!(e
+        .handle_status_action(&StatusAction::ChangeLanguage)
+        .is_none());
+    assert!(e
+        .handle_status_action(&StatusAction::ChangeEncoding)
+        .is_none());
+}

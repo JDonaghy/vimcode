@@ -967,6 +967,9 @@ fn event_loop(
 ) {
     let mut theme = Theme::from_name(&engine.settings.colorscheme);
 
+    // TUI menu bar can be fully hidden (unlike GTK where it's the title bar).
+    engine.menu_bar_toggleable = true;
+
     // Initialise sidebar from session/settings
     let initial_visible = if engine.settings.autohide_panels {
         false

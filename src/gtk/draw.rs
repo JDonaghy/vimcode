@@ -24,6 +24,7 @@ pub(super) fn draw_editor(
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     mouse_pos: (f64, f64),
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
+    status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -31,6 +32,7 @@ pub(super) fn draw_editor(
     diff_btn_map_out.borrow_mut().clear();
     split_btn_map_out.borrow_mut().clear();
     action_btn_map_out.borrow_mut().clear();
+    status_segment_map_out.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -504,6 +506,7 @@ pub(super) fn draw_editor(
             if let Some(ref status) = rendered_window.status_line {
                 let wr = &rendered_window.rect;
                 let bar_y = wr.y + wr.height - line_height;
+                let mut zones = Vec::new();
                 draw_window_status_bar(
                     cr,
                     &layout,
@@ -513,7 +516,11 @@ pub(super) fn draw_editor(
                     bar_y,
                     wr.width,
                     line_height,
+                    &mut zones,
                 );
+                status_segment_map_out
+                    .borrow_mut()
+                    .insert(rendered_window.window_id.0, zones);
             }
         }
     }
@@ -3799,6 +3806,7 @@ fn draw_window_status_bar(
     y: f64,
     width: f64,
     line_height: f64,
+    segment_zones: &mut Vec<(f64, f64, crate::core::engine::StatusAction)>,
 ) {
     // Fill background using the first segment's bg (derived from theme, not status_bg)
     let fill_bg = status
@@ -3817,6 +3825,7 @@ fn draw_window_status_bar(
     layout.set_ellipsize(pango::EllipsizeMode::None);
 
     // Draw left segments
+    segment_zones.clear();
     let mut cx = x;
     for seg in &status.left_segments {
         let (sr, sg, sb) = seg.bg.to_cairo();
@@ -3832,6 +3841,9 @@ fn draw_window_status_bar(
         }
         let (seg_w, _) = layout.pixel_size();
         let seg_w = seg_w as f64;
+        if let Some(ref action) = seg.action {
+            segment_zones.push((cx - x, cx - x + seg_w, action.clone()));
+        }
         // Draw segment background
         cr.rectangle(cx, y, seg_w, line_height);
         cr.fill().ok();
@@ -3874,6 +3886,9 @@ fn draw_window_status_bar(
         }
         let (seg_w, _) = layout.pixel_size();
         let seg_w = seg_w as f64;
+        if let Some(ref action) = seg.action {
+            segment_zones.push((rx - x, rx - x + seg_w, action.clone()));
+        }
         cr.rectangle(rx, y, seg_w, line_height);
         cr.fill().ok();
         let (fr, fg, fb) = seg.fg.to_cairo();

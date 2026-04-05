@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 250 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 251 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 251 — Layout toggle buttons (5304 tests):**
+
+Clickable nerd-font icon segments (󰘖 sidebar, 󰆍 panel, 󰍜 menu) with `[S]`/`[P]`/`[M]` ASCII fallbacks in per-window status bar (right side, after Ln:Col). Sidebar and terminal panel toggles in both GTK and TUI; menu bar toggle only in TUI (`menu_bar_toggleable` engine field — GTK menu bar is the window title bar and can't be hidden). Icons dim via `theme.status_inactive_fg` when panel is inactive. `StatusAction::ToggleSidebar` returns `EngineAction::ToggleSidebar` (backends manage sidebar visibility); `StatusAction::TogglePanel` returns `EngineAction::OpenTerminal` when no PTY panes exist, otherwise calls `toggle_terminal()` directly. GTK status bar click detection overhauled: `draw_window_status_bar` now populates a `StatusSegmentMap` cache with Pango-measured `(start_x, end_x, action)` zones per window; `pixel_to_click_target` uses cached zones instead of the old `gtk_status_segment_hit_test` (which used `chars().count() * char_width` and broke on variable-width nerd font glyphs). `handle_status_action` return type changed from `()` to `Option<EngineAction>`; `handle_mouse_click` return type changed to `(Option<bool>, Option<EngineAction>)`. Files changed: `engine/mod.rs`, `engine/execute.rs`, `engine/tests.rs`, `render.rs`, `gtk/mod.rs`, `gtk/draw.rs`, `gtk/click.rs`, `tui_main/mod.rs`, `tui_main/mouse.rs`. Known bug: GTK terminal panel toggle requires two clicks on first use.
 
 ---
 

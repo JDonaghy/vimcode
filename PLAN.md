@@ -23,9 +23,8 @@
 ---
 
 ## Recently Completed
-- **Session 250**: Marksman LSP status indicator fix — `mark_server_responded()` on `Initialized` event; removed empty-result guards on hover/definition.
-- **Session 249**: Spell check underline misalignment fix, spell checker lazy-init, inline rename test fix for CI (5300 total).
-> Sessions 248 and earlier in **SESSION_HISTORY.md**.
+- **Session 251**: Layout toggle buttons — nerd-font icon segments in per-window status bar; GTK Pango-measured `StatusSegmentMap` cache for accurate click zones; menu toggle hidden in GTK; `menu_bar_toggleable` field. 4 new tests (5304 total).
+> Sessions 250 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
@@ -227,7 +226,7 @@
 - [x] **Editor action menu (`...`) button** — `…` button at right edge of each tab bar group; dropdown with Close All, Close Others, Close Saved, Close Tabs to Right/Left, Toggle Word Wrap, Change Language Mode, Reveal in File Explorer. `ContextMenuTarget::EditorActionMenu` + `open_editor_action_menu()` + `close_all_tabs()`; TUI `TAB_ACTION_BTN_COLS` reserved + click handling; GTK Pango-measured button + `ActionBtnMap` + `PopoverMenu` popover. 5 new tests.
 
 ### Layout & Chrome
-- [ ] **Layout toggle buttons** — Add small clickable icons to toggle sidebar visibility, bottom panel (terminal) visibility, and editor layout from the menu bar or activity bar. VSCode puts these in the top-right corner of the title bar. Could also be exposed as status bar segments. Reuses existing toggle commands.
+- [x] **Layout toggle buttons** — Clickable nerd-font icon segments (󰘖/󰆍/󰍜 with `[S]`/`[P]`/`[M]` ASCII fallbacks) in per-window status bar (right side, after Ln:Col) toggle sidebar and terminal panel visibility; dim when inactive. Menu bar toggle only shown in TUI (`menu_bar_toggleable` field). GTK click detection uses Pango-measured `StatusSegmentMap` cache instead of `char_width` approximation. 4 new tests.
 - [ ] **Notification / progress indicator** — Show a subtle indicator in the status bar or menu bar during background operations: LSP indexing, extension install, git operations, project search. Bell icon for completed notifications. Clicking opens an output log or dismisses. Prevents "is it working?" uncertainty during long operations.
 
 ### Editor Features

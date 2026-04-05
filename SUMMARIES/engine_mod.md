@@ -7,6 +7,7 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `EngineAction` — enum returned by key handlers (None, Quit, OpenFile, Redraw, etc.)
 - `Mode` — editor mode (Normal, Insert, Visual, VisualLine, VisualBlock, Command, Search, Replace)
 - `PickerSource` / `PickerItem` / `PickerAction` — unified picker types (includes `CommandCenter` source, `GotoLine(usize)` and `GotoSymbol(PathBuf, usize, usize)` actions; `PickerItem` has `depth`/`expandable`/`expanded` for tree view)
+- `StatusAction` — enum for clickable status bar segments (GoToLine, ChangeLanguage, ChangeIndentation, ChangeLineEnding, ChangeEncoding, SwitchBranch, LspInfo, ToggleSidebar, TogglePanel, ToggleMenuBar)
 - `Dialog` / `DialogButton` / `DialogInput` — modal dialog system
 - `PaletteCommand` — command palette entry (includes "Go: Command Center")
 - `DiffLine` / `AlignedDiffEntry` — diff display types

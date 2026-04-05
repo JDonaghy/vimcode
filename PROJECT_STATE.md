@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 4, 2026 (Session 250 — Marksman LSP status fix) | **Tests:** 5300
+**Last updated:** Apr 5, 2026 (Session 251 — Layout toggle buttons) | **Tests:** 5304
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 250 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 251 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,7 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 250 archived in **SESSION_HISTORY.md**.
+> All sessions through 251 archived in **SESSION_HISTORY.md**.
 
-- **Session 250**: Marksman LSP status indicator fix. `mark_server_responded()` was only called on non-empty hover/definition responses, leaving servers like Marksman (no semantic tokens, often empty hover) stuck on "Initializing". Fixed by marking responsive on `Initialized` event and removing empty-result guards on hover/definition handlers. 2 files changed (`panels.rs`, `lsp_manager.rs`).
-- **Session 249**: Spell check underline misalignment fix + spell checker initialization fix + CI test fix (5300 total).
+- **Session 251**: Layout toggle buttons — clickable nerd-font icon segments (󰘖/󰆍/󰍜 with `[S]`/`[P]`/`[M]` ASCII fallbacks) in per-window status bar to toggle sidebar, terminal panel, and menu bar visibility; dim when inactive. GTK status bar click hit-testing overhauled: Pango-measured `StatusSegmentMap` cache replaces `char_width`-based approximation (fixes nerd font glyph width mismatch). Menu bar toggle hidden in GTK (title bar can't be hidden). `EngineAction::OpenTerminal` returned when no PTY panes exist. `menu_bar_toggleable` engine field. 4 new tests (5304 total).
