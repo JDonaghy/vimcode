@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 253 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 254 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 254 — Windows TUI builds + bug fixes (5313 tests):**
+
+Release v0.8.0 prep and Windows TUI support. Added `CREATE_NEW_PROCESS_GROUP` to LSP/DAP process spawning on Windows (equivalent of Unix setsid). Windows clipboard via powershell `Get-Clipboard`/`Set-Clipboard` and `clip.exe`. Windows URL opener via `cmd /c start`. Windows swap PID check via `tasklist`. Guard DISPLAY env var to non-Windows. Added Windows TUI job to CI (`windows-latest`, `--no-default-features`) and release workflow producing `vcd-windows-x86_64.exe`. Fixed tree-sitter-latex link error on Windows (`kind = "static"` on FFI `#[link]`). Skipped/fixed 8 tests that fail on Windows paths (`#[cfg(not(target_os = "windows"))]` for git diff tests, cross-platform assertions for debugpy venv and session paths). Regenerated `flatpak/cargo-sources.json` for ratatui 0.29. Bug fixes: picker preview stale chars when cycling files (explicit per-row clear + tab sanitization); insert mode click past EOL (allow cursor one past last char in insert/replace mode via `set_cursor_for_window`); scrollbar drag moving cursor (replaced `set_cursor_for_window` with `set_scroll_top_for_window`); git panel discard confirm dialog (`pending_sc_discard` + `confirm_sc_discard` dialog tag). Files changed: `lsp.rs`, `dap.rs`, `swap.rs`, `syntax.rs`, `session.rs`, `dap_manager.rs`, `engine/mod.rs`, `engine/windows.rs`, `engine/source_control.rs`, `engine/panels.rs`, `engine/tests.rs`, `tui_main/mod.rs`, `tui_main/mouse.rs`, `tui_main/render_impl.rs`, `gtk/click.rs`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `flatpak/cargo-sources.json`.
 
 ---
 

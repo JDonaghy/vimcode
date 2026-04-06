@@ -1,5 +1,7 @@
 # VimCode Implementation Plan
 
+- Improve unindenting and indenting bevavior (tab or shift-tab in visual mode) to make it context aware so it tries to figure out how many spaces to remve or add based on the surounding text. Sometimes it unindents nested blocks too much so that the nesting is destroyed, yet pressing u to undo starts to restore individual nests. A single undo should be all it takes to undo. 
+
 - ~~investigate bundling the nerd font glyphs~~ **Done** — centralized icon registry (`icons.rs`), `use_nerd_fonts` setting with ASCII fallback, bundled 13KB Nerd Font subset for GTK, extension `fallback_icon` API
 
 - ~~add a way to clearly indicate the current tab that works across editor groups~~ **Done** — `tab_active_accent` theme color; GTK draws 2px colored top border on active tab in focused group; TUI uses colored underline (ratatui 0.29); 6 built-in themes + VSCode JSON importer (`tab.activeBorderTop`)
@@ -23,11 +25,18 @@
 ---
 
 ## Recently Completed
+- **Session 254**: Windows TUI builds + bug fixes — CI/release for `vcd-windows-x86_64.exe`; picker preview stale chars; insert mode click past EOL; scrollbar drag cursor; git panel discard confirm dialog.
 - **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops (LSP install, project search/replace); auto-dismiss; click-to-clear; 9 tests.
 - **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` and `underline_color` so spell underlines don't bleed into picker overlays. Added remote editing research item.
-> Sessions 251 and earlier in **SESSION_HISTORY.md**.
+> Sessions 252 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
+- [x] Picker preview stale chars when cycling files — explicit per-row clear + tab sanitization
+- [x] Insert mode click past EOL — `set_cursor_for_window` allows cursor one past last char in insert/replace mode
+- [x] Scrollbar drag moves cursor — replaced `set_cursor_for_window` with `set_scroll_top_for_window`
+- [x] Git panel discard needs confirm dialog — `pending_sc_discard` + `confirm_sc_discard` dialog
+- [x] Tree-sitter-latex link error on Windows — `kind = "static"` on `#[link]`
+- [x] 8 tests fail on Windows paths — `#[cfg(not(target_os = "windows"))]` + cross-platform assertions
 - [x] TUI spell underlines bleed into fuzzy finder — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` + `underline_color`
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
 - [x] GStrInteriorNulError crash from NUL byte in dialog button hotkey
@@ -251,7 +260,8 @@
 
 ### CI & Distribution
 - [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.
-- [ ] **Windows portable builds + code signing** — Add a Windows build target to the GitHub Actions CI/release workflow (build on `windows-latest` with `cargo build --release`). Package as a portable app (self-contained `.zip` with `vimcode.exe` + any required DLLs, no installer needed — just extract and run). Attach the `.zip` as a release artifact. Investigate code signing (Authenticode) so the binary doesn't trigger SmartScreen warnings and can be installed/run on corporate machines with restricted execution policies; document the signing process and certificate options (self-signed for testing, trusted CA for production).
+- [x] **Windows TUI builds** — Windows CI job (`windows-latest`) builds `vcd.exe` with `--no-default-features` (no GTK). Release workflow produces `vcd-windows-x86_64.exe` artifact. Windows-specific: `CREATE_NEW_PROCESS_GROUP` for LSP/DAP, powershell clipboard, `cmd /c start` URL opener, `tasklist` PID check, tree-sitter-latex static link, 8 test fixes. GTK GUI build not feasible on Windows (no static linking support).
+- [ ] **Windows code signing** — Investigate Authenticode signing for `vcd-windows-x86_64.exe` to avoid SmartScreen warnings on corporate machines.
 
 ### Website & SEO (vimcode.org)
 - [x] **Project website** — Static landing page on GitHub Pages (`JDonaghy/vimcode-website`), OneDark-derived dark theme, responsive, SEO meta tags + JSON-LD structured data + sitemap. Custom domain `vimcode.org` with HTTPS.

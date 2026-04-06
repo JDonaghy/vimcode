@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 5, 2026 (Session 253 — Notification / progress indicator) | **Tests:** 5313
+**Last updated:** Apr 6, 2026 (Session 254 — Windows TUI builds + bug fixes) | **Tests:** 5313
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 253 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 254 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,8 +26,8 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 253 archived in **SESSION_HISTORY.md**.
+> All sessions through 254 archived in **SESSION_HISTORY.md**.
 
-- **Session 253**: Notification / progress indicator — `Notification` struct + `NotificationKind` enum on Engine; `notify()`/`notify_done()`/`notify_done_by_kind()`/`tick_notifications()` lifecycle; spinner animation (⠋⠙⠹…) for in-progress, bell icon (󰂞) for completed; auto-dismiss after 5s; `StatusAction::DismissNotifications` click-to-clear; rendered as `StatusSegment` in per-window status bar (between Ln:Col and layout toggles); GTK+TUI backends animate via poll tick + short poll timeout; wired up for LSP install, project search, project replace; 9 new tests.
+- **Session 254**: Windows TUI builds + bug fixes — `CREATE_NEW_PROCESS_GROUP` for LSP/DAP on Windows; Windows clipboard (powershell), URL opener (`cmd /c start`), swap PID check (`tasklist`); CI + release workflow for `vcd-windows-x86_64.exe`; tree-sitter-latex static link fix; 8 Windows test fixes; flatpak cargo-sources.json regen; picker preview stale chars fix; insert mode click past EOL fix; scrollbar drag cursor fix; git panel discard confirm dialog.
 
-- **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()` in TUI backend only reset char/fg/bg but not `cell.modifier` or `cell.underline_color`, so spell check underlines bled through into picker/fuzzy finder overlays. Fixed by resetting `modifier` to `Modifier::empty()` and `underline_color` to `RColor::Reset` in all three cell-setting functions. Added remote editing research item to PLAN.md.
+- **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops; auto-dismiss after 5s; click-to-clear; 9 new tests.
