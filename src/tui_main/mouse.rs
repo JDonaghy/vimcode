@@ -469,8 +469,7 @@ pub(super) fn handle_mouse(
                         let clamped = row.clamp(drag.track_abs_start, end);
                         let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
                         let new_top = (ratio * drag.total as f64) as usize;
-                        engine.set_cursor_for_window(drag.window_id, new_top, 0);
-                        engine.ensure_cursor_visible();
+                        engine.set_scroll_top_for_window(drag.window_id, new_top);
                         engine.sync_scroll_binds();
                     }
                 }
@@ -2498,8 +2497,7 @@ pub(super) fn handle_mouse(
                     let track_rel_row = editor_row.saturating_sub(wy);
                     let ratio = track_rel_row as f64 / track_len as f64;
                     let new_top = (ratio * rw.total_lines as f64) as usize;
-                    engine.set_cursor_for_window(rw.window_id, new_top, 0);
-                    engine.ensure_cursor_visible();
+                    engine.set_scroll_top_for_window(rw.window_id, new_top);
                     engine.sync_scroll_binds();
                     return sidebar_width;
                 }

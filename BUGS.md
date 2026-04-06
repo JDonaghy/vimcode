@@ -1,9 +1,5 @@
 # Known Bugs
 
-- when clicking beyond the end of  line in insert mode the cursor is placed before the last character instead of after if - it should be before the newline.
-
-- when scrolling by dragging the scrollbar, the cussor position changes constantly as I drag the mouse. Scrolling should not change the cursor position. The effect is that dragging does not move the scrollbar down until the cursor reaches the botton of the visible area,
-
 - need a confirm dialog for discarding a change file in the git panel
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.

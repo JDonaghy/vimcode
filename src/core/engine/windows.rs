@@ -269,8 +269,20 @@ impl Engine {
             let max_line = buffer.content.len_lines().saturating_sub(1);
             let clamped_line = line.min(max_line);
 
-            // Get max col for this line (excludes newline)
-            let max_col = self.get_max_cursor_col(clamped_line);
+            // Get max col for this line (excludes newline).
+            // In insert/replace mode the cursor can sit one past the last char
+            // (between the last char and the newline), matching Vim behavior.
+            let mut max_col = self.get_max_cursor_col(clamped_line);
+            if matches!(self.mode, Mode::Insert | Mode::Replace) {
+                let line_len = self.buffer().line_len_chars(clamped_line);
+                let has_newline =
+                    self.buffer().content.line(clamped_line).chars().last() == Some('\n');
+                if has_newline && line_len > 1 {
+                    max_col = line_len - 1; // one past last char, before newline
+                } else if !has_newline {
+                    max_col = line_len; // last line with no trailing newline
+                }
+            }
             let clamped_col = col.min(max_col);
 
             // Set cursor position
