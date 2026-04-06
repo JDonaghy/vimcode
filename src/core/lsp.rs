@@ -876,6 +876,11 @@ impl LspServer {
                 });
             }
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start {}: {}", config.command, e))?;

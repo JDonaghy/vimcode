@@ -671,6 +671,13 @@ fn has_binary(name: &str) -> bool {
 /// Find the first available clipboard write command (program + args).
 fn find_clipboard_write_cmd() -> Option<(&'static str, &'static [&'static str])> {
     let candidates: &[(&str, &[&str])] = &[
+        #[cfg(target_os = "windows")]
+        ("clip.exe", &[]),
+        #[cfg(target_os = "windows")]
+        (
+            "powershell.exe",
+            &["-Command", "Set-Clipboard -Value $input"],
+        ),
         ("xclip", &["-selection", "clipboard"]),
         ("xsel", &["--clipboard", "--input"]),
         ("wl-copy", &[]),
@@ -688,6 +695,8 @@ fn find_clipboard_write_cmd() -> Option<(&'static str, &'static [&'static str])>
 /// Find the first available clipboard read command (program + args).
 fn find_clipboard_read_cmd() -> Option<(&'static str, &'static [&'static str])> {
     let candidates: &[(&str, &[&str])] = &[
+        #[cfg(target_os = "windows")]
+        ("powershell.exe", &["-Command", "Get-Clipboard"]),
         ("xclip", &["-selection", "clipboard", "-o"]),
         ("xsel", &["--clipboard", "--output"]),
         ("wl-paste", &[]),
@@ -711,6 +720,7 @@ fn find_clipboard_read_cmd() -> Option<(&'static str, &'static [&'static str])> 
 fn setup_tui_clipboard(engine: &mut Engine) {
     // Ensure DISPLAY is set for xclip/xsel — TUI sessions (e.g. tmux, SSH)
     // may not inherit it even when an X server is running on :0.
+    #[cfg(not(target_os = "windows"))]
     if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
         unsafe { std::env::set_var("DISPLAY", ":0") };
     }
@@ -4121,17 +4131,32 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             std::process::exit(1);
         }
         EngineAction::OpenUrl(url) => {
+            #[cfg(target_os = "windows")]
+            let cmd = "cmd";
             #[cfg(target_os = "macos")]
             let cmd = "open";
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             let cmd = "xdg-open";
             if crate::core::engine::is_safe_url(&url) {
-                std::process::Command::new(cmd)
-                    .arg(&url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .ok();
+                #[cfg(target_os = "windows")]
+                {
+                    // `cmd /c start "" "url"` — empty title needed for start.
+                    std::process::Command::new(cmd)
+                        .args(["/c", "start", "", &url])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .ok();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    std::process::Command::new(cmd)
+                        .arg(&url)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .ok();
+                }
             }
             false
         }

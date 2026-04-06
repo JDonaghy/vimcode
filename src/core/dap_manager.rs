@@ -1051,8 +1051,8 @@ mod tests {
         let dir = debugpy_venv_dir().expect("venv dir should be determinable");
         let s = dir.to_string_lossy();
         assert!(
-            s.contains(".config") && s.contains("vimcode") && s.contains("debugpy-venv"),
-            "debugpy venv dir should be ~/.config/vimcode/debugpy-venv: {s}"
+            s.contains("vimcode") && s.contains("debugpy-venv"),
+            "debugpy venv dir should contain vimcode/debugpy-venv: {s}"
         );
     }
 

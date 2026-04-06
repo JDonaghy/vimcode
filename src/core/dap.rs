@@ -138,6 +138,11 @@ impl DapServer {
                 });
             }
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to spawn DAP adapter '{cmd}': {e}"))?;
@@ -212,6 +217,11 @@ impl DapServer {
                     Ok(())
                 });
             }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            tcp_command.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
         }
         let child = tcp_command
             .spawn()

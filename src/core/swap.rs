@@ -170,7 +170,22 @@ pub fn is_pid_alive(pid: u32) -> bool {
     {
         Path::new(&format!("/proc/{}", pid)).exists()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        // Use tasklist to check if the PID exists.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                // tasklist returns "INFO: No tasks are running..." when PID not found.
+                !out.contains("No tasks") && out.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         // POSIX: kill(pid, 0) checks process existence without sending a signal.
         std::process::Command::new("kill")
