@@ -200,7 +200,7 @@ impl SyntaxLanguage {
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Self::Latex => {
-                #[link(name = "tree_sitter_latex")]
+                #[link(name = "tree_sitter_latex", kind = "static")]
                 extern "C" {
                     fn tree_sitter_latex() -> *const ();
                 }
