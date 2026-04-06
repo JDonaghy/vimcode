@@ -1886,15 +1886,7 @@ pub(super) fn render_picker_popup(
             }
         }
 
-        // Fill right pane background (two-pane mode)
-        if has_preview {
-            for col in (left_w + 1)..(width - 1) {
-                let cx = x + col;
-                if cx < term_area.width {
-                    set_cell(buf, cx, ry, ' ', fg_color, bg_color);
-                }
-            }
-        }
+        // Right pane background is cleared in the preview section below.
 
         // Left pane: item text with fuzzy match highlighting
         if let Some(item) = picker.items.get(result_idx) {
@@ -1961,12 +1953,22 @@ pub(super) fn render_picker_popup(
 
         // Right pane: preview line
         if has_preview {
+            let right_start = x + left_w + 1;
+            let right_inner = (width - left_w - 2) as usize;
+            // Always clear the full right pane row first (prevents stale chars
+            // from previous preview when the new file has shorter/fewer lines).
+            for j in 0..right_inner {
+                let cx = right_start + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ' ', fg_color, bg_color);
+                }
+            }
             if let Some(ref preview) = picker.preview {
                 if let Some((lineno, text, is_match)) = preview.get(row_idx) {
-                    let preview_text = format!("{:4}: {}", lineno, text);
+                    // Replace tabs with spaces so each character occupies exactly one cell.
+                    let sanitized = text.replace('\t', "    ");
+                    let preview_text = format!("{:4}: {}", lineno, sanitized);
                     let preview_fg = if *is_match { title_fg } else { fg_color };
-                    let right_start = x + left_w + 1;
-                    let right_inner = (width - left_w - 2) as usize;
                     for (j, ch) in preview_text.chars().enumerate().take(right_inner) {
                         let cx = right_start + j as u16;
                         if cx + 1 < x + width && cx < term_area.width {
