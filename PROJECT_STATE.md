@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 6, 2026 (Session 254 — Windows TUI builds + bug fixes) | **Tests:** 5313
+**Last updated:** Apr 6, 2026 (Session 255 — Multi-backend prep for native Windows/macOS GUIs) | **Tests:** 5313
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 254 are in **SESSION_HISTORY.md**.
@@ -27,6 +27,8 @@ When implementing a new key/command, add tests covering:
 ## Recent Work
 
 > All sessions through 254 archived in **SESSION_HISTORY.md**.
+
+- **Session 255**: Multi-backend prep for native Windows/macOS GUIs — `Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI); added Native Platform GUIs roadmap to PLAN.md.
 
 - **Session 254**: Windows TUI builds + bug fixes — `CREATE_NEW_PROCESS_GROUP` for LSP/DAP on Windows; Windows clipboard (powershell), URL opener (`cmd /c start`), swap PID check (`tasklist`); CI + release workflow for `vcd-windows-x86_64.exe`; tree-sitter-latex static link fix; 8 Windows test fixes; flatpak cargo-sources.json regen; picker preview stale chars fix; insert mode click past EOL fix; scrollbar drag cursor fix; git panel discard confirm dialog.
 

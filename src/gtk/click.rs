@@ -1,4 +1,5 @@
 use super::*;
+use crate::render::{view_row_to_buf_line, view_row_to_buf_pos_wrap};
 
 /// Result of converting pixel coordinates to buffer position.
 pub(super) enum ClickTarget {

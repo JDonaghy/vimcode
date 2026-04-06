@@ -2,19 +2,7 @@ use super::*;
 
 /// Open a URL in the default browser (only https/http).
 pub(super) fn open_url(url: &str) {
-    if !crate::core::engine::is_safe_url(url) {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(not(target_os = "macos"))]
-    let cmd = "xdg-open";
-    std::process::Command::new(cmd)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok();
+    crate::core::engine::open_url_in_browser(url);
 }
 
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.

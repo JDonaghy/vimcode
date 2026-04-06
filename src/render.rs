@@ -139,6 +139,17 @@ impl Color {
         )
     }
 
+    /// Normalise to `(f32, f32, f32, f32)` RGBA with full opacity.
+    /// Used by Direct2D (`D2D1_COLOR_F`) and Core Graphics (`CGColor`).
+    pub fn to_f32_rgba(self) -> (f32, f32, f32, f32) {
+        (
+            self.r as f32 / 255.0,
+            self.g as f32 / 255.0,
+            self.b as f32 / 255.0,
+            1.0,
+        )
+    }
+
     /// Format as a CSS `#rrggbb` hex string.
     pub fn to_hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
@@ -4846,6 +4857,76 @@ pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usiz
         pos = break_at.max(pos + 1);
     }
     segments
+}
+
+/// Map a visible row index (0-based from scroll_top) to the corresponding
+/// buffer line index, skipping lines hidden inside closed folds.
+/// Shared across all GUI backends for click hit-testing.
+pub fn view_row_to_buf_line(
+    view: &crate::core::view::View,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+) -> usize {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        if visible == view_row {
+            return buf_line;
+        }
+        visible += 1;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    // Clamp to last valid line
+    total_lines.saturating_sub(1)
+}
+
+/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
+/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
+/// character index within the buffer line where the clicked visual segment starts.
+/// Shared across all GUI backends for click hit-testing with `:set wrap`.
+pub fn view_row_to_buf_pos_wrap(
+    view: &crate::core::view::View,
+    buffer: &crate::core::buffer::Buffer,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+    viewport_cols: usize,
+) -> (usize, usize) {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        // Compute how many visual rows this buffer line occupies when wrapped.
+        let line_str = buffer.content.line(buf_line).to_string();
+        let line_str = line_str.trim_end_matches('\n');
+        let segments = compute_word_wrap_segments(line_str, viewport_cols);
+        let visual_rows = segments.len();
+        if view_row < visible + visual_rows {
+            // The clicked row falls within this buffer line.
+            let seg_idx = view_row - visible;
+            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
+            return (buf_line, seg_col_offset);
+        }
+        visible += visual_rows;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    (total_lines.saturating_sub(1), 0)
 }
 
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,

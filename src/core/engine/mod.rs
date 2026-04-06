@@ -1172,6 +1172,43 @@ pub fn is_safe_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
+/// Open a URL in the platform's default browser. Validates the URL scheme
+/// first via `is_safe_url`. This is shared across all backends (GTK, TUI,
+/// Win-GUI) to avoid duplicating platform-specific logic.
+pub fn open_url_in_browser(url: &str) {
+    if !is_safe_url(url) {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `cmd /c start "" "url"` — empty title needed for start.
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+    }
+}
+
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
 fn hex_val(b: u8) -> Option<u8> {
     match b {

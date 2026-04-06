@@ -4131,33 +4131,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             std::process::exit(1);
         }
         EngineAction::OpenUrl(url) => {
-            #[cfg(target_os = "windows")]
-            let cmd = "cmd";
-            #[cfg(target_os = "macos")]
-            let cmd = "open";
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let cmd = "xdg-open";
-            if crate::core::engine::is_safe_url(&url) {
-                #[cfg(target_os = "windows")]
-                {
-                    // `cmd /c start "" "url"` — empty title needed for start.
-                    std::process::Command::new(cmd)
-                        .args(["/c", "start", "", &url])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .ok();
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    std::process::Command::new(cmd)
-                        .arg(&url)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .ok();
-                }
-            }
+            crate::core::engine::open_url_in_browser(&url);
             false
         }
         EngineAction::None | EngineAction::Error => false,
