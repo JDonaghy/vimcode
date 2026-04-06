@@ -2491,6 +2491,9 @@ pub struct Engine {
     /// Pending git remote operation awaiting SSH passphrase from dialog.
     /// Holds `"push"`, `"pull"`, or `"fetch"`.
     pub pending_git_remote_op: Option<String>,
+    /// Pending discard operation awaiting dialog confirmation.
+    /// `Some(path)` for a single file, `Some("")` for discard-all.
+    pub pending_sc_discard: Option<String>,
 
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
@@ -2978,6 +2981,7 @@ impl Engine {
             ext_sidebar_input_active: false,
             pending_ext_remove: None,
             pending_git_remote_op: None,
+            pending_sc_discard: None,
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,

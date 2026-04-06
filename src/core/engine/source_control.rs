@@ -81,11 +81,36 @@ impl Engine {
         self.sc_refresh();
     }
 
-    /// Discard all unstaged working-tree changes.
+    /// Discard all unstaged working-tree changes (called after dialog confirmation).
     pub fn sc_discard_all_unstaged(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let _ = git::discard_all(&dir);
         self.sc_refresh();
+    }
+
+    /// Show a confirmation dialog before discarding all unstaged changes.
+    pub fn sc_confirm_discard_all(&mut self) {
+        self.pending_sc_discard = Some(String::new()); // empty = all
+        self.show_dialog(
+            "confirm_sc_discard",
+            "Discard Changes",
+            vec![
+                "Discard ALL unstaged changes?".to_string(),
+                "This cannot be undone.".to_string(),
+            ],
+            vec![
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+                DialogButton {
+                    label: "Discard All".into(),
+                    hotkey: 'd',
+                    action: "discard".into(),
+                },
+            ],
+        );
     }
 
     /// Run `git pull` and show the result as a status message.
@@ -436,13 +461,22 @@ impl Engine {
         }
     }
 
-    /// Discard working-tree changes for the selected unstaged file.
-    pub fn sc_discard_selected(&mut self) {
+    /// Discard working-tree changes for the selected unstaged file (called after dialog confirmation).
+    pub fn sc_discard_file(&mut self, path: &str) {
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        match git::discard_path(&dir, path) {
+            Ok(()) => {}
+            Err(e) => self.message = format!("discard: {e}"),
+        }
+        self.sc_refresh();
+    }
+
+    /// Show a confirmation dialog before discarding changes for the selected file.
+    pub fn sc_confirm_discard_selected(&mut self) {
         let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
         if section != 1 || idx == usize::MAX {
             return;
         }
-        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let unstaged: Vec<git::FileStatus> = self
             .sc_file_statuses
             .iter()
@@ -450,13 +484,29 @@ impl Engine {
             .cloned()
             .collect();
         if let Some(f) = unstaged.get(idx) {
-            let path = f.path.clone();
-            match git::discard_path(&dir, &path) {
-                Ok(()) => {}
-                Err(e) => self.message = format!("discard: {e}"),
-            }
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            self.pending_sc_discard = Some(f.path.clone());
+            self.show_dialog(
+                "confirm_sc_discard",
+                "Discard Changes",
+                vec![
+                    format!("Discard changes to '{name}'?"),
+                    "This cannot be undone.".to_string(),
+                ],
+                vec![
+                    DialogButton {
+                        label: "Cancel".into(),
+                        hotkey: '\0',
+                        action: "cancel".into(),
+                    },
+                    DialogButton {
+                        label: "Discard".into(),
+                        hotkey: 'd',
+                        action: "discard".into(),
+                    },
+                ],
+            );
         }
-        self.sc_refresh();
     }
 
     /// Switch to the selected worktree's directory.
@@ -512,11 +562,11 @@ impl Engine {
                 true
             }
             "d" => {
-                self.sc_discard_selected();
+                self.sc_confirm_discard_selected();
                 true
             }
             "D" => {
-                self.sc_discard_all_unstaged();
+                self.sc_confirm_discard_all();
                 true
             }
             "c" => {

@@ -1,7 +1,5 @@
 # Known Bugs
 
-- need a confirm dialog for discarding a change file in the git panel
-
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
 - **GTK terminal panel toggle requires two clicks** — The `[P]` layout toggle button in the GTK status bar requires two clicks to show the terminal panel on the first use. Subsequent toggles work with a single click. Likely a timing issue between the `EngineAction::OpenTerminal` dispatch and the GTK layout recomputation.
