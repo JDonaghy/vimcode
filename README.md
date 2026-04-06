@@ -10,7 +10,7 @@ If you like Vim and you like VSCode, but Vim isn't VSCode-enough and VSCode isn'
 
 **Extensions** are available, but note that these are not VSCode extensions or Vim plugins. VimCode takes a "batteries-included" approach, so many features just work out of the box. Both **LSP** and **DAP** protocols are supported, and extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry. New extensions can be added to the registry without updating VimCode itself.
 
-There is no VimScript or TypeScript support for extensions. Instead, like Neovim, VimCode supports **Lua** for writing extensions. However, the API is very different from Neovim’s, so its plugins will not work. There is also no GPU acceleration (like Zed), as the goal was for VimCode to work everywhere.
+There is no VimScript or TypeScript support for extensions. Instead, like Neovim, VimCode supports **Lua** for writing extensions. However, the API is very different from Neovim’s, so its plugins will not work. Unlike Zed, VimCode does not require a dedicated GPU — GTK4 can use hardware compositing when available but falls back gracefully to software rendering, so it works everywhere including VMs, remote desktops, and headless servers.
 
 ### Status
 VimCode has been shamelessly "vibe-coded" using **Claude Code**, and development has proceeded very quickly as a result. I am beginning to use it on a daily basis, but at this stage, it is still very much **alpha software**. Use at your own risk. 
@@ -36,7 +36,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 
 - **First-class Vim mode** — deeply integrated, not a plugin
 - **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
-- **CPU rendering** — Cairo/Pango (works in VMs, remote desktops, SSH)
+- **No GPU required** — Cairo/Pango rendering; GTK4 uses hardware compositing when available but works without a GPU (VMs, remote desktops, SSH)
 - **Clean architecture** — platform-agnostic core, 5,304 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
@@ -1179,7 +1179,7 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 | Language | Rust 2021 |
 | GTK UI | GTK4 + Relm4 |
 | TUI UI | ratatui 0.29 + crossterm |
-| Rendering | Pango + Cairo (CPU, no GPU) |
+| Rendering | Pango + Cairo (GPU compositing via GTK4 when available, software fallback) |
 | Text | Ropey (rope data structure) |
 | Parsing | Tree-sitter (20 languages incl. LaTeX, Lua, Markdown) |
 | LSP | lsp-types (protocol definitions) |

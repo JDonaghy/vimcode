@@ -285,3 +285,4 @@
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
+- [ ] **README revamp** — Full review and rewrite of README.md to ensure it is up to date, accurate, and reads professionally. Check: feature tables match current implementation, test count is current, architecture section reflects actual file sizes and module structure, tech stack table is accurate (e.g. rendering description), vision section reflects multi-platform goals (GTK on Linux, native Windows GUI planned, TUI everywhere), remove any alpha/vibe-coded hedging if the project has matured past that point, ensure installation instructions cover all platforms (Linux deb/Flatpak, macOS Homebrew, Windows TUI), review tone and wording for consistency.
