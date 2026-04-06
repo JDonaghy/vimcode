@@ -647,7 +647,10 @@ mod tests {
         assert_eq!(path1, path2);
         // Path must live under ~/.config/vimcode/sessions/
         let path_str = path1.to_string_lossy();
-        assert!(path_str.contains("vimcode/sessions/"));
+        assert!(
+            path_str.contains("vimcode/sessions/") || path_str.contains("vimcode\\sessions\\"),
+            "session path should contain vimcode sessions dir: {path_str}"
+        );
         assert!(path_str.ends_with(".json"));
     }
 

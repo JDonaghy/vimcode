@@ -3294,6 +3294,7 @@ fn test_count_not_applied_to_visual_operators() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))] // settings path differs on Windows
 fn test_config_reload() {
     use std::fs;
     use std::path::PathBuf;
@@ -11049,6 +11050,7 @@ fn setup_git_diff_split_repo(suffix: &str) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))] // git diff tests require Unix-style paths
 fn test_git_diff_split_creates_pair() {
     let (dir, file) = setup_git_diff_split_repo("creates_pair");
     let mut engine = Engine::new();
@@ -11086,6 +11088,7 @@ fn test_git_diff_split_creates_pair() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn test_git_diff_split_left_readonly() {
     let (dir, file) = setup_git_diff_split_repo("left_ro");
     let mut engine = Engine::new();
@@ -11098,6 +11101,7 @@ fn test_git_diff_split_left_readonly() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn test_git_diff_split_head_scratch_name() {
     let (dir, file) = setup_git_diff_split_repo("scratch");
     let mut engine = Engine::new();
@@ -11114,6 +11118,7 @@ fn test_git_diff_split_head_scratch_name() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn test_git_diff_split_untracked_file_errors() {
     use std::process::Command;
     let dir = std::env::temp_dir().join("vimcode_gds_untracked");
@@ -11139,6 +11144,7 @@ fn test_git_diff_split_untracked_file_errors() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
 fn test_close_window_cleans_diff_state() {
     let (dir, file) = setup_git_diff_split_repo("close_win");
     let mut engine = Engine::new();
