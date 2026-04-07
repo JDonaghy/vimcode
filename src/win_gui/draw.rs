@@ -116,7 +116,38 @@ impl<'a> DrawContext<'a> {
                 self.draw_hover(hover, active);
             }
 
-            // Draw dialog
+            // Draw signature help popup
+            if let Some(ref sig) = layout.signature_help {
+                let active = layout.windows.iter().find(|w| w.is_active);
+                self.draw_signature_help(sig, active);
+            }
+
+            // Draw wildmenu (Tab completion bar)
+            if let Some(ref wm) = layout.wildmenu {
+                self.draw_wildmenu(wm, layout);
+            }
+
+            // Draw quickfix panel
+            if let Some(ref qf) = layout.quickfix {
+                self.draw_quickfix(qf, layout);
+            }
+
+            // Draw picker (command palette / fuzzy finder)
+            if let Some(ref picker) = layout.picker {
+                self.draw_picker(picker);
+            }
+
+            // Draw tab switcher
+            if let Some(ref ts) = layout.tab_switcher {
+                self.draw_tab_switcher(ts);
+            }
+
+            // Draw context menu
+            if let Some(ref ctx) = layout.context_menu {
+                self.draw_context_menu(ctx);
+            }
+
+            // Draw dialog (on top of everything)
             if let Some(ref dialog) = layout.dialog {
                 self.draw_dialog(dialog);
             }
@@ -315,6 +346,37 @@ impl<'a> DrawContext<'a> {
 
             // Syntax-highlighted text spans
             self.draw_styled_line(line, rx + gutter_px, line_y);
+
+            // Diagnostic underlines (squiggles)
+            for diag in &line.diagnostics {
+                self.draw_diagnostic_underline(diag, rx + gutter_px, line_y);
+            }
+
+            // Indent guides
+            for &guide_col in &line.indent_guides {
+                let gx = rx + gutter_px + guide_col as f32 * self.char_width;
+                let guide_brush = self.solid_brush_alpha(self.theme.line_number_fg, 0.3);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(gx, line_y, 1.0, self.line_height),
+                        &guide_brush,
+                    );
+                }
+            }
+
+            // Ghost text (AI completions)
+            if let Some(ref ghost) = line.ghost_suffix {
+                let text_len = line.raw_text.trim_end_matches('\n').chars().count();
+                let gx = rx + gutter_px + text_len as f32 * self.char_width;
+                self.draw_text(ghost, gx, line_y, self.theme.line_number_fg);
+            }
+
+            // Inline annotation
+            if let Some(ref ann) = line.annotation {
+                let text_len = line.raw_text.trim_end_matches('\n').chars().count();
+                let ax = rx + gutter_px + (text_len as f32 + 2.0) * self.char_width;
+                self.draw_text(ann, ax, line_y, self.theme.line_number_fg);
+            }
         }
 
         // Per-window status line
@@ -692,6 +754,361 @@ impl<'a> DrawContext<'a> {
             }
             self.draw_text(label, bx + self.char_width, btn_y, self.theme.foreground);
             bx -= self.char_width;
+        }
+    }
+
+    // ─── Diagnostic underlines ──────────────────────────────────────────────
+
+    fn draw_diagnostic_underline(
+        &self,
+        diag: &crate::render::DiagnosticMark,
+        text_x: f32,
+        line_y: f32,
+    ) {
+        use crate::core::lsp::DiagnosticSeverity;
+        let color = match diag.severity {
+            DiagnosticSeverity::Error => self.theme.diagnostic_error,
+            DiagnosticSeverity::Warning => self.theme.diagnostic_warning,
+            DiagnosticSeverity::Information => self.theme.diagnostic_info,
+            DiagnosticSeverity::Hint => self.theme.diagnostic_hint,
+        };
+        let brush = self.solid_brush(color);
+        let x1 = text_x + diag.start_col as f32 * self.char_width;
+        let x2 = text_x + diag.end_col as f32 * self.char_width;
+        let y = line_y + self.line_height - 2.0;
+        // Draw a zigzag underline (3 segments per character width)
+        let step = (self.char_width / 3.0).max(2.0);
+        let mut x = x1;
+        let mut up = false;
+        unsafe {
+            while x < x2 {
+                let nx = (x + step).min(x2);
+                let y_off: f32 = if up { -2.0 } else { 0.0 };
+                let ny_off: f32 = if up { 0.0 } else { -2.0 };
+                self.rt.FillRectangle(
+                    &rect_f(x, y + y_off.min(ny_off), nx - x, 2.0),
+                    &brush,
+                );
+                up = !up;
+                x = nx;
+            }
+        }
+    }
+
+    // ─── Signature help ──────────────────────────────────────────────────────
+
+    fn draw_signature_help(
+        &self,
+        sig: &crate::render::SignatureHelp,
+        active_window: Option<&RenderedWindow>,
+    ) {
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border_brush = self.solid_brush(self.theme.separator);
+        let popup_w = (sig.label.chars().count() as f32 + 4.0) * self.char_width;
+        let popup_h = self.line_height + 4.0;
+
+        let (x, y) = if let Some(rw) = active_window {
+            let gutter_px = rw.gutter_char_width as f32 * self.char_width;
+            let scroll_top = rw.lines.first().map_or(0, |l| l.line_idx);
+            let view_line = sig.anchor_line.saturating_sub(scroll_top);
+            let cx = rw.rect.x as f32 + gutter_px + sig.anchor_col as f32 * self.char_width;
+            let cy = rw.rect.y as f32 + view_line as f32 * self.line_height;
+            let fy = if cy >= popup_h { cy - popup_h } else { cy + self.line_height };
+            let (rt_w, _) = self.rt_size();
+            (cx.min(rt_w - popup_w - 2.0).max(0.0), fy.max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt.DrawRectangle(&rect_f(x, y, popup_w, popup_h), &border_brush, 1.0, None);
+        }
+
+        // Draw the label, highlighting the active parameter
+        let tx = x + self.char_width;
+        let ty = y + 2.0;
+        if let Some(active_idx) = sig.active_param {
+            if let Some(&(start, end)) = sig.params.get(active_idx) {
+                // Before active param
+                let before = safe_slice(&sig.label, 0, start);
+                self.draw_text(before, tx, ty, self.theme.foreground);
+                // Active param (highlighted)
+                let param_text = safe_slice(&sig.label, start, end);
+                let param_x = tx + before.chars().count() as f32 * self.char_width;
+                self.draw_text(param_text, param_x, ty, self.theme.tab_active_accent);
+                // After active param
+                let after = safe_slice(&sig.label, end, sig.label.len());
+                let after_x = param_x + param_text.chars().count() as f32 * self.char_width;
+                self.draw_text(after, after_x, ty, self.theme.foreground);
+            } else {
+                self.draw_text(&sig.label, tx, ty, self.theme.foreground);
+            }
+        } else {
+            self.draw_text(&sig.label, tx, ty, self.theme.foreground);
+        }
+    }
+
+    // ─── Wildmenu (Tab completion bar) ───────────────────────────────────────
+
+    fn draw_wildmenu(&self, wm: &crate::render::WildmenuData, layout: &ScreenLayout) {
+        let (width, height) = self.rt_size();
+        // Draw just above the command line
+        let y = height - 2.0 * self.line_height;
+        // Shift status bar up by one row when wildmenu is shown
+        let _ = layout;
+
+        let bg = self.solid_brush(self.theme.status_bg);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(0.0, y, width, self.line_height), &bg);
+        }
+
+        let mut x = self.char_width;
+        for (i, item) in wm.items.iter().enumerate() {
+            let is_selected = wm.selected == Some(i);
+            let item_w = (item.chars().count() as f32 + 2.0) * self.char_width;
+            if is_selected {
+                let sel_bg = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(x, y, item_w, self.line_height), &sel_bg);
+                }
+            }
+            self.draw_text(item, x + self.char_width, y, self.theme.foreground);
+            x += item_w;
+        }
+    }
+
+    // ─── Quickfix panel ──────────────────────────────────────────────────────
+
+    fn draw_quickfix(&self, qf: &crate::render::QuickfixPanel, _layout: &ScreenLayout) {
+        let (width, height) = self.rt_size();
+        let max_visible = 6usize.min(qf.items.len());
+        let panel_h = max_visible as f32 * self.line_height + self.line_height; // +1 for header
+        // Position above the status bar
+        let y = height - 2.0 * self.line_height - panel_h;
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(0.0, y, width, panel_h), &bg);
+            self.rt.DrawRectangle(&rect_f(0.0, y, width, panel_h), &border, 1.0, None);
+        }
+
+        // Header
+        let header = format!("Quickfix ({}/{})", qf.selected_idx + 1, qf.total_items);
+        self.draw_text(&header, self.char_width, y, self.theme.foreground);
+
+        // Items
+        for (i, item) in qf.items.iter().take(max_visible).enumerate() {
+            let iy = y + (i as f32 + 1.0) * self.line_height;
+            if i == qf.selected_idx {
+                let sel = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(0.0, iy, width, self.line_height), &sel);
+                }
+            }
+            self.draw_text(item, self.char_width * 2.0, iy, self.theme.foreground);
+        }
+    }
+
+    // ─── Picker (command palette / fuzzy finder) ─────────────────────────────
+
+    fn draw_picker(&self, picker: &crate::render::PickerPanel) {
+        let (rt_w, rt_h) = self.rt_size();
+
+        // Semi-transparent overlay
+        let overlay = self.solid_brush_alpha(self.theme.background, 0.4);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(0.0, 0.0, rt_w, rt_h), &overlay);
+        }
+
+        let max_visible = 12usize;
+        let has_preview = picker.preview.is_some();
+        let list_w = if has_preview { rt_w * 0.4 } else { rt_w * 0.6 };
+        let total_w = if has_preview { rt_w * 0.8 } else { list_w };
+        let header_h = self.line_height * 2.0; // title + input
+        let body_h = max_visible as f32 * self.line_height;
+        let total_h = header_h + body_h;
+
+        let dx = (rt_w - total_w) / 2.0;
+        let dy = rt_h * 0.15;
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(dx, dy, total_w, total_h), &bg);
+            self.rt.DrawRectangle(&rect_f(dx, dy, total_w, total_h), &border, 1.0, None);
+        }
+
+        // Title bar
+        let title_bg = self.solid_brush(self.theme.status_bg);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(dx, dy, total_w, self.line_height), &title_bg);
+        }
+        let title_text = format!("{} ({}/{})", picker.title, picker.items.len(), picker.total_count);
+        self.draw_text(&title_text, dx + self.char_width, dy, self.theme.foreground);
+
+        // Query input
+        let input_y = dy + self.line_height;
+        let input_bg = self.solid_brush(self.theme.background);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(dx + 4.0, input_y + 2.0, list_w - 8.0, self.line_height - 4.0), &input_bg);
+        }
+        let query_display = format!("> {}", picker.query);
+        self.draw_text(&query_display, dx + self.char_width, input_y, self.theme.foreground);
+
+        // Item list
+        let list_y = dy + header_h;
+        for (i, item) in picker.items.iter().skip(picker.scroll_top).take(max_visible).enumerate() {
+            let iy = list_y + i as f32 * self.line_height;
+            let actual_idx = picker.scroll_top + i;
+            if actual_idx == picker.selected_idx {
+                let sel = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(dx, iy, list_w, self.line_height), &sel);
+                }
+            }
+
+            // Indent for tree items
+            let indent = item.depth as f32 * 2.0 * self.char_width;
+            let ix = dx + self.char_width + indent;
+
+            // Expand arrow for tree items
+            if item.expandable {
+                let arrow = if item.expanded { "\u{25BC}" } else { "\u{25B6}" };
+                self.draw_text(arrow, ix - self.char_width * 1.5, iy, self.theme.line_number_fg);
+            }
+
+            // Draw display text with match highlights
+            if item.match_positions.is_empty() {
+                self.draw_text(&item.display, ix, iy, self.theme.foreground);
+            } else {
+                // Render char by char, highlighting matches
+                let mut cx = ix;
+                for (ci, ch) in item.display.chars().enumerate() {
+                    let color = if item.match_positions.contains(&ci) {
+                        self.theme.tab_active_accent
+                    } else {
+                        self.theme.foreground
+                    };
+                    let s = String::from(ch);
+                    self.draw_text(&s, cx, iy, color);
+                    cx += self.char_width;
+                }
+            }
+
+            // Detail hint (right-aligned)
+            if let Some(ref detail) = item.detail {
+                let dw = detail.chars().count() as f32 * self.char_width;
+                self.draw_text(detail, dx + list_w - dw - self.char_width, iy, self.theme.line_number_fg);
+            }
+        }
+
+        // Preview pane
+        if let Some(ref preview_lines) = picker.preview {
+            let preview_x = dx + list_w;
+            let preview_w = total_w - list_w;
+            let sep = self.solid_brush(self.theme.separator);
+            unsafe {
+                self.rt.FillRectangle(&rect_f(preview_x, dy + header_h, 1.0, body_h), &sep);
+            }
+
+            for (i, (line_no, text, is_hl)) in preview_lines.iter().take(max_visible).enumerate() {
+                let py = list_y + i as f32 * self.line_height;
+                if *is_hl {
+                    let hl = self.solid_brush_alpha(self.theme.selection, 0.4);
+                    unsafe {
+                        self.rt.FillRectangle(&rect_f(preview_x + 1.0, py, preview_w - 1.0, self.line_height), &hl);
+                    }
+                }
+                // Line number
+                let ln_text = format!("{:>4} ", line_no);
+                self.draw_text(&ln_text, preview_x + self.char_width, py, self.theme.line_number_fg);
+                // Content
+                self.draw_text(text, preview_x + 6.0 * self.char_width, py, self.theme.foreground);
+            }
+        }
+    }
+
+    // ─── Tab switcher (Ctrl+Tab) ─────────────────────────────────────────────
+
+    fn draw_tab_switcher(&self, ts: &crate::render::TabSwitcherPanel) {
+        let (rt_w, rt_h) = self.rt_size();
+
+        let max_visible = ts.items.len().min(12);
+        let max_name_w = ts.items.iter().map(|(n, _, _)| n.chars().count()).max().unwrap_or(20);
+        let popup_w = (max_name_w as f32 + 6.0) * self.char_width;
+        let popup_h = max_visible as f32 * self.line_height;
+        let dx = (rt_w - popup_w) / 2.0;
+        let dy = (rt_h - popup_h) / 2.0;
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(dx, dy, popup_w, popup_h), &bg);
+            self.rt.DrawRectangle(&rect_f(dx, dy, popup_w, popup_h), &border, 1.0, None);
+        }
+
+        for (i, (name, _path, is_dirty)) in ts.items.iter().take(max_visible).enumerate() {
+            let iy = dy + i as f32 * self.line_height;
+            if i == ts.selected_idx {
+                let sel = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(dx, iy, popup_w, self.line_height), &sel);
+                }
+            }
+            let label = if *is_dirty {
+                format!("\u{25CF} {}", name)
+            } else {
+                format!("  {}", name)
+            };
+            self.draw_text(&label, dx + self.char_width, iy, self.theme.foreground);
+        }
+    }
+
+    // ─── Context menu ────────────────────────────────────────────────────────
+
+    fn draw_context_menu(&self, ctx: &crate::render::ContextMenuPanel) {
+        let max_label = ctx.items.iter().map(|i| i.label.chars().count() + i.shortcut.chars().count() + 4).max().unwrap_or(20);
+        let popup_w = max_label as f32 * self.char_width;
+        let popup_h = ctx.items.len() as f32 * self.line_height;
+        let x = ctx.screen_col as f32 * self.char_width;
+        let y = ctx.screen_row as f32 * self.line_height;
+
+        // Clamp to screen
+        let (rt_w, rt_h) = self.rt_size();
+        let x = x.min(rt_w - popup_w).max(0.0);
+        let y = y.min(rt_h - popup_h).max(0.0);
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt.DrawRectangle(&rect_f(x, y, popup_w, popup_h), &border, 1.0, None);
+        }
+
+        for (i, item) in ctx.items.iter().enumerate() {
+            let iy = y + i as f32 * self.line_height;
+            if i == ctx.selected_idx {
+                let sel = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(x, iy, popup_w, self.line_height), &sel);
+                }
+            }
+            self.draw_text(&item.label, x + self.char_width, iy, self.theme.foreground);
+            if !item.shortcut.is_empty() {
+                let sw = item.shortcut.chars().count() as f32 * self.char_width;
+                self.draw_text(&item.shortcut, x + popup_w - sw - self.char_width, iy, self.theme.line_number_fg);
+            }
+            if item.separator_after {
+                let sep = self.solid_brush(self.theme.separator);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(x + 4.0, iy + self.line_height - 1.0, popup_w - 8.0, 1.0),
+                        &sep,
+                    );
+                }
+            }
         }
     }
 
