@@ -958,7 +958,9 @@ fn pixel_to_editor_pos(state: &AppState, px: f32, py: f32) -> Option<(WindowId, 
         let rw = cwr.rect.width as f32;
         let rh = cwr.rect.height as f32;
 
-        if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
+        // Exclude scrollbar area (rightmost 6px)
+        let scrollbar_w = 6.0f32;
+        if px >= rx && px < rx + rw - scrollbar_w && py >= ry && py < ry + rh {
             let gutter_px = cwr.gutter_chars as f32 * cw;
             let view_row = ((py - ry) / lh).floor().max(0.0) as usize;
 
