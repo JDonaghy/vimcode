@@ -1038,6 +1038,15 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.hover_delay = n;
             }
+            "font_size" => {
+                let n: i32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.font_size = n.clamp(6, 72);
+            }
+            "font_family" => {
+                self.font_family = value.to_string();
+            }
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())

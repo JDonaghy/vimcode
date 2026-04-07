@@ -458,12 +458,21 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            // Consume bare Alt/F10 to prevent Windows menu-mode activation.
+            // Without this, pressing Alt-M activates menu mode and steals
+            // all subsequent keyboard input from the editor.
+            let vk = VIRTUAL_KEY(wparam.0 as u16);
+            if vk == VK_MENU || vk == VK_F10 {
+                return LRESULT(0);
+            }
             if on_key_down(wparam, lparam) {
                 LRESULT(0)
             } else {
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        // Consume WM_SYSCHAR to prevent beep on Alt+letter combos
+        WM_SYSCHAR => LRESULT(0),
         WM_CHAR => {
             on_char(wparam);
             LRESULT(0)
@@ -582,6 +591,7 @@ fn on_paint(hwnd: HWND) {
             theme: &state.theme,
             char_width: state.char_width,
             line_height: state.line_height,
+            editor_left: state.sidebar.total_width(),
         };
 
         unsafe {

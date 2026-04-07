@@ -69,6 +69,8 @@ pub struct DrawContext<'a> {
     pub theme: &'a Theme,
     pub char_width: f32,
     pub line_height: f32,
+    /// Left edge of the editor area (sidebar width offset).
+    pub editor_left: f32,
 }
 
 impl<'a> DrawContext<'a> {
@@ -527,15 +529,16 @@ impl<'a> DrawContext<'a> {
 
     fn draw_status_bar(&self, layout: &ScreenLayout) {
         let (width, height) = self.rt_size();
+        let x0 = self.editor_left;
         let y = height - 2.0 * self.line_height;
         let bg = self.solid_brush(self.theme.status_bg);
         unsafe {
             self.rt
-                .FillRectangle(&rect_f(0.0, y, width, self.line_height), &bg);
+                .FillRectangle(&rect_f(x0, y, width - x0, self.line_height), &bg);
         }
         self.draw_text(
             &layout.status_left,
-            self.char_width * 0.5,
+            x0 + self.char_width * 0.5,
             y,
             self.theme.status_fg,
         );
@@ -553,14 +556,15 @@ impl<'a> DrawContext<'a> {
 
     fn draw_command_line(&self, layout: &ScreenLayout) {
         let (width, height) = self.rt_size();
+        let x0 = self.editor_left;
         let y = height - self.line_height;
         let bg = self.solid_brush(self.theme.background);
         unsafe {
             self.rt
-                .FillRectangle(&rect_f(0.0, y, width, self.line_height), &bg);
+                .FillRectangle(&rect_f(x0, y, width - x0, self.line_height), &bg);
         }
         let cmd = &layout.command;
-        self.draw_text(&cmd.text, self.char_width * 0.5, y, self.theme.foreground);
+        self.draw_text(&cmd.text, x0 + self.char_width * 0.5, y, self.theme.foreground);
     }
 
     // ─── Completion popup ────────────────────────────────────────────────────
