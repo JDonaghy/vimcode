@@ -76,8 +76,17 @@ impl<'a> DrawContext<'a> {
             // Clear background
             self.rt.Clear(Some(&color_f(self.theme.background)));
 
-            // Draw tab bar
-            self.draw_tab_bar(layout);
+            // Draw tab bar(s)
+            if let Some(ref split) = layout.editor_group_split {
+                for gtb in &split.group_tab_bars {
+                    let is_active = gtb.group_id == split.active_group;
+                    self.draw_group_tab_bar(gtb, is_active);
+                }
+                // Draw group dividers
+                self.draw_group_dividers(split);
+            } else {
+                self.draw_tab_bar(layout);
+            }
 
             // Draw editor windows
             for rw in &layout.windows {
@@ -90,16 +99,26 @@ impl<'a> DrawContext<'a> {
             // Draw command line
             self.draw_command_line(layout);
 
-            // Draw cursor on active window
+            // Draw cursors on all windows (active gets block/bar, inactive gets thin line)
             for rw in &layout.windows {
-                if rw.is_active {
-                    self.draw_cursor(rw);
-                }
+                self.draw_cursor(rw);
             }
 
-            // Draw completion menu
+            // Draw completion menu anchored at cursor
             if let Some(ref comp) = layout.completion {
-                self.draw_completion(comp);
+                let active = layout.windows.iter().find(|w| w.is_active);
+                self.draw_completion(comp, active);
+            }
+
+            // Draw hover popup
+            if let Some(ref hover) = layout.hover {
+                let active = layout.windows.iter().find(|w| w.is_active);
+                self.draw_hover(hover, active);
+            }
+
+            // Draw dialog
+            if let Some(ref dialog) = layout.dialog {
+                self.draw_dialog(dialog);
             }
         }
     }
@@ -107,41 +126,114 @@ impl<'a> DrawContext<'a> {
     // ─── Tab bar ─────────────────────────────────────────────────────────────
 
     fn draw_tab_bar(&self, layout: &ScreenLayout) {
-        let tab_bg = self.solid_brush(self.theme.tab_bar_bg);
         let y = 0.0f32;
         let h = self.line_height;
-
+        let (width, _) = self.rt_size();
+        let tab_bg = self.solid_brush(self.theme.tab_bar_bg);
         unsafe {
-            // Tab bar background
             self.rt
-                .FillRectangle(&rect_f(0.0, y, 10000.0, h), &tab_bg);
+                .FillRectangle(&rect_f(0.0, y, width, h), &tab_bg);
+        }
+        self.draw_tabs(&layout.tab_bar, 0.0, y, width);
+    }
 
-            let mut x = 0.0f32;
-            for tab in &layout.tab_bar {
-                let bg = if tab.active {
-                    self.solid_brush(self.theme.active_background)
-                } else {
-                    self.solid_brush(self.theme.tab_bar_bg)
-                };
-                let fg_color = if tab.active {
-                    self.theme.foreground
-                } else {
-                    self.theme.line_number_fg
-                };
+    fn draw_group_tab_bar(
+        &self,
+        gtb: &crate::render::GroupTabBar,
+        is_active_group: bool,
+    ) {
+        let h = self.line_height;
+        let x = gtb.bounds.x as f32;
+        let y = gtb.bounds.y as f32 - h; // tab bar sits above the group content
+        let w = gtb.bounds.width as f32;
 
-                let tab_w = (tab.name.chars().count() as f32 + 3.0) * self.char_width;
+        let bg = if is_active_group {
+            self.solid_brush(self.theme.tab_bar_bg)
+        } else {
+            self.solid_brush(self.theme.tab_bar_bg)
+        };
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
+        }
+        self.draw_tabs(&gtb.tabs, x, y, w);
+    }
 
+    fn draw_tabs(&self, tabs: &[crate::render::TabInfo], x_origin: f32, y: f32, _max_width: f32) {
+        let h = self.line_height;
+        let mut x = x_origin;
+
+        for tab in tabs {
+            let bg = if tab.active {
+                self.solid_brush(self.theme.active_background)
+            } else {
+                self.solid_brush(self.theme.tab_bar_bg)
+            };
+            let fg_color = if tab.active {
+                self.theme.foreground
+            } else {
+                self.theme.line_number_fg
+            };
+
+            let tab_w = (tab.name.chars().count() as f32 + 3.0) * self.char_width;
+
+            unsafe {
                 self.rt.FillRectangle(&rect_f(x, y, tab_w, h), &bg);
-                self.draw_text(&tab.name, x + self.char_width, y, fg_color);
+            }
 
-                // Active tab accent
-                if tab.active {
-                    let accent = self.solid_brush(self.theme.tab_active_accent);
+            // Tab name
+            self.draw_text(&tab.name, x + self.char_width, y, fg_color);
+
+            // Dirty indicator (dot) or close button (x)
+            let close_x = x + tab_w - 2.0 * self.char_width;
+            if tab.dirty {
+                // Show a dot for unsaved changes
+                self.draw_text("\u{25CF}", close_x, y, self.theme.git_modified);
+            } else {
+                self.draw_text("\u{00D7}", close_x, y, self.theme.line_number_fg);
+            }
+
+            // Active tab accent bar (2px at top)
+            if tab.active {
+                let accent = self.solid_brush(self.theme.tab_active_accent);
+                unsafe {
                     self.rt
                         .FillRectangle(&rect_f(x, y, tab_w, 2.0), &accent);
                 }
+            }
 
-                x += tab_w;
+            // Tab separator
+            unsafe {
+                let sep = self.solid_brush(self.theme.separator);
+                self.rt.FillRectangle(
+                    &rect_f(x + tab_w - 1.0, y + 4.0, 1.0, h - 8.0),
+                    &sep,
+                );
+            }
+
+            x += tab_w;
+        }
+    }
+
+    fn draw_group_dividers(&self, split: &crate::render::EditorGroupSplitData) {
+        let divider_brush = self.solid_brush(self.theme.separator);
+        for div in &split.dividers {
+            let (x, y, w, h) = match div.direction {
+                crate::core::window::SplitDirection::Vertical => (
+                    div.position as f32,
+                    div.cross_start as f32,
+                    2.0,
+                    div.cross_size as f32,
+                ),
+                crate::core::window::SplitDirection::Horizontal => (
+                    div.cross_start as f32,
+                    div.position as f32,
+                    div.cross_size as f32,
+                    2.0,
+                ),
+            };
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(x, y, w, h), &divider_brush);
             }
         }
     }
@@ -412,23 +504,194 @@ impl<'a> DrawContext<'a> {
 
     // ─── Completion popup ────────────────────────────────────────────────────
 
-    fn draw_completion(&self, comp: &crate::render::CompletionMenu) {
+    fn draw_completion(
+        &self,
+        comp: &crate::render::CompletionMenu,
+        active_window: Option<&RenderedWindow>,
+    ) {
         let bg = self.solid_brush(self.theme.completion_bg);
         let sel_bg = self.solid_brush(self.theme.selection);
+        let border_brush = self.solid_brush(self.theme.separator);
         let popup_w = (comp.max_width as f32 + 4.0) * self.char_width;
-        // Position at left edge, below cursor area (approximate)
-        let x = 4.0 * self.char_width;
-        let y = 2.0 * self.line_height;
+        let max_visible = comp.candidates.len().min(10);
+        let popup_h = max_visible as f32 * self.line_height;
 
-        for (i, candidate) in comp.candidates.iter().enumerate() {
+        // Position below the cursor in the active window
+        let (x, y) = if let Some(rw) = active_window {
+            if let Some((pos, _)) = &rw.cursor {
+                let gutter_px = rw.gutter_char_width as f32 * self.char_width;
+                let cx = rw.rect.x as f32 + gutter_px + pos.col as f32 * self.char_width;
+                let cy = rw.rect.y as f32 + (pos.view_line as f32 + 1.0) * self.line_height;
+                // Clamp to window bounds
+                let (rt_w, rt_h) = self.rt_size();
+                let fx = cx.min(rt_w - popup_w - 2.0).max(0.0);
+                let fy = if cy + popup_h > rt_h - 2.0 * self.line_height {
+                    // Show above cursor instead
+                    rw.rect.y as f32 + pos.view_line as f32 * self.line_height - popup_h
+                } else {
+                    cy
+                };
+                (fx, fy.max(0.0))
+            } else {
+                (4.0 * self.char_width, 2.0 * self.line_height)
+            }
+        } else {
+            (4.0 * self.char_width, 2.0 * self.line_height)
+        };
+
+        unsafe {
+            // Background + border
+            self.rt
+                .FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt.DrawRectangle(
+                &rect_f(x, y, popup_w, popup_h),
+                &border_brush,
+                1.0,
+                None,
+            );
+        }
+
+        for (i, candidate) in comp.candidates.iter().take(max_visible).enumerate() {
             let iy = y + i as f32 * self.line_height;
             let is_selected = i == comp.selected_idx;
-            let row_bg = if is_selected { &sel_bg } else { &bg };
+            if is_selected {
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(x, iy, popup_w, self.line_height), &sel_bg);
+                }
+            }
+            self.draw_text(
+                candidate,
+                x + self.char_width,
+                iy,
+                self.theme.foreground,
+            );
+        }
+    }
+
+    fn draw_hover(
+        &self,
+        hover: &crate::render::HoverPopup,
+        active_window: Option<&RenderedWindow>,
+    ) {
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border_brush = self.solid_brush(self.theme.separator);
+
+        // Compute popup size from text content
+        let lines: Vec<&str> = hover.text.lines().collect();
+        let max_line_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(20);
+        let popup_w = (max_line_chars as f32 + 4.0) * self.char_width;
+        let popup_h = lines.len() as f32 * self.line_height + 4.0;
+        let max_popup_w = {
+            let (rt_w, _) = self.rt_size();
+            rt_w * 0.6
+        };
+        let popup_w = popup_w.min(max_popup_w);
+
+        // Position above the anchor in the active window
+        let (x, y) = if let Some(rw) = active_window {
+            let gutter_px = rw.gutter_char_width as f32 * self.char_width;
+            let scroll_top = rw.lines.first().map_or(0, |l| l.line_idx);
+            let view_line = hover.anchor_line.saturating_sub(scroll_top);
+            let cx = rw.rect.x as f32 + gutter_px + hover.anchor_col as f32 * self.char_width;
+            let cy = rw.rect.y as f32 + view_line as f32 * self.line_height;
+            // Prefer above cursor
+            let fy = if cy >= popup_h {
+                cy - popup_h
+            } else {
+                cy + self.line_height
+            };
+            let (rt_w, _) = self.rt_size();
+            (cx.min(rt_w - popup_w - 2.0).max(0.0), fy.max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt.DrawRectangle(
+                &rect_f(x, y, popup_w, popup_h),
+                &border_brush,
+                1.0,
+                None,
+            );
+        }
+
+        for (i, line_text) in lines.iter().enumerate() {
+            self.draw_text(
+                line_text,
+                x + self.char_width,
+                y + 2.0 + i as f32 * self.line_height,
+                self.theme.foreground,
+            );
+        }
+    }
+
+    fn draw_dialog(&self, dialog: &crate::render::DialogPanel) {
+        let (rt_w, rt_h) = self.rt_size();
+
+        // Semi-transparent overlay
+        let overlay = self.solid_brush_alpha(self.theme.background, 0.6);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(0.0, 0.0, rt_w, rt_h), &overlay);
+        }
+
+        // Dialog box
+        let dialog_w = 400.0f32.min(rt_w - 40.0);
+        let dialog_h = (dialog.body.len() as f32 + 3.0) * self.line_height + 20.0;
+        let dx = (rt_w - dialog_w) / 2.0;
+        let dy = (rt_h - dialog_h) / 2.0;
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(dx, dy, dialog_w, dialog_h), &bg);
+            self.rt.DrawRectangle(
+                &rect_f(dx, dy, dialog_w, dialog_h),
+                &border,
+                1.0,
+                None,
+            );
+        }
+
+        // Title
+        self.draw_text(
+            &dialog.title,
+            dx + self.char_width,
+            dy + 4.0,
+            self.theme.foreground,
+        );
+
+        // Body lines
+        for (i, line_text) in dialog.body.iter().enumerate() {
+            self.draw_text(
+                line_text,
+                dx + self.char_width,
+                dy + (i as f32 + 1.5) * self.line_height,
+                self.theme.foreground,
+            );
+        }
+
+        // Buttons
+        let btn_y = dy + dialog_h - self.line_height - 8.0;
+        let mut bx = dx + dialog_w - self.char_width;
+        for (label, is_selected) in dialog.buttons.iter().rev() {
+            let btn_w = (label.chars().count() as f32 + 2.0) * self.char_width;
+            bx -= btn_w;
+            let btn_bg = if *is_selected {
+                self.solid_brush(self.theme.selection)
+            } else {
+                self.solid_brush(self.theme.status_bg)
+            };
             unsafe {
                 self.rt
-                    .FillRectangle(&rect_f(x, iy, popup_w, self.line_height), row_bg);
+                    .FillRectangle(&rect_f(bx, btn_y, btn_w, self.line_height), &btn_bg);
             }
-            self.draw_text(candidate, x + self.char_width, iy, self.theme.foreground);
+            self.draw_text(label, bx + self.char_width, btn_y, self.theme.foreground);
+            bx -= self.char_width;
         }
     }
 

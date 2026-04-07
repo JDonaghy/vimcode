@@ -12,6 +12,7 @@ pub mod input;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -24,9 +25,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::core::engine::{open_url_in_browser, Engine, EngineAction, OpenMode};
-use crate::core::window::WindowRect;
+use crate::core::window::{GroupId, WindowId, WindowRect};
 use crate::icons;
-use crate::render::{self, build_screen_layout, Theme};
+use crate::render::{self, build_screen_layout, ScreenLayout, Theme};
 
 use self::draw::DrawContext;
 use self::input::{translate_char, translate_vk};
@@ -35,7 +36,30 @@ use self::input::{translate_char, translate_vk};
 const TICK_TIMER_ID: usize = 1;
 const TICK_INTERVAL_MS: u32 = 50;
 
+/// Double-click detection threshold.
+const DOUBLE_CLICK_MS: u64 = 400;
+
 // ─── Per-window state stored in a thread-local ──────────────────────────────
+
+/// Cached tab slot positions from the last draw pass, used for click hit-testing.
+#[derive(Clone, Debug)]
+struct TabSlot {
+    group_id: GroupId,
+    tab_idx: usize,
+    x_start: f32,
+    x_end: f32,
+    close_x_start: f32,
+    y: f32,
+    height: f32,
+}
+
+/// Cached window rectangle from the last draw pass, for mouse-to-editor mapping.
+#[derive(Clone, Debug)]
+struct CachedWindowRect {
+    window_id: WindowId,
+    rect: WindowRect,
+    gutter_chars: usize,
+}
 
 struct AppState {
     engine: Engine,
@@ -48,6 +72,15 @@ struct AppState {
     char_width: f32,
     line_height: f32,
     dpi_scale: f32,
+
+    // ── Cached layout from last draw pass ────────────────────────────────
+    tab_slots: Vec<TabSlot>,
+    cached_window_rects: Vec<CachedWindowRect>,
+
+    // ── Mouse state ──────────────────────────────────────────────────────
+    mouse_text_drag: bool,
+    last_click_time: Instant,
+    last_click_pos: (i16, i16),
 }
 
 thread_local! {
@@ -137,6 +170,11 @@ pub fn run(file_path: Option<PathBuf>) {
             char_width,
             line_height,
             dpi_scale: 1.0,
+            tab_slots: Vec::new(),
+            cached_window_rects: Vec::new(),
+            mouse_text_drag: false,
+            last_click_time: Instant::now(),
+            last_click_pos: (0, 0),
         });
     });
 
@@ -169,7 +207,7 @@ fn create_window() -> HWND {
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_IBEAM).unwrap_or_default(),
@@ -267,7 +305,22 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            on_mouse_click(hwnd, lparam);
+            on_mouse_down(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            on_mouse_up(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if wparam.0 & 0x0001 != 0 {
+                // MK_LBUTTON is pressed — this is a drag
+                on_mouse_drag(hwnd, lparam);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            on_mouse_dblclick(hwnd, lparam);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -296,7 +349,7 @@ fn on_paint(hwnd: HWND) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        let Some(ref rt) = state.render_target else {
+        let Some(rt) = state.render_target.clone() else {
             return;
         };
 
@@ -311,39 +364,39 @@ fn on_paint(hwnd: HWND) {
         let cw = state.char_width as f64;
         let lh = state.line_height as f64;
 
-        // Reserve rows: 1 tab bar + 1 status bar + 1 command line = 3 rows
-        let chrome_rows = 3.0;
-        let editor_y = lh; // below tab bar
-        let editor_h = height - chrome_rows * lh;
+        // Reserve: 1 status bar + 1 command line at the bottom
+        let tab_bar_height = lh;
+        let editor_bottom = height - 2.0 * lh; // status + command line
 
-        // Compute viewport for the engine
-        let viewport_lines = (editor_h / lh).floor() as usize;
-        let viewport_cols = (width / cw).floor() as usize;
+        // Use engine's group-aware rect calculation (handles splits)
+        let editor_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+        let (window_rects, _dividers) = state
+            .engine
+            .calculate_group_window_rects(editor_bounds, tab_bar_height);
 
-        // Update all windows' viewport sizes
-        let window_ids: Vec<_> = state.engine.windows.keys().copied().collect();
-        for wid in &window_ids {
-            state.engine.set_viewport_for_window(*wid, viewport_lines.saturating_sub(1), viewport_cols);
+        // Update viewports for all windows based on their rects
+        for (wid, wrect) in &window_rects {
+            let vp_lines = (wrect.height / lh).floor() as usize;
+            let vp_cols = (wrect.width / cw).floor() as usize;
+            state
+                .engine
+                .set_viewport_for_window(*wid, vp_lines.saturating_sub(1), vp_cols);
         }
 
-        // Build window rects — single-window for now
-        let window_rects: Vec<_> = state
-            .engine
-            .windows
-            .keys()
-            .map(|&wid| {
-                (
-                    wid,
-                    WindowRect::new(0.0, editor_y, width, editor_h),
-                )
-            })
-            .collect();
+        let screen = build_screen_layout(
+            &state.engine,
+            &state.theme,
+            &window_rects,
+            lh,
+            cw,
+            true,
+        );
 
-        let screen =
-            build_screen_layout(&state.engine, &state.theme, &window_rects, lh, cw, true);
+        // Cache window rects for mouse hit-testing
+        cache_layout(state, &screen, &window_rects);
 
         let ctx = DrawContext {
-            rt,
+            rt: &rt,
             dwrite: &state.dwrite_factory,
             format: &state.text_format,
             theme: &state.theme,
@@ -362,6 +415,74 @@ fn on_paint(hwnd: HWND) {
             let _ = ValidateRect(Some(hwnd), None);
         }
     });
+}
+
+/// Cache tab slot positions and window rects after each draw for mouse hit-testing.
+fn cache_layout(
+    state: &mut AppState,
+    screen: &ScreenLayout,
+    window_rects: &[(WindowId, WindowRect)],
+) {
+    let cw = state.char_width;
+    let lh = state.line_height;
+
+    // Cache tab slots from screen layout
+    state.tab_slots.clear();
+    if let Some(ref split) = screen.editor_group_split {
+        // Multi-group: each group has its own tab bar
+        for gtb in &split.group_tab_bars {
+            let tab_y = gtb.bounds.y as f32 - lh;
+            let mut x = gtb.bounds.x as f32;
+            for (idx, tab) in gtb.tabs.iter().enumerate() {
+                let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
+                let close_x = x + name_w - 2.0 * cw;
+                state.tab_slots.push(TabSlot {
+                    group_id: gtb.group_id,
+                    tab_idx: idx,
+                    x_start: x,
+                    x_end: x + name_w,
+                    close_x_start: close_x,
+                    y: tab_y,
+                    height: lh,
+                });
+                x += name_w;
+            }
+        }
+    } else {
+        // Single-group: use the flat tab_bar
+        let group_id = state.engine.active_group;
+        let tab_y = 0.0f32;
+        let mut x = 0.0f32;
+        for (idx, tab) in screen.tab_bar.iter().enumerate() {
+            let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
+            let close_x = x + name_w - 2.0 * cw;
+            state.tab_slots.push(TabSlot {
+                group_id,
+                tab_idx: idx,
+                x_start: x,
+                x_end: x + name_w,
+                close_x_start: close_x,
+                y: tab_y,
+                height: lh,
+            });
+            x += name_w;
+        }
+    }
+
+    // Cache window rects with gutter widths
+    state.cached_window_rects.clear();
+    for rw in &screen.windows {
+        state.cached_window_rects.push(CachedWindowRect {
+            window_id: rw.window_id,
+            rect: WindowRect::new(
+                rw.rect.x,
+                rw.rect.y,
+                rw.rect.width,
+                rw.rect.height,
+            ),
+            gutter_chars: rw.gutter_char_width,
+        });
+    }
 }
 
 fn on_resize(hwnd: HWND) {
@@ -442,47 +563,155 @@ fn on_char(wparam: WPARAM) {
     });
 }
 
-fn on_mouse_click(hwnd: HWND, lparam: LPARAM) {
+/// Extract pixel coordinates from LPARAM.
+fn lparam_xy(lparam: LPARAM) -> (f32, f32) {
     let x = (lparam.0 & 0xFFFF) as i16 as f32;
     let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+    (x, y)
+}
+
+/// Find which cached window rect contains the given pixel position, and convert
+/// to (window_id, buffer_line, column).
+fn pixel_to_editor_pos(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize, usize)> {
+    let cw = state.char_width;
+    let lh = state.line_height;
+
+    for cwr in &state.cached_window_rects {
+        let rx = cwr.rect.x as f32;
+        let ry = cwr.rect.y as f32;
+        let rw = cwr.rect.width as f32;
+        let rh = cwr.rect.height as f32;
+
+        if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
+            let gutter_px = cwr.gutter_chars as f32 * cw;
+            let view_row = ((py - ry) / lh).floor().max(0.0) as usize;
+
+            // Look up the buffer line from the RenderedWindow lines
+            // (handles wrapped lines). We use scroll_top + view_row as fallback.
+            let w = state.engine.windows.get(&cwr.window_id);
+            let scroll_top = w.map_or(0, |w| w.view.scroll_top);
+            let buf_line = scroll_top + view_row;
+
+            let text_x = px - rx - gutter_px;
+            let scroll_left = w.map_or(0, |w| w.view.scroll_left);
+            let col = (text_x / cw).max(0.0).floor() as usize + scroll_left;
+
+            return Some((cwr.window_id, buf_line, col));
+        }
+    }
+    None
+}
+
+fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
+    let (px, py) = lparam_xy(lparam);
+    let ix = (lparam.0 & 0xFFFF) as i16;
+    let iy = ((lparam.0 >> 16) & 0xFFFF) as i16;
+
+    // Capture mouse so we get drag events even outside the window
+    unsafe {
+        SetCapture(hwnd);
+    }
 
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        let cw = state.char_width;
-        let lh = state.line_height;
+        // ── Check tab bar hits first ─────────────────────────────────────
+        for slot in &state.tab_slots {
+            if px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height {
+                // Hit a tab — switch group and tab
+                state.engine.active_group = slot.group_id;
+                if px >= slot.close_x_start {
+                    // Close button hit
+                    state.engine.goto_tab(slot.tab_idx);
+                    state.engine.close_tab();
+                } else {
+                    state.engine.goto_tab(slot.tab_idx);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
 
-        // Convert pixel to editor position
-        // Tab bar occupies row 0, editor starts at row 1
-        let editor_row = ((y - lh) / lh).floor().max(0.0) as usize;
-        let gutter_chars = state
-            .engine
-            .windows
-            .values()
-            .next()
-            .map(|w| {
-                let bs = state.engine.buffer_manager.get(w.buffer_id);
-                let total_lines = bs.map_or(1, |s| s.buffer.len_lines());
-                render::calculate_gutter_cols(
-                    state.engine.settings.line_numbers,
-                    total_lines,
-                    cw as f64,
-                    false,
-                    false,
-                )
-            })
-            .unwrap_or(4);
-        let text_x = x - (gutter_chars as f32) * cw;
-        let col = (text_x / cw).max(0.0).floor() as usize;
+        // ── Double-click detection ───────────────────────────────────────
+        let now = Instant::now();
+        let is_double = now.duration_since(state.last_click_time).as_millis() < DOUBLE_CLICK_MS as u128
+            && state.last_click_pos == (ix, iy);
+        state.last_click_time = now;
+        state.last_click_pos = (ix, iy);
 
-        // Move cursor via engine's set_cursor_for_window (handles clamping)
-        let scroll_top = state.engine.view().scroll_top;
-        let target_line = scroll_top + editor_row;
-        let active_wid = state.engine.active_window_id();
-        state
-            .engine
-            .set_cursor_for_window(active_wid, target_line, col);
+        // ── Editor area click ────────────────────────────────────────────
+        if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            if is_double {
+                state.engine.mouse_double_click(wid, line, col);
+            } else {
+                state.engine.mouse_click(wid, line, col);
+            }
+            state.mouse_text_drag = true;
+        }
+
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    });
+}
+
+fn on_mouse_up(hwnd: HWND) {
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+
+    APP.with(|app| {
+        let mut app = app.borrow_mut();
+        let state = app.as_mut().expect("AppState");
+        state.mouse_text_drag = false;
+        state.engine.mouse_drag_active = false;
+        state.engine.mouse_drag_origin_window = None;
+        state.engine.mouse_drag_word_mode = false;
+
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    });
+}
+
+fn on_mouse_drag(hwnd: HWND, lparam: LPARAM) {
+    let (px, py) = lparam_xy(lparam);
+
+    APP.with(|app| {
+        let mut app = app.borrow_mut();
+        let state = app.as_mut().expect("AppState");
+
+        if !state.mouse_text_drag {
+            return;
+        }
+
+        if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            state.engine.mouse_drag(wid, line, col);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    });
+}
+
+fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
+    let (px, py) = lparam_xy(lparam);
+
+    unsafe {
+        SetCapture(hwnd);
+    }
+
+    APP.with(|app| {
+        let mut app = app.borrow_mut();
+        let state = app.as_mut().expect("AppState");
+
+        if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            state.engine.mouse_double_click(wid, line, col);
+            state.mouse_text_drag = true;
+        }
 
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
