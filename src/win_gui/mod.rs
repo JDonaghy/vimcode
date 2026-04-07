@@ -464,6 +464,22 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Catch panics so they don't unwind across the FFI boundary (which is UB).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wnd_proc_inner(hwnd, msg, wparam, lparam)
+    }));
+    match result {
+        Ok(lresult) => lresult,
+        Err(_) => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn wnd_proc_inner(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_PAINT => {
             on_paint(hwnd);
@@ -1137,7 +1153,7 @@ fn on_mouse_up(hwnd: HWND) {
 }
 
 fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
-    let (px, _py) = lparam_xy(lparam);
+    let (px, py) = lparam_xy(lparam);
     let lbutton = wparam.0 & 0x0001 != 0;
 
     APP.with(|app| {
@@ -1155,8 +1171,14 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             return;
         }
 
-        if !state.sidebar_resize_drag && lbutton {
-            on_mouse_drag(hwnd, lparam);
+        // Text drag (inline instead of calling on_mouse_drag to avoid double borrow)
+        if !state.sidebar_resize_drag && lbutton && state.mouse_text_drag {
+            if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+                state.engine.mouse_drag(wid, line, col);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
             return;
         }
 
