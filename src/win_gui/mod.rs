@@ -100,6 +100,8 @@ struct WinSidebar {
     sort_case_insensitive: bool,
     /// Set when tree needs to be rebuilt (file opened, folder toggled, etc.)
     dirty: bool,
+    /// Whether the sidebar has keyboard focus.
+    has_focus: bool,
 }
 
 impl WinSidebar {
@@ -116,6 +118,7 @@ impl WinSidebar {
             show_hidden: false,
             sort_case_insensitive: true,
             dirty: true,
+            has_focus: false,
         }
     }
 
@@ -240,6 +243,10 @@ struct AppState {
     // ── Sidebar ───────────────────────────────────────────────────────────
     sidebar: WinSidebar,
 
+    // ── Hot-reload tracking ──────────────────────────────────────────────
+    current_colorscheme: String,
+    current_font_size: i32,
+
     // ── Mouse state ──────────────────────────────────────────────────────
     mouse_text_drag: bool,
     last_click_time: Instant,
@@ -299,7 +306,9 @@ pub fn run(file_path: Option<PathBuf>) {
     .expect("DWriteCreateFactory");
 
     // Create text format (monospace font, size from settings)
-    let font_size = engine.settings.font_size as f32;
+    let initial_colorscheme = engine.settings.colorscheme.clone();
+    let initial_font_size = engine.settings.font_size;
+    let font_size = initial_font_size as f32;
     let text_format: IDWriteTextFormat = unsafe {
         dwrite_factory.CreateTextFormat(
             w!("Consolas"),
@@ -336,6 +345,8 @@ pub fn run(file_path: Option<PathBuf>) {
             tab_slots: Vec::new(),
             cached_window_rects: Vec::new(),
             sidebar: WinSidebar::new(),
+            current_colorscheme: initial_colorscheme,
+            current_font_size: initial_font_size,
             mouse_text_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
@@ -717,6 +728,84 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Ctrl+Shift+E: toggle sidebar focus
+        if ctrl && shift && key.key_name == "E" {
+            if !state.sidebar.visible {
+                state.sidebar.visible = true;
+                state.sidebar.dirty = true;
+                if state.sidebar.expanded.is_empty() {
+                    if let Some(ref root) = state.engine.workspace_root.clone() {
+                        state.sidebar.expanded.insert(root.clone());
+                    }
+                }
+            }
+            state.sidebar.has_focus = !state.sidebar.has_focus;
+            state.sidebar.active_panel = SidebarPanel::Explorer;
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Sidebar keyboard navigation when focused
+        if state.sidebar.has_focus && state.sidebar.visible {
+            let handled = match key.key_name.as_str() {
+                "Escape" => {
+                    state.sidebar.has_focus = false;
+                    true
+                }
+                "Up" | "k" if !ctrl => {
+                    state.sidebar.selected = state.sidebar.selected.saturating_sub(1);
+                    true
+                }
+                "Down" | "j" if !ctrl => {
+                    if state.sidebar.selected + 1 < state.sidebar.rows.len() {
+                        state.sidebar.selected += 1;
+                    }
+                    true
+                }
+                "Return" | "Right" | "l" if !ctrl => {
+                    if state.sidebar.active_panel == SidebarPanel::Explorer {
+                        let idx = state.sidebar.selected;
+                        if idx < state.sidebar.rows.len() {
+                            let is_dir = state.sidebar.rows[idx].is_dir;
+                            let path = state.sidebar.rows[idx].path.clone();
+                            if is_dir {
+                                state.sidebar.toggle_expand(idx);
+                                if let Some(ref root) = state.engine.workspace_root.clone() {
+                                    state.sidebar.build_rows(root);
+                                }
+                            } else {
+                                let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                                state.sidebar.has_focus = false;
+                            }
+                        }
+                    }
+                    true
+                }
+                "Left" | "h" if !ctrl => {
+                    // Collapse directory
+                    if state.sidebar.active_panel == SidebarPanel::Explorer {
+                        let idx = state.sidebar.selected;
+                        if idx < state.sidebar.rows.len() && state.sidebar.rows[idx].is_dir && state.sidebar.rows[idx].is_expanded {
+                            state.sidebar.toggle_expand(idx);
+                            if let Some(ref root) = state.engine.workspace_root.clone() {
+                                state.sidebar.build_rows(root);
+                            }
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+        }
+
         // Backend-level Alt key handling (matches TUI behavior)
         if key.key_name.starts_with("Alt-") {
             let handled = match key.key_name.as_str() {
@@ -869,6 +958,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
 
         // ── Check sidebar panel clicks ──────────────────────────────────
         if state.sidebar.visible && px < state.sidebar.total_width() {
+            state.sidebar.has_focus = px >= ab_w; // focus panel area, not activity bar
             let row = (py / state.line_height).floor() as usize;
 
             if state.sidebar.active_panel == SidebarPanel::Explorer {
@@ -928,6 +1018,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         state.last_click_pos = (ix, iy);
 
         // ── Editor area click ────────────────────────────────────────────
+        state.sidebar.has_focus = false;
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             if is_double {
                 state.engine.mouse_double_click(wid, line, col);
@@ -1099,8 +1190,38 @@ fn on_tick(hwnd: HWND) {
 
         // Notification ticker
         state.engine.tick_notifications();
-        // tick_notifications always causes a redraw check
         needs_redraw = true;
+
+        // Hot-reload theme
+        if state.engine.settings.colorscheme != state.current_colorscheme {
+            state.theme = Theme::from_name(&state.engine.settings.colorscheme);
+            state.current_colorscheme = state.engine.settings.colorscheme.clone();
+            needs_redraw = true;
+        }
+
+        // Hot-reload font size
+        if state.engine.settings.font_size != state.current_font_size {
+            let new_size = state.engine.settings.font_size as f32;
+            if let Ok(fmt) = unsafe {
+                state.dwrite_factory.CreateTextFormat(
+                    w!("Consolas"),
+                    None,
+                    DWRITE_FONT_WEIGHT_REGULAR,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    new_size,
+                    w!("en-us"),
+                )
+            } {
+                state.text_format = fmt;
+                state.char_width =
+                    draw::measure_char_width(&state.dwrite_factory, &state.text_format);
+                state.line_height =
+                    draw::measure_line_height(&state.dwrite_factory, &state.text_format);
+                state.current_font_size = state.engine.settings.font_size;
+                needs_redraw = true;
+            }
+        }
 
         if needs_redraw {
             unsafe {

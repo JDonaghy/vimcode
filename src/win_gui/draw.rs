@@ -1183,19 +1183,26 @@ impl<'a> DrawContext<'a> {
             SidebarPanel::Git => self.draw_git_panel(screen, panel_x, panel_w, rt_h),
             SidebarPanel::Debug => self.draw_debug_panel(screen, panel_x, panel_w, rt_h),
             SidebarPanel::Extensions => self.draw_extensions_panel(screen, panel_x, panel_w, rt_h),
-            _ => {
-                let label = match sidebar.active_panel {
-                    SidebarPanel::Search => "Search",
-                    SidebarPanel::Ai => "AI Assistant",
-                    SidebarPanel::Settings => "Settings",
-                    _ => "",
-                };
-                self.draw_text(label, panel_x + self.char_width, self.line_height * 0.5, self.theme.foreground);
+            SidebarPanel::Search => self.draw_search_panel(screen, panel_x, panel_w, rt_h),
+            SidebarPanel::Ai => self.draw_ai_panel(screen, panel_x, panel_w, rt_h),
+            SidebarPanel::Settings => {
+                self.draw_text("SETTINGS", panel_x + self.char_width, 0.0, self.theme.foreground);
+                self.draw_text(
+                    "Edit settings.json",
+                    panel_x + self.char_width,
+                    self.line_height * 1.5,
+                    self.theme.line_number_fg,
+                );
             }
         }
     }
 
     fn draw_explorer_panel(&self, sidebar: &WinSidebar, panel_x: f32, panel_w: f32, _rt_h: f32) {
+        let sel_color = if sidebar.has_focus {
+            self.theme.sidebar_sel_bg
+        } else {
+            self.theme.sidebar_sel_bg_inactive
+        };
         // Header
         let header_y = 0.0;
         self.draw_text("EXPLORER", panel_x + self.char_width, header_y, self.theme.foreground);
@@ -1210,7 +1217,7 @@ impl<'a> DrawContext<'a> {
 
             // Selection highlight
             if actual_idx == sidebar.selected {
-                let sel_bg = self.solid_brush(self.theme.sidebar_sel_bg);
+                let sel_bg = self.solid_brush(sel_color);
                 unsafe {
                     self.rt.FillRectangle(&rect_f(panel_x, y, panel_w, self.line_height), &sel_bg);
                 }
@@ -1462,6 +1469,142 @@ impl<'a> DrawContext<'a> {
                 y += lh;
             }
         }
+    }
+
+    // ─── Search panel ─────────────────────────────────────────────────────────
+
+    fn draw_search_panel(
+        &self,
+        _screen: &ScreenLayout,
+        panel_x: f32,
+        panel_w: f32,
+        _rt_h: f32,
+    ) {
+        let lh = self.line_height;
+        let cw = self.char_width;
+        let _ = panel_w;
+
+        self.draw_text("SEARCH", panel_x + cw, 0.0, self.theme.foreground);
+
+        // Search input box placeholder
+        let input_y = lh * 1.5;
+        let input_bg = self.solid_brush(self.theme.background);
+        unsafe {
+            self.rt.FillRectangle(
+                &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
+                &input_bg,
+            );
+        }
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.DrawRectangle(
+                &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
+                &border,
+                1.0,
+                None,
+            );
+        }
+        self.draw_text(
+            "Search (use :grep)",
+            panel_x + cw,
+            input_y,
+            self.theme.line_number_fg,
+        );
+    }
+
+    // ─── AI panel ────────────────────────────────────────────────────────────
+
+    fn draw_ai_panel(
+        &self,
+        screen: &ScreenLayout,
+        panel_x: f32,
+        panel_w: f32,
+        rt_h: f32,
+    ) {
+        let lh = self.line_height;
+        let cw = self.char_width;
+
+        self.draw_text("AI ASSISTANT", panel_x + cw, 0.0, self.theme.foreground);
+
+        let Some(ref ai) = screen.ai_panel else {
+            self.draw_text(
+                "Set ai_api_key in settings",
+                panel_x + cw,
+                lh * 1.5,
+                self.theme.line_number_fg,
+            );
+            return;
+        };
+
+        // Messages
+        let mut y = lh * 1.5;
+        let max_y = rt_h - lh * 3.0;
+        let wrap_cols = ((panel_w - cw * 2.0) / cw).floor() as usize;
+
+        for msg in ai.messages.iter().skip(ai.scroll_top) {
+            if y > max_y {
+                break;
+            }
+
+            let role_color = if msg.role == "user" {
+                self.theme.tab_active_accent
+            } else {
+                self.theme.git_added
+            };
+            let label = if msg.role == "user" { "You:" } else { "AI:" };
+            self.draw_text(label, panel_x + cw, y, role_color);
+            y += lh;
+
+            // Word-wrap content
+            for line in msg.content.lines() {
+                if y > max_y {
+                    break;
+                }
+                if wrap_cols > 0 && line.chars().count() > wrap_cols {
+                    let mut remaining = line;
+                    while !remaining.is_empty() && y <= max_y {
+                        let take: String = remaining.chars().take(wrap_cols).collect();
+                        self.draw_text(&take, panel_x + cw * 1.5, y, self.theme.foreground);
+                        remaining = &remaining[take.len()..];
+                        y += lh;
+                    }
+                } else {
+                    self.draw_text(line, panel_x + cw * 1.5, y, self.theme.foreground);
+                    y += lh;
+                }
+            }
+            y += lh * 0.3;
+        }
+
+        // Input box at bottom
+        let input_y = rt_h - lh * 2.0;
+        let input_bg = self.solid_brush(self.theme.background);
+        unsafe {
+            self.rt.FillRectangle(
+                &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
+                &input_bg,
+            );
+        }
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.DrawRectangle(
+                &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
+                &border,
+                1.0,
+                None,
+            );
+        }
+        let input_text = if ai.input.is_empty() {
+            "Ask a question..."
+        } else {
+            &ai.input
+        };
+        let input_color = if ai.input.is_empty() {
+            self.theme.line_number_fg
+        } else {
+            self.theme.foreground
+        };
+        self.draw_text(input_text, panel_x + cw, input_y, input_color);
     }
 
     // ─── Primitive helpers ───────────────────────────────────────────────────
