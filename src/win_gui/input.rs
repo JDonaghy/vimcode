@@ -65,6 +65,10 @@ pub fn translate_vk(vk: u16, ctrl: bool, shift: bool, alt: bool) -> Option<KeyIn
         VK_F11 => Some(named("F11")),
         VK_F12 => Some(named("F12")),
 
+        // Alt+letter combos — handled here because WM_SYSKEYDOWN doesn't
+        // generate WM_CHAR for Alt combos.
+        _ if alt && !ctrl => translate_alt_key(vk, shift),
+
         // Ctrl+letter combos — handled here so they don't go through WM_CHAR
         // (WM_CHAR turns Ctrl+A into char 0x01, etc.)
         _ if ctrl && !alt => translate_ctrl_key(vk, shift),
@@ -84,6 +88,31 @@ pub fn translate_char(ch: char) -> Option<KeyInput> {
         unicode: Some(ch),
         ctrl: false,
     })
+}
+
+fn translate_alt_key(vk: VIRTUAL_KEY, _shift: bool) -> Option<KeyInput> {
+    let code = vk.0;
+    if (0x41..=0x5A).contains(&code) {
+        let lower = (code as u8 + 32) as char;
+        return Some(KeyInput {
+            key_name: format!("Alt-{}", lower),
+            unicode: Some(lower),
+            ctrl: false,
+        });
+    }
+    match vk {
+        VK_OEM_COMMA => Some(KeyInput {
+            key_name: "Alt-,".to_string(),
+            unicode: Some(','),
+            ctrl: false,
+        }),
+        VK_OEM_PERIOD => Some(KeyInput {
+            key_name: "Alt-.".to_string(),
+            unicode: Some('.'),
+            ctrl: false,
+        }),
+        _ => None,
+    }
 }
 
 fn translate_ctrl_key(vk: VIRTUAL_KEY, shift: bool) -> Option<KeyInput> {

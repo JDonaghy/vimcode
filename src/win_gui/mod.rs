@@ -11,7 +11,8 @@ pub mod draw;
 pub mod input;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use windows::core::*;
@@ -61,6 +62,165 @@ struct CachedWindowRect {
     gutter_chars: usize,
 }
 
+// ─── Sidebar ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarPanel {
+    Explorer,
+    Search,
+    Debug,
+    Git,
+    Extensions,
+    Ai,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+struct ExplorerRow {
+    depth: usize,
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    is_expanded: bool,
+}
+
+struct WinSidebar {
+    visible: bool,
+    active_panel: SidebarPanel,
+    /// Activity bar width in pixels (icon column).
+    activity_bar_px: f32,
+    /// Sidebar panel width in pixels.
+    panel_width: f32,
+    // Explorer state
+    rows: Vec<ExplorerRow>,
+    expanded: HashSet<PathBuf>,
+    selected: usize,
+    scroll_top: usize,
+    show_hidden: bool,
+    sort_case_insensitive: bool,
+    /// Set when tree needs to be rebuilt (file opened, folder toggled, etc.)
+    dirty: bool,
+}
+
+impl WinSidebar {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            active_panel: SidebarPanel::Explorer,
+            activity_bar_px: 36.0,
+            panel_width: 220.0,
+            rows: Vec::new(),
+            expanded: HashSet::new(),
+            selected: 0,
+            scroll_top: 0,
+            show_hidden: false,
+            sort_case_insensitive: true,
+            dirty: true,
+        }
+    }
+
+    /// Total width consumed by the sidebar (activity bar + panel, or just activity bar).
+    fn total_width(&self) -> f32 {
+        if self.visible {
+            self.activity_bar_px + self.panel_width
+        } else {
+            self.activity_bar_px
+        }
+    }
+
+    fn build_rows(&mut self, root: &Path) {
+        self.rows.clear();
+        let root_name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.to_string_lossy().to_string());
+        let root_expanded = self.expanded.contains(root);
+        self.rows.push(ExplorerRow {
+            depth: 0,
+            name: root_name.to_uppercase(),
+            path: root.to_path_buf(),
+            is_dir: true,
+            is_expanded: root_expanded,
+        });
+        if root_expanded {
+            collect_explorer_rows(
+                root,
+                1,
+                &self.expanded,
+                self.show_hidden,
+                self.sort_case_insensitive,
+                &mut self.rows,
+            );
+        }
+        if !self.rows.is_empty() && self.selected >= self.rows.len() {
+            self.selected = self.rows.len() - 1;
+        }
+    }
+
+    fn toggle_expand(&mut self, idx: usize) {
+        if idx >= self.rows.len() || !self.rows[idx].is_dir {
+            return;
+        }
+        let path = self.rows[idx].path.clone();
+        if self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+        } else {
+            self.expanded.insert(path);
+        }
+    }
+}
+
+fn collect_explorer_rows(
+    dir: &Path,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    show_hidden: bool,
+    case_insensitive: bool,
+    out: &mut Vec<ExplorerRow>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by(|a, b| {
+        let ad = a.path().is_dir();
+        let bd = b.path().is_dir();
+        match (ad, bd) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                if case_insensitive {
+                    let an = a.file_name().to_string_lossy().to_lowercase();
+                    let bn = b.file_name().to_string_lossy().to_lowercase();
+                    an.cmp(&bn)
+                } else {
+                    a.file_name().cmp(&b.file_name())
+                }
+            }
+        }
+    });
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && !show_hidden {
+            continue;
+        }
+        let is_dir = path.is_dir();
+        let is_expanded = is_dir && expanded.contains(&path);
+        out.push(ExplorerRow {
+            depth,
+            name,
+            path: path.clone(),
+            is_dir,
+            is_expanded,
+        });
+        if is_expanded {
+            collect_explorer_rows(&path, depth + 1, expanded, show_hidden, case_insensitive, out);
+        }
+    }
+}
+
 struct AppState {
     engine: Engine,
     theme: Theme,
@@ -76,6 +236,9 @@ struct AppState {
     // ── Cached layout from last draw pass ────────────────────────────────
     tab_slots: Vec<TabSlot>,
     cached_window_rects: Vec<CachedWindowRect>,
+
+    // ── Sidebar ───────────────────────────────────────────────────────────
+    sidebar: WinSidebar,
 
     // ── Mouse state ──────────────────────────────────────────────────────
     mouse_text_drag: bool,
@@ -172,6 +335,7 @@ pub fn run(file_path: Option<PathBuf>) {
             dpi_scale: 1.0,
             tab_slots: Vec::new(),
             cached_window_rects: Vec::new(),
+            sidebar: WinSidebar::new(),
             mouse_text_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
@@ -207,7 +371,7 @@ fn create_window() -> HWND {
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_IBEAM).unwrap_or_default(),
@@ -364,12 +528,16 @@ fn on_paint(hwnd: HWND) {
         let cw = state.char_width as f64;
         let lh = state.line_height as f64;
 
+        // Sidebar offset
+        let sidebar_left = state.sidebar.total_width() as f64;
+
         // Reserve: 1 status bar + 1 command line at the bottom
         let tab_bar_height = lh;
         let editor_bottom = height - 2.0 * lh; // status + command line
 
         // Use engine's group-aware rect calculation (handles splits)
-        let editor_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+        let editor_bounds =
+            WindowRect::new(sidebar_left, 0.0, width - sidebar_left, editor_bottom);
         let (window_rects, _dividers) = state
             .engine
             .calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -381,6 +549,14 @@ fn on_paint(hwnd: HWND) {
             state
                 .engine
                 .set_viewport_for_window(*wid, vp_lines.saturating_sub(1), vp_cols);
+        }
+
+        // Rebuild explorer rows only when dirty
+        if state.sidebar.visible && state.sidebar.active_panel == SidebarPanel::Explorer && state.sidebar.dirty {
+            if let Some(ref root) = state.engine.workspace_root.clone() {
+                state.sidebar.build_rows(root);
+                state.sidebar.dirty = false;
+            }
         }
 
         let screen = build_screen_layout(
@@ -407,6 +583,8 @@ fn on_paint(hwnd: HWND) {
         unsafe {
             rt.BeginDraw();
             ctx.draw_frame(&screen);
+            // Draw sidebar on top of left edge (activity bar always, panel when visible)
+            ctx.draw_sidebar(&state.sidebar);
             let _ = rt.EndDraw(None, None);
         }
 
@@ -524,10 +702,36 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
     let should_quit = APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+
+        // Backend-level Alt key handling (matches TUI behavior)
+        if key.key_name.starts_with("Alt-") {
+            let handled = match key.key_name.as_str() {
+                "Alt-m" => {
+                    state.engine.toggle_editor_mode();
+                    true
+                }
+                "Alt-," => {
+                    state.engine.group_resize(-0.05);
+                    true
+                }
+                "Alt-." => {
+                    state.engine.group_resize(0.05);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
-        let quit = handle_action(&mut state.engine, action);
+        let quit = handle_action_with_sidebar(state, action);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -545,7 +749,6 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
 
 fn on_char(wparam: WPARAM) {
     let ch = char::from_u32(wparam.0 as u32).unwrap_or('\0');
-
     let Some(key) = translate_char(ch) else {
         return;
     };
@@ -556,7 +759,7 @@ fn on_char(wparam: WPARAM) {
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
-        let _ = handle_action(&mut state.engine, action);
+        let _ = handle_action_with_sidebar(state, action);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -615,6 +818,74 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+
+        // ── Check activity bar clicks ────────────────────────────────────
+        let ab_w = state.sidebar.activity_bar_px;
+        if px < ab_w {
+            let row = (py / state.line_height).floor() as usize;
+            let panels = [
+                SidebarPanel::Explorer,
+                SidebarPanel::Search,
+                SidebarPanel::Debug,
+                SidebarPanel::Git,
+                SidebarPanel::Extensions,
+                SidebarPanel::Ai,
+            ];
+            if row < panels.len() {
+                let clicked_panel = panels[row];
+                if state.sidebar.visible && state.sidebar.active_panel == clicked_panel {
+                    state.sidebar.visible = false;
+                } else {
+                    state.sidebar.active_panel = clicked_panel;
+                    state.sidebar.visible = true;
+                    state.sidebar.dirty = true;
+                    // Auto-expand root
+                    if clicked_panel == SidebarPanel::Explorer && state.sidebar.expanded.is_empty() {
+                        if let Some(ref root) = state.engine.workspace_root.clone() {
+                            state.sidebar.expanded.insert(root.clone());
+                        }
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Check sidebar panel clicks ──────────────────────────────────
+        if state.sidebar.visible && px < state.sidebar.total_width() {
+            let row = (py / state.line_height).floor() as usize;
+
+            if state.sidebar.active_panel == SidebarPanel::Explorer {
+                // Row 0 is the "EXPLORER" header — tree starts at row 1
+                if row == 0 {
+                    // Header click — ignore
+                } else {
+                    let tree_row = row - 1; // adjust for header
+                    let vis_idx = state.sidebar.scroll_top + tree_row;
+                    if vis_idx < state.sidebar.rows.len() {
+                        state.sidebar.selected = vis_idx;
+                        let is_dir = state.sidebar.rows[vis_idx].is_dir;
+                        let path = state.sidebar.rows[vis_idx].path.clone();
+                        if is_dir {
+                            state.sidebar.toggle_expand(vis_idx);
+                            if let Some(ref root) = state.engine.workspace_root.clone() {
+                                state.sidebar.build_rows(root);
+                            }
+                        } else {
+                            let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                        }
+                    }
+                }
+            }
+            // Other panels: Git, Debug, etc. — click handling TBD
+
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
 
         // ── Check tab bar hits first ─────────────────────────────────────
         for slot in &state.tab_slots {
@@ -793,6 +1064,21 @@ fn on_destroy() {
 
 // ─── Action handling ─────────────────────────────────────────────────────────
 
+/// Process an engine action. Returns `true` if the app should quit.
+/// `state` is optional — some callers only have the engine.
+fn handle_action_with_sidebar(state: &mut AppState, action: EngineAction) -> bool {
+    if matches!(action, EngineAction::ToggleSidebar) {
+        state.sidebar.visible = !state.sidebar.visible;
+        state.sidebar.dirty = true;
+        if state.sidebar.visible && state.sidebar.expanded.is_empty() {
+            if let Some(ref root) = state.engine.workspace_root.clone() {
+                state.sidebar.expanded.insert(root.clone());
+            }
+        }
+    }
+    handle_action(&mut state.engine, action)
+}
+
 fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
     match action {
         EngineAction::Quit | EngineAction::SaveQuit => {
@@ -823,7 +1109,10 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false,
         EngineAction::QuitWithUnsaved => false,
-        EngineAction::ToggleSidebar => false,
+        EngineAction::ToggleSidebar => {
+            // Handled at the caller side (needs AppState access)
+            false
+        }
         EngineAction::None | EngineAction::Error => false,
     }
 }
@@ -855,16 +1144,20 @@ fn save_session(engine: &mut Engine) {
 
 fn setup_win_clipboard(engine: &mut Engine) {
     engine.clipboard_read = Some(Box::new(|| {
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "Get-Clipboard"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map_err(|e| e.to_string())
             .and_then(|o| String::from_utf8(o.stdout).map_err(|e| e.to_string()))
             .map(|s| s.trim_end_matches("\r\n").to_string())
     }));
     engine.clipboard_write = Some(Box::new(|text: &str| {
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", "Set-Clipboard", "-Value", text])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

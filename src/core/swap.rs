@@ -173,10 +173,12 @@ pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Use tasklist to check if the PID exists.
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);

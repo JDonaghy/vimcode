@@ -1182,12 +1182,15 @@ pub fn open_url_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
         // `cmd /c start "" "url"` — empty title needed for start.
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", url])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
+            .stderr(std::process::Stdio::null());
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        cmd.spawn().ok();
     }
     #[cfg(target_os = "macos")]
     {

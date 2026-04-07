@@ -879,7 +879,8 @@ impl LspServer {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            cmd.creation_flags(0x00000200 | 0x08000000);
         }
         let mut child = cmd
             .spawn()

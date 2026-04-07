@@ -11,6 +11,8 @@ use crate::render::{
     Color, CursorShape, RenderedLine, RenderedWindow, ScreenLayout, SelectionKind, Theme,
 };
 
+use super::{SidebarPanel, WinSidebar};
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn color_f(c: Color) -> D2D1_COLOR_F {
@@ -178,11 +180,8 @@ impl<'a> DrawContext<'a> {
         let y = gtb.bounds.y as f32 - h; // tab bar sits above the group content
         let w = gtb.bounds.width as f32;
 
-        let bg = if is_active_group {
-            self.solid_brush(self.theme.tab_bar_bg)
-        } else {
-            self.solid_brush(self.theme.tab_bar_bg)
-        };
+        let _ = is_active_group; // reserved for future per-group styling
+        let bg = self.solid_brush(self.theme.tab_bar_bg);
         unsafe {
             self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
         }
@@ -1108,6 +1107,134 @@ impl<'a> DrawContext<'a> {
                         &sep,
                     );
                 }
+            }
+        }
+    }
+
+    // ─── Sidebar ─────────────────────────────────────────────────────────────
+
+    pub(super) fn draw_sidebar(&self, sidebar: &WinSidebar) {
+        let (_, rt_h) = self.rt_size();
+        let ab_w = sidebar.activity_bar_px;
+
+        // Activity bar background (always drawn)
+        let ab_bg = self.solid_brush(self.theme.tab_bar_bg);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(0.0, 0.0, ab_w, rt_h), &ab_bg);
+        }
+
+        // Activity bar icons
+        let panels = [
+            (SidebarPanel::Explorer, "\u{1F4C1}"),  // folder
+            (SidebarPanel::Search, "\u{1F50D}"),     // magnifying glass
+            (SidebarPanel::Debug, "\u{1F41B}"),      // bug
+            (SidebarPanel::Git, "\u{2442}"),         // branch-like
+            (SidebarPanel::Extensions, "\u{2B9E}"),  // extension-like
+            (SidebarPanel::Ai, "\u{1F4AC}"),         // chat bubble
+        ];
+
+        for (i, &(panel, icon)) in panels.iter().enumerate() {
+            let y = i as f32 * self.line_height;
+            let is_active = sidebar.visible && sidebar.active_panel == panel;
+
+            if is_active {
+                // Left accent bar
+                let accent = self.solid_brush(self.theme.tab_active_accent);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(0.0, y, 2.0, self.line_height), &accent);
+                }
+                // Active background
+                let sel = self.solid_brush(self.theme.active_background);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(2.0, y, ab_w - 2.0, self.line_height), &sel);
+                }
+            }
+
+            // Icon text (centered in activity bar)
+            let icon_x = (ab_w - self.char_width) / 2.0;
+            self.draw_text(icon, icon_x, y, self.theme.activity_bar_fg);
+        }
+
+        // If sidebar panel is not visible, we're done
+        if !sidebar.visible {
+            return;
+        }
+
+        // Panel background
+        let panel_x = ab_w;
+        let panel_w = sidebar.panel_width;
+        let panel_bg = self.solid_brush(self.theme.tab_bar_bg);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(panel_x, 0.0, panel_w, rt_h), &panel_bg);
+        }
+
+        // Separator line between panel and editor
+        let sep = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(panel_x + panel_w - 1.0, 0.0, 1.0, rt_h), &sep);
+        }
+
+        match sidebar.active_panel {
+            SidebarPanel::Explorer => self.draw_explorer_panel(sidebar, panel_x, panel_w, rt_h),
+            _ => {
+                // Placeholder for other panels
+                let label = match sidebar.active_panel {
+                    SidebarPanel::Search => "Search",
+                    SidebarPanel::Debug => "Debug",
+                    SidebarPanel::Git => "Source Control",
+                    SidebarPanel::Extensions => "Extensions",
+                    SidebarPanel::Ai => "AI Assistant",
+                    SidebarPanel::Settings => "Settings",
+                    _ => "",
+                };
+                self.draw_text(label, panel_x + self.char_width, self.line_height * 0.5, self.theme.foreground);
+            }
+        }
+    }
+
+    fn draw_explorer_panel(&self, sidebar: &WinSidebar, panel_x: f32, panel_w: f32, _rt_h: f32) {
+        // Header
+        let header_y = 0.0;
+        self.draw_text("EXPLORER", panel_x + self.char_width, header_y, self.theme.foreground);
+
+        // File tree rows
+        let tree_start_y = self.line_height;
+        let max_rows = ((_rt_h - tree_start_y) / self.line_height).floor() as usize;
+
+        for (vis_idx, row) in sidebar.rows.iter().skip(sidebar.scroll_top).take(max_rows).enumerate() {
+            let actual_idx = sidebar.scroll_top + vis_idx;
+            let y = tree_start_y + vis_idx as f32 * self.line_height;
+
+            // Selection highlight
+            if actual_idx == sidebar.selected {
+                let sel_bg = self.solid_brush(self.theme.sidebar_sel_bg);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(panel_x, y, panel_w, self.line_height), &sel_bg);
+                }
+            }
+
+            // Indent + expand arrow
+            let indent_px = row.depth as f32 * self.char_width * 1.5;
+            let text_x = panel_x + self.char_width + indent_px;
+
+            if row.is_dir {
+                let arrow = if row.is_expanded { "\u{25BC}" } else { "\u{25B6}" };
+                self.draw_text(arrow, text_x, y, self.theme.line_number_fg);
+                // Dir name after arrow
+                self.draw_text(
+                    &row.name,
+                    text_x + self.char_width * 1.5,
+                    y,
+                    self.theme.foreground,
+                );
+            } else {
+                // File name (no arrow, offset by arrow width for alignment)
+                self.draw_text(
+                    &row.name,
+                    text_x + self.char_width * 1.5,
+                    y,
+                    self.theme.explorer_file_fg,
+                );
             }
         }
     }
