@@ -859,6 +859,63 @@ fn on_char(wparam: WPARAM) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+
+        // Sidebar keyboard navigation for character keys (j/k/h/l)
+        if state.sidebar.has_focus && state.sidebar.visible {
+            let handled = match ch {
+                'j' => {
+                    if state.sidebar.selected + 1 < state.sidebar.rows.len() {
+                        state.sidebar.selected += 1;
+                    }
+                    true
+                }
+                'k' => {
+                    state.sidebar.selected = state.sidebar.selected.saturating_sub(1);
+                    true
+                }
+                'l' => {
+                    if state.sidebar.active_panel == SidebarPanel::Explorer {
+                        let idx = state.sidebar.selected;
+                        if idx < state.sidebar.rows.len() {
+                            let is_dir = state.sidebar.rows[idx].is_dir;
+                            let path = state.sidebar.rows[idx].path.clone();
+                            if is_dir {
+                                if !state.sidebar.rows[idx].is_expanded {
+                                    state.sidebar.toggle_expand(idx);
+                                    if let Some(ref root) = state.engine.workspace_root.clone() {
+                                        state.sidebar.build_rows(root);
+                                    }
+                                }
+                            } else {
+                                let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                                state.sidebar.has_focus = false;
+                            }
+                        }
+                    }
+                    true
+                }
+                'h' => {
+                    if state.sidebar.active_panel == SidebarPanel::Explorer {
+                        let idx = state.sidebar.selected;
+                        if idx < state.sidebar.rows.len() && state.sidebar.rows[idx].is_dir && state.sidebar.rows[idx].is_expanded {
+                            state.sidebar.toggle_expand(idx);
+                            if let Some(ref root) = state.engine.workspace_root.clone() {
+                                state.sidebar.build_rows(root);
+                            }
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return;
+            }
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
