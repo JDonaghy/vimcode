@@ -298,8 +298,8 @@ pub fn run(file_path: Option<PathBuf>) {
     }
     .expect("DWriteCreateFactory");
 
-    // Create text format (monospace font)
-    let font_size = 14.0f32;
+    // Create text format (monospace font, size from settings)
+    let font_size = engine.settings.font_size as f32;
     let text_format: IDWriteTextFormat = unsafe {
         dwrite_factory.CreateTextFormat(
             w!("Consolas"),
@@ -487,8 +487,12 @@ unsafe extern "system" fn wnd_proc(
             on_mouse_dblclick(hwnd, lparam);
             LRESULT(0)
         }
+        WM_RBUTTONDOWN => {
+            on_right_click(hwnd, lparam);
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
-            on_mouse_wheel(hwnd, wparam);
+            on_mouse_wheel(hwnd, wparam, lparam);
             LRESULT(0)
         }
         WM_TIMER => {
@@ -584,7 +588,7 @@ fn on_paint(hwnd: HWND) {
             rt.BeginDraw();
             ctx.draw_frame(&screen);
             // Draw sidebar on top of left edge (activity bar always, panel when visible)
-            ctx.draw_sidebar(&state.sidebar);
+            ctx.draw_sidebar(&state.sidebar, &screen);
             let _ = rt.EndDraw(None, None);
         }
 
@@ -990,22 +994,67 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
     });
 }
 
-fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM) {
-    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-    let lines = -(delta as i32) / 120 * 3; // 3 lines per notch
+fn on_right_click(hwnd: HWND, lparam: LPARAM) {
+    let (px, py) = lparam_xy(lparam);
 
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        let scroll_top = state.engine.view().scroll_top;
-        let new_top = if lines > 0 {
-            scroll_top.saturating_add(lines as usize)
+        // Only handle right-click in editor area
+        if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            // Position cursor at click location first
+            state.engine.mouse_click(wid, line, col);
+            // Convert pixel to screen row/col for context menu positioning
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let screen_col = (px / cw).floor() as u16;
+            let screen_row = (py / lh).floor() as u16;
+            state.engine.open_editor_context_menu(screen_col, screen_row);
+        }
+
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    });
+}
+
+fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+    let lines = -(delta as i32) / 120 * 3; // 3 lines per notch
+
+    // WM_MOUSEWHEEL gives screen coords — convert to client coords
+    let screen_x = (lparam.0 & 0xFFFF) as i16;
+    let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16;
+    let mut pt = POINT { x: screen_x as i32, y: screen_y as i32 };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+    let px = pt.x as f32;
+
+    APP.with(|app| {
+        let mut app = app.borrow_mut();
+        let state = app.as_mut().expect("AppState");
+
+        // Sidebar scroll
+        if state.sidebar.visible && px < state.sidebar.total_width() {
+            let max = state.sidebar.rows.len().saturating_sub(1);
+            if lines > 0 {
+                state.sidebar.scroll_top = state.sidebar.scroll_top.saturating_add(lines as usize).min(max);
+            } else {
+                state.sidebar.scroll_top = state.sidebar.scroll_top.saturating_sub((-lines) as usize);
+            }
         } else {
-            scroll_top.saturating_sub((-lines) as usize)
-        };
-        let max = state.engine.buffer().len_lines().saturating_sub(1);
-        state.engine.view_mut().scroll_top = new_top.min(max);
+            // Editor scroll
+            let scroll_top = state.engine.view().scroll_top;
+            let new_top = if lines > 0 {
+                scroll_top.saturating_add(lines as usize)
+            } else {
+                scroll_top.saturating_sub((-lines) as usize)
+            };
+            let max = state.engine.buffer().len_lines().saturating_sub(1);
+            state.engine.view_mut().scroll_top = new_top.min(max);
+        }
 
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);

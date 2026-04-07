@@ -1113,7 +1113,7 @@ impl<'a> DrawContext<'a> {
 
     // ─── Sidebar ─────────────────────────────────────────────────────────────
 
-    pub(super) fn draw_sidebar(&self, sidebar: &WinSidebar) {
+    pub(super) fn draw_sidebar(&self, sidebar: &WinSidebar, screen: &ScreenLayout) {
         let (_, rt_h) = self.rt_size();
         let ab_w = sidebar.activity_bar_px;
 
@@ -1176,13 +1176,12 @@ impl<'a> DrawContext<'a> {
 
         match sidebar.active_panel {
             SidebarPanel::Explorer => self.draw_explorer_panel(sidebar, panel_x, panel_w, rt_h),
+            SidebarPanel::Git => self.draw_git_panel(screen, panel_x, panel_w, rt_h),
+            SidebarPanel::Debug => self.draw_debug_panel(screen, panel_x, panel_w, rt_h),
+            SidebarPanel::Extensions => self.draw_extensions_panel(screen, panel_x, panel_w, rt_h),
             _ => {
-                // Placeholder for other panels
                 let label = match sidebar.active_panel {
                     SidebarPanel::Search => "Search",
-                    SidebarPanel::Debug => "Debug",
-                    SidebarPanel::Git => "Source Control",
-                    SidebarPanel::Extensions => "Extensions",
                     SidebarPanel::Ai => "AI Assistant",
                     SidebarPanel::Settings => "Settings",
                     _ => "",
@@ -1235,6 +1234,228 @@ impl<'a> DrawContext<'a> {
                     y,
                     self.theme.explorer_file_fg,
                 );
+            }
+        }
+    }
+
+    // ─── Git (Source Control) panel ─────────────────────────────────────────
+
+    fn draw_git_panel(&self, screen: &ScreenLayout, panel_x: f32, panel_w: f32, _rt_h: f32) {
+        let lh = self.line_height;
+        let cw = self.char_width;
+
+        // Header
+        self.draw_text("SOURCE CONTROL", panel_x + cw, 0.0, self.theme.foreground);
+
+        let Some(ref sc) = screen.source_control else {
+            self.draw_text("No git repository", panel_x + cw, lh, self.theme.line_number_fg);
+            return;
+        };
+
+        // Branch info
+        let branch_text = format!("\u{2442} {} ", sc.branch);
+        let ahead_behind = if sc.ahead > 0 || sc.behind > 0 {
+            format!("\u{2191}{} \u{2193}{}", sc.ahead, sc.behind)
+        } else {
+            String::new()
+        };
+        self.draw_text(&branch_text, panel_x + cw, lh, self.theme.foreground);
+        self.draw_text(
+            &ahead_behind,
+            panel_x + cw + branch_text.chars().count() as f32 * cw,
+            lh,
+            self.theme.line_number_fg,
+        );
+
+        let mut y = lh * 2.5;
+
+        // Staged section
+        if sc.sections_expanded[0] {
+            let header = format!("\u{25BC} Staged ({})", sc.staged.len());
+            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
+            y += lh;
+            for item in &sc.staged {
+                let color = match item.status_char {
+                    'A' => self.theme.git_added,
+                    'M' => self.theme.git_modified,
+                    'D' => self.theme.git_deleted,
+                    _ => self.theme.foreground,
+                };
+                let line = format!("{} {}", item.status_char, item.path);
+                self.draw_text(&line, panel_x + cw * 2.5, y, color);
+                y += lh;
+            }
+        } else {
+            let header = format!("\u{25B6} Staged ({})", sc.staged.len());
+            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
+            y += lh;
+        }
+
+        y += lh * 0.3;
+
+        // Unstaged section
+        if sc.sections_expanded[1] {
+            let header = format!("\u{25BC} Changes ({})", sc.unstaged.len());
+            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
+            y += lh;
+            for item in &sc.unstaged {
+                let color = match item.status_char {
+                    'M' => self.theme.git_modified,
+                    'D' => self.theme.git_deleted,
+                    '?' => self.theme.line_number_fg,
+                    _ => self.theme.foreground,
+                };
+                let line = format!("{} {}", item.status_char, item.path);
+                self.draw_text(&line, panel_x + cw * 2.5, y, color);
+                y += lh;
+            }
+        } else {
+            let header = format!("\u{25B6} Changes ({})", sc.unstaged.len());
+            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
+            y += lh;
+        }
+
+        // Log section (if expanded)
+        if sc.sections_expanded.len() > 3 && sc.sections_expanded[3] && !sc.log.is_empty() {
+            y += lh * 0.3;
+            let header = format!("\u{25BC} Log ({})", sc.log.len());
+            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
+            y += lh;
+            for entry in sc.log.iter().take(20) {
+                let line = format!("{} {}", &entry.hash[..7.min(entry.hash.len())], entry.message);
+                self.draw_text(&line, panel_x + cw * 2.5, y, self.theme.line_number_fg);
+                y += lh;
+            }
+        }
+    }
+
+    // ─── Debug panel ─────────────────────────────────────────────────────────
+
+    fn draw_debug_panel(&self, screen: &ScreenLayout, panel_x: f32, panel_w: f32, _rt_h: f32) {
+        let lh = self.line_height;
+        let cw = self.char_width;
+        let _ = panel_w;
+
+        self.draw_text("DEBUG", panel_x + cw, 0.0, self.theme.foreground);
+
+        let sidebar = &screen.debug_sidebar;
+        if !sidebar.session_active {
+            let cfg = sidebar
+                .launch_config_name
+                .as_deref()
+                .unwrap_or("no config");
+            self.draw_text(
+                &format!("Config: {}", cfg),
+                panel_x + cw,
+                lh,
+                self.theme.line_number_fg,
+            );
+            self.draw_text(
+                "Press F5 to start",
+                panel_x + cw,
+                lh * 2.0,
+                self.theme.line_number_fg,
+            );
+            return;
+        }
+
+        let status = if sidebar.stopped { "PAUSED" } else { "RUNNING" };
+        let status_color = if sidebar.stopped {
+            self.theme.diagnostic_warning
+        } else {
+            self.theme.git_added
+        };
+        self.draw_text(status, panel_x + cw, lh, status_color);
+
+        let mut y = lh * 2.5;
+        let sections: &[(&str, &[crate::render::DebugSidebarItem])] = &[
+            ("Variables", &sidebar.variables),
+            ("Watch", &sidebar.watch),
+            ("Call Stack", &sidebar.frames),
+            ("Breakpoints", &sidebar.breakpoints),
+        ];
+        for (name, items) in sections {
+            self.draw_text(
+                &format!("\u{25BC} {}", name),
+                panel_x + cw,
+                y,
+                self.theme.foreground,
+            );
+            y += lh;
+            for item in items.iter().take(15) {
+                self.draw_text(&item.text, panel_x + cw * 2.5, y, self.theme.foreground);
+                y += lh;
+            }
+            y += lh * 0.3;
+        }
+    }
+
+    // ─── Extensions panel ────────────────────────────────────────────────────
+
+    fn draw_extensions_panel(
+        &self,
+        screen: &ScreenLayout,
+        panel_x: f32,
+        panel_w: f32,
+        _rt_h: f32,
+    ) {
+        let lh = self.line_height;
+        let cw = self.char_width;
+        let _ = panel_w;
+
+        self.draw_text("EXTENSIONS", panel_x + cw, 0.0, self.theme.foreground);
+
+        let Some(ref ext) = screen.ext_sidebar else {
+            self.draw_text(
+                "No extension data",
+                panel_x + cw,
+                lh,
+                self.theme.line_number_fg,
+            );
+            return;
+        };
+
+        let mut y = lh * 1.5;
+
+        // Installed
+        let arrow = if ext.sections_expanded[0] {
+            "\u{25BC}"
+        } else {
+            "\u{25B6}"
+        };
+        self.draw_text(
+            &format!("{} Installed ({})", arrow, ext.items_installed.len()),
+            panel_x + cw,
+            y,
+            self.theme.foreground,
+        );
+        y += lh;
+        if ext.sections_expanded[0] {
+            for item in &ext.items_installed {
+                self.draw_text(&item.name, panel_x + cw * 2.5, y, self.theme.foreground);
+                y += lh;
+            }
+        }
+
+        y += lh * 0.3;
+
+        // Available
+        let arrow = if ext.sections_expanded[1] {
+            "\u{25BC}"
+        } else {
+            "\u{25B6}"
+        };
+        self.draw_text(
+            &format!("{} Available ({})", arrow, ext.items_available.len()),
+            panel_x + cw,
+            y,
+            self.theme.foreground,
+        );
+        y += lh;
+        if ext.sections_expanded[1] {
+            for item in &ext.items_available {
+                self.draw_text(&item.name, panel_x + cw * 2.5, y, self.theme.foreground);
+                y += lh;
             }
         }
     }
