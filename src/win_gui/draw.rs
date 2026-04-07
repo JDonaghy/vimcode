@@ -7,6 +7,7 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 
+use crate::core::engine::Notification;
 use crate::render::{
     Color, CursorShape, RenderedLine, RenderedWindow, ScreenLayout, SelectionKind, Theme,
 };
@@ -377,6 +378,40 @@ impl<'a> DrawContext<'a> {
                 let text_len = line.raw_text.trim_end_matches('\n').chars().count();
                 let ax = rx + gutter_px + (text_len as f32 + 2.0) * self.char_width;
                 self.draw_text(ann, ax, line_y, self.theme.line_number_fg);
+            }
+        }
+
+        // Scrollbar (thin track on right edge)
+        if rw.total_lines > 0 {
+            let sb_width = 6.0f32;
+            let sb_x = rx + rw.rect.width as f32 - sb_width;
+            let editor_h = rw.rect.height as f32
+                - if rw.status_line.is_some() {
+                    self.line_height
+                } else {
+                    0.0
+                };
+            let viewport_lines = rw.lines.len();
+            if rw.total_lines > viewport_lines {
+                // Track background
+                let track_brush = self.solid_brush_alpha(self.theme.line_number_fg, 0.15);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(sb_x, ry, sb_width, editor_h), &track_brush);
+                }
+                // Thumb
+                let ratio = viewport_lines as f32 / rw.total_lines as f32;
+                let thumb_h = (editor_h * ratio).max(20.0);
+                let scroll_ratio = rw.scroll_top as f32
+                    / (rw.total_lines.saturating_sub(viewport_lines)) as f32;
+                let thumb_y = ry + scroll_ratio * (editor_h - thumb_h);
+                let thumb_brush = self.solid_brush_alpha(self.theme.foreground, 0.35);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(sb_x, thumb_y, sb_width, thumb_h),
+                        &thumb_brush,
+                    );
+                }
             }
         }
 
@@ -1605,6 +1640,49 @@ impl<'a> DrawContext<'a> {
             self.theme.foreground
         };
         self.draw_text(input_text, panel_x + cw, input_y, input_color);
+    }
+
+    // ─── Notification toasts ────────────────────────────────────────────────
+
+    pub(super) fn draw_notifications(&self, notifications: &[Notification]) {
+        if notifications.is_empty() {
+            return;
+        }
+        let (rt_w, rt_h) = self.rt_size();
+        let lh = self.line_height;
+        let cw = self.char_width;
+        let toast_w = 300.0f32.min(rt_w * 0.4);
+        let margin = 8.0f32;
+        let x = rt_w - toast_w - margin;
+        let mut y = rt_h - 3.0 * lh - margin; // above status+command line
+
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+
+        for notif in notifications.iter().rev().take(3) {
+            let spinner = if notif.done { "\u{2714}" } else { "\u{25CB}" };
+            let text = format!("{} {}", spinner, notif.message);
+            let toast_h = lh + 4.0;
+            y -= toast_h + 4.0;
+
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(x, y, toast_w, toast_h), &bg);
+                self.rt.DrawRectangle(
+                    &rect_f(x, y, toast_w, toast_h),
+                    &border,
+                    1.0,
+                    None,
+                );
+            }
+
+            let color = if notif.done {
+                self.theme.git_added
+            } else {
+                self.theme.foreground
+            };
+            self.draw_text(&text, x + cw * 0.5, y + 2.0, color);
+        }
     }
 
     // ─── Primitive helpers ───────────────────────────────────────────────────

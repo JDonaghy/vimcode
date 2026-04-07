@@ -40,6 +40,9 @@ const TICK_INTERVAL_MS: u32 = 50;
 /// Double-click detection threshold.
 const DOUBLE_CLICK_MS: u64 = 400;
 
+/// Hit zone width (pixels) for sidebar resize drag handle.
+const SIDEBAR_RESIZE_HIT_PX: f32 = 5.0;
+
 // ─── Per-window state stored in a thread-local ──────────────────────────────
 
 /// Cached tab slot positions from the last draw pass, used for click hit-testing.
@@ -249,6 +252,7 @@ struct AppState {
 
     // ── Mouse state ──────────────────────────────────────────────────────
     mouse_text_drag: bool,
+    sidebar_resize_drag: bool,
     last_click_time: Instant,
     last_click_pos: (i16, i16),
 }
@@ -348,6 +352,7 @@ pub fn run(file_path: Option<PathBuf>) {
             current_colorscheme: initial_colorscheme,
             current_font_size: initial_font_size,
             mouse_text_drag: false,
+            sidebar_resize_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
         });
@@ -497,11 +502,17 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if wparam.0 & 0x0001 != 0 {
-                // MK_LBUTTON is pressed — this is a drag
-                on_mouse_drag(hwnd, lparam);
-            }
+            on_mouse_move(hwnd, wparam, lparam);
             LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            // Let on_mouse_move set the cursor; only override in client area
+            if (lparam.0 & 0xFFFF) as u16 == 1 {
+                // HTCLIENT — we handle cursor ourselves
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_LBUTTONDBLCLK => {
             on_mouse_dblclick(hwnd, lparam);
@@ -610,6 +621,8 @@ fn on_paint(hwnd: HWND) {
             ctx.draw_frame(&screen);
             // Draw sidebar on top of left edge (activity bar always, panel when visible)
             ctx.draw_sidebar(&state.sidebar, &screen);
+            // Notification toasts
+            ctx.draw_notifications(&state.engine.notifications);
             let _ = rt.EndDraw(None, None);
         }
 
@@ -979,6 +992,16 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // ── Sidebar resize drag start ────────────────────────────────────
+        let edge = state.sidebar.total_width();
+        if state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX {
+            state.sidebar_resize_drag = true;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
         // ── Check activity bar clicks ────────────────────────────────────
         let ab_w = state.sidebar.activity_bar_px;
         if px < ab_w {
@@ -1100,12 +1123,51 @@ fn on_mouse_up(hwnd: HWND) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
         state.mouse_text_drag = false;
+        state.sidebar_resize_drag = false;
         state.engine.mouse_drag_active = false;
         state.engine.mouse_drag_origin_window = None;
         state.engine.mouse_drag_word_mode = false;
 
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    });
+}
+
+fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let (px, _py) = lparam_xy(lparam);
+    let lbutton = wparam.0 & 0x0001 != 0;
+
+    APP.with(|app| {
+        let mut app = app.borrow_mut();
+        let state = app.as_mut().expect("AppState");
+
+        // Sidebar resize drag in progress
+        if state.sidebar_resize_drag && lbutton {
+            let ab_w = state.sidebar.activity_bar_px;
+            let new_w = (px - ab_w).clamp(80.0, 600.0);
+            state.sidebar.panel_width = new_w;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        if !state.sidebar_resize_drag && lbutton {
+            on_mouse_drag(hwnd, lparam);
+            return;
+        }
+
+        // Cursor shape: resize arrow near sidebar edge
+        let edge = state.sidebar.total_width();
+        let near_edge = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
+        unsafe {
+            let cursor = if near_edge {
+                LoadCursorW(None, IDC_SIZEWE).unwrap_or_default()
+            } else {
+                LoadCursorW(None, IDC_IBEAM).unwrap_or_default()
+            };
+            SetCursor(Some(cursor));
         }
     });
 }
