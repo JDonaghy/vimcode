@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 6, 2026 (Session 255 — Multi-backend prep for native Windows/macOS GUIs) | **Tests:** 5313
+**Last updated:** Apr 7, 2026 (Session 256 — Win-GUI Phase 3: menu bar, terminal, DPI, sidebar clicks, breadcrumbs) | **Tests:** 5313
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 254 are in **SESSION_HISTORY.md**.
@@ -27,6 +27,8 @@ When implementing a new key/command, add tests covering:
 ## Recent Work
 
 > All sessions through 254 archived in **SESSION_HISTORY.md**.
+
+- **Session 256**: Win-GUI Phase 3 — menu bar with dropdowns (keyboard+mouse hover switching), terminal panel (D2D cell rendering, PTY input, Ctrl-T toggle), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords), sidebar panel click handling (Git/Extensions/Settings/AI/Search/Debug), scrollbar click-to-jump+drag, breadcrumb bar, tab bar visibility fixes (sidebar+menu offset, breadcrumb height), periodic git refresh, D2D clip for sidebar content. 15 bug fixes during iterative testing.
 
 - **Session 255**: Multi-backend prep for native Windows/macOS GUIs — `Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI); added Native Platform GUIs roadmap to PLAN.md.
 
