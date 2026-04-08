@@ -2804,8 +2804,8 @@ fn event_loop(
                                 needs_redraw = true;
                                 continue;
                             }
-                            // Ctrl+Shift+V (crossterm: Ctrl+uppercase-V): paste clipboard to PTY.
-                            if ctrl && matches!(code, KeyCode::Char('V')) {
+                            // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY (VS Code behavior).
+                            if ctrl && matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
                                 if let Some(ref cb) = engine.clipboard_read {
                                     if let Ok(text) = cb() {
                                         engine.terminal_write(text.as_bytes());

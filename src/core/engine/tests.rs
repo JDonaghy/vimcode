@@ -18408,3 +18408,84 @@ fn test_notification_ids_increment() {
     let id2 = e.notify(NotificationKind::LspInstall, "B");
     assert!(id2 > id1);
 }
+
+#[test]
+fn test_percent_centers_viewport_on_far_match() {
+    let mut engine = Engine::new();
+    // Create a buffer with opening brace at top and closing brace far away.
+    let mut text = String::from("{\n");
+    for _ in 0..100 {
+        text.push_str("line\n");
+    }
+    text.push('}');
+    engine.buffer_mut().insert(0, &text);
+    engine.update_syntax();
+
+    // Set a viewport size so the match is off-screen.
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.view_mut().scroll_top = 0;
+
+    press_char(&mut engine, '%');
+
+    // Cursor should be on the closing brace line.
+    assert_eq!(engine.view().cursor.line, 101);
+    // Viewport should have scrolled to show the match (centered).
+    assert!(engine.view().scroll_top > 0);
+    // Match should be approximately centered in viewport.
+    let scroll = engine.view().scroll_top;
+    assert!(engine.view().cursor.line >= scroll);
+    assert!(engine.view().cursor.line < scroll + 20);
+}
+
+#[test]
+fn test_goto_tab_promotes_preview() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("vimcode_test_goto_tab_promote.txt");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"preview content").unwrap();
+    }
+
+    let mut engine = Engine::new();
+    // Open a file in preview mode (simulates single-click in explorer).
+    engine
+        .open_file_with_mode(&path, OpenMode::Preview)
+        .unwrap();
+    let bid = engine.active_buffer_id();
+    assert!(engine.buffer_manager.get(bid).unwrap().preview);
+    assert_eq!(engine.preview_buffer_id, Some(bid));
+
+    // goto_tab (simulates clicking the tab) should promote the preview.
+    let tab_idx = engine.active_group().active_tab;
+    engine.goto_tab(tab_idx);
+    assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+    assert_eq!(engine.preview_buffer_id, None);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_confirm_move_file_same_dir_suppressed() {
+    let mut engine = Engine::new();
+    let src = std::path::PathBuf::from("/tmp/testdir/file.txt");
+    let dest = std::path::PathBuf::from("/tmp/testdir");
+
+    // Moving a file to its own parent directory should be suppressed.
+    engine.confirm_move_file(&src, &dest);
+    assert!(engine.pending_move.is_none());
+    assert!(engine.dialog.is_none());
+}
+
+#[test]
+fn test_confirm_move_file_different_dir_shows_dialog() {
+    let mut engine = Engine::new();
+    let src = std::path::PathBuf::from("/tmp/testdir/file.txt");
+    let dest = std::path::PathBuf::from("/tmp/otherdir");
+
+    // Moving a file to a different directory should show the dialog.
+    engine.confirm_move_file(&src, &dest);
+    assert!(engine.pending_move.is_some());
+    assert!(engine.dialog.is_some());
+}

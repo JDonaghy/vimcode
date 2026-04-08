@@ -80,6 +80,7 @@ pub struct DiffHunkInfo {
 /// Create a `git` Command with `CREATE_NO_WINDOW` on Windows to prevent
 /// console window flashes in GUI mode.
 fn git_command() -> Command {
+    #[allow(unused_mut)]
     let mut cmd = Command::new("git");
     #[cfg(windows)]
     {

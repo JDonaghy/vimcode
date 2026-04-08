@@ -1481,6 +1481,7 @@ impl Engine {
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('%') => {
+                let pre_line = self.view().cursor.line;
                 if self.peek_count().is_some() {
                     // N% — go to N% of file
                     let pct = self.take_count().min(100);
@@ -1497,6 +1498,13 @@ impl Engine {
                 } else {
                     self.push_jump_location();
                     self.move_to_matching_bracket();
+                }
+                // Center viewport when the match is far from the current view,
+                // so the matched brace is clearly visible (like search `n`).
+                let post_line = self.view().cursor.line;
+                let vp = self.view().viewport_lines;
+                if vp > 0 && pre_line.abs_diff(post_line) > vp / 2 {
+                    self.scroll_cursor_center();
                 }
             }
             Some(':') => {

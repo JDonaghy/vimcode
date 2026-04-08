@@ -1,9 +1,31 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 259 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 260 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 260 — 12 bug fixes (5396 tests):**
+
+Massive bug fix session fixing 12 bugs across GTK, TUI, and core engine. Also filed 10 new bugs, 2 new features (status line above terminal, terminal maximize), and 1 new feature request (full keyboard navigation in picker).
+
+Bug fixes:
+1. `%` brace match doesn't scroll — center viewport when match is >½ screen away (`keys.rs`). 1 test.
+2. TUI tab underline extends to number prefix — split render loop, underline only on filename portion after `: ` (`render_impl.rs`).
+3. Preview tab can't be made permanent by clicking tab — `goto_tab()` calls `promote_preview()` on active buffer (`windows.rs`). 1 test.
+4. Accidental explorer drag triggers move to same location — `confirm_move_file()` returns early when `src.parent() == dest` (`buffers.rs`). 2 tests.
+5. GTK tab bar hides tabs despite available space — char width measurement used "M" (widest Latin char) with proportional font; changed to 15-char representative sample (`draw.rs`).
+6. Terminal panel steals clicks from explorer tree — added `col >= editor_left` guard to TUI terminal click handler (`mouse.rs`).
+7. Live grep scroll wheel changes file instead of scrolling preview — added column-based pane detection; `picker_preview_scroll` field on Engine; increased preview context (30→500 lines, ±5→±50 grep context); initial scroll centers on match (`mouse.rs`, `picker.rs`, `render.rs`, `mod.rs`).
+8. Terminal Ctrl+V paste broken — TUI: added lowercase 'v' match; GTK: added Ctrl+V handler in terminal focus block (`tui_main/mod.rs`, `gtk/mod.rs`).
+9. TUI terminal draws on top of fuzzy finder — moved picker/folder-picker/tab-switcher rendering after bottom panel in draw order (`render_impl.rs`).
+10. GTK terminal draws on top of fuzzy finder — moved picker/tab-switcher/dialog to absolute end of `draw_editor()` after all persistent UI (`draw.rs`).
+11. GTK visual select highlights wrong line — rewrote `draw_visual_selection()`: built `line_to_view` HashMap mapping buffer line→last non-skippable view row; line-mode iterates all visual rows (including wrap continuations); skips `DiffLine::Padding` and `is_ghost_continuation` (`draw.rs`).
+12. Right-click in terminal shows editor context menu — added terminal bounds check before `open_editor_context_menu()` fallthrough (`mouse.rs`).
+
+Also fixed: pre-existing clippy warning in `git.rs` (`#[allow(unused_mut)]` for Windows-only mutation).
+
+Files changed: `src/core/engine/keys.rs`, `src/core/engine/windows.rs`, `src/core/engine/buffers.rs`, `src/core/engine/mod.rs`, `src/core/engine/picker.rs`, `src/core/engine/tests.rs`, `src/core/git.rs`, `src/render.rs`, `src/gtk/draw.rs`, `src/gtk/mod.rs`, `src/tui_main/render_impl.rs`, `src/tui_main/mouse.rs`, `src/tui_main/mod.rs`, `BUGS.md`, `PLAN.md`, `PROJECT_STATE.md`.
 
 **Session 259 — README revamp (5391 tests):**
 

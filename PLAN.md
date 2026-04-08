@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 260**: 12 bug fixes — `%` viewport centering; TUI tab underline filename-only; preview tab click-to-permanent; explorer micro-drag same-dest guard; GTK tab bar proportional font width; terminal click overlap; live grep preview scroll; terminal Ctrl+V paste; picker z-order over terminal (TUI+GTK); GTK visual select highlight; terminal right-click suppression. 5 new tests.
 - **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.
 - **Session 258**: Multi-backend code sharing — `ClickTarget` enum + 8 shared geometry/key-binding helpers extracted to `render.rs`; GTK, TUI, Win-GUI backends delegate to shared functions; 7 new tests; 4 win-gui bugs filed.
 > Sessions 258 and earlier in **SESSION_HISTORY.md**.
@@ -87,6 +88,17 @@
 - [x] GTK explorer focus not returning to editor after file open — clear `explorer_has_focus`/`tree_has_focus` in `OpenFileFromSidebar`
 - [x] GTK 100% CPU after opening file from explorer — caused by stuck `explorer_has_focus` state (same fix as above)
 - [x] Drag-to-select text leaks across editor groups — `mouse_drag_origin_window` field locks drag to originating window until mouse-up; cross-window drag events ignored
+- [x] `%` brace match doesn't scroll to matched brace — center viewport on far jumps
+- [x] TUI tab underline extends to tab number prefix — filename-only underline
+- [x] Preview tab can't be made permanent by clicking tab — `goto_tab()` promotes preview
+- [x] Accidental explorer drag triggers move to same location — source==dest guard
+- [x] GTK tab bar hides tabs despite available space — proportional font char width measurement
+- [x] Terminal panel steals clicks from explorer tree — column guard on terminal click handler
+- [x] Live grep scroll wheel changes file instead of scrolling preview — column-based pane routing + `picker_preview_scroll`
+- [x] Terminal Ctrl+V paste broken — added lowercase 'v' match (TUI) + Ctrl+V handler (GTK)
+- [x] Terminal draws on top of fuzzy finder (TUI+GTK) — moved popups to end of draw order
+- [x] GTK visual select highlights wrong line — `line_to_view` HashMap + wrap-aware line-mode highlight
+- [x] Right-click in terminal shows editor context menu — terminal bounds check before fallthrough
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -135,6 +147,8 @@
 - [x] **Terminal: button bar (Add / Close)** — `+` creates a new tab; `×`/`󰅖` closes the active tab; click detection in both GTK and TUI backends
 - [x] **Terminal: horizontal split view** — `⊞`/`󰤼` toolbar button toggles two panes side-by-side; independent PTY sessions; mouse click or Ctrl-W switches active pane; `│` divider
 - [x] **Debugger (DAP)** — Transport + adapter registry + `:DapInstall` (S83); poll loop + breakpoint gutter + stopped-line highlight (S84); variables/call-stack/output panel (S85-86); VSCode-like UI with launch.json (S88); codelldb compat (S89); interactive sidebar + conditional breakpoints (S90)
+- [ ] **Status line above terminal pane** — `status_line_above_terminal` setting (default `true`). When enabled, the per-window status line renders above the terminal panel rather than below the editor content, so it stays visible and is not pushed off-screen or obscured by the terminal. Both GTK and TUI backends.
+- [ ] **Terminal maximize (full editor coverage)** — Toggle the terminal panel to cover the entire editor area (like VSCode's "Maximize Panel Size" / `Ctrl+`\` behavior). When maximized, the terminal fills the space normally occupied by editor panes; sidebar remains visible. A second toggle restores the previous layout. Keyboard shortcut + toolbar button. Both GTK and TUI backends.
 
 ### Editor Groups
 - [x] **Drag tab between editor groups** — drag a tab from one group's tab bar and drop it onto another group's tab bar to move the buffer; visual drop indicator (highlight bar between tabs or at group edge); dropping on the editor area creates a new split; GTK `DragSource`/`DropTarget` + TUI mouse drag tracking
@@ -256,6 +270,7 @@
 
 ### Picker / Fuzzy Finder
 - [x] **Search history in picker dialogs** — Up arrow at top of results recalls previous searches from the current session. Per-source history stack (`picker_history: HashMap<PickerSource, Vec<String>>`); Down navigates forward or restores the in-progress query; typing/backspace/paste exits history mode; consecutive duplicates deduplicated; capped at 100 entries; session-scoped (not persisted). 7 new tests.
+- [ ] **Full keyboard navigation in picker** — Drive the fuzzy finder entirely by keyboard: Ctrl+J/K or arrow keys to scroll results, Ctrl+U/D for page up/down in results, Ctrl+F/B or arrow keys in preview pane to scroll the preview, Tab to toggle focus between results and preview panes. Currently the picker only supports Up/Down for single-step selection; there is no way to page through results or scroll the preview without a mouse.
 
 ### CI & Distribution
 - [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.

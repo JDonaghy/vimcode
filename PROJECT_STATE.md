@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 259 — README revamp) | **Tests:** 5391
+**Last updated:** Apr 8, 2026 (Session 260 — 12 bug fixes) | **Tests:** 5396
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 259 archived in **SESSION_HISTORY.md**.
-
-- **Session 259**: README revamp — updated intro/status (beta label + disclaimer), Platforms table, Windows download/build instructions, Architecture with win_gui/ + all current line counts (~128K total), Tech Stack with windows-rs/D2D/DWrite/notify, Extensions panel mentions, vimcode.org reference, removed duplicate commands, updated Acknowledgements.
+> All sessions through 260 archived in **SESSION_HISTORY.md**.

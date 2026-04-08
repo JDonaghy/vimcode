@@ -2238,6 +2238,8 @@ pub struct Engine {
     pub picker_title: String,
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
+    /// Scroll offset for the preview pane (lines scrolled from top).
+    pub picker_preview_scroll: usize,
     /// Per-source search history (session-scoped, not persisted).
     pub picker_history: std::collections::HashMap<PickerSource, Vec<String>>,
     /// Current position in history when navigating (None = not browsing history).
@@ -2923,6 +2925,7 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            picker_preview_scroll: 0,
             picker_history: std::collections::HashMap::new(),
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),

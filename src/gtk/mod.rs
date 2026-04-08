@@ -1449,6 +1449,11 @@ impl SimpleComponent for App {
                                             engine.borrow_mut().terminal_split_switch_focus();
                                             return gtk4::glib::Propagation::Stop;
                                         }
+                                        // Ctrl+V (without shift): paste clipboard to PTY (VS Code behavior).
+                                        if ctrl && !shift && (key_name == "v" || key_name == "V") {
+                                            sender.input(Msg::TerminalPasteClipboard);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
                                         let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
                                         if !data.is_empty() {
                                             engine.borrow_mut().terminal_write(&data);

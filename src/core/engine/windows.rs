@@ -1604,6 +1604,11 @@ impl Engine {
             self.active_group_mut().active_tab = index;
             self.line_annotations.clear();
             self.blame_annotations_active = false;
+            // Clicking a preview tab promotes it to permanent (VSCode behavior).
+            let buf_id = self.active_buffer_id();
+            if self.buffer_manager.get(buf_id).is_some_and(|s| s.preview) {
+                self.promote_preview(buf_id);
+            }
             self.tab_mru_touch();
             self.tab_nav_push();
             self.lsp_ensure_active_buffer();

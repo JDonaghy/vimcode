@@ -220,22 +220,65 @@ pub(super) fn handle_mouse(
                 }
             }
             MouseEventKind::ScrollDown => {
-                let step = 3;
-                let max = engine.picker_items.len().saturating_sub(1);
-                engine.picker_selected = (engine.picker_selected + step).min(max);
-                let visible = 20usize;
-                if engine.picker_selected >= engine.picker_scroll_top + visible {
-                    engine.picker_scroll_top = engine.picker_selected + 1 - visible;
+                // Check if scroll is over the preview pane (right side).
+                let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let has_preview = engine.picker_preview.is_some();
+                let popup_w = if has_preview {
+                    (term_cols * 4 / 5).max(60)
+                } else {
+                    (term_cols * 55 / 100).max(55)
+                };
+                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
+                let left_w = if has_preview {
+                    (popup_w as usize * 35 / 100) as u16
+                } else {
+                    0
+                };
+                if has_preview && col > popup_x + left_w {
+                    // Scroll the preview pane.
+                    let max = engine
+                        .picker_preview
+                        .as_ref()
+                        .map(|p| p.lines.len())
+                        .unwrap_or(0);
+                    engine.picker_preview_scroll =
+                        (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
+                } else {
+                    let step = 3;
+                    let max = engine.picker_items.len().saturating_sub(1);
+                    engine.picker_selected = (engine.picker_selected + step).min(max);
+                    let visible = 20usize;
+                    if engine.picker_selected >= engine.picker_scroll_top + visible {
+                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
+                    }
+                    engine.picker_load_preview();
                 }
-                engine.picker_load_preview();
             }
             MouseEventKind::ScrollUp => {
-                let step = 3;
-                engine.picker_selected = engine.picker_selected.saturating_sub(step);
-                if engine.picker_selected < engine.picker_scroll_top {
-                    engine.picker_scroll_top = engine.picker_selected;
+                let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let has_preview = engine.picker_preview.is_some();
+                let popup_w = if has_preview {
+                    (term_cols * 4 / 5).max(60)
+                } else {
+                    (term_cols * 55 / 100).max(55)
+                };
+                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
+                let left_w = if has_preview {
+                    (popup_w as usize * 35 / 100) as u16
+                } else {
+                    0
+                };
+                if has_preview && col > popup_x + left_w {
+                    // Scroll the preview pane.
+                    engine.picker_preview_scroll = engine.picker_preview_scroll.saturating_sub(3);
+                } else {
+                    let step = 3;
+                    engine.picker_selected = engine.picker_selected.saturating_sub(step);
+                    if engine.picker_selected < engine.picker_scroll_top {
+                        engine.picker_scroll_top = engine.picker_selected;
+                    }
+                    engine.picker_load_preview();
                 }
-                engine.picker_load_preview();
             }
             _ => {} // consume all other events
         }
@@ -877,6 +920,25 @@ pub(super) fn handle_mouse(
             }
         }
 
+        // Right-click on terminal panel → suppress (don't show editor context menu).
+        {
+            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            let strip_rows: u16 = if engine.terminal_open {
+                engine.session.terminal_panel_rows + 1
+            } else {
+                0
+            };
+            let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+            if engine.terminal_open
+                && strip_rows > 0
+                && col >= editor_left
+                && row >= term_strip_top
+                && row < term_strip_top + strip_rows
+            {
+                return sidebar_width;
+            }
+        }
+
         // Right-click on editor area → open editor context menu
         if col >= editor_left {
             engine.open_editor_context_menu(col, row + 1);
@@ -1484,6 +1546,7 @@ pub(super) fn handle_mouse(
         let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
         if engine.terminal_open
             && strip_rows > 0
+            && col >= editor_left
             && row >= term_strip_top
             && row < term_strip_top + strip_rows
         {

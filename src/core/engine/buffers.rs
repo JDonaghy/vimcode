@@ -2320,6 +2320,13 @@ impl Engine {
     /// Stores the pending move and displays a Yes/No dialog.  The actual
     /// `move_file()` call happens when the user confirms via the dialog.
     pub fn confirm_move_file(&mut self, src: &Path, dest: &Path) {
+        // Suppress dialog when source is already in the destination directory
+        // (e.g. accidental micro-drag in the explorer tree).
+        if let Some(parent) = src.parent() {
+            if parent == dest {
+                return;
+            }
+        }
         let src_name = src
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

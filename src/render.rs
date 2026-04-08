@@ -664,6 +664,8 @@ pub struct PickerPanel {
     /// Preview lines: (1-based line number, text, is_highlighted).
     /// When `Some`, the picker is rendered in two-pane mode.
     pub preview: Option<Vec<(usize, String, bool)>>,
+    /// Scroll offset for the preview pane.
+    pub preview_scroll: usize,
 }
 
 // ─── TabSwitcherPanel ─────────────────────────────────────────────────────
@@ -4060,6 +4062,7 @@ pub fn build_screen_layout(
                 } else {
                     None
                 },
+                preview_scroll: engine.picker_preview_scroll,
             }
         }),
         tab_switcher,

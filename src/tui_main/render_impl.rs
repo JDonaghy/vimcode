@@ -501,21 +501,6 @@ pub(super) fn draw_frame(
         }
     }
 
-    // ── Folder / workspace picker modal ──────────────────────────────────────
-    if let Some(picker) = folder_picker {
-        render_folder_picker(frame, picker, area, theme);
-    }
-
-    // ── Unified picker modal (rendered on top of everything) ─────────────────
-    if let Some(ref picker) = screen.picker {
-        render_picker_popup(frame, picker, area, theme);
-    }
-
-    // ── Tab switcher popup ───────────────────────────────────────────────────
-    if let Some(ref ts) = screen.tab_switcher {
-        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
-    }
-
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -624,6 +609,21 @@ pub(super) fn draw_frame(
             *hover_link_rects_out = rects;
             *hover_popup_rect_out = popup_rect;
         }
+    }
+
+    // ── Folder / workspace picker modal ──────────────────────────────────────
+    if let Some(picker) = folder_picker {
+        render_folder_picker(frame, picker, area, theme);
+    }
+
+    // ── Unified picker modal (above terminal/status so it's fully visible) ──
+    if let Some(ref picker) = screen.picker {
+        render_picker_popup(frame, picker, area, theme);
+    }
+
+    // ── Tab switcher popup ───────────────────────────────────────────────────
+    if let Some(ref ts) = screen.tab_switcher {
+        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
     }
 
     // ── Context menu popup (above status/command line) ─────────────────────
@@ -1079,12 +1079,26 @@ pub(super) fn render_tab_bar(
             break;
         }
 
-        for ch in tab.name.chars() {
+        // Find where the filename starts (after the " N: " prefix) so the
+        // underline accent only covers the filename, not the number prefix.
+        let prefix_len = tab.name.find(": ").map(|p| p + 2).unwrap_or(0);
+        let prefix_mod = if tab.preview {
+            Modifier::ITALIC
+        } else {
+            Modifier::empty()
+        };
+        for (ci, ch) in tab.name.chars().enumerate() {
             if x >= tab_end_for_content {
                 break;
             }
-            let ul_color = if tab.active { focused_accent } else { None };
-            set_cell_styled(buf, x, area.y, ch, fg, bg, modifier, ul_color);
+            let in_filename = ci >= prefix_len;
+            let cell_mod = if in_filename { modifier } else { prefix_mod };
+            let ul_color = if in_filename && tab.active {
+                focused_accent
+            } else {
+                None
+            };
+            set_cell_styled(buf, x, area.y, ch, fg, bg, cell_mod, ul_color);
             x += 1;
         }
         // Show ● (modified dot) when dirty, × otherwise (VSCode style).
@@ -1964,7 +1978,8 @@ pub(super) fn render_picker_popup(
                 }
             }
             if let Some(ref preview) = picker.preview {
-                if let Some((lineno, text, is_match)) = preview.get(row_idx) {
+                let preview_idx = row_idx + picker.preview_scroll;
+                if let Some((lineno, text, is_match)) = preview.get(preview_idx) {
                     // Replace tabs with spaces so each character occupies exactly one cell.
                     let sanitized = text.replace('\t', "    ");
                     let preview_text = format!("{:4}: {}", lineno, sanitized);

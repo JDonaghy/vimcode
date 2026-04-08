@@ -1621,11 +1621,12 @@ impl Engine {
                 };
                 let lines: Vec<(usize, String, bool)> = content
                     .lines()
-                    .take(30)
+                    .take(500)
                     .enumerate()
                     .map(|(i, text)| (i + 1, text.to_string(), false))
                     .collect();
                 self.picker_preview = Some(PickerPreview { lines });
+                self.picker_preview_scroll = 0;
             }
             PickerAction::OpenFileAtLine(path, line) => {
                 let Ok(content) = std::fs::read_to_string(path) else {
@@ -1633,7 +1634,8 @@ impl Engine {
                 };
                 let all_lines: Vec<&str> = content.lines().collect();
                 let match_line = *line;
-                let context = 5usize;
+                // Show enough context for meaningful scrolling in the preview pane.
+                let context = 50usize;
                 let start = match_line.saturating_sub(context);
                 let end = (match_line + context + 1).min(all_lines.len());
                 let lines: Vec<(usize, String, bool)> = all_lines[start..end]
@@ -1646,6 +1648,9 @@ impl Engine {
                     })
                     .collect();
                 self.picker_preview = Some(PickerPreview { lines });
+                // Scroll so the match line is visible near the top of the preview.
+                let match_offset = match_line.saturating_sub(start);
+                self.picker_preview_scroll = match_offset.saturating_sub(3);
             }
             _ => {}
         }
