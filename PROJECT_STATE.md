@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 258 — Multi-backend shared hit-testing & key-binding extraction) | **Tests:** 5320
+**Last updated:** Apr 8, 2026 (Session 259 — README revamp) | **Tests:** 5391
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.

@@ -2,20 +2,27 @@
 
 **[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
 
-High-performance Vim+VSCode hybrid editor in Rust. Modal editing meets modern UX, no GPU required.
+A Vim+VSCode hybrid editor written in Rust. 128K lines of code, 5,391 tests, four rendering backends.
 
-### Who's this for?
+### Who’s this for?
 
-If you like Vim and you like VSCode, but Vim isn't VSCode-enough and VSCode isn't Vim-enough for you, then this might be the editor for you. It can run in a terminal and look like Vim but behave like VSCode when you need it. Alternatively, it can run in a window and look like VSCode but behave like Vim when you need it. Easily switch from Vim-mode to VSCode-mode at any time simply by pressing `Alt-m`. 
+If you want Vim’s modal editing with VSCode’s UI — or VSCode’s ease of use with Vim’s power — VimCode bridges both worlds. Run it in a terminal and it looks like Vim; run it in a window and it looks like VSCode. Press `Alt-M` to switch between Vim mode and VSCode mode at any time.
 
-**Extensions** are available, but note that these are not VSCode extensions or Vim plugins. VimCode takes a "batteries-included" approach, so many features just work out of the box. Both **LSP** and **DAP** protocols are supported, and extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry. New extensions can be added to the registry without updating VimCode itself.
+VimCode takes a batteries-included approach: **LSP**, **DAP**, integrated terminal, git panel, AI assistant, spell checking, and 20 tree-sitter grammars all work out of the box. Language extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry and can be added without updating VimCode itself.
 
-There is no VimScript or TypeScript support for extensions. Instead, like Neovim, VimCode supports **Lua** for writing extensions. However, the API is very different from Neovim’s, so its plugins will not work. Unlike Zed, VimCode does not require a dedicated GPU — GTK4 can use hardware compositing when available but falls back gracefully to software rendering, so it works everywhere including VMs, remote desktops, and headless servers.
+Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own API, not VimScript or Neovim’s API. Unlike Zed, VimCode does not require a dedicated GPU. GTK4 uses hardware compositing when available but falls back gracefully to software rendering, and the native Windows backend uses Direct2D. VimCode works everywhere: desktops, VMs, remote sessions, headless servers.
+
+### Platforms
+
+| Platform | GUI | TUI |
+|----------|-----|-----|
+| **Linux** | GTK4 + Cairo + Pango | ratatui + crossterm |
+| **macOS** | GTK4 via Homebrew | ratatui + crossterm |
+| **Windows** | Native Win32 + Direct2D + DirectWrite | ratatui + crossterm |
 
 ### Status
-VimCode has been shamelessly "vibe-coded" using **Claude Code**, and development has proceeded very quickly as a result. I am beginning to use it on a daily basis, but at this stage, it is still very much **alpha software**. Use at your own risk. 
 
-Bug reports are welcome and will be fed to Claude—as long as there is enough detail to recreate the problem and describe the expected behavior. I am also open to feature requests that are well-described and align with the project's vision.
+VimCode is under active development with the assistance of **Claude Code**. It is used daily as a primary editor. Bug reports and feature requests are welcome — please include enough detail to reproduce the problem and describe the expected behavior.
 
 ---
 
@@ -34,20 +41,22 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 
 ## Vision
 
-- **First-class Vim mode** — deeply integrated, not a plugin
-- **Cross-platform** — GTK4 desktop UI + full terminal (TUI) backend
-- **No GPU required** — Cairo/Pango rendering; GTK4 uses hardware compositing when available but works without a GPU (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core, 5,304 tests, zero async runtime dependency
+- **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
+- **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
+- **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,391 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
 > compatibility, not a VimScript runtime. For a detailed Vim compatibility checklist, see [VIM_COMPATIBILITY.md](VIM_COMPATIBILITY.md).
 
-## Download (Linux)
+## Download
 
-Pre-built packages are published automatically on every push to `main`:
+Pre-built packages are published automatically on every release:
 
 **[→ Download latest release](../../releases/tag/latest)**
+
+### Linux
 
 **Option A — `.deb` package (recommended for Ubuntu/Debian)**
 ```bash
@@ -74,29 +83,7 @@ The Flatpak bundles GTK4 and all dependencies — works on any Linux distro with
 
 > **Note:** Ubuntu 22.04 ships GTK 4.6 which is too old for the `.deb` and raw binary; use the Flatpak or upgrade to 24.04+.
 
----
-
-## Building
-
-### Prerequisites
-
-VimCode requires **GTK4 development libraries** for the GUI backend. The TUI mode (`--tui`) works without GTK4 — only a terminal emulator is needed.
-
-| Platform | Install command |
-|---|---|
-| Ubuntu/Debian | `sudo apt install libgtk-4-dev build-essential pkg-config` |
-| Fedora | `sudo dnf install gtk4-devel gcc pkg-config` |
-| Arch | `sudo pacman -S gtk4 base-devel pkgconf` |
-| openSUSE | `sudo zypper install gtk4-devel gcc pkg-config` |
-| macOS | `brew install gtk4 pkg-config` |
-| Windows (MSYS2) | `pacman -S mingw-w64-x86_64-gtk4 mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc` |
-
-**Platform notes:**
-- **macOS:** GTK4 works via Homebrew; this is not a native AppKit app. See [Homebrew install](#homebrew-macos) below
-- **Windows:** Use the MSYS2 MinGW64 shell and set `rustup default stable-x86_64-pc-windows-gnu`
-- **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI — the file explorer, activity bar, tab bar, terminal toolbar, and debug panel. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
-
-### Homebrew (macOS)
+### macOS
 
 ```bash
 brew tap JDonaghy/vimcode
@@ -104,14 +91,54 @@ brew install vimcode    # GTK4 GUI + TUI (installs both `vimcode` and `vcd`)
 brew install vcd        # TUI only (no GTK4 dependency)
 ```
 
+### Windows
+
+**Option A — Native GUI** (`vimcode-win.exe`)
+Download `vimcode-win-x86_64.exe` from the release page. No dependencies required — Direct2D and DirectWrite are built into Windows.
+
+**Option B — TUI** (`vcd.exe`)
+Download `vcd-windows-x86_64.exe` from the release page. Run it in Windows Terminal, PowerShell, or any terminal emulator. No dependencies required.
+
+---
+
+## Building from Source
+
+### Prerequisites
+
+The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windows GUI** is built separately with a Cargo feature flag.
+
+| Platform | GTK4 GUI deps |
+|---|---|
+| Ubuntu/Debian | `sudo apt install libgtk-4-dev build-essential pkg-config` |
+| Fedora | `sudo dnf install gtk4-devel gcc pkg-config` |
+| Arch | `sudo pacman -S gtk4 base-devel pkgconf` |
+| openSUSE | `sudo zypper install gtk4-devel gcc pkg-config` |
+| macOS | `brew install gtk4 pkg-config` |
+
+**Platform notes:**
+- **TUI-only mode** (`--tui` or `-t`) works without GTK4 — only a terminal emulator is needed
+- **Windows native GUI** does not require GTK4; it uses the Win32 API directly (see below)
+- **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
+
 ### Build & run
 
 ```bash
+# Linux / macOS (GTK4 GUI + TUI)
 cargo build
 cargo run -- <file>                         # GTK window
 cargo run -- --tui <file>                   # Terminal UI (alias: -t)
 cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
 cargo run -- --version                      # Print version and exit (alias: -V)
+
+# Windows — Native GUI (Direct2D + DirectWrite, no GTK4 needed)
+cargo build --features win-gui --bin vimcode-win
+cargo run --features win-gui --bin vimcode-win
+
+# Windows — TUI only (no GTK4 needed)
+cargo build --no-default-features
+cargo run --no-default-features -- <file>
+
+# Tests & linting
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
@@ -772,12 +799,15 @@ All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/s
 
 ### Rendering
 
+All three GUI/TUI backends consume the same `ScreenLayout` abstraction from `render.rs` — shared hit-testing, key-binding matching, and scrollbar geometry ensure consistent behavior across platforms.
+
 **Syntax highlighting** (Tree-sitter, auto-detected by extension)
-- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, Lua, JSON, TOML, CSS, YAML, HTML, Markdown
+- Rust, Python, JavaScript, TypeScript/TSX, Go, C, C++, C#, Java, Ruby, Bash, Lua, JSON, TOML, CSS, YAML, HTML, Markdown, LaTeX, LaTeX
+- LSP semantic token overlay (22 token types) enhances tree-sitter colors when available
 
 **Line numbers** — absolute / relative / hybrid (both on = hybrid)
 
-**Scrollbars** (GTK + TUI)
+**Scrollbars** (all backends)
 - Per-window vertical scrollbar with cursor position indicator
 - Per-window horizontal scrollbar (shown when content is wider than viewport)
 - Scrollbar click-to-jump and drag support
@@ -790,7 +820,7 @@ All state lives in `~/.config/vimcode/`. Open files, cursor positions, command/s
 
 ### TUI Backend (Terminal UI)
 
-Full editor in the terminal via ratatui + crossterm — feature-parity with GTK.
+Full editor in the terminal via ratatui + crossterm — feature-parity with the GUI backends. Runs on Linux, macOS, and Windows.
 
 - **Layout:** activity bar (3 cols) | sidebar | editor area; status line + command line full-width at bottom
 - **Sidebar:** same file explorer as GTK with Nerd Font icons
@@ -1083,18 +1113,11 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:DapInfo` | Show detected DAP adapters |
 | `:DapEval <expr>` | Evaluate expression in current debug frame |
 | `:DapWatch <expr>` | Add watch expression to debug sidebar |
-| `:GWorktreeAdd <branch> <path>` | Add git worktree |
-| `:GWorktreeRemove <path>` | Remove git worktree |
 | `:EditorGroupSplit` / `:egsp` | Split editor right (new editor group) |
 | `:EditorGroupSplitDown` / `:egspd` | Split editor down |
 | `:EditorGroupClose` / `:egc` | Close active editor group |
 | `:EditorGroupFocus` / `:egf` | Toggle focus between editor groups |
 | `:EditorGroupMoveTab` / `:egmt` | Move current tab to other editor group |
-| `:OpenFolder <path>` | Open folder as workspace root |
-| `:OpenWorkspace <path>` | Open `.vimcode-workspace` file |
-| `:SaveWorkspaceAs <path>` | Save workspace file |
-| `:OpenRecent` | Open recent workspaces picker |
-| `:cd <path>` | Change working directory |
 | `:Plugin list` | List loaded plugins |
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |
@@ -1120,56 +1143,58 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 ## Architecture
 
 ```
-src/
-├── main.rs              (~55 lines)  Thin dispatcher: CLI args → gtk::run() or tui_main::run()
-├── gtk/             (~11,786 lines)  GTK4/Relm4 UI backend
-│   ├── mod.rs        (~9,267 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
-│   ├── draw.rs       (~5,519 lines)  All 32 draw_* rendering functions + Pango attrs
-│   ├── click.rs        (~575 lines)  ClickTarget enum, mouse click/drag/double-click handlers
-│   ├── css.rs          (~525 lines)  Theme CSS generation + static CSS
-│   ├── util.rs         (~468 lines)  GTK key mapping, settings form builders, URL/icon helpers
-│   └── tree.rs         (~432 lines)  File tree construction, expansion tracking, name validation
-├── tui_main/        (~14,212 lines)  ratatui/crossterm TUI backend
-│   ├── mod.rs        (~4,166 lines)  Structs, event_loop, key translation, clipboard, run()
-│   ├── panels.rs     (~3,931 lines)  Activity bar, sidebar, status/command lines, all panel renders
-│   ├── render_impl.rs(~3,736 lines)  draw_frame orchestrator, tab bar, editor windows, popups
-│   └── mouse.rs      (~2,379 lines)  All mouse click/drag/scroll interaction handling
-├── render.rs        (~5,877 lines)  Platform-agnostic ScreenLayout bridge (DebugSidebarData, SourceControlData, ExtPanelData, BottomPanelTabs)
-├── icons.rs           (~160 lines)  Icon registry with Nerd Font + ASCII fallback (GTK + TUI)
-└── core/            (~70,878 lines)  Zero GTK/rendering deps — fully testable
-    ├── engine/      (~51,825 lines)  Orchestrator: 20 submodules (mod.rs 3,334 + keys, motions, commands, tests, …)
+src/                  (~128,000 lines total)
+├── main.rs              (~57 lines)  Thin CLI dispatcher → gtk::run() or tui_main::run()
+├── win_gui_bin.rs       (~36 lines)  Windows native GUI entry point → win_gui::run()
+├── gtk/             (~18,156 lines)  GTK4/Relm4 UI backend (Linux + macOS)
+│   ├── mod.rs       (~10,029 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
+│   ├── draw.rs       (~5,975 lines)  All draw_* rendering functions + Pango attrs
+│   ├── click.rs        (~622 lines)  Mouse click/drag/double-click handlers
+│   ├── css.rs          (~553 lines)  Theme CSS generation + static CSS
+│   ├── util.rs         (~474 lines)  GTK key mapping, settings form builders, URL/icon helpers
+│   └── tree.rs         (~503 lines)  File tree construction, expansion tracking, name validation
+├── tui_main/        (~14,814 lines)  ratatui/crossterm TUI backend (all platforms)
+│   ├── mod.rs        (~4,173 lines)  Structs, event_loop, key translation, clipboard, run()
+│   ├── panels.rs     (~4,040 lines)  Activity bar, sidebar, status/command lines, all panel renders
+│   ├── render_impl.rs(~3,947 lines)  draw_frame orchestrator, tab bar, editor windows, popups
+│   └── mouse.rs      (~2,654 lines)  All mouse click/drag/scroll interaction handling
+├── win_gui/          (~5,322 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
+│   ├── mod.rs        (~2,710 lines)  HWND, D2D render target, event loop, DWM title bar, IME
+│   ├── draw.rs       (~2,395 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar
+│   └── input.rs        (~217 lines)  Keyboard and mouse input translation
+├── render.rs         (~7,815 lines)  Platform-agnostic ScreenLayout bridge + shared hit-testing geometry
+├── icons.rs           (~160 lines)  Icon registry with Nerd Font + ASCII fallback
+└── core/            (~81,824 lines)  Zero GUI/rendering deps — fully testable in isolation
+    ├── engine/      (~59,947 lines)  Orchestrator: 20 submodules (keys, motions, buffers, tests, …)
+    ├── lsp.rs        (~2,923 lines)  LSP protocol transport + single-server client
+    ├── lsp_manager.rs(~1,105 lines)  Multi-server coordinator + semantic token legends
+    ├── git.rs        (~2,550 lines)  Git subprocesses: diff, blame, stage, worktrees, log, branches
+    ├── settings.rs   (~2,336 lines)  JSON config, :set parsing, key bindings, SETTING_DEFS
+    ├── plugin.rs     (~1,936 lines)  Lua 5.4 plugin manager (vendored; vimcode.* API; panel API)
+    ├── syntax.rs     (~1,854 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX via vendored grammar)
+    ├── dap_manager.rs(~1,427 lines)  DAP multi-adapter coordinator + launch.json + tasks.json
+    ├── buffer_manager.rs(~1,018 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
+    ├── dap.rs          (~719 lines)  DAP protocol transport + event routing
     ├── markdown.rs     (~705 lines)  Markdown → styled plain text converter (pulldown-cmark)
-    ├── plugin.rs     (~1,915 lines)  Lua 5.4 plugin manager (mlua vendored; vimcode.* API; async_shell; panel API)
-    ├── terminal.rs     (~320 lines)  PTY-backed terminal pane (portable-pty + vt100, history ring buffer)
-    ├── lsp.rs        (~2,329 lines)  LSP protocol transport + single-server client (request ID tracking, JSON-RPC framing, semantic tokens)
-    ├── lsp_manager.rs  (~868 lines)  Multi-server coordinator with initialization guards + built-in registry + semantic legends
-    ├── dap.rs          (~707 lines)  DAP protocol transport + event routing + seq→command tracking + BreakpointInfo
-    ├── dap_manager.rs (~1,423 lines)  DAP multi-adapter coordinator + launch.json + tasks.json support + install scripts
-    ├── ai.rs               (~336 lines)  AI provider integration (Anthropic/OpenAI/Ollama via curl subprocess)
-    ├── project_search.rs (~630 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
-    ├── buffer_manager.rs (~908 lines)  Buffer lifecycle, undo/redo stacks, semantic tokens
-    ├── buffer.rs       (~120 lines)  Rope-based text storage (ropey)
-    ├── settings.rs   (~2,131 lines)  JSON config, :set parsing, key binding notation, SETTING_DEFS
-    ├── session.rs      (~235 lines)  Session state persistence + per-workspace paths
-    ├── git.rs        (~2,538 lines)  Git subprocesses: diff, blame, stage_hunk, SC panel, worktrees, git log, branches, commit details
-    ├── spell.rs        (~375 lines)  Spell checker (spellbook/Hunspell; tree-sitter-aware; LaTeX-aware; user dictionary)
-    ├── syntax.rs     (~1,380 lines)  Tree-sitter highlighting for 20 languages (incl. LaTeX via vendored grammar)
-    └── window.rs, tab.rs, view.rs, cursor.rs, mode.rs (~700 lines)
+    ├── session.rs      (~782 lines)  Session state persistence + per-workspace paths
+    ├── project_search.rs(~631 lines)  Regex/case/whole-word search + replace (ignore + regex crates)
+    ├── terminal.rs     (~410 lines)  PTY-backed terminal pane (portable-pty + vt100)
+    ├── ai.rs           (~384 lines)  AI provider integration (Anthropic/OpenAI/Ollama)
+    ├── spell.rs        (~379 lines)  Spell checker (Hunspell; tree-sitter-aware; LaTeX-aware)
+    └── window.rs, tab.rs, view.rs, buffer.rs, cursor.rs, mode.rs, … (~2,718 lines)
 ```
 
-**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation.
+**Design rule:** `src/core/` has zero GTK/rendering dependencies and is testable in isolation. All four backends (GTK, TUI, Windows native, future macOS native) consume the same `ScreenLayout` abstraction from `render.rs`.
 
 `dictionaries/` — bundled en_US Hunspell dictionary files (`.aff` + `.dic`) compiled into the binary via `include_bytes!`.
 
 
 ## Acknowledgements
-VimCode is built on the shoulders of giants, and I take very little credit for it. Credit belongs instead to the following people and teams:
 
-*   **Bram Moolenaar (RIP):** The original author of Vim. If you use VimCode and want to give something back, you can honor his legacy by donating to a charity of your choice. See [moolenaar.net/Charityware.html](https://www.moolenaar.net). I personally believe in the mission of UNICEF. No pressure!
-*   **The VSCode Team:** Obviously.
+*   **Bram Moolenaar (RIP):** The original author of Vim. If you use VimCode and want to give something back, consider honoring his legacy by donating to a charity. See [moolenaar.net/Charityware.html](https://www.moolenaar.net).
 *   **Bill Joy:** The creator of the original vi editor.
-*   **LLM Pioneers:** I also feel the need to begrudgingly acknowledge the work done by those who helped create LLMs (too many to mention). I say "begrudgingly" because of the horrors of "AI Slop" unleashed on the world, not to mention the environmental concerns regarding power-hungry data centers. That said, I remain hopeful that AI will be a catalyst for generating unlimited clean energy and many other benefits as well. I just hope that too many people won't suffer because of the incredible pace of the disruption.
-*   **Boris Cherny:** The creator of **Claude Code**, who is probably putting all of us developers out of a job any day now.
+*   **The VSCode Team:** For setting the standard on what a modern editor UX should look like.
+*   **Boris Cherny and the Claude Code team:** VimCode is built with the assistance of [Claude Code](https://claude.ai/claude-code).
 
 
 ## Tech Stack
@@ -1177,15 +1202,17 @@ VimCode is built on the shoulders of giants, and I take very little credit for i
 | Component | Library |
 |-----------|---------|
 | Language | Rust 2021 |
-| GTK UI | GTK4 + Relm4 |
-| TUI UI | ratatui 0.29 + crossterm |
-| Rendering | Pango + Cairo (GPU compositing via GTK4 when available, software fallback) |
-| Text | Ropey (rope data structure) |
+| GTK UI | GTK4 + Relm4 (Linux, macOS) |
+| Windows UI | windows-rs + Direct2D + DirectWrite (native Win32) |
+| TUI | ratatui 0.29 + crossterm (all platforms) |
+| Text rendering | Pango + Cairo (GTK), DirectWrite (Windows) |
+| Text storage | Ropey (rope data structure) |
 | Parsing | Tree-sitter (20 languages incl. LaTeX, Lua, Markdown) |
 | LSP | lsp-types (protocol definitions) |
 | Config | serde + serde_json |
 | Plugins | mlua 0.9 (Lua 5.4, vendored) |
 | Spell check | spellbook 0.4 (pure-Rust Hunspell parser) |
+| File watching | notify (cross-platform filesystem events) |
 
 ## License
 

@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.
 - **Session 258**: Multi-backend code sharing — `ClickTarget` enum + 8 shared geometry/key-binding helpers extracted to `render.rs`; GTK, TUI, Win-GUI backends delegate to shared functions; 7 new tests; 4 win-gui bugs filed.
 - **Session 257**: Win-GUI Phase 4 — custom frameless title bar, native file dialogs, IME, file watching, Segoe UI font, dynamic title, RefCell borrow fix.
 > Sessions 256 and earlier in **SESSION_HISTORY.md**.
@@ -283,4 +284,4 @@
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
-- [ ] **README revamp** — Full review and rewrite of README.md to ensure it is up to date, accurate, and reads professionally. Check: feature tables match current implementation, test count is current, architecture section reflects actual file sizes and module structure, tech stack table is accurate (e.g. rendering description), vision section reflects multi-platform goals (GTK on Linux, native Windows GUI planned, TUI everywhere), remove any alpha/vibe-coded hedging if the project has matured past that point, ensure installation instructions cover all platforms (Linux deb/Flatpak, macOS Homebrew, Windows TUI), review tone and wording for consistency.
+- [x] **README revamp** — Full review and rewrite: updated intro/status (removed alpha hedging), added Platforms table (Linux/macOS/Windows), added Windows native GUI + TUI download instructions, added Windows build commands, updated Architecture tree with win_gui/ directory and all current line counts (~128K total), updated Tech Stack with windows-rs/Direct2D/DirectWrite/notify, added LaTeX to syntax list + semantic token overlay mention, updated test count to 5,391, removed duplicate command table entries, updated Acknowledgements.
