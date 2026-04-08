@@ -26,14 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 254 archived in **SESSION_HISTORY.md**.
+> All sessions through 257 archived in **SESSION_HISTORY.md**.
 
 - **Session 257**: Win-GUI Phase 4 — custom frameless title bar (WM_NCCALCSIZE + DwmExtendFrameIntoClientArea + WM_NCHITTEST, min/max/close buttons with hover states, Segoe UI proportional font for menus+tabs matching VSCode), native file dialogs (IFileOpenDialog for Open File/Folder, IFileSaveDialog for Save Workspace As, COM init), IME composition (WM_IME_STARTCOMPOSITION positions candidate window at cursor), cross-platform file watching (notify crate, auto-reload clean buffers, reload/keep dialog for dirty, added to TUI too), dynamic window title, taller title+tab bars with vertical centering. Fixed double RefCell borrow panic in on_mouse_move that silently broke all menu hover code.
-
-- **Session 256**: Win-GUI Phase 3 — menu bar with dropdowns (keyboard+mouse hover switching), terminal panel (D2D cell rendering, PTY input, Ctrl-T toggle), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords), sidebar panel click handling (Git/Extensions/Settings/AI/Search/Debug), scrollbar click-to-jump+drag, breadcrumb bar, tab bar visibility fixes (sidebar+menu offset, breadcrumb height), periodic git refresh, D2D clip for sidebar content. 15 bug fixes during iterative testing.
-
-- **Session 255**: Multi-backend prep for native Windows/macOS GUIs — `Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI); added Native Platform GUIs roadmap to PLAN.md.
-
-- **Session 254**: Windows TUI builds + bug fixes — `CREATE_NEW_PROCESS_GROUP` for LSP/DAP on Windows; Windows clipboard (powershell), URL opener (`cmd /c start`), swap PID check (`tasklist`); CI + release workflow for `vcd-windows-x86_64.exe`; tree-sitter-latex static link fix; 8 Windows test fixes; flatpak cargo-sources.json regen; picker preview stale chars fix; insert mode click past EOL fix; scrollbar drag cursor fix; git panel discard confirm dialog.
-
-- **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops; auto-dismiss after 5s; click-to-clear; 9 new tests.

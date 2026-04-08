@@ -26,12 +26,7 @@
 
 ## Recently Completed
 - **Session 257**: Win-GUI Phase 4 — custom frameless title bar (WM_NCCALCSIZE, DwmExtendFrameIntoClientArea, WM_NCHITTEST with HTCAPTION/HTCLIENT zones, min/max/close buttons with hover), native file dialogs (IFileOpenDialog/IFileSaveDialog via COM), IME composition (WM_IME_STARTCOMPOSITION cursor positioning), cross-platform file watching (notify crate, auto-reload/dialog for dirty buffers, TUI integration), Segoe UI proportional font for menus+tabs, taller title/tab bars matching VSCode, dynamic window title, fixed double RefCell borrow panic in on_mouse_move.
-- **Session 256**: Win-GUI Phase 3 — menu bar (rendering, dropdowns, keyboard nav, mouse hover switching, item highlight), terminal panel (D2D cell-grid rendering, PTY keyboard input, Ctrl-T toggle, toolbar tabs, find bar), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords, render target recreation), sidebar panel click handling (Git section toggle/selection, Extensions expand/select, Settings row select, AI/Search/Debug focus), scrollbar click-to-jump + drag, breadcrumb bar rendering, tab bar sidebar/menu offset, D2D axis-aligned clip, periodic git refresh, Win32_UI_HiDpi feature. 15 iterative bug fixes.
-- **Session 255**: Multi-backend prep for native Windows/macOS GUIs — `Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI with platform-specific logic); added Native Platform GUIs roadmap items.
-- **Session 254**: Windows TUI builds + bug fixes — CI/release for `vcd-windows-x86_64.exe`; picker preview stale chars; insert mode click past EOL; scrollbar drag cursor; git panel discard confirm dialog.
-- **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops (LSP install, project search/replace); auto-dismiss; click-to-clear; 9 tests.
-- **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` and `underline_color` so spell underlines don't bleed into picker overlays. Added remote editing research item.
-> Sessions 252 and earlier in **SESSION_HISTORY.md**.
+> Sessions 256 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] Picker preview stale chars when cycling files — explicit per-row clear + tab sanitization

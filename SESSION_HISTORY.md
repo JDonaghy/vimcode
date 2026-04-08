@@ -1,7 +1,25 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 254 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 257 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 257 — Win-GUI Phase 4: custom title bar, native file dialogs, IME, file watching (5313 tests):**
+
+Custom frameless title bar: WM_NCCALCSIZE removes Windows chrome, DwmExtendFrameIntoClientArea preserves native shadow and Win11 rounded corners, WM_NCHITTEST provides drag (HTCAPTION), resize borders (HTTOP/HTTOPLEFT/HTTOPRIGHT), caption button zones (HTCLIENT). Min/max/close buttons with hover states (red for close, lighter for min/max). Full title bar returns HTCLIENT when menu dropdown is open to enable hover switching. Taller title bar (1.8× line_height) with 6px top inset for DWM shadow zone. Native file dialogs via COM: IFileOpenDialog for File > Open File and File > Open Folder (FOS_PICKFOLDERS), IFileSaveDialog for Save Workspace As. CoInitializeEx at startup. Menu action strings intercepted before execute_command (same pattern as GTK backend). IME composition: WM_IME_STARTCOMPOSITION positions candidate window at cursor via ImmSetCompositionWindow with CFS_POINT. Cursor pixel position computed from cached window rects + scroll offset with DPI scaling. Cross-platform file watching: notify crate v7, RecommendedWatcher initialized in Engine::new(), files watched on open, tick_file_watcher() polled from win-gui and TUI backends, auto-reload non-dirty buffers, reload/keep dialog for dirty buffers via engine dialog system. UI polish: Segoe UI 13px proportional font for menu bar and tab labels (matching VSCode), separate IDWriteTextFormat + draw_ui_text()/measure_ui_text() helpers. Taller tab bar (1.5× line_height) with proper padding and vertical centering. Menu bar uses tab_bar_bg (dark) instead of status_bg (blue). Dark dropdown background (background.lighten(0.10)). Dynamic window title: "filename — VimCode" with dirty indicator. Bug fix: double RefCell borrow panic in on_mouse_move — caption_button_at() called APP.with(borrow()) inside APP.with(borrow_mut()), silently caught by catch_unwind, preventing all menu hover code from executing. Fixed by inlining the check. Files changed: Cargo.toml (+7 features), Cargo.lock (+126), src/win_gui/mod.rs (+546), src/win_gui/draw.rs (+197), src/core/engine/mod.rs (+13 fields), src/core/engine/buffers.rs (+168 file watcher), src/core/engine/panels.rs (+4 dialog handler), src/tui_main/mod.rs (+2 tick call).
+
+---
+
+**Session 256 — Win-GUI Phase 3: menu bar, terminal, DPI, sidebar clicks, breadcrumbs (5313 tests):**
+
+Menu bar with dropdowns (rendering, keyboard nav with arrow keys/Enter/Escape, mouse hover switching between menus, item highlight), terminal panel (D2D cell-grid rendering, PTY keyboard input, Ctrl-T toggle, toolbar with tabs, find bar), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords, render target recreation), sidebar panel click handling (Git section toggle/selection, Extensions expand/select, Settings row select, AI/Search/Debug focus), scrollbar click-to-jump + drag, breadcrumb bar rendering, tab bar sidebar/menu offset, D2D axis-aligned clip, periodic git status refresh, Win32_UI_HiDpi feature. 15 iterative bug fixes during testing.
+
+---
+
+**Session 255 — Multi-backend prep for native Windows/macOS GUIs (5313 tests):**
+
+`Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI with platform-specific logic); added Native Platform GUIs roadmap items to PLAN.md.
 
 ---
 
