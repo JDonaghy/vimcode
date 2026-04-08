@@ -2806,10 +2806,36 @@ fn event_loop(
                             }
                             // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY (VS Code behavior).
                             if ctrl && matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
-                                if let Some(ref cb) = engine.clipboard_read {
-                                    if let Ok(text) = cb() {
-                                        engine.terminal_write(text.as_bytes());
-                                    }
+                                // Try system clipboard first, fall back to VimCode
+                                // registers ("+ then ") so yanked text is always available.
+                                let paste_text = engine
+                                    .clipboard_read
+                                    .as_ref()
+                                    .and_then(|cb| cb().ok())
+                                    .filter(|t| !t.is_empty())
+                                    .or_else(|| {
+                                        engine
+                                            .registers
+                                            .get(&'+')
+                                            .map(|(t, _)| t.clone())
+                                            .filter(|t| !t.is_empty())
+                                    })
+                                    .or_else(|| {
+                                        engine
+                                            .registers
+                                            .get(&'"')
+                                            .map(|(t, _)| t.clone())
+                                            .filter(|t| !t.is_empty())
+                                    });
+                                if let Some(text) = paste_text {
+                                    // Wrap in bracketed paste so the inner shell
+                                    // treats multi-line content as a single paste.
+                                    engine.terminal_write(b"\x1b[200~");
+                                    engine.terminal_write(text.as_bytes());
+                                    engine.terminal_write(b"\x1b[201~");
+                                    engine.poll_terminal();
+                                } else {
+                                    engine.message = "Nothing to paste".to_string();
                                 }
                                 needs_redraw = true;
                                 continue;
@@ -3668,7 +3694,8 @@ fn event_loop(
                 // engine in Normal mode while the TUI routes keys locally.
                 let first_line = text.lines().next().unwrap_or("");
 
-                // Terminal PTY — forward raw bytes.
+                // Terminal PTY — forward raw bytes wrapped in bracketed paste
+                // so the inner shell treats multi-line content as a single paste.
                 if engine.terminal_has_focus {
                     if engine.terminal_find_active {
                         // Paste into the terminal find bar, not the PTY.
@@ -3677,8 +3704,11 @@ fn event_loop(
                                 engine.terminal_find_char(ch);
                             }
                         }
-                    } else {
+                    } else if !text.is_empty() {
+                        engine.terminal_write(b"\x1b[200~");
                         engine.terminal_write(text.as_bytes());
+                        engine.terminal_write(b"\x1b[201~");
+                        engine.poll_terminal();
                     }
                     needs_redraw = true;
                     continue;

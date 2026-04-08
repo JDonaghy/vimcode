@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 262**: 7 bug fixes — TUI terminal paste (register fallback + bracketed paste + poll_terminal); GTK terminal Ctrl+C/Ctrl+Shift+C (key-to-pty fallback + copy handler); TUI terminal selection offset (relative columns + dynamic bottom_chrome); editor drag leak into terminal; CI coverage `--all-features` → `--features gui`.
 - **Session 261**: Fix `o` command with CRLF/CR line endings — `insert_pos` calculation now handles `\r\n` (skip both chars) and lone `\r` (insert before it) so new lines aren't absorbed into CRLF pairs. 4 new tests.
 - **Session 260**: 12 bug fixes — `%` viewport centering; TUI tab underline filename-only; preview tab click-to-permanent; explorer micro-drag same-dest guard; GTK tab bar proportional font width; terminal click overlap; live grep preview scroll; terminal Ctrl+V paste; picker z-order over terminal (TUI+GTK); GTK visual select highlight; terminal right-click suppression. 5 new tests.
 - **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.

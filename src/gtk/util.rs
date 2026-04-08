@@ -236,6 +236,14 @@ pub(super) fn gtk_key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: 
                 return vec![b & 0x1f];
             }
         }
+        // unicode may be None because GTK's to_unicode() filters control chars.
+        // Derive the control byte from the key name (single lowercase letter).
+        if key_name.len() == 1 {
+            let b = key_name.as_bytes()[0].to_ascii_lowercase();
+            if b.is_ascii_lowercase() {
+                return vec![b & 0x1f];
+            }
+        }
         // Named control keys when ctrl held
         return match key_name {
             "Return" => b"\r".to_vec(),

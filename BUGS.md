@@ -14,10 +14,14 @@
 
 - **Terminal panel resize not working via mouse** — Dragging the terminal panel header to resize the panel height does not appear to work. Multiple attempts to click and drag the resize handle fail to change the terminal size.
 
-- **TUI terminal paste still not working** — Ctrl+V in TUI terminal still does not paste clipboard content into the terminal PTY. The previous fix (matching lowercase 'v') may not be reaching the paste handler, or `clipboard_read` may be None/failing.
 
 
 ## Resolved
+
+- **TUI terminal paste not working** — Ctrl+V in TUI terminal didn't paste. Three fixes: (1) added `poll_terminal()` after paste writes for immediate feedback, (2) wrapped paste in bracketed paste sequences for multi-line safety, (3) falls back to VimCode `+`/`"` registers when system clipboard is empty. Also added error messages instead of silent failure.
+- **GTK terminal Ctrl+C sends newline instead of copying** — `gtk_key_to_pty_bytes()` returned empty for Ctrl+letter keys because GTK's `to_unicode()` filters control chars. Added fallback to derive control byte from `key_name`. Also added Ctrl+Shift+C handler to copy terminal selection.
+- **TUI terminal drag-select offset** — Selection used absolute screen column instead of terminal-relative column (`col.saturating_sub(editor_left)`). Row was off by one because mouse handler hardcoded `2` bottom chrome rows (status+cmd) while per-window status lines (default) hide the global status bar. Fixed all 10 instances in mouse.rs to compute `bottom_chrome` dynamically.
+- **Editor drag leaks into terminal panel** — Editor text drag that moved outside all editor windows fell through to terminal drag handler. Added early return when `mouse_text_drag` is active and no editor window matches.
 
 - **`o` inserts whitespace instead of creating new line (YAML/bash)** — The `o` handler's `insert_pos` calculation only checked for `\n` line endings. For CRLF files (`\r\n`), it inserted between `\r` and `\n`; for lone `\r` files, the new `\n` was absorbed into a CRLF pair, failing to create a new line. Fixed by checking for `\r\n` (skip both) and `\r` alone (insert before it). 4 new tests.
 - **Terminal draws on top of fuzzy finder (TUI + GTK)** — Terminal panel was rendered after the picker popup in both TUI and GTK draw orders, overwriting it. Fixed by moving picker/folder picker/tab switcher/dialog rendering to after the bottom panel in both backends, so popups have higher z-order.

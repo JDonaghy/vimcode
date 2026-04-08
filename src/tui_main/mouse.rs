@@ -57,6 +57,14 @@ pub(super) fn handle_mouse(
             0
         };
 
+    // Bottom chrome rows: command line (1) + optional global status bar.
+    // With per-window status lines (the default), the global bar is hidden.
+    let bottom_chrome: u16 = if engine.settings.window_status_line {
+        1
+    } else {
+        2
+    };
+
     // Check if the mouse cursor is currently inside or adjacent to the hover
     // popup bounding rect. We include 1 column to the left (the sidebar
     // separator) so the popup doesn't dismiss while the mouse crosses to it.
@@ -554,8 +562,15 @@ pub(super) fn handle_mouse(
                         }
                     }
                 }
+                // Editor drag moved outside all windows (e.g. into terminal area) —
+                // stop processing so it doesn't bleed into other panels.
+                if *mouse_text_drag {
+                    return sidebar_width;
+                }
             }
             // Terminal drag-to-select in content rows.
+            // Only activate if the drag originated in the terminal (selection exists)
+            // and the mouse is within the terminal panel bounds.
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
                 let strip_rows: u16 = if engine.terminal_open {
@@ -563,17 +578,22 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+                let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
+                    && col >= editor_left
                     && row > term_strip_top
                     && row < term_strip_top + strip_rows
+                    && engine
+                        .active_terminal()
+                        .is_some_and(|t| t.selection.is_some())
                 {
                     let term_row = row - term_strip_top - 1;
+                    let term_col = col.saturating_sub(editor_left);
                     if let Some(term) = engine.active_terminal_mut() {
                         if let Some(ref mut sel) = term.selection {
                             sel.end_row = term_row;
-                            sel.end_col = col;
+                            sel.end_col = term_col;
                         }
                     }
                     return sidebar_width;
@@ -768,7 +788,7 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+                let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
                     && row >= term_strip_top
@@ -790,8 +810,8 @@ pub(super) fn handle_mouse(
                 if debug_output_open {
                     let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
                     let panel_height = engine.session.terminal_panel_rows + 2;
-                    let panel_y = term_height.saturating_sub(2 + dt_rows + panel_height);
-                    let panel_end = term_height.saturating_sub(2 + dt_rows);
+                    let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
+                    let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
                     if row >= panel_y && row < panel_end {
                         let content_rows = engine.session.terminal_panel_rows as usize;
                         let total = engine.dap_output_lines.len();
@@ -928,7 +948,7 @@ pub(super) fn handle_mouse(
             } else {
                 0
             };
-            let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+            let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
             if engine.terminal_open
                 && strip_rows > 0
                 && col >= editor_left
@@ -1518,8 +1538,8 @@ pub(super) fn handle_mouse(
         if debug_output_open {
             let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
             let panel_height = engine.session.terminal_panel_rows + 2;
-            let panel_y = term_height.saturating_sub(2 + dt_rows + panel_height);
-            let panel_end = term_height.saturating_sub(2 + dt_rows);
+            let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
+            let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
             if row >= panel_y && row < panel_end {
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
                 let sb_col = term_width.saturating_sub(1);
@@ -1543,7 +1563,7 @@ pub(super) fn handle_mouse(
         } else {
             0
         };
-        let term_strip_top = term_height.saturating_sub(2 + qf_rows + strip_rows);
+        let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
         if engine.terminal_open
             && strip_rows > 0
             && col >= editor_left
@@ -1610,13 +1630,14 @@ pub(super) fn handle_mouse(
                 } else {
                     // Content area — start a selection.
                     let term_row = row - term_strip_top - 1;
+                    let term_col = col.saturating_sub(editor_left);
                     engine.terminal_scroll_reset();
                     if let Some(term) = engine.active_terminal_mut() {
                         term.selection = Some(crate::core::terminal::TermSelection {
                             start_row: term_row,
-                            start_col: col,
+                            start_col: term_col,
                             end_row: term_row,
-                            end_col: col,
+                            end_col: term_col,
                         });
                     }
                 }
@@ -1763,7 +1784,7 @@ pub(super) fn handle_mouse(
 
             // Scrollbar click/drag → jump-scroll + arm drag
             let flat_len = engine.ext_panel_flat_len();
-            let content_h = term_height.saturating_sub(2 + menu_rows + content_start) as usize;
+            let content_h = term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
             if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
                 let rel_row = (sidebar_row - content_start) as usize;
                 let ratio = rel_row as f64 / content_h as f64;
@@ -1801,8 +1822,8 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
-            // tree_height = total height - 2 status rows (no header)
-            let tree_height = term_height.saturating_sub(2) as usize;
+            // tree_height = total height - bottom chrome rows (no header)
+            let tree_height = term_height.saturating_sub(bottom_chrome) as usize;
             let total_rows = sidebar.rows.len();
 
             // Click on the scrollbar column → jump-scroll + arm drag

@@ -1419,8 +1419,12 @@ impl SimpleComponent for App {
                                                 }
                                             }
                                         }
-                                        // Ctrl+Y: copy terminal selection to clipboard.
+                                        // Ctrl+Y / Ctrl+Shift+C: copy terminal selection to clipboard.
                                         if ctrl && !shift && (key_name == "y" || key_name == "Y") {
+                                            sender.input(Msg::TerminalCopySelection);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if ctrl && shift && (key_name == "c" || key_name == "C") {
                                             sender.input(Msg::TerminalCopySelection);
                                             return gtk4::glib::Propagation::Stop;
                                         }

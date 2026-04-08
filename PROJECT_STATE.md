@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 261 — fix `o` CRLF/CR line ending bug) | **Tests:** 5415
+**Last updated:** Apr 8, 2026 (Session 262 — 7 bug fixes across terminal, mouse, GTK, CI) | **Tests:** 5415
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 261 archived in **SESSION_HISTORY.md**.
+> All sessions through 262 archived in **SESSION_HISTORY.md**.

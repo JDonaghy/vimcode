@@ -1,7 +1,21 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 261 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 262 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 262 — 7 bug fixes: terminal paste, GTK Ctrl+C, mouse selection, CI (5415 tests):**
+
+1. **TUI terminal paste**: Added `poll_terminal()` for immediate feedback, wrapped paste in bracketed paste escape sequences for multi-line safety, added register fallback (system clipboard → `+` register → `"` register) so yanked text is available in terminal Ctrl+V. Added error messages instead of silent failure.
+2. **GTK terminal Ctrl+C**: `gtk_key_to_pty_bytes()` returned empty for Ctrl+letter keys because GTK's `to_unicode()` filters control characters. Added fallback to derive control byte from `key_name` (single letter → `& 0x1f`). Plain Ctrl+C now sends `\x03` (SIGINT) correctly. Added Ctrl+Shift+C handler to copy terminal selection.
+3. **TUI terminal selection column offset**: Selection start/drag used absolute screen `col` instead of terminal-relative `col.saturating_sub(editor_left)`. Fixed both click and drag handlers.
+4. **TUI terminal selection row offset**: Mouse handler hardcoded `2` bottom chrome rows (status + command line), but per-window status lines (default) hide the global status bar — only 1 bottom chrome row. Replaced all 10 hardcoded instances with dynamic `bottom_chrome` variable.
+5. **Editor drag leaking into terminal**: Editor text drag that moved outside all editor windows fell through to terminal drag handler, creating phantom selections. Added early return when `mouse_text_drag` is active.
+6. **Terminal drag guard**: Added `col >= editor_left` check and existing-selection requirement to terminal drag handler to prevent sidebar clicks from activating terminal selection.
+7. **CI coverage job failure**: `--all-features` on Linux pulled in `win-gui` → `windows-rs` crates with `windows-future 0.2.1` API incompatibility (`IMarshal`/`marshaler` not found). Changed to `--features gui`.
+
+Files changed: `src/tui_main/mod.rs`, `src/tui_main/mouse.rs`, `src/gtk/mod.rs`, `src/gtk/util.rs`, `.github/workflows/ci.yml`, `BUGS.md`.
 
 ---
 
