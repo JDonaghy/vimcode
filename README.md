@@ -8,7 +8,7 @@ A Vim+VSCode hybrid editor written in Rust. 128K lines of code, 5,391 tests, fou
 
 If you want Vim’s modal editing with VSCode’s UI — or VSCode’s ease of use with Vim’s power — VimCode bridges both worlds. Run it in a terminal and it looks like Vim; run it in a window and it looks like VSCode. Press `Alt-M` to switch between Vim mode and VSCode mode at any time.
 
-VimCode takes a batteries-included approach: **LSP**, **DAP**, integrated terminal, git panel, AI assistant, spell checking, and 20 tree-sitter grammars all work out of the box. Language extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry and can be added without updating VimCode itself.
+VimCode takes a batteries-included approach: **LSP**, **DAP**, integrated terminal, git panel, AI assistant, spell checking, and 20 tree-sitter grammars all work out of the box. Language extensions for 17 languages are available from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry — browse and install them from the built-in **Extensions panel** or with `:ExtInstall`.
 
 Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own API, not VimScript or Neovim’s API. Unlike Zed, VimCode does not require a dedicated GPU. GTK4 uses hardware compositing when available but falls back gracefully to software rendering, and the native Windows backend uses Direct2D. VimCode works everywhere: desktops, VMs, remote sessions, headless servers.
 
@@ -20,9 +20,11 @@ Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own AP
 | **macOS** | GTK4 via Homebrew | ratatui + crossterm |
 | **Windows** | Native Win32 + Direct2D + DirectWrite | ratatui + crossterm |
 
-### Status
+### Status — Beta
 
-VimCode is under active development with the assistance of **Claude Code**. It is used daily as a primary editor. Bug reports and feature requests are welcome — please include enough detail to reproduce the problem and describe the expected behavior.
+VimCode is currently in **beta**. It is under active development with the assistance of **Claude Code** and is used daily as a primary editor. While it is stable enough for daily use, you may encounter bugs or incomplete features. **Back up your work and use version control.** Bug reports and feature requests are welcome — please include enough detail to reproduce the problem and describe the expected behavior.
+
+For screenshots and more information, visit **[vimcode.org](https://vimcode.org)**.
 
 ---
 
@@ -52,7 +54,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 
 ## Download
 
-Pre-built packages are published automatically on every release:
+Pre-built packages are published automatically on every release. For terminal use on any platform, the **`vcd`** binary is the recommended option — it has no GUI dependencies and works everywhere.
 
 **[→ Download latest release](../../releases/tag/latest)**
 
@@ -97,7 +99,7 @@ brew install vcd        # TUI only (no GTK4 dependency)
 Download `vimcode-win-x86_64.exe` from the release page. No dependencies required — Direct2D and DirectWrite are built into Windows.
 
 **Option B — TUI** (`vcd.exe`)
-Download `vcd-windows-x86_64.exe` from the release page. Run it in Windows Terminal, PowerShell, or any terminal emulator. No dependencies required.
+Download `vcd-windows-x86_64.exe` from the release page (rename to `vcd.exe` for convenience). Run it in Windows Terminal, PowerShell, or cmd.exe. No dependencies required. This is the same `vcd` binary used on Linux and macOS.
 
 ---
 
@@ -643,7 +645,7 @@ For the full API reference, see the **[Lua Plugin API](https://github.com/JDonag
 
 ### Language Extensions
 
-Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts into a single package. Install with `:ExtInstall <name>`. Extensions are fetched from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry and cached locally.
+Language extensions bundle an LSP server, optional DAP debugger, and Lua scripts into a single package. Browse and install extensions from the **Extensions panel** (click the extensions icon in the activity bar) or install directly with `:ExtInstall <name>`. Extensions are fetched from the [vimcode-ext](https://github.com/JDonaghy/vimcode-ext) registry and cached locally.
 
 | Extension | Language | LSP | DAP |
 |-----------|----------|-----|-----|
@@ -758,7 +760,7 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `Shift+Home` / `Shift+End` — extend selection to line start/end
 - `Escape` — clear selection (stays in insert)
 - `Ctrl-Q` — quit
-- `F1` — command palette (search and run any command)
+- `F1` — command palette (search and run any command — also works in Vim mode)
 - `F10` — toggle menu bar visibility
 - Typing while a selection is active **replaces** the selection
 - Status bar shows `EDIT  F1:palette  Alt-M:vim` (or `SELECT` when text is selected, `COMMAND` in command bar)
@@ -787,7 +789,7 @@ Switch the editor into a **non-modal editing** mode that works like a standard t
 - `` Ctrl+` `` — toggle terminal panel
 - `Ctrl+,` — open settings
 
-VSCode mode supports the same `:map` remapping system as Vim mode — see the **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki page. The `editor_mode` setting is persisted in `settings.json`.
+VSCode mode supports the same `:map` remapping system as Vim mode — see the **[Key Remapping](https://github.com/JDonaghy/vimcode/wiki/Key-Remapping)** wiki page. To open the keymaps editor in VSCode mode, use `F1` → search "Keymaps" → Enter (or type `:Keymaps` in the command bar). The `editor_mode` setting is persisted in `settings.json`.
 
 ---
 
