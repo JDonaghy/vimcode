@@ -1482,6 +1482,8 @@ fn event_loop(
             }
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
+            // Check for externally modified files.
+            engine.tick_file_watcher();
             // Auto-dismiss completed notifications after timeout.
             // Force redraw every idle tick when notifications are visible (spinner animation).
             if !engine.notifications.is_empty() {

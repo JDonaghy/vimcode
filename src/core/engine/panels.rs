@@ -350,6 +350,10 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "file_changed" => {
+                self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
             _ => EngineAction::None,
         }
     }

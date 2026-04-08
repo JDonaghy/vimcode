@@ -20,10 +20,16 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::Input::Ime::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::core::engine::{open_url_in_browser, Engine, EngineAction, OpenMode};
@@ -44,6 +50,21 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// Hit zone width (pixels) for sidebar resize drag handle.
 const SIDEBAR_RESIZE_HIT_PX: f32 = 5.0;
 const SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// Width of each caption button (min/max/close) in DIPs.
+const CAPTION_BTN_WIDTH: f32 = 46.0;
+/// Number of caption buttons.
+const CAPTION_BTN_COUNT: f32 = 3.0;
+/// Title/menu bar height multiplier (relative to line_height).
+/// Gives the menu bar more vertical breathing room than a code line.
+const TITLE_BAR_HEIGHT_MULT: f32 = 1.8;
+/// Top inset in DIPs to avoid content clipping against the DWM frame top edge.
+/// DWM paints over the top few pixels of the client area for the window shadow,
+/// so we need to push content down below that zone.
+const TITLE_BAR_TOP_INSET: f32 = 6.0;
+/// Tab bar height multiplier (relative to line_height).
+/// Makes tabs taller like VSCode (~1.6× code line height).
+const TAB_BAR_HEIGHT_MULT: f32 = 1.5;
 
 // ─── Per-window state stored in a thread-local ──────────────────────────────
 
@@ -242,6 +263,8 @@ struct AppState {
     d2d_factory: ID2D1Factory,
     dwrite_factory: IDWriteFactory,
     text_format: IDWriteTextFormat,
+    /// Proportional UI font (Segoe UI) for menus and tab labels.
+    ui_text_format: IDWriteTextFormat,
     render_target: Option<ID2D1HwndRenderTarget>,
     hwnd: HWND,
     char_width: f32,
@@ -268,6 +291,10 @@ struct AppState {
 
     // ── Periodic refresh ─────────────────────────────────────────────────
     last_sidebar_refresh: Instant,
+
+    // ── Caption buttons (custom title bar) ──────────────────────────────
+    /// Which caption button is hovered (0=min, 1=max, 2=close), or None.
+    caption_hover: Option<usize>,
 }
 
 thread_local! {
@@ -277,6 +304,11 @@ thread_local! {
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 pub fn run(file_path: Option<PathBuf>) {
+    // Initialize COM (needed for native file dialogs, etc.)
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+
     // Enable per-monitor DPI awareness (Windows 10 1703+)
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -329,6 +361,18 @@ pub fn run(file_path: Option<PathBuf>) {
     // Register window class + create window (before text format, so we can get DPI)
     let hwnd = create_window();
 
+    // Extend the DWM frame into the client area so we can draw a custom title bar
+    // while keeping the native window shadow and rounded corners (Win11).
+    unsafe {
+        let margins = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 1, // 1px top margin gives us shadow + lets WM_NCCALCSIZE work
+            cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+
     // Get initial DPI and compute scale factor
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi_scale = dpi as f32 / 96.0;
@@ -350,6 +394,21 @@ pub fn run(file_path: Option<PathBuf>) {
     }
     .expect("CreateTextFormat");
 
+    // Create proportional UI font (Segoe UI) for menus and tab labels
+    let ui_font_size = 13.0 * dpi_scale; // 13px is VSCode's menu font size
+    let ui_text_format: IDWriteTextFormat = unsafe {
+        dwrite_factory.CreateTextFormat(
+            w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT_REGULAR,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            ui_font_size,
+            w!("en-us"),
+        )
+    }
+    .expect("CreateTextFormat for UI font");
+
     // Measure monospace dimensions (already includes DPI scaling via font size)
     let char_width = draw::measure_char_width(&dwrite_factory, &text_format);
     let line_height = draw::measure_line_height(&dwrite_factory, &text_format);
@@ -362,6 +421,7 @@ pub fn run(file_path: Option<PathBuf>) {
             d2d_factory,
             dwrite_factory,
             text_format,
+            ui_text_format,
             render_target: None,
             hwnd,
             char_width,
@@ -378,15 +438,27 @@ pub fn run(file_path: Option<PathBuf>) {
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
             last_sidebar_refresh: Instant::now(),
+            caption_hover: None,
         });
     });
 
     // Create render target now that we have the HWND
     create_render_target();
 
-    // Show window
+    // Show window and force frame recalculation so WM_NCCALCSIZE removes the title bar
+    // immediately (without this, the standard title bar is visible until the first
+    // maximize/restore cycle).
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        );
         UpdateWindow(hwnd).expect("UpdateWindow");
         SetTimer(Some(hwnd), TICK_TIMER_ID, TICK_INTERVAL_MS, None);
     }
@@ -500,6 +572,32 @@ unsafe extern "system" fn wnd_proc(
 
 unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // ── Custom title bar ─────────────────────────────────────────
+        WM_NCCALCSIZE => {
+            if wparam.0 != 0 {
+                // Return 0 to remove the entire non-client area (title bar + borders).
+                // The DWM frame extension preserves the native window shadow.
+                let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+                if is_maximized(hwnd) {
+                    // When maximized, Windows extends the window past the screen
+                    // edge by the frame thickness. Add that offset so content
+                    // doesn't overflow onto adjacent monitors.
+                    let dpi = GetDpiForWindow(hwnd);
+                    let frame_y = GetSystemMetricsForDpi(SM_CYFRAME, dpi)
+                        + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    params.rgrc[0].top += frame_y;
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_NCHITTEST => {
+            let result = on_nchittest(hwnd, lparam);
+            if result != HTNOWHERE {
+                return LRESULT(result as isize);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_PAINT => {
             on_paint(hwnd);
             LRESULT(0)
@@ -527,6 +625,18 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_CHAR => {
             on_char(wparam);
             LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION => {
+            on_ime_start_composition(hwnd);
+            // Let DefWindowProc show the composition window
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_IME_COMPOSITION => {
+            if (lparam.0 as u32 & GCS_RESULTSTR.0) != 0 {
+                // The final committed string will arrive as WM_CHAR messages,
+                // so we just need to pass through to DefWindowProc.
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             on_mouse_down(hwnd, lparam);
@@ -582,6 +692,110 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
 
 // ─── Message handlers ────────────────────────────────────────────────────────
 
+fn is_maximized(hwnd: HWND) -> bool {
+    let mut wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetWindowPlacement(hwnd, &mut wp);
+    }
+    wp.showCmd == SW_MAXIMIZE.0 as u32
+}
+
+/// Custom hit-test for the frameless title bar.
+/// Returns the appropriate HT* value, or `HTNOWHERE` to fall through to DefWindowProc.
+fn on_nchittest(hwnd: HWND, lparam: LPARAM) -> u32 {
+    // Get cursor position in screen coords, convert to client coords
+    let screen_x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let screen_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    let mut pt = POINT {
+        x: screen_x,
+        y: screen_y,
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut pt);
+    }
+
+    // Get client rect and DPI-aware sizes
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let client_width = (rc.right - rc.left) as f32;
+
+    let dpi_scale = APP.with(|app| app.borrow().as_ref().map_or(1.0f32, |s| s.dpi_scale));
+    let line_height = APP.with(|app| app.borrow().as_ref().map_or(20.0f32, |s| s.line_height));
+
+    // Title bar height = top inset + line_height * multiplier
+    let title_bar_height = (TITLE_BAR_TOP_INSET + line_height * TITLE_BAR_HEIGHT_MULT) * dpi_scale;
+    // Resize border (only at top edge for the frameless window)
+    let resize_border = 5.0 * dpi_scale;
+
+    let px = pt.x as f32;
+    let py = pt.y as f32;
+
+    // Top resize border (thin strip at very top for resizing)
+    if py < resize_border && !is_maximized(hwnd) {
+        // Top corners
+        if px < resize_border {
+            return HTTOPLEFT;
+        }
+        if px > client_width - resize_border {
+            return HTTOPRIGHT;
+        }
+        return HTTOP;
+    }
+
+    // Caption buttons area (right side of the title bar row)
+    if py < title_bar_height {
+        let btn_total = CAPTION_BTN_COUNT * CAPTION_BTN_WIDTH * dpi_scale;
+        let btn_start = client_width - btn_total;
+
+        if px >= btn_start {
+            // Return HTCLIENT so the buttons are handled by our WM_LBUTTONDOWN handler
+            // with proper hover/click rendering.
+            return HTCLIENT;
+        }
+
+        // When a menu dropdown is open, the entire title bar should be HTCLIENT
+        // so WM_MOUSEMOVE fires and we can switch between menus on hover.
+        let menu_open = APP.with(|app| {
+            app.borrow()
+                .as_ref()
+                .is_some_and(|s| s.engine.menu_open_idx.is_some())
+        });
+        if menu_open {
+            return HTCLIENT;
+        }
+
+        // Check if we're over the menu bar items — those should be HTCLIENT
+        // so mouse clicks reach our WM_LBUTTONDOWN handler.
+        let menu_bar_visible = APP.with(|app| {
+            app.borrow()
+                .as_ref()
+                .is_some_and(|s| s.engine.menu_bar_visible)
+        });
+        if menu_bar_visible {
+            let char_width = APP.with(|app| app.borrow().as_ref().map_or(8.0f32, |s| s.char_width));
+            // Menu labels start at 1*cw and extend across all menu items
+            let mut menu_end = char_width; // initial offset
+            for (name, _, _) in MENU_STRUCTURE.iter() {
+                menu_end += (name.len() as f32 + 2.0) * char_width;
+            }
+            if px < menu_end * dpi_scale {
+                return HTCLIENT;
+            }
+        }
+
+        // Rest of the title bar row = draggable caption
+        return HTCAPTION;
+    }
+
+    // Below the title bar — handled by client area
+    HTNOWHERE
+}
+
 fn on_paint(hwnd: HWND) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
@@ -605,9 +819,9 @@ fn on_paint(hwnd: HWND) {
         // Sidebar offset
         let sidebar_left = state.sidebar.total_width() as f64;
 
-        // Menu bar takes 1 row at the top when visible
+        // Menu/title bar takes a taller row at the top when visible (+ top inset)
         let menu_bar_height = if state.engine.menu_bar_visible {
-            lh
+            TITLE_BAR_TOP_INSET as f64 + lh * TITLE_BAR_HEIGHT_MULT as f64
         } else {
             0.0
         };
@@ -620,11 +834,11 @@ fn on_paint(hwnd: HWND) {
                 0.0
             };
 
-        // Reserve: 1 status bar + 1 command line at the bottom + terminal panel
+        // Reserve: tab bar (taller) + optional breadcrumb row at the top of each group
         let tab_bar_height = if state.engine.settings.breadcrumbs {
-            lh * 2.0 // tab bar + breadcrumb row
+            lh * TAB_BAR_HEIGHT_MULT as f64 + lh // taller tab bar + breadcrumb row
         } else {
-            lh
+            lh * TAB_BAR_HEIGHT_MULT as f64
         };
         let bottom_chrome = 2.0 * lh + terminal_height; // status + command line + terminal
         let editor_bottom = height - bottom_chrome;
@@ -669,10 +883,13 @@ fn on_paint(hwnd: HWND) {
             rt: &rt,
             dwrite: &state.dwrite_factory,
             format: &state.text_format,
+            ui_format: &state.ui_text_format,
             theme: &state.theme,
             char_width: state.char_width,
             line_height: state.line_height,
             editor_left: state.sidebar.total_width(),
+            caption_hover: state.caption_hover,
+            is_maximized: is_maximized(state.hwnd),
         };
 
         unsafe {
@@ -680,7 +897,7 @@ fn on_paint(hwnd: HWND) {
             ctx.draw_frame(&screen);
             // Draw sidebar on top of left edge (activity bar always, panel when visible)
             let menu_bar_y = if state.engine.menu_bar_visible {
-                state.line_height
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
             } else {
                 0.0
             };
@@ -1072,9 +1289,7 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
                     if let Some((midx, item_idx)) = state.engine.menu_activate_highlighted() {
                         if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
                             if let Some(item) = items.get(item_idx) {
-                                let ea =
-                                    state.engine.menu_activate_item(midx, item_idx, item.action);
-                                handle_action_with_sidebar(state, ea);
+                                activate_menu_item(state, midx, item_idx, item.action);
                             }
                         }
                     }
@@ -1256,6 +1471,83 @@ fn on_char(wparam: WPARAM) {
     });
 }
 
+/// Position the IME composition window at the current cursor location.
+fn on_ime_start_composition(hwnd: HWND) {
+    APP.with(|app| {
+        let app = app.borrow();
+        let Some(state) = app.as_ref() else { return };
+
+        // Find the active window's cached rect and cursor position
+        let active_wid = state.engine.active_window_id();
+        let Some(cwr) = state
+            .cached_window_rects
+            .iter()
+            .find(|r| r.window_id == active_wid)
+        else {
+            return;
+        };
+
+        let cursor = state.engine.cursor();
+        let cursor_line = cursor.line;
+        let cursor_col = cursor.col;
+        let scroll_top = state.engine.view().scroll_top;
+        let cw = state.char_width;
+        let lh = state.line_height;
+
+        // The editor area starts after gutter + rect origin
+        let tab_bar_rows = if state.engine.settings.breadcrumbs {
+            2.0
+        } else {
+            1.0
+        };
+        let gutter_px = cwr.gutter_chars as f32 * cw;
+        let x = cwr.rect.x as f32 + gutter_px + (cursor_col as f32 * cw);
+        let y = cwr.rect.y as f32 + tab_bar_rows * lh + ((cursor_line - scroll_top) as f32 * lh);
+
+        // Convert from DIPs to physical pixels for the IME API
+        let scale = state.dpi_scale;
+        let px = (x * scale) as i32;
+        let py = (y * scale) as i32;
+
+        unsafe {
+            let himc = ImmGetContext(hwnd);
+            if !himc.is_invalid() {
+                let cf = COMPOSITIONFORM {
+                    dwStyle: CFS_POINT,
+                    ptCurrentPos: POINT { x: px, y: py },
+                    ..Default::default()
+                };
+                let _ = ImmSetCompositionWindow(himc, &cf);
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+        }
+    });
+}
+
+/// Check if a DIP-space coordinate is over a caption button.
+/// Returns Some(0)=minimize, Some(1)=maximize, Some(2)=close, or None.
+fn caption_button_at(px: f32, py: f32) -> Option<usize> {
+    APP.with(|app| {
+        let app = app.borrow();
+        let state = app.as_ref()?;
+        let title_h = TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT;
+        if py >= title_h {
+            return None; // below title bar row
+        }
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(state.hwnd, &mut rc);
+        }
+        let client_width = (rc.right - rc.left) as f32 / state.dpi_scale;
+        let btn_total = CAPTION_BTN_COUNT * CAPTION_BTN_WIDTH;
+        let btn_start = client_width - btn_total;
+        if px < btn_start {
+            return None;
+        }
+        Some(((px - btn_start) / CAPTION_BTN_WIDTH) as usize)
+    })
+}
+
 /// Extract pixel coordinates from LPARAM.
 fn lparam_xy(lparam: LPARAM) -> (f32, f32) {
     let x = (lparam.0 & 0xFFFF) as i16 as f32;
@@ -1343,6 +1635,31 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
     let ix = (lparam.0 & 0xFFFF) as i16;
     let iy = ((lparam.0 >> 16) & 0xFFFF) as i16;
 
+    // ── Caption button clicks (custom title bar) ─────────────────────
+    {
+        let btn = caption_button_at(px, py);
+        if let Some(idx) = btn {
+            unsafe {
+                match idx {
+                    0 => {
+                        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    }
+                    1 => {
+                        if is_maximized(hwnd) {
+                            let _ = ShowWindow(hwnd, SW_RESTORE);
+                        } else {
+                            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+                        }
+                    }
+                    _ => {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     // Capture mouse so we get drag events even outside the window
     unsafe {
         SetCapture(hwnd);
@@ -1392,7 +1709,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 .unwrap_or(0);
             let popup_w = (max_label + max_sc + 6).clamp(20, 50) as f32 * cw;
             let popup_h = (items.len() as f32 + 1.0) * lh;
-            let popup_y = lh;
+            let popup_y = TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT;
 
             // Check if click is on the menu bar labels (to switch menus)
             if py < lh {
@@ -1425,9 +1742,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 }
                 let item_idx = (rel_y / lh).floor() as usize;
                 if item_idx < items.len() && !items[item_idx].separator && items[item_idx].enabled {
-                    let action = items[item_idx].action;
-                    let ea = state.engine.menu_activate_item(midx, item_idx, action);
-                    handle_action_with_sidebar(state, ea);
+                    activate_menu_item(state, midx, item_idx, items[item_idx].action);
                 }
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1444,7 +1759,8 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         }
 
         // ── Menu bar clicks (when no dropdown is open) ───────────────────
-        if state.engine.menu_bar_visible && py < state.line_height {
+        let title_bar_h = TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT;
+        if state.engine.menu_bar_visible && py < title_bar_h {
             let cw = state.char_width;
             let mut label_x = cw;
             for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
@@ -1463,7 +1779,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Check activity bar clicks ────────────────────────────────────
         let ab_w = state.sidebar.activity_bar_px;
         let menu_y = if state.engine.menu_bar_visible {
-            state.line_height
+            TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
         } else {
             0.0
         };
@@ -1677,6 +1993,33 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Caption button hover tracking (inlined to avoid double RefCell borrow)
+        let new_hover = {
+            let title_h = TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT;
+            if py >= title_h {
+                None
+            } else {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(state.hwnd, &mut rc);
+                }
+                let client_width = (rc.right - rc.left) as f32 / state.dpi_scale;
+                let btn_total = CAPTION_BTN_COUNT * CAPTION_BTN_WIDTH;
+                let btn_start = client_width - btn_total;
+                if px < btn_start {
+                    None
+                } else {
+                    Some(((px - btn_start) / CAPTION_BTN_WIDTH) as usize)
+                }
+            }
+        };
+        if new_hover != state.caption_hover {
+            state.caption_hover = new_hover;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+
         // Sidebar resize drag in progress
         if state.sidebar_resize_drag && lbutton {
             let ab_w = state.sidebar.activity_bar_px;
@@ -1735,7 +2078,8 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 let lh = state.line_height;
 
                 // Hover over menu bar labels — switch to that menu
-                if py < lh {
+                let title_h = TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT;
+                if py < title_h {
                     let mut label_x = cw;
                     for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
                         let label_w = (name.len() as f32 + 2.0) * cw;
@@ -1767,7 +2111,7 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                         .max()
                         .unwrap_or(0);
                     let popup_w = (max_label + max_sc + 6).clamp(20, 50) as f32 * cw;
-                    let popup_y = lh;
+                    let popup_y = TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT;
 
                     if px >= popup_x && px < popup_x + popup_w && py >= popup_y {
                         let rel_y = py - popup_y - lh * 0.25;
@@ -1981,6 +2325,9 @@ fn on_tick(hwnd: HWND) {
             needs_redraw = true;
         }
 
+        // File watcher (external modification detection)
+        state.engine.tick_file_watcher();
+
         // Notification ticker
         state.engine.tick_notifications();
         needs_redraw = true;
@@ -2016,12 +2363,44 @@ fn on_tick(hwnd: HWND) {
             }
         }
 
+        // Update window title with current file name
+        update_window_title(state);
+
         if needs_redraw {
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
     });
+}
+
+/// Update the Win32 window title to reflect the current file and dirty state.
+fn update_window_title(state: &AppState) {
+    let bid = state.engine.active_buffer_id();
+    let (name, dirty) = state
+        .engine
+        .buffer_manager
+        .get(bid)
+        .map(|s| {
+            let name = s
+                .file_path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "[No Name]".to_string());
+            (name, s.dirty)
+        })
+        .unwrap_or_else(|| ("[No Name]".to_string(), false));
+
+    let title = if dirty {
+        format!("{} (modified) — VimCode", name)
+    } else {
+        format!("{} — VimCode", name)
+    };
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = SetWindowTextW(state.hwnd, PCWSTR(wide.as_ptr()));
+    }
 }
 
 fn on_destroy() {
@@ -2037,17 +2416,136 @@ fn on_destroy() {
 
 // ─── Action handling ─────────────────────────────────────────────────────────
 
+// ─── Menu item activation (intercepts dialog actions) ───────────────────────
+
+/// Activate a menu item by action string. Dialog actions (open file/folder, save workspace)
+/// are intercepted here and handled via native Win32 dialogs instead of going through
+/// `execute_command`. All other actions fall through to the engine.
+fn activate_menu_item(state: &mut AppState, menu_idx: usize, item_idx: usize, action: &str) {
+    match action {
+        "open_file_dialog" => {
+            state.engine.close_menu();
+            if let Some(path) = show_open_file_dialog(state.hwnd) {
+                if let Err(e) = state.engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                    state.engine.message = e;
+                }
+                state.sidebar.dirty = true;
+            }
+        }
+        "open_folder_dialog" => {
+            state.engine.close_menu();
+            if let Some(path) = show_open_folder_dialog(state.hwnd) {
+                state.engine.open_folder(&path);
+                state.sidebar.dirty = true;
+                state.sidebar.expanded.clear();
+                state.sidebar.expanded.insert(path);
+            }
+        }
+        "save_workspace_as_dialog" => {
+            state.engine.close_menu();
+            if let Some(path) = show_save_dialog(state.hwnd, ".vimcode-workspace") {
+                state.engine.save_workspace_as(&path);
+            }
+        }
+        _ => {
+            let ea = state.engine.menu_activate_item(menu_idx, item_idx, action);
+            handle_action_with_sidebar(state, ea);
+        }
+    }
+}
+
+// ─── Native file dialogs (IFileOpenDialog / IFileSaveDialog) ────────────────
+
+/// Show a native "Open File" dialog. Returns the selected path, or `None` if cancelled.
+fn show_open_file_dialog(hwnd: HWND) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let filters = [COMDLG_FILTERSPEC {
+            pszName: w!("All Files"),
+            pszSpec: w!("*.*"),
+        }];
+        dialog.SetFileTypes(&filters).ok()?;
+        dialog.SetTitle(w!("Open File")).ok()?;
+        dialog.Show(Some(hwnd)).ok()?;
+        let result = dialog.GetResult().ok()?;
+        let path_w = result.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(path_w.to_string().ok()?);
+        CoTaskMemFree(Some(path_w.0 as *const _));
+        Some(path)
+    }
+}
+
+/// Show a native "Open Folder" dialog. Returns the selected path, or `None` if cancelled.
+fn show_open_folder_dialog(hwnd: HWND) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog
+            .SetOptions(dialog.GetOptions().ok()? | FOS_PICKFOLDERS)
+            .ok()?;
+        dialog.SetTitle(w!("Open Folder")).ok()?;
+        dialog.Show(Some(hwnd)).ok()?;
+        let result = dialog.GetResult().ok()?;
+        let path_w = result.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(path_w.to_string().ok()?);
+        CoTaskMemFree(Some(path_w.0 as *const _));
+        Some(path)
+    }
+}
+
+/// Show a native "Save As" dialog with a suggested filename. Returns the selected path.
+fn show_save_dialog(hwnd: HWND, suggested_name: &str) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let name_wide: Vec<u16> = suggested_name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        dialog.SetFileName(PCWSTR(name_wide.as_ptr())).ok()?;
+        dialog.SetTitle(w!("Save Workspace As")).ok()?;
+        dialog.Show(Some(hwnd)).ok()?;
+        let result = dialog.GetResult().ok()?;
+        let path_w = result.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = PathBuf::from(path_w.to_string().ok()?);
+        CoTaskMemFree(Some(path_w.0 as *const _));
+        Some(path)
+    }
+}
+
 /// Process an engine action. Returns `true` if the app should quit.
 /// `state` is optional — some callers only have the engine.
 fn handle_action_with_sidebar(state: &mut AppState, action: EngineAction) -> bool {
-    if matches!(action, EngineAction::ToggleSidebar) {
-        state.sidebar.visible = !state.sidebar.visible;
-        state.sidebar.dirty = true;
-        if state.sidebar.visible && state.sidebar.expanded.is_empty() {
-            if let Some(ref root) = state.engine.workspace_root.clone() {
-                state.sidebar.expanded.insert(root.clone());
+    match action {
+        EngineAction::ToggleSidebar => {
+            state.sidebar.visible = !state.sidebar.visible;
+            state.sidebar.dirty = true;
+            if state.sidebar.visible && state.sidebar.expanded.is_empty() {
+                if let Some(ref root) = state.engine.workspace_root.clone() {
+                    state.sidebar.expanded.insert(root.clone());
+                }
             }
         }
+        EngineAction::OpenFolderDialog => {
+            if let Some(path) = show_open_folder_dialog(state.hwnd) {
+                state.engine.open_folder(&path);
+                state.sidebar.dirty = true;
+                state.sidebar.expanded.clear();
+                state.sidebar.expanded.insert(path);
+            }
+            return false;
+        }
+        EngineAction::SaveWorkspaceAsDialog => {
+            if let Some(path) = show_save_dialog(state.hwnd, ".vimcode-workspace") {
+                state.engine.save_workspace_as(&path);
+            }
+            return false;
+        }
+        EngineAction::OpenRecentDialog => {
+            // Open Recent is handled by the picker — engine already populates it
+        }
+        _ => {}
     }
     handle_action(&mut state.engine, action)
 }

@@ -3056,7 +3056,175 @@ impl Engine {
         self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
         self.lsp_did_open(buffer_id);
+        // Watch the file for external changes
+        self.watch_file(path);
         Ok(())
+    }
+}
+
+// ─── File watching ──────────────────────────────────────────────────────
+
+impl Engine {
+    /// Initialize the file watcher. Called once from `Engine::new()`.
+    pub(crate) fn init_file_watcher(&mut self) {
+        use notify::{RecommendedWatcher, Watcher};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        match RecommendedWatcher::new(tx, notify::Config::default()) {
+            Ok(watcher) => {
+                self.file_watcher = Some(watcher);
+                self.file_watcher_rx = Some(rx);
+            }
+            Err(_) => {
+                // File watching unavailable — not fatal
+            }
+        }
+    }
+
+    /// Add a file to the watch list.
+    fn watch_file(&mut self, path: &Path) {
+        use notify::{RecursiveMode, Watcher};
+
+        if let Some(ref mut watcher) = self.file_watcher {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let _ = watcher.watch(&canonical, RecursiveMode::NonRecursive);
+        }
+    }
+
+    /// Remove a file from the watch list.
+    #[allow(dead_code)]
+    pub(crate) fn unwatch_file(&mut self, path: &Path) {
+        use notify::Watcher;
+
+        if let Some(ref mut watcher) = self.file_watcher {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let _ = watcher.unwatch(&canonical);
+        }
+    }
+
+    /// Poll the file watcher for external modifications and show reload dialogs.
+    /// Called from the backend's tick function.
+    pub fn tick_file_watcher(&mut self) {
+        use notify::EventKind;
+
+        let Some(ref rx) = self.file_watcher_rx else {
+            return;
+        };
+
+        let mut modified_paths: Vec<PathBuf> = Vec::new();
+        while let Ok(Ok(event)) = rx.try_recv() {
+            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                for path in event.paths {
+                    let canonical = path.canonicalize().unwrap_or(path);
+                    if !self.file_watcher_pending.contains(&canonical) {
+                        modified_paths.push(canonical);
+                    }
+                }
+            }
+        }
+
+        for path in modified_paths {
+            // Only prompt for files we have open
+            let has_buffer = self.buffer_manager.list().iter().any(|&bid| {
+                self.buffer_manager
+                    .get(bid)
+                    .and_then(|s| s.file_path.as_deref())
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+                    == Some(path.clone())
+            });
+
+            if !has_buffer {
+                continue;
+            }
+
+            // Check if the buffer is dirty — if so, show a dialog; if not, auto-reload
+            let is_dirty = self.buffer_manager.list().iter().any(|&bid| {
+                self.buffer_manager
+                    .get(bid)
+                    .filter(|s| {
+                        s.file_path
+                            .as_deref()
+                            .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+                            == Some(path.clone())
+                    })
+                    .is_some_and(|s| s.dirty)
+            });
+
+            if is_dirty {
+                // Mark as pending so we don't show multiple dialogs
+                self.file_watcher_pending.insert(path.clone());
+                let display = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                self.show_dialog(
+                    "file_changed",
+                    "File Changed",
+                    vec![format!(
+                        "\"{}\" has been changed outside the editor.",
+                        display
+                    )],
+                    vec![
+                        DialogButton {
+                            label: "Reload".to_string(),
+                            action: format!("file_reload:{}", path.display()),
+                            hotkey: 'r',
+                        },
+                        DialogButton {
+                            label: "Keep".to_string(),
+                            action: format!("file_keep:{}", path.display()),
+                            hotkey: 'k',
+                        },
+                    ],
+                );
+            } else {
+                // Auto-reload non-dirty buffers
+                self.reload_file_from_disk(&path);
+            }
+        }
+    }
+
+    /// Reload a buffer's content from disk.
+    fn reload_file_from_disk(&mut self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let bid = self.buffer_manager.list().iter().find_map(|&bid| {
+            let s = self.buffer_manager.get(bid)?;
+            let fp = s.file_path.as_deref()?;
+            if fp.canonicalize().unwrap_or_else(|_| fp.to_path_buf()) == canonical {
+                Some(bid)
+            } else {
+                None
+            }
+        });
+
+        if let Some(bid) = bid {
+            if let Ok(content) = std::fs::read_to_string(&canonical) {
+                if let Some(state) = self.buffer_manager.get_mut(bid) {
+                    state.buffer = Buffer::from_text(bid, &content);
+                    state.dirty = false;
+                    state.update_syntax();
+                }
+                self.refresh_git_diff(bid);
+                let display = canonical
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| canonical.to_string_lossy().to_string());
+                self.message = format!("\"{}\" reloaded", display);
+            }
+        }
+        self.file_watcher_pending.remove(&canonical);
+    }
+
+    /// Handle file watcher dialog responses.
+    pub(crate) fn handle_file_watcher_action(&mut self, action: &str) {
+        if let Some(path_str) = action.strip_prefix("file_reload:") {
+            let path = PathBuf::from(path_str);
+            self.reload_file_from_disk(&path);
+        } else if let Some(path_str) = action.strip_prefix("file_keep:") {
+            let path = PathBuf::from(path_str);
+            let canonical = path.canonicalize().unwrap_or(path);
+            self.file_watcher_pending.remove(&canonical);
+        }
     }
 }
 

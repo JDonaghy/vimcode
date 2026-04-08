@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 7, 2026 (Session 256 — Win-GUI Phase 3: menu bar, terminal, DPI, sidebar clicks, breadcrumbs) | **Tests:** 5313
+**Last updated:** Apr 8, 2026 (Session 257 — Win-GUI Phase 4: custom title bar, native file dialogs, IME, file watching, UI font) | **Tests:** 5313
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 254 are in **SESSION_HISTORY.md**.
@@ -27,6 +27,8 @@ When implementing a new key/command, add tests covering:
 ## Recent Work
 
 > All sessions through 254 archived in **SESSION_HISTORY.md**.
+
+- **Session 257**: Win-GUI Phase 4 — custom frameless title bar (WM_NCCALCSIZE + DwmExtendFrameIntoClientArea + WM_NCHITTEST, min/max/close buttons with hover states, Segoe UI proportional font for menus+tabs matching VSCode), native file dialogs (IFileOpenDialog for Open File/Folder, IFileSaveDialog for Save Workspace As, COM init), IME composition (WM_IME_STARTCOMPOSITION positions candidate window at cursor), cross-platform file watching (notify crate, auto-reload clean buffers, reload/keep dialog for dirty, added to TUI too), dynamic window title, taller title+tab bars with vertical centering. Fixed double RefCell borrow panic in on_mouse_move that silently broke all menu hover code.
 
 - **Session 256**: Win-GUI Phase 3 — menu bar with dropdowns (keyboard+mouse hover switching), terminal panel (D2D cell rendering, PTY input, Ctrl-T toggle), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords), sidebar panel click handling (Git/Extensions/Settings/AI/Search/Debug), scrollbar click-to-jump+drag, breadcrumb bar, tab bar visibility fixes (sidebar+menu offset, breadcrumb height), periodic git refresh, D2D clip for sidebar content. 15 bug fixes during iterative testing.
 

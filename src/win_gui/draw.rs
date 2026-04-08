@@ -68,11 +68,17 @@ pub struct DrawContext<'a> {
     pub rt: &'a ID2D1HwndRenderTarget,
     pub dwrite: &'a IDWriteFactory,
     pub format: &'a IDWriteTextFormat,
+    /// Proportional UI font (Segoe UI) for menus and tab labels.
+    pub ui_format: &'a IDWriteTextFormat,
     pub theme: &'a Theme,
     pub char_width: f32,
     pub line_height: f32,
     /// Left edge of the editor area (sidebar width offset).
     pub editor_left: f32,
+    /// Which caption button (0=min, 1=max, 2=close) is hovered, or None.
+    pub caption_hover: Option<usize>,
+    /// Whether the window is currently maximized (affects the max/restore icon).
+    pub is_maximized: bool,
 }
 
 impl<'a> DrawContext<'a> {
@@ -86,6 +92,9 @@ impl<'a> DrawContext<'a> {
             if let Some(ref menu) = layout.menu_bar {
                 self.draw_menu_bar(menu);
             }
+
+            // Draw caption buttons (min/max/close) over the menu bar row
+            self.draw_caption_buttons();
 
             // Draw tab bar(s)
             if let Some(ref split) = layout.editor_group_split {
@@ -180,24 +189,25 @@ impl<'a> DrawContext<'a> {
     // ─── Tab bar ─────────────────────────────────────────────────────────────
 
     fn draw_tab_bar(&self, layout: &ScreenLayout) {
-        // Tab bar starts below the menu bar when visible
+        // Tab bar starts below the title/menu bar when visible
         let y = if layout.menu_bar.is_some() {
-            self.line_height
+            super::TITLE_BAR_TOP_INSET + self.line_height * super::TITLE_BAR_HEIGHT_MULT
         } else {
             0.0f32
         };
-        let h = self.line_height;
+        let h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let (width, _) = self.rt_size();
         let x = self.editor_left; // start after sidebar
         let tab_bg = self.solid_brush(self.theme.tab_bar_bg);
         unsafe {
             self.rt.FillRectangle(&rect_f(x, y, width - x, h), &tab_bg);
         }
-        self.draw_tabs(&layout.tab_bar, x, y, width - x);
+        let text_y = y + (h - self.line_height) / 2.0; // vertically center text
+        self.draw_tabs(&layout.tab_bar, x, text_y, width - x);
     }
 
     fn draw_group_tab_bar(&self, gtb: &crate::render::GroupTabBar, is_active_group: bool) {
-        let h = self.line_height;
+        let h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let x = gtb.bounds.x as f32;
         let y = gtb.bounds.y as f32 - h; // tab bar sits above the group content
         let w = gtb.bounds.width as f32;
@@ -207,12 +217,14 @@ impl<'a> DrawContext<'a> {
         unsafe {
             self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
         }
-        self.draw_tabs(&gtb.tabs, x, y, w);
+        let text_y = y + (h - self.line_height) / 2.0;
+        self.draw_tabs(&gtb.tabs, x, text_y, w);
     }
 
     fn draw_tabs(&self, tabs: &[crate::render::TabInfo], x_origin: f32, y: f32, _max_width: f32) {
-        let h = self.line_height;
+        let tab_h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let mut x = x_origin;
+        let pad = 12.0; // horizontal padding inside each tab
 
         for tab in tabs {
             let bg = if tab.active {
@@ -226,22 +238,33 @@ impl<'a> DrawContext<'a> {
                 self.theme.line_number_fg
             };
 
-            let tab_w = (tab.name.chars().count() as f32 + 3.0) * self.char_width;
+            let name_w = self.measure_ui_text(&tab.name);
+            let close_w = self.char_width; // close button width
+            let tab_w = pad + name_w + pad + close_w + pad * 0.5;
 
             unsafe {
-                self.rt.FillRectangle(&rect_f(x, y, tab_w, h), &bg);
+                self.rt.FillRectangle(&rect_f(x, y, tab_w, tab_h), &bg);
             }
 
-            // Tab name
-            self.draw_text(&tab.name, x + self.char_width, y, fg_color);
+            // Tab name (UI font, vertically centered)
+            self.draw_ui_text(&tab.name, x + pad, y, tab_h, fg_color);
 
             // Dirty indicator (dot) or close button (x)
-            let close_x = x + tab_w - 2.0 * self.char_width;
+            let close_x = x + tab_w - close_w - pad * 0.5;
             if tab.dirty {
-                // Show a dot for unsaved changes
-                self.draw_text("\u{25CF}", close_x, y, self.theme.git_modified);
+                self.draw_text(
+                    "\u{25CF}",
+                    close_x,
+                    y + (tab_h - self.line_height) / 2.0,
+                    self.theme.git_modified,
+                );
             } else {
-                self.draw_text("\u{00D7}", close_x, y, self.theme.line_number_fg);
+                self.draw_text(
+                    "\u{00D7}",
+                    close_x,
+                    y + (tab_h - self.line_height) / 2.0,
+                    self.theme.line_number_fg,
+                );
             }
 
             // Active tab accent bar (2px at top)
@@ -256,7 +279,7 @@ impl<'a> DrawContext<'a> {
             unsafe {
                 let sep = self.solid_brush(self.theme.separator);
                 self.rt
-                    .FillRectangle(&rect_f(x + tab_w - 1.0, y + 4.0, 1.0, h - 8.0), &sep);
+                    .FillRectangle(&rect_f(x + tab_w - 1.0, y + 4.0, 1.0, tab_h - 8.0), &sep);
             }
 
             x += tab_w;
@@ -2031,33 +2054,41 @@ impl<'a> DrawContext<'a> {
     fn draw_menu_bar(&self, data: &MenuBarData) {
         let (width, _) = self.rt_size();
         let lh = self.line_height;
+        let top = super::TITLE_BAR_TOP_INSET;
+        let bar_h = lh * super::TITLE_BAR_HEIGHT_MULT;
         let cw = self.char_width;
-        let bar_bg = self.solid_brush(self.theme.status_bg);
-        let bar_fg = self.theme.status_fg;
+        // Title/menu bar uses a dark background (like VSCode's title bar),
+        // not the status bar color which can be bright blue.
+        let title_bg = self.theme.tab_bar_bg;
+        let bar_bg = self.solid_brush(title_bg);
+        let bar_fg = self.theme.foreground;
         let dim_fg = self.theme.line_number_fg;
+        // Vertical offset to center text within the taller title bar (below top inset)
+        let text_y = top + (bar_h - lh) / 2.0;
 
-        // Background
+        // Background (fill from top inset)
         unsafe {
-            self.rt.FillRectangle(&rect_f(0.0, 0.0, width, lh), &bar_bg);
+            self.rt
+                .FillRectangle(&rect_f(0.0, top, width, bar_h), &bar_bg);
         }
 
-        // Menu labels
-        let mut x = cw; // left padding
+        // Menu labels (proportional UI font)
+        let pad = 8.0; // horizontal padding around each label
+        let mut x = pad;
         for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
             let is_open = data.open_menu_idx == Some(idx);
-            let label = format!(" {} ", name);
-            let label_w = label.chars().count() as f32 * cw;
+            let label_w = self.measure_ui_text(name) + pad * 2.0;
 
             if is_open {
-                // Highlight background for open menu
-                let hl_brush = self.solid_brush(bar_fg);
+                // Highlight background for open menu (subtle lighter bg)
+                let hl_brush = self.solid_brush(title_bg.lighten(0.15));
                 unsafe {
                     self.rt
-                        .FillRectangle(&rect_f(x, 0.0, label_w, lh), &hl_brush);
+                        .FillRectangle(&rect_f(x, top, label_w, bar_h), &hl_brush);
                 }
-                self.draw_text(&label, x, 0.0, self.theme.status_bg);
+                self.draw_ui_text(name, x + pad, text_y, bar_h, bar_fg);
             } else {
-                self.draw_text(&label, x, 0.0, bar_fg);
+                self.draw_ui_text(name, x + pad, text_y, bar_h, bar_fg);
             }
             x += label_w;
         }
@@ -2078,7 +2109,9 @@ impl<'a> DrawContext<'a> {
         };
         let gap = if box_w > 0.0 { cw } else { 0.0 };
         let total_unit = arrows_w + gap + box_w;
-        let available = width - menu_end;
+        // Reserve space for caption buttons (min/max/close) at the right edge
+        let caption_btns_w = super::CAPTION_BTN_COUNT * super::CAPTION_BTN_WIDTH;
+        let available = width - menu_end - caption_btns_w;
 
         if available >= total_unit + 2.0 * cw {
             let unit_start = menu_end + (available - total_unit) / 2.0;
@@ -2089,22 +2122,76 @@ impl<'a> DrawContext<'a> {
             } else {
                 dim_fg
             };
-            self.draw_text("◀", unit_start, 0.0, back_color);
+            self.draw_text("◀", unit_start, text_y, back_color);
             let fwd_color = if data.nav_forward_enabled {
                 bar_fg
             } else {
                 dim_fg
             };
-            self.draw_text("▶", unit_start + 2.0 * cw, 0.0, fwd_color);
+            self.draw_text("▶", unit_start + 2.0 * cw, text_y, fwd_color);
 
             // Search box
             if !title_display.is_empty() {
                 let bx = unit_start + arrows_w + gap;
-                self.draw_text("[", bx, 0.0, dim_fg);
-                self.draw_text(&title_display, bx + cw, 0.0, bar_fg);
+                self.draw_text("[", bx, text_y, dim_fg);
+                self.draw_text(&title_display, bx + cw, text_y, bar_fg);
                 let end_x = bx + (text_len + 3.0) * cw;
-                self.draw_text("]", end_x, 0.0, dim_fg);
+                self.draw_text("]", end_x, text_y, dim_fg);
             }
+        }
+    }
+
+    /// Draw minimize / maximize / close buttons at the right edge of the title bar row.
+    fn draw_caption_buttons(&self) {
+        let (width, _) = self.rt_size();
+        let lh = self.line_height;
+        let top = super::TITLE_BAR_TOP_INSET;
+        let bar_h = lh * super::TITLE_BAR_HEIGHT_MULT;
+        let btn_w = super::CAPTION_BTN_WIDTH;
+        let btn_count = super::CAPTION_BTN_COUNT as usize;
+        let btn_start = width - btn_w * btn_count as f32;
+
+        let fg = self.theme.foreground;
+
+        for i in 0..btn_count {
+            let x = btn_start + i as f32 * btn_w;
+
+            // Hover highlight
+            if self.caption_hover == Some(i) {
+                let hover_color = if i == 2 {
+                    // Close button: red hover
+                    Color::from_rgb(232, 17, 35)
+                } else {
+                    self.theme.tab_bar_bg.lighten(0.15)
+                };
+                let brush = self.solid_brush(hover_color);
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(x, top, btn_w, bar_h), &brush);
+                }
+            }
+
+            // Button icon (centered in the button rect)
+            let icon_color = if i == 2 && self.caption_hover == Some(2) {
+                Color::from_rgb(255, 255, 255) // white on red for close hover
+            } else {
+                fg
+            };
+            let icon = match i {
+                0 => "\u{2500}", // ─ minimize
+                1 => {
+                    if self.is_maximized {
+                        "\u{25A3}" // ▣ restore
+                    } else {
+                        "\u{25A1}" // □ maximize
+                    }
+                }
+                _ => "\u{2715}", // ✕ close
+            };
+            // Center the icon in the button
+            let icon_w = self.char_width;
+            let ix = x + (btn_w - icon_w) / 2.0;
+            let iy = top + (bar_h - lh) / 2.0;
+            self.draw_text(icon, ix, iy, icon_color);
         }
     }
 
@@ -2118,7 +2205,7 @@ impl<'a> DrawContext<'a> {
 
         let cw = self.char_width;
         let lh = self.line_height;
-        let popup_bg = self.theme.tab_bar_bg;
+        let popup_bg = self.theme.background.lighten(0.10);
         let popup_fg = self.theme.foreground;
         let sep_fg = self.theme.line_number_fg;
 
@@ -2154,7 +2241,7 @@ impl<'a> DrawContext<'a> {
         }
         let (width, _) = self.rt_size();
         let popup_x = label_x.min(width - popup_w);
-        let popup_y = lh; // just below menu bar
+        let popup_y = super::TITLE_BAR_TOP_INSET + lh * super::TITLE_BAR_HEIGHT_MULT; // just below title/menu bar
 
         // Background + border
         let bg_brush = self.solid_brush(popup_bg);
@@ -2229,6 +2316,42 @@ impl<'a> DrawContext<'a> {
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+        }
+    }
+
+    /// Draw text using the proportional UI font (Segoe UI) for menus and tabs.
+    fn draw_ui_text(&self, text: &str, x: f32, y: f32, height: f32, color: Color) {
+        if text.is_empty() {
+            return;
+        }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let brush = self.solid_brush(color);
+        unsafe {
+            self.rt.DrawText(
+                &wide,
+                self.ui_format,
+                &rect_f(x, y, 10000.0, height),
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    /// Measure text width using the UI font.
+    fn measure_ui_text(&self, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let layout: IDWriteTextLayout = self
+                .dwrite
+                .CreateTextLayout(&wide, self.ui_format, 10000.0, 1000.0)
+                .expect("CreateTextLayout");
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut metrics).expect("GetMetrics");
+            metrics.width
         }
     }
 

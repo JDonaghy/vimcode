@@ -2729,6 +2729,14 @@ pub struct Engine {
     /// Inline new-file/folder state for the explorer sidebar.  When `Some`,
     /// a temporary editable row is inserted in the tree under `parent_dir`.
     pub explorer_new_entry: Option<ExplorerNewEntryState>,
+
+    // --- File watching (external modification detection) ---
+    /// Cross-platform file watcher (notify crate). Watches open buffer files for changes.
+    file_watcher: Option<notify::RecommendedWatcher>,
+    /// Receiver for file change events from the watcher.
+    file_watcher_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
+    /// Paths that have been reported as modified but not yet handled (avoids duplicate dialogs).
+    pub file_watcher_pending: HashSet<PathBuf>,
 }
 
 impl Engine {
@@ -3096,7 +3104,12 @@ impl Engine {
             explorer_needs_refresh: false,
             explorer_rename: None,
             explorer_new_entry: None,
+            file_watcher: None,
+            file_watcher_rx: None,
+            file_watcher_pending: HashSet::new(),
         };
+        // Initialize file watcher
+        engine.init_file_watcher();
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
