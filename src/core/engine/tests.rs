@@ -18489,3 +18489,110 @@ fn test_confirm_move_file_different_dir_shows_dialog() {
     assert!(engine.pending_move.is_some());
     assert!(engine.dialog.is_some());
 }
+
+// ── o / O with CRLF and lone-CR line endings ────────────────────────────
+
+#[test]
+fn test_o_with_crlf_line_endings() {
+    // Buffer uses CRLF line endings — `o` must create a new line, not
+    // get absorbed by the \r\n pair.
+    let mut engine = engine_with_text("AB\r\nCD\r\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 1);
+    // A new empty line should exist between AB and CD.
+    assert_eq!(engine.buffer().len_lines(), 3);
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    let line2: String = engine.buffer().content.line(2).chars().collect();
+    assert!(
+        line0.starts_with("AB"),
+        "line0 should start with AB, got: {:?}",
+        line0
+    );
+    assert!(
+        !line1.starts_with("CD"),
+        "line1 should be the new blank line, got: {:?}",
+        line1
+    );
+    assert!(
+        line2.starts_with("CD"),
+        "line2 should start with CD, got: {:?}",
+        line2
+    );
+}
+
+#[test]
+fn test_o_with_lone_cr_line_endings() {
+    // Buffer uses lone \r line endings (classic Mac) — `o` must still
+    // create a new line, not join lines.
+    let mut engine = engine_with_text("AB\rCD\r");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 1);
+    // Should now have 3 lines: AB, (new blank), CD.
+    assert!(
+        engine.buffer().len_lines() >= 3,
+        "expected >= 3 lines, got {}",
+        engine.buffer().len_lines()
+    );
+    let full: String = engine.buffer().content.chars().collect();
+    // The new line must be a separate line — AB and CD must NOT be joined.
+    assert!(
+        !full.contains("ABCD"),
+        "lines should not be joined, got: {:?}",
+        full
+    );
+}
+
+#[test]
+fn test_o_with_crlf_preserves_content() {
+    // Pressing `o` on the first line of a CRLF file should not corrupt
+    // the second line's content.
+    let mut engine = engine_with_text("hello\r\nworld\r\n");
+    engine.view_mut().cursor.line = 0;
+
+    press_char(&mut engine, 'o');
+    press_special(&mut engine, "Escape");
+
+    let text = engine.buffer().to_string();
+    assert!(
+        text.contains("hello") && text.contains("world"),
+        "both lines should be preserved, got: {:?}",
+        text
+    );
+    // There should be exactly 3 non-empty content lines (hello, new, world).
+    let content_lines: Vec<&str> = text.lines().collect();
+    assert!(
+        content_lines.len() >= 3,
+        "expected >= 3 lines, got {}: {:?}",
+        content_lines.len(),
+        content_lines
+    );
+}
+
+#[test]
+fn test_o_with_crlf_indented_yaml() {
+    // Simulate YAML with CRLF — `o` on an indented line should create
+    // a new indented line below, not join with the next line.
+    let mut engine = engine_with_text("steps:\r\n  - script: |\r\n    echo hi\r\n");
+    engine.settings.auto_indent = true;
+    engine.view_mut().cursor.line = 2; // on "    echo hi"
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 3);
+    // The new line should have the same indent as "    echo hi" (4 spaces).
+    assert_eq!(engine.view().cursor.col, 4);
+    assert!(
+        engine.buffer().len_lines() >= 4,
+        "expected >= 4 lines, got {}",
+        engine.buffer().len_lines()
+    );
+}

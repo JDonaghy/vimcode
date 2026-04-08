@@ -14,13 +14,12 @@
 
 - **Terminal panel resize not working via mouse** — Dragging the terminal panel header to resize the panel height does not appear to work. Multiple attempts to click and drag the resize handle fail to change the terminal size.
 
-- **`o` inserts whitespace instead of creating new line (YAML/bash)** — In Azure DevOps Pipeline YAML files with embedded bash scripts, pressing `o` to open a new line sometimes fails to create an empty line below. Instead, it inserts whitespace at the start of the current line's content, joining text from the next line onto the current line with extra spaces.
-
 - **TUI terminal paste still not working** — Ctrl+V in TUI terminal still does not paste clipboard content into the terminal PTY. The previous fix (matching lowercase 'v') may not be reaching the paste handler, or `clipboard_read` may be None/failing.
 
 
 ## Resolved
 
+- **`o` inserts whitespace instead of creating new line (YAML/bash)** — The `o` handler's `insert_pos` calculation only checked for `\n` line endings. For CRLF files (`\r\n`), it inserted between `\r` and `\n`; for lone `\r` files, the new `\n` was absorbed into a CRLF pair, failing to create a new line. Fixed by checking for `\r\n` (skip both) and `\r` alone (insert before it). 4 new tests.
 - **Terminal draws on top of fuzzy finder (TUI + GTK)** — Terminal panel was rendered after the picker popup in both TUI and GTK draw orders, overwriting it. Fixed by moving picker/folder picker/tab switcher/dialog rendering to after the bottom panel in both backends, so popups have higher z-order.
 - **GTK visual select highlights wrong line** — `draw_visual_selection()` used `line_idx - scroll_top` to map buffer lines to view rows, which breaks with wrap, diff padding, or any non-1:1 mapping. Rewrote to iterate over `RenderedLine` entries and use `rl.line_idx` for correct view-row lookup. Also skips diff padding rows (`DiffLine::Padding`) which share `line_idx` with the following real line but occupy a separate view row.
 - **Right-click in terminal shows editor context menu** — Right-click handler fell through to `open_editor_context_menu()` without checking if the click was on the terminal panel. Added terminal bounds check to suppress the context menu on terminal area right-clicks.

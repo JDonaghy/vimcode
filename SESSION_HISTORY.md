@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 260 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 261 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 261 — Fix `o` CRLF/CR line ending bug (5415 tests):**
+
+Bug fix: `o` command failed to create a new line in files with CRLF (`\r\n`) or lone CR (`\r`) line endings. The `insert_pos` calculation in `keys.rs` only checked for `\n`, so for CRLF it inserted between `\r` and `\n` (Ropey re-paired them but created mixed endings), and for lone `\r` the new `\n` was absorbed into a CRLF pair — no new line appeared. Fixed by using `RopeSlice::char()` indexed access to detect `\r\n` (skip 2 chars) and `\r` alone (insert before it). 4 new tests covering CRLF, lone CR, content preservation, and indented YAML scenarios.
 
 ---
 

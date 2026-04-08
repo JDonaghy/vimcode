@@ -879,7 +879,17 @@ impl Engine {
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
                 let line_content = self.buffer().content.line(line);
                 let insert_pos = if self.buffer().line_len_chars(line) > 0 {
-                    if line_content.chars().last() == Some('\n') {
+                    let len = line_content.len_chars();
+                    let last = line_content.char(len - 1);
+                    if last == '\n' {
+                        // Check for \r\n (CRLF) — skip both chars
+                        if len >= 2 && line_content.char(len - 2) == '\r' {
+                            line_end - 2
+                        } else {
+                            line_end - 1
+                        }
+                    } else if last == '\r' {
+                        // Lone \r line ending — insert before it
                         line_end - 1
                     } else {
                         line_end
