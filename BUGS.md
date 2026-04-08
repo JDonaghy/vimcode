@@ -4,6 +4,14 @@
 
 - **GTK terminal panel toggle requires two clicks** — The `[P]` layout toggle button in the GTK status bar requires two clicks to show the terminal panel on the first use. Subsequent toggles work with a single click. Likely a timing issue between the `EngineAction::OpenTerminal` dispatch and the GTK layout recomputation.
 
+- **Win-GUI: scrollbar not visible** — Scrollbar hit-testing and drag handling exist (`scrollbar_hit()`, `scrollbar_drag` state) and `SCROLLBAR_WIDTH` reserves space, but there is no drawing code to paint the scrollbar thumb/track. Clicks on the scrollbar area do work invisibly.
+
+- **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
+
+- **Win-GUI: opening a file replaces current buffer** — Selecting a file from the explorer replaces the current tab's contents instead of opening in a new tab. All file opens use `OpenMode::Permanent` but may be reusing the existing window rather than creating a new tab.
+
+- **Win-GUI: no preview mode** — Preview/transient tab mode (italic filename, replaced on next file open) is not implemented. All opens are permanent.
+
 
 ## Resolved
 

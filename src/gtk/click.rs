@@ -1,31 +1,8 @@
 use super::*;
-use crate::render::{view_row_to_buf_line, view_row_to_buf_pos_wrap};
+use crate::render::{self as render_mod, view_row_to_buf_line, view_row_to_buf_pos_wrap};
 
-/// Result of converting pixel coordinates to buffer position.
-pub(super) enum ClickTarget {
-    /// Click was in the tab bar, tab already switched.
-    TabBar,
-    /// Click was in gutter — fold already toggled.
-    Gutter,
-    /// Click resolved to a buffer position in a specific window.
-    BufferPos(core::WindowId, usize, usize),
-    /// Click was on a tab-bar split button: (group_id, direction).
-    SplitButton(core::window::GroupId, crate::core::window::SplitDirection),
-    /// Click was on a tab's × close button: (group_id, tab_idx).
-    CloseTab(core::window::GroupId, usize),
-    /// Click was on a diff toolbar prev-change button.
-    DiffToolbarPrev,
-    /// Click was on a diff toolbar next-change button.
-    DiffToolbarNext,
-    /// Click was on a diff toolbar toggle-fold button.
-    DiffToolbarToggleFold,
-    /// Click was on a per-window status bar segment with an action.
-    StatusBarAction(crate::core::engine::StatusAction),
-    /// Click was on the editor action menu button ("…").
-    ActionMenuButton(core::window::GroupId),
-    /// Click was outside any actionable area.
-    None,
-}
+/// Re-export the shared ClickTarget enum.
+pub(super) use render_mod::ClickTarget;
 
 /// Convert pixel (x, y) to a buffer position (window_id, line, col).
 /// Also handles tab-bar clicks and gutter fold toggles.
@@ -44,41 +21,22 @@ pub(super) fn pixel_to_click_target(
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
 ) -> ClickTarget {
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
+    let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
 
     // Check if click is in a group's tab bar region.
     // Use the group layout tree to find group bounds (must match draw_editor layout).
     {
-        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-            0.0
-        } else {
-            line_height
-        };
-        let per_window_status = engine.settings.window_status_line;
-        let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
-        let status_bar_height = line_height * global_status_rows + wildmenu_px;
-        let qf_px = if engine.quickfix_open {
-            let n = engine.quickfix_items.len().clamp(1, 10) as f64;
-            (n + 1.0) * line_height
-        } else {
-            0.0
-        };
-        let term_px = if engine.terminal_open || engine.bottom_panel_open {
-            (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
-        } else {
-            0.0
-        };
-        let debug_toolbar_px = if engine.debug_toolbar_visible {
-            line_height
-        } else {
-            0.0
-        };
-        let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+        let editor_bottom = render_mod::editor_bottom_px(
+            height,
+            line_height,
+            engine.settings.window_status_line,
+            !engine.wildmenu_items.is_empty(),
+            engine.quickfix_open,
+            engine.quickfix_items.len(),
+            engine.terminal_open || engine.bottom_panel_open,
+            engine.session.terminal_panel_rows as usize,
+            engine.debug_toolbar_visible,
+        );
         let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
         let mut group_rects = engine
             .group_layout

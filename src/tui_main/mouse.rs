@@ -2495,8 +2495,13 @@ pub(super) fn handle_mouse(
                         total: rw.total_lines,
                     });
                     let track_rel_row = editor_row.saturating_sub(wy);
-                    let ratio = track_rel_row as f64 / track_len as f64;
-                    let new_top = (ratio * rw.total_lines as f64) as usize;
+                    let viewport_lines = track_len as usize;
+                    let new_top = crate::render::scrollbar_click_to_scroll_top(
+                        track_rel_row as f64,
+                        track_len as f64,
+                        rw.total_lines,
+                        viewport_lines,
+                    );
                     engine.set_scroll_top_for_window(rw.window_id, new_top);
                     engine.sync_scroll_binds();
                     return sidebar_width;

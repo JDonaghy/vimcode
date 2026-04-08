@@ -1621,9 +1621,12 @@ fn scrollbar_hit(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize)
             }
 
             let rel_y = (py - ry).clamp(0.0, editor_h);
-            let ratio = rel_y / editor_h;
-            let max_scroll = total_lines.saturating_sub(viewport_lines);
-            let new_top = ((ratio * max_scroll as f32) as usize).min(max_scroll);
+            let new_top = crate::render::scrollbar_click_to_scroll_top(
+                rel_y as f64,
+                editor_h as f64,
+                total_lines,
+                viewport_lines,
+            );
             return Some((cwr.window_id, new_top));
         }
     }

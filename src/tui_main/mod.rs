@@ -95,30 +95,20 @@ use crate::render::{
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
-    let Some((ctrl, shift, alt, key_name)) =
-        crate::core::settings::parse_key_binding_named(binding)
-    else {
-        return false;
+    let key_char = match code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
     };
-    if ctrl != mods.contains(KeyModifiers::CONTROL) {
-        return false;
-    }
-    if shift != mods.contains(KeyModifiers::SHIFT) {
-        return false;
-    }
-    if alt != mods.contains(KeyModifiers::ALT) {
-        return false;
-    }
-    match key_name.as_str() {
-        "Tab" | "tab" => matches!(code, KeyCode::Tab),
-        "Space" | "space" => matches!(code, KeyCode::Char(' ')),
-        "Escape" | "Esc" => matches!(code, KeyCode::Esc),
-        s if s.chars().count() == 1 => {
-            let ch = s.chars().next().unwrap().to_ascii_lowercase();
-            matches!(code, KeyCode::Char(c) if c.to_ascii_lowercase() == ch)
-        }
-        _ => false,
-    }
+    crate::render::matches_key_binding(
+        binding,
+        mods.contains(KeyModifiers::CONTROL),
+        mods.contains(KeyModifiers::SHIFT),
+        mods.contains(KeyModifiers::ALT),
+        key_char,
+        matches!(code, KeyCode::Tab),
+        matches!(code, KeyCode::Char(' ')),
+        matches!(code, KeyCode::Esc),
+    )
 }
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
