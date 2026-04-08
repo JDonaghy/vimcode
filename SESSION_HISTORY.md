@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 257 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 258 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 258 — Multi-backend shared hit-testing & key-binding extraction (5320 tests):**
+
+Merged `windows` branch into `develop`. Extracted shared hit-testing and key-binding code from GTK/TUI/Win-GUI backends into platform-agnostic `render.rs`. Moved `ClickTarget` enum from `gtk/click.rs` to `render.rs` (now `pub`). Added 8 shared geometry/hit-testing helper functions: `tab_row_height_px()`, `tab_bar_height_px()`, `status_bar_height_px()`, `editor_bottom_px()` (layout dimensions), `scrollbar_click_to_scroll_top()` (ratio-based scroll), `display_col_to_buffer_col()` (tab-aware column mapping), `is_tab_close_click()` (close button zone), `matches_key_binding()` (Vim-style key notation matcher). GTK: `pixel_to_click_target()` uses `tab_bar_height_px()` + `editor_bottom_px()` instead of inline math; `matches_gtk_key()` extracts GDK modifiers and delegates to `matches_key_binding()`. TUI: `matches_tui_key()` extracts crossterm modifiers and delegates; scrollbar click uses `scrollbar_click_to_scroll_top()`. Win-GUI: `scrollbar_hit()` uses shared scrollbar helper. All functions are pure (no platform deps), take basic types (f64, usize, bool, &str). 7 comprehensive tests. Filed 4 pre-existing win-gui bugs: scrollbar not drawn (hit area exists but no paint code), tab bar clicks not working, file open replaces buffer instead of new tab, no preview mode. Files changed: `render.rs` (+352), `gtk/click.rs` (-52), `gtk/util.rs` (-17), `tui_main/mod.rs` (-17), `tui_main/mouse.rs` (-4), `win_gui/mod.rs` (-4), `BUGS.md` (+8).
 
 ---
 

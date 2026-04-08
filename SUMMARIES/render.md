@@ -1,4 +1,4 @@
-# src/render.rs — 7,384 lines
+# src/render.rs — 7,815 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -42,6 +42,9 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `DiffPeekPopup` — inline diff hunk popup
 - `DiffToolbarData` — diff view toolbar
 
+## Key Types — Shared Hit-Testing & Geometry
+- `ClickTarget` — semantic editor click target enum (TabBar, Gutter, BufferPos, SplitButton, CloseTab, StatusBarAction, etc.) — moved from gtk/click.rs for multi-backend sharing
+
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)
 - `format_button_label(label, hotkey)` — dialog button label formatter
@@ -50,6 +53,16 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `Theme::from_vscode_json(path)` — import VSCode JSON theme
 - `Theme::scope_color(scope)` — tree-sitter scope to color mapping
 - `Theme::semantic_token_style(type, modifiers)` — semantic token styling
+
+## Shared Geometry Helpers (multi-backend)
+- `tab_row_height_px(line_height)` — tab row height as ceil(line_height * 1.6)
+- `tab_bar_height_px(line_height, breadcrumbs)` — tab bar + optional breadcrumb row
+- `status_bar_height_px(line_height, per_window_status, has_wildmenu)` — global status bar height
+- `editor_bottom_px(total_height, ...)` — Y coordinate where editor area ends (accounts for all chrome)
+- `scrollbar_click_to_scroll_top(click_pos, track_len, total_lines, viewport_lines)` — maps scrollbar click to scroll position
+- `display_col_to_buffer_col(line_text, x_offset, tabstop, scroll_left)` — tab-aware column conversion
+- `is_tab_close_click(col_in_tab, tab_width, close_cols)` — detects close button zone in tab
+- `matches_key_binding(binding, ctrl, shift, alt, key_char, ...)` — backend-agnostic Vim key notation matcher
 
 ## Constants
 - `MENU_STRUCTURE` — 7-menu application menu definition

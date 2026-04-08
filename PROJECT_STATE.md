@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 257 — Win-GUI Phase 4: custom title bar, native file dialogs, IME, file watching, UI font) | **Tests:** 5313
+**Last updated:** Apr 8, 2026 (Session 258 — Multi-backend shared hit-testing & key-binding extraction) | **Tests:** 5320
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 254 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,6 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 257 archived in **SESSION_HISTORY.md**.
+> All sessions through 258 archived in **SESSION_HISTORY.md**.
 
-- **Session 257**: Win-GUI Phase 4 — custom frameless title bar (WM_NCCALCSIZE + DwmExtendFrameIntoClientArea + WM_NCHITTEST, min/max/close buttons with hover states, Segoe UI proportional font for menus+tabs matching VSCode), native file dialogs (IFileOpenDialog for Open File/Folder, IFileSaveDialog for Save Workspace As, COM init), IME composition (WM_IME_STARTCOMPOSITION positions candidate window at cursor), cross-platform file watching (notify crate, auto-reload clean buffers, reload/keep dialog for dirty, added to TUI too), dynamic window title, taller title+tab bars with vertical centering. Fixed double RefCell borrow panic in on_mouse_move that silently broke all menu hover code.
+- **Session 258**: Multi-backend code sharing — extracted shared hit-testing geometry, key-binding matching, and scrollbar helpers from GTK/TUI/Win-GUI backends into `render.rs`. Moved `ClickTarget` enum to render.rs (public). Added 8 shared helper functions: `tab_row_height_px`, `tab_bar_height_px`, `status_bar_height_px`, `editor_bottom_px`, `scrollbar_click_to_scroll_top`, `display_col_to_buffer_col`, `is_tab_close_click`, `matches_key_binding`. GTK `pixel_to_click_target()` and `matches_gtk_key()`, TUI `matches_tui_key()` and scrollbar click, Win-GUI `scrollbar_hit()` all delegate to shared functions. 7 new tests. Filed 4 pre-existing win-gui bugs (scrollbar not drawn, tab clicks, file open behavior, no preview mode).
