@@ -27,8 +27,7 @@
 ## Recently Completed
 - **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.
 - **Session 258**: Multi-backend code sharing — `ClickTarget` enum + 8 shared geometry/key-binding helpers extracted to `render.rs`; GTK, TUI, Win-GUI backends delegate to shared functions; 7 new tests; 4 win-gui bugs filed.
-- **Session 257**: Win-GUI Phase 4 — custom frameless title bar, native file dialogs, IME, file watching, Segoe UI font, dynamic title, RefCell borrow fix.
-> Sessions 256 and earlier in **SESSION_HISTORY.md**.
+> Sessions 258 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] Picker preview stale chars when cycling files — explicit per-row clear + tab sanitization

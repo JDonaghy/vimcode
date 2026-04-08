@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 258 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 259 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 259 — README revamp (5391 tests):**
+
+Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha software" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
 
 ---
 

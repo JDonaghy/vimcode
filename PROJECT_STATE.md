@@ -26,6 +26,6 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 258 archived in **SESSION_HISTORY.md**.
+> All sessions through 259 archived in **SESSION_HISTORY.md**.
 
-- **Session 258**: Multi-backend code sharing — extracted shared hit-testing geometry, key-binding matching, and scrollbar helpers from GTK/TUI/Win-GUI backends into `render.rs`. Moved `ClickTarget` enum to render.rs (public). Added 8 shared helper functions: `tab_row_height_px`, `tab_bar_height_px`, `status_bar_height_px`, `editor_bottom_px`, `scrollbar_click_to_scroll_top`, `display_col_to_buffer_col`, `is_tab_close_click`, `matches_key_binding`. GTK `pixel_to_click_target()` and `matches_gtk_key()`, TUI `matches_tui_key()` and scrollbar click, Win-GUI `scrollbar_hit()` all delegate to shared functions. 7 new tests. Filed 4 pre-existing win-gui bugs (scrollbar not drawn, tab clicks, file open behavior, no preview mode).
+- **Session 259**: README revamp — updated intro/status (beta label + disclaimer), Platforms table, Windows download/build instructions, Architecture with win_gui/ + all current line counts (~128K total), Tech Stack with windows-rs/D2D/DWrite/notify, Extensions panel mentions, vimcode.org reference, removed duplicate commands, updated Acknowledgements.
