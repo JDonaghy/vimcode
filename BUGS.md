@@ -3,13 +3,22 @@
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
 
-- **Win-GUI: scrollbar not visible** — Scrollbar hit-testing and drag handling exist (`scrollbar_hit()`, `scrollbar_drag` state) and `SCROLLBAR_WIDTH` reserves space, but there is no drawing code to paint the scrollbar thumb/track. Clicks on the scrollbar area do work invisibly.
+### Win-GUI gaps (vs TUI reference)
 
+**Critical:**
+- **Win-GUI: opening a file replaces current buffer** — All file opens hardcode `OpenMode::Permanent` (mod.rs lines 327, 1225, 1445, 1861). Single-click should use `OpenMode::Preview` for transient tabs; double-click or explicit open should use `Permanent`.
+- **Win-GUI: no preview tab mode** — `tab.preview` field is never checked in draw.rs (lines 231-294). Preview tabs appear identical to permanent tabs — no italic styling, no distinct color. Engine's preview logic works but Win-GUI never creates preview tabs and never renders them differently.
+- **Win-GUI: status bar not clickable** — Status segments are rendered (draw.rs lines 494-522) but there is no click handler or hit-test. TUI has `status_segment_hit_test()` mapping clicks to `StatusAction` (mode switch, branch picker, go-to-line, etc.). Win-GUI status bar is display-only.
+- **Win-GUI: missing explorer/tab context menus** — Right-click only calls `open_editor_context_menu()` (mod.rs line 2245). No calls to `open_explorer_context_menu()` or `open_tab_context_menu()`. Right-clicking files in the explorer or tabs on the tab bar does nothing.
+
+**Medium:**
 - **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
+- **Win-GUI: no terminal resize drag** — Terminal can be toggled (Ctrl+T) and rendered, but cannot be resized by dragging the panel header. No drag handler exists for terminal height.
+- **Win-GUI: no tab drag-and-drop** — No `tab_drag_*` state or handlers. Tabs cannot be reordered or moved between groups by dragging. TUI has full tab drag with visual drop indicators.
+- **Win-GUI: no terminal split** — TUI supports horizontal terminal split (two PTY panes side-by-side). Win-GUI has no terminal split button or drag handler.
 
-- **Win-GUI: opening a file replaces current buffer** — Selecting a file from the explorer replaces the current tab's contents instead of opening in a new tab. All file opens use `OpenMode::Permanent` but may be reusing the existing window rather than creating a new tab.
-
-- **Win-GUI: no preview mode** — Preview/transient tab mode (italic filename, replaced on next file open) is not implemented. All opens are permanent.
+**Low / Possibly stale:**
+- **Win-GUI: scrollbar rendering** — Investigation found that draw.rs lines 462-492 DO draw track and thumb with Direct2D brushes. If the scrollbar is still invisible, it may be a color/contrast issue rather than missing code.
 
 
 
