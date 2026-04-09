@@ -840,7 +840,20 @@ fn on_paint(hwnd: HWND) {
         } else {
             lh * TAB_BAR_HEIGHT_MULT as f64
         };
-        let bottom_chrome = 2.0 * lh + terminal_height; // status + command line + terminal
+        let status_above_terminal = state.engine.settings.window_status_line
+            && state.engine.settings.status_line_above_terminal
+            && state.engine.terminal_open;
+        let above_terminal_px = if status_above_terminal {
+            2.0 * lh // separated status + cmd (above terminal)
+        } else {
+            0.0
+        };
+        let below_terminal_px = if status_above_terminal {
+            0.0 // nothing below terminal
+        } else {
+            2.0 * lh // status + cmd (below terminal)
+        };
+        let bottom_chrome = below_terminal_px + terminal_height + above_terminal_px;
         let editor_bottom = height - bottom_chrome;
 
         // Use engine's group-aware rect calculation (handles splits)

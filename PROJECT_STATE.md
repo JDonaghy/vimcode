@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 262 — 7 bug fixes across terminal, mouse, GTK, CI) | **Tests:** 5415
+**Last updated:** Apr 8, 2026 (Session 263 — status line positioning + Windows alpha note) | **Tests:** 5422
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 262 archived in **SESSION_HISTORY.md**.
+> All sessions through 263 archived in **SESSION_HISTORY.md**.

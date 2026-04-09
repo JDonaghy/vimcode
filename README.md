@@ -18,7 +18,7 @@ Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own AP
 |----------|-----|-----|
 | **Linux** | GTK4 + Cairo + Pango | ratatui + crossterm |
 | **macOS** | GTK4 via Homebrew | ratatui + crossterm |
-| **Windows** | Native Win32 + Direct2D + DirectWrite | ratatui + crossterm |
+| **Windows** | Native Win32 + Direct2D + DirectWrite (**alpha**) | ratatui + crossterm |
 
 ### Status — Beta
 
@@ -94,6 +94,8 @@ brew install vcd        # TUI only (no GTK4 dependency)
 ```
 
 ### Windows
+
+> **Note:** The native Windows GUI is in **alpha** — several features (scrollbars, tab clicks, preview tabs) are not yet implemented. The TUI build is recommended for Windows users until the native GUI matures. See [Known Bugs](BUGS.md) for details.
 
 **Option A — Native GUI** (`vimcode-win.exe`)
 Download `vimcode-win-x86_64.exe` from the release page. No dependencies required — Direct2D and DirectWrite are built into Windows.
@@ -715,6 +717,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
 | `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
 | `windowstatusline` / `nowindowstatusline` | `wsl` | on | Per-window status line instead of single global bar (includes layout toggle icons) |
+| `statuslineaboveterminal` / `nostatuslineaboveterminal` | `slat` | on | Show active window's status line above the terminal panel instead of inside each window |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |
 | `textwidth=N` | `tw` | 0 | Auto-wrap inserted text at column N (0=off) |
 | `wrap` / `nowrap` | | off | Soft-wrap long lines at viewport edge |

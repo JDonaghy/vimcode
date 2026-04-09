@@ -28,14 +28,18 @@ pub(super) fn build_screen_for_tui(
     };
     let per_window_status = engine.settings.window_status_line;
     let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
     let content_rows = area.height.saturating_sub(
         1 + global_status_rows
             + qf_height
             + term_height
             + menu_height
             + dbg_height
-            + wildmenu_height,
-    ); // cmd(1) + optional status(1) + panels
+            + wildmenu_height
+            + separated_status_rows,
+    ); // cmd(1) + optional status(1) + panels + separated status
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -154,25 +158,33 @@ pub(super) fn draw_frame(
     let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
     let per_window_status = engine.settings.window_status_line;
     let global_status_height: u16 = if per_window_status { 0 } else { 1 };
+    let has_separated = screen.separated_status_line.is_some();
+    let separated_status_height: u16 = if has_separated { 1 } else { 0 };
+
+    // Layout: [editor][qf][terminal][debug][sep_status?][wildmenu][global_status][cmd]
+    // When noslat + terminal open, sep_status(1) shows between debug and wildmenu.
+    // When slat (default) or no terminal, sep_status is 0 and per-window bars are inside windows.
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),
-            Constraint::Length(qf_height),
-            Constraint::Length(bottom_panel_height),
-            Constraint::Length(debug_toolbar_height),
-            Constraint::Length(wildmenu_height),
-            Constraint::Length(global_status_height),
-            Constraint::Length(1),
+            Constraint::Min(0),                          // 0: editor
+            Constraint::Length(qf_height),               // 1: quickfix
+            Constraint::Length(bottom_panel_height),     // 2: terminal
+            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
+            Constraint::Length(separated_status_height), // 4: separated status (0 or 1)
+            Constraint::Length(wildmenu_height),         // 5: wildmenu
+            Constraint::Length(global_status_height),    // 6: global status
+            Constraint::Length(1),                       // 7: cmd
         ])
         .split(right_col);
     let editor_col = v_chunks[0];
     let quickfix_area = v_chunks[1];
     let bottom_panel_area = v_chunks[2];
     let debug_toolbar_area = v_chunks[3];
-    let wildmenu_area = v_chunks[4];
-    let status_area = v_chunks[5];
-    let cmd_area = v_chunks[6];
+    let separated_status_area = v_chunks[4];
+    let wildmenu_area = v_chunks[5];
+    let status_area = v_chunks[6];
+    let cmd_area = v_chunks[7];
 
     // The editor column includes the tab bar row(s).  Window rects from
     // calculate_group_window_rects already have y >= 1 (tab_bar_height offset),
@@ -508,6 +520,18 @@ pub(super) fn draw_frame(
             quickfix_area,
             qf,
             quickfix_scroll_top,
+            theme,
+        );
+    }
+
+    // ── Separated status line (above terminal, when status_line_above_terminal is active) ──
+    if let Some(ref status) = screen.separated_status_line {
+        render_window_status_line(
+            frame.buffer_mut(),
+            separated_status_area.x,
+            separated_status_area.y,
+            separated_status_area.width,
+            status,
             theme,
         );
     }

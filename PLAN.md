@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 263**: Status line + command line positioning — `status_line_above_terminal` setting (default true); `slat` ON: per-window status bars inside each split as before (naturally above terminal); `noslat`: single status bar for active file + command line move below terminal as a pair; all 3 backends (GTK, TUI, Win-GUI); click detection on separated status segments. Also: README Windows alpha note.
 - **Session 262**: 7 bug fixes — TUI terminal paste (register fallback + bracketed paste + poll_terminal); GTK terminal Ctrl+C/Ctrl+Shift+C (key-to-pty fallback + copy handler); TUI terminal selection offset (relative columns + dynamic bottom_chrome); editor drag leak into terminal; CI coverage `--all-features` → `--features gui`.
 - **Session 261**: Fix `o` command with CRLF/CR line endings — `insert_pos` calculation now handles `\r\n` (skip both chars) and lone `\r` (insert before it) so new lines aren't absorbed into CRLF pairs. 4 new tests.
 - **Session 260**: 12 bug fixes — `%` viewport centering; TUI tab underline filename-only; preview tab click-to-permanent; explorer micro-drag same-dest guard; GTK tab bar proportional font width; terminal click overlap; live grep preview scroll; terminal Ctrl+V paste; picker z-order over terminal (TUI+GTK); GTK visual select highlight; terminal right-click suppression. 5 new tests.
@@ -149,7 +150,7 @@
 - [x] **Terminal: button bar (Add / Close)** — `+` creates a new tab; `×`/`󰅖` closes the active tab; click detection in both GTK and TUI backends
 - [x] **Terminal: horizontal split view** — `⊞`/`󰤼` toolbar button toggles two panes side-by-side; independent PTY sessions; mouse click or Ctrl-W switches active pane; `│` divider
 - [x] **Debugger (DAP)** — Transport + adapter registry + `:DapInstall` (S83); poll loop + breakpoint gutter + stopped-line highlight (S84); variables/call-stack/output panel (S85-86); VSCode-like UI with launch.json (S88); codelldb compat (S89); interactive sidebar + conditional breakpoints (S90)
-- [ ] **Status line above terminal pane** — `status_line_above_terminal` setting (default `true`). When enabled, the per-window status line renders above the terminal panel rather than below the editor content, so it stays visible and is not pushed off-screen or obscured by the terminal. Both GTK and TUI backends.
+- [x] **Status line + command line above terminal pane** — `status_line_above_terminal` setting (default `true`). When enabled and the terminal panel is open, the active window's status line and the command line (`:`, `/`, `?`) render as dedicated rows above the terminal panel. When disabled, status and command line sit below the terminal at the screen bottom. The command line always sits directly below the status line. GTK, TUI, and Win-GUI backends.
 - [ ] **Terminal maximize (full editor coverage)** — Toggle the terminal panel to cover the entire editor area (like VSCode's "Maximize Panel Size" / `Ctrl+`\` behavior). When maximized, the terminal fills the space normally occupied by editor panes; sidebar remains visible. A second toggle restores the previous layout. Keyboard shortcut + toolbar button. Both GTK and TUI backends.
 
 ### Editor Groups

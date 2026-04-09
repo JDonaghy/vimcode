@@ -26,17 +26,7 @@ pub(super) fn pixel_to_click_target(
     // Check if click is in a group's tab bar region.
     // Use the group layout tree to find group bounds (must match draw_editor layout).
     {
-        let editor_bottom = render_mod::editor_bottom_px(
-            height,
-            line_height,
-            engine.settings.window_status_line,
-            !engine.wildmenu_items.is_empty(),
-            engine.quickfix_open,
-            engine.quickfix_items.len(),
-            engine.terminal_open || engine.bottom_panel_open,
-            engine.session.terminal_panel_rows as usize,
-            engine.debug_toolbar_visible,
-        );
+        let editor_bottom = gtk_editor_bottom(engine, width, height, line_height);
         let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
         let mut group_rects = engine
             .group_layout
@@ -140,34 +130,7 @@ pub(super) fn pixel_to_click_target(
         }
     }
 
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let global_status_rows = if engine.settings.window_status_line {
-        1.0
-    } else {
-        2.0
-    };
-    let status_bar_height = line_height * global_status_rows + wildmenu_px;
-    let qf_px2 = if engine.quickfix_open {
-        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
-        (n + 1.0) * line_height
-    } else {
-        0.0
-    };
-    let term_px2 = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
-    let dbg_px2 = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let editor_bottom = height - status_bar_height - dbg_px2 - qf_px2 - term_px2;
+    let editor_bottom = gtk_editor_bottom(engine, width, height, line_height);
 
     if y >= editor_bottom {
         return ClickTarget::None;
@@ -462,29 +425,7 @@ pub(super) fn compute_tab_drop_zone(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let qf_px = if engine.quickfix_open {
-        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
-        (n + 1.0) * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
+    let editor_bottom = gtk_editor_bottom(engine, width, height, line_height);
     let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
     let mut group_rects = engine
         .group_layout

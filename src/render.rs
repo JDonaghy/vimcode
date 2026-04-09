@@ -1707,6 +1707,11 @@ pub struct ScreenLayout {
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
     pub tab_scroll_offset: usize,
+    /// When `status_line_above_terminal` is active AND the terminal panel is open,
+    /// this carries the active window's status line to render as a dedicated row
+    /// above the terminal panel. When `Some`, per-window `status_line` fields on
+    /// individual `RenderedWindow`s are `None`.
+    pub separated_status_line: Option<WindowStatusLine>,
 }
 
 /// Context menu data for TUI rendering.
@@ -3433,12 +3438,19 @@ pub fn build_screen_layout(
     let tab_bar = build_tab_bar(engine);
 
     let per_window_status = engine.settings.window_status_line;
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    // When status_line_above_terminal is OFF and the terminal is open, extract the
+    // active window's status into a separated bar rendered below the terminal.
+    // When the setting is ON (default), per-window status bars stay inside each
+    // window — they're naturally above the terminal by being part of the editor area.
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
 
     let windows = window_rects
         .iter()
         .map(|(window_id, rect)| {
             let mut visible_lines = (rect.height / line_height).floor() as usize;
-            if per_window_status && visible_lines > 1 {
+            if per_window_status && !separate_status && visible_lines > 1 {
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
@@ -3453,7 +3465,7 @@ pub fn build_screen_layout(
                 multi_window,
                 color_headings,
             );
-            if per_window_status {
+            if per_window_status && !separate_status {
                 rw.status_line = Some(build_window_status_line(
                     engine, theme, *window_id, is_active,
                 ));
@@ -3461,6 +3473,17 @@ pub fn build_screen_layout(
             rw
         })
         .collect();
+
+    let separated_status_line = if separate_status {
+        Some(build_window_status_line(
+            engine,
+            theme,
+            active_window_id,
+            true,
+        ))
+    } else {
+        None
+    };
 
     let (status_left, status_right, status_branch_range) = if per_window_status {
         (String::new(), String::new(), None)
@@ -4134,6 +4157,7 @@ pub fn build_screen_layout(
             .get(&engine.active_group)
             .map(|g| g.tab_scroll_offset)
             .unwrap_or(0),
+        separated_status_line,
     }
 }
 
@@ -7079,6 +7103,15 @@ pub fn debug_toolbar_height_px(line_height: f64, visible: bool) -> f64 {
     }
 }
 
+/// Compute the height of the separated status line row (0 if not active).
+pub fn separated_status_height_px(line_height: f64, has_separated: bool) -> f64 {
+    if has_separated {
+        line_height
+    } else {
+        0.0
+    }
+}
+
 /// Compute the Y coordinate of the editor bottom edge (below which status/terminal/etc live).
 #[allow(clippy::too_many_arguments)]
 pub fn editor_bottom_px(
@@ -7091,12 +7124,14 @@ pub fn editor_bottom_px(
     panel_open: bool,
     panel_rows: usize,
     debug_toolbar_visible: bool,
+    has_separated_status: bool,
 ) -> f64 {
     total_height
         - status_bar_height_px(line_height, per_window_status_line, has_wildmenu)
         - quickfix_height_px(line_height, quickfix_open, quickfix_item_count)
         - terminal_panel_height_px(line_height, panel_open, panel_rows)
         - debug_toolbar_height_px(line_height, debug_toolbar_visible)
+        - separated_status_height_px(line_height, has_separated_status)
 }
 
 /// Compute the scrollbar-to-scroll-top mapping from a click position.
@@ -7701,8 +7736,25 @@ mod tests {
     fn test_editor_bottom_px() {
         let lh = 20.0;
         let total = 800.0;
-        let eb = editor_bottom_px(total, lh, true, false, false, 0, false, 0, false);
+        let eb = editor_bottom_px(total, lh, true, false, false, 0, false, 0, false, false);
         assert_eq!(eb, total - lh); // only status bar (1 row)
+    }
+
+    #[test]
+    fn test_editor_bottom_px_with_separated_status() {
+        let lh = 20.0;
+        let total = 800.0;
+        // With separated status, editor bottom is 1 extra row lower
+        let without = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, false);
+        let with = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, true);
+        assert_eq!(without - with, lh);
+    }
+
+    #[test]
+    fn test_separated_status_height_px() {
+        let lh = 18.0;
+        assert_eq!(separated_status_height_px(lh, true), lh);
+        assert_eq!(separated_status_height_px(lh, false), 0.0);
     }
 
     #[test]

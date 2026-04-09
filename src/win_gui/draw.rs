@@ -118,10 +118,12 @@ impl<'a> DrawContext<'a> {
                 self.draw_editor_window(rw);
             }
 
-            // Draw status bar
-            self.draw_status_bar(layout);
+            // Draw status bar (only when not separated above terminal)
+            if layout.separated_status_line.is_none() {
+                self.draw_status_bar(layout);
+            }
 
-            // Draw command line
+            // Draw command line (position depends on whether status is above terminal)
             self.draw_command_line(layout);
 
             // Draw cursors on all windows (active gets block/bar, inactive gets thin line)
@@ -155,6 +157,11 @@ impl<'a> DrawContext<'a> {
             // Draw quickfix panel
             if let Some(ref qf) = layout.quickfix {
                 self.draw_quickfix(qf, layout);
+            }
+
+            // Draw separated status line (above terminal)
+            if let Some(ref status) = layout.separated_status_line {
+                self.draw_separated_status_line(status, layout);
             }
 
             // Draw terminal panel
@@ -656,12 +663,70 @@ impl<'a> DrawContext<'a> {
         );
     }
 
+    // ─── Separated status line (above terminal) ────────────────────────────
+
+    fn draw_separated_status_line(
+        &self,
+        status: &crate::render::WindowStatusLine,
+        _layout: &ScreenLayout,
+    ) {
+        let (width, height) = self.rt_size();
+        let x0 = self.editor_left;
+        // The separated status sits just above the terminal panel.
+        // Layout: editor | sep_status | terminal | status_bar | cmd_line
+        // The terminal panel content row count tells us how much space it uses.
+        let terminal_px = _layout
+            .bottom_tabs
+            .terminal
+            .as_ref()
+            .map(|t| (t.content_rows as f32 + 2.0) * self.line_height)
+            .unwrap_or(0.0);
+        // Layout when above: [editor][sep_status][cmd][terminal]
+        // sep_y = height - terminal - cmd - sep_status
+        let sep_y = height - terminal_px - 2.0 * self.line_height;
+        let bar_width = width - x0;
+        let bg = self.solid_brush(self.theme.status_bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(x0, sep_y, bar_width, self.line_height), &bg);
+        }
+        // Left segments
+        let mut sx = x0 + self.char_width * 0.5;
+        for seg in &status.left_segments {
+            self.draw_text(&seg.text, sx, sep_y, seg.fg);
+            sx += seg.text.chars().count() as f32 * self.char_width;
+        }
+        // Right segments
+        let right_text: String = status
+            .right_segments
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        let right_w = right_text.chars().count() as f32 * self.char_width;
+        let mut sx2 = x0 + bar_width - right_w - self.char_width * 0.5;
+        for seg in &status.right_segments {
+            self.draw_text(&seg.text, sx2, sep_y, seg.fg);
+            sx2 += seg.text.chars().count() as f32 * self.char_width;
+        }
+    }
+
     // ─── Command line ────────────────────────────────────────────────────────
 
     fn draw_command_line(&self, layout: &ScreenLayout) {
         let (width, height) = self.rt_size();
         let x0 = self.editor_left;
-        let y = height - self.line_height;
+        let y = if layout.separated_status_line.is_some() {
+            // Above terminal: cmd line is right below separated status, above terminal
+            let terminal_px = layout
+                .bottom_tabs
+                .terminal
+                .as_ref()
+                .map(|t| (t.content_rows as f32 + 2.0) * self.line_height)
+                .unwrap_or(0.0);
+            height - terminal_px - self.line_height
+        } else {
+            height - self.line_height
+        };
         let bg = self.solid_brush(self.theme.background);
         unsafe {
             self.rt

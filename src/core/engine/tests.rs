@@ -18596,3 +18596,26 @@ fn test_o_with_crlf_indented_yaml() {
         engine.buffer().len_lines()
     );
 }
+
+#[test]
+fn test_status_line_above_terminal_setting_toggle() {
+    let mut engine = engine_with_text("hello\n");
+    // Default: status_line_above_terminal is true
+    assert!(engine.settings.status_line_above_terminal);
+
+    // Disable via :set
+    engine.execute_command("set nostatuslineaboveterminal");
+    assert!(!engine.settings.status_line_above_terminal);
+
+    // Re-enable via abbreviation
+    engine.execute_command("set slat");
+    assert!(engine.settings.status_line_above_terminal);
+
+    // Disable via abbreviation
+    engine.execute_command("set noslat");
+    assert!(!engine.settings.status_line_above_terminal);
+
+    // Query via :set slat?
+    engine.execute_command("set slat?");
+    assert_eq!(engine.message, "nostatuslineaboveterminal");
+}

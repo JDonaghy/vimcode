@@ -57,13 +57,17 @@ pub(super) fn handle_mouse(
             0
         };
 
-    // Bottom chrome rows: command line (1) + optional global status bar.
-    // With per-window status lines (the default), the global bar is hidden.
+    // Bottom chrome rows: rows below the terminal panel.
+    let has_separated = last_layout
+        .as_ref()
+        .is_some_and(|l| l.separated_status_line.is_some());
     let bottom_chrome: u16 = if engine.settings.window_status_line {
-        1
+        1 // cmd only
     } else {
-        2
+        2 // status + cmd
     };
+    // Separated status row between terminal and cmd (when noslat + terminal open).
+    let sep_status_rows: u16 = if has_separated { 1 } else { 0 };
 
     // Check if the mouse cursor is currently inside or adjacent to the hover
     // popup bounding rect. We include 1 column to the left (the sidebar
@@ -578,7 +582,8 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
+                let term_strip_top =
+                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
                     && col >= editor_left
@@ -788,7 +793,8 @@ pub(super) fn handle_mouse(
                 } else {
                     0
                 };
-                let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
+                let term_strip_top =
+                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
                 if engine.terminal_open
                     && strip_rows > 0
                     && row >= term_strip_top
@@ -810,7 +816,8 @@ pub(super) fn handle_mouse(
                 if debug_output_open {
                     let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
                     let panel_height = engine.session.terminal_panel_rows + 2;
-                    let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
+                    let panel_y =
+                        term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
                     let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
                     if row >= panel_y && row < panel_end {
                         let content_rows = engine.session.terminal_panel_rows as usize;
@@ -1555,6 +1562,44 @@ pub(super) fn handle_mouse(
             }
         }
     }
+    // ── Separated status line click (above terminal) ────────────────────────
+    if sep_status_rows > 0 {
+        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+        let strip_rows: u16 = if engine.terminal_open {
+            engine.session.terminal_panel_rows + 1
+        } else {
+            0
+        };
+        let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
+        // Separated status is 1 row above the terminal panel.
+        let sep_row = term_strip_top.saturating_sub(sep_status_rows);
+        if col >= editor_left && row == sep_row {
+            if let Some(layout) = last_layout {
+                if let Some(status) = &layout.separated_status_line {
+                    let click_col = (col - editor_left) as usize;
+                    let bar_width = terminal_size.map(|s| s.width).unwrap_or(80) as usize;
+                    if let Some(action) = status_segment_hit_test(status, bar_width, click_col) {
+                        if let Some(ea) = engine.handle_status_action(&action) {
+                            use crate::core::engine::EngineAction;
+                            match ea {
+                                EngineAction::ToggleSidebar => {
+                                    sidebar.visible = !sidebar.visible;
+                                }
+                                EngineAction::OpenTerminal => {
+                                    let cols =
+                                        terminal_size.as_ref().map(|s| s.width).unwrap_or(80);
+                                    engine
+                                        .terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return sidebar_width;
+                }
+            }
+        }
+    }
     // ── Terminal panel click ───────────────────────────────────────────────────
     {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
@@ -1784,7 +1829,8 @@ pub(super) fn handle_mouse(
 
             // Scrollbar click/drag → jump-scroll + arm drag
             let flat_len = engine.ext_panel_flat_len();
-            let content_h = term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
+            let content_h =
+                term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
             if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
                 let rel_row = (sidebar_row - content_start) as usize;
                 let ratio = rel_row as f64 / content_h as f64;

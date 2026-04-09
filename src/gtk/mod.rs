@@ -3890,28 +3890,7 @@ impl SimpleComponent for App {
                     let widget = g.widget();
                     let width = widget.width() as f64;
                     let height = widget.height() as f64;
-                    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                        0.0
-                    } else {
-                        lh
-                    };
-                    let status_h = lh * 2.0 + wildmenu_px;
-                    let dbg_px = if engine.debug_toolbar_visible {
-                        lh
-                    } else {
-                        0.0
-                    };
-                    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                        6.0 * lh
-                    } else {
-                        0.0
-                    };
-                    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                        (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                    } else {
-                        0.0
-                    };
-                    let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                    let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
                     let content_bounds =
                         core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                     let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
@@ -4747,32 +4726,11 @@ fn sync_scrollbar_positions(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-    } else {
-        0.0
-    };
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
         da_width,
-        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        gtk_editor_bottom(engine, da_width, da_height, line_height),
     );
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -5090,33 +5048,11 @@ impl App {
         } else {
             tab_row_height
         };
-        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-            0.0
-        } else {
-            line_height
-        };
-        let status_bar_height = line_height * 2.0 + wildmenu_px;
-        let debug_toolbar_px = if engine.debug_toolbar_visible {
-            line_height
-        } else {
-            0.0
-        };
-        let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-            6.0 * line_height
-        } else {
-            0.0
-        };
-        let term_px = if engine.terminal_open || engine.bottom_panel_open {
-            (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-        } else {
-            0.0
-        };
-
         let editor_bounds = WindowRect::new(
             0.0,
             0.0,
             da_width,
-            da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+            gtk_editor_bottom(&engine, da_width, da_height, line_height),
         );
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -6708,28 +6644,7 @@ impl App {
         if let Some(split_index) = self.group_divider_dragging {
             let engine = self.engine.borrow();
             let lh = self.cached_line_height;
-            let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                0.0
-            } else {
-                lh
-            };
-            let status_h = lh * 2.0 + wildmenu_px;
-            let dbg_px = if engine.debug_toolbar_visible {
-                lh
-            } else {
-                0.0
-            };
-            let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                6.0 * lh
-            } else {
-                0.0
-            };
-            let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-            } else {
-                0.0
-            };
-            let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+            let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
             drop(engine);
             let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
             let dividers = self
@@ -9698,6 +9613,10 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         line_height
     };
+    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+    let has_separated = engine.settings.window_status_line
+        && !engine.settings.status_line_above_terminal
+        && bp_open;
     let global_status_rows = if engine.settings.window_status_line {
         1.0
     } else {
@@ -9709,7 +9628,7 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         0.0
     };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+    let term_px = if bp_open {
         (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
     } else {
         0.0
@@ -9719,7 +9638,12 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         0.0
     };
-    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px
+    let separated_status_px = if has_separated {
+        line_height // status row below terminal (cmd already in status_bar_height)
+    } else {
+        0.0
+    };
+    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px - separated_status_px
 }
 
 /// Compute editor window rects with the same formula used by draw_editor and

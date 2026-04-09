@@ -79,7 +79,11 @@ pub(super) fn draw_editor(
         line_height
     };
     let per_window_status = engine.settings.window_status_line;
-    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let bottom_panel_open_early = engine.terminal_open || engine.bottom_panel_open;
+    let has_separated =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open_early;
+    // Bottom chrome: cmd line + optional global status + wildmenu.
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
     let status_bar_height = line_height * global_status_rows + wildmenu_px;
 
     // Reserve space for the quickfix panel when open
@@ -104,13 +108,26 @@ pub(super) fn draw_editor(
         0.0
     };
 
+    // Separated status: extracted from windows whenever terminal is open.
+    // When noslat + terminal: separated status row goes below terminal.
+    let separated_status_px = if has_separated {
+        line_height // status row below terminal (cmd already in status_bar_height)
+    } else {
+        0.0
+    };
+
     // Calculate window rects for all editor groups.
     // editor_bounds spans the full editor area from y=0; tab_bar_height is reserved per group.
     let editor_bounds = WindowRect::new(
         0.0,
         0.0,
         width as f64,
-        height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        height as f64
+            - status_bar_height
+            - debug_toolbar_px
+            - qf_px
+            - term_px
+            - separated_status_px,
     );
     let (window_rects, _group_dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -492,42 +509,73 @@ pub(super) fn draw_editor(
         }
     }
 
-    // 6. Status Line (global — only when per-window status is off)
-    let status_y = height as f64 - status_bar_height;
-    if !per_window_status {
-        draw_status_line(
+    // 5k–7. Status line, wildmenu, and command line.
+    if let Some(ref status) = screen.separated_status_line {
+        // noslat + terminal: [terminal][debug] ... [sep_status][wildmenu?][cmd]
+        let status_y = height as f64 - status_bar_height - separated_status_px;
+        let mut zones = Vec::new();
+        draw_window_status_bar(
             cr,
             &layout,
             &theme,
-            &screen.status_left,
-            &screen.status_right,
-            width as f64,
+            status,
+            0.0,
             status_y,
+            width as f64,
+            line_height,
+            &mut zones,
+        );
+        status_segment_map_out
+            .borrow_mut()
+            .insert(screen.active_window_id.0, zones);
+        let mut next_y = status_y + line_height;
+        if let Some(ref wm) = screen.wildmenu {
+            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            next_y += line_height;
+        }
+        draw_command_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.command,
+            width as f64,
+            next_y,
+            line_height,
+        );
+    } else {
+        // No terminal: original layout with per-window or global status at bottom
+        let status_y = height as f64 - status_bar_height;
+        if !per_window_status {
+            draw_status_line(
+                cr,
+                &layout,
+                &theme,
+                &screen.status_left,
+                &screen.status_right,
+                width as f64,
+                status_y,
+                line_height,
+            );
+        }
+        let mut next_y = if per_window_status {
+            status_y
+        } else {
+            status_y + line_height
+        };
+        if let Some(ref wm) = screen.wildmenu {
+            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            next_y += line_height;
+        }
+        draw_command_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.command,
+            width as f64,
+            next_y,
             line_height,
         );
     }
-
-    // 6b. Wildmenu bar (between status and command line)
-    let mut next_y = if per_window_status {
-        status_y // no global status row — cmd line starts where status_y is
-    } else {
-        status_y + line_height // skip past the global status row
-    };
-    if let Some(ref wm) = screen.wildmenu {
-        draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
-        next_y += line_height;
-    }
-
-    // 7. Command Line (last line)
-    draw_command_line(
-        cr,
-        &layout,
-        &theme,
-        &screen.command,
-        width as f64,
-        next_y,
-        line_height,
-    );
 
     // 8. Popups and modals — drawn last so they appear on top of everything.
     draw_picker_popup(

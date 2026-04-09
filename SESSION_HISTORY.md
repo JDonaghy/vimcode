@@ -1,7 +1,22 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 262 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 263 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 263 — Status line positioning + Windows alpha note (5422 tests):**
+
+1. **`status_line_above_terminal` setting** (default `true`, abbreviation `slat`): controls where the status line and command line appear relative to the terminal panel.
+   - `slat` ON (default): per-window status bars stay inside each editor split window as before — they're naturally above the terminal by being part of the editor area. Command line at screen bottom.
+   - `noslat`: when terminal is open, per-window status bars are removed from windows; a single status bar for the active file renders below the terminal panel, with the command line directly below it.
+2. **New setting infrastructure**: field on `Settings` struct with `#[serde(default)]`, `parse_set_option` for `:set slat`/`:set noslat`, `get_value_str`/`set_value_str` for JSON, `SettingDef` for Settings UI.
+3. **render.rs**: `separated_status_line: Option<WindowStatusLine>` on `ScreenLayout`; `build_screen_layout()` conditionally extracts active window status; `separated_status_height_px()` helper; updated `editor_bottom_px()`.
+4. **TUI backend**: 8-slot vertical layout with conditional separated status row between debug toolbar and wildmenu; `render_window_status_line()` for separated bar; mouse click detection via `status_segment_hit_test()`.
+5. **GTK backend**: `draw_window_status_bar()` for separated status below terminal; `gtk_editor_bottom()` helper consolidated 6+ inline editor_bottom calculations; click zones auto-populated via `status_segment_map`.
+6. **Win-GUI backend**: `draw_separated_status_line()` method; `draw_command_line()` repositioned when separated; layout `bottom_chrome` adjusted.
+7. **README**: Windows native GUI marked as **alpha** in Platforms table; added warning note in Windows install section recommending TUI build.
+8. **3 new tests**: setting toggle, `editor_bottom_px` with separated status, `separated_status_height_px`.
 
 ---
 
