@@ -240,7 +240,11 @@ impl<'a> DrawContext<'a> {
                 self.solid_brush(self.theme.tab_bar_bg)
             };
             let fg_color = if tab.active {
-                self.theme.foreground
+                if tab.preview {
+                    self.theme.line_number_fg // dimmer for preview tabs
+                } else {
+                    self.theme.foreground
+                }
             } else {
                 self.theme.line_number_fg
             };
@@ -1405,6 +1409,26 @@ impl<'a> DrawContext<'a> {
             // Icon text (centered in activity bar)
             let icon_x = (ab_w - self.char_width) / 2.0;
             self.draw_text(icon, icon_x, y, self.theme.activity_bar_fg);
+        }
+
+        // Settings gear pinned to bottom of activity bar (like TUI/VSCode)
+        {
+            let y = rt_h - self.line_height;
+            let is_active = sidebar.visible && sidebar.active_panel == SidebarPanel::Settings;
+            if is_active {
+                let accent = self.solid_brush(self.theme.tab_active_accent);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(0.0, y, 2.0, self.line_height), &accent);
+                }
+                let sel = self.solid_brush(self.theme.active_background);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, self.line_height), &sel);
+                }
+            }
+            let icon_x = (ab_w - self.char_width) / 2.0;
+            self.draw_text("\u{2699}", icon_x, y, self.theme.activity_bar_fg); // gear icon
         }
 
         // If sidebar panel is not visible, we're done

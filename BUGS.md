@@ -6,10 +6,7 @@
 ### Win-GUI gaps (vs TUI reference)
 
 **Critical:**
-- **Win-GUI: opening a file replaces current buffer** — All file opens hardcode `OpenMode::Permanent` (mod.rs lines 327, 1225, 1445, 1861). Single-click should use `OpenMode::Preview` for transient tabs; double-click or explicit open should use `Permanent`.
-- **Win-GUI: no preview tab mode** — `tab.preview` field is never checked in draw.rs (lines 231-294). Preview tabs appear identical to permanent tabs — no italic styling, no distinct color. Engine's preview logic works but Win-GUI never creates preview tabs and never renders them differently.
 - **Win-GUI: status bar not clickable** — Status segments are rendered (draw.rs lines 494-522) but there is no click handler or hit-test. TUI has `status_segment_hit_test()` mapping clicks to `StatusAction` (mode switch, branch picker, go-to-line, etc.). Win-GUI status bar is display-only.
-- **Win-GUI: missing explorer/tab context menus** — Right-click only calls `open_editor_context_menu()` (mod.rs line 2245). No calls to `open_explorer_context_menu()` or `open_tab_context_menu()`. Right-clicking files in the explorer or tabs on the tab bar does nothing.
 
 **Medium:**
 - **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
@@ -24,6 +21,10 @@
 
 ## Resolved
 
+- **Win-GUI: opening a file replaces current buffer** — Explorer single-click now uses `OpenMode::Preview` (transient tab); double-click uses `OpenMode::Permanent`. Previously all opens hardcoded `Permanent`.
+- **Win-GUI: no preview tab mode** — Preview tabs now render with dimmer text color in draw.rs. Engine's preview logic now works because explorer single-click creates preview tabs.
+- **Win-GUI: missing explorer/tab context menus** — Right-click on explorer items now calls `open_explorer_context_menu(path, is_dir, ...)`. Right-click on tab bar now calls `open_tab_context_menu(group_id, tab_idx, ...)`. Previously only editor right-click worked.
+- **Win-GUI: no settings button** — Activity bar now renders a gear icon pinned to the bottom row (matching TUI/VSCode). Click handler routes to `SidebarPanel::Settings`.
 - **GTK terminal panel toggle requires two clicks** — On first use, the `[P]` status bar button sent an async `Msg::ToggleTerminal` via Relm4's message queue instead of creating the terminal tab synchronously. The async path caused a one-frame delay where the terminal state wasn't set, requiring a second click. Fixed by calling `terminal_new_tab()` immediately in the click handler (matching TUI behavior which already handled `OpenTerminal` synchronously).
 
 - **Terminal panel resize not working via mouse** — Two bugs: (1) mouse events didn't trigger a redraw (`needs_redraw` was not set after `handle_mouse`), so the drag visually did nothing; (2) the available-space formula used hardcoded `2` instead of the computed `bottom_chrome` value, giving wrong row counts with default settings (`window_status_line=true` → `bottom_chrome=1`). Fixed by unconditionally setting `needs_redraw=true` after all mouse events, and using `bottom_chrome` in the formula.

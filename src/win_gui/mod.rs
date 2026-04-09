@@ -1800,17 +1800,24 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             0.0
         };
         if px < ab_w && py >= menu_y {
-            let row = ((py - menu_y) / state.line_height).floor() as usize;
-            let panels = [
-                SidebarPanel::Explorer,
-                SidebarPanel::Search,
-                SidebarPanel::Debug,
-                SidebarPanel::Git,
-                SidebarPanel::Extensions,
-                SidebarPanel::Ai,
-            ];
-            if row < panels.len() {
-                let clicked_panel = panels[row];
+            // Check if clicking the bottom-pinned Settings gear
+            let (_, rt_h) = get_client_size(hwnd);
+            let settings_y = rt_h as f32 - state.line_height;
+            let clicked_panel = if py >= settings_y {
+                Some(SidebarPanel::Settings)
+            } else {
+                let row = ((py - menu_y) / state.line_height).floor() as usize;
+                let panels = [
+                    SidebarPanel::Explorer,
+                    SidebarPanel::Search,
+                    SidebarPanel::Debug,
+                    SidebarPanel::Git,
+                    SidebarPanel::Extensions,
+                    SidebarPanel::Ai,
+                ];
+                panels.get(row).copied()
+            };
+            if let Some(clicked_panel) = clicked_panel {
                 if state.sidebar.visible && state.sidebar.active_panel == clicked_panel {
                     state.sidebar.visible = false;
                 } else {
@@ -1858,7 +1865,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                 state.sidebar.build_rows(root);
                             }
                         } else {
-                            let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                            let _ = state.engine.open_file_with_mode(&path, OpenMode::Preview);
                         }
                     }
                 }
@@ -2213,6 +2220,34 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Double-click on explorer file → open as Permanent (promotes preview tab)
+        let ab_w = state.sidebar.activity_bar_px;
+        let menu_y = if state.engine.menu_bar_visible {
+            TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+        } else {
+            0.0
+        };
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let row = ((py - menu_y) / state.line_height).floor() as usize;
+            if row >= 1 {
+                let vis_idx = state.sidebar.scroll_top + (row - 1);
+                if vis_idx < state.sidebar.rows.len() && !state.sidebar.rows[vis_idx].is_dir {
+                    let path = state.sidebar.rows[vis_idx].path.clone();
+                    let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on editor → word-select
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             state.engine.mouse_double_click(wid, line, col);
             state.mouse_text_drag = true;
@@ -2231,15 +2266,70 @@ fn on_right_click(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        // Only handle right-click in editor area
+        let lh = state.line_height;
+        let cw = state.char_width;
+        let screen_col = (px / cw).floor() as u16;
+        let screen_row = (py / lh).floor() as u16;
+
+        // Check tab bar right-click
+        for slot in &state.tab_slots {
+            if px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height {
+                state.engine.active_group = slot.group_id;
+                state.engine.goto_tab(slot.tab_idx);
+                state.engine.open_tab_context_menu(
+                    slot.group_id,
+                    slot.tab_idx,
+                    screen_col,
+                    screen_row,
+                );
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // Check explorer sidebar right-click
+        let ab_w = state.sidebar.activity_bar_px;
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+        {
+            let menu_y = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0
+            };
+            let row = ((py - menu_y) / state.line_height).floor() as usize;
+            // Row 0 is header, tree starts at row 1
+            if row >= 1 {
+                let vis_idx = state.sidebar.scroll_top + (row - 1);
+                if vis_idx < state.sidebar.rows.len() {
+                    let path = state.sidebar.rows[vis_idx].path.clone();
+                    let is_dir = state.sidebar.rows[vis_idx].is_dir;
+                    state
+                        .engine
+                        .open_explorer_context_menu(path, is_dir, screen_col, screen_row);
+                } else if let Some(ref root) = state.engine.workspace_root.clone() {
+                    state.engine.open_explorer_context_menu(
+                        root.clone(),
+                        true,
+                        screen_col,
+                        screen_row,
+                    );
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Editor area right-click
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             // Position cursor at click location first
             state.engine.mouse_click(wid, line, col);
-            // Convert pixel to screen row/col for context menu positioning
-            let lh = state.line_height;
-            let cw = state.char_width;
-            let screen_col = (px / cw).floor() as u16;
-            let screen_row = (py / lh).floor() as u16;
             state
                 .engine
                 .open_editor_context_menu(screen_col, screen_row);
