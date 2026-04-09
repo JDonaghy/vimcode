@@ -4234,4 +4234,75 @@ mod tests {
         let has_line50 = lines.iter().any(|l| l.contains("line 50"));
         assert!(!has_line50, "should not show line 50 in 15-row viewport");
     }
+
+    // ── Snapshot tests (golden reference) ────────────────────────────────
+    //
+    // These capture the full rendered grid. Any visual change causes a
+    // test failure until the snapshot is reviewed and accepted with:
+    //   cargo insta review
+    //
+    // First run creates the snapshot files automatically.
+    //
+    // The `prepend_module_path(false)` setting ensures both the `vimcode`
+    // and `vcd` binaries share the same snapshot files.
+
+    fn snap_settings() -> insta::Settings {
+        let mut s = insta::Settings::clone_current();
+        s.set_prepend_module_to_snapshot(false);
+        s.set_snapshot_path("snapshots");
+        s
+    }
+
+    #[test]
+    fn snapshot_normal_mode() {
+        let e = test_engine("fn main() {\n    println!(\"hello\");\n}\n");
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("normal_mode", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_insert_mode() {
+        let mut e = test_engine("hello world\n");
+        e.handle_key("i", Some('i'), false);
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("insert_mode", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_visual_selection() {
+        let mut e = test_engine("select this text\nand this too\n");
+        e.handle_key("v", Some('v'), false);
+        for _ in 0..10 {
+            e.handle_key("l", Some('l'), false);
+        }
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("visual_selection", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_command_line() {
+        let mut e = test_engine("buffer content\n");
+        e.handle_key(":", Some(':'), false);
+        e.handle_key("s", Some('s'), false);
+        e.handle_key("e", Some('e'), false);
+        e.handle_key("t", Some('t'), false);
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("command_line", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_split_panes() {
+        let mut e = test_engine("left pane content\n");
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let lines = render_tui(&e, 80, 16);
+        snap_settings().bind(|| insta::assert_snapshot!("split_panes", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_line_numbers() {
+        let mut e = test_engine("alpha\nbeta\ngamma\ndelta\nepsilon\n");
+        e.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("line_numbers", lines.join("\n")));
+    }
 }

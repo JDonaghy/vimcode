@@ -1,0 +1,16 @@
+---
+source: src/tui_main/render_impl.rs
+expression: "lines.join(\"\\n\")"
+---
+ 󰍜  1: [No Name] ×                                  󰤲   ⋯
+ 
+    1 alpha
+    2 beta
+    3 gamma
+    4 delta
+    5 epsilon
+
+
+
+    NORMAL  [No Name] Spaces: 4 utf-8 LF  Ln 1, Col 1  󰘖  󰆍
+ 

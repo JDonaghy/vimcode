@@ -105,6 +105,9 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
 ], optional = true }
 
+[dev-dependencies]
+insta = "1.39"
+
 [build-dependencies]
 cc = "1.0"
 
