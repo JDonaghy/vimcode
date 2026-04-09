@@ -95,30 +95,20 @@ use crate::render::{
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
-    let Some((ctrl, shift, alt, key_name)) =
-        crate::core::settings::parse_key_binding_named(binding)
-    else {
-        return false;
+    let key_char = match code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
     };
-    if ctrl != mods.contains(KeyModifiers::CONTROL) {
-        return false;
-    }
-    if shift != mods.contains(KeyModifiers::SHIFT) {
-        return false;
-    }
-    if alt != mods.contains(KeyModifiers::ALT) {
-        return false;
-    }
-    match key_name.as_str() {
-        "Tab" | "tab" => matches!(code, KeyCode::Tab),
-        "Space" | "space" => matches!(code, KeyCode::Char(' ')),
-        "Escape" | "Esc" => matches!(code, KeyCode::Esc),
-        s if s.chars().count() == 1 => {
-            let ch = s.chars().next().unwrap().to_ascii_lowercase();
-            matches!(code, KeyCode::Char(c) if c.to_ascii_lowercase() == ch)
-        }
-        _ => false,
-    }
+    crate::render::matches_key_binding(
+        binding,
+        mods.contains(KeyModifiers::CONTROL),
+        mods.contains(KeyModifiers::SHIFT),
+        mods.contains(KeyModifiers::ALT),
+        key_char,
+        matches!(code, KeyCode::Tab),
+        matches!(code, KeyCode::Char(' ')),
+        matches!(code, KeyCode::Esc),
+    )
 }
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
@@ -1482,6 +1472,8 @@ fn event_loop(
             }
             // Tick swap file writes (only does work when updatetime elapsed).
             engine.tick_swap_files();
+            // Check for externally modified files.
+            engine.tick_file_watcher();
             // Auto-dismiss completed notifications after timeout.
             // Force redraw every idle tick when notifications are visible (spinner animation).
             if !engine.notifications.is_empty() {
@@ -2812,12 +2804,38 @@ fn event_loop(
                                 needs_redraw = true;
                                 continue;
                             }
-                            // Ctrl+Shift+V (crossterm: Ctrl+uppercase-V): paste clipboard to PTY.
-                            if ctrl && matches!(code, KeyCode::Char('V')) {
-                                if let Some(ref cb) = engine.clipboard_read {
-                                    if let Ok(text) = cb() {
-                                        engine.terminal_write(text.as_bytes());
-                                    }
+                            // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY (VS Code behavior).
+                            if ctrl && matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
+                                // Try system clipboard first, fall back to VimCode
+                                // registers ("+ then ") so yanked text is always available.
+                                let paste_text = engine
+                                    .clipboard_read
+                                    .as_ref()
+                                    .and_then(|cb| cb().ok())
+                                    .filter(|t| !t.is_empty())
+                                    .or_else(|| {
+                                        engine
+                                            .registers
+                                            .get(&'+')
+                                            .map(|(t, _)| t.clone())
+                                            .filter(|t| !t.is_empty())
+                                    })
+                                    .or_else(|| {
+                                        engine
+                                            .registers
+                                            .get(&'"')
+                                            .map(|(t, _)| t.clone())
+                                            .filter(|t| !t.is_empty())
+                                    });
+                                if let Some(text) = paste_text {
+                                    // Wrap in bracketed paste so the inner shell
+                                    // treats multi-line content as a single paste.
+                                    engine.terminal_write(b"\x1b[200~");
+                                    engine.terminal_write(text.as_bytes());
+                                    engine.terminal_write(b"\x1b[201~");
+                                    engine.poll_terminal();
+                                } else {
+                                    engine.message = "Nothing to paste".to_string();
                                 }
                                 needs_redraw = true;
                                 continue;
@@ -3613,7 +3631,6 @@ fn event_loop(
                     }
                 }
                 let mut mouse_should_quit = false;
-                let hover_before = engine.sc_button_hovered;
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -3656,17 +3673,14 @@ fn event_loop(
                 if mouse_should_quit {
                     return;
                 }
-                if engine.sc_button_hovered != hover_before {
-                    needs_redraw = true;
-                }
+                // Mouse events (clicks, drags) almost always change visual
+                // state. Always request a redraw so drag-resize, selection,
+                // scrollbar, and other interactive feedback is immediate.
+                needs_redraw = true;
                 // Poll editor hover dwell after mouse events so the timer
                 // can fire even when continuous mouse events prevent idle polling.
-                if engine.poll_editor_hover() {
-                    needs_redraw = true;
-                }
-                if engine.poll_blame() {
-                    needs_redraw = true;
-                }
+                engine.poll_editor_hover();
+                engine.poll_blame();
             }
             Event::Paste(text) => {
                 // Bracketed paste — text delivered directly from the terminal emulator
@@ -3676,7 +3690,8 @@ fn event_loop(
                 // engine in Normal mode while the TUI routes keys locally.
                 let first_line = text.lines().next().unwrap_or("");
 
-                // Terminal PTY — forward raw bytes.
+                // Terminal PTY — forward raw bytes wrapped in bracketed paste
+                // so the inner shell treats multi-line content as a single paste.
                 if engine.terminal_has_focus {
                     if engine.terminal_find_active {
                         // Paste into the terminal find bar, not the PTY.
@@ -3685,8 +3700,11 @@ fn event_loop(
                                 engine.terminal_find_char(ch);
                             }
                         }
-                    } else {
+                    } else if !text.is_empty() {
+                        engine.terminal_write(b"\x1b[200~");
                         engine.terminal_write(text.as_bytes());
+                        engine.terminal_write(b"\x1b[201~");
+                        engine.poll_terminal();
                     }
                     needs_redraw = true;
                     continue;
@@ -4131,33 +4149,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             std::process::exit(1);
         }
         EngineAction::OpenUrl(url) => {
-            #[cfg(target_os = "windows")]
-            let cmd = "cmd";
-            #[cfg(target_os = "macos")]
-            let cmd = "open";
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let cmd = "xdg-open";
-            if crate::core::engine::is_safe_url(&url) {
-                #[cfg(target_os = "windows")]
-                {
-                    // `cmd /c start "" "url"` — empty title needed for start.
-                    std::process::Command::new(cmd)
-                        .args(["/c", "start", "", &url])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .ok();
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    std::process::Command::new(cmd)
-                        .arg(&url)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                        .ok();
-                }
-            }
+            crate::core::engine::open_url_in_browser(&url);
             false
         }
         EngineAction::None | EngineAction::Error => false,

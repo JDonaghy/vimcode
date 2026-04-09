@@ -175,6 +175,12 @@ pub struct Settings {
     #[serde(default = "default_window_status_line")]
     pub window_status_line: bool,
 
+    /// When per-window status lines are enabled and the terminal panel is open,
+    /// show the active window's status line as a dedicated row above the terminal
+    /// instead of inside each window (default true).
+    #[serde(default = "default_status_line_above_terminal")]
+    pub status_line_above_terminal: bool,
+
     /// Automatically reload files when changed externally (default true).
     /// Vim: `autoread`.
     #[serde(default = "default_autoread")]
@@ -367,6 +373,10 @@ fn default_hlsearch() -> bool {
 }
 
 fn default_window_status_line() -> bool {
+    true
+}
+
+fn default_status_line_above_terminal() -> bool {
     true
 }
 
@@ -694,6 +704,7 @@ impl Default for Settings {
             scrolloff: 0,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
+            status_line_above_terminal: default_status_line_above_terminal(),
             autoread: default_autoread(),
             splitbelow: false,
             splitright: false,
@@ -959,6 +970,7 @@ impl Settings {
             "smartcase" | "scs" => self.smartcase = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
+            "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
             "autoread" | "ar" => self.autoread = enable,
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
@@ -1037,6 +1049,15 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.hover_delay = n;
+            }
+            "font_size" => {
+                let n: i32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.font_size = n.clamp(6, 72);
+            }
+            "font_family" => {
+                self.font_family = value.to_string();
             }
             _ => return Err(format!("Unknown option: {name}")),
         }
@@ -1132,6 +1153,11 @@ impl Settings {
                 "windowstatusline".to_string()
             } else {
                 "nowindowstatusline".to_string()
+            }),
+            "statuslineaboveterminal" | "slat" => Ok(if self.status_line_above_terminal {
+                "statuslineaboveterminal".to_string()
+            } else {
+                "nostatuslineaboveterminal".to_string()
             }),
             "splitbelow" | "sb" => Ok(if self.splitbelow {
                 "splitbelow".to_string()
@@ -1256,6 +1282,7 @@ impl Settings {
             },
             "cursorline" => self.cursorline.to_string(),
             "window_status_line" => self.window_status_line.to_string(),
+            "status_line_above_terminal" => self.status_line_above_terminal.to_string(),
             "tabstop" => self.tabstop.to_string(),
             "shift_width" => self.shift_width.to_string(),
             "expand_tab" => self.expand_tab.to_string(),
@@ -1329,6 +1356,7 @@ impl Settings {
             }
             "cursorline" => self.cursorline = value == "true",
             "window_status_line" => self.window_status_line = value == "true",
+            "status_line_above_terminal" => self.status_line_above_terminal = value == "true",
             "tabstop" => {
                 self.tabstop = value
                     .parse()
@@ -1552,6 +1580,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "window_status_line",
         label: "Per-Window Status Line",
         description: "Show a status line at the bottom of each window instead of a single global bar",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "status_line_above_terminal",
+        label: "Status Line Above Terminal",
+        description: "Show the active window's status line as a dedicated row above the terminal panel",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },

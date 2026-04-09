@@ -21,7 +21,7 @@ use crate::core::settings::LineNumberMode;
 pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
-use crate::core::window::{GroupDivider, GroupId};
+use crate::core::window::{GroupDivider, GroupId, SplitDirection};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
 use crate::icons;
 
@@ -136,6 +136,17 @@ impl Color {
             self.r as f64 / 255.0,
             self.g as f64 / 255.0,
             self.b as f64 / 255.0,
+        )
+    }
+
+    /// Normalise to `(f32, f32, f32, f32)` RGBA with full opacity.
+    /// Used by Direct2D (`D2D1_COLOR_F`) and Core Graphics (`CGColor`).
+    pub fn to_f32_rgba(self) -> (f32, f32, f32, f32) {
+        (
+            self.r as f32 / 255.0,
+            self.g as f32 / 255.0,
+            self.b as f32 / 255.0,
+            1.0,
         )
     }
 
@@ -653,6 +664,8 @@ pub struct PickerPanel {
     /// Preview lines: (1-based line number, text, is_highlighted).
     /// When `Some`, the picker is rendered in two-pane mode.
     pub preview: Option<Vec<(usize, String, bool)>>,
+    /// Scroll offset for the preview pane.
+    pub preview_scroll: usize,
 }
 
 // ─── TabSwitcherPanel ─────────────────────────────────────────────────────
@@ -1694,6 +1707,11 @@ pub struct ScreenLayout {
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
     pub tab_scroll_offset: usize,
+    /// When `status_line_above_terminal` is active AND the terminal panel is open,
+    /// this carries the active window's status line to render as a dedicated row
+    /// above the terminal panel. When `Some`, per-window `status_line` fields on
+    /// individual `RenderedWindow`s are `None`.
+    pub separated_status_line: Option<WindowStatusLine>,
 }
 
 /// Context menu data for TUI rendering.
@@ -3420,12 +3438,19 @@ pub fn build_screen_layout(
     let tab_bar = build_tab_bar(engine);
 
     let per_window_status = engine.settings.window_status_line;
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    // When status_line_above_terminal is OFF and the terminal is open, extract the
+    // active window's status into a separated bar rendered below the terminal.
+    // When the setting is ON (default), per-window status bars stay inside each
+    // window — they're naturally above the terminal by being part of the editor area.
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
 
     let windows = window_rects
         .iter()
         .map(|(window_id, rect)| {
             let mut visible_lines = (rect.height / line_height).floor() as usize;
-            if per_window_status && visible_lines > 1 {
+            if per_window_status && !separate_status && visible_lines > 1 {
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
@@ -3440,7 +3465,7 @@ pub fn build_screen_layout(
                 multi_window,
                 color_headings,
             );
-            if per_window_status {
+            if per_window_status && !separate_status {
                 rw.status_line = Some(build_window_status_line(
                     engine, theme, *window_id, is_active,
                 ));
@@ -3448,6 +3473,17 @@ pub fn build_screen_layout(
             rw
         })
         .collect();
+
+    let separated_status_line = if separate_status {
+        Some(build_window_status_line(
+            engine,
+            theme,
+            active_window_id,
+            true,
+        ))
+    } else {
+        None
+    };
 
     let (status_left, status_right, status_branch_range) = if per_window_status {
         (String::new(), String::new(), None)
@@ -4049,6 +4085,7 @@ pub fn build_screen_layout(
                 } else {
                     None
                 },
+                preview_scroll: engine.picker_preview_scroll,
             }
         }),
         tab_switcher,
@@ -4120,6 +4157,7 @@ pub fn build_screen_layout(
             .get(&engine.active_group)
             .map(|g| g.tab_scroll_offset)
             .unwrap_or(0),
+        separated_status_line,
     }
 }
 
@@ -4846,6 +4884,76 @@ pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usiz
         pos = break_at.max(pos + 1);
     }
     segments
+}
+
+/// Map a visible row index (0-based from scroll_top) to the corresponding
+/// buffer line index, skipping lines hidden inside closed folds.
+/// Shared across all GUI backends for click hit-testing.
+pub fn view_row_to_buf_line(
+    view: &crate::core::view::View,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+) -> usize {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        if visible == view_row {
+            return buf_line;
+        }
+        visible += 1;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    // Clamp to last valid line
+    total_lines.saturating_sub(1)
+}
+
+/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
+/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
+/// character index within the buffer line where the clicked visual segment starts.
+/// Shared across all GUI backends for click hit-testing with `:set wrap`.
+pub fn view_row_to_buf_pos_wrap(
+    view: &crate::core::view::View,
+    buffer: &crate::core::buffer::Buffer,
+    scroll_top: usize,
+    view_row: usize,
+    total_lines: usize,
+    viewport_cols: usize,
+) -> (usize, usize) {
+    let mut buf_line = scroll_top;
+    let mut visible = 0usize;
+    while buf_line < total_lines {
+        if view.is_line_hidden(buf_line) {
+            buf_line += 1;
+            continue;
+        }
+        // Compute how many visual rows this buffer line occupies when wrapped.
+        let line_str = buffer.content.line(buf_line).to_string();
+        let line_str = line_str.trim_end_matches('\n');
+        let segments = compute_word_wrap_segments(line_str, viewport_cols);
+        let visual_rows = segments.len();
+        if view_row < visible + visual_rows {
+            // The clicked row falls within this buffer line.
+            let seg_idx = view_row - visible;
+            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
+            return (buf_line, seg_col_offset);
+        }
+        visible += visual_rows;
+        if let Some(fold) = view.fold_at(buf_line) {
+            buf_line = fold.end + 1;
+        } else {
+            buf_line += 1;
+        }
+    }
+    (total_lines.saturating_sub(1), 0)
 }
 
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
@@ -6906,6 +7014,226 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
     }
 }
 
+// ─── Shared click target + layout geometry helpers ──────────────────────────
+//
+// These types and functions are used by all backends (GTK, TUI, Win-GUI) to
+// avoid duplicating hit-testing geometry calculations.
+
+/// Result of converting a click coordinate to a semantic editor target.
+/// Shared across all backends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClickTarget {
+    /// Click was in the tab bar, tab already switched.
+    TabBar,
+    /// Click was in gutter — fold already toggled.
+    Gutter,
+    /// Click resolved to a buffer position in a specific window.
+    BufferPos(WindowId, usize, usize),
+    /// Click was on a tab-bar split button: (group_id, direction).
+    SplitButton(GroupId, SplitDirection),
+    /// Click was on a tab's close button: (group_id, tab_idx).
+    CloseTab(GroupId, usize),
+    /// Click was on a diff toolbar prev-change button.
+    DiffToolbarPrev,
+    /// Click was on a diff toolbar next-change button.
+    DiffToolbarNext,
+    /// Click was on a diff toolbar toggle-fold button.
+    DiffToolbarToggleFold,
+    /// Click was on a per-window status bar segment with an action.
+    StatusBarAction(StatusAction),
+    /// Click was on the editor action menu button.
+    ActionMenuButton(GroupId),
+    /// Click was outside any actionable area.
+    None,
+}
+
+/// Compute the tab bar row height in pixels (the row containing tab labels).
+/// Used by GTK and Win-GUI backends.
+pub fn tab_row_height_px(line_height: f64) -> f64 {
+    (line_height * 1.6).ceil()
+}
+
+/// Compute the full tab bar height including optional breadcrumb row.
+/// Used by GTK and Win-GUI backends.
+pub fn tab_bar_height_px(line_height: f64, breadcrumbs: bool) -> f64 {
+    let row_h = tab_row_height_px(line_height);
+    if breadcrumbs {
+        row_h + line_height
+    } else {
+        row_h
+    }
+}
+
+/// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
+pub fn status_bar_height_px(
+    line_height: f64,
+    per_window_status_line: bool,
+    has_wildmenu: bool,
+) -> f64 {
+    let wildmenu_px = if has_wildmenu { line_height } else { 0.0 };
+    let global_rows = if per_window_status_line { 1.0 } else { 2.0 };
+    line_height * global_rows + wildmenu_px
+}
+
+/// Compute the quickfix panel height in pixels (0 if closed).
+pub fn quickfix_height_px(line_height: f64, quickfix_open: bool, item_count: usize) -> f64 {
+    if quickfix_open {
+        let n = item_count.clamp(1, 10) as f64;
+        (n + 1.0) * line_height
+    } else {
+        0.0
+    }
+}
+
+/// Compute the terminal/bottom panel height in pixels (0 if closed).
+pub fn terminal_panel_height_px(line_height: f64, panel_open: bool, panel_rows: usize) -> f64 {
+    if panel_open {
+        (panel_rows + 2) as f64 * line_height
+    } else {
+        0.0
+    }
+}
+
+/// Compute the debug toolbar height in pixels (0 if hidden).
+pub fn debug_toolbar_height_px(line_height: f64, visible: bool) -> f64 {
+    if visible {
+        line_height
+    } else {
+        0.0
+    }
+}
+
+/// Compute the height of the separated status line row (0 if not active).
+pub fn separated_status_height_px(line_height: f64, has_separated: bool) -> f64 {
+    if has_separated {
+        line_height
+    } else {
+        0.0
+    }
+}
+
+/// Compute the Y coordinate of the editor bottom edge (below which status/terminal/etc live).
+#[allow(clippy::too_many_arguments)]
+pub fn editor_bottom_px(
+    total_height: f64,
+    line_height: f64,
+    per_window_status_line: bool,
+    has_wildmenu: bool,
+    quickfix_open: bool,
+    quickfix_item_count: usize,
+    panel_open: bool,
+    panel_rows: usize,
+    debug_toolbar_visible: bool,
+    has_separated_status: bool,
+) -> f64 {
+    total_height
+        - status_bar_height_px(line_height, per_window_status_line, has_wildmenu)
+        - quickfix_height_px(line_height, quickfix_open, quickfix_item_count)
+        - terminal_panel_height_px(line_height, panel_open, panel_rows)
+        - debug_toolbar_height_px(line_height, debug_toolbar_visible)
+        - separated_status_height_px(line_height, has_separated_status)
+}
+
+/// Compute the scrollbar-to-scroll-top mapping from a click position.
+/// Returns the new `scroll_top` value.
+///
+/// - `click_pos`: relative position of click within the scrollbar track (0.0 .. track_len).
+/// - `track_len`: total length of the scrollbar track in pixels (or cells).
+/// - `total_lines`: total number of lines in the buffer.
+/// - `viewport_lines`: number of visible lines in the viewport.
+pub fn scrollbar_click_to_scroll_top(
+    click_pos: f64,
+    track_len: f64,
+    total_lines: usize,
+    viewport_lines: usize,
+) -> usize {
+    if track_len <= 0.0 || total_lines <= viewport_lines {
+        return 0;
+    }
+    let ratio = (click_pos / track_len).clamp(0.0, 1.0);
+    let max_scroll = total_lines.saturating_sub(viewport_lines);
+    ((ratio * max_scroll as f64).round() as usize).min(max_scroll)
+}
+
+/// Compute the display column from a pixel/cell X offset within the text area.
+/// Handles tab expansion (tabs = `tabstop` display columns).
+///
+/// - `line_text`: the text of the buffer line.
+/// - `x_offset`: click position relative to the text area start, in character-width units
+///   (i.e. `(pixel_x - gutter_px) / char_width` for pixel backends, or `col - gutter` for TUI).
+/// - `tabstop`: tab stop width (default 4).
+/// - `scroll_left`: horizontal scroll offset in display columns.
+///
+/// Returns the buffer column index.
+pub fn display_col_to_buffer_col(
+    line_text: &str,
+    x_offset: usize,
+    tabstop: usize,
+    scroll_left: usize,
+) -> usize {
+    let target_display_col = x_offset + scroll_left;
+    let mut display_col = 0usize;
+    for (i, ch) in line_text.chars().enumerate() {
+        if display_col >= target_display_col {
+            return i;
+        }
+        if ch == '\t' {
+            display_col += tabstop - (display_col % tabstop);
+        } else {
+            display_col += 1;
+        }
+    }
+    line_text.chars().count()
+}
+
+/// Check if a click at `col` within a tab of total width `tab_width` is on the close button.
+/// Close button occupies the rightmost `close_cols` columns of the tab.
+pub fn is_tab_close_click(col_in_tab: usize, tab_width: usize, close_cols: usize) -> bool {
+    tab_width > close_cols && col_in_tab >= tab_width - close_cols
+}
+
+/// Matches a key binding string (e.g. `<C-S-e>`) against abstract modifier flags
+/// and a key name/char. This is the backend-agnostic core of key matching.
+///
+/// - `binding`: Vim-style binding string like `<C-b>`, `<C-S-e>`, `<A-x>`.
+/// - `ctrl`, `shift`, `alt`: whether these modifiers are pressed.
+/// - `key_char`: the lowercase character of the pressed key (if printable).
+/// - `is_tab`: true if the pressed key is Tab.
+/// - `is_space`: true if the pressed key is Space.
+/// - `is_escape`: true if the pressed key is Escape.
+#[allow(clippy::too_many_arguments)]
+pub fn matches_key_binding(
+    binding: &str,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    key_char: Option<char>,
+    is_tab: bool,
+    is_space: bool,
+    is_escape: bool,
+) -> bool {
+    let Some((want_ctrl, want_shift, want_alt, key_name)) =
+        crate::core::settings::parse_key_binding_named(binding)
+    else {
+        return false;
+    };
+    if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
+        return false;
+    }
+    match key_name.as_str() {
+        "Tab" | "tab" => is_tab,
+        "Space" | "space" => is_space,
+        "Escape" | "Esc" => is_escape,
+        s if s.chars().count() == 1 => {
+            let want = s.chars().next().unwrap().to_ascii_lowercase();
+            key_char
+                .map(|c| c.to_ascii_lowercase() == want)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7380,5 +7708,163 @@ mod tests {
             lsp_seg.is_none(),
             "should not show LSP segment without lsp_manager"
         );
+    }
+
+    // ─── Shared layout helper tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_tab_bar_height_px() {
+        let lh = 20.0;
+        let no_bc = tab_bar_height_px(lh, false);
+        let with_bc = tab_bar_height_px(lh, true);
+        assert_eq!(no_bc, (lh * 1.6).ceil());
+        assert_eq!(with_bc, (lh * 1.6).ceil() + lh);
+    }
+
+    #[test]
+    fn test_status_bar_height_px() {
+        let lh = 16.0;
+        // per-window status → 1 global row
+        assert_eq!(status_bar_height_px(lh, true, false), lh);
+        // no per-window → 2 global rows
+        assert_eq!(status_bar_height_px(lh, false, false), 2.0 * lh);
+        // with wildmenu adds one line_height
+        assert_eq!(status_bar_height_px(lh, true, true), 2.0 * lh);
+    }
+
+    #[test]
+    fn test_editor_bottom_px() {
+        let lh = 20.0;
+        let total = 800.0;
+        let eb = editor_bottom_px(total, lh, true, false, false, 0, false, 0, false, false);
+        assert_eq!(eb, total - lh); // only status bar (1 row)
+    }
+
+    #[test]
+    fn test_editor_bottom_px_with_separated_status() {
+        let lh = 20.0;
+        let total = 800.0;
+        // With separated status, editor bottom is 1 extra row lower
+        let without = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, false);
+        let with = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, true);
+        assert_eq!(without - with, lh);
+    }
+
+    #[test]
+    fn test_separated_status_height_px() {
+        let lh = 18.0;
+        assert_eq!(separated_status_height_px(lh, true), lh);
+        assert_eq!(separated_status_height_px(lh, false), 0.0);
+    }
+
+    #[test]
+    fn test_scrollbar_click_to_scroll_top() {
+        // Click at top → scroll 0
+        assert_eq!(scrollbar_click_to_scroll_top(0.0, 100.0, 200, 50), 0);
+        // Click at bottom → max scroll
+        assert_eq!(scrollbar_click_to_scroll_top(100.0, 100.0, 200, 50), 150);
+        // Click at 50% → half of max scroll
+        assert_eq!(scrollbar_click_to_scroll_top(50.0, 100.0, 200, 50), 75);
+        // No scrollbar needed
+        assert_eq!(scrollbar_click_to_scroll_top(50.0, 100.0, 50, 50), 0);
+        // Zero track
+        assert_eq!(scrollbar_click_to_scroll_top(50.0, 0.0, 200, 50), 0);
+    }
+
+    #[test]
+    fn test_display_col_to_buffer_col() {
+        // Plain text
+        assert_eq!(display_col_to_buffer_col("hello", 3, 4, 0), 3);
+        // With tab
+        assert_eq!(display_col_to_buffer_col("\thello", 0, 4, 0), 0);
+        assert_eq!(display_col_to_buffer_col("\thello", 4, 4, 0), 1);
+        assert_eq!(display_col_to_buffer_col("\thello", 5, 4, 0), 2);
+        // Past end
+        assert_eq!(display_col_to_buffer_col("hi", 10, 4, 0), 2);
+        // With scroll_left
+        assert_eq!(display_col_to_buffer_col("hello world", 0, 4, 6), 6);
+    }
+
+    #[test]
+    fn test_is_tab_close_click() {
+        assert!(!is_tab_close_click(0, 10, 2));
+        assert!(!is_tab_close_click(7, 10, 2));
+        assert!(is_tab_close_click(8, 10, 2));
+        assert!(is_tab_close_click(9, 10, 2));
+        // Edge case: tab too narrow for close button
+        assert!(!is_tab_close_click(0, 2, 2));
+    }
+
+    #[test]
+    fn test_matches_key_binding() {
+        // Ctrl+B
+        assert!(matches_key_binding(
+            "<C-b>",
+            true,
+            false,
+            false,
+            Some('b'),
+            false,
+            false,
+            false
+        ));
+        assert!(!matches_key_binding(
+            "<C-b>",
+            false,
+            false,
+            false,
+            Some('b'),
+            false,
+            false,
+            false
+        ));
+        // Ctrl+Shift+E
+        assert!(matches_key_binding(
+            "<C-S-e>",
+            true,
+            true,
+            false,
+            Some('e'),
+            false,
+            false,
+            false
+        ));
+        // Tab
+        assert!(matches_key_binding(
+            "<C-Tab>", true, false, false, None, true, false, false
+        ));
+        // Alt+X
+        assert!(matches_key_binding(
+            "<A-x>",
+            false,
+            false,
+            true,
+            Some('x'),
+            false,
+            false,
+            false
+        ));
+        // Case insensitive
+        assert!(matches_key_binding(
+            "<C-b>",
+            true,
+            false,
+            false,
+            Some('B'),
+            false,
+            false,
+            false
+        ));
+        // Wrong modifier
+        assert!(!matches_key_binding(
+            "<C-S-e>",
+            true,
+            false,
+            false,
+            Some('e'),
+            false,
+            false,
+            false
+        ));
     }
 }

@@ -7,6 +7,8 @@ mod gtk;
 mod icons;
 mod render;
 mod tui_main;
+#[cfg(feature = "win-gui")]
+mod win_gui;
 
 use std::path::PathBuf;
 

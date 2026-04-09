@@ -1,5 +1,7 @@
 # VimCode Implementation Plan
 
+- ~~Improve unindenting and indenting behavior to make it context aware~~ **Done** — `dedent_lines()` now computes the minimum indent across all non-blank lines in the selection and removes that amount uniformly (capped at `shift_width`), preserving relative nesting structure. Blank lines are skipped for the minimum calculation. Undo restores in a single step. 6 new tests.
+
 - ~~investigate bundling the nerd font glyphs~~ **Done** — centralized icon registry (`icons.rs`), `use_nerd_fonts` setting with ASCII fallback, bundled 13KB Nerd Font subset for GTK, extension `fallback_icon` API
 
 - ~~add a way to clearly indicate the current tab that works across editor groups~~ **Done** — `tab_active_accent` theme color; GTK draws 2px colored top border on active tab in focused group; TUI uses colored underline (ratatui 0.29); 6 built-in themes + VSCode JSON importer (`tab.activeBorderTop`)
@@ -23,11 +25,21 @@
 ---
 
 ## Recently Completed
-- **Session 253**: Notification / progress indicator — spinner/bell in per-window status bar for background ops (LSP install, project search/replace); auto-dismiss; click-to-clear; 9 tests.
-- **Session 252**: TUI spell underline bleed fix — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` and `underline_color` so spell underlines don't bleed into picker overlays. Added remote editing research item.
-> Sessions 251 and earlier in **SESSION_HISTORY.md**.
+- **Session 263**: Status line + command line positioning — `status_line_above_terminal` setting (default true); `slat` ON: per-window status bars inside each split as before (naturally above terminal); `noslat`: single status bar for active file + command line move below terminal as a pair; all 3 backends (GTK, TUI, Win-GUI); click detection on separated status segments. Also: README Windows alpha note.
+- **Session 262**: 7 bug fixes — TUI terminal paste (register fallback + bracketed paste + poll_terminal); GTK terminal Ctrl+C/Ctrl+Shift+C (key-to-pty fallback + copy handler); TUI terminal selection offset (relative columns + dynamic bottom_chrome); editor drag leak into terminal; CI coverage `--all-features` → `--features gui`.
+- **Session 261**: Fix `o` command with CRLF/CR line endings — `insert_pos` calculation now handles `\r\n` (skip both chars) and lone `\r` (insert before it) so new lines aren't absorbed into CRLF pairs. 4 new tests.
+- **Session 260**: 12 bug fixes — `%` viewport centering; TUI tab underline filename-only; preview tab click-to-permanent; explorer micro-drag same-dest guard; GTK tab bar proportional font width; terminal click overlap; live grep preview scroll; terminal Ctrl+V paste; picker z-order over terminal (TUI+GTK); GTK visual select highlight; terminal right-click suppression. 5 new tests.
+- **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.
+- **Session 258**: Multi-backend code sharing — `ClickTarget` enum + 8 shared geometry/key-binding helpers extracted to `render.rs`; GTK, TUI, Win-GUI backends delegate to shared functions; 7 new tests; 4 win-gui bugs filed.
+> Sessions 258 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
+- [x] Picker preview stale chars when cycling files — explicit per-row clear + tab sanitization
+- [x] Insert mode click past EOL — `set_cursor_for_window` allows cursor one past last char in insert/replace mode
+- [x] Scrollbar drag moves cursor — replaced `set_cursor_for_window` with `set_scroll_top_for_window`
+- [x] Git panel discard needs confirm dialog — `pending_sc_discard` + `confirm_sc_discard` dialog
+- [x] Tree-sitter-latex link error on Windows — `kind = "static"` on `#[link]`
+- [x] 8 tests fail on Windows paths — `#[cfg(not(target_os = "windows"))]` + cross-platform assertions
 - [x] TUI spell underlines bleed into fuzzy finder — `set_cell()`/`set_cell_wide()`/`set_cell_styled()` now reset `modifier` + `underline_color`
 - [x] GTK core dump from panic in extern "C" draw callback — `catch_unwind` + `.ok()` on Cairo operations
 - [x] GStrInteriorNulError crash from NUL byte in dialog button hotkey
@@ -79,6 +91,17 @@
 - [x] GTK explorer focus not returning to editor after file open — clear `explorer_has_focus`/`tree_has_focus` in `OpenFileFromSidebar`
 - [x] GTK 100% CPU after opening file from explorer — caused by stuck `explorer_has_focus` state (same fix as above)
 - [x] Drag-to-select text leaks across editor groups — `mouse_drag_origin_window` field locks drag to originating window until mouse-up; cross-window drag events ignored
+- [x] `%` brace match doesn't scroll to matched brace — center viewport on far jumps
+- [x] TUI tab underline extends to tab number prefix — filename-only underline
+- [x] Preview tab can't be made permanent by clicking tab — `goto_tab()` promotes preview
+- [x] Accidental explorer drag triggers move to same location — source==dest guard
+- [x] GTK tab bar hides tabs despite available space — proportional font char width measurement
+- [x] Terminal panel steals clicks from explorer tree — column guard on terminal click handler
+- [x] Live grep scroll wheel changes file instead of scrolling preview — column-based pane routing + `picker_preview_scroll`
+- [x] Terminal Ctrl+V paste broken — added lowercase 'v' match (TUI) + Ctrl+V handler (GTK)
+- [x] Terminal draws on top of fuzzy finder (TUI+GTK) — moved popups to end of draw order
+- [x] GTK visual select highlights wrong line — `line_to_view` HashMap + wrap-aware line-mode highlight
+- [x] Right-click in terminal shows editor context menu — terminal bounds check before fallthrough
 
 ## Roadmap
 - [x] **Spell checker** — Vim-compatible `]s`/`[s`/`z=`/`zg`/`zw`; spellbook Hunspell parser; bundled en_US dictionary; tree-sitter-aware; `spell`/`spelllang` settings; user dictionary at `~/.config/vimcode/user.dic`
@@ -127,6 +150,8 @@
 - [x] **Terminal: button bar (Add / Close)** — `+` creates a new tab; `×`/`󰅖` closes the active tab; click detection in both GTK and TUI backends
 - [x] **Terminal: horizontal split view** — `⊞`/`󰤼` toolbar button toggles two panes side-by-side; independent PTY sessions; mouse click or Ctrl-W switches active pane; `│` divider
 - [x] **Debugger (DAP)** — Transport + adapter registry + `:DapInstall` (S83); poll loop + breakpoint gutter + stopped-line highlight (S84); variables/call-stack/output panel (S85-86); VSCode-like UI with launch.json (S88); codelldb compat (S89); interactive sidebar + conditional breakpoints (S90)
+- [x] **Status line + command line above terminal pane** — `status_line_above_terminal` setting (default `true`). When enabled and the terminal panel is open, the active window's status line and the command line (`:`, `/`, `?`) render as dedicated rows above the terminal panel. When disabled, status and command line sit below the terminal at the screen bottom. The command line always sits directly below the status line. GTK, TUI, and Win-GUI backends.
+- [ ] **Terminal maximize (full editor coverage)** — Toggle the terminal panel to cover the entire editor area (like VSCode's "Maximize Panel Size" / `Ctrl+`\` behavior). When maximized, the terminal fills the space normally occupied by editor panes; sidebar remains visible. A second toggle restores the previous layout. Keyboard shortcut + toolbar button. Both GTK and TUI backends.
 
 ### Editor Groups
 - [x] **Drag tab between editor groups** — drag a tab from one group's tab bar and drop it onto another group's tab bar to move the buffer; visual drop indicator (highlight bar between tabs or at group edge); dropping on the editor area creates a new split; GTK `DragSource`/`DropTarget` + TUI mouse drag tracking
@@ -248,10 +273,12 @@
 
 ### Picker / Fuzzy Finder
 - [x] **Search history in picker dialogs** — Up arrow at top of results recalls previous searches from the current session. Per-source history stack (`picker_history: HashMap<PickerSource, Vec<String>>`); Down navigates forward or restores the in-progress query; typing/backspace/paste exits history mode; consecutive duplicates deduplicated; capped at 100 entries; session-scoped (not persisted). 7 new tests.
+- [ ] **Full keyboard navigation in picker** — Drive the fuzzy finder entirely by keyboard: Ctrl+J/K or arrow keys to scroll results, Ctrl+U/D for page up/down in results, Ctrl+F/B or arrow keys in preview pane to scroll the preview, Tab to toggle focus between results and preview panes. Currently the picker only supports Up/Down for single-step selection; there is no way to page through results or scroll the preview without a mouse.
 
 ### CI & Distribution
 - [x] **macOS builds via GitHub Actions + Homebrew tap** — Add a macOS build target to the GitHub Actions CI/release workflow (build on `macos-latest` with `cargo build --release`). Produce a universal or arch-specific binary artifact. Create a Homebrew tap repository (e.g. `homebrew-vimcode`) with a formula that installs the release binary. Ensure the release workflow updates the tap formula (SHA256 + version) on each release. Test the full `brew install` → launch cycle in CI.
-- [ ] **Windows portable builds + code signing** — Add a Windows build target to the GitHub Actions CI/release workflow (build on `windows-latest` with `cargo build --release`). Package as a portable app (self-contained `.zip` with `vimcode.exe` + any required DLLs, no installer needed — just extract and run). Attach the `.zip` as a release artifact. Investigate code signing (Authenticode) so the binary doesn't trigger SmartScreen warnings and can be installed/run on corporate machines with restricted execution policies; document the signing process and certificate options (self-signed for testing, trusted CA for production).
+- [x] **Windows TUI builds** — Windows CI job (`windows-latest`) builds `vcd.exe` with `--no-default-features` (no GTK). Release workflow produces `vcd-windows-x86_64.exe` artifact. Windows-specific: `CREATE_NEW_PROCESS_GROUP` for LSP/DAP, powershell clipboard, `cmd /c start` URL opener, `tasklist` PID check, tree-sitter-latex static link, 8 test fixes. GTK GUI build not feasible on Windows (no static linking support).
+- [ ] **Windows code signing** — Investigate Authenticode signing for `vcd-windows-x86_64.exe` to avoid SmartScreen warnings on corporate machines.
 
 ### Website & SEO (vimcode.org)
 - [x] **Project website** — Static landing page on GitHub Pages (`JDonaghy/vimcode-website`), OneDark-derived dark theme, responsive, SEO meta tags + JSON-LD structured data + sitemap. Custom domain `vimcode.org` with HTTPS.
@@ -264,8 +291,14 @@
 - [ ] **Publish on Flathub** — Submit the Flatpak to Flathub for discoverability and a trusted backlink.
 - [ ] **Additional website pages** — Getting Started guide, screenshots gallery, extension registry browser. Add each to sitemap.
 
+### Native Platform GUIs
+- [x] **Native Windows GUI (Direct2D + DirectWrite)** — Native Win32 backend using `windows-rs` + Direct2D + DirectWrite. Produces `vimcode-win.exe` via `win-gui` Cargo feature. `src/win_gui/` directory (~4.5K lines) consuming `ScreenLayout` from `render.rs` — zero changes to core engine. Phase 1: HWND + D2D + DWrite + keyboard → editor pane with syntax. Phase 2: Tab bar, mouse, popups, clipboard. Phase 3: Sidebar, terminal, menu bar, scrollbar, breadcrumbs, DPI awareness. Phase 4: Custom frameless title bar (DWM + NCCALCSIZE + NCHITTEST, caption buttons), native file dialogs (IFileOpenDialog/IFileSaveDialog via COM), IME composition, file watching (notify crate), Segoe UI proportional font for menus/tabs, dynamic window title, accessibility (MSAA via window title).
+- [ ] **Native macOS GUI (Core Graphics + Core Text)** — Future: native macOS backend using `objc2` + Core Graphics rendering + Core Text. Would produce a `.app` bundle. Same `ScreenLayout` consumption pattern as Windows backend. Core Text provides native font rendering with proper Retina support. Depends on Windows backend proving the multi-backend pattern works.
+- [x] **Multi-backend prep work** — Extracted shared hit-testing geometry, key binding matching, and scrollbar helpers from GTK/TUI/Win-GUI into `render.rs`. `ClickTarget` enum now public in render.rs. 8 shared helper functions. `Color::to_f32_rgba()` for D2D/CoreGraphics. `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` in render.rs. `open_url_in_browser()` in core/engine. `notify` crate for cross-platform file watching (replaces GTK's gio::FileMonitor).
+
 ### Remote Editing
 - [ ] **Remote editing over SSH** — Research and design a remote editing story for VimCode. Key questions: (1) **Neovim's approach** — Neovim supports `--remote`, `--server`, and `--headless` modes with a msgpack RPC API; clients connect over stdio/TCP/Unix socket; how much of this is worth emulating? (2) **SSH tunneling** — can VimCode run headless on a remote host with the TUI/GTK frontend on the local machine, forwarding over SSH (à la VS Code Remote SSH)? What's the protocol between frontend and engine? (3) **Headless VimCode** — a `vcd --headless` mode that exposes the engine over a socket/pipe for scripting, testing, or remote frontends; what API surface is needed? (4) **sshfs / FUSE alternative** — simpler approach: open remote files via sshfs mount; what are the LSP/git/terminal implications? (5) **Latency** — how to handle input latency, optimistic rendering, reconnection. Study Neovim's `--headless` + `nvim --listen`, VS Code Remote SSH extension architecture, and Mosh's approach to latency compensation.
 
 ### Documentation
 - [x] **GitHub Wiki** — 9 pages: Home, Getting Started, Key Remapping, Settings Reference, Extension Development, Lua Plugin API, Theme Customization, DAP Debugger Setup, LSP Configuration; README Documentation section links to wiki
+- [x] **README revamp** — Full review and rewrite: updated intro/status (removed alpha hedging), added Platforms table (Linux/macOS/Windows), added Windows native GUI + TUI download instructions, added Windows build commands, updated Architecture tree with win_gui/ directory and all current line counts (~128K total), updated Tech Stack with windows-rs/Direct2D/DirectWrite/notify, added LaTeX to syntax list + semantic token overlay mention, updated test count to 5,391, removed duplicate command table entries, updated Acknowledgements.

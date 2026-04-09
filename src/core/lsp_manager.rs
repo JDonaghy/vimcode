@@ -304,10 +304,14 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let which_cmd = "which";
 
-    let output = std::process::Command::new(which_cmd)
-        .arg(binary)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(which_cmd);
+    cmd.arg(binary);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
         // `where` on Windows may return multiple lines — take the first
@@ -561,9 +565,13 @@ impl LspManager {
 
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH
             #[cfg(target_os = "windows")]
-            let result = std::process::Command::new("cmd")
-                .args(["/C", &install_cmd])
-                .output();
+            let result = {
+                use std::os::windows::process::CommandExt;
+                std::process::Command::new("cmd")
+                    .args(["/C", &install_cmd])
+                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                    .output()
+            };
             #[cfg(not(target_os = "windows"))]
             let result = std::process::Command::new("sh")
                 .args(["-c", &install_cmd])

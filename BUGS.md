@@ -2,10 +2,42 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
-- **GTK terminal panel toggle requires two clicks** — The `[P]` layout toggle button in the GTK status bar requires two clicks to show the terminal panel on the first use. Subsequent toggles work with a single click. Likely a timing issue between the `EngineAction::OpenTerminal` dispatch and the GTK layout recomputation.
+
+- **Win-GUI: scrollbar not visible** — Scrollbar hit-testing and drag handling exist (`scrollbar_hit()`, `scrollbar_drag` state) and `SCROLLBAR_WIDTH` reserves space, but there is no drawing code to paint the scrollbar thumb/track. Clicks on the scrollbar area do work invisibly.
+
+- **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
+
+- **Win-GUI: opening a file replaces current buffer** — Selecting a file from the explorer replaces the current tab's contents instead of opening in a new tab. All file opens use `OpenMode::Permanent` but may be reusing the existing window rather than creating a new tab.
+
+- **Win-GUI: no preview mode** — Preview/transient tab mode (italic filename, replaced on next file open) is not implemented. All opens are permanent.
+
 
 
 ## Resolved
+
+- **GTK terminal panel toggle requires two clicks** — On first use, the `[P]` status bar button sent an async `Msg::ToggleTerminal` via Relm4's message queue instead of creating the terminal tab synchronously. The async path caused a one-frame delay where the terminal state wasn't set, requiring a second click. Fixed by calling `terminal_new_tab()` immediately in the click handler (matching TUI behavior which already handled `OpenTerminal` synchronously).
+
+- **Terminal panel resize not working via mouse** — Two bugs: (1) mouse events didn't trigger a redraw (`needs_redraw` was not set after `handle_mouse`), so the drag visually did nothing; (2) the available-space formula used hardcoded `2` instead of the computed `bottom_chrome` value, giving wrong row counts with default settings (`window_status_line=true` → `bottom_chrome=1`). Fixed by unconditionally setting `needs_redraw=true` after all mouse events, and using `bottom_chrome` in the formula.
+
+- **TUI terminal paste not working** — Ctrl+V in TUI terminal didn't paste. Three fixes: (1) added `poll_terminal()` after paste writes for immediate feedback, (2) wrapped paste in bracketed paste sequences for multi-line safety, (3) falls back to VimCode `+`/`"` registers when system clipboard is empty. Also added error messages instead of silent failure.
+- **GTK terminal Ctrl+C sends newline instead of copying** — `gtk_key_to_pty_bytes()` returned empty for Ctrl+letter keys because GTK's `to_unicode()` filters control chars. Added fallback to derive control byte from `key_name`. Also added Ctrl+Shift+C handler to copy terminal selection.
+- **TUI terminal drag-select offset** — Selection used absolute screen column instead of terminal-relative column (`col.saturating_sub(editor_left)`). Row was off by one because mouse handler hardcoded `2` bottom chrome rows (status+cmd) while per-window status lines (default) hide the global status bar. Fixed all 10 instances in mouse.rs to compute `bottom_chrome` dynamically.
+- **Editor drag leaks into terminal panel** — Editor text drag that moved outside all editor windows fell through to terminal drag handler. Added early return when `mouse_text_drag` is active and no editor window matches.
+
+- **`o` inserts whitespace instead of creating new line (YAML/bash)** — The `o` handler's `insert_pos` calculation only checked for `\n` line endings. For CRLF files (`\r\n`), it inserted between `\r` and `\n`; for lone `\r` files, the new `\n` was absorbed into a CRLF pair, failing to create a new line. Fixed by checking for `\r\n` (skip both) and `\r` alone (insert before it). 4 new tests.
+- **Terminal draws on top of fuzzy finder (TUI + GTK)** — Terminal panel was rendered after the picker popup in both TUI and GTK draw orders, overwriting it. Fixed by moving picker/folder picker/tab switcher/dialog rendering to after the bottom panel in both backends, so popups have higher z-order.
+- **GTK visual select highlights wrong line** — `draw_visual_selection()` used `line_idx - scroll_top` to map buffer lines to view rows, which breaks with wrap, diff padding, or any non-1:1 mapping. Rewrote to iterate over `RenderedLine` entries and use `rl.line_idx` for correct view-row lookup. Also skips diff padding rows (`DiffLine::Padding`) which share `line_idx` with the following real line but occupy a separate view row.
+- **Right-click in terminal shows editor context menu** — Right-click handler fell through to `open_editor_context_menu()` without checking if the click was on the terminal panel. Added terminal bounds check to suppress the context menu on terminal area right-clicks.
+- **Terminal panel steals clicks from explorer tree** — Terminal click handler checked row bounds but not column, so clicks on the sidebar at the same row as the terminal were intercepted. Fixed by adding `col >= editor_left` guard to the TUI terminal panel click handler.
+- **Live grep scroll wheel changes file instead of scrolling preview** — Scroll events in the picker didn't distinguish left (results) vs right (preview) pane. Added column-based hit test: scrolling over the preview pane now scrolls the preview content via `picker_preview_scroll`. Also increased preview line limits (30→500 for files, ±5→±50 context for grep matches) and set initial scroll to center on the match line.
+- **Pasting clipboard into terminal broken** — TUI only handled Ctrl+Shift+V (uppercase 'V' in crossterm) for terminal paste; plain Ctrl+V was forwarded as a raw control character. Added Ctrl+V (lowercase) handler in TUI. Also added Ctrl+V paste in GTK terminal focus (previously only Ctrl+Shift+V worked).
+
+- **`%` brace match doesn't scroll to matched brace** — `%` jumped to the matching brace but the viewport didn't follow for off-screen matches. Fixed by centering the viewport when the match is more than half a screen away (same approach as search `n`). 1 new test.
+- **TUI tab underline extends to tab number prefix** — Active tab underline covered the `N:` prefix. Fixed by splitting the render loop to only apply the underline modifier and accent color to the filename portion (after the `: ` prefix).
+- **Preview tab can't be made permanent by clicking its tab** — `goto_tab()` now calls `promote_preview()` on the active buffer if it's in preview mode, matching VSCode behavior. Works for both GTK and TUI since both call `goto_tab()`. 1 new test.
+- **Accidental explorer drag triggers move dialog to same location** — `confirm_move_file()` now detects when the source file's parent directory is the same as the destination and silently returns. 2 new tests.
+- **GTK tab bar hides tabs despite available space** — The GTK tab bar measured available width using "M" as the reference character, but since GTK uses a proportional sans-serif font, "M" is much wider than average. This made the engine think fewer tabs fit, causing unnecessary scroll offset. Fixed by measuring a representative 15-character sample string for the average char width.
+
 
 - **TUI spell underlines bleed into fuzzy finder** — `set_cell()` and `set_cell_wide()` only reset character/fg/bg but not `cell.modifier` or `cell.underline_color`, so `Modifier::UNDERLINED` from spell rendering survived into the picker overlay. Fixed by resetting both fields in `set_cell()`, `set_cell_wide()`, and `set_cell_styled()` (which left stale `underline_color` when passed `None`).
 

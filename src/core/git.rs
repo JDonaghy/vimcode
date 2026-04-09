@@ -77,8 +77,21 @@ pub struct DiffHunkInfo {
     pub new_count: usize,
 }
 
+/// Create a `git` Command with `CREATE_NO_WINDOW` on Windows to prevent
+/// console window flashes in GUI mode.
+fn git_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
-    Command::new("git")
+    git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -219,7 +232,7 @@ pub fn status_text(dir: &Path) -> Option<String> {
 pub fn stage_file(path: &Path) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent directory")?;
     let path_str = path.to_str().ok_or("invalid path")?;
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(["add", path_str])
@@ -239,7 +252,7 @@ pub fn stage_file(path: &Path) -> Result<(), String> {
 
 /// Run `git add -A` to stage all changes. Returns Ok(()) on success.
 pub fn stage_all(dir: &Path) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(["add", "-A"])
@@ -283,7 +296,7 @@ pub fn parse_diff_hunks(diff: &str) -> (String, Vec<Hunk>) {
 
 /// Run a git command with stdin input, returning stdout or an error string.
 fn run_git_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String, String> {
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -342,7 +355,7 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("commit message cannot be empty".to_string());
     }
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(["commit", "-m", message])
@@ -390,7 +403,7 @@ fn run_git_remote(
         std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1063,29 +1076,29 @@ mod tests {
         let dir = std::env::temp_dir().join("vimcode_show_ref_head");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Command::new("git")
+        git_command()
             .args(["init"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.email", "t@t.com"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.name", "T"])
             .current_dir(&dir)
             .output()
             .unwrap();
         let file = dir.join("test.txt");
         std::fs::write(&file, "original\n").unwrap();
-        Command::new("git")
+        git_command()
             .args(["add", "."])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["commit", "-m", "init"])
             .current_dir(&dir)
             .output()
@@ -1104,23 +1117,23 @@ mod tests {
         let dir = std::env::temp_dir().join("vimcode_show_ref_nofile");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Command::new("git")
+        git_command()
             .args(["init"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.email", "t@t.com"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.name", "T"])
             .current_dir(&dir)
             .output()
             .unwrap();
         // Create an empty commit so HEAD exists
-        Command::new("git")
+        git_command()
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(&dir)
             .output()
@@ -1136,28 +1149,28 @@ mod tests {
         let dir = std::env::temp_dir().join("vimcode_branch_ops");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Command::new("git")
+        git_command()
             .args(["init"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.email", "test@test.com"])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["config", "user.name", "Test"])
             .current_dir(&dir)
             .output()
             .unwrap();
         std::fs::write(dir.join("f.txt"), "x").unwrap();
-        Command::new("git")
+        git_command()
             .args(["add", "."])
             .current_dir(&dir)
             .output()
             .unwrap();
-        Command::new("git")
+        git_command()
             .args(["commit", "-m", "init"])
             .current_dir(&dir)
             .output()
@@ -1306,7 +1319,7 @@ pub fn create_branch(dir: &Path, branch: &str) -> Result<(), String> {
 }
 
 fn run_git_result(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -2031,13 +2044,13 @@ pub fn stash_list(dir: &Path) -> Vec<StashEntry> {
 /// Push changes to stash with an optional message.
 pub fn stash_push(dir: &Path, msg: Option<&str>) -> Result<String, String> {
     let output = if let Some(m) = msg {
-        Command::new("git")
+        git_command()
             .arg("-C")
             .arg(dir)
             .args(["stash", "push", "-m", m])
             .output()
     } else {
-        Command::new("git")
+        git_command()
             .arg("-C")
             .arg(dir)
             .args(["stash", "push"])
@@ -2054,7 +2067,7 @@ pub fn stash_push(dir: &Path, msg: Option<&str>) -> Result<String, String> {
 /// Pop a stash entry by index.
 pub fn stash_pop(dir: &Path, index: usize) -> Result<String, String> {
     let stash_ref = format!("stash@{{{}}}", index);
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(dir)
         .args(["stash", "pop", &stash_ref])

@@ -8345,6 +8345,95 @@ fn test_visual_dedent() {
     assert!(!lines[1].starts_with("    "));
 }
 
+// ─── Context-aware dedent (nesting preservation) ────────────────────────
+
+#[test]
+fn test_dedent_preserves_nesting_mixed_indent() {
+    // When the least-indented line has fewer spaces than shift_width,
+    // all lines should lose only that many spaces, preserving relative nesting.
+    let mut e = engine_with_text("  outer\n      inner\n          deep\n");
+    // shift_width=4 but min indent is 2 — should remove only 2 from each line
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "outer", "outer line should lose 2 spaces");
+    assert_eq!(lines[1], "    inner", "inner line should lose 2 spaces");
+    assert_eq!(lines[2], "        deep", "deep line should lose 2 spaces");
+}
+
+#[test]
+fn test_dedent_preserves_nesting_full_shift() {
+    // When all lines have at least shift_width indent, remove shift_width uniformly.
+    let mut e = engine_with_text("    outer\n        inner\n            deep\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "outer");
+    assert_eq!(lines[1], "    inner");
+    assert_eq!(lines[2], "        deep");
+}
+
+#[test]
+fn test_dedent_skips_blank_lines_for_min() {
+    // Blank lines should not constrain the removal amount.
+    let mut e = engine_with_text("    hello\n\n    world\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "hello");
+    assert_eq!(lines[1], "");
+    assert_eq!(lines[2], "world");
+}
+
+#[test]
+fn test_dedent_no_op_when_min_indent_zero() {
+    // If any non-blank line has zero indent, dedent should be a no-op.
+    let mut e = engine_with_text("no_indent\n    indented\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let text = e.buffer().to_string();
+    assert_eq!(text, "no_indent\n    indented\n");
+}
+
+#[test]
+fn test_dedent_nesting_undo_single_step() {
+    // The entire multi-line dedent should undo in one step.
+    let mut e = engine_with_text("    a\n        b\n            c\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    // Verify dedent happened
+    assert_eq!(e.buffer().to_string(), "a\n    b\n        c\n");
+    // Single undo should restore original
+    press_char(&mut e, 'u');
+    assert_eq!(e.buffer().to_string(), "    a\n        b\n            c\n");
+}
+
+#[test]
+fn test_dedent_normal_mode_preserves_nesting() {
+    // Normal mode 3<< should also preserve nesting.
+    let mut e = engine_with_text("  line1\n      line2\n          line3\n");
+    press_char(&mut e, '3');
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "line1", "should remove only 2 (min indent)");
+    assert_eq!(lines[1], "    line2");
+    assert_eq!(lines[2], "        line3");
+}
+
 // ─── Tag text objects (it / at) ──────────────────────────────────────────
 
 fn make_tag_engine(html: &str) -> Engine {
@@ -18407,4 +18496,215 @@ fn test_notification_ids_increment() {
     let id1 = e.notify(NotificationKind::ProjectSearch, "A");
     let id2 = e.notify(NotificationKind::LspInstall, "B");
     assert!(id2 > id1);
+}
+
+#[test]
+fn test_percent_centers_viewport_on_far_match() {
+    let mut engine = Engine::new();
+    // Create a buffer with opening brace at top and closing brace far away.
+    let mut text = String::from("{\n");
+    for _ in 0..100 {
+        text.push_str("line\n");
+    }
+    text.push('}');
+    engine.buffer_mut().insert(0, &text);
+    engine.update_syntax();
+
+    // Set a viewport size so the match is off-screen.
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.view_mut().scroll_top = 0;
+
+    press_char(&mut engine, '%');
+
+    // Cursor should be on the closing brace line.
+    assert_eq!(engine.view().cursor.line, 101);
+    // Viewport should have scrolled to show the match (centered).
+    assert!(engine.view().scroll_top > 0);
+    // Match should be approximately centered in viewport.
+    let scroll = engine.view().scroll_top;
+    assert!(engine.view().cursor.line >= scroll);
+    assert!(engine.view().cursor.line < scroll + 20);
+}
+
+#[test]
+fn test_goto_tab_promotes_preview() {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("vimcode_test_goto_tab_promote.txt");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"preview content").unwrap();
+    }
+
+    let mut engine = Engine::new();
+    // Open a file in preview mode (simulates single-click in explorer).
+    engine
+        .open_file_with_mode(&path, OpenMode::Preview)
+        .unwrap();
+    let bid = engine.active_buffer_id();
+    assert!(engine.buffer_manager.get(bid).unwrap().preview);
+    assert_eq!(engine.preview_buffer_id, Some(bid));
+
+    // goto_tab (simulates clicking the tab) should promote the preview.
+    let tab_idx = engine.active_group().active_tab;
+    engine.goto_tab(tab_idx);
+    assert!(!engine.buffer_manager.get(bid).unwrap().preview);
+    assert_eq!(engine.preview_buffer_id, None);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_confirm_move_file_same_dir_suppressed() {
+    let mut engine = Engine::new();
+    let src = std::path::PathBuf::from("/tmp/testdir/file.txt");
+    let dest = std::path::PathBuf::from("/tmp/testdir");
+
+    // Moving a file to its own parent directory should be suppressed.
+    engine.confirm_move_file(&src, &dest);
+    assert!(engine.pending_move.is_none());
+    assert!(engine.dialog.is_none());
+}
+
+#[test]
+fn test_confirm_move_file_different_dir_shows_dialog() {
+    let mut engine = Engine::new();
+    let src = std::path::PathBuf::from("/tmp/testdir/file.txt");
+    let dest = std::path::PathBuf::from("/tmp/otherdir");
+
+    // Moving a file to a different directory should show the dialog.
+    engine.confirm_move_file(&src, &dest);
+    assert!(engine.pending_move.is_some());
+    assert!(engine.dialog.is_some());
+}
+
+// ── o / O with CRLF and lone-CR line endings ────────────────────────────
+
+#[test]
+fn test_o_with_crlf_line_endings() {
+    // Buffer uses CRLF line endings — `o` must create a new line, not
+    // get absorbed by the \r\n pair.
+    let mut engine = engine_with_text("AB\r\nCD\r\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 1);
+    // A new empty line should exist between AB and CD.
+    assert_eq!(engine.buffer().len_lines(), 3);
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    let line2: String = engine.buffer().content.line(2).chars().collect();
+    assert!(
+        line0.starts_with("AB"),
+        "line0 should start with AB, got: {:?}",
+        line0
+    );
+    assert!(
+        !line1.starts_with("CD"),
+        "line1 should be the new blank line, got: {:?}",
+        line1
+    );
+    assert!(
+        line2.starts_with("CD"),
+        "line2 should start with CD, got: {:?}",
+        line2
+    );
+}
+
+#[test]
+fn test_o_with_lone_cr_line_endings() {
+    // Buffer uses lone \r line endings (classic Mac) — `o` must still
+    // create a new line, not join lines.
+    let mut engine = engine_with_text("AB\rCD\r");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 1);
+    // Should now have 3 lines: AB, (new blank), CD.
+    assert!(
+        engine.buffer().len_lines() >= 3,
+        "expected >= 3 lines, got {}",
+        engine.buffer().len_lines()
+    );
+    let full: String = engine.buffer().content.chars().collect();
+    // The new line must be a separate line — AB and CD must NOT be joined.
+    assert!(
+        !full.contains("ABCD"),
+        "lines should not be joined, got: {:?}",
+        full
+    );
+}
+
+#[test]
+fn test_o_with_crlf_preserves_content() {
+    // Pressing `o` on the first line of a CRLF file should not corrupt
+    // the second line's content.
+    let mut engine = engine_with_text("hello\r\nworld\r\n");
+    engine.view_mut().cursor.line = 0;
+
+    press_char(&mut engine, 'o');
+    press_special(&mut engine, "Escape");
+
+    let text = engine.buffer().to_string();
+    assert!(
+        text.contains("hello") && text.contains("world"),
+        "both lines should be preserved, got: {:?}",
+        text
+    );
+    // There should be exactly 3 non-empty content lines (hello, new, world).
+    let content_lines: Vec<&str> = text.lines().collect();
+    assert!(
+        content_lines.len() >= 3,
+        "expected >= 3 lines, got {}: {:?}",
+        content_lines.len(),
+        content_lines
+    );
+}
+
+#[test]
+fn test_o_with_crlf_indented_yaml() {
+    // Simulate YAML with CRLF — `o` on an indented line should create
+    // a new indented line below, not join with the next line.
+    let mut engine = engine_with_text("steps:\r\n  - script: |\r\n    echo hi\r\n");
+    engine.settings.auto_indent = true;
+    engine.view_mut().cursor.line = 2; // on "    echo hi"
+
+    press_char(&mut engine, 'o');
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.line, 3);
+    // The new line should have the same indent as "    echo hi" (4 spaces).
+    assert_eq!(engine.view().cursor.col, 4);
+    assert!(
+        engine.buffer().len_lines() >= 4,
+        "expected >= 4 lines, got {}",
+        engine.buffer().len_lines()
+    );
+}
+
+#[test]
+fn test_status_line_above_terminal_setting_toggle() {
+    let mut engine = engine_with_text("hello\n");
+    // Default: status_line_above_terminal is true
+    assert!(engine.settings.status_line_above_terminal);
+
+    // Disable via :set
+    engine.execute_command("set nostatuslineaboveterminal");
+    assert!(!engine.settings.status_line_above_terminal);
+
+    // Re-enable via abbreviation
+    engine.execute_command("set slat");
+    assert!(engine.settings.status_line_above_terminal);
+
+    // Disable via abbreviation
+    engine.execute_command("set noslat");
+    assert!(!engine.settings.status_line_above_terminal);
+
+    // Query via :set slat?
+    engine.execute_command("set slat?");
+    assert_eq!(engine.message, "nostatuslineaboveterminal");
 }

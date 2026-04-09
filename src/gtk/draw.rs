@@ -79,7 +79,11 @@ pub(super) fn draw_editor(
         line_height
     };
     let per_window_status = engine.settings.window_status_line;
-    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
+    let bottom_panel_open_early = engine.terminal_open || engine.bottom_panel_open;
+    let has_separated =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open_early;
+    // Bottom chrome: cmd line + optional global status + wildmenu.
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
     let status_bar_height = line_height * global_status_rows + wildmenu_px;
 
     // Reserve space for the quickfix panel when open
@@ -104,13 +108,26 @@ pub(super) fn draw_editor(
         0.0
     };
 
+    // Separated status: extracted from windows whenever terminal is open.
+    // When noslat + terminal: separated status row goes below terminal.
+    let separated_status_px = if has_separated {
+        line_height // status row below terminal (cmd already in status_bar_height)
+    } else {
+        0.0
+    };
+
     // Calculate window rects for all editor groups.
     // editor_bounds spans the full editor area from y=0; tab_bar_height is reserved per group.
     let editor_bounds = WindowRect::new(
         0.0,
         0.0,
         width as f64,
-        height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        height as f64
+            - status_bar_height
+            - debug_toolbar_px
+            - qf_px
+            - term_px
+            - separated_status_px,
     );
     let (window_rects, _group_dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -375,39 +392,6 @@ pub(super) fn draw_editor(
         }
     }
 
-    // 5d. Draw unified picker modal (on top of everything else)
-    draw_picker_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        line_height,
-    );
-
-    // 5e3. Draw tab switcher popup
-    draw_tab_switcher_popup(
-        cr,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        line_height,
-    );
-
-    // 5e4. Draw modal dialog (highest z-order)
-    let btn_rects = draw_dialog_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        line_height,
-    );
-    *dialog_btn_rects_out.borrow_mut() = btn_rects;
-
     // 5f2. Draw quickfix panel (persistent bottom strip above status bar)
     if qf_px > 0.0 {
         let qf_y = height as f64 - status_bar_height - debug_toolbar_px - qf_px - term_px;
@@ -525,42 +509,104 @@ pub(super) fn draw_editor(
         }
     }
 
-    // 6. Status Line (global — only when per-window status is off)
-    let status_y = height as f64 - status_bar_height;
-    if !per_window_status {
-        draw_status_line(
+    // 5k–7. Status line, wildmenu, and command line.
+    if let Some(ref status) = screen.separated_status_line {
+        // noslat + terminal: [terminal][debug] ... [sep_status][wildmenu?][cmd]
+        let status_y = height as f64 - status_bar_height - separated_status_px;
+        let mut zones = Vec::new();
+        draw_window_status_bar(
             cr,
             &layout,
             &theme,
-            &screen.status_left,
-            &screen.status_right,
-            width as f64,
+            status,
+            0.0,
             status_y,
+            width as f64,
+            line_height,
+            &mut zones,
+        );
+        status_segment_map_out
+            .borrow_mut()
+            .insert(screen.active_window_id.0, zones);
+        let mut next_y = status_y + line_height;
+        if let Some(ref wm) = screen.wildmenu {
+            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            next_y += line_height;
+        }
+        draw_command_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.command,
+            width as f64,
+            next_y,
+            line_height,
+        );
+    } else {
+        // No terminal: original layout with per-window or global status at bottom
+        let status_y = height as f64 - status_bar_height;
+        if !per_window_status {
+            draw_status_line(
+                cr,
+                &layout,
+                &theme,
+                &screen.status_left,
+                &screen.status_right,
+                width as f64,
+                status_y,
+                line_height,
+            );
+        }
+        let mut next_y = if per_window_status {
+            status_y
+        } else {
+            status_y + line_height
+        };
+        if let Some(ref wm) = screen.wildmenu {
+            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            next_y += line_height;
+        }
+        draw_command_line(
+            cr,
+            &layout,
+            &theme,
+            &screen.command,
+            width as f64,
+            next_y,
             line_height,
         );
     }
 
-    // 6b. Wildmenu bar (between status and command line)
-    let mut next_y = if per_window_status {
-        status_y // no global status row — cmd line starts where status_y is
-    } else {
-        status_y + line_height // skip past the global status row
-    };
-    if let Some(ref wm) = screen.wildmenu {
-        draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
-        next_y += line_height;
-    }
-
-    // 7. Command Line (last line)
-    draw_command_line(
+    // 8. Popups and modals — drawn last so they appear on top of everything.
+    draw_picker_popup(
         cr,
         &layout,
+        &screen,
         &theme,
-        &screen.command,
         width as f64,
-        next_y,
+        height as f64,
         line_height,
     );
+
+    draw_tab_switcher_popup(
+        cr,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
+    let btn_rects = draw_dialog_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+    *dialog_btn_rects_out.borrow_mut() = btn_rects;
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
@@ -1063,11 +1109,14 @@ pub(super) fn draw_tab_bar(
 
     // Measure average character width, then report tab bar width in
     // character-column equivalents so the engine can compute tab fits
-    // using char-based tab name widths.
+    // using char-based tab name widths.  Use a representative sample
+    // string instead of just "M" — proportional fonts make "M" much
+    // wider than the average character, causing the engine to think
+    // fewer tabs fit than actually do.
     layout.set_font_description(Some(&normal_font));
-    layout.set_text("M");
-    let (char_px, _) = layout.pixel_size();
-    let char_w = (char_px as f64).max(1.0);
+    layout.set_text("ABCDabcd0123.:_");
+    let (sample_px, _) = layout.pixel_size();
+    let char_w = (sample_px as f64 / 15.0).max(1.0);
     let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
 
     // Draw the editor action menu button ("…") at the far right.
@@ -1723,20 +1772,41 @@ pub(super) fn draw_visual_selection(
     lines: &[render::RenderedLine],
     rect: &WindowRect,
     line_height: f64,
-    scroll_top: usize,
+    _scroll_top: usize,
     text_x_offset: f64,
     color: render::Color,
     alpha: f64,
 ) {
-    let visible_lines = lines.len();
     let (sr, sg, sb) = color.to_cairo();
     cr.set_source_rgba(sr, sg, sb, alpha);
 
+    // Build a mapping from buffer line → view row index.  For each buffer
+    // line we take the LAST non-skippable rendered row (skipping wrap
+    // continuations, diff padding, and ghost continuations that share the
+    // same line_idx but occupy preceding view rows).
+    let mut line_to_view: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for (view_idx, rl) in lines.iter().enumerate() {
+        if rl.is_wrap_continuation || rl.is_ghost_continuation {
+            continue;
+        }
+        if rl.diff_status == Some(crate::core::engine::DiffLine::Padding) {
+            continue;
+        }
+        // Overwrite with latest view_idx → picks the content row, not a
+        // preceding padding/ghost row with the same line_idx.
+        line_to_view.insert(rl.line_idx, view_idx);
+    }
     match sel.kind {
         SelectionKind::Line => {
-            for line_idx in sel.start_line..=sel.end_line {
-                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                    let view_idx = line_idx - scroll_top;
+            // Line-mode: highlight ALL visual rows (including wrap continuations)
+            // for each selected buffer line, so wrapped lines are fully covered.
+            for (view_idx, rl) in lines.iter().enumerate() {
+                if rl.line_idx >= sel.start_line
+                    && rl.line_idx <= sel.end_line
+                    && rl.diff_status != Some(crate::core::engine::DiffLine::Padding)
+                    && !rl.is_ghost_continuation
+                {
                     let y = rect.y + view_idx as f64 * line_height;
                     let highlight_width = rect.width - (text_x_offset - rect.x);
                     cr.rectangle(text_x_offset, y, highlight_width, line_height);
@@ -1745,16 +1815,19 @@ pub(super) fn draw_visual_selection(
             cr.fill().ok();
         }
         SelectionKind::Char => {
-            if sel.start_line == sel.end_line {
-                // Single-line selection
-                if sel.start_line >= scroll_top && sel.start_line < scroll_top + visible_lines {
-                    let view_idx = sel.start_line - scroll_top;
-                    let y = rect.y + view_idx as f64 * line_height;
-                    let line_text = &lines[view_idx].raw_text;
+            for line_idx in sel.start_line..=sel.end_line {
+                let Some(&view_idx) = line_to_view.get(&line_idx) else {
+                    continue;
+                };
+                let rl = &lines[view_idx];
+                let y = rect.y + view_idx as f64 * line_height;
+                let line_text = &rl.raw_text;
 
-                    layout.set_text(line_text);
-                    layout.set_attributes(None);
+                layout.set_text(line_text);
+                layout.set_attributes(None);
 
+                if sel.start_line == sel.end_line {
+                    // Single-line selection
                     let start_byte = line_text
                         .char_indices()
                         .nth(sel.start_col)
@@ -1774,86 +1847,72 @@ pub(super) fn draw_visual_selection(
 
                     cr.rectangle(start_x, y, end_x - start_x, line_height);
                     cr.fill().ok();
-                }
-            } else {
-                // Multi-line selection
-                for line_idx in sel.start_line..=sel.end_line {
-                    if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                        let view_idx = line_idx - scroll_top;
-                        let y = rect.y + view_idx as f64 * line_height;
-                        let line_text = &lines[view_idx].raw_text;
-
-                        layout.set_text(line_text);
-                        layout.set_attributes(None);
-
-                        if line_idx == sel.start_line {
-                            let start_byte = line_text
-                                .char_indices()
-                                .nth(sel.start_col)
-                                .map(|(i, _)| i)
-                                .unwrap_or(line_text.len());
-                            let start_pos = layout.index_to_pos(start_byte as i32);
-                            let start_x =
-                                text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-                            let (line_width, _) = layout.pixel_size();
-                            cr.rectangle(
-                                start_x,
-                                y,
-                                text_x_offset + line_width as f64 - start_x,
-                                line_height,
-                            );
-                            cr.fill().ok();
-                        } else if line_idx == sel.end_line {
-                            let end_col = (sel.end_col + 1).min(line_text.chars().count());
-                            let end_byte = line_text
-                                .char_indices()
-                                .nth(end_col)
-                                .map(|(i, _)| i)
-                                .unwrap_or(line_text.len());
-                            let end_pos = layout.index_to_pos(end_byte as i32);
-                            let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-                            cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
-                            cr.fill().ok();
-                        } else {
-                            let (line_width, _) = layout.pixel_size();
-                            cr.rectangle(text_x_offset, y, line_width as f64, line_height);
-                            cr.fill().ok();
-                        }
-                    }
+                } else if line_idx == sel.start_line {
+                    let start_byte = line_text
+                        .char_indices()
+                        .nth(sel.start_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let start_pos = layout.index_to_pos(start_byte as i32);
+                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+                    let (line_width, _) = layout.pixel_size();
+                    cr.rectangle(
+                        start_x,
+                        y,
+                        text_x_offset + line_width as f64 - start_x,
+                        line_height,
+                    );
+                    cr.fill().ok();
+                } else if line_idx == sel.end_line {
+                    let end_col = (sel.end_col + 1).min(line_text.chars().count());
+                    let end_byte = line_text
+                        .char_indices()
+                        .nth(end_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let end_pos = layout.index_to_pos(end_byte as i32);
+                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+                    cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
+                    cr.fill().ok();
+                } else {
+                    let (line_width, _) = layout.pixel_size();
+                    cr.rectangle(text_x_offset, y, line_width as f64, line_height);
+                    cr.fill().ok();
                 }
             }
         }
         SelectionKind::Block => {
             for line_idx in sel.start_line..=sel.end_line {
-                if line_idx >= scroll_top && line_idx < scroll_top + visible_lines {
-                    let view_idx = line_idx - scroll_top;
-                    let y = rect.y + view_idx as f64 * line_height;
-                    let line_text = &lines[view_idx].raw_text;
-                    let line_len = line_text.chars().count();
+                let Some(&view_idx) = line_to_view.get(&line_idx) else {
+                    continue;
+                };
+                let rl = &lines[view_idx];
+                let y = rect.y + view_idx as f64 * line_height;
+                let line_text = &rl.raw_text;
+                let line_len = line_text.chars().count();
 
-                    layout.set_text(line_text);
-                    layout.set_attributes(None);
+                layout.set_text(line_text);
+                layout.set_attributes(None);
 
-                    if sel.start_col < line_len {
-                        let start_byte = line_text
-                            .char_indices()
-                            .nth(sel.start_col)
-                            .map(|(i, _)| i)
-                            .unwrap_or(line_text.len());
-                        let start_pos = layout.index_to_pos(start_byte as i32);
-                        let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
+                if sel.start_col < line_len {
+                    let start_byte = line_text
+                        .char_indices()
+                        .nth(sel.start_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let start_pos = layout.index_to_pos(start_byte as i32);
+                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
 
-                        let block_end_col = (sel.end_col + 1).min(line_len);
-                        let end_byte = line_text
-                            .char_indices()
-                            .nth(block_end_col)
-                            .map(|(i, _)| i)
-                            .unwrap_or(line_text.len());
-                        let end_pos = layout.index_to_pos(end_byte as i32);
-                        let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
+                    let block_end_col = (sel.end_col + 1).min(line_len);
+                    let end_byte = line_text
+                        .char_indices()
+                        .nth(block_end_col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line_text.len());
+                    let end_pos = layout.index_to_pos(end_byte as i32);
+                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
 
-                        cr.rectangle(start_x, y, end_x - start_x, line_height);
-                    }
+                    cr.rectangle(start_x, y, end_x - start_x, line_height);
                 }
             }
             cr.fill().ok();

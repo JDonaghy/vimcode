@@ -37,11 +37,13 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 
 ## Architecture
 
-**VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher.
+**VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI) vs `src/win_gui/` (native Windows). `src/main.rs` is a thin CLI dispatcher.
 
-**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey (text rope), Tree-sitter (parsing), Pango+Cairo (rendering), ratatui+crossterm (TUI)
+**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey (text rope), Tree-sitter (parsing), Pango+Cairo (rendering), ratatui+crossterm (TUI), windows-rs+Direct2D+DirectWrite (Win-GUI)
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
+
+**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there.
 
 ### GTK directory (`src/gtk/`)
 
@@ -62,6 +64,14 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 | `render_impl.rs` | `draw_frame()`, `build_screen_for_tui()`, tab bar, editor/popup rendering |
 | `panels.rs` | Sidebar panel rendering (activity bar, explorer, git, debug, extensions, AI, search, terminal) |
 | `mouse.rs` | `handle_mouse()` — all click/drag/scroll interactions |
+
+### Win-GUI directory (`src/win_gui/`)
+
+Native Windows backend using `windows-rs` + Direct2D + DirectWrite. Behind `win-gui` Cargo feature. Consumes `ScreenLayout` from `render.rs` — same pattern as GTK/TUI. Some features are still missing (see BUGS.md for known Win-GUI gaps).
+
+| File | What goes here |
+|------|---------------|
+| `mod.rs` | Win32 window creation, D2D/DWrite setup, event loop, keyboard/mouse handling, rendering |
 
 ### Engine directory (`src/core/engine/`)
 

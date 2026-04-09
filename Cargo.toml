@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -32,9 +32,15 @@ required-features = ["gui"]
 name = "vcd"
 path = "src/tui_bin.rs"
 
+[[bin]]
+name = "vimcode-win"
+path = "src/win_gui_bin.rs"
+required-features = ["win-gui"]
+
 [features]
 default = ["gui"]
 gui = ["gtk4", "relm4", "pangocairo", "gio"]
+win-gui = ["windows"]
 
 [dependencies]
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
@@ -78,6 +84,26 @@ libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
 spellbook = "0.4.0"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+], optional = true }
 
 [build-dependencies]
 cc = "1.0"

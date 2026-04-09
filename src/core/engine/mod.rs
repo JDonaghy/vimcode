@@ -1172,6 +1172,46 @@ pub fn is_safe_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
+/// Open a URL in the platform's default browser. Validates the URL scheme
+/// first via `is_safe_url`. This is shared across all backends (GTK, TUI,
+/// Win-GUI) to avoid duplicating platform-specific logic.
+pub fn open_url_in_browser(url: &str) {
+    if !is_safe_url(url) {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `cmd /c start "" "url"` — empty title needed for start.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "start", "", url])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        cmd.spawn().ok();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+    }
+}
+
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
 fn hex_val(b: u8) -> Option<u8> {
     match b {
@@ -2198,6 +2238,8 @@ pub struct Engine {
     pub picker_title: String,
     /// Preview pane content for the selected item, or None for no-preview sources.
     pub picker_preview: Option<PickerPreview>,
+    /// Scroll offset for the preview pane (lines scrolled from top).
+    pub picker_preview_scroll: usize,
     /// Per-source search history (session-scoped, not persisted).
     pub picker_history: std::collections::HashMap<PickerSource, Vec<String>>,
     /// Current position in history when navigating (None = not browsing history).
@@ -2491,6 +2533,9 @@ pub struct Engine {
     /// Pending git remote operation awaiting SSH passphrase from dialog.
     /// Holds `"push"`, `"pull"`, or `"fetch"`.
     pub pending_git_remote_op: Option<String>,
+    /// Pending discard operation awaiting dialog confirmation.
+    /// `Some(path)` for a single file, `Some("")` for discard-all.
+    pub pending_sc_discard: Option<String>,
 
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
@@ -2686,6 +2731,14 @@ pub struct Engine {
     /// Inline new-file/folder state for the explorer sidebar.  When `Some`,
     /// a temporary editable row is inserted in the tree under `parent_dir`.
     pub explorer_new_entry: Option<ExplorerNewEntryState>,
+
+    // --- File watching (external modification detection) ---
+    /// Cross-platform file watcher (notify crate). Watches open buffer files for changes.
+    file_watcher: Option<notify::RecommendedWatcher>,
+    /// Receiver for file change events from the watcher.
+    file_watcher_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
+    /// Paths that have been reported as modified but not yet handled (avoids duplicate dialogs).
+    pub file_watcher_pending: HashSet<PathBuf>,
 }
 
 impl Engine {
@@ -2872,6 +2925,7 @@ impl Engine {
             picker_scroll_top: 0,
             picker_title: String::new(),
             picker_preview: None,
+            picker_preview_scroll: 0,
             picker_history: std::collections::HashMap::new(),
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),
@@ -2978,6 +3032,7 @@ impl Engine {
             ext_sidebar_input_active: false,
             pending_ext_remove: None,
             pending_git_remote_op: None,
+            pending_sc_discard: None,
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
@@ -3052,7 +3107,12 @@ impl Engine {
             explorer_needs_refresh: false,
             explorer_rename: None,
             explorer_new_entry: None,
+            file_watcher: None,
+            file_watcher_rx: None,
+            file_watcher_pending: HashSet::new(),
         };
+        // Initialize file watcher
+        engine.init_file_watcher();
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;

@@ -1419,8 +1419,12 @@ impl SimpleComponent for App {
                                                 }
                                             }
                                         }
-                                        // Ctrl+Y: copy terminal selection to clipboard.
+                                        // Ctrl+Y / Ctrl+Shift+C: copy terminal selection to clipboard.
                                         if ctrl && !shift && (key_name == "y" || key_name == "Y") {
+                                            sender.input(Msg::TerminalCopySelection);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        if ctrl && shift && (key_name == "c" || key_name == "C") {
                                             sender.input(Msg::TerminalCopySelection);
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1447,6 +1451,11 @@ impl SimpleComponent for App {
                                             && engine.borrow().terminal_split
                                         {
                                             engine.borrow_mut().terminal_split_switch_focus();
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
+                                        // Ctrl+V (without shift): paste clipboard to PTY (VS Code behavior).
+                                        if ctrl && !shift && (key_name == "v" || key_name == "V") {
+                                            sender.input(Msg::TerminalPasteClipboard);
                                             return gtk4::glib::Propagation::Stop;
                                         }
                                         let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
@@ -3881,28 +3890,7 @@ impl SimpleComponent for App {
                     let widget = g.widget();
                     let width = widget.width() as f64;
                     let height = widget.height() as f64;
-                    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                        0.0
-                    } else {
-                        lh
-                    };
-                    let status_h = lh * 2.0 + wildmenu_px;
-                    let dbg_px = if engine.debug_toolbar_visible {
-                        lh
-                    } else {
-                        0.0
-                    };
-                    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                        6.0 * lh
-                    } else {
-                        0.0
-                    };
-                    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                        (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-                    } else {
-                        0.0
-                    };
-                    let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+                    let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
                     let content_bounds =
                         core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                     let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
@@ -4738,32 +4726,11 @@ fn sync_scrollbar_positions(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-    } else {
-        0.0
-    };
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
         da_width,
-        da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+        gtk_editor_bottom(engine, da_width, da_height, line_height),
     );
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -5081,33 +5048,11 @@ impl App {
         } else {
             tab_row_height
         };
-        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-            0.0
-        } else {
-            line_height
-        };
-        let status_bar_height = line_height * 2.0 + wildmenu_px;
-        let debug_toolbar_px = if engine.debug_toolbar_visible {
-            line_height
-        } else {
-            0.0
-        };
-        let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-            6.0 * line_height
-        } else {
-            0.0
-        };
-        let term_px = if engine.terminal_open || engine.bottom_panel_open {
-            (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
-        } else {
-            0.0
-        };
-
         let editor_bounds = WindowRect::new(
             0.0,
             0.0,
             da_width,
-            da_height - status_bar_height - debug_toolbar_px - qf_px - term_px,
+            gtk_editor_bottom(&engine, da_width, da_height, line_height),
         );
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
@@ -6503,8 +6448,13 @@ impl App {
                                 return;
                             }
                             Some(core::engine::EngineAction::OpenTerminal) => {
+                                // Create the terminal tab immediately (not via
+                                // async Msg::ToggleTerminal) so the panel
+                                // appears on this same draw cycle.
+                                let cols = self.terminal_cols();
+                                let rows = engine.session.terminal_panel_rows;
+                                engine.terminal_new_tab(cols, rows);
                                 drop(engine);
-                                sender.input(Msg::ToggleTerminal);
                                 self.draw_needed.set(true);
                                 return;
                             }
@@ -6699,28 +6649,7 @@ impl App {
         if let Some(split_index) = self.group_divider_dragging {
             let engine = self.engine.borrow();
             let lh = self.cached_line_height;
-            let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                0.0
-            } else {
-                lh
-            };
-            let status_h = lh * 2.0 + wildmenu_px;
-            let dbg_px = if engine.debug_toolbar_visible {
-                lh
-            } else {
-                0.0
-            };
-            let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                6.0 * lh
-            } else {
-                0.0
-            };
-            let term_px = if engine.terminal_open || engine.bottom_panel_open {
-                (engine.session.terminal_panel_rows as f64 + 2.0) * lh
-            } else {
-                0.0
-            };
-            let editor_bottom = height - status_h - dbg_px - qf_px - term_px;
+            let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
             drop(engine);
             let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
             let dividers = self
@@ -6765,9 +6694,14 @@ impl App {
                 };
                 let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let available = (height - y - status_h).max(0.0);
+                // Leave at least 4 editor lines visible (+ tab bar chrome)
+                let min_editor_lines = 4.0 + 1.0; // 4 lines + tab bar
+                let max_rows = ((height - status_h - min_editor_lines * self.cached_line_height)
+                    / self.cached_line_height) as u16;
+                let max_rows = max_rows.saturating_sub(2).max(5);
                 let new_rows = ((available / self.cached_line_height) as u16)
                     .saturating_sub(2)
-                    .clamp(5, 30);
+                    .clamp(5, max_rows);
                 self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
                 self.draw_needed.set(true);
             }
@@ -9659,73 +9593,8 @@ impl App {
     }
 }
 
-/// Map a visible row index (0-based from scroll_top) to the corresponding
-/// buffer line index, skipping lines hidden inside closed folds.
-fn view_row_to_buf_line(
-    view: &crate::core::view::View,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-) -> usize {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        if visible == view_row {
-            return buf_line;
-        }
-        visible += 1;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
-        }
-    }
-    // Clamp to last valid line
-    total_lines.saturating_sub(1)
-}
-
-/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
-/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
-/// character index within the buffer line where the clicked visual segment starts.
-fn view_row_to_buf_pos_wrap(
-    view: &crate::core::view::View,
-    buffer: &crate::core::buffer::Buffer,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-    viewport_cols: usize,
-) -> (usize, usize) {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        // Compute how many visual rows this buffer line occupies when wrapped.
-        let line_str = buffer.content.line(buf_line).to_string();
-        let line_str = line_str.trim_end_matches('\n');
-        let segments = render::compute_word_wrap_segments(line_str, viewport_cols);
-        let visual_rows = segments.len();
-        if view_row < visible + visual_rows {
-            // The clicked row falls within this buffer line.
-            let seg_idx = view_row - visible;
-            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
-            return (buf_line, seg_col_offset);
-        }
-        visible += visual_rows;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
-        }
-    }
-    (total_lines.saturating_sub(1), 0)
-}
+// view_row_to_buf_line and view_row_to_buf_pos_wrap are now shared functions
+// in render.rs — use render::view_row_to_buf_line / render::view_row_to_buf_pos_wrap.
 
 /// Calculate gutter width in pixels based on line number mode and buffer size
 #[allow(dead_code)]
@@ -9754,6 +9623,10 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         line_height
     };
+    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+    let has_separated = engine.settings.window_status_line
+        && !engine.settings.status_line_above_terminal
+        && bp_open;
     let global_status_rows = if engine.settings.window_status_line {
         1.0
     } else {
@@ -9765,7 +9638,7 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         0.0
     };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
+    let term_px = if bp_open {
         (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
     } else {
         0.0
@@ -9775,7 +9648,12 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     } else {
         0.0
     };
-    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px
+    let separated_status_px = if has_separated {
+        line_height // status row below terminal (cmd already in status_bar_height)
+    } else {
+        0.0
+    };
+    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px - separated_status_px
 }
 
 /// Compute editor window rects with the same formula used by draw_editor and

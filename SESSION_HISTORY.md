@@ -1,7 +1,100 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 253 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 263 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 263 — Status line positioning + Windows alpha note (5422 tests):**
+
+1. **`status_line_above_terminal` setting** (default `true`, abbreviation `slat`): controls where the status line and command line appear relative to the terminal panel.
+   - `slat` ON (default): per-window status bars stay inside each editor split window as before — they're naturally above the terminal by being part of the editor area. Command line at screen bottom.
+   - `noslat`: when terminal is open, per-window status bars are removed from windows; a single status bar for the active file renders below the terminal panel, with the command line directly below it.
+2. **New setting infrastructure**: field on `Settings` struct with `#[serde(default)]`, `parse_set_option` for `:set slat`/`:set noslat`, `get_value_str`/`set_value_str` for JSON, `SettingDef` for Settings UI.
+3. **render.rs**: `separated_status_line: Option<WindowStatusLine>` on `ScreenLayout`; `build_screen_layout()` conditionally extracts active window status; `separated_status_height_px()` helper; updated `editor_bottom_px()`.
+4. **TUI backend**: 8-slot vertical layout with conditional separated status row between debug toolbar and wildmenu; `render_window_status_line()` for separated bar; mouse click detection via `status_segment_hit_test()`.
+5. **GTK backend**: `draw_window_status_bar()` for separated status below terminal; `gtk_editor_bottom()` helper consolidated 6+ inline editor_bottom calculations; click zones auto-populated via `status_segment_map`.
+6. **Win-GUI backend**: `draw_separated_status_line()` method; `draw_command_line()` repositioned when separated; layout `bottom_chrome` adjusted.
+7. **README**: Windows native GUI marked as **alpha** in Platforms table; added warning note in Windows install section recommending TUI build.
+8. **3 new tests**: setting toggle, `editor_bottom_px` with separated status, `separated_status_height_px`.
+
+---
+
+**Session 262 — 7 bug fixes: terminal paste, GTK Ctrl+C, mouse selection, CI (5415 tests):**
+
+1. **TUI terminal paste**: Added `poll_terminal()` for immediate feedback, wrapped paste in bracketed paste escape sequences for multi-line safety, added register fallback (system clipboard → `+` register → `"` register) so yanked text is available in terminal Ctrl+V. Added error messages instead of silent failure.
+2. **GTK terminal Ctrl+C**: `gtk_key_to_pty_bytes()` returned empty for Ctrl+letter keys because GTK's `to_unicode()` filters control characters. Added fallback to derive control byte from `key_name` (single letter → `& 0x1f`). Plain Ctrl+C now sends `\x03` (SIGINT) correctly. Added Ctrl+Shift+C handler to copy terminal selection.
+3. **TUI terminal selection column offset**: Selection start/drag used absolute screen `col` instead of terminal-relative `col.saturating_sub(editor_left)`. Fixed both click and drag handlers.
+4. **TUI terminal selection row offset**: Mouse handler hardcoded `2` bottom chrome rows (status + command line), but per-window status lines (default) hide the global status bar — only 1 bottom chrome row. Replaced all 10 hardcoded instances with dynamic `bottom_chrome` variable.
+5. **Editor drag leaking into terminal**: Editor text drag that moved outside all editor windows fell through to terminal drag handler, creating phantom selections. Added early return when `mouse_text_drag` is active.
+6. **Terminal drag guard**: Added `col >= editor_left` check and existing-selection requirement to terminal drag handler to prevent sidebar clicks from activating terminal selection.
+7. **CI coverage job failure**: `--all-features` on Linux pulled in `win-gui` → `windows-rs` crates with `windows-future 0.2.1` API incompatibility (`IMarshal`/`marshaler` not found). Changed to `--features gui`.
+
+Files changed: `src/tui_main/mod.rs`, `src/tui_main/mouse.rs`, `src/gtk/mod.rs`, `src/gtk/util.rs`, `.github/workflows/ci.yml`, `BUGS.md`.
+
+---
+
+**Session 261 — Fix `o` CRLF/CR line ending bug (5415 tests):**
+
+Bug fix: `o` command failed to create a new line in files with CRLF (`\r\n`) or lone CR (`\r`) line endings. The `insert_pos` calculation in `keys.rs` only checked for `\n`, so for CRLF it inserted between `\r` and `\n` (Ropey re-paired them but created mixed endings), and for lone `\r` the new `\n` was absorbed into a CRLF pair — no new line appeared. Fixed by using `RopeSlice::char()` indexed access to detect `\r\n` (skip 2 chars) and `\r` alone (insert before it). 4 new tests covering CRLF, lone CR, content preservation, and indented YAML scenarios.
+
+---
+
+**Session 260 — 12 bug fixes (5396 tests):**
+
+Massive bug fix session fixing 12 bugs across GTK, TUI, and core engine. Also filed 10 new bugs, 2 new features (status line above terminal, terminal maximize), and 1 new feature request (full keyboard navigation in picker).
+
+Bug fixes:
+1. `%` brace match doesn't scroll — center viewport when match is >½ screen away (`keys.rs`). 1 test.
+2. TUI tab underline extends to number prefix — split render loop, underline only on filename portion after `: ` (`render_impl.rs`).
+3. Preview tab can't be made permanent by clicking tab — `goto_tab()` calls `promote_preview()` on active buffer (`windows.rs`). 1 test.
+4. Accidental explorer drag triggers move to same location — `confirm_move_file()` returns early when `src.parent() == dest` (`buffers.rs`). 2 tests.
+5. GTK tab bar hides tabs despite available space — char width measurement used "M" (widest Latin char) with proportional font; changed to 15-char representative sample (`draw.rs`).
+6. Terminal panel steals clicks from explorer tree — added `col >= editor_left` guard to TUI terminal click handler (`mouse.rs`).
+7. Live grep scroll wheel changes file instead of scrolling preview — added column-based pane detection; `picker_preview_scroll` field on Engine; increased preview context (30→500 lines, ±5→±50 grep context); initial scroll centers on match (`mouse.rs`, `picker.rs`, `render.rs`, `mod.rs`).
+8. Terminal Ctrl+V paste broken — TUI: added lowercase 'v' match; GTK: added Ctrl+V handler in terminal focus block (`tui_main/mod.rs`, `gtk/mod.rs`).
+9. TUI terminal draws on top of fuzzy finder — moved picker/folder-picker/tab-switcher rendering after bottom panel in draw order (`render_impl.rs`).
+10. GTK terminal draws on top of fuzzy finder — moved picker/tab-switcher/dialog to absolute end of `draw_editor()` after all persistent UI (`draw.rs`).
+11. GTK visual select highlights wrong line — rewrote `draw_visual_selection()`: built `line_to_view` HashMap mapping buffer line→last non-skippable view row; line-mode iterates all visual rows (including wrap continuations); skips `DiffLine::Padding` and `is_ghost_continuation` (`draw.rs`).
+12. Right-click in terminal shows editor context menu — added terminal bounds check before `open_editor_context_menu()` fallthrough (`mouse.rs`).
+
+Also fixed: pre-existing clippy warning in `git.rs` (`#[allow(unused_mut)]` for Windows-only mutation).
+
+Files changed: `src/core/engine/keys.rs`, `src/core/engine/windows.rs`, `src/core/engine/buffers.rs`, `src/core/engine/mod.rs`, `src/core/engine/picker.rs`, `src/core/engine/tests.rs`, `src/core/git.rs`, `src/render.rs`, `src/gtk/draw.rs`, `src/gtk/mod.rs`, `src/tui_main/render_impl.rs`, `src/tui_main/mouse.rs`, `src/tui_main/mod.rs`, `BUGS.md`, `PLAN.md`, `PROJECT_STATE.md`.
+
+**Session 259 — README revamp (5391 tests):**
+
+Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha software" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
+
+---
+
+**Session 258 — Multi-backend shared hit-testing & key-binding extraction (5320 tests):**
+
+Merged `windows` branch into `develop`. Extracted shared hit-testing and key-binding code from GTK/TUI/Win-GUI backends into platform-agnostic `render.rs`. Moved `ClickTarget` enum from `gtk/click.rs` to `render.rs` (now `pub`). Added 8 shared geometry/hit-testing helper functions: `tab_row_height_px()`, `tab_bar_height_px()`, `status_bar_height_px()`, `editor_bottom_px()` (layout dimensions), `scrollbar_click_to_scroll_top()` (ratio-based scroll), `display_col_to_buffer_col()` (tab-aware column mapping), `is_tab_close_click()` (close button zone), `matches_key_binding()` (Vim-style key notation matcher). GTK: `pixel_to_click_target()` uses `tab_bar_height_px()` + `editor_bottom_px()` instead of inline math; `matches_gtk_key()` extracts GDK modifiers and delegates to `matches_key_binding()`. TUI: `matches_tui_key()` extracts crossterm modifiers and delegates; scrollbar click uses `scrollbar_click_to_scroll_top()`. Win-GUI: `scrollbar_hit()` uses shared scrollbar helper. All functions are pure (no platform deps), take basic types (f64, usize, bool, &str). 7 comprehensive tests. Filed 4 pre-existing win-gui bugs: scrollbar not drawn (hit area exists but no paint code), tab bar clicks not working, file open replaces buffer instead of new tab, no preview mode. Files changed: `render.rs` (+352), `gtk/click.rs` (-52), `gtk/util.rs` (-17), `tui_main/mod.rs` (-17), `tui_main/mouse.rs` (-4), `win_gui/mod.rs` (-4), `BUGS.md` (+8).
+
+---
+
+**Session 257 — Win-GUI Phase 4: custom title bar, native file dialogs, IME, file watching (5313 tests):**
+
+Custom frameless title bar: WM_NCCALCSIZE removes Windows chrome, DwmExtendFrameIntoClientArea preserves native shadow and Win11 rounded corners, WM_NCHITTEST provides drag (HTCAPTION), resize borders (HTTOP/HTTOPLEFT/HTTOPRIGHT), caption button zones (HTCLIENT). Min/max/close buttons with hover states (red for close, lighter for min/max). Full title bar returns HTCLIENT when menu dropdown is open to enable hover switching. Taller title bar (1.8× line_height) with 6px top inset for DWM shadow zone. Native file dialogs via COM: IFileOpenDialog for File > Open File and File > Open Folder (FOS_PICKFOLDERS), IFileSaveDialog for Save Workspace As. CoInitializeEx at startup. Menu action strings intercepted before execute_command (same pattern as GTK backend). IME composition: WM_IME_STARTCOMPOSITION positions candidate window at cursor via ImmSetCompositionWindow with CFS_POINT. Cursor pixel position computed from cached window rects + scroll offset with DPI scaling. Cross-platform file watching: notify crate v7, RecommendedWatcher initialized in Engine::new(), files watched on open, tick_file_watcher() polled from win-gui and TUI backends, auto-reload non-dirty buffers, reload/keep dialog for dirty buffers via engine dialog system. UI polish: Segoe UI 13px proportional font for menu bar and tab labels (matching VSCode), separate IDWriteTextFormat + draw_ui_text()/measure_ui_text() helpers. Taller tab bar (1.5× line_height) with proper padding and vertical centering. Menu bar uses tab_bar_bg (dark) instead of status_bg (blue). Dark dropdown background (background.lighten(0.10)). Dynamic window title: "filename — VimCode" with dirty indicator. Bug fix: double RefCell borrow panic in on_mouse_move — caption_button_at() called APP.with(borrow()) inside APP.with(borrow_mut()), silently caught by catch_unwind, preventing all menu hover code from executing. Fixed by inlining the check. Files changed: Cargo.toml (+7 features), Cargo.lock (+126), src/win_gui/mod.rs (+546), src/win_gui/draw.rs (+197), src/core/engine/mod.rs (+13 fields), src/core/engine/buffers.rs (+168 file watcher), src/core/engine/panels.rs (+4 dialog handler), src/tui_main/mod.rs (+2 tick call).
+
+---
+
+**Session 256 — Win-GUI Phase 3: menu bar, terminal, DPI, sidebar clicks, breadcrumbs (5313 tests):**
+
+Menu bar with dropdowns (rendering, keyboard nav with arrow keys/Enter/Escape, mouse hover switching between menus, item highlight), terminal panel (D2D cell-grid rendering, PTY keyboard input, Ctrl-T toggle, toolbar with tabs, find bar), per-monitor DPI awareness (WM_DPICHANGED, physical-to-DIP mouse coords, render target recreation), sidebar panel click handling (Git section toggle/selection, Extensions expand/select, Settings row select, AI/Search/Debug focus), scrollbar click-to-jump + drag, breadcrumb bar rendering, tab bar sidebar/menu offset, D2D axis-aligned clip, periodic git status refresh, Win32_UI_HiDpi feature. 15 iterative bug fixes during testing.
+
+---
+
+**Session 255 — Multi-backend prep for native Windows/macOS GUIs (5313 tests):**
+
+`Color::to_f32_rgba()` for D2D/CoreGraphics; extracted `view_row_to_buf_line()`/`view_row_to_buf_pos_wrap()` from GTK to shared `render.rs`; consolidated `open_url_in_browser()` in core engine (was duplicated in GTK and TUI with platform-specific logic); added Native Platform GUIs roadmap items to PLAN.md.
+
+---
+
+**Session 254 — Windows TUI builds + bug fixes (5313 tests):**
+
+Release v0.8.0 prep and Windows TUI support. Added `CREATE_NEW_PROCESS_GROUP` to LSP/DAP process spawning on Windows (equivalent of Unix setsid). Windows clipboard via powershell `Get-Clipboard`/`Set-Clipboard` and `clip.exe`. Windows URL opener via `cmd /c start`. Windows swap PID check via `tasklist`. Guard DISPLAY env var to non-Windows. Added Windows TUI job to CI (`windows-latest`, `--no-default-features`) and release workflow producing `vcd-windows-x86_64.exe`. Fixed tree-sitter-latex link error on Windows (`kind = "static"` on FFI `#[link]`). Skipped/fixed 8 tests that fail on Windows paths (`#[cfg(not(target_os = "windows"))]` for git diff tests, cross-platform assertions for debugpy venv and session paths). Regenerated `flatpak/cargo-sources.json` for ratatui 0.29. Bug fixes: picker preview stale chars when cycling files (explicit per-row clear + tab sanitization); insert mode click past EOL (allow cursor one past last char in insert/replace mode via `set_cursor_for_window`); scrollbar drag moving cursor (replaced `set_cursor_for_window` with `set_scroll_top_for_window`); git panel discard confirm dialog (`pending_sc_discard` + `confirm_sc_discard` dialog tag). Files changed: `lsp.rs`, `dap.rs`, `swap.rs`, `syntax.rs`, `session.rs`, `dap_manager.rs`, `engine/mod.rs`, `engine/windows.rs`, `engine/source_control.rs`, `engine/panels.rs`, `engine/tests.rs`, `tui_main/mod.rs`, `tui_main/mouse.rs`, `tui_main/render_impl.rs`, `gtk/click.rs`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `flatpak/cargo-sources.json`.
 
 ---
 

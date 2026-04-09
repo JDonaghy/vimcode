@@ -28,14 +28,18 @@ pub(super) fn build_screen_for_tui(
     };
     let per_window_status = engine.settings.window_status_line;
     let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
     let content_rows = area.height.saturating_sub(
         1 + global_status_rows
             + qf_height
             + term_height
             + menu_height
             + dbg_height
-            + wildmenu_height,
-    ); // cmd(1) + optional status(1) + panels
+            + wildmenu_height
+            + separated_status_rows,
+    ); // cmd(1) + optional status(1) + panels + separated status
     let sidebar_cols = if sidebar.visible {
         sidebar_width + 1
     } else {
@@ -154,25 +158,33 @@ pub(super) fn draw_frame(
     let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
     let per_window_status = engine.settings.window_status_line;
     let global_status_height: u16 = if per_window_status { 0 } else { 1 };
+    let has_separated = screen.separated_status_line.is_some();
+    let separated_status_height: u16 = if has_separated { 1 } else { 0 };
+
+    // Layout: [editor][qf][terminal][debug][sep_status?][wildmenu][global_status][cmd]
+    // When noslat + terminal open, sep_status(1) shows between debug and wildmenu.
+    // When slat (default) or no terminal, sep_status is 0 and per-window bars are inside windows.
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),
-            Constraint::Length(qf_height),
-            Constraint::Length(bottom_panel_height),
-            Constraint::Length(debug_toolbar_height),
-            Constraint::Length(wildmenu_height),
-            Constraint::Length(global_status_height),
-            Constraint::Length(1),
+            Constraint::Min(0),                          // 0: editor
+            Constraint::Length(qf_height),               // 1: quickfix
+            Constraint::Length(bottom_panel_height),     // 2: terminal
+            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
+            Constraint::Length(separated_status_height), // 4: separated status (0 or 1)
+            Constraint::Length(wildmenu_height),         // 5: wildmenu
+            Constraint::Length(global_status_height),    // 6: global status
+            Constraint::Length(1),                       // 7: cmd
         ])
         .split(right_col);
     let editor_col = v_chunks[0];
     let quickfix_area = v_chunks[1];
     let bottom_panel_area = v_chunks[2];
     let debug_toolbar_area = v_chunks[3];
-    let wildmenu_area = v_chunks[4];
-    let status_area = v_chunks[5];
-    let cmd_area = v_chunks[6];
+    let separated_status_area = v_chunks[4];
+    let wildmenu_area = v_chunks[5];
+    let status_area = v_chunks[6];
+    let cmd_area = v_chunks[7];
 
     // The editor column includes the tab bar row(s).  Window rects from
     // calculate_group_window_rects already have y >= 1 (tab_bar_height offset),
@@ -501,21 +513,6 @@ pub(super) fn draw_frame(
         }
     }
 
-    // ── Folder / workspace picker modal ──────────────────────────────────────
-    if let Some(picker) = folder_picker {
-        render_folder_picker(frame, picker, area, theme);
-    }
-
-    // ── Unified picker modal (rendered on top of everything) ─────────────────
-    if let Some(ref picker) = screen.picker {
-        render_picker_popup(frame, picker, area, theme);
-    }
-
-    // ── Tab switcher popup ───────────────────────────────────────────────────
-    if let Some(ref ts) = screen.tab_switcher {
-        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
-    }
-
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
@@ -523,6 +520,18 @@ pub(super) fn draw_frame(
             quickfix_area,
             qf,
             quickfix_scroll_top,
+            theme,
+        );
+    }
+
+    // ── Separated status line (above terminal, when status_line_above_terminal is active) ──
+    if let Some(ref status) = screen.separated_status_line {
+        render_window_status_line(
+            frame.buffer_mut(),
+            separated_status_area.x,
+            separated_status_area.y,
+            separated_status_area.width,
+            status,
             theme,
         );
     }
@@ -624,6 +633,21 @@ pub(super) fn draw_frame(
             *hover_link_rects_out = rects;
             *hover_popup_rect_out = popup_rect;
         }
+    }
+
+    // ── Folder / workspace picker modal ──────────────────────────────────────
+    if let Some(picker) = folder_picker {
+        render_folder_picker(frame, picker, area, theme);
+    }
+
+    // ── Unified picker modal (above terminal/status so it's fully visible) ──
+    if let Some(ref picker) = screen.picker {
+        render_picker_popup(frame, picker, area, theme);
+    }
+
+    // ── Tab switcher popup ───────────────────────────────────────────────────
+    if let Some(ref ts) = screen.tab_switcher {
+        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
     }
 
     // ── Context menu popup (above status/command line) ─────────────────────
@@ -1079,12 +1103,26 @@ pub(super) fn render_tab_bar(
             break;
         }
 
-        for ch in tab.name.chars() {
+        // Find where the filename starts (after the " N: " prefix) so the
+        // underline accent only covers the filename, not the number prefix.
+        let prefix_len = tab.name.find(": ").map(|p| p + 2).unwrap_or(0);
+        let prefix_mod = if tab.preview {
+            Modifier::ITALIC
+        } else {
+            Modifier::empty()
+        };
+        for (ci, ch) in tab.name.chars().enumerate() {
             if x >= tab_end_for_content {
                 break;
             }
-            let ul_color = if tab.active { focused_accent } else { None };
-            set_cell_styled(buf, x, area.y, ch, fg, bg, modifier, ul_color);
+            let in_filename = ci >= prefix_len;
+            let cell_mod = if in_filename { modifier } else { prefix_mod };
+            let ul_color = if in_filename && tab.active {
+                focused_accent
+            } else {
+                None
+            };
+            set_cell_styled(buf, x, area.y, ch, fg, bg, cell_mod, ul_color);
             x += 1;
         }
         // Show ● (modified dot) when dirty, × otherwise (VSCode style).
@@ -1886,15 +1924,7 @@ pub(super) fn render_picker_popup(
             }
         }
 
-        // Fill right pane background (two-pane mode)
-        if has_preview {
-            for col in (left_w + 1)..(width - 1) {
-                let cx = x + col;
-                if cx < term_area.width {
-                    set_cell(buf, cx, ry, ' ', fg_color, bg_color);
-                }
-            }
-        }
+        // Right pane background is cleared in the preview section below.
 
         // Left pane: item text with fuzzy match highlighting
         if let Some(item) = picker.items.get(result_idx) {
@@ -1961,12 +1991,23 @@ pub(super) fn render_picker_popup(
 
         // Right pane: preview line
         if has_preview {
+            let right_start = x + left_w + 1;
+            let right_inner = (width - left_w - 2) as usize;
+            // Always clear the full right pane row first (prevents stale chars
+            // from previous preview when the new file has shorter/fewer lines).
+            for j in 0..right_inner {
+                let cx = right_start + j as u16;
+                if cx + 1 < x + width && cx < term_area.width {
+                    set_cell(buf, cx, ry, ' ', fg_color, bg_color);
+                }
+            }
             if let Some(ref preview) = picker.preview {
-                if let Some((lineno, text, is_match)) = preview.get(row_idx) {
-                    let preview_text = format!("{:4}: {}", lineno, text);
+                let preview_idx = row_idx + picker.preview_scroll;
+                if let Some((lineno, text, is_match)) = preview.get(preview_idx) {
+                    // Replace tabs with spaces so each character occupies exactly one cell.
+                    let sanitized = text.replace('\t', "    ");
+                    let preview_text = format!("{:4}: {}", lineno, sanitized);
                     let preview_fg = if *is_match { title_fg } else { fg_color };
-                    let right_start = x + left_w + 1;
-                    let right_inner = (width - left_w - 2) as usize;
                     for (j, ch) in preview_text.chars().enumerate().take(right_inner) {
                         let cx = right_start + j as u16;
                         if cx + 1 < x + width && cx < term_area.width {

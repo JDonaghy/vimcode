@@ -2,49 +2,21 @@ use super::*;
 
 /// Open a URL in the default browser (only https/http).
 pub(super) fn open_url(url: &str) {
-    if !crate::core::engine::is_safe_url(url) {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(not(target_os = "macos"))]
-    let cmd = "xdg-open";
-    std::process::Command::new(cmd)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok();
+    crate::core::engine::open_url_in_browser(url);
 }
 
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
 pub(super) fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
-    let Some((ctrl, shift, alt, key_name)) =
-        crate::core::settings::parse_key_binding_named(binding)
-    else {
-        return false;
-    };
-    if ctrl != state.contains(gdk::ModifierType::CONTROL_MASK) {
-        return false;
-    }
-    if shift != state.contains(gdk::ModifierType::SHIFT_MASK) {
-        return false;
-    }
-    if alt != state.contains(gdk::ModifierType::ALT_MASK) {
-        return false;
-    }
-    match key_name.as_str() {
-        "Tab" | "tab" => key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab,
-        "Space" | "space" => key.to_unicode() == Some(' '),
-        "Escape" | "Esc" => key == gdk::Key::Escape,
-        s if s.chars().count() == 1 => {
-            let ch = s.chars().next().unwrap().to_ascii_lowercase();
-            key.to_unicode()
-                .map(|c| c.to_ascii_lowercase() == ch)
-                .unwrap_or(false)
-        }
-        _ => false,
-    }
+    crate::render::matches_key_binding(
+        binding,
+        state.contains(gdk::ModifierType::CONTROL_MASK),
+        state.contains(gdk::ModifierType::SHIFT_MASK),
+        state.contains(gdk::ModifierType::ALT_MASK),
+        key.to_unicode(),
+        key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab,
+        key.to_unicode() == Some(' '),
+        key == gdk::Key::Escape,
+    )
 }
 
 /// Build a single setting row widget (label+description on left, control widget on right).
@@ -261,6 +233,14 @@ pub(super) fn gtk_key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: 
         if let Some(ch) = unicode {
             let b = ch as u8;
             if b.is_ascii() {
+                return vec![b & 0x1f];
+            }
+        }
+        // unicode may be None because GTK's to_unicode() filters control chars.
+        // Derive the control byte from the key name (single lowercase letter).
+        if key_name.len() == 1 {
+            let b = key_name.as_bytes()[0].to_ascii_lowercase();
+            if b.is_ascii_lowercase() {
                 return vec![b & 0x1f];
             }
         }

@@ -187,10 +187,14 @@ pub fn resolve_binary(name: &str) -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let which_cmd = "which";
 
-    let output = std::process::Command::new(which_cmd)
-        .arg(name)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(which_cmd);
+    cmd.arg(name);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
         let first_line = path_str.lines().next()?.trim();

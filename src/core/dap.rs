@@ -141,7 +141,8 @@ impl DapServer {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            command.creation_flags(0x00000200 | 0x08000000);
         }
         let mut child = command
             .spawn()
@@ -221,7 +222,8 @@ impl DapServer {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            tcp_command.creation_flags(0x00000200); // CREATE_NEW_PROCESS_GROUP
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            tcp_command.creation_flags(0x00000200 | 0x08000000);
         }
         let child = tcp_command
             .spawn()

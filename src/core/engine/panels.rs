@@ -265,6 +265,18 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "confirm_sc_discard" => {
+                if let Some(path) = self.pending_sc_discard.take() {
+                    if action == "discard" {
+                        if path.is_empty() {
+                            self.sc_discard_all_unstaged();
+                        } else {
+                            self.sc_discard_file(&path);
+                        }
+                    }
+                }
+                EngineAction::None
+            }
             "ext_remove" => {
                 if let Some(name) = self.pending_ext_remove.take() {
                     match action {
@@ -336,6 +348,10 @@ impl Engine {
                 } else {
                     self.pending_code_action_choices.clear();
                 }
+                EngineAction::None
+            }
+            "file_changed" => {
+                self.handle_file_watcher_action(action);
                 EngineAction::None
             }
             _ => EngineAction::None,
