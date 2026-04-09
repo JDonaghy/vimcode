@@ -131,6 +131,11 @@ impl<'a> DrawContext<'a> {
                 self.draw_cursor(rw);
             }
 
+            // Draw tab tooltip (below tab bar, on hover)
+            if let Some(ref tooltip) = layout.tab_tooltip {
+                self.draw_tab_tooltip(tooltip, layout);
+            }
+
             // Draw completion menu anchored at cursor
             if let Some(ref comp) = layout.completion {
                 let active = layout.windows.iter().find(|w| w.is_active);
@@ -141,6 +146,18 @@ impl<'a> DrawContext<'a> {
             if let Some(ref hover) = layout.hover {
                 let active = layout.windows.iter().find(|w| w.is_active);
                 self.draw_hover(hover, active);
+            }
+
+            // Draw editor hover popup (rich markdown, gh / mouse dwell)
+            if let Some(ref eh) = layout.editor_hover {
+                let active = layout.windows.iter().find(|w| w.is_active);
+                self.draw_editor_hover(eh, active);
+            }
+
+            // Draw diff peek popup (inline git hunk preview)
+            if let Some(ref peek) = layout.diff_peek {
+                let active = layout.windows.iter().find(|w| w.is_active);
+                self.draw_diff_peek(peek, active);
             }
 
             // Draw signature help popup
@@ -164,9 +181,19 @@ impl<'a> DrawContext<'a> {
                 self.draw_separated_status_line(status, layout);
             }
 
+            // Draw debug toolbar strip (DAP controls)
+            if let Some(ref toolbar) = layout.debug_toolbar {
+                self.draw_debug_toolbar(toolbar);
+            }
+
             // Draw terminal panel
             if let Some(ref term) = layout.bottom_tabs.terminal {
                 self.draw_terminal(term);
+            }
+
+            // Draw panel hover popup (sidebar item hover)
+            if let Some(ref ph) = layout.panel_hover {
+                self.draw_panel_hover(ph);
             }
 
             // Draw picker (command palette / fuzzy finder)
@@ -211,6 +238,10 @@ impl<'a> DrawContext<'a> {
         }
         let text_y = y + (h - self.line_height) / 2.0; // vertically center text
         self.draw_tabs(&layout.tab_bar, x, text_y, width - x);
+        // Diff toolbar (change nav buttons) at right edge
+        if let Some(ref dt) = layout.diff_toolbar {
+            self.draw_diff_toolbar_in_tab_bar(dt, x, y, width - x, h);
+        }
     }
 
     fn draw_group_tab_bar(&self, gtb: &crate::render::GroupTabBar, is_active_group: bool) {
@@ -226,6 +257,10 @@ impl<'a> DrawContext<'a> {
         }
         let text_y = y + (h - self.line_height) / 2.0;
         self.draw_tabs(&gtb.tabs, x, text_y, w);
+        // Diff toolbar (change nav buttons) at right edge
+        if let Some(ref dt) = &gtb.diff_toolbar {
+            self.draw_diff_toolbar_in_tab_bar(dt, x, y, w, h);
+        }
     }
 
     fn draw_tabs(&self, tabs: &[crate::render::TabInfo], x_origin: f32, y: f32, _max_width: f32) {
@@ -1011,6 +1046,431 @@ impl<'a> DrawContext<'a> {
             }
         } else {
             self.draw_text(&sig.label, tx, ty, self.theme.foreground);
+        }
+    }
+
+    // ─── Editor hover popup (rich markdown, gh / mouse dwell) ──────────────
+
+    fn draw_editor_hover(
+        &self,
+        eh: &crate::render::EditorHoverPopupData,
+        active_window: Option<&RenderedWindow>,
+    ) {
+        use crate::core::markdown::MdStyle;
+
+        let lines = &eh.rendered.lines;
+        if lines.is_empty() {
+            return;
+        }
+        let cw = self.char_width;
+        let lh = self.line_height;
+        let (rt_w, rt_h) = self.rt_size();
+
+        let max_height = 20;
+        let scroll = eh.scroll_top;
+        let visible_count = lines.len().saturating_sub(scroll).min(max_height);
+        if visible_count == 0 {
+            return;
+        }
+        let num_lines = lines.len().min(max_height);
+        let content_w = (eh.popup_width as f32 + 2.0) * cw;
+        let popup_w = content_w.clamp(12.0 * cw, rt_w * 0.7);
+        let popup_h = num_lines as f32 * lh + 8.0; // padding top+bottom
+
+        // Position relative to active window anchor
+        let (x, y) = if let Some(rw) = active_window {
+            let gutter_px = rw.gutter_char_width as f32 * cw;
+            let view_line = eh.anchor_line.saturating_sub(eh.frozen_scroll_top);
+            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left);
+            let cx = rw.rect.x as f32 + gutter_px + vis_col as f32 * cw;
+            let cy = rw.rect.y as f32 + view_line as f32 * lh;
+            let fy = if cy >= popup_h + 4.0 {
+                cy - popup_h
+            } else {
+                cy + lh
+            };
+            (cx.min(rt_w - popup_w - 4.0).max(0.0), fy.max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+
+        let bg = self.solid_brush(self.theme.hover_bg);
+        let border_color = if eh.has_focus {
+            self.theme.md_link
+        } else {
+            self.theme.hover_border
+        };
+        let border_brush = self.solid_brush(border_color);
+
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt
+                .DrawRectangle(&rect_f(x, y, popup_w, popup_h), &border_brush, 1.0, None);
+        }
+
+        // Render content lines with markdown styling
+        for (li, text_line) in lines.iter().skip(scroll).enumerate().take(num_lines) {
+            let line_y = y + 4.0 + li as f32 * lh;
+            if line_y + lh > rt_h {
+                break;
+            }
+            let actual_line = scroll + li;
+            let line_spans = eh.rendered.spans.get(actual_line);
+            let code_hl = eh.rendered.code_highlights.get(actual_line);
+            let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+
+            let mut col_x = x + cw; // left padding
+            let mut byte_pos: usize = 0;
+            for ch in text_line.chars() {
+                let ch_len = ch.len_utf8();
+                let fg_color = if has_code_hl {
+                    code_hl
+                        .unwrap()
+                        .iter()
+                        .find(|h| byte_pos >= h.start_byte && byte_pos < h.end_byte)
+                        .map(|h| self.theme.scope_color(&h.scope))
+                        .unwrap_or(self.theme.md_code)
+                } else if let Some(spans) = line_spans {
+                    spans
+                        .iter()
+                        .find(|sp| byte_pos >= sp.start_byte && byte_pos < sp.end_byte)
+                        .map(|sp| match sp.style {
+                            MdStyle::Heading(1) => self.theme.md_heading1,
+                            MdStyle::Heading(2) => self.theme.md_heading2,
+                            MdStyle::Heading(_) => self.theme.md_heading3,
+                            MdStyle::Bold | MdStyle::BoldItalic => self.theme.hover_fg,
+                            MdStyle::Code | MdStyle::CodeBlock => self.theme.md_code,
+                            MdStyle::Link | MdStyle::LinkUrl => self.theme.md_link,
+                            MdStyle::BlockQuote => self.theme.md_heading3,
+                            MdStyle::ListBullet => self.theme.md_heading1,
+                            _ => self.theme.hover_fg,
+                        })
+                        .unwrap_or(self.theme.hover_fg)
+                } else {
+                    self.theme.hover_fg
+                };
+
+                if col_x + cw <= x + popup_w - cw {
+                    // Selection highlight
+                    let char_col = ((col_x - x - cw) / cw) as usize;
+                    let in_selection = if let Some((sl, sc, el, ec)) = eh.selection {
+                        if sl == el {
+                            actual_line == sl && char_col >= sc && char_col < ec
+                        } else if actual_line == sl {
+                            char_col >= sc
+                        } else if actual_line == el {
+                            char_col < ec
+                        } else {
+                            actual_line > sl && actual_line < el
+                        }
+                    } else {
+                        false
+                    };
+                    if in_selection {
+                        let sel_brush = self.solid_brush(self.theme.selection);
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(col_x, line_y, cw, lh), &sel_brush);
+                        }
+                    }
+                    self.draw_text(&ch.to_string(), col_x, line_y, fg_color);
+                }
+                byte_pos += ch_len;
+                col_x += cw;
+            }
+        }
+
+        // Scrollbar when content overflows
+        if lines.len() > max_height && num_lines > 0 {
+            let track_h = num_lines as f32 * lh;
+            let thumb_ratio = num_lines as f32 / lines.len() as f32;
+            let thumb_h = (track_h * thumb_ratio).max(lh);
+            let max_scroll = lines.len().saturating_sub(max_height);
+            let thumb_top = if max_scroll > 0 {
+                (scroll as f32 / max_scroll as f32) * (track_h - thumb_h)
+            } else {
+                0.0
+            };
+            let sb_x = x + popup_w - 6.0;
+            let sb_y = y + 4.0;
+            let track_brush = self.solid_brush(self.theme.scrollbar_track);
+            let thumb_brush = self.solid_brush(self.theme.scrollbar_thumb);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(sb_x, sb_y, 4.0, track_h), &track_brush);
+                self.rt
+                    .FillRectangle(&rect_f(sb_x, sb_y + thumb_top, 4.0, thumb_h), &thumb_brush);
+            }
+        }
+    }
+
+    // ─── Diff peek popup (inline git hunk preview) ──────────────────────────
+
+    fn draw_diff_peek(
+        &self,
+        peek: &crate::render::DiffPeekPopup,
+        active_window: Option<&RenderedWindow>,
+    ) {
+        if peek.hunk_lines.is_empty() {
+            return;
+        }
+        let cw = self.char_width;
+        let lh = self.line_height;
+        let (rt_w, _) = self.rt_size();
+
+        let max_lines = 29;
+        let action_bar_lines = 1;
+        let num_lines = (peek.hunk_lines.len().min(max_lines) + action_bar_lines) as f32;
+        let max_len = peek
+            .hunk_lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(10);
+        let popup_w = ((max_len + 4) as f32 * cw).max(20.0 * cw);
+        let popup_h = num_lines * lh + 8.0;
+
+        // Position below anchor in active window
+        let (x, y) = if let Some(rw) = active_window {
+            let gutter_px = rw.gutter_char_width as f32 * cw;
+            let scroll_top = rw.lines.first().map_or(0, |l| l.line_idx);
+            let view_line = peek.anchor_line.saturating_sub(scroll_top);
+            let cx = rw.rect.x as f32 + gutter_px;
+            let cy = rw.rect.y as f32 + (view_line as f32 + 1.0) * lh;
+            (cx.min(rt_w - popup_w - 4.0).max(0.0), cy.max(0.0))
+        } else {
+            (0.0, 0.0)
+        };
+
+        let bg = self.solid_brush(self.theme.hover_bg);
+        let border_brush = self.solid_brush(self.theme.hover_border);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt
+                .DrawRectangle(&rect_f(x, y, popup_w, popup_h), &border_brush, 1.0, None);
+        }
+
+        // Draw diff lines with color coding
+        for (i, hline) in peek.hunk_lines.iter().enumerate().take(max_lines) {
+            let fg_color = if hline.starts_with('+') {
+                self.theme.git_added
+            } else if hline.starts_with('-') {
+                self.theme.git_deleted
+            } else {
+                self.theme.hover_fg
+            };
+            self.draw_text(hline, x + cw, y + 4.0 + i as f32 * lh, fg_color);
+        }
+
+        // Action bar at bottom
+        let action_y = y + 4.0 + peek.hunk_lines.len().min(max_lines) as f32 * lh;
+        let actions = "[s] Stage  [r] Revert  [q] Close";
+        self.draw_text(actions, x + cw, action_y, self.theme.line_number_fg);
+    }
+
+    // ─── Debug toolbar (DAP control strip) ──────────────────────────────────
+
+    fn draw_debug_toolbar(&self, toolbar: &crate::render::DebugToolbarData) {
+        let cw = self.char_width;
+        let lh = self.line_height;
+        let (width, height) = self.rt_size();
+        let x0 = self.editor_left;
+
+        // Position: above the terminal/status area, similar to TUI layout
+        // Place it just above the status bar row (height - 2*lh for status, -lh for toolbar)
+        let y = height - 3.0 * lh;
+        let bar_w = width - x0;
+
+        let bg = self.solid_brush(self.theme.status_bg);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x0, y, bar_w, lh), &bg);
+        }
+
+        let fg = if toolbar.session_active {
+            self.theme.status_fg
+        } else {
+            self.theme.line_number_fg
+        };
+        let dim_fg = self.theme.line_number_fg;
+
+        let mut col = x0 + cw;
+        for (idx, btn) in toolbar.buttons.iter().enumerate() {
+            // Separator between button groups (index 3→4)
+            if idx == 4 {
+                self.draw_text("│", col, y, dim_fg);
+                col += cw * 2.0;
+            }
+            // Icon + key hint
+            let label = format!("{}({})", btn.icon, btn.key_hint);
+            self.draw_text(&label, col, y, fg);
+            col += (label.chars().count() as f32 + 1.0) * cw;
+        }
+    }
+
+    // ─── Diff toolbar (change nav buttons in tab bar) ───────────────────────
+
+    fn draw_diff_toolbar_in_tab_bar(
+        &self,
+        dt: &crate::render::DiffToolbarData,
+        bar_x: f32,
+        bar_y: f32,
+        bar_w: f32,
+        bar_h: f32,
+    ) {
+        let cw = self.char_width;
+        let text_y = bar_y + (bar_h - self.line_height) / 2.0;
+        let dim_fg = self.theme.line_number_fg;
+
+        // Build label: "2 of 5  ↑ ↓ ≡"
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ref label) = dt.change_label {
+            parts.push(label.clone());
+        }
+        parts.push("\u{2191}".to_string()); // ↑ prev
+        parts.push("\u{2193}".to_string()); // ↓ next
+        let fold_icon = if dt.unchanged_hidden {
+            "\u{2261}"
+        } else {
+            "\u{2261}"
+        };
+        parts.push(fold_icon.to_string());
+
+        let label = parts.join("  ");
+        let label_w = label.chars().count() as f32 * cw;
+        let rx = bar_x + bar_w - label_w - cw * 2.0;
+
+        let active_fg = if dt.unchanged_hidden {
+            self.theme.tab_active_accent
+        } else {
+            dim_fg
+        };
+        // Draw change label part in foreground, buttons in dim
+        if let Some(ref change_label) = dt.change_label {
+            self.draw_text(change_label, rx, text_y, self.theme.foreground);
+            let offset = change_label.chars().count() as f32 * cw;
+            let rest = format!("  \u{2191}  \u{2193}  {fold_icon}");
+            self.draw_text(&rest, rx + offset, text_y, active_fg);
+        } else {
+            self.draw_text(&label, rx, text_y, active_fg);
+        }
+    }
+
+    // ─── Tab tooltip (file path on hover) ───────────────────────────────────
+
+    fn draw_tab_tooltip(&self, tooltip: &str, layout: &ScreenLayout) {
+        let cw = self.char_width;
+        let lh = self.line_height;
+
+        // Position just below the tab bar
+        let tab_bar_bottom = if layout.menu_bar.is_some() {
+            super::TITLE_BAR_TOP_INSET
+                + lh * super::TITLE_BAR_HEIGHT_MULT
+                + lh * super::TAB_BAR_HEIGHT_MULT
+        } else {
+            lh * super::TAB_BAR_HEIGHT_MULT
+        };
+
+        let tooltip_w = tooltip.chars().count() as f32 * cw + cw * 2.0;
+        let tooltip_h = lh + 4.0;
+        let (rt_w, _) = self.rt_size();
+        let x = self.editor_left.min(rt_w - tooltip_w);
+
+        let bg = self.solid_brush(self.theme.hover_bg);
+        let border_brush = self.solid_brush(self.theme.hover_border);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(x, tab_bar_bottom, tooltip_w, tooltip_h), &bg);
+            self.rt.DrawRectangle(
+                &rect_f(x, tab_bar_bottom, tooltip_w, tooltip_h),
+                &border_brush,
+                1.0,
+                None,
+            );
+        }
+        self.draw_text(tooltip, x + cw, tab_bar_bottom + 2.0, self.theme.hover_fg);
+    }
+
+    // ─── Panel hover popup (sidebar item hover) ─────────────────────────────
+
+    fn draw_panel_hover(&self, ph: &crate::render::PanelHoverPopupData) {
+        use crate::core::markdown::MdStyle;
+
+        let lines = &ph.rendered.lines;
+        if lines.is_empty() {
+            return;
+        }
+        let cw = self.char_width;
+        let lh = self.line_height;
+        let (rt_w, rt_h) = self.rt_size();
+
+        let max_height = 20;
+        let num_lines = lines.len().min(max_height);
+        let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+        let popup_w = ((max_len + 4) as f32 * cw).clamp(12.0 * cw, rt_w * 0.5);
+        let popup_h = num_lines as f32 * lh + 8.0;
+
+        // Position to the right of the sidebar
+        let x = self.editor_left + 2.0;
+        // Vertically align with the hovered item
+        let y = (ph.item_index as f32 * lh + lh * 2.0)
+            .min(rt_h - popup_h)
+            .max(0.0);
+
+        let bg = self.solid_brush(self.theme.hover_bg);
+        let border_brush = self.solid_brush(self.theme.hover_border);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, popup_w, popup_h), &bg);
+            self.rt
+                .DrawRectangle(&rect_f(x, y, popup_w, popup_h), &border_brush, 1.0, None);
+        }
+
+        // Render content lines with markdown styling
+        for (li, text_line) in lines.iter().enumerate().take(num_lines) {
+            let line_y = y + 4.0 + li as f32 * lh;
+            if line_y + lh > rt_h {
+                break;
+            }
+            let line_spans = ph.rendered.spans.get(li);
+            let code_hl = ph.rendered.code_highlights.get(li);
+            let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
+
+            let mut col_x = x + cw;
+            let mut byte_pos: usize = 0;
+            for ch in text_line.chars() {
+                let ch_len = ch.len_utf8();
+                let fg_color = if has_code_hl {
+                    code_hl
+                        .unwrap()
+                        .iter()
+                        .find(|h| byte_pos >= h.start_byte && byte_pos < h.end_byte)
+                        .map(|h| self.theme.scope_color(&h.scope))
+                        .unwrap_or(self.theme.md_code)
+                } else if let Some(spans) = line_spans {
+                    spans
+                        .iter()
+                        .find(|sp| byte_pos >= sp.start_byte && byte_pos < sp.end_byte)
+                        .map(|sp| match sp.style {
+                            MdStyle::Heading(1) => self.theme.md_heading1,
+                            MdStyle::Heading(2) => self.theme.md_heading2,
+                            MdStyle::Heading(_) => self.theme.md_heading3,
+                            MdStyle::Bold | MdStyle::BoldItalic => self.theme.hover_fg,
+                            MdStyle::Code | MdStyle::CodeBlock => self.theme.md_code,
+                            MdStyle::Link | MdStyle::LinkUrl => self.theme.md_link,
+                            MdStyle::BlockQuote => self.theme.md_heading3,
+                            MdStyle::ListBullet => self.theme.md_heading1,
+                            _ => self.theme.hover_fg,
+                        })
+                        .unwrap_or(self.theme.hover_fg)
+                } else {
+                    self.theme.hover_fg
+                };
+
+                if col_x + cw <= x + popup_w - cw {
+                    self.draw_text(&ch.to_string(), col_x, line_y, fg_color);
+                }
+                byte_pos += ch_len;
+                col_x += cw;
+            }
         }
     }
 

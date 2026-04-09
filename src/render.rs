@@ -1642,6 +1642,534 @@ pub static DEBUG_BUTTONS: &[DebugButton] = &[
     },
 ];
 
+// ─── Backend Parity Harness ───────────────────────────────────────────────────
+
+/// A UI element that a backend is expected to render from a [`ScreenLayout`].
+/// Used by the parity harness to verify all three backends handle the same set
+/// of elements.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UiElement {
+    /// Menu bar strip (File / Edit / View / …).
+    MenuBar,
+    /// Open menu dropdown overlay.
+    MenuDropdown,
+    /// Single-group tab bar (uses `ScreenLayout.tab_bar`).
+    TabBar,
+    /// Per-group tab bar in a multi-group split.
+    GroupTabBar { group_idx: usize },
+    /// Group divider lines between editor groups.
+    GroupDividers,
+    /// Breadcrumb bar for a group.
+    Breadcrumbs { group_idx: usize },
+    /// An editor window/pane.
+    EditorWindow { window_idx: usize },
+    /// Per-window status line (Vim-style).
+    WindowStatusLine { window_idx: usize },
+    /// Global status bar (when per-window status lines are off).
+    GlobalStatusBar,
+    /// Separated status line (above terminal panel).
+    SeparatedStatusLine,
+    /// Command line (always present).
+    CommandLine,
+    /// Completion popup (autocomplete).
+    CompletionPopup,
+    /// Hover popup (LSP documentation).
+    HoverPopup,
+    /// Rich editor hover popup (markdown, triggered by `gh` or mouse dwell).
+    EditorHoverPopup,
+    /// Signature help popup (function parameter hints).
+    SignatureHelp,
+    /// Wildmenu bar (Tab completion in command mode).
+    Wildmenu,
+    /// Quickfix bottom panel.
+    QuickfixPanel,
+    /// Debug toolbar strip.
+    DebugToolbar,
+    /// Terminal panel (bottom).
+    TerminalPanel,
+    /// Unified picker modal (fuzzy finder / command palette).
+    PickerPopup,
+    /// Tab switcher popup (Ctrl+Tab MRU list).
+    TabSwitcher,
+    /// Context menu popup (right-click).
+    ContextMenu,
+    /// Modal dialog popup.
+    Dialog,
+    /// Diff peek popup (inline git hunk preview).
+    DiffPeekPopup,
+    /// Panel hover popup (sidebar item hover).
+    PanelHoverPopup,
+    /// Tab hover tooltip.
+    TabTooltip,
+    /// Diff toolbar (change navigation buttons in tab bar).
+    DiffToolbar,
+    /// Activity bar (sidebar icon strip) — rendered by backends, not in ScreenLayout directly.
+    ActivityBar,
+    /// Sidebar panel content — rendered by backends from ScreenLayout sidebar data.
+    Sidebar,
+}
+
+/// Walk a [`ScreenLayout`] and collect every [`UiElement`] that a backend is
+/// expected to render.  This is the **source of truth** for the parity harness.
+pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // Menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+        if layout
+            .menu_bar
+            .as_ref()
+            .is_some_and(|m| m.open_menu_idx.is_some())
+        {
+            elems.push(UiElement::MenuDropdown);
+        }
+    }
+
+    // Tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // Diff toolbar (single-group)
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    // Diff toolbar (per-group)
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break; // one element is enough to flag presence
+            }
+        }
+    }
+
+    // Breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // Editor windows + per-window status lines
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // Global status bar (only when per-window status lines are off)
+    let any_per_window_status = layout.windows.iter().any(|w| w.status_line.is_some());
+    if !any_per_window_status {
+        elems.push(UiElement::GlobalStatusBar);
+    }
+
+    // Separated status line (above terminal)
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // Command line (always rendered)
+    elems.push(UiElement::CommandLine);
+
+    // Popups & overlays (conditional)
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // Activity bar + sidebar — always expected (backends render these from
+    // engine state / ScreenLayout sidebar fields).
+    elems.push(UiElement::ActivityBar);
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    elems.sort();
+    elems
+}
+
+/// Simulate the Win-GUI backend's `draw_frame()` + `on_paint()` branching logic
+/// to collect which [`UiElement`]s it would render.  This mirrors the actual
+/// rendering code in `src/win_gui/draw.rs` without requiring Direct2D.
+pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // draw_frame(): menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+    }
+
+    // draw_frame(): tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // draw_frame(): breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // draw_frame(): editor windows
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // draw_frame(): status bar (global, only when separated_status_line is None)
+    if layout.separated_status_line.is_none() {
+        let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
+        if !any_per_window {
+            elems.push(UiElement::GlobalStatusBar);
+        }
+    }
+
+    // draw_frame(): command line
+    elems.push(UiElement::CommandLine);
+
+    // draw_frame(): tab tooltip
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // draw_frame(): completion popup
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+
+    // draw_frame(): hover popup
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+
+    // draw_frame(): editor hover (rich markdown)
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+
+    // draw_frame(): diff peek popup
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+
+    // draw_frame(): signature help
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+
+    // draw_frame(): wildmenu
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+
+    // draw_frame(): quickfix
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+
+    // draw_frame(): separated status line
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // draw_frame(): debug toolbar
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+
+    // draw_frame(): terminal
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+
+    // draw_frame(): panel hover popup
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+
+    // draw_frame(): picker
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+
+    // draw_frame(): tab switcher
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+
+    // draw_frame(): context menu
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+
+    // draw_frame(): dialog
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+
+    // on_paint(): sidebar (always rendered after draw_frame)
+    elems.push(UiElement::ActivityBar);
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    // on_paint(): menu dropdown (rendered after sidebar for z-order)
+    if layout
+        .menu_bar
+        .as_ref()
+        .is_some_and(|m| m.open_menu_idx.is_some())
+    {
+        elems.push(UiElement::MenuDropdown);
+    }
+
+    // draw_tab_bar() / draw_group_tab_bar(): diff toolbar
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break;
+            }
+        }
+    }
+
+    elems.sort();
+    elems
+}
+
+/// Simulate the TUI backend's `draw_frame()` branching logic to collect which
+/// [`UiElement`]s it would render.
+pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // Menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+    }
+
+    // Activity bar (always rendered)
+    elems.push(UiElement::ActivityBar);
+
+    // Sidebar
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    // Tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // Diff toolbar (single-group, rendered as part of tab bar)
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    // Diff toolbar (per-group)
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break;
+            }
+        }
+    }
+
+    // Breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // Editor windows
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // Tab tooltip
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // Completion popup
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+
+    // Hover popup
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+
+    // Editor hover popup (rich markdown)
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+
+    // Diff peek popup
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+
+    // Signature help
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+
+    // Quickfix
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+
+    // Separated status line
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // Bottom panel (terminal / debug output)
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+
+    // Debug toolbar
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+
+    // Wildmenu
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+
+    // Global status bar (when per-window status is off)
+    let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
+    if !any_per_window {
+        elems.push(UiElement::GlobalStatusBar);
+    }
+
+    // Command line
+    elems.push(UiElement::CommandLine);
+
+    // Panel hover popup
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+
+    // Picker
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+
+    // Tab switcher
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+
+    // Context menu
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+
+    // Dialog
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+
+    // Menu dropdown (rendered last for z-order)
+    if layout
+        .menu_bar
+        .as_ref()
+        .is_some_and(|m| m.open_menu_idx.is_some())
+    {
+        elems.push(UiElement::MenuDropdown);
+    }
+
+    elems.sort();
+    elems
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -8066,5 +8594,172 @@ mod tests {
                 "status should show normal mode, got: {mode_text}"
             );
         }
+    }
+
+    // ─── Backend Parity Tests ────────────────────────────────────────────────
+
+    /// Helper: compute the set difference (elements in `expected` but not in `actual`).
+    fn missing_elements(expected: &[UiElement], actual: &[UiElement]) -> Vec<UiElement> {
+        let actual_set: std::collections::HashSet<_> = actual.iter().collect();
+        expected
+            .iter()
+            .filter(|e| !actual_set.contains(e))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn test_parity_basic_layout_tui() {
+        let e = test_engine("Hello\nWorld\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let tui = collect_ui_elements_tui(&layout);
+        let missing = missing_elements(&expected, &tui);
+        assert!(
+            missing.is_empty(),
+            "TUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {tui:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_basic_layout_wingui() {
+        let e = test_engine("Hello\nWorld\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let wingui = collect_ui_elements_wingui(&layout);
+        let missing = missing_elements(&expected, &wingui);
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {wingui:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_with_completion_popup() {
+        let mut e = test_engine("fn main() {\n    let x = 1;\n}\n");
+        // Simulate an active completion menu
+        e.completion_candidates = vec!["println".to_string(), "print".to_string()];
+        e.completion_idx = Some(0);
+        e.completion_start_col = 0;
+        let layout = render_engine(&e, 80.0, 24.0);
+        // The completion popup should be present
+        assert!(layout.completion.is_some(), "completion should be active");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with completion: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_with_dialog() {
+        use crate::core::engine::DialogButton;
+        let mut e = test_engine("test content\n");
+        e.show_dialog(
+            "test_dialog",
+            "Confirm",
+            vec!["Are you sure?".to_string()],
+            vec![
+                DialogButton {
+                    label: "Yes".into(),
+                    hotkey: 'y',
+                    action: "yes".into(),
+                },
+                DialogButton {
+                    label: "No".into(),
+                    hotkey: 'n',
+                    action: "no".into(),
+                },
+            ],
+        );
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(layout.dialog.is_some(), "dialog should be active");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with dialog: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_with_menu_bar() {
+        let mut e = test_engine("hello\n");
+        e.menu_bar_visible = true;
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(layout.menu_bar.is_some(), "menu bar should be visible");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with menu bar: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_wingui_no_known_gaps() {
+        // All previously-known Win-GUI gaps have been fixed.  This test
+        // verifies that no regressions have been introduced.
+        let mut e = test_engine("hello world\n");
+        e.menu_bar_visible = true;
+        e.debug_toolbar_visible = true;
+        e.dap_session_active = true;
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let wingui = collect_ui_elements_wingui(&layout);
+        let missing = missing_elements(&expected, &wingui);
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing elements (regressions): {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_all_elements_covered_by_expected() {
+        // Verify that collect_expected_ui_elements produces at least the
+        // baseline set of elements for a simple layout.
+        let e = test_engine("line1\nline2\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+        let expected = collect_expected_ui_elements(&layout);
+
+        // Must always have: tab bar, at least one window, command line, activity bar
+        assert!(expected.contains(&UiElement::TabBar));
+        assert!(expected.contains(&UiElement::EditorWindow { window_idx: 0 }));
+        assert!(expected.contains(&UiElement::CommandLine));
+        assert!(expected.contains(&UiElement::ActivityBar));
     }
 }

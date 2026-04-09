@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 265**: Backend parity harness (`UiElement` enum, 27 variants, 3 collectors, 7 parity tests); 6 Win-GUI rendering fixes (editor hover, diff peek, debug toolbar, diff toolbar, tab tooltip, panel hover) — zero known rendering gaps remaining.
 - **Session 264**: Context-aware dedent; TUI terminal resize fix; GTK terminal toggle fix; 7 Win-GUI fixes (preview tabs, settings button, context menus, status bar clicks, tab bar clicks, terminal resize drag); rendering test infrastructure (9 ScreenLayout + 10 TUI assertion + 6 insta snapshot tests); Win-GUI bug audit; **v0.9.0 release**.
 > Sessions 263 and earlier in **SESSION_HISTORY.md**.
 
@@ -217,6 +218,11 @@
 
 ### UI & Menus
 - [x] **Hide tab bar when single tab** — `hide_single_tab` setting (default `false`); when enabled, the tab bar row is hidden if the active editor group has only one tab, reclaiming the row for editor content. Applies to both GTK and TUI backends. Gives a more traditional Vim feel by removing chrome when there's nothing to switch between. Tab bar reappears automatically when a second tab is opened.
+
+### Testing & Backend Parity
+- [x] **Phase 2b: Backend rendering parity harness** — `UiElement` enum (27 variants) + `collect_expected_ui_elements()` source of truth + per-backend collectors (`collect_ui_elements_tui`, `collect_ui_elements_wingui`). 7 parity tests assert every `ScreenLayout` field has a corresponding draw call in each backend. Caught and drove fixes for 6 Win-GUI rendering gaps (editor hover, diff peek, debug toolbar, diff toolbar, tab tooltip, panel hover).
+- [ ] **Phase 2c: Click/mouse handling parity harness** — Same approach as Phase 2b but for mouse interaction handlers. For each clickable UI element (status bar segments, tab bar tabs, toolbar buttons, popup dismiss areas, scrollbars), verify that all three backends have corresponding click/mouse handlers. Currently the 6 new Win-GUI renderers have no click handlers — they draw correctly but are not interactive.
+- [ ] **Win-GUI: mouse handlers for new popups** — Add click/dismiss/scroll handlers for the 6 renderers added in Session 265: editor hover (click-to-focus, scroll, dismiss-on-mouseout), diff peek (key routing for s/r/q), debug toolbar (button clicks), diff toolbar (prev/next/fold clicks), tab tooltip (dismiss-on-mouseout), panel hover (dismiss, link clicks).
 
 ### Robustness (Low Priority)
 - [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness

@@ -8,9 +8,11 @@
 **Medium:**
 - **Win-GUI: no tab drag-and-drop** — No `tab_drag_*` state or handlers. Tabs cannot be reordered or moved between groups by dragging. TUI has full tab drag with visual drop indicators.
 - **Win-GUI: no terminal split** — TUI supports horizontal terminal split (two PTY panes side-by-side). Win-GUI has no terminal split button or drag handler.
+- **Win-GUI: no click/mouse handling for new popups** — `draw_editor_hover`, `draw_diff_peek`, `draw_panel_hover`, `draw_tab_tooltip`, `draw_debug_toolbar`, `draw_diff_toolbar_in_tab_bar` were added in Session 265 but have no corresponding click/dismiss/scroll mouse handlers. Editor hover needs click-to-focus, scroll, dismiss-on-mouseout. Diff peek needs `s`/`r`/`q` key routing. Debug toolbar buttons need click handlers. Tab tooltip needs dismiss-on-mouseout. Diff toolbar prev/next/fold buttons need click handlers.
 
-**Low / Possibly stale:**
+**Low / Needs visual verification on Windows:**
 - **Win-GUI: scrollbar rendering** — Investigation found that draw.rs lines 462-492 DO draw track and thumb with Direct2D brushes. If the scrollbar is still invisible, it may be a color/contrast issue rather than missing code.
+- **Win-GUI: new popup positioning unverified** — The 6 renderers added in Session 265 (editor hover, diff peek, debug toolbar, diff toolbar, tab tooltip, panel hover) follow existing `draw_hover`/`draw_dialog` D2D patterns but have not been visually tested on Windows. Popup anchoring, text clipping at edges, and scrollbar thumb math may need adjustment.
 
 
 
