@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 9, 2026 (Session 264 — context-aware dedent) | **Tests:** 5428
+**Last updated:** Apr 9, 2026 (Session 264 — context-aware dedent + terminal fixes + v0.9.0 release) | **Tests:** 5440
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 264 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,4 +26,4 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-> All sessions through 263 archived in **SESSION_HISTORY.md**.
+> All sessions through 264 archived in **SESSION_HISTORY.md**.

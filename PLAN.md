@@ -25,13 +25,8 @@
 ---
 
 ## Recently Completed
-- **Session 263**: Status line + command line positioning — `status_line_above_terminal` setting (default true); `slat` ON: per-window status bars inside each split as before (naturally above terminal); `noslat`: single status bar for active file + command line move below terminal as a pair; all 3 backends (GTK, TUI, Win-GUI); click detection on separated status segments. Also: README Windows alpha note.
-- **Session 262**: 7 bug fixes — TUI terminal paste (register fallback + bracketed paste + poll_terminal); GTK terminal Ctrl+C/Ctrl+Shift+C (key-to-pty fallback + copy handler); TUI terminal selection offset (relative columns + dynamic bottom_chrome); editor drag leak into terminal; CI coverage `--all-features` → `--features gui`.
-- **Session 261**: Fix `o` command with CRLF/CR line endings — `insert_pos` calculation now handles `\r\n` (skip both chars) and lone `\r` (insert before it) so new lines aren't absorbed into CRLF pairs. 4 new tests.
-- **Session 260**: 12 bug fixes — `%` viewport centering; TUI tab underline filename-only; preview tab click-to-permanent; explorer micro-drag same-dest guard; GTK tab bar proportional font width; terminal click overlap; live grep preview scroll; terminal Ctrl+V paste; picker z-order over terminal (TUI+GTK); GTK visual select highlight; terminal right-click suppression. 5 new tests.
-- **Session 259**: README revamp — updated intro/status, Platforms table, Windows download/build instructions, Architecture with win_gui/ + current line counts, Tech Stack with Windows-rs/D2D/DWrite, removed duplicate commands, updated Acknowledgements.
-- **Session 258**: Multi-backend code sharing — `ClickTarget` enum + 8 shared geometry/key-binding helpers extracted to `render.rs`; GTK, TUI, Win-GUI backends delegate to shared functions; 7 new tests; 4 win-gui bugs filed.
-> Sessions 258 and earlier in **SESSION_HISTORY.md**.
+- **Session 264**: Context-aware dedent (preserves nesting), terminal resize fix (missing redraw + formula), GTK terminal toggle fix (sync PTY creation), CLAUDE.md multi-backend docs, **v0.9.0 release**.
+> Sessions 263 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
 - [x] Picker preview stale chars when cycling files — explicit per-row clear + tab sanitization

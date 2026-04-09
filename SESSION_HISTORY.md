@@ -1,9 +1,17 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 263 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 264 archived here. Recent work summary in PROJECT_STATE.md.
 
 ---
+
+**Session 264 — Context-aware dedent + terminal bug fixes (5440 tests):**
+
+1. **Context-aware dedent** — `dedent_lines()` in `motions.rs` rewritten with two-pass approach: first pass finds minimum indent across all non-blank lines in the selection; second pass removes `min(shift_width, min_indent)` columns from every line uniformly. Preserves relative nesting structure. Blank lines skipped for min calculation. 6 new tests.
+2. **Terminal panel resize fix** — Two bugs: (a) mouse drag events didn't set `needs_redraw=true` in `tui_main/mod.rs`, so drag had no visual effect; (b) available-space formula in `mouse.rs` used hardcoded `2` instead of computed `bottom_chrome`. Also raised max terminal height from fixed `30` to dynamic (leaves 4 editor lines visible). Both TUI and GTK backends updated.
+3. **GTK terminal toggle fix** — `[P]` status bar button required two clicks on first use because it sent an async `Msg::ToggleTerminal` via Relm4 message queue. Fixed by calling `terminal_new_tab()` synchronously in the click handler (matching TUI which already did this).
+4. **CLAUDE.md updates** — Added Win-GUI directory section, multi-backend rule ("check all THREE backends when touching mouse/layout/rendering code").
+5. **Release v0.9.0** — Version bumped, PR #21 created and merged.
 
 **Session 263 — Status line positioning + Windows alpha note (5422 tests):**
 
