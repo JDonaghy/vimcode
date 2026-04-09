@@ -12,6 +12,9 @@ All sessions through 264 archived here. Recent work summary in PROJECT_STATE.md.
 3. **GTK terminal toggle fix** — `[P]` status bar button required two clicks on first use because it sent an async `Msg::ToggleTerminal` via Relm4 message queue. Fixed by calling `terminal_new_tab()` synchronously in the click handler (matching TUI which already did this).
 4. **CLAUDE.md updates** — Added Win-GUI directory section, multi-backend rule ("check all THREE backends when touching mouse/layout/rendering code").
 5. **Release v0.9.0** — Version bumped, PR #21 created and merged.
+6. **Rendering test infrastructure** — 9 ScreenLayout tests in `render.rs` (tests shared rendering data all backends consume); 10 TUI assertion tests + 6 insta golden-file snapshot tests in `tui_main/render_impl.rs` using ratatui `TestBackend`; `insta` added as dev-dependency.
+7. **Win-GUI bug audit** — Systematic comparison of Win-GUI vs TUI across 10 areas (tab clicks, file open, scrollbar, preview tabs, terminal, status bar, explorer, keys, mouse drag, context menus). Identified 9 gaps, corrected stale bugs.
+8. **Win-GUI fixes (7 total)**: (a) Explorer single-click → `OpenMode::Preview`, double-click → `Permanent`; (b) preview tab dimmer color in draw.rs; (c) Settings gear icon pinned to activity bar bottom + click handler; (d) explorer + tab bar right-click context menus; (e) status bar clickable via `win_status_segment_hit_test()` + `build_window_status_line()` on demand + `pixel_to_editor_pos()` now excludes status bar area; (f) tab bar clicks — fixed Y coordinate (`TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT`) and height (`lh * TAB_BAR_HEIGHT_MULT`) in both single-group and multi-group cache; (g) terminal resize drag — `terminal_resize_drag` field + header click + WM_MOUSEMOVE handler + mouse-up PTY resize.
 
 **Session 263 — Status line positioning + Windows alpha note (5422 tests):**
 

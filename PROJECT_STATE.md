@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 9, 2026 (Session 264 — context-aware dedent + terminal fixes + v0.9.0 release) | **Tests:** 5440
+**Last updated:** Apr 9, 2026 (Session 264 — context-aware dedent, 7 Win-GUI fixes, rendering test infra, v0.9.0 release) | **Tests:** 5471
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 264 are in **SESSION_HISTORY.md**.

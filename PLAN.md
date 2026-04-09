@@ -25,7 +25,7 @@
 ---
 
 ## Recently Completed
-- **Session 264**: Context-aware dedent (preserves nesting), terminal resize fix (missing redraw + formula), GTK terminal toggle fix (sync PTY creation), CLAUDE.md multi-backend docs, **v0.9.0 release**.
+- **Session 264**: Context-aware dedent; TUI terminal resize fix; GTK terminal toggle fix; 7 Win-GUI fixes (preview tabs, settings button, context menus, status bar clicks, tab bar clicks, terminal resize drag); rendering test infrastructure (9 ScreenLayout + 10 TUI assertion + 6 insta snapshot tests); Win-GUI bug audit; **v0.9.0 release**.
 > Sessions 263 and earlier in **SESSION_HISTORY.md**.
 
 ### Bug Fixes
