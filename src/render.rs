@@ -7867,4 +7867,204 @@ mod tests {
             false
         ));
     }
+
+    // ─── ScreenLayout rendering tests ────────────────────────────────────
+
+    /// Build a ScreenLayout for an engine with the given content at the given
+    /// terminal dimensions (in character cells).
+    fn render_engine(engine: &Engine, width: f64, height: f64) -> ScreenLayout {
+        let bounds = WindowRect::new(0.0, 0.0, width, height);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
+        let theme = Theme::onedark();
+        build_screen_layout(engine, &theme, &rects, 1.0, 1.0, true)
+    }
+
+    fn test_engine(text: &str) -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = Mode::Normal;
+        if !text.is_empty() {
+            e.buffer_mut().insert(0, text);
+        }
+        e
+    }
+
+    #[test]
+    fn test_screen_layout_basic_structure() {
+        let e = test_engine("Hello, world!\nSecond line\nThird line\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Should have exactly one window
+        assert_eq!(layout.windows.len(), 1, "single buffer = single window");
+
+        // Window should contain rendered lines
+        let win = &layout.windows[0];
+        assert!(
+            win.lines.len() >= 3,
+            "should render at least 3 content lines"
+        );
+        assert!(win.is_active);
+        assert!(win.cursor.is_some(), "cursor should be visible");
+
+        // First line content
+        assert_eq!(win.lines[0].raw_text.trim_end(), "Hello, world!");
+
+        // Tab bar should have one tab
+        assert!(!layout.tab_bar.is_empty());
+        assert!(layout.tab_bar[0].active);
+    }
+
+    #[test]
+    fn test_screen_layout_cursor_position() {
+        let mut e = test_engine("abcdef\nghijkl\n");
+        // Move cursor to line 1, col 3
+        e.handle_key("j", Some('j'), false);
+        e.handle_key("l", Some('l'), false);
+        e.handle_key("l", Some('l'), false);
+        e.handle_key("l", Some('l'), false);
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let win = &layout.windows[0];
+        let (cursor_pos, _shape) = win.cursor.unwrap();
+        assert_eq!(cursor_pos.view_line, 1, "cursor on second line");
+        assert_eq!(cursor_pos.col, 3, "cursor at col 3");
+    }
+
+    #[test]
+    fn test_screen_layout_split_windows() {
+        let mut e = test_engine("file one\n");
+        // Open a vertical split
+        e.open_editor_group(SplitDirection::Vertical);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert_eq!(layout.windows.len(), 2, "vsplit should produce two windows");
+
+        // Windows should divide the horizontal space
+        let w0 = &layout.windows[0];
+        let w1 = &layout.windows[1];
+        assert!(w0.rect.width > 0.0);
+        assert!(w1.rect.width > 0.0);
+        assert!(
+            (w0.rect.width + w1.rect.width - 80.0).abs() < 2.0,
+            "widths should approximately sum to terminal width"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_terminal_open() {
+        let mut e = test_engine("content\n");
+        e.terminal_open = true;
+        e.session.terminal_panel_rows = 10;
+
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Bottom panel active tab should reflect terminal
+        assert_eq!(
+            layout.bottom_tabs.active,
+            BottomPanelKind::Terminal,
+            "bottom panel should show terminal tab"
+        );
+
+        // Editor window height should be reduced (less than full 24 rows)
+        let win = &layout.windows[0];
+        assert!(
+            win.rect.height < 24.0,
+            "editor should be shorter when terminal is open"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_visual_selection() {
+        let mut e = test_engine("select this text\n");
+        // Enter visual mode and select 5 chars
+        e.handle_key("v", Some('v'), false);
+        for _ in 0..4 {
+            e.handle_key("l", Some('l'), false);
+        }
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        let win = &layout.windows[0];
+        assert!(
+            win.selection.is_some(),
+            "visual mode should produce a selection range"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_command_line() {
+        let mut e = test_engine("hello\n");
+        // Enter command mode
+        e.handle_key(":", Some(':'), false);
+        e.handle_key("w", Some('w'), false);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(
+            layout.command.text.contains(":w"),
+            "command line should show ':w', got: {:?}",
+            layout.command.text
+        );
+        assert!(layout.command.show_cursor);
+    }
+
+    #[test]
+    fn test_screen_layout_dirty_tab() {
+        let mut e = test_engine("hello\n");
+        // Make a change to dirty the buffer
+        e.handle_key("i", Some('i'), false);
+        e.handle_key("x", Some('x'), false);
+        e.handle_key("Escape", None, false);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(
+            layout.tab_bar[0].dirty,
+            "modified buffer should show dirty tab"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_line_numbers() {
+        let mut e = test_engine("line1\nline2\nline3\nline4\nline5\n");
+        e.settings.line_numbers = LineNumberMode::Absolute;
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let win = &layout.windows[0];
+        assert!(
+            win.gutter_char_width > 0,
+            "line numbers should produce a gutter"
+        );
+        // Gutter text should have line numbers
+        assert!(win.lines[0].gutter_text.contains('1'));
+        assert!(win.lines[1].gutter_text.contains('2'));
+    }
+
+    #[test]
+    fn test_screen_layout_status_segments() {
+        let e = test_engine("hello\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Per-window status lines should have segments
+        let win = &layout.windows[0];
+        if let Some(ref status) = win.status_line {
+            assert!(
+                !status.left_segments.is_empty(),
+                "status should have left segments"
+            );
+            assert!(
+                !status.right_segments.is_empty(),
+                "status should have right segments"
+            );
+
+            // Mode should be shown
+            let mode_text: String = status
+                .left_segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            assert!(
+                mode_text.contains("NORMAL") || mode_text.contains("NOR"),
+                "status should show normal mode, got: {mode_text}"
+            );
+        }
+    }
 }
