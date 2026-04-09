@@ -2,7 +2,6 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
-- **GTK terminal panel toggle requires two clicks** — The `[P]` layout toggle button in the GTK status bar requires two clicks to show the terminal panel on the first use. Subsequent toggles work with a single click. Likely a timing issue between the `EngineAction::OpenTerminal` dispatch and the GTK layout recomputation.
 
 - **Win-GUI: scrollbar not visible** — Scrollbar hit-testing and drag handling exist (`scrollbar_hit()`, `scrollbar_drag` state) and `SCROLLBAR_WIDTH` reserves space, but there is no drawing code to paint the scrollbar thumb/track. Clicks on the scrollbar area do work invisibly.
 
@@ -12,11 +11,13 @@
 
 - **Win-GUI: no preview mode** — Preview/transient tab mode (italic filename, replaced on next file open) is not implemented. All opens are permanent.
 
-- **Terminal panel resize not working via mouse** — Dragging the terminal panel header to resize the panel height does not appear to work. Multiple attempts to click and drag the resize handle fail to change the terminal size.
-
 
 
 ## Resolved
+
+- **GTK terminal panel toggle requires two clicks** — On first use, the `[P]` status bar button sent an async `Msg::ToggleTerminal` via Relm4's message queue instead of creating the terminal tab synchronously. The async path caused a one-frame delay where the terminal state wasn't set, requiring a second click. Fixed by calling `terminal_new_tab()` immediately in the click handler (matching TUI behavior which already handled `OpenTerminal` synchronously).
+
+- **Terminal panel resize not working via mouse** — Two bugs: (1) mouse events didn't trigger a redraw (`needs_redraw` was not set after `handle_mouse`), so the drag visually did nothing; (2) the available-space formula used hardcoded `2` instead of the computed `bottom_chrome` value, giving wrong row counts with default settings (`window_status_line=true` → `bottom_chrome=1`). Fixed by unconditionally setting `needs_redraw=true` after all mouse events, and using `bottom_chrome` in the formula.
 
 - **TUI terminal paste not working** — Ctrl+V in TUI terminal didn't paste. Three fixes: (1) added `poll_terminal()` after paste writes for immediate feedback, (2) wrapped paste in bracketed paste sequences for multi-line safety, (3) falls back to VimCode `+`/`"` registers when system clipboard is empty. Also added error messages instead of silent failure.
 - **GTK terminal Ctrl+C sends newline instead of copying** — `gtk_key_to_pty_bytes()` returned empty for Ctrl+letter keys because GTK's `to_unicode()` filters control chars. Added fallback to derive control byte from `key_name`. Also added Ctrl+Shift+C handler to copy terminal selection.

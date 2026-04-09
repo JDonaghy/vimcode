@@ -6448,8 +6448,13 @@ impl App {
                                 return;
                             }
                             Some(core::engine::EngineAction::OpenTerminal) => {
+                                // Create the terminal tab immediately (not via
+                                // async Msg::ToggleTerminal) so the panel
+                                // appears on this same draw cycle.
+                                let cols = self.terminal_cols();
+                                let rows = engine.session.terminal_panel_rows;
+                                engine.terminal_new_tab(cols, rows);
                                 drop(engine);
-                                sender.input(Msg::ToggleTerminal);
                                 self.draw_needed.set(true);
                                 return;
                             }
@@ -6689,9 +6694,14 @@ impl App {
                 };
                 let status_h = (1.0 + global_status_rows) * self.cached_line_height;
                 let available = (height - y - status_h).max(0.0);
+                // Leave at least 4 editor lines visible (+ tab bar chrome)
+                let min_editor_lines = 4.0 + 1.0; // 4 lines + tab bar
+                let max_rows = ((height - status_h - min_editor_lines * self.cached_line_height)
+                    / self.cached_line_height) as u16;
+                let max_rows = max_rows.saturating_sub(2).max(5);
                 let new_rows = ((available / self.cached_line_height) as u16)
                     .saturating_sub(2)
-                    .clamp(5, 30);
+                    .clamp(5, max_rows);
                 self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
                 self.draw_needed.set(true);
             }

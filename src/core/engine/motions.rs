@@ -4736,12 +4736,49 @@ impl Engine {
         *changed = true;
     }
 
-    /// Dedent `count` lines starting at `start_line` by up to shift_width.
+    /// Dedent `count` lines starting at `start_line`.
+    /// Removes up to shift_width columns, but caps removal at the minimum
+    /// indent across all non-blank lines in the selection to preserve
+    /// relative nesting structure.
     pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
         let sw = self.effective_shift_width();
-        self.start_undo_group();
-        // Work backwards to avoid invalidating positions
         let total = self.buffer().len_lines();
+
+        // First pass: find minimum leading whitespace (visual columns) across
+        // all non-blank lines in the selection.
+        let mut min_indent = usize::MAX;
+        for i in 0..count {
+            let line_idx = start_line + i;
+            if line_idx >= total {
+                break;
+            }
+            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
+            let trimmed = line_content.trim_end_matches(['\n', '\r']);
+            // Skip blank/whitespace-only lines — they shouldn't constrain removal
+            if trimmed.trim().is_empty() {
+                continue;
+            }
+            let mut visual_indent = 0;
+            for ch in trimmed.chars() {
+                match ch {
+                    ' ' => visual_indent += 1,
+                    '\t' => visual_indent += sw - (visual_indent % sw),
+                    _ => break,
+                }
+            }
+            min_indent = min_indent.min(visual_indent);
+        }
+
+        if min_indent == usize::MAX || min_indent == 0 {
+            return;
+        }
+
+        // Remove at most shift_width, but never more than the least-indented
+        // non-blank line has — this preserves relative nesting.
+        let remove_cols = sw.min(min_indent);
+
+        self.start_undo_group();
+        // Work backwards to avoid invalidating char positions
         for i in (0..count).rev() {
             let line_idx = start_line + i;
             if line_idx >= total {
@@ -4749,19 +4786,30 @@ impl Engine {
             }
             let line_start = self.buffer().line_to_char(line_idx);
             let line_content: String = self.buffer().content.line(line_idx).chars().collect();
-            let mut removed = 0;
+            let mut removed_visual = 0;
+            let mut removed_chars = 0;
             for ch in line_content.chars() {
-                if removed >= sw {
+                if removed_visual >= remove_cols {
                     break;
                 }
                 match ch {
-                    ' ' => removed += 1,
-                    '\t' => removed += sw.min(sw - (removed % sw).max(1) + 1).min(sw - removed),
+                    ' ' => {
+                        removed_visual += 1;
+                        removed_chars += 1;
+                    }
+                    '\t' => {
+                        let tab_width = sw - (removed_visual % sw);
+                        if removed_visual + tab_width > remove_cols {
+                            break; // don't partially remove a tab
+                        }
+                        removed_visual += tab_width;
+                        removed_chars += 1;
+                    }
                     _ => break,
                 }
             }
-            if removed > 0 {
-                self.delete_with_undo(line_start, line_start + removed);
+            if removed_chars > 0 {
+                self.delete_with_undo(line_start, line_start + removed_chars);
             }
         }
         self.finish_undo_group();

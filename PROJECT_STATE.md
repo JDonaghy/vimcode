@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 8, 2026 (Session 263 — status line positioning + Windows alpha note) | **Tests:** 5422
+**Last updated:** Apr 9, 2026 (Session 264 — context-aware dedent) | **Tests:** 5428
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 257 are in **SESSION_HISTORY.md**.

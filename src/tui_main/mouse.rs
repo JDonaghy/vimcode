@@ -451,8 +451,14 @@ pub(super) fn handle_mouse(
             // Terminal panel resize drag
             if *dragging_terminal_resize {
                 let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let available = term_height.saturating_sub(row + 2 + qf_h);
-                let new_rows = available.saturating_sub(1).clamp(5, 30);
+                let available = term_height.saturating_sub(row + bottom_chrome + qf_h);
+                // Leave at least 4 editor lines visible (+ menu/tab bar chrome)
+                let mr: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let min_editor_chrome = 4 + mr + 1; // 4 lines + menu + tab bar
+                let max_rows = term_height
+                    .saturating_sub(bottom_chrome + qf_h + min_editor_chrome + 2) // +2 for terminal tab bar + header
+                    .max(5);
+                let new_rows = available.saturating_sub(1).clamp(5, max_rows);
                 engine.session.terminal_panel_rows = new_rows;
                 return sidebar_width;
             }

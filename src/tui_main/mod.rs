@@ -3631,7 +3631,6 @@ fn event_loop(
                     }
                 }
                 let mut mouse_should_quit = false;
-                let hover_before = engine.sc_button_hovered;
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -3674,17 +3673,14 @@ fn event_loop(
                 if mouse_should_quit {
                     return;
                 }
-                if engine.sc_button_hovered != hover_before {
-                    needs_redraw = true;
-                }
+                // Mouse events (clicks, drags) almost always change visual
+                // state. Always request a redraw so drag-resize, selection,
+                // scrollbar, and other interactive feedback is immediate.
+                needs_redraw = true;
                 // Poll editor hover dwell after mouse events so the timer
                 // can fire even when continuous mouse events prevent idle polling.
-                if engine.poll_editor_hover() {
-                    needs_redraw = true;
-                }
-                if engine.poll_blame() {
-                    needs_redraw = true;
-                }
+                engine.poll_editor_hover();
+                engine.poll_blame();
             }
             Event::Paste(text) => {
                 // Bracketed paste — text delivered directly from the terminal emulator

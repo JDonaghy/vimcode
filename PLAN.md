@@ -1,6 +1,6 @@
 # VimCode Implementation Plan
 
-- Improve unindenting and indenting bevavior (tab or shift-tab in visual mode) to make it context aware so it tries to figure out how many spaces to remve or add based on the surounding text. Sometimes it unindents nested blocks too much so that the nesting is destroyed, yet pressing u to undo starts to restore individual nests. A single undo should be all it takes to undo. 
+- ~~Improve unindenting and indenting behavior to make it context aware~~ **Done** — `dedent_lines()` now computes the minimum indent across all non-blank lines in the selection and removes that amount uniformly (capped at `shift_width`), preserving relative nesting structure. Blank lines are skipped for the minimum calculation. Undo restores in a single step. 6 new tests.
 
 - ~~investigate bundling the nerd font glyphs~~ **Done** — centralized icon registry (`icons.rs`), `use_nerd_fonts` setting with ASCII fallback, bundled 13KB Nerd Font subset for GTK, extension `fallback_icon` API
 

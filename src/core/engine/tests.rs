@@ -8345,6 +8345,95 @@ fn test_visual_dedent() {
     assert!(!lines[1].starts_with("    "));
 }
 
+// ─── Context-aware dedent (nesting preservation) ────────────────────────
+
+#[test]
+fn test_dedent_preserves_nesting_mixed_indent() {
+    // When the least-indented line has fewer spaces than shift_width,
+    // all lines should lose only that many spaces, preserving relative nesting.
+    let mut e = engine_with_text("  outer\n      inner\n          deep\n");
+    // shift_width=4 but min indent is 2 — should remove only 2 from each line
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "outer", "outer line should lose 2 spaces");
+    assert_eq!(lines[1], "    inner", "inner line should lose 2 spaces");
+    assert_eq!(lines[2], "        deep", "deep line should lose 2 spaces");
+}
+
+#[test]
+fn test_dedent_preserves_nesting_full_shift() {
+    // When all lines have at least shift_width indent, remove shift_width uniformly.
+    let mut e = engine_with_text("    outer\n        inner\n            deep\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "outer");
+    assert_eq!(lines[1], "    inner");
+    assert_eq!(lines[2], "        deep");
+}
+
+#[test]
+fn test_dedent_skips_blank_lines_for_min() {
+    // Blank lines should not constrain the removal amount.
+    let mut e = engine_with_text("    hello\n\n    world\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "hello");
+    assert_eq!(lines[1], "");
+    assert_eq!(lines[2], "world");
+}
+
+#[test]
+fn test_dedent_no_op_when_min_indent_zero() {
+    // If any non-blank line has zero indent, dedent should be a no-op.
+    let mut e = engine_with_text("no_indent\n    indented\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    let text = e.buffer().to_string();
+    assert_eq!(text, "no_indent\n    indented\n");
+}
+
+#[test]
+fn test_dedent_nesting_undo_single_step() {
+    // The entire multi-line dedent should undo in one step.
+    let mut e = engine_with_text("    a\n        b\n            c\n");
+    press_char(&mut e, 'V');
+    press_char(&mut e, '2');
+    press_char(&mut e, 'j');
+    press_char(&mut e, '<');
+    // Verify dedent happened
+    assert_eq!(e.buffer().to_string(), "a\n    b\n        c\n");
+    // Single undo should restore original
+    press_char(&mut e, 'u');
+    assert_eq!(e.buffer().to_string(), "    a\n        b\n            c\n");
+}
+
+#[test]
+fn test_dedent_normal_mode_preserves_nesting() {
+    // Normal mode 3<< should also preserve nesting.
+    let mut e = engine_with_text("  line1\n      line2\n          line3\n");
+    press_char(&mut e, '3');
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    let buf = e.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "line1", "should remove only 2 (min indent)");
+    assert_eq!(lines[1], "    line2");
+    assert_eq!(lines[2], "        line3");
+}
+
 // ─── Tag text objects (it / at) ──────────────────────────────────────────
 
 fn make_tag_engine(html: &str) -> Engine {
