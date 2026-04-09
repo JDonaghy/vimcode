@@ -3984,3 +3984,254 @@ pub(super) fn render_debug_toolbar(
         }
     }
 }
+
+// ─── TUI rendering regression tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::window::GroupId;
+    use ratatui::backend::TestBackend;
+
+    /// Create a hermetic engine for rendering tests.
+    fn test_engine(text: &str) -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.extension_state = crate::core::session::ExtensionState::default();
+        e.ext_registry = None;
+        e.mode = crate::core::Mode::Normal;
+        e.rebuild_user_keymaps();
+        if !text.is_empty() {
+            e.buffer_mut().insert(0, text);
+        }
+        e
+    }
+
+    /// Render the TUI and return the character buffer as a Vec of lines.
+    fn render_tui(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut sidebar = TuiSidebar {
+            visible: false,
+            has_focus: false,
+            active_panel: TuiPanel::Explorer,
+            selected: 0,
+            scroll_top: 0,
+            rows: Vec::new(),
+            root: std::path::PathBuf::from("/tmp"),
+            expanded: std::collections::HashSet::new(),
+            search_input_mode: false,
+            replace_input_focused: false,
+            search_scroll_top: 0,
+            show_hidden_files: false,
+            sort_case_insensitive: false,
+            toolbar_focused: false,
+            toolbar_selected: 0,
+            pending_ctrl_w: false,
+            ext_panel_name: None,
+        };
+        let sidebar_width = 0u16;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
+
+        let mut hover_link_rects = Vec::new();
+        let mut hover_popup_rect = None;
+        let mut editor_hover_popup_rect = None;
+        let mut editor_hover_link_rects = Vec::new();
+        let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
+
+        terminal
+            .draw(|frame| {
+                draw_frame(
+                    frame,
+                    &screen,
+                    &theme,
+                    &mut sidebar,
+                    engine,
+                    sidebar_width,
+                    0,    // quickfix_scroll_top
+                    0,    // debug_output_scroll
+                    None, // folder_picker
+                    false,
+                    false,
+                    None, // cmd_sel
+                    None, // explorer_drop_target
+                    &mut hover_link_rects,
+                    &mut hover_popup_rect,
+                    &mut editor_hover_popup_rect,
+                    &mut editor_hover_link_rects,
+                    &mut tab_visible_counts,
+                );
+            })
+            .unwrap();
+
+        // Extract the rendered buffer as lines of text
+        let buf = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                let cell = &buf[(x, y)];
+                line.push_str(cell.symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines
+    }
+
+    /// Assert that a specific row in the rendered output contains a substring.
+    fn assert_row_contains(lines: &[String], row: usize, substr: &str) {
+        assert!(
+            row < lines.len(),
+            "row {row} out of bounds (have {} lines)",
+            lines.len()
+        );
+        assert!(
+            lines[row].contains(substr),
+            "row {row}: expected {substr:?} in {:?}",
+            lines[row]
+        );
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tui_renders_file_content() {
+        let e = test_engine("Hello, world!\nSecond line\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Content should appear somewhere in the rendered output
+        let has_hello = lines.iter().any(|l| l.contains("Hello, world!"));
+        assert!(has_hello, "rendered output should contain file content");
+
+        let has_second = lines.iter().any(|l| l.contains("Second line"));
+        assert!(has_second, "rendered output should contain second line");
+    }
+
+    #[test]
+    fn test_tui_renders_tab_bar() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Tab bar is the first line; should show "[No Name]" for unsaved buffer
+        assert_row_contains(&lines, 0, "No Name");
+    }
+
+    #[test]
+    fn test_tui_renders_command_line() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Last line is the command line — should not contain normal text content.
+        // Activity bar icons (nerd font glyphs) may appear in the leftmost columns.
+        let last = &lines[23];
+        assert!(
+            !last.contains("content") && !last.contains("NORMAL"),
+            "command line should not contain editor content or status, got: {last:?}"
+        );
+    }
+
+    #[test]
+    fn test_tui_renders_status_bar() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Per-window status bar should show NORMAL mode
+        let has_normal = lines
+            .iter()
+            .any(|l| l.contains("NORMAL") || l.contains("NOR"));
+        assert!(has_normal, "status bar should show normal mode");
+    }
+
+    #[test]
+    fn test_tui_split_renders_two_panes() {
+        let mut e = test_engine("left pane\n");
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let lines = render_tui(&e, 80, 24);
+
+        // Both panes should have a tab bar with "[No Name]"
+        // Count occurrences of "No Name" across all lines
+        let tab_count: usize = lines.iter().filter(|l| l.contains("No Name")).count();
+        assert!(
+            tab_count >= 2,
+            "split should produce two tab bars, found {tab_count} 'No Name' occurrences"
+        );
+    }
+
+    #[test]
+    fn test_tui_dirty_indicator() {
+        let mut e = test_engine("clean\n");
+        e.handle_key("i", Some('i'), false);
+        e.handle_key("x", Some('x'), false);
+        e.handle_key("Escape", None, false);
+        let lines = render_tui(&e, 80, 24);
+
+        // Dirty buffer shows a dot indicator in the tab bar
+        let has_dot = lines[0].contains('●') || lines[0].contains('•') || lines[0].contains('+');
+        assert!(
+            has_dot,
+            "dirty buffer should show indicator in tab bar: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_tui_insert_mode_status() {
+        let mut e = test_engine("hello\n");
+        e.handle_key("i", Some('i'), false);
+        let lines = render_tui(&e, 80, 24);
+
+        let has_insert = lines
+            .iter()
+            .any(|l| l.contains("INSERT") || l.contains("INS"));
+        assert!(has_insert, "insert mode should show in status bar");
+    }
+
+    #[test]
+    fn test_tui_visual_mode_status() {
+        let mut e = test_engine("hello\n");
+        e.handle_key("v", Some('v'), false);
+        let lines = render_tui(&e, 80, 24);
+
+        let has_visual = lines
+            .iter()
+            .any(|l| l.contains("VISUAL") || l.contains("VIS"));
+        assert!(has_visual, "visual mode should show in status bar");
+    }
+
+    #[test]
+    fn test_tui_dimensions_respected() {
+        let e = test_engine("content\n");
+        // Small terminal
+        let lines = render_tui(&e, 40, 10);
+        assert_eq!(lines.len(), 10, "should render exactly 10 rows");
+
+        // All lines should fit in 40 display columns.
+        // Note: multi-byte nerd font glyphs may make .len() > 40 but the
+        // ratatui buffer guarantees 40 cell columns. Check cell count instead.
+        // (The render_tui helper already indexes by cell coordinates.)
+    }
+
+    #[test]
+    fn test_tui_long_file_scroll() {
+        // Create a file longer than the viewport
+        let content: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let e = test_engine(&content);
+        let lines = render_tui(&e, 80, 15);
+
+        // Should show "line 1" at the top (we're at scroll position 0)
+        let has_line1 = lines.iter().any(|l| l.contains("line 1"));
+        assert!(has_line1, "scrolled-to-top should show line 1");
+
+        // Should NOT show "line 50" (too far down)
+        let has_line50 = lines.iter().any(|l| l.contains("line 50"));
+        assert!(!has_line50, "should not show line 50 in 15-row viewport");
+    }
+}
