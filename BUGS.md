@@ -5,12 +5,7 @@
 
 ### Win-GUI gaps (vs TUI reference)
 
-**Critical:**
-- **Win-GUI: status bar not clickable** — Status segments are rendered (draw.rs lines 494-522) but there is no click handler or hit-test. TUI has `status_segment_hit_test()` mapping clicks to `StatusAction` (mode switch, branch picker, go-to-line, etc.). Win-GUI status bar is display-only.
-
 **Medium:**
-- **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
-- **Win-GUI: no terminal resize drag** — Terminal can be toggled (Ctrl+T) and rendered, but cannot be resized by dragging the panel header. No drag handler exists for terminal height.
 - **Win-GUI: no tab drag-and-drop** — No `tab_drag_*` state or handlers. Tabs cannot be reordered or moved between groups by dragging. TUI has full tab drag with visual drop indicators.
 - **Win-GUI: no terminal split** — TUI supports horizontal terminal split (two PTY panes side-by-side). Win-GUI has no terminal split button or drag handler.
 
@@ -25,6 +20,9 @@
 - **Win-GUI: no preview tab mode** — Preview tabs now render with dimmer text color in draw.rs. Engine's preview logic now works because explorer single-click creates preview tabs.
 - **Win-GUI: missing explorer/tab context menus** — Right-click on explorer items now calls `open_explorer_context_menu(path, is_dir, ...)`. Right-click on tab bar now calls `open_tab_context_menu(group_id, tab_idx, ...)`. Previously only editor right-click worked.
 - **Win-GUI: no settings button** — Activity bar now renders a gear icon pinned to the bottom row (matching TUI/VSCode). Click handler routes to `SidebarPanel::Settings`.
+- **Win-GUI: status bar not clickable** — Added `win_status_segment_hit_test()` + click handler before editor click. Calls `build_window_status_line()` to get segments, maps click to `StatusAction`, dispatches via `handle_status_action()`. Also fixed `pixel_to_editor_pos()` to exclude per-window status bar area.
+- **Win-GUI: tab bar clicks not working** — Tab slot Y coordinates used `lh` (line height) instead of `TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT` (actual title bar height), and slot height was `lh` instead of `lh * TAB_BAR_HEIGHT_MULT`. Clicks at the real tab bar position missed the cached slots. Fixed both single-group and multi-group tab slot calculations.
+- **Win-GUI: no terminal resize drag** — Added `terminal_resize_drag` field + header click detection + WM_MOUSEMOVE drag handler + mouse-up finalization with PTY resize and session save.
 - **GTK terminal panel toggle requires two clicks** — On first use, the `[P]` status bar button sent an async `Msg::ToggleTerminal` via Relm4's message queue instead of creating the terminal tab synchronously. The async path caused a one-frame delay where the terminal state wasn't set, requiring a second click. Fixed by calling `terminal_new_tab()` immediately in the click handler (matching TUI behavior which already handled `OpenTerminal` synchronously).
 
 - **Terminal panel resize not working via mouse** — Two bugs: (1) mouse events didn't trigger a redraw (`needs_redraw` was not set after `handle_mouse`), so the drag visually did nothing; (2) the available-space formula used hardcoded `2` instead of the computed `bottom_chrome` value, giving wrong row counts with default settings (`window_status_line=true` → `bottom_chrome=1`). Fixed by unconditionally setting `needs_redraw=true` after all mouse events, and using `bottom_chrome` in the formula.

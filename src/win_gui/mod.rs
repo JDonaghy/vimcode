@@ -35,7 +35,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::core::engine::{open_url_in_browser, Engine, EngineAction, OpenMode};
 use crate::core::window::{GroupId, WindowId, WindowRect};
 use crate::icons;
-use crate::render::{self, build_screen_layout, ScreenLayout, Theme, MENU_STRUCTURE};
+use crate::render::{
+    self, build_screen_layout, build_window_status_line, ScreenLayout, StatusAction, Theme,
+    MENU_STRUCTURE,
+};
 
 use self::draw::DrawContext;
 use self::input::{translate_char, translate_vk};
@@ -286,6 +289,7 @@ struct AppState {
     mouse_text_drag: bool,
     sidebar_resize_drag: bool,
     scrollbar_drag: Option<WindowId>,
+    terminal_resize_drag: bool,
     last_click_time: Instant,
     last_click_pos: (i16, i16),
 
@@ -435,6 +439,7 @@ pub fn run(file_path: Option<PathBuf>) {
             mouse_text_drag: false,
             sidebar_resize_drag: false,
             scrollbar_drag: None,
+            terminal_resize_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
             last_sidebar_refresh: Instant::now(),
@@ -945,7 +950,8 @@ fn cache_layout(
     if let Some(ref split) = screen.editor_group_split {
         // Multi-group: each group has its own tab bar
         for gtb in &split.group_tab_bars {
-            let tab_y = gtb.bounds.y as f32 - lh;
+            let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+            let tab_y = gtb.bounds.y as f32 - tab_h;
             let mut x = gtb.bounds.x as f32;
             for (idx, tab) in gtb.tabs.iter().enumerate() {
                 let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
@@ -957,7 +963,7 @@ fn cache_layout(
                     x_end: x + name_w,
                     close_x_start: close_x,
                     y: tab_y,
-                    height: lh,
+                    height: tab_h,
                 });
                 x += name_w;
             }
@@ -966,10 +972,11 @@ fn cache_layout(
         // Single-group: use the flat tab_bar
         let group_id = state.engine.active_group;
         let tab_y = if screen.menu_bar.is_some() {
-            lh
+            TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT
         } else {
             0.0f32
         };
+        let tab_h = lh * TAB_BAR_HEIGHT_MULT;
         let mut x = state.sidebar.total_width(); // start after sidebar
         for (idx, tab) in screen.tab_bar.iter().enumerate() {
             let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
@@ -981,7 +988,7 @@ fn cache_layout(
                 x_end: x + name_w,
                 close_x_start: close_x,
                 y: tab_y,
-                height: lh,
+                height: tab_h,
             });
             x += name_w;
         }
@@ -1583,7 +1590,13 @@ fn pixel_to_editor_pos(state: &AppState, px: f32, py: f32) -> Option<(WindowId, 
         let rh = cwr.rect.height as f32;
 
         // Exclude scrollbar area (rightmost SCROLLBAR_WIDTH px)
-        if px >= rx && px < rx + rw - SCROLLBAR_WIDTH && py >= ry && py < ry + rh {
+        // Exclude per-window status bar (bottom line_height px)
+        let status_h = if state.engine.settings.window_status_line {
+            lh
+        } else {
+            0.0
+        };
+        if px >= rx && px < rx + rw - SCROLLBAR_WIDTH && py >= ry && py < ry + rh - status_h {
             let gutter_px = cwr.gutter_chars as f32 * cw;
             let view_row = ((py - ry) / lh).floor().max(0.0) as usize;
 
@@ -1801,8 +1814,13 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         };
         if px < ab_w && py >= menu_y {
             // Check if clicking the bottom-pinned Settings gear
-            let (_, rt_h) = get_client_size(hwnd);
-            let settings_y = rt_h as f32 - state.line_height;
+            let settings_y = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            } - state.line_height;
             let clicked_panel = if py >= settings_y {
                 Some(SidebarPanel::Settings)
             } else {
@@ -1962,6 +1980,29 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             }
         }
 
+        // ── Terminal panel header click → start resize drag ─────────────
+        if state.engine.terminal_open && !state.engine.terminal_panes.is_empty() {
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let lh = state.line_height;
+            let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
+            let panel_y = rt_h - (total_rows + 2.0) * lh;
+            // Click on the toolbar row (first row of the terminal panel)
+            if py >= panel_y && py < panel_y + lh && px >= state.sidebar.total_width() {
+                state.terminal_resize_drag = true;
+                state.engine.terminal_has_focus = true;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
         // ── Double-click detection ───────────────────────────────────────
         let now = Instant::now();
         let is_double = now.duration_since(state.last_click_time).as_millis()
@@ -1969,6 +2010,59 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             && state.last_click_pos == (ix, iy);
         state.last_click_time = now;
         state.last_click_pos = (ix, iy);
+
+        // ── Per-window status bar click ─────────────────────────────────
+        if state.engine.settings.window_status_line {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let mut status_clicked = false;
+            for cwr in &state.cached_window_rects {
+                let rx = cwr.rect.x as f32;
+                let ry = cwr.rect.y as f32;
+                let rw_px = cwr.rect.width as f32;
+                let rh_px = cwr.rect.height as f32;
+                let status_y = ry + rh_px - lh;
+                if px >= rx && px < rx + rw_px && py >= status_y && py < status_y + lh {
+                    // Click is on this window's status bar
+                    let is_active = cwr.window_id == state.engine.active_window_id();
+                    let status = build_window_status_line(
+                        &state.engine,
+                        &state.theme,
+                        cwr.window_id,
+                        is_active,
+                    );
+                    let click_col = ((px - rx) / cw).floor() as usize;
+                    let bar_width = (rw_px / cw).floor() as usize;
+                    if let Some(action) = win_status_segment_hit_test(&status, bar_width, click_col)
+                    {
+                        if let Some(ea) = state.engine.handle_status_action(&action) {
+                            use crate::core::engine::EngineAction;
+                            match ea {
+                                EngineAction::ToggleSidebar => {
+                                    state.sidebar.visible = !state.sidebar.visible;
+                                }
+                                EngineAction::OpenTerminal => {
+                                    let cols = (rw_px / cw).floor() as u16;
+                                    state.engine.terminal_new_tab(
+                                        cols,
+                                        state.engine.session.terminal_panel_rows,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    status_clicked = true;
+                    break;
+                }
+            }
+            if status_clicked {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
 
         // ── Editor area click ────────────────────────────────────────────
         state.sidebar.has_focus = false;
@@ -1998,6 +2092,20 @@ fn on_mouse_up(hwnd: HWND) {
         state.mouse_text_drag = false;
         state.sidebar_resize_drag = false;
         state.scrollbar_drag = None;
+        if state.terminal_resize_drag {
+            state.terminal_resize_drag = false;
+            let rows = state.engine.session.terminal_panel_rows;
+            let cw = state.char_width;
+            let cols = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                ((rc.right - rc.left) as f32 / state.dpi_scale / cw).floor() as u16
+            };
+            state.engine.terminal_resize(cols, rows);
+            let _ = state.engine.session.save();
+        }
         state.engine.mouse_drag_active = false;
         state.engine.mouse_drag_origin_window = None;
         state.engine.mouse_drag_word_mode = false;
@@ -2041,6 +2149,39 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+        }
+
+        // Terminal panel resize drag in progress
+        if state.terminal_resize_drag && lbutton {
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let lh = state.line_height;
+            // Available rows between drag position and bottom chrome (status + cmd = 2 rows)
+            let available = ((rt_h - py) / lh).floor() as u16;
+            let new_rows = available.saturating_sub(3).clamp(5, 50); // -3 for toolbar + status + cmd
+            state.engine.session.terminal_panel_rows = new_rows;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        } else if state.terminal_resize_drag && !lbutton {
+            state.terminal_resize_drag = false;
+            let rows = state.engine.session.terminal_panel_rows;
+            let cw = state.char_width;
+            let cols = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                ((rc.right - rc.left) as f32 / state.dpi_scale / cw).floor() as u16
+            };
+            state.engine.terminal_resize(cols, rows);
+            let _ = state.engine.session.save();
         }
 
         // Sidebar resize drag in progress
@@ -2810,4 +2951,38 @@ fn translate_key_to_pty(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
             }
         }
     }
+}
+
+/// Hit-test a per-window status bar click, returning the action if any segment matches.
+fn win_status_segment_hit_test(
+    status: &crate::render::WindowStatusLine,
+    width: usize,
+    click_col: usize,
+) -> Option<StatusAction> {
+    let right_width: usize = status
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count())
+        .sum();
+    let right_start = width.saturating_sub(right_width);
+
+    let mut col = 0;
+    for seg in &status.left_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    let mut col = right_start;
+    for seg in &status.right_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    None
 }
