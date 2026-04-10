@@ -1,7 +1,15 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 264 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 265 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 265 — Backend parity harness + Win-GUI rendering fixes (5471 tests):**
+
+1. **Backend parity harness** — `UiElement` enum (27 variants) + `collect_expected_ui_elements()` source of truth + per-backend collectors (`collect_ui_elements_tui`, `collect_ui_elements_wingui`). 7 parity tests assert every `ScreenLayout` field has a corresponding draw call in each backend.
+2. **6 Win-GUI rendering fixes** — Added `draw_editor_hover`, `draw_diff_peek`, `draw_debug_toolbar`, `draw_diff_toolbar_in_tab_bar`, `draw_tab_tooltip`, `draw_panel_hover` to Win-GUI backend. Zero known rendering gaps remaining.
+3. **Win-GUI smoke test checklist** — Documented visual verification steps for Session 265 changes.
 
 ---
 

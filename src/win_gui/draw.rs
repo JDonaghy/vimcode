@@ -395,14 +395,22 @@ impl<'a> DrawContext<'a> {
     fn draw_editor_window(&self, rw: &RenderedWindow) {
         let rx = rw.rect.x as f32;
         let ry = rw.rect.y as f32;
+        let rw_w = rw.rect.width as f32;
+        let rw_h = rw.rect.height as f32;
+
+        // Clip to window bounds so text doesn't bleed into adjacent areas
+        unsafe {
+            self.rt.PushAxisAlignedClip(
+                &rect_f(rx, ry, rw_w, rw_h),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
 
         // Background fill for the window
         let bg = self.solid_brush(self.theme.background);
         unsafe {
-            self.rt.FillRectangle(
-                &rect_f(rx, ry, rw.rect.width as f32, rw.rect.height as f32),
-                &bg,
-            );
+            self.rt
+                .FillRectangle(&rect_f(rx, ry, rw_w, rw_h), &bg);
         }
 
         let gutter_chars = rw.gutter_char_width;
@@ -530,34 +538,51 @@ impl<'a> DrawContext<'a> {
             }
         }
 
-        // Per-window status line
+        // Per-window status line (with per-segment background colors)
         if let Some(ref status) = rw.status_line {
             let status_y = ry + rw.rect.height as f32 - self.line_height;
-            let status_bg_brush = self.solid_brush(self.theme.status_bg);
+            let bar_w = rw.rect.width as f32;
+            // Base background for the whole bar
+            let base_bg = self.solid_brush(self.theme.background.lighten(0.10));
             unsafe {
-                self.rt.FillRectangle(
-                    &rect_f(rx, status_y, rw.rect.width as f32, self.line_height),
-                    &status_bg_brush,
-                );
+                self.rt
+                    .FillRectangle(&rect_f(rx, status_y, bar_w, self.line_height), &base_bg);
             }
-            // Left segments
-            let mut sx = rx + self.char_width * 0.5;
+            // Left segments with per-segment background
+            let mut sx = rx;
             for seg in &status.left_segments {
+                let seg_w = seg.text.chars().count() as f32 * self.char_width;
+                let seg_bg = self.solid_brush(seg.bg);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(sx, status_y, seg_w, self.line_height), &seg_bg);
+                }
                 self.draw_text(&seg.text, sx, status_y, seg.fg);
-                sx += seg.text.chars().count() as f32 * self.char_width;
+                sx += seg_w;
             }
-            // Right segments
+            // Right segments with per-segment background
             let right_text: String = status
                 .right_segments
                 .iter()
                 .map(|s| s.text.as_str())
                 .collect();
             let right_w = right_text.chars().count() as f32 * self.char_width;
-            let mut sx = rx + rw.rect.width as f32 - right_w - self.char_width * 0.5;
+            let mut sx = rx + bar_w - right_w;
             for seg in &status.right_segments {
+                let seg_w = seg.text.chars().count() as f32 * self.char_width;
+                let seg_bg = self.solid_brush(seg.bg);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(sx, status_y, seg_w, self.line_height), &seg_bg);
+                }
                 self.draw_text(&seg.text, sx, status_y, seg.fg);
-                sx += seg.text.chars().count() as f32 * self.char_width;
+                sx += seg_w;
             }
+        }
+
+        // Pop editor window clip
+        unsafe {
+            self.rt.PopAxisAlignedClip();
         }
     }
 
@@ -568,17 +593,45 @@ impl<'a> DrawContext<'a> {
             return;
         }
 
+        let raw = &line.raw_text;
+        let raw_len = raw.len();
+        let mut cursor_byte = 0usize;
+
         for span in &line.spans {
-            let span_text = safe_slice(&line.raw_text, span.start_byte, span.end_byte);
-            if span_text.is_empty() {
-                continue;
+            let span_start = span.start_byte.min(raw_len);
+            let span_end = span.end_byte.min(raw_len);
+
+            // Draw gap text (between previous span end and this span start) in default color
+            if cursor_byte < span_start {
+                let gap_text = safe_slice(raw, cursor_byte, span_start);
+                if !gap_text.is_empty() {
+                    let char_offset = raw[..cursor_byte.min(raw_len)].chars().count();
+                    let gx = x + char_offset as f32 * self.char_width;
+                    self.draw_text(gap_text, gx, y, self.theme.foreground);
+                }
             }
-            // Compute character offset from byte offset for positioning
-            let char_offset = line.raw_text[..span.start_byte.min(line.raw_text.len())]
-                .chars()
-                .count();
-            let sx = x + char_offset as f32 * self.char_width;
-            self.draw_text(span_text, sx, y, span.style.fg);
+
+            // Draw span text in its styled color
+            let span_text = safe_slice(raw, span_start, span_end);
+            if !span_text.is_empty() {
+                let char_offset = raw[..span_start].chars().count();
+                let sx = x + char_offset as f32 * self.char_width;
+                self.draw_text(span_text, sx, y, span.style.fg);
+            }
+
+            if span_end > cursor_byte {
+                cursor_byte = span_end;
+            }
+        }
+
+        // Draw any trailing text after the last span
+        if cursor_byte < raw_len {
+            let tail_text = safe_slice(raw, cursor_byte, raw_len);
+            if !tail_text.is_empty() {
+                let char_offset = raw[..cursor_byte].chars().count();
+                let tx = x + char_offset as f32 * self.char_width;
+                self.draw_text(tail_text, tx, y, self.theme.foreground);
+            }
         }
     }
 
@@ -678,6 +731,10 @@ impl<'a> DrawContext<'a> {
     // ─── Status bar ──────────────────────────────────────────────────────────
 
     fn draw_status_bar(&self, layout: &ScreenLayout) {
+        // Skip global status bar when per-window status lines are active (status_left is empty)
+        if layout.status_left.is_empty() && layout.status_right.is_empty() {
+            return;
+        }
         let (width, height) = self.rt_size();
         let x0 = self.editor_left;
         let y = height - 2.0 * self.line_height;
@@ -753,28 +810,30 @@ impl<'a> DrawContext<'a> {
 
     fn draw_command_line(&self, layout: &ScreenLayout) {
         let (width, height) = self.rt_size();
-        let x0 = self.editor_left;
+        let lh = self.line_height;
+        // Leave a small margin at the bottom so descenders (g, y, p, :) aren't clipped
+        let margin = (lh * 0.15).max(2.0);
         let y = if layout.separated_status_line.is_some() {
-            // Above terminal: cmd line is right below separated status, above terminal
             let terminal_px = layout
                 .bottom_tabs
                 .terminal
                 .as_ref()
-                .map(|t| (t.content_rows as f32 + 2.0) * self.line_height)
+                .map(|t| (t.content_rows as f32 + 2.0) * lh)
                 .unwrap_or(0.0);
-            height - terminal_px - self.line_height
+            height - terminal_px - lh - margin
         } else {
-            height - self.line_height
+            height - lh - margin
         };
+        // Fill from editor_left to right edge; sidebar area is covered by its own background
         let bg = self.solid_brush(self.theme.background);
         unsafe {
             self.rt
-                .FillRectangle(&rect_f(x0, y, width - x0, self.line_height), &bg);
+                .FillRectangle(&rect_f(self.editor_left, y, width - self.editor_left, lh + margin), &bg);
         }
         let cmd = &layout.command;
         self.draw_text(
             &cmd.text,
-            x0 + self.char_width * 0.5,
+            self.editor_left + self.char_width * 0.5,
             y,
             self.theme.foreground,
         );
@@ -1328,12 +1387,7 @@ impl<'a> DrawContext<'a> {
         }
         parts.push("\u{2191}".to_string()); // ↑ prev
         parts.push("\u{2193}".to_string()); // ↓ next
-        let fold_icon = if dt.unchanged_hidden {
-            "\u{2261}"
-        } else {
-            "\u{2261}"
-        };
-        parts.push(fold_icon.to_string());
+        parts.push("\u{2261}".to_string()); // fold toggle
 
         let label = parts.join("  ");
         let label_w = label.chars().count() as f32 * cw;
@@ -1348,7 +1402,7 @@ impl<'a> DrawContext<'a> {
         if let Some(ref change_label) = dt.change_label {
             self.draw_text(change_label, rx, text_y, self.theme.foreground);
             let offset = change_label.chars().count() as f32 * cw;
-            let rest = format!("  \u{2191}  \u{2193}  {fold_icon}");
+            let rest = "  \u{2191}  \u{2193}  \u{2261}".to_string();
             self.draw_text(&rest, rx + offset, text_y, active_fg);
         } else {
             self.draw_text(&label, rx, text_y, active_fg);
@@ -1825,12 +1879,15 @@ impl<'a> DrawContext<'a> {
         sidebar: &WinSidebar,
         screen: &ScreenLayout,
         menu_bar_y: f32,
+        bottom_chrome_px: f32,
+        engine: &crate::core::engine::Engine,
     ) {
         let (_, rt_h) = self.rt_size();
+        let sidebar_bottom = rt_h - bottom_chrome_px;
         let ab_w = sidebar.activity_bar_px;
         let top = menu_bar_y; // sidebar starts below the menu bar
 
-        // Activity bar background (always drawn)
+        // Activity bar background (always drawn, full height)
         let ab_bg = self.solid_brush(self.theme.tab_bar_bg);
         unsafe {
             self.rt
@@ -1873,7 +1930,7 @@ impl<'a> DrawContext<'a> {
 
         // Settings gear pinned to bottom of activity bar (like TUI/VSCode)
         {
-            let y = rt_h - self.line_height;
+            let y = sidebar_bottom - self.line_height;
             let is_active = sidebar.visible && sidebar.active_panel == SidebarPanel::Settings;
             if is_active {
                 let accent = self.solid_brush(self.theme.tab_active_accent);
@@ -1896,7 +1953,7 @@ impl<'a> DrawContext<'a> {
             return;
         }
 
-        // Panel background
+        // Panel background (full height including bottom chrome, so no gaps)
         let panel_x = ab_w;
         let panel_w = sidebar.panel_width;
         let panel_bg = self.solid_brush(self.theme.tab_bar_bg);
@@ -1912,19 +1969,19 @@ impl<'a> DrawContext<'a> {
                 .FillRectangle(&rect_f(panel_x + panel_w - 1.0, top, 1.0, rt_h - top), &sep);
         }
 
-        // Clip panel content to prevent bleeding into editor area
+        // Clip panel content to prevent bleeding into status/command line area
         let clip_rect = D2D_RECT_F {
             left: panel_x,
             top,
             right: panel_x + panel_w,
-            bottom: rt_h,
+            bottom: sidebar_bottom,
         };
         unsafe {
             self.rt
                 .PushAxisAlignedClip(&clip_rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
 
-        let panel_h = rt_h - top;
+        let panel_h = sidebar_bottom - top;
         match sidebar.active_panel {
             SidebarPanel::Explorer => {
                 self.draw_explorer_panel(sidebar, panel_x, panel_w, panel_h, top);
@@ -1937,18 +1994,7 @@ impl<'a> DrawContext<'a> {
             SidebarPanel::Search => self.draw_search_panel(screen, panel_x, panel_w, panel_h, top),
             SidebarPanel::Ai => self.draw_ai_panel(screen, panel_x, panel_w, panel_h, top),
             SidebarPanel::Settings => {
-                self.draw_text(
-                    "SETTINGS",
-                    panel_x + self.char_width,
-                    top,
-                    self.theme.foreground,
-                );
-                self.draw_text(
-                    "Edit settings.json",
-                    panel_x + self.char_width,
-                    top + self.line_height * 1.5,
-                    self.theme.line_number_fg,
-                );
+                self.draw_settings_panel(engine, panel_x, panel_w, panel_h, top);
             }
         }
 
@@ -2449,6 +2495,196 @@ impl<'a> DrawContext<'a> {
                 self.theme.foreground
             };
             self.draw_text(&text, x + cw * 0.5, y + 2.0, color);
+        }
+    }
+
+    fn draw_settings_panel(
+        &self,
+        engine: &crate::core::engine::Engine,
+        panel_x: f32,
+        panel_w: f32,
+        _panel_h: f32,
+        top: f32,
+    ) {
+        use crate::core::engine::SettingsRow;
+        use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+
+        let lh = self.line_height;
+        let cw = self.char_width;
+        let fg = self.theme.foreground;
+        let dim_fg = self.theme.line_number_fg;
+        let key_fg = self.theme.keyword;
+        let cat_fg = self.theme.keyword;
+        let sel_bg = if engine.settings_has_focus {
+            self.theme.sidebar_sel_bg
+        } else {
+            self.theme.sidebar_sel_bg_inactive
+        };
+
+        // Row 0: Header
+        let header_bg = self.solid_brush(self.theme.status_bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(panel_x, top, panel_w, lh), &header_bg);
+        }
+        self.draw_text(" SETTINGS", panel_x + cw * 0.5, top, self.theme.status_fg);
+
+        // Row 1: Search input
+        let search_y = top + lh;
+        let search_bg = if engine.settings_input_active {
+            sel_bg
+        } else {
+            self.theme.tab_bar_bg
+        };
+        let sb = self.solid_brush(search_bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(panel_x, search_y, panel_w, lh), &sb);
+        }
+        let mut search_text = format!(" / {}", engine.settings_query);
+        if engine.settings_input_active {
+            search_text.push('█');
+        }
+        self.draw_text(&search_text, panel_x + cw * 0.5, search_y, dim_fg);
+
+        // Rows 2+: scrollable form
+        let content_y = top + lh * 2.0;
+        let flat = engine.settings_flat_list();
+        let cats = setting_categories();
+        let scroll = engine.settings_scroll_top;
+        let max_rows = (((_panel_h - lh * 2.0) / lh).floor() as usize).max(1);
+        let right_edge = panel_x + panel_w - cw; // leave room for scrollbar
+
+        for vi in 0..max_rows {
+            let fi = scroll + vi;
+            if fi >= flat.len() {
+                break;
+            }
+            let y = content_y + vi as f32 * lh;
+            let row = &flat[fi];
+            let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
+
+            if is_selected {
+                let sb = self.solid_brush(sel_bg);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(panel_x, y, panel_w, lh), &sb);
+                }
+            }
+
+            match row {
+                SettingsRow::CoreCategory(cat_idx) => {
+                    let collapsed = *cat_idx < engine.settings_collapsed.len()
+                        && engine.settings_collapsed[*cat_idx];
+                    let arrow = if collapsed { "\u{25B6}" } else { "\u{25BC}" };
+                    let cat_name = cats.get(*cat_idx).copied().unwrap_or("?");
+                    let text = format!(" {} {}", arrow, cat_name);
+                    self.draw_text(&text, panel_x + cw, y, cat_fg);
+                }
+                SettingsRow::ExtCategory(name) => {
+                    let collapsed = engine
+                        .ext_settings_collapsed
+                        .get(name)
+                        .copied()
+                        .unwrap_or(false);
+                    let arrow = if collapsed { "\u{25B6}" } else { "\u{25BC}" };
+                    let display = engine
+                        .ext_available_manifests()
+                        .into_iter()
+                        .find(|m| &m.name == name)
+                        .map(|m| m.display_name.clone())
+                        .unwrap_or_else(|| name.clone());
+                    let text = format!(" {} {}", arrow, display);
+                    self.draw_text(&text, panel_x + cw, y, cat_fg);
+                }
+                SettingsRow::CoreSetting(idx) => {
+                    let def = &SETTING_DEFS[*idx];
+                    // Label on the left
+                    self.draw_text(def.label, panel_x + cw * 3.0, y, fg);
+
+                    let editing_this = engine.settings_editing == Some(*idx);
+
+                    // Value on the right
+                    let val_text = match &def.setting_type {
+                        SettingType::Bool => {
+                            let val = engine.settings.get_value_str(def.key);
+                            if val == "true" {
+                                "[\u{2713}]".to_string()
+                            } else {
+                                "[ ]".to_string()
+                            }
+                        }
+                        SettingType::Integer { .. } => {
+                            if editing_this {
+                                format!("{}\u{2588}", engine.settings_edit_buf)
+                            } else {
+                                engine.settings.get_value_str(def.key)
+                            }
+                        }
+                        SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
+                            format!("{} \u{25B8}", engine.settings.get_value_str(def.key))
+                        }
+                        SettingType::StringVal => {
+                            if editing_this {
+                                format!("{}\u{2588}", engine.settings_edit_buf)
+                            } else {
+                                let val = engine.settings.get_value_str(def.key);
+                                if val.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    val
+                                }
+                            }
+                        }
+                        SettingType::BufferEditor => match def.key {
+                            "keymaps" => {
+                                format!("{} defined \u{25B8}", engine.settings.keymaps.len())
+                            }
+                            "extension_registries" => {
+                                format!(
+                                    "{} configured \u{25B8}",
+                                    engine.settings.extension_registries.len()
+                                )
+                            }
+                            _ => "\u{25B8}".to_string(),
+                        },
+                    };
+                    let val_w = val_text.chars().count() as f32 * cw;
+                    let vx = (right_edge - val_w).max(panel_x + cw * 3.0);
+                    let val_color = if editing_this { fg } else { key_fg };
+                    self.draw_text(&val_text, vx, y, val_color);
+                }
+                SettingsRow::ExtSetting(ext_name, ext_key) => {
+                    let def = engine.find_ext_setting_def(ext_name, ext_key);
+                    let label = def
+                        .as_ref()
+                        .map(|d| d.label.as_str())
+                        .unwrap_or(ext_key.as_str());
+                    self.draw_text(label, panel_x + cw * 3.0, y, fg);
+
+                    let val = engine.get_ext_setting(ext_name, ext_key);
+                    let typ = def.as_ref().map(|d| d.r#type.as_str()).unwrap_or("string");
+                    let val_text = match typ {
+                        "bool" => {
+                            if val == "true" {
+                                "[\u{2713}]".to_string()
+                            } else {
+                                "[ ]".to_string()
+                            }
+                        }
+                        _ => {
+                            if val.is_empty() {
+                                "(empty)".to_string()
+                            } else {
+                                val
+                            }
+                        }
+                    };
+                    let val_w = val_text.chars().count() as f32 * cw;
+                    let vx = (right_edge - val_w).max(panel_x + cw * 3.0);
+                    self.draw_text(&val_text, vx, y, key_fg);
+                }
+            }
         }
     }
 

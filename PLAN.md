@@ -25,6 +25,7 @@
 ---
 
 ## Recently Completed
+- **Session 266**: 10 Win-GUI parity fixes — text rendering gap-filling, interactive settings panel (rendering + keyboard), per-segment status bar colors, editor window clipping, sidebar/command line layout fixes, command line descender margin.
 - **Session 265**: Backend parity harness (`UiElement` enum, 27 variants, 3 collectors, 7 parity tests); 6 Win-GUI rendering fixes (editor hover, diff peek, debug toolbar, diff toolbar, tab tooltip, panel hover) — zero known rendering gaps remaining.
 - **Session 264**: Context-aware dedent; TUI terminal resize fix; GTK terminal toggle fix; 7 Win-GUI fixes (preview tabs, settings button, context menus, status bar clicks, tab bar clicks, terminal resize drag); rendering test infrastructure (9 ScreenLayout + 10 TUI assertion + 6 insta snapshot tests); Win-GUI bug audit; **v0.9.0 release**.
 > Sessions 263 and earlier in **SESSION_HISTORY.md**.

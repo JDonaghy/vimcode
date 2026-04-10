@@ -296,6 +296,10 @@ struct AppState {
     // ── Periodic refresh ─────────────────────────────────────────────────
     last_sidebar_refresh: Instant,
 
+    // ── Layout cache ─────────────────────────────────────────────────────
+    /// Bottom chrome height in DIPs (status bar + cmd line + terminal + above-terminal status)
+    bottom_chrome_px: f32,
+
     // ── Caption buttons (custom title bar) ──────────────────────────────
     /// Which caption button is hovered (0=min, 1=max, 2=close), or None.
     caption_hover: Option<usize>,
@@ -443,6 +447,7 @@ pub fn run(file_path: Option<PathBuf>) {
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
             last_sidebar_refresh: Instant::now(),
+            bottom_chrome_px: 0.0,
             caption_hover: None,
         });
     });
@@ -855,10 +860,14 @@ fn on_paint(hwnd: HWND) {
         };
         let below_terminal_px = if status_above_terminal {
             0.0 // nothing below terminal
+        } else if state.engine.settings.window_status_line {
+            1.0 * lh // cmd line only (per-window status is inside editor windows)
         } else {
-            2.0 * lh // status + cmd (below terminal)
+            2.0 * lh // global status + cmd (below terminal)
         };
         let bottom_chrome = below_terminal_px + terminal_height + above_terminal_px;
+        // Store in same units as line_height (physical-px) — callers that need DIPs must divide by dpi_scale
+        state.bottom_chrome_px = bottom_chrome as f32;
         let editor_bottom = height - bottom_chrome;
 
         // Use engine's group-aware rect calculation (handles splits)
@@ -919,7 +928,7 @@ fn on_paint(hwnd: HWND) {
             } else {
                 0.0
             };
-            ctx.draw_sidebar(&state.sidebar, &screen, menu_bar_y);
+            ctx.draw_sidebar(&state.sidebar, &screen, menu_bar_y, state.bottom_chrome_px, &state.engine);
             // Menu dropdown on top of sidebar
             if let Some(ref menu) = screen.menu_bar {
                 ctx.draw_menu_dropdown(menu);
@@ -1199,6 +1208,84 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
+        // ── Settings panel keyboard handling ─────────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Settings
+        {
+            // Ctrl+V paste into search input or inline edit
+            if ctrl && key.key_name == "v" {
+                if state.engine.settings_input_active || state.engine.settings_editing.is_some() {
+                    let text = match state.engine.clipboard_read {
+                        Some(ref cb) => cb().ok(),
+                        None => None,
+                    };
+                    if let Some(t) = text {
+                        state.engine.settings_paste(&t);
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Tab" => ("Tab", None),
+                "Return" => ("Return", None),
+                "space" | " " => ("Space", None),
+                "l" | "Right" => ("l", None),
+                "h" | "Left" => ("h", None),
+                "/" => ("/", None),
+                "q" | "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                _ => {
+                    if let Some(ch) = key.unicode {
+                        ("char", Some(ch))
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                state.engine.handle_settings_key(
+                    if key_name == "char" { "" } else { key_name },
+                    ctrl,
+                    ch,
+                );
+                if !state.engine.settings_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+                // Keep selected item visible after navigation
+                let content_h = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(state.hwnd, &mut rc);
+                    }
+                    let h = (rc.bottom - rc.top) as f32;
+                    ((h - state.bottom_chrome_px - state.line_height * 2.0) / state.line_height)
+                        .floor() as usize
+                };
+                if content_h > 0 {
+                    if state.engine.settings_selected
+                        >= state.engine.settings_scroll_top + content_h
+                    {
+                        state.engine.settings_scroll_top =
+                            state.engine.settings_selected - content_h + 1;
+                    } else if state.engine.settings_selected < state.engine.settings_scroll_top {
+                        state.engine.settings_scroll_top = state.engine.settings_selected;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
         // Sidebar keyboard navigation when focused
         if state.sidebar.has_focus && state.sidebar.visible {
             let handled = match key.key_name.as_str() {
@@ -1420,6 +1507,59 @@ fn on_char(wparam: WPARAM) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+
+        // Settings panel character key handling
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Settings
+        {
+            let (key_name, unicode): (&str, Option<char>) = match ch {
+                'j' => ("j", None),
+                'k' => ("k", None),
+                'l' => ("l", None),
+                'h' => ("h", None),
+                '/' => ("/", None),
+                'q' => ("Escape", None),
+                ' ' => ("Space", None),
+                c if !c.is_control() => ("char", Some(c)),
+                _ => ("", None),
+            };
+            if !key_name.is_empty() {
+                let ch_arg = if key_name == "char" { unicode } else { None };
+                state.engine.handle_settings_key(
+                    if key_name == "char" { "" } else { key_name },
+                    false,
+                    ch_arg,
+                );
+                if !state.engine.settings_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+                // Keep selected item visible
+                let content_h = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(state.hwnd, &mut rc);
+                    }
+                    let h = (rc.bottom - rc.top) as f32;
+                    ((h - state.bottom_chrome_px - state.line_height * 2.0) / state.line_height)
+                        .floor() as usize
+                };
+                if content_h > 0 {
+                    if state.engine.settings_selected
+                        >= state.engine.settings_scroll_top + content_h
+                    {
+                        state.engine.settings_scroll_top =
+                            state.engine.settings_selected - content_h + 1;
+                    } else if state.engine.settings_selected < state.engine.settings_scroll_top {
+                        state.engine.settings_scroll_top = state.engine.settings_selected;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
 
         // Sidebar keyboard navigation for character keys (j/k/h/l)
         if state.sidebar.has_focus && state.sidebar.visible {
@@ -1813,14 +1953,15 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             0.0
         };
         if px < ab_w && py >= menu_y {
-            // Check if clicking the bottom-pinned Settings gear
-            let settings_y = {
+            // Check if clicking the bottom-pinned Settings gear.
+            // The gear is drawn at sidebar_bottom - line_height where sidebar_bottom = rt_h - bottom_chrome.
+            // Use physical pixel coords (iy) directly for reliable hit-testing.
+            let client_h = unsafe {
                 let mut rc = RECT::default();
-                unsafe {
-                    let _ = GetClientRect(hwnd, &mut rc);
-                }
-                (rc.bottom - rc.top) as f32 / state.dpi_scale
-            } - state.line_height;
+                let _ = GetClientRect(hwnd, &mut rc);
+                (rc.bottom - rc.top) as f32
+            };
+            let settings_y = (client_h - state.bottom_chrome_px - state.line_height) / state.dpi_scale;
             let clicked_panel = if py >= settings_y {
                 Some(SidebarPanel::Settings)
             } else {
@@ -1838,13 +1979,24 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             if let Some(clicked_panel) = clicked_panel {
                 if state.sidebar.visible && state.sidebar.active_panel == clicked_panel {
                     state.sidebar.visible = false;
+                    state.sidebar.has_focus = false;
+                    state.engine.clear_sidebar_focus();
                 } else {
                     state.sidebar.active_panel = clicked_panel;
                     state.sidebar.visible = true;
                     state.sidebar.dirty = true;
-                    // Refresh git data when switching to Git panel
-                    if clicked_panel == SidebarPanel::Git {
-                        state.engine.sc_refresh();
+                    state.sidebar.has_focus = true;
+                    // Set engine-side focus for the appropriate panel
+                    state.engine.clear_sidebar_focus();
+                    match clicked_panel {
+                        SidebarPanel::Settings => state.engine.settings_has_focus = true,
+                        SidebarPanel::Git => {
+                            state.engine.sc_has_focus = true;
+                            state.engine.sc_refresh();
+                        }
+                        SidebarPanel::Extensions => state.engine.ext_sidebar_has_focus = true,
+                        SidebarPanel::Ai => state.engine.ai_has_focus = true,
+                        _ => {}
                     }
                     // Auto-expand root
                     if clicked_panel == SidebarPanel::Explorer && state.sidebar.expanded.is_empty()

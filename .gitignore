@@ -4,3 +4,4 @@ opencode.json
 vim-index.txt
 .flatpak-builder/
 build-dir/
+target2/

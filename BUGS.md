@@ -6,6 +6,7 @@
 ### Win-GUI gaps (vs TUI reference)
 
 **Medium:**
+- **Win-GUI: activity bar icon size mismatch** — Activity bar icons are smaller than the GTK build. Should match GTK icon sizing for visual consistency.
 - **Win-GUI: no tab drag-and-drop** — No `tab_drag_*` state or handlers. Tabs cannot be reordered or moved between groups by dragging. TUI has full tab drag with visual drop indicators.
 - **Win-GUI: no terminal split** — TUI supports horizontal terminal split (two PTY panes side-by-side). Win-GUI has no terminal split button or drag handler.
 - **Win-GUI: no click/mouse handling for new popups** — `draw_editor_hover`, `draw_diff_peek`, `draw_panel_hover`, `draw_tab_tooltip`, `draw_debug_toolbar`, `draw_diff_toolbar_in_tab_bar` were added in Session 265 but have no corresponding click/dismiss/scroll mouse handlers. Editor hover needs click-to-focus, scroll, dismiss-on-mouseout. Diff peek needs `s`/`r`/`q` key routing. Debug toolbar buttons need click handlers. Tab tooltip needs dismiss-on-mouseout. Diff toolbar prev/next/fold buttons need click handlers.
@@ -18,6 +19,14 @@
 
 ## Resolved
 
+- **Win-GUI: text rendering truncation** — `draw_styled_line` only rendered syntax spans, leaving gaps invisible (`crate` in `pub(crate)`, variable names). Fixed by drawing text between and after spans in default foreground color.
+- **Win-GUI: settings icon clipped and not clickable** — Gear icon positioned at `rt_h - lh` (below status bar). Repositioned to `sidebar_bottom - lh` (above bottom chrome). Click handler updated with matching geometry.
+- **Win-GUI: settings panel stub** — Settings panel was a two-line stub. Replaced with full interactive form: categories (expandable), bools, integers, strings, enums, extension settings, search input. Keyboard handling via `handle_settings_key()` in both `on_key_down` and `on_char`.
+- **Win-GUI: global status bar drawn over per-window status** — `draw_status_bar` painted full-width blue bar even when per-window status was active (empty `status_left`/`status_right`). Fixed by early return when both are empty. Also fixed `below_terminal_px` to reserve 1 row (not 2) when per-window status is active.
+- **Win-GUI: per-window status bar all one color** — Status bar painted entire background with `status_bg`. Now renders per-segment backgrounds (mode name gets its own colored bg, matching TUI).
+- **Win-GUI: editor text bleeding past window bounds** — Added `PushAxisAlignedClip` around each editor window draw. Sidebar panel clip rect tightened to `sidebar_bottom`.
+- **Win-GUI: command line descenders clipped** — Added bottom margin so characters with descenders (`g`, `y`, `p`, `:`) aren't cut off at the window edge.
+- **Win-GUI: sidebar panel/command line background gaps** — Panel background now extends full height; command line background starts at `editor_left`; `panel_h` uses `sidebar_bottom` instead of `rt_h`.
 - **Win-GUI: opening a file replaces current buffer** — Explorer single-click now uses `OpenMode::Preview` (transient tab); double-click uses `OpenMode::Permanent`. Previously all opens hardcoded `Permanent`.
 - **Win-GUI: no preview tab mode** — Preview tabs now render with dimmer text color in draw.rs. Engine's preview logic now works because explorer single-click creates preview tabs.
 - **Win-GUI: missing explorer/tab context menus** — Right-click on explorer items now calls `open_explorer_context_menu(path, is_dir, ...)`. Right-click on tab bar now calls `open_tab_context_menu(group_id, tab_idx, ...)`. Previously only editor right-click worked.
