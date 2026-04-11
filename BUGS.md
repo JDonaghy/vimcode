@@ -18,6 +18,22 @@
 - ~~**Win-GUI: cursor not kept in viewport after scroll**~~ — Fixed: cursor now clamped into viewport (with scrolloff) after scroll, matching GTK. Also calls `sync_scroll_binds()`.
 - ~~**Win-GUI: terminal tab switching by mouse missing**~~ — Fixed: click on numbered tab labels in terminal toolbar switches `terminal_active`. Matches tab label geometry from draw code.
 
+**Medium (incorrect behavior — new):**
+- ~~**Win-GUI: tabs disappear when second editor group is created**~~ — Fixed: `draw_group_tab_bar` only subtracted the tab bar height from `bounds.y`, but the reserved space also includes the breadcrumb row. Tab bars were drawn at the breadcrumb position (hidden behind breadcrumbs/editor content). Fixed by accounting for breadcrumb offset in both drawing and click slot caching.
+
+**Medium (incorrect behavior — new):**
+- ~~**Win-GUI: explorer single-click opens permanent tab instead of preview**~~ — Investigated: preview system works correctly. `open_file_preview()` is called and reuses the preview tab. Multiple tabs appear only when the preview is promoted (by clicking the tab, editing, or saving) — this is expected VSCode behavior.
+- ~~**Win-GUI: terminal steals keyboard focus from editor**~~ — Fixed: added `terminal_has_focus = false` in the editor area click handler, matching GTK/TUI behavior.
+- ~~**Win-GUI: no active tab accent line across editor groups**~~ — Fixed: `draw_tabs` now takes `show_accent` parameter; `draw_group_tab_bar` passes `is_active_group` so the 2px accent line only appears on tabs in the focused group.
+
+**Medium (found by systematic focus/draw audit):**
+- ~~**Win-GUI: sidebar focus persists after editor click**~~ — Fixed: added `clear_sidebar_focus()` on editor click. Settings/AI/Search/Debug focus flags were never cleared when clicking the editor, causing keyboard events to route to sidebar panels.
+- ~~**Win-GUI: sidebar focus persists after terminal click**~~ — Fixed: added `clear_sidebar_focus()` and `sidebar.has_focus = false` when clicking in the terminal panel area.
+- ~~**Win-GUI: dialog text and buttons overflow the dialog box**~~ — Fixed: dialog width now auto-sized from content (buttons + body + title) instead of hardcoded 400px. Both draw and click handler use the same calculation.
+
+**Medium (deferred):**
+- **Win-GUI: terminal can't regain focus after editor click** — After clicking in the editor (which correctly clears `terminal_has_focus`), clicking back on the terminal panel doesn't restore `terminal_has_focus = true`. The terminal click handler likely doesn't set focus, or the editor click handler intercepts the click first.
+
 **Low (missing features):**
 - **Win-GUI: breadcrumb clicks not handled** — Breadcrumbs render but are not clickable. GTK handles single-click (opens scoped picker for directory/symbol segment) and double-click. Win-GUI clicks on the breadcrumb row fall through to the editor.
 - **Win-GUI: group divider drag not implemented** — Split editor groups can be created (via tab drag) but the divider between them cannot be dragged to resize. GTK has full divider drag handling.

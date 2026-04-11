@@ -43,7 +43,7 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 
-**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there.
+**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there. When building a new native GUI backend (e.g. macOS), read **`docs/NATIVE_GUI_LESSONS.md`** first — it documents pitfalls from Win-GUI (breadcrumb offset bugs, multi-group layout issues, click/draw parity, backend checklist).
 
 ### GTK directory (`src/gtk/`)
 

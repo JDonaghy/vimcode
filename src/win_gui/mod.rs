@@ -1204,7 +1204,12 @@ fn cache_layout(
         // Multi-group: each group has its own tab bar
         for gtb in &split.group_tab_bars {
             let tab_h = lh * TAB_BAR_HEIGHT_MULT;
-            let tab_y = gtb.bounds.y as f32 - tab_h;
+            let has_bc = screen
+                .breadcrumbs
+                .iter()
+                .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+            let bc_offset = if has_bc { lh } else { 0.0 };
+            let tab_y = gtb.bounds.y as f32 - tab_h - bc_offset;
             let mut x = gtb.bounds.x as f32;
             for (idx, tab) in gtb.tabs.iter().enumerate() {
                 let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
@@ -2388,9 +2393,22 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     (rc.bottom - rc.top) as f32 / state.dpi_scale,
                 )
             };
-            // Match geometry from draw_dialog
+            // Match geometry from draw_dialog (auto-sized width)
             let dialog = state.engine.dialog.as_ref().unwrap();
-            let dialog_w = 400.0f32.min(rt_w - 40.0);
+            let btn_total_w: f32 = dialog
+                .buttons
+                .iter()
+                .map(|b| (b.label.chars().count() as f32 + 2.0) * cw + cw)
+                .sum::<f32>()
+                + cw * 2.0;
+            let body_max_w = dialog
+                .body
+                .iter()
+                .map(|line| line.chars().count() as f32 * cw + cw * 4.0)
+                .fold(0.0f32, f32::max);
+            let title_w = dialog.title.chars().count() as f32 * cw + cw * 4.0;
+            let content_w = btn_total_w.max(body_max_w).max(title_w);
+            let dialog_w = content_w.max(300.0).min(rt_w - 40.0);
             let dialog_h = (dialog.body.len() as f32 + 3.0) * lh + 20.0;
             let dx = (rt_w - dialog_w) / 2.0;
             let dy = (rt_h - dialog_h) / 2.0;
@@ -2676,6 +2694,11 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             let editor_left = state.sidebar.total_width();
 
             // Click on the toolbar row
+            if py >= panel_y && px >= editor_left {
+                // Clear sidebar focus when clicking on terminal area
+                state.sidebar.has_focus = false;
+                state.engine.clear_sidebar_focus();
+            }
             if py >= panel_y && py < panel_y + lh && px >= editor_left {
                 // Check toolbar buttons (right-aligned): × at width-2cw, split at width-4cw, + at width-6cw
                 let btn_close_x = rt_h.max(0.0); // rt_h unused — use width
@@ -2834,6 +2857,8 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
 
         // ── Editor area click ────────────────────────────────────────────
         state.sidebar.has_focus = false;
+        state.engine.terminal_has_focus = false;
+        state.engine.clear_sidebar_focus();
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             // Clear VSCode selection on click (matching GTK behavior)
             if state.engine.is_vscode_mode() {

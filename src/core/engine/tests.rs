@@ -18708,3 +18708,65 @@ fn test_status_line_above_terminal_setting_toggle() {
     engine.execute_command("set slat?");
     assert_eq!(engine.message, "nostatuslineaboveterminal");
 }
+
+#[test]
+fn test_multi_group_window_rects_cover_all_groups() {
+    use crate::core::window::{SplitDirection, WindowRect};
+
+    let mut engine = Engine::new();
+    // Create a second editor group via vertical split
+    engine.open_editor_group(SplitDirection::Vertical);
+    assert_eq!(engine.group_layout.leaf_count(), 2);
+
+    // Simulate realistic editor bounds (like Win-GUI would pass)
+    let tab_bar_height = 30.0;
+    let editor_bounds = WindowRect::new(200.0, 40.0, 1600.0, 900.0);
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
+
+    // Every group must have at least one window in the rects
+    let group_ids = engine.group_layout.group_ids();
+    assert_eq!(group_ids.len(), 2);
+    for &gid in &group_ids {
+        let group = engine.editor_groups.get(&gid).expect("group exists");
+        let wids = group.active_tab().layout.window_ids();
+        let matching: Vec<_> = window_rects
+            .iter()
+            .filter(|(wid, _)| wids.contains(wid))
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "Group {:?} has no matching window_rects. wids={:?}, all_rects={:?}",
+            gid,
+            wids,
+            window_rects.iter().map(|(w, _)| w).collect::<Vec<_>>()
+        );
+        // All matching rects should have non-zero dimensions
+        for (wid, wr) in &matching {
+            assert!(
+                wr.width > 0.0 && wr.height > 0.0,
+                "Window {:?} in group {:?} has zero dimensions: {:?}",
+                wid,
+                gid,
+                wr
+            );
+        }
+    }
+
+    // Also test horizontal split
+    let mut engine2 = Engine::new();
+    engine2.open_editor_group(SplitDirection::Horizontal);
+    assert_eq!(engine2.group_layout.leaf_count(), 2);
+    let (rects2, _) = engine2.calculate_group_window_rects(editor_bounds, tab_bar_height);
+    let gids2 = engine2.group_layout.group_ids();
+    for &gid in &gids2 {
+        let group = engine2.editor_groups.get(&gid).expect("group exists");
+        let wids = group.active_tab().layout.window_ids();
+        let has_match = rects2.iter().any(|(wid, _)| wids.contains(wid));
+        assert!(
+            has_match,
+            "Horizontal split: group {:?} has no matching window_rects",
+            gid
+        );
+    }
+}

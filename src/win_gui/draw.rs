@@ -102,7 +102,11 @@ impl<'a> DrawContext<'a> {
             if let Some(ref split) = layout.editor_group_split {
                 for gtb in &split.group_tab_bars {
                     let is_active = gtb.group_id == split.active_group;
-                    self.draw_group_tab_bar(gtb, is_active);
+                    let has_breadcrumb = layout
+                        .breadcrumbs
+                        .iter()
+                        .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+                    self.draw_group_tab_bar(gtb, is_active, has_breadcrumb);
                 }
                 // Draw group dividers
                 self.draw_group_dividers(split);
@@ -230,33 +234,51 @@ impl<'a> DrawContext<'a> {
             self.rt.FillRectangle(&rect_f(x, y, width - x, h), &tab_bg);
         }
         let text_y = y + (h - self.line_height) / 2.0; // vertically center text
-        self.draw_tabs(&layout.tab_bar, x, text_y, width - x);
+        self.draw_tabs(&layout.tab_bar, x, text_y, width - x, true);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = layout.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, width - x, h);
         }
     }
 
-    fn draw_group_tab_bar(&self, gtb: &crate::render::GroupTabBar, is_active_group: bool) {
+    fn draw_group_tab_bar(
+        &self,
+        gtb: &crate::render::GroupTabBar,
+        is_active_group: bool,
+        has_breadcrumb: bool,
+    ) {
         let h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let x = gtb.bounds.x as f32;
-        let y = gtb.bounds.y as f32 - h; // tab bar sits above the group content
+        // bounds.y is the content area top; the reserved space above includes
+        // the tab bar height + optional breadcrumb row. Subtract the full amount.
+        let breadcrumb_offset = if has_breadcrumb {
+            self.line_height
+        } else {
+            0.0
+        };
+        let y = gtb.bounds.y as f32 - h - breadcrumb_offset;
         let w = gtb.bounds.width as f32;
 
-        let _ = is_active_group; // reserved for future per-group styling
         let bg = self.solid_brush(self.theme.tab_bar_bg);
         unsafe {
             self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
         }
         let text_y = y + (h - self.line_height) / 2.0;
-        self.draw_tabs(&gtb.tabs, x, text_y, w);
+        self.draw_tabs(&gtb.tabs, x, text_y, w, is_active_group);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = &gtb.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, w, h);
         }
     }
 
-    fn draw_tabs(&self, tabs: &[crate::render::TabInfo], x_origin: f32, y: f32, _max_width: f32) {
+    fn draw_tabs(
+        &self,
+        tabs: &[crate::render::TabInfo],
+        x_origin: f32,
+        y: f32,
+        _max_width: f32,
+        show_accent: bool,
+    ) {
         let tab_h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let mut x = x_origin;
         let pad = 12.0; // horizontal padding inside each tab
@@ -306,8 +328,8 @@ impl<'a> DrawContext<'a> {
                 );
             }
 
-            // Active tab accent bar (2px at top)
-            if tab.active {
+            // Active tab accent bar (2px at top) — only in the focused group
+            if tab.active && show_accent {
                 let accent = self.solid_brush(self.theme.tab_active_accent);
                 unsafe {
                     self.rt.FillRectangle(&rect_f(x, y, tab_w, 2.0), &accent);
@@ -971,12 +993,20 @@ impl<'a> DrawContext<'a> {
                 let by = gtb.bounds.y as f32;
                 let bw = gtb.bounds.width as f32;
                 let bh = gtb.bounds.height as f32;
-                let tab_bar_y = by - tab_h;
+                // Account for breadcrumb row when positioning tab bar overlay
+                let has_bc = layout
+                    .breadcrumbs
+                    .iter()
+                    .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+                let bc_offset = if has_bc { lh } else { 0.0 };
+                let tab_bar_y = by - tab_h - bc_offset;
 
                 match zone {
                     DropZone::Center(gid) if *gid == gtb.group_id => unsafe {
-                        self.rt
-                            .FillRectangle(&rect_f(bx, tab_bar_y, bw, bh + tab_h), &overlay_brush);
+                        self.rt.FillRectangle(
+                            &rect_f(bx, tab_bar_y, bw, bh + tab_h + bc_offset),
+                            &overlay_brush,
+                        );
                     },
                     DropZone::Split(gid, dir, new_first) if *gid == gtb.group_id => {
                         let (rx, ry, rw, rh) = match (dir, new_first) {
@@ -1116,8 +1146,22 @@ impl<'a> DrawContext<'a> {
                 .FillRectangle(&rect_f(0.0, 0.0, rt_w, rt_h), &overlay);
         }
 
-        // Dialog box
-        let dialog_w = 400.0f32.min(rt_w - 40.0);
+        // Dialog box — auto-size width to fit buttons and body text
+        let cw = self.char_width;
+        let btn_total_w: f32 = dialog
+            .buttons
+            .iter()
+            .map(|(label, _)| (label.chars().count() as f32 + 2.0) * cw + cw)
+            .sum::<f32>()
+            + cw * 2.0; // padding
+        let body_max_w = dialog
+            .body
+            .iter()
+            .map(|line| line.chars().count() as f32 * cw + cw * 4.0)
+            .fold(0.0f32, f32::max);
+        let title_w = dialog.title.chars().count() as f32 * cw + cw * 4.0;
+        let content_w = btn_total_w.max(body_max_w).max(title_w);
+        let dialog_w = content_w.max(300.0).min(rt_w - 40.0);
         let dialog_h = (dialog.body.len() as f32 + 3.0) * self.line_height + 20.0;
         let dx = (rt_w - dialog_w) / 2.0;
         let dy = (rt_h - dialog_h) / 2.0;
