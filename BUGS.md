@@ -3,17 +3,39 @@
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
 
-### Win-GUI gaps (vs TUI reference)
+### Win-GUI gaps (vs GTK reference) — found by systematic GTK↔Win-GUI comparison
 
-**Medium:**
-- **Win-GUI: activity bar icon size mismatch** — Activity bar icons are smaller than the GTK build. Should match GTK icon sizing for visual consistency.
-- **Win-GUI: no tab drag-and-drop** — No `tab_drag_*` state or handlers. Tabs cannot be reordered or moved between groups by dragging. TUI has full tab drag with visual drop indicators.
-- **Win-GUI: no terminal split** — TUI supports horizontal terminal split (two PTY panes side-by-side). Win-GUI has no terminal split button or drag handler.
-- **Win-GUI: no click/mouse handling for new popups** — `draw_editor_hover`, `draw_diff_peek`, `draw_panel_hover`, `draw_tab_tooltip`, `draw_debug_toolbar`, `draw_diff_toolbar_in_tab_bar` were added in Session 265 but have no corresponding click/dismiss/scroll mouse handlers. Editor hover needs click-to-focus, scroll, dismiss-on-mouseout. Diff peek needs `s`/`r`/`q` key routing. Debug toolbar buttons need click handlers. Tab tooltip needs dismiss-on-mouseout. Diff toolbar prev/next/fold buttons need click handlers.
+**Critical (data loss / broken core features):**
+- **Win-GUI: tab close skips dirty check** — `on_click` calls `engine.close_tab()` unconditionally without checking `engine.dirty()`. GTK shows a confirmation dialog (`ShowCloseTabConfirm`) when the buffer has unsaved changes. Win-GUI silently discards unsaved work.
+- **Win-GUI: picker (fuzzy finder) not mouse-interactive** — When `engine.picker_open` is true, GTK intercepts all clicks (click result to select, click outside to dismiss, scroll to navigate). Win-GUI has no picker-open check in `on_click` — clicks pass through to the editor behind the picker. Picker is keyboard-only.
+- **Win-GUI: dialog buttons not clickable** — Dialogs (delete confirmation, quit-unsaved, swap recovery) render correctly but have no click handling. GTK tests button rects and dispatches confirm/cancel. Win-GUI draws the dialog but mouse clicks have no effect — dialogs are keyboard-only.
+- **Win-GUI: QuitWithUnsaved action silently ignored** — When the user tries to quit with unsaved changes, the engine returns `EngineAction::QuitWithUnsaved`. GTK shows a confirmation dialog. Win-GUI's `handle_engine_action` returns `false` (no-op), silently ignoring the action. User cannot confirm or cancel quit via this path.
 
-**Low / Needs visual verification on Windows:**
-- **Win-GUI: scrollbar rendering** — Investigation found that draw.rs lines 462-492 DO draw track and thumb with Direct2D brushes. If the scrollbar is still invisible, it may be a color/contrast issue rather than missing code.
-- **Win-GUI: new popup positioning unverified** — The 6 renderers added in Session 265 (editor hover, diff peek, debug toolbar, diff toolbar, tab tooltip, panel hover) follow existing `draw_hover`/`draw_dialog` D2D patterns but have not been visually tested on Windows. Popup anchoring, text clipping at edges, and scrollbar thumb math may need adjustment.
+**Medium (incorrect behavior):**
+- **Win-GUI: scroll doesn't skip folded lines** — `on_mouse_wheel` directly modifies `view_mut().scroll_top` with raw arithmetic. GTK calls `engine.scroll_down_visible(count)` / `engine.scroll_up_visible(count)` which skip folded regions. Win-GUI can land the viewport inside a folded region. Additionally, GTK adjusts the cursor to stay within the viewport after scrolling; Win-GUI does not.
+- **Win-GUI: picker scroll not intercepted** — Mouse wheel while the picker/command palette is open scrolls the editor behind it instead of scrolling picker results. GTK checks `picker_open` before editor scroll in its scroll handler.
+- **Win-GUI: VSCode selection not cleared on click** — GTK calls `engine.vscode_clear_selection()` before `handle_mouse_click` when in VSCode edit mode. Win-GUI does not, leaving stale selections after clicking.
+- **Win-GUI: cursor not kept in viewport after scroll** — GTK adjusts cursor position after scroll to keep it on-screen. Win-GUI scrolls the viewport without repositioning the cursor, which can leave it above or below the visible area.
+- **Win-GUI: terminal tab switching by mouse missing** — Terminal toolbar has add/split/close buttons but no individual terminal tab click handling. GTK detects clicks on numbered tab labels and switches `terminal_active`. Win-GUI only handles the 3 right-aligned buttons.
+
+**Low (missing features):**
+- **Win-GUI: breadcrumb clicks not handled** — Breadcrumbs render but are not clickable. GTK handles single-click (opens scoped picker for directory/symbol segment) and double-click. Win-GUI clicks on the breadcrumb row fall through to the editor.
+- **Win-GUI: group divider drag not implemented** — Split editor groups can be created (via tab drag) but the divider between them cannot be dragged to resize. GTK has full divider drag handling.
+- **Win-GUI: horizontal scrollbar drag not implemented** — Horizontal scrollbar renders but is not interactive. GTK has h-scrollbar click and drag. Win-GUI only handles vertical scrollbar drag.
+- **Win-GUI: diff toolbar buttons not clickable** — The `↑`/`↓`/`≡` buttons in the diff toolbar (tab bar) render but have no click hit-testing. GTK dispatches prev-change/next-change/toggle-fold on click.
+- **Win-GUI: diff peek key routing missing** — The diff peek popup renders but `s`/`r`/`q` key routing (stage/revert/quit) is not implemented.
+- **Win-GUI: tab tooltip dismiss-on-mouseout missing** — Tab tooltip renders on hover but doesn't dismiss when the mouse moves away from the tab.
+
+**Verified fixed this session:**
+- ~~Win-GUI: activity bar icon size mismatch~~ — Now uses Segoe MDL2 Assets / Segoe Fluent Icons at 20px in 48×48 cells.
+- ~~Win-GUI: no tab drag-and-drop~~ — Full drag with threshold, drop zone computation, visual overlay, ghost label.
+- ~~Win-GUI: no terminal split~~ — Split button, pane rendering, focus switching, divider drag.
+- ~~Win-GUI: no click/mouse handling for new popups~~ — Editor hover (click/dismiss/scroll), panel hover (dismiss), debug toolbar (button clicks), context menu (full click handling).
+- ~~Win-GUI: scrollbar rendering~~ — Fixed to use `theme.scrollbar_thumb`/`scrollbar_track` instead of hardcoded alpha.
+- ~~Win-GUI: explorer double-click replaces buffer~~ — Now uses `open_file_preview` (single-click) and `open_file_in_tab` (double-click/Enter).
+- ~~Win-GUI: context menu draws under explorer~~ — Context menu, dialog, notifications now draw after sidebar in on_paint.
+- ~~Win-GUI: context menu clicks pass through~~ — Full click handler with item selection, action dispatch, outside-click dismiss.
+- ~~Win-GUI: :term opens /bin/bash on Windows~~ — `default_shell()` returns `powershell.exe` on Windows.
 
 
 

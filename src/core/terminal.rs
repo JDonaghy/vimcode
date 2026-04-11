@@ -404,7 +404,20 @@ fn normalize_selection(sel: &TermSelection) -> (u16, u16, u16, u16) {
     }
 }
 
-/// Return the user's preferred shell from `$SHELL`, falling back to `/bin/bash`.
+/// Return the user's preferred shell.
+///
+/// On Unix: reads `$SHELL`, falls back to `/bin/bash`.
+/// On Windows: reads `$SHELL`, falls back to `powershell.exe`.
 pub fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    if let Ok(shell) = std::env::var("SHELL") {
+        return shell;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "/bin/bash".to_string()
+    }
 }

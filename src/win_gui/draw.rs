@@ -70,6 +70,8 @@ pub struct DrawContext<'a> {
     pub format: &'a IDWriteTextFormat,
     /// Proportional UI font (Segoe UI) for menus and tab labels.
     pub ui_format: &'a IDWriteTextFormat,
+    /// Icon font for activity bar icons (larger, Nerd Font glyphs).
+    pub icon_format: &'a IDWriteTextFormat,
     pub theme: &'a Theme,
     pub char_width: f32,
     pub line_height: f32,
@@ -206,17 +208,8 @@ impl<'a> DrawContext<'a> {
                 self.draw_tab_switcher(ts);
             }
 
-            // Draw context menu
-            if let Some(ref ctx) = layout.context_menu {
-                self.draw_context_menu(ctx);
-            }
-
-            // NOTE: menu dropdown drawn separately after sidebar (see on_paint)
-
-            // Draw dialog (on top of everything)
-            if let Some(ref dialog) = layout.dialog {
-                self.draw_dialog(dialog);
-            }
+            // NOTE: context menu, menu dropdown, tab drag overlay, and dialog
+            // are drawn separately after sidebar in on_paint for correct z-order.
         }
     }
 
@@ -409,8 +402,7 @@ impl<'a> DrawContext<'a> {
         // Background fill for the window
         let bg = self.solid_brush(self.theme.background);
         unsafe {
-            self.rt
-                .FillRectangle(&rect_f(rx, ry, rw_w, rw_h), &bg);
+            self.rt.FillRectangle(&rect_f(rx, ry, rw_w, rw_h), &bg);
         }
 
         let gutter_chars = rw.gutter_char_width;
@@ -519,7 +511,7 @@ impl<'a> DrawContext<'a> {
             let viewport_lines = rw.lines.len();
             if rw.total_lines > viewport_lines {
                 // Track background
-                let track_brush = self.solid_brush_alpha(self.theme.line_number_fg, 0.15);
+                let track_brush = self.solid_brush(self.theme.scrollbar_track);
                 unsafe {
                     self.rt
                         .FillRectangle(&rect_f(sb_x, ry, sb_width, editor_h), &track_brush);
@@ -530,7 +522,7 @@ impl<'a> DrawContext<'a> {
                 let scroll_ratio =
                     rw.scroll_top as f32 / (rw.total_lines.saturating_sub(viewport_lines)) as f32;
                 let thumb_y = ry + scroll_ratio * (editor_h - thumb_h);
-                let thumb_brush = self.solid_brush_alpha(self.theme.foreground, 0.35);
+                let thumb_brush = self.solid_brush(self.theme.scrollbar_thumb);
                 unsafe {
                     self.rt
                         .FillRectangle(&rect_f(sb_x, thumb_y, sb_width, thumb_h), &thumb_brush);
@@ -827,8 +819,10 @@ impl<'a> DrawContext<'a> {
         // Fill from editor_left to right edge; sidebar area is covered by its own background
         let bg = self.solid_brush(self.theme.background);
         unsafe {
-            self.rt
-                .FillRectangle(&rect_f(self.editor_left, y, width - self.editor_left, lh + margin), &bg);
+            self.rt.FillRectangle(
+                &rect_f(self.editor_left, y, width - self.editor_left, lh + margin),
+                &bg,
+            );
         }
         let cmd = &layout.command;
         self.draw_text(
@@ -950,7 +944,169 @@ impl<'a> DrawContext<'a> {
         }
     }
 
-    fn draw_dialog(&self, dialog: &crate::render::DialogPanel) {
+    pub fn draw_tab_drag_overlay(
+        &self,
+        layout: &ScreenLayout,
+        engine: &crate::core::engine::Engine,
+    ) {
+        use crate::core::window::{DropZone, SplitDirection};
+
+        let drag = match &engine.tab_drag {
+            Some(td) => td,
+            None => return,
+        };
+
+        let zone = &engine.tab_drop_zone;
+        let lh = self.line_height;
+        let tab_h = lh * super::TAB_BAR_HEIGHT_MULT;
+
+        // Blue overlay for drop zone
+        let overlay_color = Color::from_rgb(30, 60, 120);
+        let overlay_brush = self.solid_brush(overlay_color);
+
+        // Determine the highlight rectangle based on drop zone
+        if let Some(ref split) = layout.editor_group_split {
+            for gtb in &split.group_tab_bars {
+                let bx = gtb.bounds.x as f32;
+                let by = gtb.bounds.y as f32;
+                let bw = gtb.bounds.width as f32;
+                let bh = gtb.bounds.height as f32;
+                let tab_bar_y = by - tab_h;
+
+                match zone {
+                    DropZone::Center(gid) if *gid == gtb.group_id => unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(bx, tab_bar_y, bw, bh + tab_h), &overlay_brush);
+                    },
+                    DropZone::Split(gid, dir, new_first) if *gid == gtb.group_id => {
+                        let (rx, ry, rw, rh) = match (dir, new_first) {
+                            (SplitDirection::Vertical, true) => (bx, by, bw / 2.0, bh),
+                            (SplitDirection::Vertical, false) => (bx + bw / 2.0, by, bw / 2.0, bh),
+                            (SplitDirection::Horizontal, true) => (bx, by, bw, bh / 2.0),
+                            (SplitDirection::Horizontal, false) => {
+                                (bx, by + bh / 2.0, bw, bh / 2.0)
+                            }
+                        };
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(rx, ry, rw, rh), &overlay_brush);
+                        }
+                    }
+                    DropZone::TabReorder(gid, idx) if *gid == gtb.group_id => {
+                        // Highlight the tab bar
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(bx, tab_bar_y, bw, tab_h), &overlay_brush);
+                        }
+                        // Draw insertion bar
+                        let cw = self.char_width;
+                        let mut x = bx;
+                        for (i, tab) in gtb.tabs.iter().enumerate() {
+                            if i == *idx {
+                                break;
+                            }
+                            x += (tab.name.chars().count() as f32 + 3.0) * cw;
+                        }
+                        let bar_brush = self.solid_brush(self.theme.cursor);
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(x - 1.0, tab_bar_y, 2.0, tab_h), &bar_brush);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            // Single group — handle TabReorder insertion bar + Split/Center overlay
+            match zone {
+                DropZone::TabReorder(_, idx) => {
+                    let tab_y = if layout.menu_bar.is_some() {
+                        super::TITLE_BAR_TOP_INSET + lh * super::TITLE_BAR_HEIGHT_MULT
+                    } else {
+                        0.0
+                    };
+                    let cw = self.char_width;
+                    let mut x = self.editor_left;
+                    for (i, tab) in layout.tab_bar.iter().enumerate() {
+                        if i == *idx {
+                            break;
+                        }
+                        x += (tab.name.chars().count() as f32 + 3.0) * cw;
+                    }
+                    let bar_brush = self.solid_brush(self.theme.cursor);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(x - 1.0, tab_y, 2.0, tab_h), &bar_brush);
+                    }
+                }
+                DropZone::Split(_, dir, new_first) => {
+                    // Use the first window rect as the editor area
+                    if let Some(rw) = layout.windows.first() {
+                        let bx = rw.rect.x as f32;
+                        let by = rw.rect.y as f32;
+                        let bw = rw.rect.width as f32;
+                        let bh = rw.rect.height as f32;
+                        let (rx, ry, rw_f, rh_f) = match (dir, new_first) {
+                            (SplitDirection::Vertical, true) => (bx, by, bw / 2.0, bh),
+                            (SplitDirection::Vertical, false) => (bx + bw / 2.0, by, bw / 2.0, bh),
+                            (SplitDirection::Horizontal, true) => (bx, by, bw, bh / 2.0),
+                            (SplitDirection::Horizontal, false) => {
+                                (bx, by + bh / 2.0, bw, bh / 2.0)
+                            }
+                        };
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(rx, ry, rw_f, rh_f), &overlay_brush);
+                        }
+                    }
+                }
+                DropZone::Center(_) => {
+                    // Highlight entire editor area
+                    if let Some(rw) = layout.windows.first() {
+                        let tab_y = if layout.menu_bar.is_some() {
+                            super::TITLE_BAR_TOP_INSET + lh * super::TITLE_BAR_HEIGHT_MULT
+                        } else {
+                            0.0
+                        };
+                        unsafe {
+                            self.rt.FillRectangle(
+                                &rect_f(
+                                    rw.rect.x as f32,
+                                    tab_y,
+                                    rw.rect.width as f32,
+                                    rw.rect.height as f32 + rw.rect.y as f32 - tab_y,
+                                ),
+                                &overlay_brush,
+                            );
+                        }
+                    }
+                }
+                DropZone::None => {}
+            }
+        }
+
+        // Ghost label near mouse cursor
+        if let Some((mx, my)) = engine.tab_drag_mouse {
+            let mx = mx as f32;
+            let my = my as f32;
+            let label = &drag.tab_name;
+            let ghost_bg = self.solid_brush(Color::from_rgb(60, 60, 60));
+            let ghost_w = (label.chars().count() as f32 + 2.0) * self.char_width;
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(mx + 10.0, my - lh / 2.0, ghost_w, lh), &ghost_bg);
+            }
+            self.draw_ui_text(
+                label,
+                mx + 10.0 + self.char_width,
+                my - lh / 2.0,
+                lh,
+                self.theme.foreground,
+            );
+        }
+    }
+
+    pub(super) fn draw_dialog(&self, dialog: &crate::render::DialogPanel) {
         let (rt_w, rt_h) = self.rt_size();
 
         // Semi-transparent overlay
@@ -1816,7 +1972,7 @@ impl<'a> DrawContext<'a> {
 
     // ─── Context menu ────────────────────────────────────────────────────────
 
-    fn draw_context_menu(&self, ctx: &crate::render::ContextMenuPanel) {
+    pub(super) fn draw_context_menu(&self, ctx: &crate::render::ContextMenuPanel) {
         let max_label = ctx
             .items
             .iter()
@@ -1894,18 +2050,20 @@ impl<'a> DrawContext<'a> {
                 .FillRectangle(&rect_f(0.0, top, ab_w, rt_h - top), &ab_bg);
         }
 
-        // Activity bar icons
-        let panels = [
-            (SidebarPanel::Explorer, "\u{1F4C1}"),  // folder
-            (SidebarPanel::Search, "\u{1F50D}"),    // magnifying glass
-            (SidebarPanel::Debug, "\u{1F41B}"),     // bug
-            (SidebarPanel::Git, "\u{2442}"),        // branch-like
-            (SidebarPanel::Extensions, "\u{2B9E}"), // extension-like
-            (SidebarPanel::Ai, "\u{1F4AC}"),        // chat bubble
+        // Activity bar icons — Segoe MDL2 Assets / Segoe Fluent Icons codepoints
+        // (these ship with Windows 10+ and render natively in DirectWrite)
+        let icon_row_h = ab_w; // square cells matching the 48px activity bar width
+        let panels: &[(SidebarPanel, &str)] = &[
+            (SidebarPanel::Explorer, "\u{ED25}"),   // FileExplorer
+            (SidebarPanel::Search, "\u{E721}"),     // Search
+            (SidebarPanel::Debug, "\u{EBE8}"),      // Bug
+            (SidebarPanel::Git, "\u{E8D4}"),        // BranchFork2
+            (SidebarPanel::Extensions, "\u{EA86}"), // Puzzle
+            (SidebarPanel::Ai, "\u{E8BD}"),         // Chat
         ];
 
         for (i, &(panel, icon)) in panels.iter().enumerate() {
-            let y = top + i as f32 * self.line_height;
+            let y = top + i as f32 * icon_row_h;
             let is_active = sidebar.visible && sidebar.active_panel == panel;
 
             if is_active {
@@ -1913,39 +2071,44 @@ impl<'a> DrawContext<'a> {
                 let accent = self.solid_brush(self.theme.tab_active_accent);
                 unsafe {
                     self.rt
-                        .FillRectangle(&rect_f(0.0, y, 2.0, self.line_height), &accent);
+                        .FillRectangle(&rect_f(0.0, y, 2.0, icon_row_h), &accent);
                 }
                 // Active background
                 let sel = self.solid_brush(self.theme.active_background);
                 unsafe {
                     self.rt
-                        .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, self.line_height), &sel);
+                        .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, icon_row_h), &sel);
                 }
             }
 
-            // Icon text (centered in activity bar)
-            let icon_x = (ab_w - self.char_width) / 2.0;
-            self.draw_text(icon, icon_x, y, self.theme.activity_bar_fg);
+            // Icon text (centered in activity bar cell)
+            self.draw_icon_text(icon, 0.0, y, ab_w, icon_row_h, self.theme.activity_bar_fg);
         }
 
         // Settings gear pinned to bottom of activity bar (like TUI/VSCode)
         {
-            let y = sidebar_bottom - self.line_height;
+            let y = sidebar_bottom - icon_row_h;
             let is_active = sidebar.visible && sidebar.active_panel == SidebarPanel::Settings;
             if is_active {
                 let accent = self.solid_brush(self.theme.tab_active_accent);
                 unsafe {
                     self.rt
-                        .FillRectangle(&rect_f(0.0, y, 2.0, self.line_height), &accent);
+                        .FillRectangle(&rect_f(0.0, y, 2.0, icon_row_h), &accent);
                 }
                 let sel = self.solid_brush(self.theme.active_background);
                 unsafe {
                     self.rt
-                        .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, self.line_height), &sel);
+                        .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, icon_row_h), &sel);
                 }
             }
-            let icon_x = (ab_w - self.char_width) / 2.0;
-            self.draw_text("\u{2699}", icon_x, y, self.theme.activity_bar_fg); // gear icon
+            self.draw_icon_text(
+                "\u{E713}", // Settings gear
+                0.0,
+                y,
+                ab_w,
+                icon_row_h,
+                self.theme.activity_bar_fg,
+            );
         }
 
         // If sidebar panel is not visible, we're done
@@ -2567,8 +2730,7 @@ impl<'a> DrawContext<'a> {
             if is_selected {
                 let sb = self.solid_brush(sel_bg);
                 unsafe {
-                    self.rt
-                        .FillRectangle(&rect_f(panel_x, y, panel_w, lh), &sb);
+                    self.rt.FillRectangle(&rect_f(panel_x, y, panel_w, lh), &sb);
                 }
             }
 
@@ -2692,6 +2854,54 @@ impl<'a> DrawContext<'a> {
 
     // ─── Terminal panel ────────────────────────────────────────────────────
 
+    /// Draw a single terminal cell (background + character + cursor).
+    fn draw_terminal_cell(
+        &self,
+        cell: &crate::render::TerminalCell,
+        cx: f32,
+        cy: f32,
+        show_cursor: bool,
+    ) {
+        let cw = self.char_width;
+        let lh = self.line_height;
+
+        // Cell background
+        let has_custom_bg =
+            cell.bg != (0, 0, 0) || cell.selected || cell.is_find_match || cell.is_find_active;
+        if has_custom_bg {
+            let bg_color = if cell.is_find_active {
+                self.theme.search_match_fg
+            } else if cell.is_find_match {
+                self.theme.search_match_bg
+            } else if cell.selected {
+                self.theme.selection
+            } else {
+                Color::from_rgb(cell.bg.0, cell.bg.1, cell.bg.2)
+            };
+            let bg_brush = self.solid_brush(bg_color);
+            unsafe {
+                self.rt.FillRectangle(&rect_f(cx, cy, cw, lh), &bg_brush);
+            }
+        }
+
+        // Cell character
+        if cell.ch != ' ' && cell.ch != '\0' {
+            let fg_color = Color::from_rgb(cell.fg.0, cell.fg.1, cell.fg.2);
+            let mut buf = [0u8; 4];
+            let s = cell.ch.encode_utf8(&mut buf);
+            self.draw_text(s, cx, cy, fg_color);
+        }
+
+        // Cursor
+        if cell.is_cursor && show_cursor {
+            let cursor_brush = self.solid_brush_alpha(self.theme.cursor, 0.7);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(cx, cy, cw, lh), &cursor_brush);
+            }
+        }
+    }
+
     fn draw_terminal(&self, term: &crate::render::TerminalPanel) {
         let lh = self.line_height;
         let cw = self.char_width;
@@ -2731,6 +2941,21 @@ impl<'a> DrawContext<'a> {
             tx += label.chars().count() as f32 * cw;
         }
 
+        // Toolbar buttons (right-aligned): + split × ...
+        {
+            let nf = crate::icons::nerd_fonts_enabled();
+            let btn_close = if nf { "×" } else { "x" };
+            let btn_split = if nf { "󰤼" } else { "⊞" };
+            let btn_add = "+";
+            // Draw right-to-left: × split +
+            let mut bx = width - cw * 2.0;
+            self.draw_text(btn_close, bx, panel_y, self.theme.line_number_fg);
+            bx -= cw * 2.0;
+            self.draw_text(btn_split, bx, panel_y, self.theme.line_number_fg);
+            bx -= cw * 2.0;
+            self.draw_text(btn_add, bx, panel_y, self.theme.line_number_fg);
+        }
+
         // Content background
         let content_y = panel_y + lh;
         let content_h = term.content_rows as f32 * lh;
@@ -2747,54 +2972,61 @@ impl<'a> DrawContext<'a> {
             );
         }
 
-        // Draw cell grid
-        for (row_idx, row) in term.rows.iter().enumerate() {
-            let cy = content_y + row_idx as f32 * lh;
-            if cy + lh > height - 2.0 * lh {
-                break; // don't overdraw into status/cmd
-            }
-            for (col_idx, cell) in row.iter().enumerate() {
-                let cx = self.editor_left + col_idx as f32 * cw;
-                if cx + cw > width {
+        // Draw terminal cells — either split (two panes + divider) or single
+        if let Some(ref left_rows) = term.split_left_rows {
+            let split_cols = term.split_left_cols as f32;
+            let div_x = self.editor_left + split_cols * cw;
+
+            // Left pane cells
+            for (row_idx, row) in left_rows.iter().enumerate() {
+                let cy = content_y + row_idx as f32 * lh;
+                if cy + lh > height - 2.0 * lh {
                     break;
                 }
-
-                // Cell background (only if non-default or selected/match)
-                let has_custom_bg = cell.bg != (0, 0, 0)
-                    || cell.selected
-                    || cell.is_find_match
-                    || cell.is_find_active;
-                if has_custom_bg {
-                    let bg_color = if cell.is_find_active {
-                        self.theme.search_match_fg
-                    } else if cell.is_find_match {
-                        self.theme.search_match_bg
-                    } else if cell.selected {
-                        self.theme.selection
-                    } else {
-                        Color::from_rgb(cell.bg.0, cell.bg.1, cell.bg.2)
-                    };
-                    let bg_brush = self.solid_brush(bg_color);
-                    unsafe {
-                        self.rt.FillRectangle(&rect_f(cx, cy, cw, lh), &bg_brush);
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let cx = self.editor_left + col_idx as f32 * cw;
+                    if cx + cw > div_x {
+                        break;
                     }
+                    self.draw_terminal_cell(cell, cx, cy, term.has_focus && term.split_focus == 0);
                 }
+            }
 
-                // Cell character
-                if cell.ch != ' ' && cell.ch != '\0' {
-                    let fg_color = Color::from_rgb(cell.fg.0, cell.fg.1, cell.fg.2);
-                    let mut buf = [0u8; 4];
-                    let s = cell.ch.encode_utf8(&mut buf);
-                    self.draw_text(s, cx, cy, fg_color);
+            // Divider
+            let div_brush = self.solid_brush(self.theme.separator);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(div_x, content_y, 1.0, content_h), &div_brush);
+            }
+
+            // Right pane cells
+            let right_x = div_x + cw; // skip divider column
+            for (row_idx, row) in term.rows.iter().enumerate() {
+                let cy = content_y + row_idx as f32 * lh;
+                if cy + lh > height - 2.0 * lh {
+                    break;
                 }
-
-                // Cursor
-                if cell.is_cursor && term.has_focus {
-                    let cursor_brush = self.solid_brush_alpha(self.theme.cursor, 0.7);
-                    unsafe {
-                        self.rt
-                            .FillRectangle(&rect_f(cx, cy, cw, lh), &cursor_brush);
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let cx = right_x + col_idx as f32 * cw;
+                    if cx + cw > width {
+                        break;
                     }
+                    self.draw_terminal_cell(cell, cx, cy, term.has_focus && term.split_focus == 1);
+                }
+            }
+        } else {
+            // Single pane
+            for (row_idx, row) in term.rows.iter().enumerate() {
+                let cy = content_y + row_idx as f32 * lh;
+                if cy + lh > height - 2.0 * lh {
+                    break;
+                }
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let cx = self.editor_left + col_idx as f32 * cw;
+                    if cx + cw > width {
+                        break;
+                    }
+                    self.draw_terminal_cell(cell, cx, cy, term.has_focus);
                 }
             }
         }
@@ -3116,6 +3348,25 @@ impl<'a> DrawContext<'a> {
                 &wide,
                 self.ui_format,
                 &rect_f(x, y, 10000.0, height),
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+
+    /// Draw text using the icon font (Nerd Font), centered in a box.
+    fn draw_icon_text(&self, text: &str, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        if text.is_empty() {
+            return;
+        }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let brush = self.solid_brush(color);
+        unsafe {
+            self.rt.DrawText(
+                &wide,
+                self.icon_format,
+                &rect_f(x, y, width, height),
                 &brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,

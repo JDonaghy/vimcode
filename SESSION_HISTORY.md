@@ -1,7 +1,22 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 265 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 266 archived here. Recent work summary in PROJECT_STATE.md.
+
+---
+
+**Session 266 — Win-GUI parity fixes (10 fixes, 5471 tests):**
+
+1. **Text rendering truncation** — `draw_styled_line` gap-filling for text between syntax spans
+2. **Settings icon clipped/not clickable** — repositioned above bottom chrome, click handler fixed
+3. **Settings panel interactive** — full form rendering + keyboard handling (j/k/Enter/Tab/q, editing, paste)
+4. **Global status bar over per-window status** — skip when empty; reserve 1 row not 2 for bottom chrome
+5. **Per-window status bar segments** — per-segment background colors matching TUI
+6. **Editor window clipping** — `PushAxisAlignedClip` prevents text bleeding
+7. **Sidebar panel clipping** — clip rect and panel_h use `sidebar_bottom`
+8. **Command line descenders clipped** — bottom margin for below-baseline characters
+9. **Sidebar/command line background gaps** — panel bg full height; cmd line starts at `editor_left`
+10. **Clippy fix** — identical if/else branches in diff toolbar
 
 ---
 

@@ -1,4 +1,4 @@
-# src/render.rs — 7,815 lines
+# src/render.rs — ~9,100 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -44,6 +44,14 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 
 ## Key Types — Shared Hit-Testing & Geometry
 - `ClickTarget` — semantic editor click target enum (TabBar, Gutter, BufferPos, SplitButton, CloseTab, StatusBarAction, etc.) — moved from gtk/click.rs for multi-backend sharing
+
+## Key Types — Backend Parity
+- `UiElement` (27 variants) — every renderable element a backend must draw; source of truth for rendering parity
+- `UiAction` (26 variants) — every user interaction a backend must handle; source of truth for click/mouse parity
+- `collect_expected_ui_elements(layout)` — walks ScreenLayout to list expected rendered elements
+- `all_required_ui_actions()` — canonical list of all required interaction handlers
+- `collect_ui_actions_tui()` / `collect_ui_actions_wingui()` — per-backend action lists for parity testing
+- `collect_ui_elements_tui(layout)` / `collect_ui_elements_wingui(layout)` — per-backend element lists
 
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)

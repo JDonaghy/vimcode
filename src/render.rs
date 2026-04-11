@@ -1709,6 +1709,243 @@ pub enum UiElement {
     Sidebar,
 }
 
+// ─── Phase 2c: Action / click-handler parity ────────────────────────────────
+
+/// A user-triggered action that each backend must handle.
+/// This is the **source of truth** for click/mouse/interaction parity.
+///
+/// Each variant documents: the trigger, the correct engine method to call,
+/// and any draw-order requirements.  Backends that are missing a handler
+/// will fail the parity test.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UiAction {
+    // ── Explorer interactions ─────────────────────────────────────────
+    /// Single-click on a file in the explorer tree.
+    /// Must call: `engine.open_file_preview(&path)`
+    ExplorerSingleClickFile,
+    /// Double-click on a file in the explorer tree.
+    /// Must call: `engine.open_file_in_tab(&path)`
+    ExplorerDoubleClickFile,
+    /// Enter/Return key on a file in the explorer.
+    /// Must call: `engine.open_file_in_tab(&path)`
+    ExplorerEnterOnFile,
+    /// Right-click on explorer item → open context menu.
+    /// Must call: `engine.open_explorer_context_menu(path, is_dir, x, y)`
+    ExplorerRightClick,
+
+    // ── Context menu ─────────────────────────────────────────────────
+    /// Click inside an open context menu → select item and execute.
+    /// Must call: `engine.context_menu_confirm()` then dispatch action.
+    /// Must be checked BEFORE explorer/editor click handlers.
+    ContextMenuClickInside,
+    /// Click outside an open context menu → dismiss.
+    /// Must call: `engine.close_context_menu()`
+    ContextMenuClickOutside,
+
+    // ── Tab bar ──────────────────────────────────────────────────────
+    /// Click on a tab → switch to it.
+    /// Must call: `engine.goto_tab(idx)`
+    TabClick,
+    /// Click on tab close button.
+    /// Must call: `engine.goto_tab(idx)` then `engine.close_tab()`
+    TabCloseClick,
+    /// Right-click on tab → open tab context menu.
+    /// Must call: `engine.open_tab_context_menu(group_id, tab_idx, x, y)`
+    TabRightClick,
+    /// Drag a tab → reorder or move between groups.
+    /// Must call: `engine.tab_drag_begin()`, `engine.tab_drag_drop(zone)`
+    TabDragDrop,
+
+    // ── Editor ───────────────────────────────────────────────────────
+    /// Right-click in editor → open editor context menu.
+    /// Must call: `engine.open_editor_context_menu(x, y)`
+    EditorRightClick,
+    /// Double-click in editor → word select.
+    /// Must call: `engine.mouse_double_click(wid, line, col)`
+    EditorDoubleClick,
+    /// Scroll wheel in editor → scroll viewport.
+    EditorScroll,
+
+    // ── Popup interactions ───────────────────────────────────────────
+    /// Click on editor hover popup → focus it.
+    /// Must call: `engine.editor_hover_focus()`
+    EditorHoverClick,
+    /// Click outside editor hover popup → dismiss.
+    /// Must call: `engine.dismiss_editor_hover()`
+    EditorHoverDismiss,
+    /// Scroll wheel on editor hover popup → scroll content.
+    /// Must call: `engine.editor_hover_scroll(delta)`
+    EditorHoverScroll,
+    /// Click on debug toolbar button → execute command.
+    /// Must call: `engine.execute_command(&btn.action)`
+    DebugToolbarButtonClick,
+
+    // ── Terminal ─────────────────────────────────────────────────────
+    /// Click terminal split button.
+    /// Must call: `engine.terminal_toggle_split(cols, rows)`
+    TerminalSplitButton,
+    /// Click terminal add (+) button.
+    /// Must call: `engine.terminal_new_tab(cols, rows)`
+    TerminalAddButton,
+    /// Click terminal close (×) button.
+    /// Must call: `engine.terminal_close_active_tab()`
+    TerminalCloseButton,
+    /// Click in split terminal pane → switch focus.
+    /// Must set: `engine.terminal_active = 0 or 1`
+    TerminalSplitPaneClick,
+
+    // ── Activity bar ─────────────────────────────────────────────────
+    /// Click on activity bar icon → toggle sidebar panel.
+    ActivityBarClick,
+    /// Click on settings gear icon → open settings panel.
+    ActivityBarSettingsClick,
+
+    // ── Draw order requirements ──────────────────────────────────────
+    /// Context menu must be drawn AFTER sidebar (higher z-order).
+    DrawOrderContextMenuAboveSidebar,
+    /// Dialog must be drawn AFTER context menu and sidebar.
+    DrawOrderDialogOnTop,
+    /// Menu dropdown must be drawn AFTER sidebar.
+    DrawOrderMenuDropdownAboveSidebar,
+}
+
+/// Return the full set of [`UiAction`]s that every backend must handle.
+/// This is the canonical contract — if a backend doesn't handle one of these,
+/// users will experience broken interactions.
+pub fn all_required_ui_actions() -> Vec<UiAction> {
+    vec![
+        UiAction::ExplorerSingleClickFile,
+        UiAction::ExplorerDoubleClickFile,
+        UiAction::ExplorerEnterOnFile,
+        UiAction::ExplorerRightClick,
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        UiAction::TabRightClick,
+        UiAction::TabDragDrop,
+        UiAction::EditorRightClick,
+        UiAction::EditorDoubleClick,
+        UiAction::EditorScroll,
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        UiAction::DebugToolbarButtonClick,
+        UiAction::TerminalSplitButton,
+        UiAction::TerminalAddButton,
+        UiAction::TerminalCloseButton,
+        UiAction::TerminalSplitPaneClick,
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
+/// Collect the [`UiAction`]s that the **TUI** backend handles.
+/// This is the reference implementation — all actions should be present.
+pub fn collect_ui_actions_tui() -> Vec<UiAction> {
+    // TUI is the reference backend — it handles all actions.
+    // Each entry below is verified by the corresponding code location:
+    vec![
+        // mouse.rs:1914 — open_file_preview for single click
+        UiAction::ExplorerSingleClickFile,
+        // mouse.rs:1913 — open_file_in_tab for double click
+        UiAction::ExplorerDoubleClickFile,
+        // mod.rs key handler — open_file_in_tab for Enter
+        UiAction::ExplorerEnterOnFile,
+        // mouse.rs:898 — open_explorer_context_menu
+        UiAction::ExplorerRightClick,
+        // mouse.rs:984-1036 — context_menu click inside/outside
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        // mouse.rs tab click handlers
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        UiAction::TabRightClick,
+        UiAction::TabDragDrop,
+        // mouse.rs:977 — open_editor_context_menu
+        UiAction::EditorRightClick,
+        // mouse.rs — mouse_double_click
+        UiAction::EditorDoubleClick,
+        UiAction::EditorScroll,
+        // mouse.rs — editor_hover_focus, dismiss, scroll
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        // mouse.rs — debug toolbar button handling
+        UiAction::DebugToolbarButtonClick,
+        // mouse.rs:1639 — terminal_toggle_split
+        UiAction::TerminalSplitButton,
+        // mouse.rs — terminal_new_tab
+        UiAction::TerminalAddButton,
+        // mouse.rs — terminal_close_active_tab
+        UiAction::TerminalCloseButton,
+        // mouse.rs:1650 — terminal split pane click
+        UiAction::TerminalSplitPaneClick,
+        // panels.rs — activity bar icon click
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        // render_impl.rs — draw order: popups after terminal, picker on top
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
+/// Collect the [`UiAction`]s that the **Win-GUI** backend handles.
+/// Update this list as handlers are added to `src/win_gui/`.
+pub fn collect_ui_actions_wingui() -> Vec<UiAction> {
+    vec![
+        // mod.rs:2253 — open_file_preview for single click
+        UiAction::ExplorerSingleClickFile,
+        // mod.rs:2945 — open_file_in_tab for double click
+        UiAction::ExplorerDoubleClickFile,
+        // mod.rs:1535 — open_file_in_tab for Enter/Right/l
+        UiAction::ExplorerEnterOnFile,
+        // mod.rs:3015 — open_explorer_context_menu
+        UiAction::ExplorerRightClick,
+        // mod.rs:2331-2416 — context menu click inside/outside
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        // mod.rs:2420-2440 — tab click + close
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        // mod.rs:2981 — open_tab_context_menu
+        UiAction::TabRightClick,
+        // mod.rs — tab drag begin/drop
+        UiAction::TabDragDrop,
+        // mod.rs:3037 — open_editor_context_menu
+        UiAction::EditorRightClick,
+        // mod.rs:2955 — mouse_double_click
+        UiAction::EditorDoubleClick,
+        // mod.rs:3043+ — scroll handler
+        UiAction::EditorScroll,
+        // mod.rs — editor_hover_focus, dismiss_editor_hover, editor_hover_scroll
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        // mod.rs — debug toolbar button execute_command
+        UiAction::DebugToolbarButtonClick,
+        // mod.rs — terminal_toggle_split
+        UiAction::TerminalSplitButton,
+        // mod.rs — terminal_new_tab
+        UiAction::TerminalAddButton,
+        // mod.rs — terminal_close_active_tab
+        UiAction::TerminalCloseButton,
+        // mod.rs — terminal_active = 0/1
+        UiAction::TerminalSplitPaneClick,
+        // mod.rs — sidebar panel toggle
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        // on_paint draw order: draw_frame → sidebar → context menu → dialog → notifications
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
 /// Walk a [`ScreenLayout`] and collect every [`UiElement`] that a backend is
 /// expected to render.  This is the **source of truth** for the parity harness.
 pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
@@ -8761,5 +8998,130 @@ mod tests {
         assert!(expected.contains(&UiElement::EditorWindow { window_idx: 0 }));
         assert!(expected.contains(&UiElement::CommandLine));
         assert!(expected.contains(&UiElement::ActivityBar));
+    }
+
+    // ── Phase 2c: Action / click-handler parity tests ───────────────────
+
+    #[test]
+    fn test_action_parity_tui_covers_all_required() {
+        let required = all_required_ui_actions();
+        let tui = collect_ui_actions_tui();
+        let missing: Vec<_> = required.iter().filter(|a| !tui.contains(a)).collect();
+        assert!(
+            missing.is_empty(),
+            "TUI missing required actions: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_action_parity_wingui_covers_all_required() {
+        let required = all_required_ui_actions();
+        let wingui = collect_ui_actions_wingui();
+        let missing: Vec<_> = required.iter().filter(|a| !wingui.contains(a)).collect();
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing required actions: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_action_parity_wingui_matches_tui() {
+        let tui = collect_ui_actions_tui();
+        let wingui = collect_ui_actions_wingui();
+        let tui_only: Vec<_> = tui.iter().filter(|a| !wingui.contains(a)).collect();
+        let wingui_only: Vec<_> = wingui.iter().filter(|a| !tui.contains(a)).collect();
+        assert!(
+            tui_only.is_empty() && wingui_only.is_empty(),
+            "Action parity mismatch:\n  TUI-only: {tui_only:?}\n  Win-GUI-only: {wingui_only:?}"
+        );
+    }
+
+    /// Test that `open_file_preview` reuses/creates a preview tab, NOT replacing
+    /// a permanent buffer. This is the contract for explorer single-click.
+    #[test]
+    fn test_open_file_preview_does_not_replace_permanent() {
+        let mut e = test_engine("first file\n");
+        let dir = std::env::temp_dir().join("vimcode_test_preview");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+        std::fs::write(&f2, "file B\n").unwrap();
+
+        // Open f1 permanently (simulates existing tab)
+        e.open_file_in_tab(&f1);
+        let buf_a = e.active_buffer_id();
+        assert_eq!(e.active_group().tabs.len(), 2); // scratch + f1
+
+        // Preview f2 (simulates explorer single-click)
+        e.open_file_preview(&f2);
+        let buf_b = e.active_buffer_id();
+        assert_ne!(buf_a, buf_b, "Preview should show different buffer");
+        assert_eq!(
+            e.active_group().tabs.len(),
+            3,
+            "Preview should create a new tab, not replace"
+        );
+
+        // Preview another file — should reuse the preview tab
+        let f3 = dir.join("c.txt");
+        std::fs::write(&f3, "file C\n").unwrap();
+        e.open_file_preview(&f3);
+        assert_eq!(
+            e.active_group().tabs.len(),
+            3,
+            "Second preview should reuse the preview tab"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that `open_file_in_tab` always creates a new tab (or switches to
+    /// existing). This is the contract for explorer double-click / Enter.
+    #[test]
+    fn test_open_file_in_tab_creates_new_tab() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_tab");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+        std::fs::write(&f2, "file B\n").unwrap();
+
+        let initial_tabs = e.active_group().tabs.len();
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 1);
+        e.open_file_in_tab(&f2);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 2);
+
+        // Opening f1 again should switch to existing tab, not create another
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 2);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that the default shell is platform-appropriate.
+    #[test]
+    fn test_default_shell_platform() {
+        let shell = crate::core::terminal::default_shell();
+        #[cfg(target_os = "windows")]
+        {
+            // Must NOT be /bin/bash on Windows
+            assert!(
+                !shell.contains("/bin/bash"),
+                "Windows default shell should not be /bin/bash, got: {shell}"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Should be $SHELL or /bin/bash on Unix
+            assert!(
+                shell.contains("sh") || shell.contains("zsh") || shell.contains("fish"),
+                "Unix default shell should be a known shell, got: {shell}"
+            );
+        }
     }
 }

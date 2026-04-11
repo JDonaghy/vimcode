@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 10, 2026 (Session 266 — 10 Win-GUI parity fixes: text rendering, settings panel, status bar, clipping) | **Tests:** 5471
+**Last updated:** Apr 10, 2026 (Session 267 — Win-GUI bug blitz: 9 fixes, Phase 2c action parity harness, GTK↔Win-GUI comparison found 12 more bugs) | **Tests:** 5477
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 264 are in **SESSION_HISTORY.md**.
@@ -26,16 +26,15 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 266 — Win-GUI parity fixes (10 fixes):**
-1. **Text rendering truncation** — `draw_styled_line` gap-filling for text between syntax spans
-2. **Settings icon clipped/not clickable** — repositioned above bottom chrome, click handler fixed
-3. **Settings panel interactive** — full form rendering + keyboard handling (j/k/Enter/Tab///q, editing, paste)
-4. **Global status bar over per-window status** — skip when empty; reserve 1 row not 2 for bottom chrome
-5. **Per-window status bar segments** — per-segment background colors matching TUI
-6. **Editor window clipping** — `PushAxisAlignedClip` prevents text bleeding
-7. **Sidebar panel clipping** — clip rect and panel_h use `sidebar_bottom`
-8. **Command line descenders clipped** — bottom margin for below-baseline characters
-9. **Sidebar/command line background gaps** — panel bg full height; cmd line starts at `editor_left`
-10. **Clippy fix** — identical if/else branches in diff toolbar
+**Session 267 — Win-GUI bug blitz + parity tests (9 fixes, 6 new tests, 12 bugs found):**
+1. **Activity bar icons** — Replaced broken Nerd Font approach with Segoe MDL2 Assets / Segoe Fluent Icons (native Windows icon fonts). 48×48 centered icon cells with dedicated DirectWrite format.
+2. **Tab drag-and-drop** — Full implementation: threshold-based drag start, `compute_win_tab_drop_zone()` for reorder/split/merge, visual overlay (blue zone highlight + insertion bar + ghost label), calls engine's `tab_drag_begin()`/`tab_drag_drop()`.
+3. **Terminal split** — Split button + add/close buttons in toolbar, split pane rendering with divider, pane focus switching, divider drag resize.
+4. **Popup mouse handlers** — `CachedPopupRects` infrastructure. Editor hover (click/dismiss/scroll), panel hover (dismiss), debug toolbar (button clicks via `execute_command`).
+5. **Scrollbar theme colors** — Fixed editor scrollbar to use `theme.scrollbar_thumb`/`scrollbar_track` instead of hardcoded alpha values.
+6. **Explorer file open** — Single-click now uses `open_file_preview()` (preview tab). Double-click/Enter uses `open_file_in_tab()` (new permanent tab). Was using `switch_window_buffer` which replaced the current buffer.
+7. **Context menu z-order + clicks** — Context menu, dialog, notifications now draw after sidebar in `on_paint`. Full click handler: item selection, action dispatch via `handle_context_action()`, outside-click dismiss.
+8. **Default shell** — `default_shell()` returns `powershell.exe` on Windows instead of `/bin/bash`.
+9. **Phase 2c action parity harness** — `UiAction` enum (26 variants), `all_required_ui_actions()` source of truth, per-backend collectors. 3 parity tests + 3 behavioral contract tests. Systematic GTK↔Win-GUI comparison found 12 additional bugs (4 critical, 5 medium, 3 low — see BUGS.md).
 
-> All sessions through 264 archived in **SESSION_HISTORY.md**.
+> All sessions through 266 archived in **SESSION_HISTORY.md**.
