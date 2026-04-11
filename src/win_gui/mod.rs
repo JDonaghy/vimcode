@@ -280,6 +280,12 @@ struct AppState {
     // ── Cached layout from last draw pass ────────────────────────────────
     tab_slots: Vec<TabSlot>,
     cached_window_rects: Vec<CachedWindowRect>,
+    /// Cached breadcrumb bars from last draw pass (for click handling).
+    cached_breadcrumbs: Vec<render::BreadcrumbBar>,
+    /// Cached diff toolbar button positions: (group_id, prev_x, next_x, fold_x, btn_w, bar_y, bar_h).
+    cached_diff_toolbar_btns: Vec<(GroupId, f32, f32, f32, f32, f32, f32)>,
+    /// Cached group dividers from last draw pass (for drag handling).
+    cached_dividers: Vec<crate::core::window::GroupDivider>,
 
     // ── Sidebar ───────────────────────────────────────────────────────────
     sidebar: WinSidebar,
@@ -293,6 +299,10 @@ struct AppState {
     sidebar_resize_drag: bool,
     scrollbar_drag: Option<WindowId>,
     terminal_resize_drag: bool,
+    /// Active group divider drag: split_index being dragged.
+    group_divider_drag: Option<usize>,
+    /// True when dragging to select text in the terminal panel.
+    terminal_text_drag: bool,
     last_click_time: Instant,
     last_click_pos: (i16, i16),
 
@@ -303,6 +313,13 @@ struct AppState {
     tab_dragging: bool,
     /// True when dragging the terminal split divider.
     terminal_split_drag: bool,
+
+    // ── Clipboard sync ────────────────────────────────────────────────────
+    /// Last known `"` register content, for detecting yank changes.
+    last_clipboard_register: Option<String>,
+
+    /// X position of the hovered tab for tooltip placement.
+    tab_tooltip_x: f32,
 
     // ── Periodic refresh ─────────────────────────────────────────────────
     last_sidebar_refresh: Instant,
@@ -496,6 +513,9 @@ pub fn run(file_path: Option<PathBuf>) {
             dpi_scale,
             tab_slots: Vec::new(),
             cached_window_rects: Vec::new(),
+            cached_breadcrumbs: Vec::new(),
+            cached_diff_toolbar_btns: Vec::new(),
+            cached_dividers: Vec::new(),
             sidebar: WinSidebar::new(),
             current_colorscheme: initial_colorscheme,
             current_font_size: initial_font_size,
@@ -503,11 +523,15 @@ pub fn run(file_path: Option<PathBuf>) {
             sidebar_resize_drag: false,
             scrollbar_drag: None,
             terminal_resize_drag: false,
+            group_divider_drag: None,
+            terminal_text_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
             tab_drag_start: None,
             tab_dragging: false,
             terminal_split_drag: false,
+            last_clipboard_register: None,
+            tab_tooltip_x: 0.0,
             last_sidebar_refresh: Instant::now(),
             bottom_chrome_px: 0.0,
             popup_rects: CachedPopupRects::default(),
@@ -1025,6 +1049,7 @@ fn on_paint(hwnd: HWND) {
             char_width: state.char_width,
             line_height: state.line_height,
             editor_left: state.sidebar.total_width(),
+            tab_tooltip_x: state.tab_tooltip_x,
             caption_hover: state.caption_hover,
             is_maximized: is_maximized(state.hwnd),
         };
@@ -1190,6 +1215,22 @@ fn cache_popup_rects(state: &mut AppState, screen: &ScreenLayout) {
 }
 
 /// Cache tab slot positions and window rects after each draw for mouse hit-testing.
+/// Measure text width using the proportional UI font (same as draw_tabs).
+fn measure_ui_text_width(dwrite: &IDWriteFactory, format: &IDWriteTextFormat, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        let layout: IDWriteTextLayout = dwrite
+            .CreateTextLayout(&wide, format, 10000.0, 1000.0)
+            .expect("CreateTextLayout");
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        layout.GetMetrics(&mut metrics).expect("GetMetrics");
+        metrics.width
+    }
+}
+
 fn cache_layout(
     state: &mut AppState,
     screen: &ScreenLayout,
@@ -1211,19 +1252,28 @@ fn cache_layout(
             let bc_offset = if has_bc { lh } else { 0.0 };
             let tab_y = gtb.bounds.y as f32 - tab_h - bc_offset;
             let mut x = gtb.bounds.x as f32;
+            let group_right = gtb.bounds.x as f32 + gtb.bounds.width as f32;
+            let pad = 12.0_f32;
             for (idx, tab) in gtb.tabs.iter().enumerate() {
-                let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
-                let close_x = x + name_w - 2.0 * cw;
+                let text_w =
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, &tab.name);
+                let tab_w = pad + text_w + pad + cw + pad * 0.5;
+                // Skip tabs that start past the group's right edge
+                if x >= group_right {
+                    break;
+                }
+                let clamped_end = (x + tab_w).min(group_right);
+                let close_x = x + tab_w - cw - pad * 0.5;
                 state.tab_slots.push(TabSlot {
                     group_id: gtb.group_id,
                     tab_idx: idx,
                     x_start: x,
-                    x_end: x + name_w,
+                    x_end: clamped_end,
                     close_x_start: close_x,
                     y: tab_y,
                     height: tab_h,
                 });
-                x += name_w;
+                x += tab_w;
             }
         }
     } else {
@@ -1236,19 +1286,114 @@ fn cache_layout(
         };
         let tab_h = lh * TAB_BAR_HEIGHT_MULT;
         let mut x = state.sidebar.total_width(); // start after sidebar
+        let pad = 12.0_f32;
         for (idx, tab) in screen.tab_bar.iter().enumerate() {
-            let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
-            let close_x = x + name_w - 2.0 * cw;
+            let text_w =
+                measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, &tab.name);
+            let tab_w = pad + text_w + pad + cw + pad * 0.5;
+            let close_x = x + tab_w - cw - pad * 0.5;
             state.tab_slots.push(TabSlot {
                 group_id,
                 tab_idx: idx,
                 x_start: x,
-                x_end: x + name_w,
+                x_end: x + tab_w,
                 close_x_start: close_x,
                 y: tab_y,
                 height: tab_h,
             });
-            x += name_w;
+            x += tab_w;
+        }
+    }
+
+    // Cache breadcrumb bars for click handling
+    state.cached_breadcrumbs = screen.breadcrumbs.clone();
+
+    // Cache group dividers for drag handling
+    state.cached_dividers = if let Some(ref split) = screen.editor_group_split {
+        split.dividers.clone()
+    } else {
+        Vec::new()
+    };
+
+    // Cache diff toolbar button positions
+    state.cached_diff_toolbar_btns.clear();
+    {
+        let cache_diff_toolbar = |dt: &render::DiffToolbarData,
+                                  bar_x: f32,
+                                  bar_y: f32,
+                                  bar_w: f32,
+                                  bar_h: f32,
+                                  group_id: GroupId|
+         -> (GroupId, f32, f32, f32, f32, f32, f32) {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(ref label) = dt.change_label {
+                parts.push(label.clone());
+            }
+            parts.push("\u{2191}".to_string());
+            parts.push("\u{2193}".to_string());
+            parts.push("\u{2261}".to_string());
+            let label = parts.join("  ");
+            let label_w = label.chars().count() as f32 * cw;
+            let rx = bar_x + bar_w - label_w - cw * 2.0;
+            // Skip past the change label and its trailing "  "
+            let btn_offset = if let Some(ref cl) = dt.change_label {
+                (cl.chars().count() + 2) as f32 * cw
+            } else {
+                0.0
+            };
+            let prev_x = rx + btn_offset;
+            let next_x = prev_x + 3.0 * cw; // "↑  " = 3 chars
+            let fold_x = next_x + 3.0 * cw; // "↓  " = 3 chars
+            let btn_w = cw;
+            (group_id, prev_x, next_x, fold_x, btn_w, bar_y, bar_h)
+        };
+        // Single-group diff toolbar
+        if let Some(ref dt) = screen.diff_toolbar {
+            let tab_y = if screen.menu_bar.is_some() {
+                TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0f32
+            };
+            let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+            let bar_x = state.sidebar.total_width();
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(state.hwnd, &mut rc);
+            }
+            let client_w = (rc.right - rc.left) as f32 / state.dpi_scale;
+            let bar_w = client_w - bar_x;
+            state.cached_diff_toolbar_btns.push(cache_diff_toolbar(
+                dt,
+                bar_x,
+                tab_y,
+                bar_w,
+                tab_h,
+                state.engine.active_group,
+            ));
+        }
+        // Multi-group diff toolbars
+        if let Some(ref split) = screen.editor_group_split {
+            for gtb in &split.group_tab_bars {
+                if let Some(ref dt) = gtb.diff_toolbar {
+                    let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+                    let has_bc = screen
+                        .breadcrumbs
+                        .iter()
+                        .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+                    let bc_offset = if has_bc { lh } else { 0.0 };
+                    let tab_y = gtb.bounds.y as f32 - tab_h - bc_offset;
+                    let bar_x = gtb.bounds.x as f32;
+                    let bar_w = gtb.bounds.width as f32;
+                    state.cached_diff_toolbar_btns.push(cache_diff_toolbar(
+                        dt,
+                        bar_x,
+                        tab_y,
+                        bar_w,
+                        tab_h,
+                        gtb.group_id,
+                    ));
+                }
+            }
         }
     }
 
@@ -1444,6 +1589,65 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
                 return false;
             }
 
+            // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY
+            if ctrl && (key.key_name == "v" || key.key_name == "V") {
+                let paste_text = state
+                    .engine
+                    .clipboard_read
+                    .as_ref()
+                    .and_then(|cb| cb().ok())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        state
+                            .engine
+                            .registers
+                            .get(&'+')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    })
+                    .or_else(|| {
+                        state
+                            .engine
+                            .registers
+                            .get(&'"')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    });
+                if let Some(text) = paste_text {
+                    state.engine.terminal_write(b"\x1b[200~");
+                    state.engine.terminal_write(text.as_bytes());
+                    state.engine.terminal_write(b"\x1b[201~");
+                    state.engine.poll_terminal();
+                } else {
+                    state.engine.message = "Nothing to paste".to_string();
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
+            // Ctrl+Y / Ctrl+Shift+C: copy terminal selection to clipboard
+            if ctrl
+                && ((key.key_name == "y" || key.key_name == "Y")
+                    || (shift && (key.key_name == "c" || key.key_name == "C")))
+            {
+                let text = state
+                    .engine
+                    .active_terminal()
+                    .and_then(|t| t.selected_text());
+                if let Some(ref text) = text {
+                    if let Some(ref cb) = state.engine.clipboard_write {
+                        let _ = cb(text);
+                    }
+                    state.engine.message = "Copied".to_string();
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
             // Translate key to PTY escape sequence
             let data = translate_key_to_pty(&key.key_name, key.unicode, ctrl);
             if !data.is_empty() {
@@ -1553,8 +1757,59 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
-        // Sidebar keyboard navigation when focused
-        if state.sidebar.has_focus && state.sidebar.visible {
+        // ── Extensions panel keyboard handling ─────────────────────────
+        if state.engine.ext_sidebar_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+        {
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Return" => ("Return", None),
+                "Tab" => ("Tab", None),
+                "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                _ => {
+                    // Map single letters to their key name (matching TUI behavior)
+                    if let Some(ch) = key.unicode {
+                        match ch {
+                            'i' => ("i", None),
+                            'd' => ("d", None),
+                            'u' => ("u", None),
+                            'r' => ("r", None),
+                            '/' => ("/", None),
+                            'q' => ("Escape", None),
+                            _ if !ch.is_control() => ("char", Some(ch)),
+                            _ => ("", None),
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                state.engine.handle_ext_sidebar_key(
+                    if key_name == "char" { "" } else { key_name },
+                    ctrl,
+                    ch,
+                );
+                if !state.engine.ext_sidebar_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Sidebar keyboard navigation when focused (Explorer only — other panels
+        // are handled by the engine via handle_key → handle_sc_key / etc.)
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+        {
             let handled = match key.key_name.as_str() {
                 "Escape" => {
                     state.sidebar.has_focus = false;
@@ -1724,10 +1979,48 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             }
         }
 
+        // Intercept paste keys to load system clipboard into registers
+        if !key.ctrl && intercept_paste_key(state, &key.key_name, key.unicode) {
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Ctrl+V in Insert/Replace/Command mode: paste from system clipboard
+        if key.ctrl
+            && (key.key_name == "v" || key.key_name == "V")
+            && matches!(
+                state.engine.mode,
+                crate::core::Mode::Insert | crate::core::Mode::Replace
+            )
+        {
+            if let Some(ref cb_read) = state.engine.clipboard_read {
+                if let Ok(text) = cb_read() {
+                    if !text.is_empty() {
+                        for ch in text.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                state.engine.handle_key("Return", None, false);
+                            } else if !ch.is_control() {
+                                state.engine.handle_key("", Some(ch), false);
+                            }
+                        }
+                    }
+                }
+            }
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
         let quit = handle_action_with_sidebar(state, action);
+        sync_clipboard(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -1827,8 +2120,45 @@ fn on_char(wparam: WPARAM) {
             return;
         }
 
-        // Sidebar keyboard navigation for character keys (j/k/h/l)
-        if state.sidebar.has_focus && state.sidebar.visible {
+        // Extensions panel character key handling
+        if state.engine.ext_sidebar_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+        {
+            let (key_name, unicode): (&str, Option<char>) = match ch {
+                'j' => ("j", None),
+                'k' => ("k", None),
+                'i' => ("i", None),
+                'd' => ("d", None),
+                'u' => ("u", None),
+                'r' => ("r", None),
+                '/' => ("/", None),
+                'q' => ("Escape", None),
+                c if !c.is_control() => ("char", Some(c)),
+                _ => ("", None),
+            };
+            if !key_name.is_empty() {
+                let ch_arg = if key_name == "char" { unicode } else { None };
+                state.engine.handle_ext_sidebar_key(
+                    if key_name == "char" { "" } else { key_name },
+                    false,
+                    ch_arg,
+                );
+                if !state.engine.ext_sidebar_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // Sidebar keyboard navigation for character keys (Explorer only)
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+        {
             let handled = match ch {
                 'j' => {
                     if state.sidebar.selected + 1 < state.sidebar.rows.len() {
@@ -1886,10 +2216,20 @@ fn on_char(wparam: WPARAM) {
             }
         }
 
+        // Intercept paste keys to load system clipboard
+        if !key.ctrl && intercept_paste_key(state, &key.key_name, key.unicode) {
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
         let _ = handle_action_with_sidebar(state, action);
+        sync_clipboard(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -2118,10 +2458,13 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             let cw = state.char_width;
             let lh = state.line_height;
             // Compute dropdown position (must match draw.rs logic)
-            let mut popup_x = cw;
+            let pad = 8.0_f32;
+            let mut popup_x = pad;
             for i in 0..midx {
                 if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                    popup_x += (name.len() as f32 + 2.0) * cw;
+                    popup_x +=
+                        measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                            + pad * 2.0;
                 }
             }
             let items = if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
@@ -2147,9 +2490,12 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
 
             // Check if click is on the menu bar labels (to switch menus)
             if py < lh {
-                let mut label_x = cw;
+                let pad = 8.0_f32;
+                let mut label_x = pad;
                 for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                    let label_w = (name.len() as f32 + 2.0) * cw;
+                    let label_w =
+                        measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                            + pad * 2.0;
                     if px >= label_x && px < label_x + label_w {
                         if state.engine.menu_open_idx == Some(idx) {
                             state.engine.close_menu();
@@ -2195,10 +2541,12 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Menu bar clicks (when no dropdown is open) ───────────────────
         let title_bar_h = TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT;
         if state.engine.menu_bar_visible && py < title_bar_h {
-            let cw = state.char_width;
-            let mut label_x = cw;
+            let pad = 8.0_f32;
+            let mut label_x = pad;
             for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                let label_w = (name.len() as f32 + 2.0) * cw;
+                let label_w =
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                        + pad * 2.0;
                 if px >= label_x && px < label_x + label_w {
                     state.engine.open_menu(idx);
                     unsafe {
@@ -2323,28 +2671,45 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 }
                 state.engine.sc_has_focus = true;
             } else if state.sidebar.active_panel == SidebarPanel::Extensions {
-                // Extensions panel: row 0 = header
+                // Extensions panel — Y layout must match draw_extensions_panel:
+                // row 0: "EXTENSIONS" header at top
+                // installed header at top + lh * 1.5
+                // items follow at lh each
+                // 0.3 * lh gap before available header
                 state.engine.ext_sidebar_has_focus = true;
-                if row >= 1 {
-                    // Approximate: compute flat index from row
-                    let installed_len = state.engine.ext_installed_items().len();
-                    let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
-                    let inst_header_row = 1;
-                    let inst_items_rows = if inst_expanded { installed_len } else { 0 };
-                    let avail_header_row = inst_header_row + 1 + inst_items_rows;
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+                let installed_len = state.engine.ext_installed_items().len();
+                let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
 
-                    if row == inst_header_row {
-                        state.engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
-                    } else if inst_expanded
-                        && row > inst_header_row
-                        && row <= inst_header_row + installed_len
-                    {
-                        state.engine.ext_sidebar_selected = row - inst_header_row - 1;
-                    } else if row == avail_header_row {
-                        state.engine.ext_sidebar_sections_expanded[1] =
-                            !state.engine.ext_sidebar_sections_expanded[1];
-                    } else if row > avail_header_row {
-                        let avail_idx = row - avail_header_row - 1;
+                let inst_header_y = lh * 1.5;
+                let inst_items_start_y = inst_header_y + lh;
+                let inst_items_end_y = inst_items_start_y
+                    + if inst_expanded {
+                        installed_len as f32 * lh
+                    } else {
+                        0.0
+                    };
+                let avail_header_y = inst_items_end_y + lh * 0.3;
+                let avail_items_start_y = avail_header_y + lh;
+
+                if click_y >= inst_header_y && click_y < inst_header_y + lh {
+                    state.engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
+                } else if inst_expanded
+                    && click_y >= inst_items_start_y
+                    && click_y < inst_items_end_y
+                {
+                    let idx = ((click_y - inst_items_start_y) / lh).floor() as usize;
+                    if idx < installed_len {
+                        state.engine.ext_sidebar_selected = idx;
+                    }
+                } else if click_y >= avail_header_y && click_y < avail_header_y + lh {
+                    state.engine.ext_sidebar_sections_expanded[1] =
+                        !state.engine.ext_sidebar_sections_expanded[1];
+                } else if click_y >= avail_items_start_y {
+                    let avail_idx = ((click_y - avail_items_start_y) / lh).floor() as usize;
+                    let avail_len = state.engine.ext_available_items().len();
+                    if avail_idx < avail_len {
                         state.engine.ext_sidebar_selected = installed_len + avail_idx;
                     }
                 }
@@ -2678,6 +3043,97 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             }
         }
 
+        // ── Diff toolbar button clicks ─────────────────────────────────
+        for &(_, prev_x, next_x, fold_x, btn_w, bar_y, bar_h) in
+            &state.cached_diff_toolbar_btns.clone()
+        {
+            if py >= bar_y && py < bar_y + bar_h {
+                if px >= prev_x && px < prev_x + btn_w {
+                    state.engine.jump_prev_hunk();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                } else if px >= next_x && px < next_x + btn_w {
+                    state.engine.jump_next_hunk();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                } else if px >= fold_x && px < fold_x + btn_w {
+                    state.engine.diff_toggle_hide_unchanged();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── Breadcrumb clicks ────────────────────────────────────────────
+        if state.engine.settings.breadcrumbs {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            for bc in state.cached_breadcrumbs.clone() {
+                if bc.segments.is_empty() {
+                    continue;
+                }
+                let bx = bc.bounds.x as f32;
+                let by = bc.bounds.y as f32 - lh;
+                let bw = bc.bounds.width as f32;
+                if py >= by && py < by + lh && px >= bx && px < bx + bw {
+                    let local_x = px - bx;
+                    let sep_len = 3.0 * cw; // " › "
+                    let mut x = cw; // left padding
+                    state.engine.rebuild_breadcrumb_segments();
+                    for (i, seg) in bc.segments.iter().enumerate() {
+                        if i > 0 {
+                            x += sep_len;
+                        }
+                        let label_w = seg.label.chars().count() as f32 * cw;
+                        if local_x >= x && local_x < x + label_w {
+                            state.engine.breadcrumb_selected = i;
+                            state.engine.breadcrumb_open_scoped();
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                            return;
+                        }
+                        x += label_w;
+                    }
+                    // Click on breadcrumb row but not on a segment — consume the click
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── Group divider click → start drag ─────────────────────────────
+        for div in &state.cached_dividers.clone() {
+            let hit = match div.direction {
+                SplitDirection::Vertical => {
+                    (px - div.position as f32).abs() < 6.0
+                        && py >= div.cross_start as f32
+                        && py < (div.cross_start + div.cross_size) as f32
+                }
+                SplitDirection::Horizontal => {
+                    (py - div.position as f32).abs() < 6.0
+                        && px >= div.cross_start as f32
+                        && px < (div.cross_start + div.cross_size) as f32
+                }
+            };
+            if hit {
+                state.group_divider_drag = Some(div.split_index);
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
         // ── Terminal panel header click → start resize drag ─────────────
         if state.engine.terminal_open && !state.engine.terminal_panes.is_empty() {
             let rt_h = {
@@ -2758,39 +3214,67 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 return;
             }
 
-            // Click in terminal content area — handle split divider drag and pane switching
+            // Click in terminal content area
             let content_y = panel_y + lh;
-            if py >= content_y
-                && px >= editor_left
-                && state.engine.terminal_split
-                && state.engine.terminal_panes.len() >= 2
-            {
-                let split_cols = if state.engine.terminal_split_left_cols > 0 {
-                    state.engine.terminal_split_left_cols
-                } else {
-                    state.engine.terminal_panes[0].cols
-                };
-                let div_x = editor_left + split_cols as f32 * cw;
-                // Near divider (±5px) — start drag
-                if (px - div_x).abs() < 5.0 {
-                    state.terminal_split_drag = true;
-                    state.engine.terminal_has_focus = true;
-                    unsafe {
-                        let _ = SetCapture(hwnd);
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+            if py >= content_y && px >= editor_left {
+                // Handle split divider drag and pane switching
+                if state.engine.terminal_split && state.engine.terminal_panes.len() >= 2 {
+                    let split_cols = if state.engine.terminal_split_left_cols > 0 {
+                        state.engine.terminal_split_left_cols
+                    } else {
+                        state.engine.terminal_panes[0].cols
+                    };
+                    let div_x = editor_left + split_cols as f32 * cw;
+                    // Near divider (±5px) — start drag
+                    if (px - div_x).abs() < 5.0 {
+                        state.terminal_split_drag = true;
+                        state.engine.terminal_has_focus = true;
+                        unsafe {
+                            let _ = SetCapture(hwnd);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
                     }
-                    return;
+                    // Switch focus to clicked pane
+                    if px < div_x {
+                        state.engine.terminal_active = 0;
+                    } else {
+                        state.engine.terminal_active = 1;
+                    }
                 }
-                // Switch focus to clicked pane
-                if px < div_x {
-                    state.engine.terminal_active = 0;
+                // Start terminal text selection
+                let term_col = ((px - editor_left) / cw).floor() as u16;
+                let term_row = ((py - content_y) / lh).floor() as u16;
+                // Adjust for split pane — if clicking in the right pane, offset column
+                let adj_col = if state.engine.terminal_split
+                    && state.engine.terminal_panes.len() >= 2
+                    && state.engine.terminal_active == 1
+                {
+                    let left_cols = if state.engine.terminal_split_left_cols > 0 {
+                        state.engine.terminal_split_left_cols
+                    } else {
+                        state.engine.terminal_panes[0].cols
+                    };
+                    term_col.saturating_sub(left_cols + 1) // +1 for divider
                 } else {
-                    state.engine.terminal_active = 1;
+                    term_col
+                };
+                state.engine.terminal_scroll_reset();
+                if let Some(term) = state.engine.active_terminal_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: term_row,
+                        start_col: adj_col,
+                        end_row: term_row,
+                        end_col: adj_col,
+                    });
                 }
+                state.terminal_text_drag = true;
                 state.engine.terminal_has_focus = true;
                 unsafe {
+                    let _ = SetCapture(hwnd);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
+                return;
             }
         }
 
@@ -2900,6 +3384,20 @@ fn on_mouse_up(hwnd: HWND) {
         state.sidebar_resize_drag = false;
         state.scrollbar_drag = None;
         state.terminal_split_drag = false;
+        state.group_divider_drag = None;
+        // Auto-copy terminal selection on mouse release
+        if state.terminal_text_drag {
+            state.terminal_text_drag = false;
+            let text = state
+                .engine
+                .active_terminal()
+                .and_then(|t| t.selected_text());
+            if let Some(ref text) = text {
+                if let Some(ref cb) = state.engine.clipboard_write {
+                    let _ = cb(text);
+                }
+            }
+        }
         if state.terminal_resize_drag {
             state.terminal_resize_drag = false;
             let rows = state.engine.session.terminal_panel_rows;
@@ -2956,6 +3454,60 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             state.caption_hover = new_hover;
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+
+        // Terminal text selection drag in progress
+        if state.terminal_text_drag && lbutton {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let editor_left = state.sidebar.total_width();
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(state.hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
+            let panel_y = rt_h - (total_rows + 2.0) * lh;
+            let content_y = panel_y + lh;
+            let term_col = ((px - editor_left) / cw).floor().max(0.0) as u16;
+            let term_row = ((py - content_y) / lh).floor().max(0.0) as u16;
+            let adj_col = if state.engine.terminal_split
+                && state.engine.terminal_panes.len() >= 2
+                && state.engine.terminal_active == 1
+            {
+                let left_cols = if state.engine.terminal_split_left_cols > 0 {
+                    state.engine.terminal_split_left_cols
+                } else {
+                    state.engine.terminal_panes[0].cols
+                };
+                term_col.saturating_sub(left_cols + 1)
+            } else {
+                term_col
+            };
+            if let Some(term) = state.engine.active_terminal_mut() {
+                if let Some(ref mut sel) = term.selection {
+                    sel.end_row = term_row;
+                    sel.end_col = adj_col;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        } else if state.terminal_text_drag && !lbutton {
+            state.terminal_text_drag = false;
+            // Auto-copy selection to clipboard on mouse release
+            let text = state
+                .engine
+                .active_terminal()
+                .and_then(|t| t.selected_text());
+            if let Some(ref text) = text {
+                if let Some(ref cb) = state.engine.clipboard_write {
+                    let _ = cb(text);
+                }
             }
         }
 
@@ -3034,6 +3586,36 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             return;
         }
 
+        // Group divider drag in progress
+        if let Some(split_index) = state.group_divider_drag {
+            if lbutton {
+                if let Some(div) = state
+                    .cached_dividers
+                    .iter()
+                    .find(|d| d.split_index == split_index)
+                {
+                    let mouse_pos = match div.direction {
+                        SplitDirection::Vertical => px as f64,
+                        SplitDirection::Horizontal => py as f64,
+                    };
+                    let new_ratio = ((mouse_pos - div.axis_start) / div.axis_size).clamp(0.1, 0.9);
+                    state
+                        .engine
+                        .group_layout
+                        .set_ratio_at_index(split_index, new_ratio);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            } else {
+                state.group_divider_drag = None;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
+        }
+
         // Scrollbar drag in progress
         if let Some(wid) = state.scrollbar_drag {
             if lbutton {
@@ -3107,9 +3689,14 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 // Hover over menu bar labels — switch to that menu
                 let title_h = TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT;
                 if py < title_h {
-                    let mut label_x = cw;
+                    let pad = 8.0_f32;
+                    let mut label_x = pad;
                     for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                        let label_w = (name.len() as f32 + 2.0) * cw;
+                        let label_w = measure_ui_text_width(
+                            &state.dwrite_factory,
+                            &state.ui_text_format,
+                            name,
+                        ) + pad * 2.0;
                         if px >= label_x && px < label_x + label_w && idx != midx {
                             state.engine.open_menu(idx);
                             unsafe {
@@ -3121,10 +3708,15 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                     }
                 } else {
                     // Hover over dropdown items — highlight
-                    let mut popup_x = cw;
+                    let pad = 8.0_f32;
+                    let mut popup_x = pad;
                     for i in 0..midx {
                         if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                            popup_x += (name.len() as f32 + 2.0) * cw;
+                            popup_x += measure_ui_text_width(
+                                &state.dwrite_factory,
+                                &state.ui_text_format,
+                                name,
+                            ) + pad * 2.0;
                         }
                     }
                     let items = MENU_STRUCTURE
@@ -3168,6 +3760,51 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Context menu hover tracking — highlight items on mouse move
+        if let Some(ref cm) = state.engine.context_menu {
+            let cw = state.char_width;
+            let lh = state.line_height;
+            let max_label = cm
+                .items
+                .iter()
+                .map(|i| i.label.chars().count() + i.shortcut.chars().count() + 4)
+                .max()
+                .unwrap_or(20);
+            let popup_w = max_label as f32 * cw;
+            let popup_h = cm.items.len() as f32 * lh;
+            let menu_x = (cm.screen_x as f32 * cw)
+                .min({
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.right - rc.left) as f32 / state.dpi_scale - popup_w
+                })
+                .max(0.0);
+            let menu_y = (cm.screen_y as f32 * lh)
+                .min({
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale - popup_h
+                })
+                .max(0.0);
+
+            if px >= menu_x && px < menu_x + popup_w && py >= menu_y && py < menu_y + popup_h {
+                let item_idx = ((py - menu_y) / lh).floor() as usize;
+                if item_idx < cm.items.len()
+                    && cm.items[item_idx].enabled
+                    && cm.selected != item_idx
+                {
+                    state.engine.context_menu.as_mut().unwrap().selected = item_idx;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+        }
+
         // Popup hover tracking: dismiss/cancel-dismiss for editor hover and panel hover
         if let Some(ref rect) = state.popup_rects.editor_hover {
             if rect.contains(px, py) {
@@ -3187,6 +3824,31 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Tab tooltip: show on hover, dismiss on mouseout
+        {
+            let found_slot = state.tab_slots.iter().find(|slot| {
+                px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height
+            });
+            let tooltip = found_slot.and_then(|slot| {
+                let group = state.engine.editor_groups.get(&slot.group_id)?;
+                let tab = group.tabs.get(slot.tab_idx)?;
+                let win = state.engine.windows.get(&tab.active_window)?;
+                let bs = state.engine.buffer_manager.get(win.buffer_id)?;
+                let raw_path = bs.file_path.as_ref()?;
+                let path = crate::core::paths::strip_unc_prefix(raw_path);
+                Some(path.display().to_string())
+            });
+            if let Some(slot) = found_slot {
+                state.tab_tooltip_x = slot.x_start;
+            }
+            if tooltip != state.engine.tab_hover_tooltip {
+                state.engine.tab_hover_tooltip = tooltip;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+
         // Text drag (inline instead of calling on_mouse_drag to avoid double borrow)
         if !state.sidebar_resize_drag && lbutton && state.mouse_text_drag {
             if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
@@ -3198,15 +3860,61 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             return;
         }
 
-        // Cursor shape: resize arrow near sidebar edge
+        // Cursor shape: resize arrow near sidebar edge or group divider
         let edge = state.sidebar.total_width();
-        let near_edge = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
-        unsafe {
-            let cursor = if near_edge {
-                LoadCursorW(None, IDC_SIZEWE).unwrap_or_default()
+        let near_sidebar = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
+        let hit_divider = state
+            .cached_dividers
+            .iter()
+            .find(|div| match div.direction {
+                SplitDirection::Vertical => {
+                    (px - div.position as f32).abs() < 6.0
+                        && py >= div.cross_start as f32
+                        && py < (div.cross_start + div.cross_size) as f32
+                }
+                SplitDirection::Horizontal => {
+                    (py - div.position as f32).abs() < 6.0
+                        && px >= div.cross_start as f32
+                        && px < (div.cross_start + div.cross_size) as f32
+                }
+            });
+        // Determine if cursor is over an editor text area (I-beam) or UI chrome (arrow)
+        let over_editor = {
+            let editor_left = state.sidebar.total_width();
+            let menu_h = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
             } else {
-                LoadCursorW(None, IDC_IBEAM).unwrap_or_default()
+                0.0
             };
+            let tab_h = state.line_height * TAB_BAR_HEIGHT_MULT;
+            let bc_h = if state.engine.settings.breadcrumbs {
+                state.line_height
+            } else {
+                0.0
+            };
+            let chrome_top = menu_h + tab_h + bc_h;
+            px >= editor_left
+                && py >= chrome_top
+                && state.engine.context_menu.is_none()
+                && !state
+                    .tab_slots
+                    .iter()
+                    .any(|s| px >= s.x_start && px < s.x_end && py >= s.y && py < s.y + s.height)
+        };
+        unsafe {
+            let cursor_id = if near_sidebar {
+                IDC_SIZEWE
+            } else if let Some(div) = hit_divider {
+                match div.direction {
+                    SplitDirection::Vertical => IDC_SIZEWE,
+                    SplitDirection::Horizontal => IDC_SIZENS,
+                }
+            } else if over_editor {
+                IDC_IBEAM
+            } else {
+                IDC_ARROW
+            };
+            let cursor = LoadCursorW(None, cursor_id).unwrap_or_default();
             SetCursor(Some(cursor));
         }
     });
@@ -3262,6 +3970,50 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
                 if vis_idx < state.sidebar.rows.len() && !state.sidebar.rows[vis_idx].is_dir {
                     let path = state.sidebar.rows[vis_idx].path.clone();
                     state.engine.open_file_in_tab(&path);
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on extension panel → open extension README
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let lh = state.line_height;
+            let click_y = py - menu_y;
+            let installed_len = state.engine.ext_installed_items().len();
+            let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
+
+            let inst_header_y = lh * 1.5;
+            let inst_items_start_y = inst_header_y + lh;
+            let inst_items_end_y = inst_items_start_y
+                + if inst_expanded {
+                    installed_len as f32 * lh
+                } else {
+                    0.0
+                };
+            let avail_header_y = inst_items_end_y + lh * 0.3;
+            let avail_items_start_y = avail_header_y + lh;
+
+            // Only open readme on item rows, not section headers
+            if inst_expanded && click_y >= inst_items_start_y && click_y < inst_items_end_y {
+                let idx = ((click_y - inst_items_start_y) / lh).floor() as usize;
+                if idx < installed_len {
+                    state.engine.ext_sidebar_selected = idx;
+                    state.engine.ext_open_selected_readme();
+                }
+            } else if click_y >= avail_items_start_y {
+                let avail_idx = ((click_y - avail_items_start_y) / lh).floor() as usize;
+                let avail_len = state.engine.ext_available_items().len();
+                if avail_idx < avail_len {
+                    state.engine.ext_sidebar_selected = installed_len + avail_idx;
+                    state.engine.ext_open_selected_readme();
                 }
             }
             unsafe {
@@ -3987,6 +4739,56 @@ fn compute_win_tab_drop_zone(state: &AppState, px: f32, py: f32) -> DropZone {
 }
 
 // ─── Clipboard ───────────────────────────────────────────────────────────────
+
+/// Sync the unnamed register to the system clipboard after yank/delete operations.
+fn sync_clipboard(state: &mut AppState) {
+    let current = state
+        .engine
+        .registers
+        .get(&'"')
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, _)| s.clone());
+    if current != state.last_clipboard_register {
+        if let (Some(ref text), Some(ref cb_write)) = (&current, &state.engine.clipboard_write) {
+            let _ = cb_write(text.as_str());
+        }
+        state.last_clipboard_register = current;
+    }
+}
+
+/// Load system clipboard into registers before a paste key (p/P) so that
+/// externally copied text can be pasted in the editor (clipboard=unnamedplus).
+fn intercept_paste_key(state: &mut AppState, key_name: &str, unicode: Option<char>) -> bool {
+    use crate::core::Mode;
+    // Only intercept p/P in Normal/Visual modes with default register
+    let is_paste = matches!(
+        (&state.engine.mode, unicode),
+        (
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock,
+            Some('p' | 'P')
+        )
+    );
+    if !is_paste {
+        return false;
+    }
+    if !matches!(
+        state.engine.selected_register,
+        None | Some('"') | Some('+') | Some('*')
+    ) {
+        return false;
+    }
+    // Read system clipboard and load into registers
+    if let Some(ref cb_read) = state.engine.clipboard_read {
+        if let Ok(text) = cb_read() {
+            if !text.is_empty() {
+                state.engine.load_clipboard_for_paste(text);
+            }
+        }
+    }
+    // Let engine execute the paste
+    state.engine.handle_key(key_name, unicode, false);
+    true
+}
 
 fn setup_win_clipboard(engine: &mut Engine) {
     engine.clipboard_read = Some(Box::new(|| {

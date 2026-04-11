@@ -1,7 +1,26 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 267 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 268 archived here. Recent work summary in PROJECT_STATE.md.
+
+## Session 268 — Win-GUI bug fixes (16 items — systematic audit + user-reported bugs)
+1. Tab close dirty check — shows engine dialog for unsaved buffers
+2. Picker mouse interaction — click result to select, click outside to dismiss, scroll wheel navigates
+3. Dialog button clicks — full button rect hit-testing, outside-click dismisses
+4. QuitWithUnsaved handling — shows confirmation dialog, WM_CLOSE checks for unsaved changes
+5. Fold-aware scrolling — uses scroll_down_visible()/scroll_up_visible()
+6. Picker scroll interception — scroll wheel checks picker_open first
+7. VSCode selection clear on click — calls vscode_clear_selection() before mouse_click
+8. Cursor kept in viewport after scroll — clamped with scrolloff, calls sync_scroll_binds()
+9. Terminal tab switching by mouse — matches tab label geometry from draw code
+10. Tabs disappear with second editor group — breadcrumb offset in draw + click + drag overlay
+11. Terminal steals keyboard focus — terminal_has_focus cleared on editor click
+12. Tab accent only on active group — show_accent parameter, is_active_group check
+13. Explorer preview investigated — working correctly (expected VSCode behavior)
+14. Sidebar focus persists after editor click — clear_sidebar_focus() added
+15. Sidebar focus persists after terminal click — clear_sidebar_focus() + sidebar.has_focus = false
+16. Dialog text/buttons overflow — auto-sized width from content
+- Created docs/NATIVE_GUI_LESSONS.md with 9 sections of lessons for future backends
 
 ---
 

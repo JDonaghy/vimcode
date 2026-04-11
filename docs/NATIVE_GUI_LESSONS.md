@@ -99,3 +99,61 @@ When implementing a new backend, verify each of these independently:
 - [ ] Dialog/popup width auto-sized from content, not hardcoded
 - [ ] All popups clamped to screen bounds
 - [ ] All popup text clipped to popup bounds
+- [ ] Context menu items highlight on mouse hover (not just on click)
+- [ ] Tab slot bounds clipped to group bounds (no overflow into adjacent groups)
+- [ ] Tab slot geometry matches draw code font (proportional vs monospace)
+- [ ] Menu bar click/hover geometry matches draw code font
+- [ ] Mouse cursor changes: I-beam over editor, arrow over chrome, resize near dividers
+- [ ] Clipboard sync: register → system clipboard after yank, system → register before paste
+- [ ] `clipboard_paste()` works on the target platform (Windows needs PowerShell, not xclip)
+- [ ] Ctrl+V in insert mode pastes clipboard (not literal character insert)
+- [ ] Sidebar keyboard routing: generic handler only for Explorer, other panels through `handle_key()`
+- [ ] Extension panel keys (`i`/`d`/`u`/`r`/`/`) mapped as named keys, not `("char", Some('i'))`
+- [ ] Path display strips platform-specific prefixes (`\\?\` on Windows)
+- [ ] Terminal click sets focus AND starts text selection (mouse drag → `TermSelection`)
+- [ ] Terminal paste: Ctrl+V reads clipboard/registers, writes to PTY with bracketed paste
+- [ ] Terminal copy: Ctrl+Y/Ctrl+Shift+C copies selection, auto-copy on mouse release
+
+## 10. Interaction parity is harder than rendering parity (Session 269)
+
+**The pattern:** The Win-GUI was built render-first: every `ScreenLayout` field had a corresponding draw call. But interactions (clicks, hovers, drags, keyboard routing) had no parity verification. This led to ~20 interaction bugs discovered through manual testing.
+
+**Bug classes discovered:**
+
+| Class | Description | Example | Prevention |
+|-------|------------|---------|------------|
+| **Missing hover** | Element renders but has no mouse-move tracking | Context menu items, tab tooltips | For every interactive element in TUI `mouse.rs`, add equivalent `on_mouse_move` handler |
+| **Key swallowing** | Generic handler intercepts keys meant for specific panels | Sidebar j/k handled Explorer-style for Git panel | Guard generic handlers with `active_panel == Explorer` |
+| **Font mismatch** | Click detection uses monospace width but draw uses proportional font | Tab close button, menu bar labels | Use `measure_ui_text_width()` everywhere the draw uses `measure_ui_text()` |
+| **Bounds overflow** | Cached hit zones extend past visual boundaries | Tab slots from group 1 overlap group 2 | Clip cached slots to parent bounds |
+| **Platform clipboard** | Engine static methods use Linux-only tools | `clipboard_paste()` uses xclip on Windows | Add `#[cfg(target_os)]` branches for all clipboard operations |
+| **Path display** | Platform path prefixes leak into UI | `\\?\C:\...` in tooltips and context menu actions | Use `strip_unc_prefix()` (or macOS equivalent) at all display points |
+
+**Systematic audit approach:**
+1. Grep every `on_mouse_move` handler in TUI `mouse.rs` — verify Win-GUI (or new backend) has the equivalent
+2. Grep every `_has_focus = true` setter — verify competing click paths clear it
+3. Grep every `chars().count() * cw` in click handling — verify the draw code uses the same width calculation
+4. Grep every `clipboard_paste()` call — verify it works on the target platform
+5. Grep every `.display()` or `.to_string_lossy()` on a `PathBuf` — verify no platform prefix leaks
+
+**For macOS port:** Run this audit BEFORE the first manual test, not after. Fix the classes proactively. The Win-GUI experience shows that fixing bugs one-by-one is 3-4x slower than fixing them by class.
+
+## 11. Extension panel click geometry must match fractional draw layout
+
+**The bug:** The extension panel draw code uses fractional Y positions (`1.5 * lh` for first header, `0.3 * lh` gap between sections), but the click handler used integer row indices. Clicks hit the wrong items or missed entirely.
+
+**The rule:** When a draw function uses non-integer spacing (fractional line heights, padding, gaps), the click handler must replicate the exact same Y arithmetic. Don't approximate with integer rows.
+
+**How to apply:** Extract the Y layout computation into a shared function or replicate the draw's arithmetic exactly in the click handler. If the draw adds `lh * 0.3` gap, the click handler must too.
+
+## 12. Terminal integration requires three interaction layers
+
+**The rule:** A terminal panel needs all three layers to be usable:
+1. **Focus management** — clicking terminal sets focus, clicking elsewhere clears it. Must handle both single-pane and split-pane cases.
+2. **Keyboard routing** — when focused: Escape returns to editor, Ctrl+V pastes, Ctrl+Y copies, all other keys forward to PTY. Must intercept BEFORE generic key handlers.
+3. **Mouse selection** — mouse-down starts `TermSelection`, drag updates it, release auto-copies to clipboard. Must track drag state separately from editor text drag.
+
+**Common mistakes from Win-GUI:**
+- Terminal content click only handled split-pane case (single-pane fell through to editor)
+- No paste/copy keyboard shortcuts in terminal focus
+- No mouse selection or auto-copy on release

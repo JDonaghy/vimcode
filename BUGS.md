@@ -32,15 +32,28 @@
 - ~~**Win-GUI: dialog text and buttons overflow the dialog box**~~ — Fixed: dialog width now auto-sized from content (buttons + body + title) instead of hardcoded 400px. Both draw and click handler use the same calculation.
 
 **Medium (deferred):**
-- **Win-GUI: terminal can't regain focus after editor click** — After clicking in the editor (which correctly clears `terminal_has_focus`), clicking back on the terminal panel doesn't restore `terminal_has_focus = true`. The terminal click handler likely doesn't set focus, or the editor click handler intercepts the click first.
+- ~~**Win-GUI: terminal can't regain focus after editor click**~~ — Fixed: terminal content clicks now always set `terminal_has_focus` (was only for split-pane case).
 
 **Low (missing features):**
-- **Win-GUI: breadcrumb clicks not handled** — Breadcrumbs render but are not clickable. GTK handles single-click (opens scoped picker for directory/symbol segment) and double-click. Win-GUI clicks on the breadcrumb row fall through to the editor.
-- **Win-GUI: group divider drag not implemented** — Split editor groups can be created (via tab drag) but the divider between them cannot be dragged to resize. GTK has full divider drag handling.
+- ~~**Win-GUI: breadcrumb clicks not handled**~~ — Fixed: clicking breadcrumb segments opens scoped picker (directory→file picker, symbol→@picker).
+- ~~**Win-GUI: group divider drag not implemented**~~ — Fixed: cached dividers from ScreenLayout; full drag-to-resize with cursor change.
 - **Win-GUI: horizontal scrollbar drag not implemented** — Horizontal scrollbar renders but is not interactive. GTK has h-scrollbar click and drag. Win-GUI only handles vertical scrollbar drag.
-- **Win-GUI: diff toolbar buttons not clickable** — The `↑`/`↓`/`≡` buttons in the diff toolbar (tab bar) render but have no click hit-testing. GTK dispatches prev-change/next-change/toggle-fold on click.
-- **Win-GUI: diff peek key routing missing** — The diff peek popup renders but `s`/`r`/`q` key routing (stage/revert/quit) is not implemented.
-- **Win-GUI: tab tooltip dismiss-on-mouseout missing** — Tab tooltip renders on hover but doesn't dismiss when the mouse moves away from the tab.
+- ~~**Win-GUI: diff toolbar buttons not clickable**~~ — Fixed: ↑/↓/≡ button click handlers dispatch to `jump_prev_hunk()`/`jump_next_hunk()`/`diff_toggle_hide_unchanged()`.
+- ~~**Win-GUI: diff peek key routing missing**~~ — Already working: keys route through `handle_key()` → `handle_diff_peek_key()`.
+- ~~**Win-GUI: tab tooltip dismiss-on-mouseout missing**~~ — Fixed: mouse hover shows file path, mouseout clears tooltip.
+
+**Fixed in Session 269 (interaction parity audit):**
+- ~~**Win-GUI: tab tooltip shows UNC prefix (`\\?\`)**~~ — Fixed: `strip_unc_prefix()` in `paths.rs`, also applied to `copy_relative_path()`.
+- ~~**Win-GUI: extension panel clicks/keyboard not working**~~ — Fixed: click geometry matched to draw's fractional Y layout; keyboard routing for `i`/`d`/`u`/`r`/`/`/`j`/`k`/`Return`/`q`; double-click opens README; selection highlight.
+- ~~**Win-GUI: clipboard sync missing (yank/paste broken)**~~ — Fixed: register→clipboard sync after yank, clipboard→register load before paste. Bidirectional clipboard=unnamedplus.
+- ~~**Win-GUI: context menu items not hoverable**~~ — Fixed: mouse-move tracking highlights items on hover.
+- ~~**Win-GUI: tab close button not clickable**~~ — Fixed: tab slot width uses `measure_ui_text_width()` (proportional UI font) matching `draw_tabs()`.
+- ~~**Win-GUI: first tab of second group not clickable**~~ — Fixed: tab slots clipped to group bounds.
+- ~~**Win-GUI: menu bar click/hover misaligned**~~ — Fixed: all 4 menu bar handlers use proportional font measurement matching draw code.
+- ~~**Win-GUI: Ctrl+V doesn't paste in insert mode**~~ — Fixed: intercepts Ctrl+V in Insert/Replace mode, pastes system clipboard.
+- ~~**Win-GUI: clipboard_paste() broken on Windows**~~ — Fixed: added `#[cfg(target_os = "windows")]` PowerShell branch. Fixes Ctrl+V in command mode, search mode, picker.
+- ~~**Win-GUI: mouse cursor always I-beam**~~ — Fixed: arrow over tabs/sidebar/menus, resize near dividers, I-beam over editor text only.
+- ~~**Win-GUI: generic sidebar handler swallows keys for Git/AI panels**~~ — Fixed: guarded with `active_panel == Explorer`.
 
 **Verified fixed this session:**
 - ~~Win-GUI: activity bar icon size mismatch~~ — Now uses Segoe MDL2 Assets / Segoe Fluent Icons at 20px in 48×48 cells.

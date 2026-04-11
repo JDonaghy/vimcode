@@ -578,8 +578,11 @@ impl Engine {
 
     /// Return the path relative to cwd.
     pub fn copy_relative_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.cwd)
-            .unwrap_or(path)
+        let clean_path = crate::core::paths::strip_unc_prefix(path);
+        let clean_cwd = crate::core::paths::strip_unc_prefix(&self.cwd);
+        clean_path
+            .strip_prefix(clean_cwd.as_ref())
+            .unwrap_or(&clean_path)
             .to_string_lossy()
             .into_owned()
     }

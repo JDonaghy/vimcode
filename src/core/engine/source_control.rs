@@ -384,20 +384,42 @@ impl Engine {
         #[cfg(not(test))]
         {
             use std::process::Command;
-            // Try xclip first, then xsel, then wl-paste (Wayland).
-            for cmd in &[
-                &["xclip", "-selection", "clipboard", "-o"][..],
-                &["xsel", "--clipboard", "--output"][..],
-                &["wl-paste", "--no-newline"][..],
-                &["pbpaste"][..],
-            ] {
-                if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                if let Ok(out) = Command::new("powershell")
+                    .args(["-NoProfile", "-Command", "Get-Clipboard"])
+                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                    .output()
+                {
                     if out.status.success() {
-                        return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                        let text = String::from_utf8_lossy(&out.stdout)
+                            .trim_end_matches("\r\n")
+                            .to_string();
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
                     }
                 }
+                None
             }
-            None
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Try xclip first, then xsel, then wl-paste (Wayland), then pbpaste (macOS).
+                for cmd in &[
+                    &["xclip", "-selection", "clipboard", "-o"][..],
+                    &["xsel", "--clipboard", "--output"][..],
+                    &["wl-paste", "--no-newline"][..],
+                    &["pbpaste"][..],
+                ] {
+                    if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
+                        if out.status.success() {
+                            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                        }
+                    }
+                }
+                None
+            }
         }
     }
 

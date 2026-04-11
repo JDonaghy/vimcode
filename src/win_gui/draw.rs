@@ -77,6 +77,8 @@ pub struct DrawContext<'a> {
     pub line_height: f32,
     /// Left edge of the editor area (sidebar width offset).
     pub editor_left: f32,
+    /// X position of the hovered tab (for tooltip placement).
+    pub tab_tooltip_x: f32,
     /// Which caption button (0=min, 1=max, 2=close) is hovered, or None.
     pub caption_hover: Option<usize>,
     /// Whether the window is currently maximized (affects the max/restore icon).
@@ -1627,7 +1629,11 @@ impl<'a> DrawContext<'a> {
         let tooltip_w = tooltip.chars().count() as f32 * cw + cw * 2.0;
         let tooltip_h = lh + 4.0;
         let (rt_w, _) = self.rt_size();
-        let x = self.editor_left.min(rt_w - tooltip_w);
+        // Position under the hovered tab, clamped to window bounds
+        let x = self
+            .tab_tooltip_x
+            .max(self.editor_left)
+            .min(rt_w - tooltip_w);
 
         let bg = self.solid_brush(self.theme.hover_bg);
         let border_brush = self.solid_brush(self.theme.hover_border);
@@ -2500,7 +2506,15 @@ impl<'a> DrawContext<'a> {
         );
         y += lh;
         if ext.sections_expanded[0] {
-            for item in &ext.items_installed {
+            for (i, item) in ext.items_installed.iter().enumerate() {
+                let is_sel = ext.has_focus && ext.selected == i;
+                if is_sel {
+                    let sel_bg = self.solid_brush(self.theme.explorer_active_bg);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(panel_x, y, panel_w, lh), &sel_bg);
+                    }
+                }
                 self.draw_text(&item.name, panel_x + cw * 2.5, y, self.theme.foreground);
                 y += lh;
             }
@@ -2522,7 +2536,16 @@ impl<'a> DrawContext<'a> {
         );
         y += lh;
         if ext.sections_expanded[1] {
-            for item in &ext.items_available {
+            let inst_len = ext.items_installed.len();
+            for (i, item) in ext.items_available.iter().enumerate() {
+                let is_sel = ext.has_focus && ext.selected == inst_len + i;
+                if is_sel {
+                    let sel_bg = self.solid_brush(self.theme.explorer_active_bg);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(panel_x, y, panel_w, lh), &sel_bg);
+                    }
+                }
                 self.draw_text(&item.name, panel_x + cw * 2.5, y, self.theme.foreground);
                 y += lh;
             }

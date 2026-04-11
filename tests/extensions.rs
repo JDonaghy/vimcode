@@ -28,6 +28,7 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
                 binary: "clangd".to_string(),
                 install_linux: "sudo apt-get install -y clangd".to_string(),
                 install_macos: "brew install llvm".to_string(),
+                install_windows: "winget install LLVM.LLVM".to_string(),
                 ..Default::default()
             },
             dap: DapConfig {
