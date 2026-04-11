@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 10, 2026 (Session 267 — Win-GUI bug blitz: 9 fixes, Phase 2c action parity harness, GTK↔Win-GUI comparison found 12 more bugs) | **Tests:** 5477
+**Last updated:** Apr 10, 2026 (Session 268 — Win-GUI critical + medium bug fixes: 7 fixes covering all 4 critical + 3 medium bugs) | **Tests:** 5477
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 264 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 267 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,15 +26,13 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 267 — Win-GUI bug blitz + parity tests (9 fixes, 6 new tests, 12 bugs found):**
-1. **Activity bar icons** — Replaced broken Nerd Font approach with Segoe MDL2 Assets / Segoe Fluent Icons (native Windows icon fonts). 48×48 centered icon cells with dedicated DirectWrite format.
-2. **Tab drag-and-drop** — Full implementation: threshold-based drag start, `compute_win_tab_drop_zone()` for reorder/split/merge, visual overlay (blue zone highlight + insertion bar + ghost label), calls engine's `tab_drag_begin()`/`tab_drag_drop()`.
-3. **Terminal split** — Split button + add/close buttons in toolbar, split pane rendering with divider, pane focus switching, divider drag resize.
-4. **Popup mouse handlers** — `CachedPopupRects` infrastructure. Editor hover (click/dismiss/scroll), panel hover (dismiss), debug toolbar (button clicks via `execute_command`).
-5. **Scrollbar theme colors** — Fixed editor scrollbar to use `theme.scrollbar_thumb`/`scrollbar_track` instead of hardcoded alpha values.
-6. **Explorer file open** — Single-click now uses `open_file_preview()` (preview tab). Double-click/Enter uses `open_file_in_tab()` (new permanent tab). Was using `switch_window_buffer` which replaced the current buffer.
-7. **Context menu z-order + clicks** — Context menu, dialog, notifications now draw after sidebar in `on_paint`. Full click handler: item selection, action dispatch via `handle_context_action()`, outside-click dismiss.
-8. **Default shell** — `default_shell()` returns `powershell.exe` on Windows instead of `/bin/bash`.
-9. **Phase 2c action parity harness** — `UiAction` enum (26 variants), `all_required_ui_actions()` source of truth, per-backend collectors. 3 parity tests + 3 behavioral contract tests. Systematic GTK↔Win-GUI comparison found 12 additional bugs (4 critical, 5 medium, 3 low — see BUGS.md).
+**Session 268 — Win-GUI critical + medium bug fixes (7 fixes):**
+1. **Tab close dirty check** — `on_mouse_down` now checks `engine.dirty()` before closing a tab. Shows engine dialog (Save & Close / Discard / Cancel) for unsaved buffers. Added `close_tab_confirm` and `quit_unsaved` dialog tags to `process_dialog_result`.
+2. **Picker mouse interaction** — When `picker_open` is true, all clicks are intercepted: click on result row selects it, click outside popup dismisses. Scroll wheel navigates picker items with scroll tracking.
+3. **Dialog button clicks** — Full button rect hit-testing in `on_mouse_down` (highest z-order, before context menu/popups). Computes dialog geometry matching `draw_dialog`, dispatches `dialog_click_button(idx)`, handles quit actions via `DestroyWindow`. Outside-click dismisses dialog.
+4. **QuitWithUnsaved handling** — `handle_action` now shows engine dialog (Save All & Quit / Quit Without Saving / Cancel) instead of silently returning false. Added `WM_CLOSE` handler that checks `has_any_unsaved()` and shows the same dialog, preventing accidental window close with unsaved work.
+5. **Fold-aware scrolling** — Replaced raw `view_mut().scroll_top` arithmetic with `scroll_down_visible()`/`scroll_up_visible()` which skip folded regions.
+6. **Picker scroll interception** — Scroll wheel checks `picker_open` first and navigates picker results instead of scrolling the editor behind the picker.
+7. **VSCode selection clear on click** — Calls `vscode_clear_selection()` before `mouse_click` in editor area when in VSCode edit mode, matching GTK behavior.
 
-> All sessions through 266 archived in **SESSION_HISTORY.md**.
+> All sessions through 267 archived in **SESSION_HISTORY.md**.

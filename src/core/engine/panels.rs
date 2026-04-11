@@ -350,6 +350,29 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "close_tab_confirm" => {
+                match action {
+                    "save_close" => {
+                        self.escape_to_normal();
+                        let _ = self.save();
+                        self.close_tab();
+                    }
+                    "discard" => {
+                        self.escape_to_normal();
+                        self.close_tab();
+                    }
+                    _ => {} // cancel — do nothing
+                }
+                EngineAction::None
+            }
+            "quit_unsaved" => match action {
+                "save_quit" => {
+                    self.save_all_dirty();
+                    EngineAction::SaveQuit
+                }
+                "discard_quit" => EngineAction::Quit,
+                _ => EngineAction::None, // cancel
+            },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
                 EngineAction::None

@@ -754,6 +754,52 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             on_dpi_changed(hwnd, wparam, lparam);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // Check for unsaved changes before closing
+            let has_unsaved = APP.with(|app| {
+                let app = app.borrow();
+                app.as_ref()
+                    .is_some_and(|state| state.engine.has_any_unsaved())
+            });
+            if has_unsaved {
+                APP.with(|app| {
+                    let mut app = app.borrow_mut();
+                    if let Some(state) = app.as_mut() {
+                        use crate::core::engine::DialogButton;
+                        state.engine.show_dialog(
+                            "quit_unsaved",
+                            "Unsaved Changes",
+                            vec![
+                                "You have unsaved changes. Do you want to save before quitting?"
+                                    .to_string(),
+                            ],
+                            vec![
+                                DialogButton {
+                                    label: "Save All & Quit".into(),
+                                    hotkey: 's',
+                                    action: "save_quit".into(),
+                                },
+                                DialogButton {
+                                    label: "Quit Without Saving".into(),
+                                    hotkey: 'd',
+                                    action: "discard_quit".into(),
+                                },
+                                DialogButton {
+                                    label: "Cancel".into(),
+                                    hotkey: '\0',
+                                    action: "cancel".into(),
+                                },
+                            ],
+                        );
+                    }
+                });
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0) // Don't close — let the dialog handle it
+            } else {
+                DestroyWindow(hwnd).ok();
+                LRESULT(0)
+            }
+        }
         WM_DESTROY => {
             on_destroy();
             PostQuitMessage(0);
@@ -2328,6 +2374,114 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
+        // ── Dialog button click handling (highest z-order) ────────────────
+        if state.engine.dialog.is_some() {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let (rt_w, rt_h) = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (
+                    (rc.right - rc.left) as f32 / state.dpi_scale,
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale,
+                )
+            };
+            // Match geometry from draw_dialog
+            let dialog = state.engine.dialog.as_ref().unwrap();
+            let dialog_w = 400.0f32.min(rt_w - 40.0);
+            let dialog_h = (dialog.body.len() as f32 + 3.0) * lh + 20.0;
+            let dx = (rt_w - dialog_w) / 2.0;
+            let dy = (rt_h - dialog_h) / 2.0;
+            let btn_y = dy + dialog_h - lh - 8.0;
+
+            // Hit-test buttons (laid out right-to-left, matching draw_dialog)
+            let mut bx = dx + dialog_w - cw;
+            let btn_count = dialog.buttons.len();
+            let mut clicked_btn: Option<usize> = None;
+            for (i, btn) in dialog.buttons.iter().enumerate().rev() {
+                let btn_w = (btn.label.chars().count() as f32 + 2.0) * cw;
+                bx -= btn_w;
+                if px >= bx && px < bx + btn_w && py >= btn_y && py < btn_y + lh {
+                    clicked_btn = Some(i);
+                    break;
+                }
+                bx -= cw;
+            }
+
+            let on_dialog = px >= dx && px < dx + dialog_w && py >= dy && py < dy + dialog_h;
+
+            if let Some(idx) = clicked_btn {
+                let action = state.engine.dialog_click_button(idx);
+                let quit = handle_action_with_sidebar(state, action);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                if quit {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+            } else if !on_dialog {
+                // Click outside dialog — dismiss
+                state.engine.dialog = None;
+                state.engine.pending_move = None;
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Picker click handling (intercept all clicks when picker is open) ──
+        if state.engine.picker_open {
+            let lh = state.line_height;
+            let (rt_w, rt_h) = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (
+                    (rc.right - rc.left) as f32 / state.dpi_scale,
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale,
+                )
+            };
+            // Match geometry from draw_picker
+            let max_visible = 12usize;
+            let has_preview = state.engine.picker_preview.is_some();
+            let list_w = if has_preview { rt_w * 0.4 } else { rt_w * 0.6 };
+            let total_w = if has_preview { rt_w * 0.8 } else { list_w };
+            let header_h = lh * 2.0; // title + input
+            let body_h = max_visible as f32 * lh;
+            let total_h = header_h + body_h;
+            let popup_x = (rt_w - total_w) / 2.0;
+            let popup_y = rt_h * 0.15;
+
+            let on_popup =
+                px >= popup_x && px < popup_x + total_w && py >= popup_y && py < popup_y + total_h;
+            let results_top = popup_y + header_h;
+            let results_bottom = popup_y + total_h;
+            let on_results =
+                on_popup && py >= results_top && py < results_bottom && px < popup_x + list_w;
+
+            if on_results {
+                let clicked_idx =
+                    state.engine.picker_scroll_top + ((py - results_top) / lh) as usize;
+                if clicked_idx < state.engine.picker_items.len() {
+                    state.engine.picker_selected = clicked_idx;
+                    state.engine.picker_load_preview();
+                }
+            } else if !on_popup {
+                state.engine.close_picker();
+            }
+            // Consume click — don't fall through to editor
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
         // ── Context menu click handling (must be before any other click) ──────
         if state.engine.context_menu.is_some() {
             let handled = {
@@ -2462,9 +2616,35 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 // Hit a tab — switch group and tab
                 state.engine.active_group = slot.group_id;
                 if px >= slot.close_x_start {
-                    // Close button hit
+                    // Close button hit — check for unsaved changes first
                     state.engine.goto_tab(slot.tab_idx);
-                    state.engine.close_tab();
+                    if state.engine.dirty() {
+                        use crate::core::engine::DialogButton;
+                        state.engine.show_dialog(
+                            "close_tab_confirm",
+                            "Unsaved Changes",
+                            vec!["This file has unsaved changes.".to_string()],
+                            vec![
+                                DialogButton {
+                                    label: "Save & Close".into(),
+                                    hotkey: 's',
+                                    action: "save_close".into(),
+                                },
+                                DialogButton {
+                                    label: "Discard".into(),
+                                    hotkey: 'd',
+                                    action: "discard".into(),
+                                },
+                                DialogButton {
+                                    label: "Cancel".into(),
+                                    hotkey: '\0',
+                                    action: "cancel".into(),
+                                },
+                            ],
+                        );
+                    } else {
+                        state.engine.close_tab();
+                    }
                 } else {
                     state.engine.goto_tab(slot.tab_idx);
                     // Record for potential tab drag (threshold checked on mouse move)
@@ -2633,6 +2813,10 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Editor area click ────────────────────────────────────────────
         state.sidebar.has_focus = false;
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            // Clear VSCode selection on click (matching GTK behavior)
+            if state.engine.is_vscode_mode() {
+                state.engine.vscode_clear_selection();
+            }
             if is_double {
                 state.engine.mouse_double_click(wid, line, col);
             } else {
@@ -3155,6 +3339,32 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Picker scroll — intercept scroll when picker is open
+        if state.engine.picker_open {
+            let max = state.engine.picker_items.len().saturating_sub(1);
+            if lines > 0 {
+                state.engine.picker_selected =
+                    (state.engine.picker_selected + lines as usize).min(max);
+            } else {
+                state.engine.picker_selected = state
+                    .engine
+                    .picker_selected
+                    .saturating_sub((-lines) as usize);
+            }
+            state.engine.picker_load_preview();
+            // Update scroll to keep selected item visible (12 visible items)
+            let visible = 12;
+            if state.engine.picker_selected < state.engine.picker_scroll_top {
+                state.engine.picker_scroll_top = state.engine.picker_selected;
+            } else if state.engine.picker_selected >= state.engine.picker_scroll_top + visible {
+                state.engine.picker_scroll_top = state.engine.picker_selected + 1 - visible;
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
         // Editor hover popup scroll
         if let Some(ref rect) = state.popup_rects.editor_hover {
             if rect.contains(px, py) {
@@ -3180,15 +3390,12 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                     state.sidebar.scroll_top.saturating_sub((-lines) as usize);
             }
         } else {
-            // Editor scroll
-            let scroll_top = state.engine.view().scroll_top;
-            let new_top = if lines > 0 {
-                scroll_top.saturating_add(lines as usize)
+            // Editor scroll — use fold-aware scrolling
+            if lines > 0 {
+                state.engine.scroll_down_visible(lines as usize);
             } else {
-                scroll_top.saturating_sub((-lines) as usize)
-            };
-            let max = state.engine.buffer().len_lines().saturating_sub(1);
-            state.engine.view_mut().scroll_top = new_top.min(max);
+                state.engine.scroll_up_visible((-lines) as usize);
+            }
         }
 
         unsafe {
@@ -3496,7 +3703,32 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::OpenWorkspaceDialog
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false,
-        EngineAction::QuitWithUnsaved => false,
+        EngineAction::QuitWithUnsaved => {
+            use crate::core::engine::DialogButton;
+            engine.show_dialog(
+                "quit_unsaved",
+                "Unsaved Changes",
+                vec!["You have unsaved changes. Do you want to save before quitting?".to_string()],
+                vec![
+                    DialogButton {
+                        label: "Save All & Quit".into(),
+                        hotkey: 's',
+                        action: "save_quit".into(),
+                    },
+                    DialogButton {
+                        label: "Quit Without Saving".into(),
+                        hotkey: 'd',
+                        action: "discard_quit".into(),
+                    },
+                    DialogButton {
+                        label: "Cancel".into(),
+                        hotkey: '\0',
+                        action: "cancel".into(),
+                    },
+                ],
+            );
+            false
+        }
         EngineAction::ToggleSidebar => {
             // Handled at the caller side (needs AppState access)
             false

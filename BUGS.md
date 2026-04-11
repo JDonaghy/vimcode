@@ -6,15 +6,15 @@
 ### Win-GUI gaps (vs GTK reference) — found by systematic GTK↔Win-GUI comparison
 
 **Critical (data loss / broken core features):**
-- **Win-GUI: tab close skips dirty check** — `on_click` calls `engine.close_tab()` unconditionally without checking `engine.dirty()`. GTK shows a confirmation dialog (`ShowCloseTabConfirm`) when the buffer has unsaved changes. Win-GUI silently discards unsaved work.
-- **Win-GUI: picker (fuzzy finder) not mouse-interactive** — When `engine.picker_open` is true, GTK intercepts all clicks (click result to select, click outside to dismiss, scroll to navigate). Win-GUI has no picker-open check in `on_click` — clicks pass through to the editor behind the picker. Picker is keyboard-only.
-- **Win-GUI: dialog buttons not clickable** — Dialogs (delete confirmation, quit-unsaved, swap recovery) render correctly but have no click handling. GTK tests button rects and dispatches confirm/cancel. Win-GUI draws the dialog but mouse clicks have no effect — dialogs are keyboard-only.
-- **Win-GUI: QuitWithUnsaved action silently ignored** — When the user tries to quit with unsaved changes, the engine returns `EngineAction::QuitWithUnsaved`. GTK shows a confirmation dialog. Win-GUI's `handle_engine_action` returns `false` (no-op), silently ignoring the action. User cannot confirm or cancel quit via this path.
+- ~~**Win-GUI: tab close skips dirty check**~~ — Fixed: checks `engine.dirty()` before closing; shows engine dialog with Save/Discard/Cancel.
+- ~~**Win-GUI: picker (fuzzy finder) not mouse-interactive**~~ — Fixed: click result to select, click outside to dismiss; scroll wheel navigates picker items.
+- ~~**Win-GUI: dialog buttons not clickable**~~ — Fixed: button rect hit-testing in `on_mouse_down`, dispatches `dialog_click_button(idx)`, outside-click dismisses.
+- ~~**Win-GUI: QuitWithUnsaved action silently ignored**~~ — Fixed: shows engine dialog with Save All & Quit / Quit Without Saving / Cancel. WM_CLOSE also checks for unsaved changes.
 
 **Medium (incorrect behavior):**
-- **Win-GUI: scroll doesn't skip folded lines** — `on_mouse_wheel` directly modifies `view_mut().scroll_top` with raw arithmetic. GTK calls `engine.scroll_down_visible(count)` / `engine.scroll_up_visible(count)` which skip folded regions. Win-GUI can land the viewport inside a folded region. Additionally, GTK adjusts the cursor to stay within the viewport after scrolling; Win-GUI does not.
-- **Win-GUI: picker scroll not intercepted** — Mouse wheel while the picker/command palette is open scrolls the editor behind it instead of scrolling picker results. GTK checks `picker_open` before editor scroll in its scroll handler.
-- **Win-GUI: VSCode selection not cleared on click** — GTK calls `engine.vscode_clear_selection()` before `handle_mouse_click` when in VSCode edit mode. Win-GUI does not, leaving stale selections after clicking.
+- ~~**Win-GUI: scroll doesn't skip folded lines**~~ — Fixed: uses `scroll_down_visible()`/`scroll_up_visible()` instead of raw arithmetic.
+- ~~**Win-GUI: picker scroll not intercepted**~~ — Fixed: scroll wheel checks `picker_open` first and navigates picker results.
+- ~~**Win-GUI: VSCode selection not cleared on click**~~ — Fixed: calls `vscode_clear_selection()` before `mouse_click` when in VSCode mode.
 - **Win-GUI: cursor not kept in viewport after scroll** — GTK adjusts cursor position after scroll to keep it on-screen. Win-GUI scrolls the viewport without repositioning the cursor, which can leave it above or below the visible area.
 - **Win-GUI: terminal tab switching by mouse missing** — Terminal toolbar has add/split/close buttons but no individual terminal tab click handling. GTK detects clicks on numbered tab labels and switches `terminal_active`. Win-GUI only handles the 3 right-aligned buttons.
 
