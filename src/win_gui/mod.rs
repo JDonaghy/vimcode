@@ -2703,9 +2703,31 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     state.engine.terminal_new_tab(cols, rows);
                     state.engine.terminal_has_focus = true;
                 } else {
-                    // Click on toolbar area (not a button) — start resize drag
-                    state.terminal_resize_drag = true;
-                    state.engine.terminal_has_focus = true;
+                    // Check terminal tab labels (left-aligned)
+                    let nf = crate::icons::nerd_fonts_enabled();
+                    let mut tx = editor_left + cw;
+                    let mut clicked_tab = None;
+                    for i in 0..state.engine.terminal_panes.len() {
+                        let label = if i == state.engine.terminal_active {
+                            format!(" {} Terminal {} ", if nf { "\u{f120}" } else { "$" }, i + 1)
+                        } else {
+                            format!(" {} ", i + 1)
+                        };
+                        let tab_w = label.chars().count() as f32 * cw;
+                        if px >= tx && px < tx + tab_w {
+                            clicked_tab = Some(i);
+                            break;
+                        }
+                        tx += tab_w;
+                    }
+                    if let Some(tab_idx) = clicked_tab {
+                        state.engine.terminal_active = tab_idx;
+                        state.engine.terminal_has_focus = true;
+                    } else {
+                        // Click on toolbar area (not a tab or button) — start resize drag
+                        state.terminal_resize_drag = true;
+                        state.engine.terminal_has_focus = true;
+                    }
                 }
                 unsafe {
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -3391,11 +3413,26 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         } else {
             // Editor scroll — use fold-aware scrolling
+            let max_line = state.engine.buffer().len_lines().saturating_sub(1);
             if lines > 0 {
                 state.engine.scroll_down_visible(lines as usize);
             } else {
                 state.engine.scroll_up_visible((-lines) as usize);
             }
+            // Keep cursor within the viewport (matching GTK behavior)
+            let scrolloff = state.engine.settings.scrolloff;
+            let vp = state.engine.view().viewport_lines.max(1);
+            let cur = state.engine.view().cursor.line;
+            let new_top = state.engine.view().scroll_top;
+            if cur < new_top + scrolloff {
+                state.engine.view_mut().cursor.line = (new_top + scrolloff).min(max_line);
+                state.engine.clamp_cursor_col();
+            } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+                state.engine.view_mut().cursor.line =
+                    (new_top + vp.saturating_sub(scrolloff + 1)).min(max_line);
+                state.engine.clamp_cursor_col();
+            }
+            state.engine.sync_scroll_binds();
         }
 
         unsafe {

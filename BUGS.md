@@ -15,8 +15,8 @@
 - ~~**Win-GUI: scroll doesn't skip folded lines**~~ — Fixed: uses `scroll_down_visible()`/`scroll_up_visible()` instead of raw arithmetic.
 - ~~**Win-GUI: picker scroll not intercepted**~~ — Fixed: scroll wheel checks `picker_open` first and navigates picker results.
 - ~~**Win-GUI: VSCode selection not cleared on click**~~ — Fixed: calls `vscode_clear_selection()` before `mouse_click` when in VSCode mode.
-- **Win-GUI: cursor not kept in viewport after scroll** — GTK adjusts cursor position after scroll to keep it on-screen. Win-GUI scrolls the viewport without repositioning the cursor, which can leave it above or below the visible area.
-- **Win-GUI: terminal tab switching by mouse missing** — Terminal toolbar has add/split/close buttons but no individual terminal tab click handling. GTK detects clicks on numbered tab labels and switches `terminal_active`. Win-GUI only handles the 3 right-aligned buttons.
+- ~~**Win-GUI: cursor not kept in viewport after scroll**~~ — Fixed: cursor now clamped into viewport (with scrolloff) after scroll, matching GTK. Also calls `sync_scroll_binds()`.
+- ~~**Win-GUI: terminal tab switching by mouse missing**~~ — Fixed: click on numbered tab labels in terminal toolbar switches `terminal_active`. Matches tab label geometry from draw code.
 
 **Low (missing features):**
 - **Win-GUI: breadcrumb clicks not handled** — Breadcrumbs render but are not clickable. GTK handles single-click (opens scoped picker for directory/symbol segment) and double-click. Win-GUI clicks on the breadcrumb row fall through to the editor.
