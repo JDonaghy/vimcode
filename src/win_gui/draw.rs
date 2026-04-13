@@ -2414,102 +2414,519 @@ impl<'a> DrawContext<'a> {
         screen: &ScreenLayout,
         panel_x: f32,
         panel_w: f32,
-        _rt_h: f32,
+        panel_h: f32,
         top: f32,
     ) {
         let lh = self.line_height;
         let cw = self.char_width;
+        let bg = self.theme.tab_bar_bg;
+        let fg = self.theme.foreground;
+        let dim = self.theme.line_number_fg;
+        let sel_bg = self.theme.fuzzy_selected_bg;
+        let hdr_bg = self.theme.status_bg;
+        let hdr_fg = self.theme.status_fg;
+        let add_color = self.theme.git_added;
+        let del_color = self.theme.git_deleted;
+        let mod_color = self.theme.git_modified;
 
-        // Header
-        self.draw_text("SOURCE CONTROL", panel_x + cw, top, self.theme.foreground);
+        // Background fill
+        let bg_brush = self.solid_brush(bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(panel_x, top, panel_w, panel_h), &bg_brush);
+        }
 
         let Some(ref sc) = screen.source_control else {
-            self.draw_text(
-                "No git repository",
-                panel_x + cw,
-                top + lh,
-                self.theme.line_number_fg,
-            );
+            // Header
+            let hdr_brush = self.solid_brush(hdr_bg);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(panel_x, top, panel_w, lh), &hdr_brush);
+            }
+            self.draw_text("  SOURCE CONTROL", panel_x, top, hdr_fg);
+            self.draw_text("No git repository", panel_x + cw, top + lh, dim);
             return;
         };
 
-        // Branch info
-        let branch_text = format!("\u{2442} {} ", sc.branch);
-        let ahead_behind = if sc.ahead > 0 || sc.behind > 0 {
-            format!("\u{2191}{} \u{2193}{}", sc.ahead, sc.behind)
-        } else {
-            String::new()
-        };
-        self.draw_text(&branch_text, panel_x + cw, top + lh, self.theme.foreground);
-        self.draw_text(
-            &ahead_behind,
-            panel_x + cw + branch_text.chars().count() as f32 * cw,
-            top + lh,
-            self.theme.line_number_fg,
-        );
+        let mut ry: f32 = 0.0;
 
-        let mut y = top + lh * 2.5;
-
-        // Staged section
-        if sc.sections_expanded[0] {
-            let header = format!("\u{25BC} Staged ({})", sc.staged.len());
-            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
-            y += lh;
-            for item in &sc.staged {
-                let color = match item.status_char {
-                    'A' => self.theme.git_added,
-                    'M' => self.theme.git_modified,
-                    'D' => self.theme.git_deleted,
-                    _ => self.theme.foreground,
-                };
-                let line = format!("{} {}", item.status_char, item.path);
-                self.draw_text(&line, panel_x + cw * 2.5, y, color);
-                y += lh;
+        // ── Row 0: Header "SOURCE CONTROL" with branch + ahead/behind ───
+        {
+            let hdr_brush = self.solid_brush(hdr_bg);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(panel_x, top + ry, panel_w, lh), &hdr_brush);
             }
-        } else {
-            let header = format!("\u{25B6} Staged ({})", sc.staged.len());
-            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
-            y += lh;
+            let branch_info = if sc.ahead > 0 || sc.behind > 0 {
+                format!(
+                    "  SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
+                    sc.branch, sc.ahead, sc.behind
+                )
+            } else {
+                format!("  SOURCE CONTROL  {}", sc.branch)
+            };
+            self.draw_text(&branch_info, panel_x, top + ry, hdr_fg);
+            ry += lh;
+        }
+        if ry >= panel_h {
+            return;
         }
 
-        y += lh * 0.3;
-
-        // Unstaged section
-        if sc.sections_expanded[1] {
-            let header = format!("\u{25BC} Changes ({})", sc.unstaged.len());
-            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
-            y += lh;
-            for item in &sc.unstaged {
-                let color = match item.status_char {
-                    'M' => self.theme.git_modified,
-                    'D' => self.theme.git_deleted,
-                    '?' => self.theme.line_number_fg,
-                    _ => self.theme.foreground,
-                };
-                let line = format!("{} {}", item.status_char, item.path);
-                self.draw_text(&line, panel_x + cw * 2.5, y, color);
-                y += lh;
+        // ── Hint bar at bottom (when focused) ──────────────────────────
+        let hint_h = if sc.has_focus { lh } else { 0.0 };
+        if sc.has_focus {
+            let hint_y = top + panel_h - lh;
+            let hdr_brush = self.solid_brush(hdr_bg);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(panel_x, hint_y, panel_w, lh), &hdr_brush);
             }
-        } else {
-            let header = format!("\u{25B6} Changes ({})", sc.unstaged.len());
-            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
-            y += lh;
+            self.draw_text(" Press '?' for help", panel_x, hint_y, dim);
         }
+        let content_bottom = panel_h - hint_h;
 
-        // Log section (if expanded)
-        if sc.sections_expanded.len() > 3 && sc.sections_expanded[3] && !sc.log.is_empty() {
-            y += lh * 0.3;
-            let header = format!("\u{25BC} Log ({})", sc.log.len());
-            self.draw_text(&header, panel_x + cw, y, self.theme.foreground);
-            y += lh;
-            for entry in sc.log.iter().take(20) {
-                let line = format!(
-                    "{} {}",
-                    &entry.hash[..7.min(entry.hash.len())],
-                    entry.message
+        // ── Commit input row(s) ─────────────────────────────────────────
+        let commit_lines: Vec<&str> = sc.commit_message.split('\n').collect();
+        let commit_rows = commit_lines.len().max(1);
+        {
+            let inp_bg = if sc.commit_input_active { sel_bg } else { bg };
+            let prompt_fg = if sc.commit_input_active { fg } else { dim };
+            let inp_brush = self.solid_brush(inp_bg);
+            let commit_h = commit_rows as f32 * lh;
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(panel_x, top + ry, panel_w, commit_h), &inp_brush);
+            }
+
+            // Cursor position for active input
+            let (cursor_line, cursor_col) = if sc.commit_input_active {
+                let before = &sc.commit_message[..sc.commit_cursor.min(sc.commit_message.len())];
+                let cl = before.matches('\n').count();
+                let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                (cl, before[line_start..].chars().count())
+            } else {
+                (0, 0)
+            };
+
+            let prefix = " \u{270E}  "; // ✎ pencil
+            let pad = "    ";
+
+            if sc.commit_message.is_empty() && !sc.commit_input_active {
+                self.draw_text(
+                    &format!("{}Message (press c)", prefix),
+                    panel_x,
+                    top + ry,
+                    prompt_fg,
                 );
-                self.draw_text(&line, panel_x + cw * 2.5, y, self.theme.line_number_fg);
-                y += lh;
+            } else {
+                for (line_idx, line) in commit_lines.iter().enumerate() {
+                    let line_y = top + ry + line_idx as f32 * lh;
+                    if line_y >= top + content_bottom {
+                        break;
+                    }
+                    let pfx = if line_idx == 0 { prefix } else { pad };
+                    let text = format!("{}{}", pfx, line);
+                    self.draw_text(&text, panel_x, line_y, prompt_fg);
+
+                    // Draw cursor
+                    if sc.commit_input_active && line_idx == cursor_line {
+                        let pfx_len = pfx.chars().count();
+                        let cursor_x = panel_x + (pfx_len + cursor_col) as f32 * cw;
+                        let cursor_brush = self.solid_brush(fg);
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(cursor_x, line_y, 1.5, lh), &cursor_brush);
+                        }
+                    }
+                }
+            }
+            ry += commit_h;
+        }
+        if ry >= content_bottom {
+            return;
+        }
+
+        // ── Button row (Commit / Push / Pull / Sync) ────────────────────
+        {
+            // Padding above
+            ry += lh * 0.3;
+            let btn_y = top + ry;
+            let btn_bg_color = hdr_bg;
+            let hover_bg = Color {
+                r: (hdr_bg.r as u16 + 20).min(255) as u8,
+                g: (hdr_bg.g as u16 + 20).min(255) as u8,
+                b: (hdr_bg.b as u16 + 20).min(255) as u8,
+            };
+
+            let commit_w = (panel_w * 0.5).max(cw);
+            let remain = panel_w - commit_w;
+            let icon_w = (remain / 3.0).max(cw);
+
+            let buttons: [(f32, f32, &str, usize); 4] = [
+                (0.0, commit_w, " \u{2713} Commit", 0),
+                (commit_w, icon_w, " \u{2191}", 1), // Push ↑
+                (commit_w + icon_w, icon_w, " \u{2193}", 2), // Pull ↓
+                (
+                    commit_w + icon_w * 2.0,
+                    panel_w - commit_w - icon_w * 2.0,
+                    " \u{21BB}", // Sync ↻
+                    3,
+                ),
+            ];
+            for (x_off, seg_w, text, btn_idx) in &buttons {
+                let bx = panel_x + x_off;
+                let is_focused = sc.button_focused == Some(*btn_idx);
+                let is_hovered = sc.button_hovered == Some(*btn_idx);
+                let (b_fg, b_bg) = if is_focused {
+                    (btn_bg_color, hdr_fg) // inverted
+                } else if is_hovered {
+                    (hdr_fg, hover_bg)
+                } else {
+                    (hdr_fg, btn_bg_color)
+                };
+                let btn_brush = self.solid_brush(b_bg);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(bx, btn_y, *seg_w, lh), &btn_brush);
+                }
+                self.draw_text(text, bx, btn_y, b_fg);
+            }
+            ry += lh;
+            // Padding below
+            ry += lh * 0.3;
+        }
+        if ry >= content_bottom {
+            return;
+        }
+
+        // ── Sections ────────────────────────────────────────────────────
+        let show_worktrees = sc.worktrees.len() > 1;
+        #[allow(clippy::type_complexity)]
+        let sections: [(
+            &str,
+            &[crate::render::ScFileItem],
+            Option<&[crate::render::ScWorktreeItem]>,
+            usize,
+        ); 4] = [
+            ("STAGED CHANGES", &sc.staged, None, 0),
+            ("CHANGES", &sc.unstaged, None, 1),
+            ("WORKTREES", &[], Some(&sc.worktrees), 2),
+            ("RECENT COMMITS", &[], None, 3),
+        ];
+
+        let mut flat_row: usize = 0;
+
+        for (section_label, file_items, wt_items, sec_idx) in &sections {
+            if *sec_idx == 2 && !show_worktrees {
+                continue;
+            }
+            if top + ry >= top + content_bottom {
+                break;
+            }
+
+            let is_expanded = sc.sections_expanded[*sec_idx];
+            let expand_icon = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
+
+            // Section header row
+            let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
+            let hdr_row_bg = if is_hdr_selected { sel_bg } else { hdr_bg };
+            let hdr_brush = self.solid_brush(hdr_row_bg);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(panel_x, top + ry, panel_w, lh), &hdr_brush);
+            }
+
+            // Item count badge
+            let count = if *sec_idx == 2 {
+                wt_items.map(|v| v.len()).unwrap_or(0)
+            } else if *sec_idx == 3 {
+                sc.log.len()
+            } else {
+                file_items.len()
+            };
+            let badge = if count > 0 {
+                format!(" ({})", count)
+            } else {
+                String::new()
+            };
+            let hdr_text = format!(" {} {}{}", expand_icon, section_label, badge);
+            self.draw_text(&hdr_text, panel_x, top + ry, hdr_fg);
+            ry += lh;
+            flat_row += 1;
+
+            if !is_expanded {
+                continue;
+            }
+
+            // Section items
+            if *sec_idx == 3 {
+                // Log entries
+                if sc.log.is_empty() {
+                    if top + ry < top + content_bottom {
+                        self.draw_text("  (no commits)", panel_x, top + ry, dim);
+                        ry += lh;
+                    }
+                } else {
+                    for entry in &sc.log {
+                        if top + ry >= top + content_bottom {
+                            break;
+                        }
+                        let is_selected = sc.has_focus && sc.selected == flat_row;
+                        if is_selected {
+                            let sel_brush = self.solid_brush(sel_bg);
+                            unsafe {
+                                self.rt.FillRectangle(
+                                    &rect_f(panel_x, top + ry, panel_w, lh),
+                                    &sel_brush,
+                                );
+                            }
+                        }
+                        let hash_short = &entry.hash[..7.min(entry.hash.len())];
+                        self.draw_text(&format!("  {} ", hash_short), panel_x, top + ry, dim);
+                        let hash_w = self.mono_text_width(&format!("  {} ", hash_short));
+                        let msg_color = if is_selected { fg } else { dim };
+                        self.draw_text(&entry.message, panel_x + hash_w, top + ry, msg_color);
+                        ry += lh;
+                        flat_row += 1;
+                    }
+                }
+            } else if *sec_idx == 2 {
+                // Worktrees
+                if let Some(wts) = wt_items {
+                    for wt in *wts {
+                        if top + ry >= top + content_bottom {
+                            break;
+                        }
+                        let is_selected = sc.has_focus && sc.selected == flat_row;
+                        if is_selected {
+                            let sel_brush = self.solid_brush(sel_bg);
+                            unsafe {
+                                self.rt.FillRectangle(
+                                    &rect_f(panel_x, top + ry, panel_w, lh),
+                                    &sel_brush,
+                                );
+                            }
+                        }
+                        let check = if wt.is_current { "\u{2713}" } else { " " };
+                        let main_marker = if wt.is_main { " [main]" } else { "" };
+                        let text = format!("  {} {} {}{}", check, wt.branch, wt.path, main_marker);
+                        let text_color = if is_selected { fg } else { dim };
+                        self.draw_text(&text, panel_x, top + ry, text_color);
+                        ry += lh;
+                        flat_row += 1;
+                    }
+                }
+            } else {
+                // File items (staged / unstaged)
+                if file_items.is_empty() {
+                    if top + ry < top + content_bottom {
+                        self.draw_text("  (no changes)", panel_x, top + ry, dim);
+                        ry += lh;
+                    }
+                } else {
+                    for fi in *file_items {
+                        if top + ry >= top + content_bottom {
+                            break;
+                        }
+                        let is_selected = sc.has_focus && sc.selected == flat_row;
+                        if is_selected {
+                            let sel_brush = self.solid_brush(sel_bg);
+                            unsafe {
+                                self.rt.FillRectangle(
+                                    &rect_f(panel_x, top + ry, panel_w, lh),
+                                    &sel_brush,
+                                );
+                            }
+                        }
+                        let status_color = match fi.status_char {
+                            'A' => add_color,
+                            'D' => del_color,
+                            _ => mod_color,
+                        };
+                        // Status char colored
+                        let status_text = format!("  {} ", fi.status_char);
+                        self.draw_text(&status_text, panel_x, top + ry, status_color);
+                        // Path
+                        let path_x = panel_x + self.mono_text_width(&status_text);
+                        let path_color = if is_selected { fg } else { dim };
+                        // Truncate path to fit panel
+                        let max_path_chars =
+                            ((panel_w - self.mono_text_width(&status_text) - 4.0) / cw) as usize;
+                        if fi.path.chars().count() > max_path_chars && max_path_chars > 1 {
+                            let truncated: String = fi
+                                .path
+                                .chars()
+                                .take(max_path_chars.saturating_sub(1))
+                                .chain(std::iter::once('\u{2026}'))
+                                .collect();
+                            self.draw_text(&truncated, path_x, top + ry, path_color);
+                        } else {
+                            self.draw_text(&fi.path, path_x, top + ry, path_color);
+                        }
+                        ry += lh;
+                        flat_row += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Scrollbar ───────────────────────────────────────────────────
+        // Total content rows = flat_row count + commit rows + button row + gaps
+        let total_content_h = ry;
+        let visible_h = content_bottom - lh; // minus header
+        if total_content_h > visible_h && visible_h > 0.0 {
+            let track_h = content_bottom - lh;
+            let thumb_h = (track_h * visible_h / total_content_h).max(8.0);
+            // No scroll offset for now (sections are rendered top-to-bottom)
+            let sb_x = panel_x + panel_w - 5.0;
+            let dim_brush = self.solid_brush(dim);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(sb_x, top + lh, 4.0, thumb_h), &dim_brush);
+            }
+        }
+
+        // ── Branch picker popup ─────────────────────────────────────────
+        if let Some(ref bp) = sc.branch_picker {
+            let popup_w = panel_w.min(300.0);
+            let popup_h = if bp.create_mode {
+                lh * 3.0
+            } else {
+                (panel_h * 0.6).min(lh * 15.0)
+            };
+            let popup_x = panel_x + (panel_w - popup_w) / 2.0;
+            let popup_y = top + lh * 2.0;
+
+            let popup_bg_color = self.theme.completion_bg;
+            let popup_fg_color = self.theme.completion_fg;
+            let popup_border_color = self.theme.completion_border;
+            let popup_sel_color = self.theme.completion_selected_bg;
+
+            // Background + border
+            let pbg = self.solid_brush(popup_bg_color);
+            let pborder = self.solid_brush(popup_border_color);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(popup_x, popup_y, popup_w, popup_h), &pbg);
+                self.rt.DrawRectangle(
+                    &rect_f(popup_x, popup_y, popup_w, popup_h),
+                    &pborder,
+                    1.0,
+                    None,
+                );
+            }
+
+            // Title
+            let title = if bp.create_mode {
+                "New Branch"
+            } else {
+                "Switch Branch"
+            };
+            self.draw_text(title, popup_x + 8.0, popup_y, popup_fg_color);
+
+            if bp.create_mode {
+                // Name input
+                let iy = popup_y + lh;
+                self.draw_text("Name: ", popup_x + 8.0, iy, dim);
+                let input_x = popup_x + 8.0 + self.mono_text_width("Name: ");
+                self.draw_text(&bp.create_input, input_x, iy, popup_fg_color);
+                let cursor_x = input_x + self.mono_text_width(&bp.create_input);
+                let cursor_brush = self.solid_brush(popup_fg_color);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(cursor_x, iy, 1.5, lh), &cursor_brush);
+                }
+            } else {
+                // Search input
+                let iy = popup_y + lh;
+                self.draw_text(" \u{1F50D} ", popup_x, iy, dim);
+                let qx = popup_x + self.mono_text_width(" \u{1F50D} ");
+                self.draw_text(&bp.query, qx, iy, popup_fg_color);
+
+                // Branch list
+                let list_y = popup_y + lh * 2.0;
+                let list_h = ((popup_h - lh * 3.0) / lh) as usize;
+                let scroll_off = if bp.selected >= list_h {
+                    bp.selected - list_h + 1
+                } else {
+                    0
+                };
+                for (vi, (name, is_current)) in
+                    bp.results.iter().skip(scroll_off).take(list_h).enumerate()
+                {
+                    let ey = list_y + vi as f32 * lh;
+                    let is_sel = vi + scroll_off == bp.selected;
+                    if is_sel {
+                        let sel_brush = self.solid_brush(popup_sel_color);
+                        unsafe {
+                            self.rt.FillRectangle(
+                                &rect_f(popup_x + 1.0, ey, popup_w - 2.0, lh),
+                                &sel_brush,
+                            );
+                        }
+                    }
+                    let marker = if *is_current { "\u{25CF} " } else { "  " };
+                    let display = format!("{}{}", marker, name);
+                    self.draw_text(&display, popup_x + 8.0, ey, popup_fg_color);
+                }
+            }
+        }
+
+        // ── Help dialog ─────────────────────────────────────────────────
+        if sc.help_open {
+            let bindings: &[(&str, &str)] = &[
+                ("j/k", "Navigate"),
+                ("s", "Stage / unstage"),
+                ("S", "Stage all"),
+                ("d", "Discard file"),
+                ("D", "Discard all unstaged"),
+                ("c", "Commit message"),
+                ("b", "Switch branch"),
+                ("B", "Create branch"),
+                ("p", "Push"),
+                ("P", "Pull"),
+                ("f", "Fetch"),
+                ("r", "Refresh"),
+                ("Tab", "Expand / collapse"),
+                ("Enter", "Open file"),
+                ("q/Esc", "Close panel"),
+            ];
+
+            let popup_w = panel_w.min(280.0);
+            let popup_h = lh * (bindings.len() as f32 + 2.0);
+            let popup_x = panel_x + (panel_w - popup_w) / 2.0;
+            let popup_y = top + (panel_h - popup_h) / 2.0;
+
+            let popup_bg_color = self.theme.completion_bg;
+            let popup_fg_color = self.theme.completion_fg;
+            let popup_border_color = self.theme.completion_border;
+
+            let pbg = self.solid_brush(popup_bg_color);
+            let pborder = self.solid_brush(popup_border_color);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(popup_x, popup_y, popup_w, popup_h), &pbg);
+                self.rt.DrawRectangle(
+                    &rect_f(popup_x, popup_y, popup_w, popup_h),
+                    &pborder,
+                    1.0,
+                    None,
+                );
+            }
+
+            // Title + close hint
+            self.draw_text("Keybindings", popup_x + 8.0, popup_y, popup_fg_color);
+            self.draw_text("x", popup_x + popup_w - 16.0, popup_y, popup_fg_color);
+
+            // Bindings
+            let key_color = self.theme.function;
+            for (i, (key, desc)) in bindings.iter().enumerate() {
+                let bind_y = popup_y + lh * (i as f32 + 1.0);
+                if bind_y >= popup_y + popup_h - lh {
+                    break;
+                }
+                self.draw_text(key, popup_x + 12.0, bind_y, key_color);
+                self.draw_text(desc, popup_x + 100.0, bind_y, popup_fg_color);
             }
         }
     }

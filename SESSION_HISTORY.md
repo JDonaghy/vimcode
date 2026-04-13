@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 270 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 271 archived here. Recent work summary in PROJECT_STATE.md.
+
+## Session 271 — Win-GUI extension panels + Nerd Font auto-detect + breadcrumb/tooltip fixes
+Win-GUI extension panel support: full `draw_ext_panel()` renderer (header, search input, flat rows with sections/items/badges/actions, scrollbar, help popup), activity bar ext panel icons (Segoe MDL2 mappings), click/keyboard/scroll handlers, `ext_panel_focus_pending` polling.
+Rendering fixes: breadcrumb UNC prefix (`?C:`), tab tooltip UNC prefix, empty breadcrumb covering tab bar, diff toolbar tab overlap.
+Nerd Font auto-detect: `detect_nerd_font_windows()`, default `use_nerd_fonts=false` on Windows, TUI activity bar `icons::` fallback-aware calls, startup warning message.
 
 ## Session 270 — Win-GUI bug blitz (9 fixes — panel routing, resize, subprocess, nav)
 1. `hidden_command()` helper — CREATE_NO_WINDOW for curl calls (6 sites in registry.rs + ai.rs)

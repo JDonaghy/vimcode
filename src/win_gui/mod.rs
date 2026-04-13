@@ -1126,6 +1126,18 @@ fn on_paint(hwnd: HWND) {
             let _ = rt.EndDraw(None, None);
         }
 
+        // Report tab bar widths to engine so ensure_active_tab_visible() works.
+        // Convert pixel width to approximate character columns (matching
+        // tab_display_width's character-based calculation in the engine).
+        if let Some(ref split) = screen.editor_group_split {
+            let cw = state.char_width.max(1.0);
+            for gtb in &split.group_tab_bars {
+                let width_cols = (gtb.bounds.width as f32 / cw).floor() as usize;
+                state.engine.set_tab_visible_count(gtb.group_id, width_cols);
+            }
+            state.engine.ensure_all_groups_tabs_visible();
+        }
+
         // Cache popup rects for mouse hit-testing
         cache_popup_rects(state, &screen);
 
@@ -3384,15 +3396,69 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     }
                 }
             } else if state.sidebar.active_panel == SidebarPanel::Git {
-                // Git panel: row 0 = header, row 1 = branch, row 2+ = content
-                // Route through engine's sc_ methods
-                if row >= 2 {
-                    // Map visual row to flat index for the source control panel
-                    let adjusted = row; // visual row in the panel
+                // Git panel layout (pixel-based, must match draw_git_panel):
+                //   row 0 (0..lh): header
+                //   row 1..1+commit_rows: commit input
+                //   0.3*lh gap, button row (1 lh), 0.3*lh gap
+                //   sections start after that
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+
+                let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+                let commit_rows = commit_lines as f32;
+
+                let header_end = lh;
+                let commit_end = header_end + commit_rows * lh;
+                let btn_start = commit_end + lh * 0.3;
+                let btn_end = btn_start + lh;
+                let sections_start = btn_end + lh * 0.3;
+
+                if click_y < header_end {
+                    // Header click — just set focus
+                } else if click_y < commit_end {
+                    // Commit input click — activate input mode
+                    state.engine.sc_commit_input_active = true;
+                } else if click_y >= btn_start && click_y < btn_end {
+                    // Button row click — determine which button
+                    let click_x = px - ab_w;
+                    let panel_w_val = state.sidebar.panel_width;
+                    let commit_w = panel_w_val * 0.5;
+                    let remain = panel_w_val - commit_w;
+                    let icon_w = remain / 3.0;
+                    let btn_idx = if click_x < commit_w {
+                        0 // Commit
+                    } else if click_x < commit_w + icon_w {
+                        1 // Push
+                    } else if click_x < commit_w + icon_w * 2.0 {
+                        2 // Pull
+                    } else {
+                        3 // Sync
+                    };
+                    match btn_idx {
+                        0 => {
+                            state.engine.handle_sc_key("C", false, None);
+                        }
+                        1 => {
+                            state.engine.handle_sc_key("P", false, None);
+                        }
+                        2 => {
+                            state.engine.handle_sc_key("p", false, None);
+                        }
+                        3 => {
+                            state.engine.handle_sc_key("f", false, None);
+                        }
+                        _ => {}
+                    }
+                } else if click_y >= sections_start {
+                    // Sections area — map to visual row for sc_visual_row_to_flat
+                    // sc_visual_row_to_flat expects row 3+ for sections
+                    let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                    let visual_row = section_row + 3; // offset: rows 0-2 are header/commit/buttons
                     if let Some((flat_idx, is_header)) =
-                        state.engine.sc_visual_row_to_flat(adjusted, true)
+                        state.engine.sc_visual_row_to_flat(visual_row, true)
                     {
                         if is_header {
+                            state.engine.sc_selected = flat_idx;
                             state.engine.handle_sc_key("Tab", false, None);
                         } else {
                             state.engine.sc_selected = flat_idx;
@@ -4600,6 +4666,89 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Git panel button hover tracking
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+            && px < state.sidebar.total_width()
+        {
+            let ab_w = state.sidebar.activity_bar_px;
+            let menu_y_off = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0
+            };
+            let lh = state.line_height;
+            let click_y = py - menu_y_off;
+            let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+            let commit_end = lh + commit_lines as f32 * lh;
+            let btn_start = commit_end + lh * 0.3;
+            let btn_end = btn_start + lh;
+            let old = state.engine.sc_button_hovered;
+            if click_y >= btn_start && click_y < btn_end && px >= ab_w {
+                let click_x = px - ab_w;
+                let panel_w_val = state.sidebar.panel_width;
+                let commit_w = panel_w_val * 0.5;
+                let remain = panel_w_val - commit_w;
+                let icon_w = remain / 3.0;
+                state.engine.sc_button_hovered = Some(if click_x < commit_w {
+                    0
+                } else if click_x < commit_w + icon_w {
+                    1
+                } else if click_x < commit_w + icon_w * 2.0 {
+                    2
+                } else {
+                    3
+                });
+            } else {
+                state.engine.sc_button_hovered = None;
+                // SC item hover dwell tracking (sections area)
+                let sections_start = btn_end + lh * 0.3;
+                if click_y >= sections_start && px >= ab_w {
+                    let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                    let visual_row = section_row + 3;
+                    if let Some((flat_idx, _is_header)) =
+                        state.engine.sc_visual_row_to_flat(visual_row, true)
+                    {
+                        if state
+                            .engine
+                            .panel_hover_mouse_move("source_control", "", flat_idx)
+                        {
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
+                    } else {
+                        state.engine.dismiss_panel_hover();
+                    }
+                } else {
+                    state.engine.dismiss_panel_hover();
+                }
+            }
+            if state.engine.sc_button_hovered != old {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        } else {
+            if state.engine.sc_button_hovered.is_some() {
+                state.engine.sc_button_hovered = None;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            // Mouse left git panel — dismiss hover unless over popup
+            if state.sidebar.active_panel == SidebarPanel::Git
+                && state.engine.panel_hover.is_some()
+                && state
+                    .popup_rects
+                    .panel_hover
+                    .as_ref()
+                    .is_none_or(|r| !r.contains(px, py))
+            {
+                state.engine.dismiss_panel_hover();
+            }
+        }
+
         // Popup hover tracking: dismiss/cancel-dismiss for editor hover and panel hover
         if let Some(ref rect) = state.popup_rects.editor_hover {
             if rect.contains(px, py) {
@@ -4767,6 +4916,38 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
                 if vis_idx < state.sidebar.rows.len() && !state.sidebar.rows[vis_idx].is_dir {
                     let path = state.sidebar.rows[vis_idx].path.clone();
                     state.engine.open_file_in_tab(&path);
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on git panel file → open diff / file
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let lh = state.line_height;
+            let click_y = py - menu_y;
+            let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+            let commit_end = lh + commit_lines as f32 * lh;
+            let btn_end = commit_end + lh * 0.3 + lh;
+            let sections_start = btn_end + lh * 0.3;
+
+            if click_y >= sections_start {
+                let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                let visual_row = section_row + 3;
+                if let Some((flat_idx, is_header)) =
+                    state.engine.sc_visual_row_to_flat(visual_row, true)
+                {
+                    if !is_header {
+                        state.engine.sc_selected = flat_idx;
+                        state.engine.handle_sc_key("Return", false, None);
+                    }
                 }
             }
             unsafe {

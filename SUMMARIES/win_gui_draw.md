@@ -1,4 +1,4 @@
-# src/win_gui/draw.rs — Win-GUI Rendering (4,104 lines)
+# src/win_gui/draw.rs — Win-GUI Rendering (4,521 lines)
 
 Direct2D rendering of `ScreenLayout`. Consumes platform-agnostic layout and paints via D2D render target + DirectWrite.
 
@@ -14,7 +14,7 @@ Direct2D rendering of `ScreenLayout`. Consumes platform-agnostic layout and pain
 - `draw_sidebar(sidebar, screen, engine)` — activity bar icons (fixed + ext panels), panel background, panel content dispatch
 - `draw_ext_panel(screen, engine)` — extension panel: header, search input, flat rows (sections/items/badges/actions), scrollbar, help popup
 - `draw_explorer_panel()` — file tree with icons, indent, expand/collapse
-- `draw_git_panel()` — source control entries
+- `draw_git_panel()` — full source control panel: header, commit input, button row, 4 collapsible sections, selection highlight, scrollbar, branch picker popup, help dialog
 - `draw_search_panel()` — query/replace inputs, toggle indicators, results
 - `draw_ai_panel()` — conversation messages, input box
 - `draw_settings_panel()` — categories, setting rows, search

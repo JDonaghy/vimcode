@@ -61,6 +61,10 @@
 - ~~**Win-GUI: DAP debugpy check flashes console**~~ — Fixed: 2 `Command::new(&binary)` calls in `dap_manager.rs` now use `hidden_command()`.
 - ~~**Win-GUI: `Event::SoftBreak` renamed to `Event::Break`**~~ — Fixed: stale edit in `markdown.rs` broke all builds. Restored to `Event::SoftBreak`.
 
+**Fixed in Session 272 (git panel rendering + tab scroll):**
+- ~~**Win-GUI: git panel is a rendering stub with no interactivity**~~ — Fixed: full `draw_git_panel()` rewrite with commit input box, button row, 4 collapsible sections, selection highlight, scrollbar, branch picker popup, help dialog. Click handling for all zones (items, buttons, commit input, double-click-to-open-diff). Hover dwell for commit log popups. Button hover tracking.
+- ~~**Win-GUI: new tabs not visible in tab bar (no scroll-into-view)**~~ — Fixed: Win-GUI now reports available tab bar width via `set_tab_visible_count()` after each paint frame and calls `ensure_all_groups_tabs_visible()`. Previously `tab_bar_width` defaulted to `usize::MAX`, making `ensure_active_tab_visible()` a no-op.
+
 **Fixed in Session 271 (ext panels + Nerd Font + breadcrumb):**
 - ~~**Win-GUI: extension panel not appearing after install**~~ — Fixed: full ext panel rendering, activity bar icons, click/keyboard/scroll handlers.
 - ~~**Win-GUI/TUI: breadcrumb path starts with `?C:`**~~ — Fixed: `build_breadcrumbs_for_group()` strips UNC prefix from file path and cwd.
