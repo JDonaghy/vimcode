@@ -34,6 +34,18 @@
 **Medium (deferred):**
 - ~~**Win-GUI: terminal can't regain focus after editor click**~~ — Fixed: terminal content clicks now always set `terminal_has_focus` (was only for split-pane case).
 
+**Medium (new — Win-GUI interaction gaps):**
+- ~~**Win-GUI: extension install flashes many windows**~~ — Fixed: added `hidden_command()` helper in `git.rs`; replaced all 6 `Command::new("curl")` in `registry.rs` and `ai.rs` with `hidden_command("curl")` which sets `CREATE_NO_WINDOW` on Windows.
+- ~~**Win-GUI: extension panel not appearing after install**~~ — Fixed: full `draw_ext_panel()` renderer with sections, tree items, badges, actions, scrollbar, help popup. Activity bar shows dynamic ext panel icons (Nerd Font glyphs mapped to Segoe MDL2 equivalents). Click/keyboard/scroll handlers, `ext_panel_focus_pending` polling. `WinSidebar.ext_panel_name` field (matching TUI pattern) overrides `active_panel` when set.
+- ~~**Win-GUI: activity bar icons non-functional**~~ — Investigated: activity bar clicks were already working (panel switching, focus flags, sc_refresh). The reported issue was likely that the panels themselves didn't respond after switching (see search/AI/git fixes below).
+- ~~**Win-GUI: back/forward navigation arrows non-functional**~~ — Fixed: added hit-test code for ◀/▶ arrows in the title bar click handler, calling `tab_nav_back()`/`tab_nav_forward()`. Also added command center search box click → `open_command_center()`.
+- ~~**Win-GUI: window resize only works from top/top corners**~~ — Fixed: `on_nchittest()` now handles all 8 resize zones (top/bottom/left/right + 4 corners) instead of only the top edge.
+- ~~**Win-GUI: search/replace panel non-functional**~~ — Fixed: added full keyboard routing in `on_key_down()` and `on_char()` — input mode (typing, Tab to toggle search/replace, Enter to execute, Backspace, Ctrl+V paste), results navigation (j/k, Enter to open file), Alt+C/W/R/H toggles for search options. Also set `search_has_focus` on activity bar click.
+- ~~**Win-GUI: git panel entries not clickable or navigable**~~ — Fixed: added full keyboard routing for git panel — navigation mode (j/k/s/S/d/D/c/p/P/f/b/B/?/Tab/Enter/Escape/r), commit input mode (text entry, cursor movement, Ctrl+Enter to commit), branch picker, help dialog. All routed through `engine.handle_sc_key()`.
+- ~~**Win-GUI: AI panel non-functional**~~ — Fixed: added full keyboard routing — navigation mode (j/k/G/g/i/q), input mode (text entry, Enter to submit, cursor movement, Ctrl+V paste). All routed through `engine.handle_ai_panel_key()`.
+- ~~**Win-GUI: settings panel scroll wheel broken**~~ — Fixed: sidebar scroll handler now dispatches by active panel — Settings scrolls `settings_scroll_top`, AI scrolls `ai_scroll_top`, Search scrolls `search_scroll_top`, Explorer scrolls `sidebar.scroll_top`.
+- ~~**Win-GUI: settings panel search non-functional**~~ — Settings search was already handled by the existing `handle_settings_key()` routing (the `/` key enters search mode). The scroll fix above makes it usable by allowing scrolling through results.
+
 **Low (missing features):**
 - ~~**Win-GUI: breadcrumb clicks not handled**~~ — Fixed: clicking breadcrumb segments opens scoped picker (directory→file picker, symbol→@picker).
 - ~~**Win-GUI: group divider drag not implemented**~~ — Fixed: cached dividers from ScreenLayout; full drag-to-resize with cursor change.
@@ -41,6 +53,22 @@
 - ~~**Win-GUI: diff toolbar buttons not clickable**~~ — Fixed: ↑/↓/≡ button click handlers dispatch to `jump_prev_hunk()`/`jump_next_hunk()`/`diff_toggle_hide_unchanged()`.
 - ~~**Win-GUI: diff peek key routing missing**~~ — Already working: keys route through `handle_key()` → `handle_diff_peek_key()`.
 - ~~**Win-GUI: tab tooltip dismiss-on-mouseout missing**~~ — Fixed: mouse hover shows file path, mouseout clears tooltip.
+
+**Systemic fixes found by pattern analysis (Session 270):**
+- ~~**Win-GUI: terminal steals keyboard from all non-terminal UI**~~ — Fixed: added blanket `terminal_has_focus = false` at the start of `on_mouse_down()`, `on_mouse_dblclick()`, and `on_right_click()`. Terminal click handlers re-enable it. Previously only sidebar and editor clicks cleared it; tab bar, menu, breadcrumbs, dialogs, scrollbars, and 12+ other click areas were affected.
+- ~~**Win-GUI: search panel was a draw stub**~~ — Fixed: `draw_search_panel()` now renders query text, replace text, toggle indicators (Aa/Ab|/.*), status line, and search results with file headers and selection highlight. Was previously just a placeholder with "Search (use :grep)".
+- ~~**Win-GUI: terminal panel overlap with status bar**~~ — Fixed: `draw_terminal()` used hardcoded `2.0 * lh` for bottom chrome. Now computes dynamically based on `separated_status_line` and per-window status settings. Also fixed 3 terminal row boundary checks and 2 terminal click handler Y calculations.
+- ~~**Win-GUI: DAP debugpy check flashes console**~~ — Fixed: 2 `Command::new(&binary)` calls in `dap_manager.rs` now use `hidden_command()`.
+- ~~**Win-GUI: `Event::SoftBreak` renamed to `Event::Break`**~~ — Fixed: stale edit in `markdown.rs` broke all builds. Restored to `Event::SoftBreak`.
+
+**Fixed in Session 271 (ext panels + Nerd Font + breadcrumb):**
+- ~~**Win-GUI: extension panel not appearing after install**~~ — Fixed: full ext panel rendering, activity bar icons, click/keyboard/scroll handlers.
+- ~~**Win-GUI/TUI: breadcrumb path starts with `?C:`**~~ — Fixed: `build_breadcrumbs_for_group()` strips UNC prefix from file path and cwd.
+- ~~**TUI: tab tooltip path starts with `~/` on Windows**~~ — Fixed: uses `MAIN_SEPARATOR` (`~\` on Windows, `~/` on Linux).
+- ~~**TUI: tab tooltip shows UNC prefix**~~ — Fixed: `strip_unc_prefix()` applied in `tab_tooltip_at_col()`.
+- ~~**Win-GUI: empty breadcrumb covers tab bar for diff views**~~ — Fixed: `draw_breadcrumb_bar()` returns early when segments are empty.
+- ~~**Win-GUI: diff toolbar overlaps last tab text**~~ — Fixed: `draw_tabs()` respects `max_width`, stops rendering tabs before the diff toolbar area.
+- ~~**TUI: activity bar shows diamond glyphs on Windows**~~ — Fixed: 9 hardcoded Nerd Font codepoints replaced with `icons::ICON.c()` calls. Auto-detection disables nerd fonts when no Nerd Font is installed. Startup message warns user.
 
 **Fixed in Session 269 (interaction parity audit):**
 - ~~**Win-GUI: tab tooltip shows UNC prefix (`\\?\`)**~~ — Fixed: `strip_unc_prefix()` in `paths.rs`, also applied to `copy_relative_path()`.

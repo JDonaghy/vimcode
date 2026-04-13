@@ -719,10 +719,11 @@ pub(super) fn tab_tooltip_at_col(
             let tab_data = group.tabs.get(i)?;
             let window = engine.windows.get(&tab_data.active_window)?;
             let state = engine.buffer_manager.get(window.buffer_id)?;
-            let path = state.file_path.as_ref()?;
+            let raw_path = state.file_path.as_ref()?;
+            let path = crate::core::paths::strip_unc_prefix(raw_path);
             let home = crate::core::paths::home_dir();
             if let Ok(rest) = path.strip_prefix(&home) {
-                return Some(format!("~/{}", rest.display()));
+                return Some(format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()));
             }
             return Some(path.display().to_string());
         }
@@ -1190,7 +1191,14 @@ pub(super) fn render_tab_bar(
         bx += TAB_SPLIT_BTN_COLS;
         // Split-down button (caret-down ▾)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell(buf, bx + 1, area.y, '\u{f0d7}', btn_fg, bar_bg);
+        set_cell(
+            buf,
+            bx + 1,
+            area.y,
+            crate::icons::SPLIT_DOWN.c(),
+            btn_fg,
+            bar_bg,
+        );
         set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
     }
 
@@ -2787,7 +2795,7 @@ pub(super) fn render_window(
                     frame.buffer_mut(),
                     area.x,
                     screen_y,
-                    '\u{f0eb}', // nf-fa-lightbulb_o
+                    crate::icons::LIGHTBULB.c(),
                     rc(theme.lightbulb),
                     line_bg,
                 );

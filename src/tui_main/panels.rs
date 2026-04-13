@@ -30,18 +30,18 @@ pub(super) fn render_activity_bar(
             set_cell(buf, x, y, ' ', fg, row_bg);
         }
         if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, '\u{f035c}', fg, row_bg); // hamburger
+            set_cell(buf, area.x + 1, y, crate::icons::HAMBURGER.c(), fg, row_bg);
         }
     }
 
     // Top buttons: Explorer (1), Search (2), Debug (3), Git (4), Extensions (5), AI (6)
     let top_buttons: &[(u16, TuiPanel, char)] = &[
-        (1, TuiPanel::Explorer, '\u{f07c}'),   // nf-fa-folder_open
-        (2, TuiPanel::Search, '\u{f002}'),     // nf-fa-search
-        (3, TuiPanel::Debug, '\u{f188}'),      // nf-fa-bug
-        (4, TuiPanel::Git, '\u{e702}'),        // nf-dev-git_branch
-        (5, TuiPanel::Extensions, '\u{eae6}'), // nf-cod-extensions
-        (6, TuiPanel::Ai, '\u{f0e5}'),         // nf-fa-comment (AI chat)
+        (1, TuiPanel::Explorer, crate::icons::EXPLORER.c()),
+        (2, TuiPanel::Search, crate::icons::SEARCH.c()),
+        (3, TuiPanel::Debug, crate::icons::DEBUG.c()),
+        (4, TuiPanel::Git, crate::icons::GIT_BRANCH.c()),
+        (5, TuiPanel::Extensions, crate::icons::EXTENSIONS.c()),
+        (6, TuiPanel::Ai, crate::icons::AI_CHAT.c()),
     ];
 
     for &(row_off, panel, icon) in top_buttons {
@@ -85,7 +85,7 @@ pub(super) fn render_activity_bar(
                 set_cell(buf, x, y, ' ', fg, row_bg);
             }
             if area.width >= 3 {
-                set_cell(buf, area.x + 1, y, panel.icon, fg, row_bg);
+                set_cell(buf, area.x + 1, y, panel.resolved_icon(), fg, row_bg);
             }
             if is_active && !is_kbd_sel {
                 set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
@@ -104,7 +104,7 @@ pub(super) fn render_activity_bar(
             set_cell(buf, x, y, ' ', fg, row_bg);
         }
         if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, '\u{f013}', fg, row_bg); // nf-fa-cog
+            set_cell(buf, area.x + 1, y, crate::icons::SETTINGS.c(), fg, row_bg);
         }
         if is_active && !is_kbd_sel {
             set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);

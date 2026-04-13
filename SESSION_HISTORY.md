@@ -1,7 +1,22 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 268 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 270 archived here. Recent work summary in PROJECT_STATE.md.
+
+## Session 270 — Win-GUI bug blitz (9 fixes — panel routing, resize, subprocess, nav)
+1. `hidden_command()` helper — CREATE_NO_WINDOW for curl calls (6 sites in registry.rs + ai.rs)
+2. Full NCHITTEST for all 8 resize zones
+3. Search panel keyboard routing (on_key_down + on_char)
+4. AI panel keyboard routing via handle_ai_panel_key()
+5. Git panel keyboard routing via handle_sc_key()
+6. Nav arrow clicks (tab_nav_back/forward) + command center click
+7. Panel-specific scroll wheel routing
+8. Search/Debug focus on activity bar click
+9. Search panel draw stub replaced with full renderer
+
+## Session 269 — Win-GUI interaction parity (19 fixes)
+New features: terminal regains focus, breadcrumb clicks, group divider drag, diff toolbar buttons, tab tooltip, terminal selection/paste/copy, extension panel keyboard + double-click.
+Bugs: UNC path prefix, clipboard sync, tab close/click geometry, context menu hover, tab slot bounds overflow, menu bar hit-test, insert mode paste, generic sidebar key swallowing. Systematic audit found 4 additional bug classes. Updated NATIVE_GUI_LESSONS.md.
 
 ## Session 268 — Win-GUI bug fixes (16 items — systematic audit + user-reported bugs)
 1. Tab close dirty check — shows engine dialog for unsaved buffers
@@ -131,7 +146,7 @@ Files changed: `src/core/engine/keys.rs`, `src/core/engine/windows.rs`, `src/cor
 
 **Session 259 — README revamp (5391 tests):**
 
-Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha software" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
+Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha ware" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
 
 ---
 
@@ -838,7 +853,7 @@ GTK: `set_decorated(false)` + `WindowHandle` drag + window-control buttons [─]
 **Session 88 — VSCode-like debugger UI (12 new tests, 743 total):**
 `LaunchConfig` struct + `parse_launch_json/type_to_adapter/generate_launch_json` in `dap_manager.rs`. Engine: `DebugSidebarSection`/`BottomPanelKind` enums; 8 new fields; `dap_add/remove_watch()`; `handle_debug_sidebar_key()`; `debug_toolbar_visible` default false. GTK: `SidebarPanel::Debug`, `draw_debug_sidebar()`. TUI: `TuiPanel::Debug`, `render_debug_sidebar()`. 12 new tests.
 
-**Session 87 — :set wrap / soft line-wrap rendering (7 new tests, 731 total):**
+**Session 87 — :set wrap /  line-wrap rendering (7 new tests, 731 total):**
 `Settings.wrap: bool` (default false). `render.rs`: `RenderedLine.is_wrap_continuation` + `segment_col_offset`; `build_rendered_window` splits lines at `viewport_cols`; `max_col=0` disables h-scroll. Engine: `ensure_cursor_visible_wrap`; `move_visual_down/up` helpers; `gj`/`gk` bindings. 7 new tests.
 
 **Session 86 — DAP panel interactivity + expression evaluation (4 new tests, 724 total):**

@@ -278,7 +278,7 @@ pub struct RenderedLine {
     pub is_conditional_bp: bool,
     /// True when the DAP adapter is currently stopped at this line.
     pub is_dap_current: bool,
-    /// True when this is a soft-wrap continuation row (the 2nd+ visual row of a
+    /// True when this is a -wrap continuation row (the 2nd+ visual row of a
     /// long buffer line). When true, `gutter_text` is blank and the line number
     /// belongs to the preceding non-continuation row.
     pub is_wrap_continuation: bool,
@@ -5500,10 +5500,12 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
 
     // Path segments (relative to cwd)
     if let Some(ref file_path) = buf_state.file_path {
-        let display = if let Ok(rel) = file_path.strip_prefix(&engine.cwd) {
+        let clean_path = crate::core::paths::strip_unc_prefix(file_path);
+        let clean_cwd = crate::core::paths::strip_unc_prefix(&engine.cwd);
+        let display = if let Ok(rel) = clean_path.strip_prefix(clean_cwd.as_ref()) {
             rel.to_string_lossy().to_string()
         } else {
-            file_path.to_string_lossy().to_string()
+            clean_path.to_string_lossy().to_string()
         };
         let parts: Vec<&str> = display.split(std::path::MAIN_SEPARATOR).collect();
         let mut accumulated = engine.cwd.clone();

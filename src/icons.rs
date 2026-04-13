@@ -158,3 +158,42 @@ pub fn file_icon(ext: &str) -> &'static str {
         _ => FILE_GENERIC.s(),
     }
 }
+
+/// Check whether a Nerd Font is installed on Windows by scanning the user and
+/// system font directories for font files with "Nerd" in the name.
+/// Returns `false` on non-Windows platforms.
+#[cfg(target_os = "windows")]
+pub fn detect_nerd_font_windows() -> bool {
+    use std::fs;
+    use std::path::PathBuf;
+    // User fonts (Windows 10 1803+, no admin required)
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let user_fonts = PathBuf::from(&local).join("Microsoft\\Windows\\Fonts");
+        if let Ok(entries) = fs::read_dir(&user_fonts) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.to_lowercase().contains("nerd") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // System fonts
+    let sys_fonts = PathBuf::from("C:\\Windows\\Fonts");
+    if let Ok(entries) = fs::read_dir(&sys_fonts) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_lowercase().contains("nerd") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect_nerd_font_windows() -> bool {
+    true // On non-Windows, assume available (GTK bundles, Linux has fontconfig)
+}

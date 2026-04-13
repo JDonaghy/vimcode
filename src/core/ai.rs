@@ -109,7 +109,7 @@ fn send_anthropic(
         r#"{{"model":"{model}","max_tokens":4096,"messages":{msgs_json}{system_fragment}}}"#
     );
 
-    let output = std::process::Command::new("curl")
+    let output = crate::core::git::hidden_command("curl")
         .args([
             "-sf",
             "--max-time",
@@ -181,7 +181,7 @@ fn send_openai(
     let msgs_json = messages_to_json(messages);
     let body = format!(r#"{{"model":"{model}","messages":{msgs_json}}}"#);
 
-    let output = std::process::Command::new("curl")
+    let output = crate::core::git::hidden_command("curl")
         .args([
             "-sf",
             "--max-time",
@@ -260,7 +260,7 @@ fn send_ollama(
     let msgs_str = serde_json::to_string(&all_messages).map_err(|e| e.to_string())?;
     let body = format!(r#"{{"model":"{model}","stream":false,"messages":{msgs_str}}}"#);
 
-    let output = std::process::Command::new("curl")
+    let output = crate::core::git::hidden_command("curl")
         .args([
             "-sf",
             "--max-time",

@@ -46,7 +46,7 @@ pub fn save_cache(manifests: &[ExtensionManifest]) {
 /// Fetch and deserialize the remote registry. Blocking — run in a background thread.
 /// Returns `None` on any network or parse error so the caller degrades gracefully.
 pub fn fetch_registry(url: &str) -> Option<Vec<ExtensionManifest>> {
-    let output = std::process::Command::new("curl")
+    let output = super::git::hidden_command("curl")
         .args(["-sf", "--max-time", "15", url])
         .output()
         .ok()?;
@@ -62,7 +62,7 @@ pub fn download_script(url: &str, dest: &Path) -> std::io::Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = std::process::Command::new("curl")
+    let status = super::git::hidden_command("curl")
         .args(["-sf", "--max-time", "30", "-o"])
         .arg(dest)
         .arg(url)
@@ -82,7 +82,7 @@ pub fn fetch_readme(base_url: &str, ext_name: &str) -> Option<String> {
         return None;
     }
     let url = format!("{}/{}/README.md", base_url, ext_name);
-    let output = std::process::Command::new("curl")
+    let output = super::git::hidden_command("curl")
         .args(["-sf", "--max-time", "10"])
         .arg(&url)
         .output()

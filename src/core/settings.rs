@@ -313,7 +313,12 @@ fn default_hover_delay() -> u32 {
 }
 
 fn default_use_nerd_fonts() -> bool {
-    true
+    // On Windows, terminal fonts (Consolas, Cascadia Mono) don't include Nerd
+    // Font glyphs by default. Use ASCII fallback icons instead.  Users who
+    // install a Nerd Font can enable via `:set nerdfonts`.  On Linux/macOS,
+    // the GTK backend bundles a Nerd Font subset and TUI terminals commonly
+    // have Nerd Font support.
+    !cfg!(target_os = "windows")
 }
 
 fn default_swap_file() -> bool {

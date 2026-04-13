@@ -132,6 +132,12 @@ struct WinSidebar {
     dirty: bool,
     /// Whether the sidebar has keyboard focus.
     has_focus: bool,
+    // Search panel state
+    search_input_mode: bool,
+    replace_input_focused: bool,
+    search_scroll_top: usize,
+    /// Currently active extension panel (overrides active_panel when Some).
+    ext_panel_name: Option<String>,
 }
 
 impl WinSidebar {
@@ -149,6 +155,10 @@ impl WinSidebar {
             sort_case_insensitive: true,
             dirty: true,
             has_focus: false,
+            search_input_mode: true,
+            replace_input_focused: false,
+            search_scroll_top: 0,
+            ext_panel_name: None,
         }
     }
 
@@ -354,9 +364,19 @@ pub fn run(file_path: Option<PathBuf>) {
 
     let mut engine = Engine::new();
     engine.menu_bar_visible = true;
+    // Auto-detect Nerd Font availability on Windows
+    let nerd_font_missing = engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
+    if nerd_font_missing {
+        engine.settings.use_nerd_fonts = false;
+    }
     icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
     engine.plugin_init();
     engine.ext_refresh();
+    if nerd_font_missing {
+        engine.message =
+            "No Nerd Font detected — using fallback icons. Install a Nerd Font and run :set nerdfonts to enable."
+                .to_string();
+    }
 
     if let Some(path) = file_path {
         if path.is_dir() {
@@ -878,16 +898,37 @@ fn on_nchittest(hwnd: HWND, lparam: LPARAM) -> u32 {
     let px = pt.x as f32;
     let py = pt.y as f32;
 
-    // Top resize border (thin strip at very top for resizing)
-    if py < resize_border && !is_maximized(hwnd) {
-        // Top corners
+    let client_height = (rc.bottom - rc.top) as f32;
+
+    if !is_maximized(hwnd) {
+        // Top resize border
+        if py < resize_border {
+            if px < resize_border {
+                return HTTOPLEFT;
+            }
+            if px > client_width - resize_border {
+                return HTTOPRIGHT;
+            }
+            return HTTOP;
+        }
+        // Bottom resize border
+        if py > client_height - resize_border {
+            if px < resize_border {
+                return HTBOTTOMLEFT;
+            }
+            if px > client_width - resize_border {
+                return HTBOTTOMRIGHT;
+            }
+            return HTBOTTOM;
+        }
+        // Left resize border
         if px < resize_border {
-            return HTTOPLEFT;
+            return HTLEFT;
         }
+        // Right resize border
         if px > client_width - resize_border {
-            return HTTOPRIGHT;
+            return HTRIGHT;
         }
-        return HTTOP;
     }
 
     // Caption buttons area (right side of the title bar row)
@@ -920,18 +961,14 @@ fn on_nchittest(hwnd: HWND, lparam: LPARAM) -> u32 {
                 .is_some_and(|s| s.engine.menu_bar_visible)
         });
         if menu_bar_visible {
-            let char_width = APP.with(|app| app.borrow().as_ref().map_or(8.0f32, |s| s.char_width));
-            // Menu labels start at 1*cw and extend across all menu items
-            let mut menu_end = char_width; // initial offset
-            for (name, _, _) in MENU_STRUCTURE.iter() {
-                menu_end += (name.len() as f32 + 2.0) * char_width;
-            }
-            if px < menu_end * dpi_scale {
-                return HTCLIENT;
-            }
+            // The entire title bar is HTCLIENT so that menu labels, nav arrows,
+            // and command center clicks reach our WM_LBUTTONDOWN handler.
+            // Window dragging is handled by on_mouse_down sending WM_NCLBUTTONDOWN
+            // when no interactive element was hit.
+            return HTCLIENT;
         }
 
-        // Rest of the title bar row = draggable caption
+        // No menu bar — rest of the title bar row = draggable caption
         return HTCAPTION;
     }
 
@@ -1757,6 +1794,85 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
+        // ── Extension panel (plugin-provided) keyboard handling ────────
+        if state.engine.ext_panel_has_focus
+            && state.sidebar.visible
+            && state.sidebar.ext_panel_name.is_some()
+        {
+            // When input field is active, pass characters as input
+            if state.engine.ext_panel_input_active {
+                let (ikey, ich): (&str, Option<char>) = match key.key_name.as_str() {
+                    "Escape" => ("Escape", None),
+                    "Return" => ("Return", None),
+                    "BackSpace" => ("BackSpace", None),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            if !ch.is_control() {
+                                ("char", Some(ch))
+                            } else {
+                                ("", None)
+                            }
+                        } else {
+                            ("", None)
+                        }
+                    }
+                };
+                if !ikey.is_empty() {
+                    let name = if ikey == "char" {
+                        ich.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        ikey.to_string()
+                    };
+                    state.engine.handle_ext_panel_input_key(&name, ctrl, ich);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            // Navigation keys
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Return" => ("Return", None),
+                "Tab" => ("Tab", None),
+                "Escape" => ("Escape", None),
+                _ => {
+                    if let Some(ch) = key.unicode {
+                        match ch {
+                            'g' => ("g", None),
+                            'G' => ("G", None),
+                            '/' => ("/", None),
+                            '?' => ("?", None),
+                            'q' => ("Escape", None),
+                            c if !c.is_control() => ("char", Some(c)),
+                            _ => ("", None),
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                let name = if key_name == "char" {
+                    ch.map(|c| c.to_string()).unwrap_or_default()
+                } else {
+                    key_name.to_string()
+                };
+                state.engine.handle_ext_panel_key(&name, ctrl, ch);
+                if !state.engine.ext_panel_has_focus {
+                    state.sidebar.has_focus = false;
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
         // ── Extensions panel keyboard handling ─────────────────────────
         if state.engine.ext_sidebar_has_focus
             && state.sidebar.visible
@@ -1804,8 +1920,289 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
-        // Sidebar keyboard navigation when focused (Explorer only — other panels
-        // are handled by the engine via handle_key → handle_sc_key / etc.)
+        // ── Search panel keyboard handling ──────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Search
+        {
+            // Alt toggles for search options
+            if alt {
+                match key.key_name.as_str() {
+                    "c" | "C" => {
+                        state.engine.project_search_options.case_sensitive =
+                            !state.engine.project_search_options.case_sensitive;
+                    }
+                    "w" | "W" => {
+                        state.engine.project_search_options.whole_word =
+                            !state.engine.project_search_options.whole_word;
+                    }
+                    "r" | "R" => {
+                        state.engine.project_search_options.use_regex =
+                            !state.engine.project_search_options.use_regex;
+                    }
+                    "h" | "H" => {
+                        // Toggle replace input visibility
+                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
+                    }
+                    _ => {}
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            // Ctrl+V paste into search/replace input
+            if ctrl && key.key_name == "v" && state.sidebar.search_input_mode {
+                let text = match state.engine.clipboard_read {
+                    Some(ref cb) => cb().ok(),
+                    None => None,
+                };
+                if let Some(t) = text {
+                    let line = t.lines().next().unwrap_or("");
+                    for c in line.chars() {
+                        if !c.is_control() {
+                            if state.sidebar.replace_input_focused {
+                                state.engine.project_replace_text.push(c);
+                            } else {
+                                state.engine.project_search_query.push(c);
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            if state.sidebar.search_input_mode {
+                // Input mode: typing into search or replace box
+                match key.key_name.as_str() {
+                    "Tab" => {
+                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
+                    }
+                    "Return" => {
+                        if state.sidebar.replace_input_focused {
+                            let root = state.engine.workspace_root.clone().unwrap_or_default();
+                            state.engine.start_project_replace(root);
+                        } else {
+                            let root = state.engine.workspace_root.clone().unwrap_or_default();
+                            state.engine.start_project_search(root);
+                            state.sidebar.search_scroll_top = 0;
+                        }
+                    }
+                    "BackSpace" => {
+                        if state.sidebar.replace_input_focused {
+                            state.engine.project_replace_text.pop();
+                        } else {
+                            state.engine.project_search_query.pop();
+                        }
+                    }
+                    "Escape" => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    "Down" => {
+                        // Switch to results mode
+                        if !state.engine.project_search_results.is_empty() {
+                            state.sidebar.search_input_mode = false;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Results navigation mode
+                match key.key_name.as_str() {
+                    "j" | "Down" => {
+                        state.engine.project_search_select_next();
+                    }
+                    "k" | "Up" => {
+                        state.engine.project_search_select_prev();
+                    }
+                    "Return" => {
+                        let idx = state.engine.project_search_selected;
+                        let result = state
+                            .engine
+                            .project_search_results
+                            .get(idx)
+                            .map(|m| (m.file.clone(), m.line));
+                        if let Some((file, line)) = result {
+                            state.engine.open_file_in_tab(&file);
+                            let win_id = state.engine.active_window_id();
+                            state.engine.set_cursor_for_window(win_id, line, 0);
+                            state.engine.ensure_cursor_visible();
+                            state.sidebar.has_focus = false;
+                            state.engine.search_has_focus = false;
+                        }
+                    }
+                    "Escape" => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    _ => {}
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── AI panel keyboard handling ───────────────────────────────
+        if state.engine.ai_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Ai
+        {
+            // Ctrl+V paste
+            if ctrl && key.key_name == "v" {
+                let text = match state.engine.clipboard_read {
+                    Some(ref cb) => cb().ok(),
+                    None => None,
+                };
+                if let Some(t) = text {
+                    state.engine.ai_insert_text(&t);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "Down" if !state.engine.ai_input_active => ("j", None),
+                "Up" if !state.engine.ai_input_active => ("k", None),
+                "Return" => ("Return", None),
+                "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                "Delete" => ("Delete", None),
+                "Left" => ("Left", None),
+                "Right" => ("Right", None),
+                "Home" => ("Home", None),
+                "End" => ("End", None),
+                other => {
+                    if ctrl {
+                        (other, None)
+                    } else if let Some(ch) = key.unicode {
+                        if !state.engine.ai_input_active {
+                            match ch {
+                                'j' => ("j", None),
+                                'k' => ("k", None),
+                                'G' => ("G", None),
+                                'g' => ("g", None),
+                                'i' | 'a' => ("i", None),
+                                'q' => ("Escape", None),
+                                _ => ("char", Some(ch)),
+                            }
+                        } else {
+                            ("char", Some(ch))
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let (mapped, uni) = if key_name == "char" {
+                    ("", unicode)
+                } else {
+                    (key_name, None)
+                };
+                state.engine.handle_ai_panel_key(mapped, ctrl, uni);
+                if !state.engine.ai_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── Git/Source Control panel keyboard handling ────────────────
+        if state.engine.sc_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+        {
+            if state.engine.sc_commit_input_active
+                || state.engine.sc_branch_picker_open
+                || state.engine.sc_branch_create_mode
+                || state.engine.sc_help_open
+            {
+                // Input/popup mode — route all keys through engine
+                let (key_str, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                    "Return" => ("Return", None),
+                    "Escape" => ("Escape", None),
+                    "BackSpace" => ("BackSpace", None),
+                    "Delete" => ("Delete", None),
+                    "Up" => ("Up", None),
+                    "Down" => ("Down", None),
+                    "Left" => ("Left", None),
+                    "Right" => ("Right", None),
+                    "Home" => ("Home", None),
+                    "End" => ("End", None),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            ("char", Some(ch))
+                        } else {
+                            ("", None)
+                        }
+                    }
+                };
+                if key_str == "char" {
+                    state.engine.handle_sc_key("", ctrl, unicode);
+                } else if !key_str.is_empty() {
+                    state.engine.handle_sc_key(key_str, ctrl, None);
+                }
+            } else {
+                // Navigation mode
+                let key_name: Option<&str> = match key.key_name.as_str() {
+                    "j" | "Down" => Some("j"),
+                    "k" | "Up" => Some("k"),
+                    "h" | "Left" => Some("h"),
+                    "l" | "Right" => Some("l"),
+                    "Tab" => Some("Tab"),
+                    "Escape" => Some("Escape"),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            match ch {
+                                's' => Some("s"),
+                                'S' => Some("S"),
+                                'd' => Some("d"),
+                                'D' => Some("D"),
+                                'c' => Some("c"),
+                                'C' => Some("C"),
+                                'p' => Some("p"),
+                                'P' => Some("P"),
+                                'f' => Some("f"),
+                                'b' if !ctrl => Some("b"),
+                                'B' => Some("B"),
+                                '?' => Some("?"),
+                                'r' => Some("r"),
+                                'q' => Some("Escape"),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some("Return") = key_name {
+                    let done = state.engine.sc_open_selected_async();
+                    if done && !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
+                } else if let Some(name) = key_name {
+                    state.engine.handle_sc_key(name, ctrl, None);
+                    if !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Sidebar keyboard navigation when focused (Explorer)
         if state.sidebar.has_focus
             && state.sidebar.visible
             && state.sidebar.active_panel == SidebarPanel::Explorer
@@ -2120,6 +2517,62 @@ fn on_char(wparam: WPARAM) {
             return;
         }
 
+        // Extension panel (plugin-provided) character key handling
+        if state.engine.ext_panel_has_focus
+            && state.sidebar.visible
+            && state.sidebar.ext_panel_name.is_some()
+        {
+            if state.engine.ext_panel_input_active {
+                // Input mode: all chars go to input
+                let (ikey, ich): (&str, Option<char>) = match ch {
+                    '\x1b' => ("Escape", None),
+                    '\r' => ("Return", None),
+                    '\x08' => ("BackSpace", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                };
+                if !ikey.is_empty() {
+                    let name = if ikey == "char" {
+                        ich.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        ikey.to_string()
+                    };
+                    state.engine.handle_ext_panel_input_key(&name, false, ich);
+                }
+            } else {
+                // Navigation mode
+                let (key_name, unicode): (&str, Option<char>) = match ch {
+                    'j' => ("j", None),
+                    'k' => ("k", None),
+                    'g' => ("g", None),
+                    'G' => ("G", None),
+                    '/' => ("/", None),
+                    '?' => ("?", None),
+                    'q' => ("Escape", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                };
+                if !key_name.is_empty() {
+                    let ch_arg = if key_name == "char" { unicode } else { None };
+                    let name = if key_name == "char" {
+                        ch_arg.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        key_name.to_string()
+                    };
+                    state.engine.handle_ext_panel_key(&name, false, ch_arg);
+                    if !state.engine.ext_panel_has_focus {
+                        state.sidebar.has_focus = false;
+                        state.sidebar.ext_panel_name = None;
+                        state.engine.ext_panel_active = None;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
         // Extensions panel character key handling
         if state.engine.ext_sidebar_has_focus
             && state.sidebar.visible
@@ -2146,6 +2599,138 @@ fn on_char(wparam: WPARAM) {
                 );
                 if !state.engine.ext_sidebar_has_focus {
                     state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Search panel character keys ─────────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Search
+        {
+            if state.sidebar.search_input_mode {
+                // Printable chars go into search/replace query
+                if !ch.is_control() {
+                    if state.sidebar.replace_input_focused {
+                        state.engine.project_replace_text.push(ch);
+                    } else {
+                        state.engine.project_search_query.push(ch);
+                    }
+                }
+            } else {
+                // Results navigation mode — handle nav keys, rest switches to input
+                match ch {
+                    'j' => {
+                        state.engine.project_search_select_next();
+                    }
+                    'k' => {
+                        state.engine.project_search_select_prev();
+                    }
+                    'q' => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    c if !c.is_control() => {
+                        // Any other printable char switches to input mode
+                        state.sidebar.search_input_mode = true;
+                        state.sidebar.replace_input_focused = false;
+                        state.engine.project_search_query.push(c);
+                    }
+                    _ => {}
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── AI panel character keys ─────────────────────────────────
+        if state.engine.ai_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Ai
+        {
+            let (key_name, unicode): (&str, Option<char>) = if !state.engine.ai_input_active {
+                match ch {
+                    'j' => ("j", None),
+                    'k' => ("k", None),
+                    'G' => ("G", None),
+                    'g' => ("g", None),
+                    'i' | 'a' => ("i", None),
+                    'q' => ("Escape", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                }
+            } else {
+                if !ch.is_control() {
+                    ("char", Some(ch))
+                } else {
+                    ("", None)
+                }
+            };
+            if !key_name.is_empty() {
+                let (mapped, uni) = if key_name == "char" {
+                    ("", unicode)
+                } else {
+                    (key_name, None)
+                };
+                state.engine.handle_ai_panel_key(mapped, false, uni);
+                if !state.engine.ai_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Git panel character keys ────────────────────────────────
+        if state.engine.sc_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+        {
+            if state.engine.sc_commit_input_active
+                || state.engine.sc_branch_picker_open
+                || state.engine.sc_branch_create_mode
+                || state.engine.sc_help_open
+            {
+                // Input mode: route printable chars through engine
+                if !ch.is_control() {
+                    state.engine.handle_sc_key("", false, Some(ch));
+                }
+            } else {
+                // Navigation mode
+                let key_name: Option<&str> = match ch {
+                    'j' => Some("j"),
+                    'k' => Some("k"),
+                    'h' => Some("h"),
+                    'l' => Some("l"),
+                    's' => Some("s"),
+                    'S' => Some("S"),
+                    'd' => Some("d"),
+                    'D' => Some("D"),
+                    'c' => Some("c"),
+                    'C' => Some("C"),
+                    'p' => Some("p"),
+                    'P' => Some("P"),
+                    'f' => Some("f"),
+                    'b' => Some("b"),
+                    'B' => Some("B"),
+                    '?' => Some("?"),
+                    'r' => Some("r"),
+                    'q' => Some("Escape"),
+                    _ => None,
+                };
+                if let Some(name) = key_name {
+                    state.engine.handle_sc_key(name, false, None);
+                    if !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
                 }
             }
             unsafe {
@@ -2443,6 +3028,10 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Default: any non-terminal click clears terminal focus (matching TUI).
+        // Terminal click handlers below re-enable it for terminal area clicks.
+        state.engine.terminal_has_focus = false;
+
         // ── Sidebar resize drag start ────────────────────────────────────
         let edge = state.sidebar.total_width();
         if state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX {
@@ -2558,6 +3147,92 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             }
         }
 
+        // ── Nav arrow clicks (back/forward in title bar) ────────────────
+        if state.engine.menu_bar_visible && py < title_bar_h {
+            let cw = state.char_width;
+            let pad = 8.0_f32;
+            let mut menu_end = pad;
+            for (name, _, _) in MENU_STRUCTURE.iter() {
+                menu_end +=
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                        + pad * 2.0;
+            }
+            let arrows_w = 4.0 * cw;
+            let caption_btns_w = CAPTION_BTN_COUNT * CAPTION_BTN_WIDTH;
+            let client_w = unsafe {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                (rc.right - rc.left) as f32 / state.dpi_scale
+            };
+            let available = client_w - menu_end - caption_btns_w;
+            // Compute command center title (same as render.rs MenuBarData)
+            let title = state
+                .engine
+                .cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "VimCode".to_string());
+            let title_display = format!("\u{1f50d} {}", title);
+            let text_len = title_display.chars().count() as f32;
+            let box_w = if !title_display.is_empty() {
+                (text_len + 4.0) * cw
+            } else {
+                0.0
+            };
+            let gap = if box_w > 0.0 { cw } else { 0.0 };
+            let total_unit = arrows_w + gap + box_w;
+            if available >= total_unit + 2.0 * cw {
+                let unit_start = menu_end + (available - total_unit) / 2.0;
+                // Back arrow: [unit_start, unit_start + 2*cw)
+                if px >= unit_start && px < unit_start + 2.0 * cw {
+                    state.engine.tab_nav_back();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+                // Forward arrow: [unit_start + 2*cw, unit_start + 4*cw)
+                if px >= unit_start + 2.0 * cw && px < unit_start + 4.0 * cw {
+                    state.engine.tab_nav_forward();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+                // Command center search box
+                if box_w > 0.0 {
+                    let bx = unit_start + arrows_w + gap;
+                    if px >= bx && px < bx + box_w {
+                        state.engine.open_command_center();
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // ── Title bar drag fallback ──────────────────────────────────────
+        // If click is in the title bar but no interactive element was hit above,
+        // initiate a window drag (replaces HTCAPTION behavior since we return
+        // HTCLIENT for the entire title bar when menu bar is visible).
+        if state.engine.menu_bar_visible && py < title_bar_h {
+            // Re-enable terminal focus if it was set before (blanket clear was premature
+            // for a drag operation, but this is harmless since dragging doesn't need it).
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_NCLBUTTONDOWN,
+                    Some(WPARAM(HTCAPTION as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            return;
+        }
+
         // ── Check activity bar clicks ────────────────────────────────────
         let ab_w = state.sidebar.activity_bar_px;
         let menu_y = if state.engine.menu_bar_visible {
@@ -2576,31 +3251,54 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             };
             let icon_row_h = ab_w; // square cells matching activity bar width
             let settings_y = client_h / state.dpi_scale - state.bottom_chrome_px - icon_row_h;
-            let clicked_panel = if py >= settings_y {
-                Some(SidebarPanel::Settings)
-            } else {
-                let row = ((py - menu_y) / icon_row_h).floor() as usize;
-                let panels = [
-                    SidebarPanel::Explorer,
-                    SidebarPanel::Search,
-                    SidebarPanel::Debug,
-                    SidebarPanel::Git,
-                    SidebarPanel::Extensions,
-                    SidebarPanel::Ai,
-                ];
-                panels.get(row).copied()
-            };
-            if let Some(clicked_panel) = clicked_panel {
-                if state.sidebar.visible && state.sidebar.active_panel == clicked_panel {
+            let row = ((py - menu_y) / icon_row_h).floor() as usize;
+            let fixed_panels = [
+                SidebarPanel::Explorer,
+                SidebarPanel::Search,
+                SidebarPanel::Debug,
+                SidebarPanel::Git,
+                SidebarPanel::Extensions,
+                SidebarPanel::Ai,
+            ];
+            // Determine what was clicked: Settings gear, fixed panel, or ext panel
+            let mut ext_names: Vec<_> = state.engine.ext_panels.keys().cloned().collect();
+            ext_names.sort();
+            if py >= settings_y {
+                // Settings gear clicked
+                let is_toggle = state.sidebar.visible
+                    && state.sidebar.ext_panel_name.is_none()
+                    && state.sidebar.active_panel == SidebarPanel::Settings;
+                if is_toggle {
                     state.sidebar.visible = false;
                     state.sidebar.has_focus = false;
                     state.engine.clear_sidebar_focus();
                 } else {
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
+                    state.sidebar.active_panel = SidebarPanel::Settings;
+                    state.sidebar.visible = true;
+                    state.sidebar.dirty = true;
+                    state.sidebar.has_focus = true;
+                    state.engine.clear_sidebar_focus();
+                    state.engine.settings_has_focus = true;
+                }
+            } else if row < fixed_panels.len() {
+                // Fixed panel clicked
+                let clicked_panel = fixed_panels[row];
+                let is_toggle = state.sidebar.visible
+                    && state.sidebar.ext_panel_name.is_none()
+                    && state.sidebar.active_panel == clicked_panel;
+                if is_toggle {
+                    state.sidebar.visible = false;
+                    state.sidebar.has_focus = false;
+                    state.engine.clear_sidebar_focus();
+                } else {
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
                     state.sidebar.active_panel = clicked_panel;
                     state.sidebar.visible = true;
                     state.sidebar.dirty = true;
                     state.sidebar.has_focus = true;
-                    // Set engine-side focus for the appropriate panel
                     state.engine.clear_sidebar_focus();
                     match clicked_panel {
                         SidebarPanel::Settings => state.engine.settings_has_focus = true,
@@ -2609,15 +3307,46 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                             state.engine.sc_refresh();
                         }
                         SidebarPanel::Extensions => state.engine.ext_sidebar_has_focus = true,
-                        SidebarPanel::Ai => state.engine.ai_has_focus = true,
+                        SidebarPanel::Ai => {
+                            state.engine.ai_has_focus = true;
+                            state.engine.ai_input_active = true;
+                        }
+                        SidebarPanel::Search => {
+                            state.engine.search_has_focus = true;
+                            state.sidebar.search_input_mode = true;
+                        }
+                        SidebarPanel::Debug => state.engine.dap_sidebar_has_focus = true,
                         _ => {}
                     }
-                    // Auto-expand root
                     if clicked_panel == SidebarPanel::Explorer && state.sidebar.expanded.is_empty()
                     {
                         if let Some(ref root) = state.engine.workspace_root.clone() {
                             state.sidebar.expanded.insert(root.clone());
                         }
+                    }
+                }
+            } else {
+                // Extension panel icon row
+                let ext_idx = row - fixed_panels.len();
+                if let Some(ext_name) = ext_names.get(ext_idx).cloned() {
+                    let is_toggle = state.sidebar.visible
+                        && state.sidebar.ext_panel_name.as_deref() == Some(&ext_name);
+                    if is_toggle {
+                        state.sidebar.visible = false;
+                        state.sidebar.has_focus = false;
+                        state.sidebar.ext_panel_name = None;
+                        state.engine.clear_sidebar_focus();
+                        state.engine.ext_panel_active = None;
+                    } else {
+                        state.sidebar.ext_panel_name = Some(ext_name.clone());
+                        state.sidebar.visible = true;
+                        state.sidebar.dirty = true;
+                        state.sidebar.has_focus = true;
+                        state.engine.clear_sidebar_focus();
+                        state.engine.ext_panel_active = Some(ext_name.clone());
+                        state.engine.ext_panel_has_focus = true;
+                        // Fire panel_focus event
+                        state.engine.plugin_event("panel_focus", &ext_name);
                     }
                 }
             }
@@ -2630,6 +3359,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Check sidebar panel clicks ──────────────────────────────────
         if state.sidebar.visible && px < state.sidebar.total_width() && py >= menu_y {
             state.sidebar.has_focus = px >= ab_w; // focus panel area, not activity bar
+            state.engine.clear_sidebar_focus(); // clear stale focus from other panels
             let row = ((py - menu_y) / state.line_height).floor() as usize;
 
             if state.sidebar.active_panel == SidebarPanel::Explorer {
@@ -2670,6 +3400,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     }
                 }
                 state.engine.sc_has_focus = true;
+                state.engine.sc_refresh();
             } else if state.sidebar.active_panel == SidebarPanel::Extensions {
                 // Extensions panel — Y layout must match draw_extensions_panel:
                 // row 0: "EXTENSIONS" header at top
@@ -2721,10 +3452,51 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 }
             } else if state.sidebar.active_panel == SidebarPanel::Ai {
                 state.engine.ai_has_focus = true;
+                // Click on the input box area (bottom 2 rows) activates input mode
+                let client_h = unsafe {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale
+                };
+                let input_y = client_h - state.line_height * 2.0;
+                if py >= input_y {
+                    state.engine.ai_input_active = true;
+                }
             } else if state.sidebar.active_panel == SidebarPanel::Search {
                 state.engine.search_has_focus = true;
             } else if state.sidebar.active_panel == SidebarPanel::Debug {
                 state.engine.dap_sidebar_has_focus = true;
+            }
+
+            // Extension panel content clicks (when ext_panel_name is set)
+            if state.sidebar.ext_panel_name.is_some() {
+                state.engine.ext_panel_has_focus = true;
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+                // Row 0 is header, row 1 may be input field
+                let has_input = state.engine.ext_panel_input_active
+                    || state
+                        .engine
+                        .ext_panel_active
+                        .as_ref()
+                        .and_then(|n| state.engine.ext_panel_input_text.get(n))
+                        .is_some_and(|t| !t.is_empty());
+                let content_start = if has_input { 2.0 } else { 1.0 };
+                if click_y >= content_start * lh {
+                    let content_row = ((click_y - content_start * lh) / lh).floor() as usize;
+                    let flat_idx = state.engine.ext_panel_scroll_top + content_row;
+                    let flat_len = state.engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        state.engine.ext_panel_selected = flat_idx;
+                        // Handle as "Return" (toggle expand / fire select event)
+                        state.engine.handle_ext_panel_key("Return", false, None);
+                    }
+                } else if click_y < lh {
+                    // Header click — ignore
+                } else if has_input {
+                    // Clicked input row — activate input
+                    state.engine.ext_panel_input_active = true;
+                }
             }
 
             unsafe {
@@ -3146,7 +3918,19 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             let lh = state.line_height;
             let cw = state.char_width;
             let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
-            let panel_y = rt_h - (total_rows + 2.0) * lh;
+            // Compute panel_y using same logic as the paint pass
+            let status_above = state.engine.settings.window_status_line
+                && state.engine.settings.status_line_above_terminal
+                && state.engine.terminal_open;
+            let below_term = if status_above {
+                0.0
+            } else if state.engine.settings.window_status_line {
+                1.0
+            } else {
+                2.0
+            };
+            let above_term = if status_above { 2.0 } else { 0.0 };
+            let panel_y = rt_h - (total_rows + above_term + below_term) * lh;
             let editor_left = state.sidebar.total_width();
 
             // Click on the toolbar row
@@ -3470,7 +4254,18 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 (rc.bottom - rc.top) as f32 / state.dpi_scale
             };
             let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
-            let panel_y = rt_h - (total_rows + 2.0) * lh;
+            let status_above = state.engine.settings.window_status_line
+                && state.engine.settings.status_line_above_terminal
+                && state.engine.terminal_open;
+            let below_term = if status_above {
+                0.0
+            } else if state.engine.settings.window_status_line {
+                1.0
+            } else {
+                2.0
+            };
+            let above_term = if status_above { 2.0 } else { 0.0 };
+            let panel_y = rt_h - (total_rows + above_term + below_term) * lh;
             let content_y = panel_y + lh;
             let term_col = ((px - editor_left) / cw).floor().max(0.0) as u16;
             let term_row = ((py - content_y) / lh).floor().max(0.0) as u16;
@@ -3951,6 +4746,8 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        state.engine.terminal_has_focus = false;
+
         // Double-click on explorer file → open as Permanent (promotes preview tab)
         let ab_w = state.sidebar.activity_bar_px;
         let menu_y = if state.engine.menu_bar_visible {
@@ -4040,6 +4837,8 @@ fn on_right_click(hwnd: HWND, lparam: LPARAM) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+
+        state.engine.terminal_has_focus = false;
 
         let lh = state.line_height;
         let cw = state.char_width;
@@ -4175,18 +4974,76 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
-        // Sidebar scroll
+        // Sidebar scroll — dispatch by active panel (ext panel overrides)
         if state.sidebar.visible && px < state.sidebar.total_width() {
-            let max = state.sidebar.rows.len().saturating_sub(1);
-            if lines > 0 {
-                state.sidebar.scroll_top = state
-                    .sidebar
-                    .scroll_top
-                    .saturating_add(lines as usize)
-                    .min(max);
-            } else {
-                state.sidebar.scroll_top =
-                    state.sidebar.scroll_top.saturating_sub((-lines) as usize);
+            if state.sidebar.ext_panel_name.is_some() {
+                let flat_len = state.engine.ext_panel_flat_len();
+                if lines > 0 {
+                    state.engine.ext_panel_scroll_top = state
+                        .engine
+                        .ext_panel_scroll_top
+                        .saturating_add(lines as usize)
+                        .min(flat_len.saturating_sub(1));
+                } else {
+                    state.engine.ext_panel_scroll_top = state
+                        .engine
+                        .ext_panel_scroll_top
+                        .saturating_sub((-lines) as usize);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+            match state.sidebar.active_panel {
+                SidebarPanel::Settings => {
+                    if lines > 0 {
+                        state.engine.settings_scroll_top = state
+                            .engine
+                            .settings_scroll_top
+                            .saturating_add(lines as usize);
+                    } else {
+                        state.engine.settings_scroll_top = state
+                            .engine
+                            .settings_scroll_top
+                            .saturating_sub((-lines) as usize);
+                    }
+                }
+                SidebarPanel::Ai => {
+                    if lines > 0 {
+                        state.engine.ai_scroll_top =
+                            state.engine.ai_scroll_top.saturating_add(lines as usize);
+                    } else {
+                        state.engine.ai_scroll_top =
+                            state.engine.ai_scroll_top.saturating_sub((-lines) as usize);
+                    }
+                }
+                SidebarPanel::Search => {
+                    if lines > 0 {
+                        state.sidebar.search_scroll_top = state
+                            .sidebar
+                            .search_scroll_top
+                            .saturating_add(lines as usize);
+                    } else {
+                        state.sidebar.search_scroll_top = state
+                            .sidebar
+                            .search_scroll_top
+                            .saturating_sub((-lines) as usize);
+                    }
+                }
+                _ => {
+                    let max = state.sidebar.rows.len().saturating_sub(1);
+                    if lines > 0 {
+                        state.sidebar.scroll_top = state
+                            .sidebar
+                            .scroll_top
+                            .saturating_add(lines as usize)
+                            .min(max);
+                    } else {
+                        state.sidebar.scroll_top =
+                            state.sidebar.scroll_top.saturating_sub((-lines) as usize);
+                    }
+                }
             }
         } else {
             // Editor scroll — use fold-aware scrolling
@@ -4247,6 +5104,24 @@ fn on_tick(hwnd: HWND) {
 
         // Swap file periodic writes
         state.engine.tick_swap_files();
+
+        // Poll for completed async shell tasks (plugin background commands)
+        if state.engine.poll_async_shells() {
+            needs_redraw = true;
+        }
+
+        // Check for panel reveal request from plugins
+        if let Some(panel_name) = state.engine.ext_panel_focus_pending.take() {
+            state.sidebar.ext_panel_name = Some(panel_name);
+            state.sidebar.visible = true;
+            state.sidebar.has_focus = true;
+            needs_redraw = true;
+        }
+
+        // Poll panel hover dwell timer
+        if state.engine.poll_panel_hover() {
+            needs_redraw = true;
+        }
 
         // Periodic sidebar refresh (git status, explorer indicators) — every 2s
         if state.last_sidebar_refresh.elapsed().as_secs() >= 2 {

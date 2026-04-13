@@ -36,6 +36,28 @@ fn rect_f(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
     }
 }
 
+/// Parse a badge color string (hex like "#4ec9b0" or named colors) to Color.
+fn parse_badge_color_d2d(color: &str) -> Option<Color> {
+    if let Some(hex) = color.strip_prefix('#') {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some(Color::from_rgb(r, g, b));
+        }
+    }
+    match color {
+        "red" => Some(Color::from_rgb(255, 80, 80)),
+        "green" => Some(Color::from_rgb(80, 200, 120)),
+        "blue" => Some(Color::from_rgb(80, 150, 255)),
+        "yellow" => Some(Color::from_rgb(220, 200, 60)),
+        "orange" => Some(Color::from_rgb(230, 150, 50)),
+        "purple" => Some(Color::from_rgb(180, 100, 220)),
+        "cyan" => Some(Color::from_rgb(80, 200, 200)),
+        _ => None,
+    }
+}
+
 // ─── Text measurement ───────────────────────────────────────────────────────
 
 /// Measure the width of a single character in the monospace font.
@@ -196,7 +218,7 @@ impl<'a> DrawContext<'a> {
 
             // Draw terminal panel
             if let Some(ref term) = layout.bottom_tabs.terminal {
-                self.draw_terminal(term);
+                self.draw_terminal(term, layout);
             }
 
             // Draw panel hover popup (sidebar item hover)
@@ -236,7 +258,17 @@ impl<'a> DrawContext<'a> {
             self.rt.FillRectangle(&rect_f(x, y, width - x, h), &tab_bg);
         }
         let text_y = y + (h - self.line_height) / 2.0; // vertically center text
-        self.draw_tabs(&layout.tab_bar, x, text_y, width - x, true);
+                                                       // Reserve space for diff toolbar so tabs don't extend under it
+        let dt_reserve = layout.diff_toolbar.as_ref().map_or(0.0, |dt| {
+            let cw = self.char_width;
+            let mut parts_len: usize = 0;
+            if let Some(ref label) = dt.change_label {
+                parts_len += label.len() + 2;
+            }
+            parts_len += 3 * 3 + 4; // 3 symbols + separators
+            parts_len as f32 * cw + cw * 2.0
+        });
+        self.draw_tabs(&layout.tab_bar, x, text_y, width - x - dt_reserve, true);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = layout.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, width - x, h);
@@ -266,7 +298,17 @@ impl<'a> DrawContext<'a> {
             self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
         }
         let text_y = y + (h - self.line_height) / 2.0;
-        self.draw_tabs(&gtb.tabs, x, text_y, w, is_active_group);
+        // Reserve space for diff toolbar so tabs don't extend under it
+        let dt_reserve = gtb.diff_toolbar.as_ref().map_or(0.0, |dt| {
+            let cw = self.char_width;
+            let mut parts_len: usize = 0;
+            if let Some(ref label) = dt.change_label {
+                parts_len += label.len() + 2;
+            }
+            parts_len += 3 * 3 + 4; // 3 symbols + separators
+            parts_len as f32 * cw + cw * 2.0
+        });
+        self.draw_tabs(&gtb.tabs, x, text_y, w - dt_reserve, is_active_group);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = &gtb.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, w, h);
@@ -278,12 +320,13 @@ impl<'a> DrawContext<'a> {
         tabs: &[crate::render::TabInfo],
         x_origin: f32,
         y: f32,
-        _max_width: f32,
+        max_width: f32,
         show_accent: bool,
     ) {
         let tab_h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
         let mut x = x_origin;
         let pad = 12.0; // horizontal padding inside each tab
+        let x_limit = x_origin + max_width;
 
         for tab in tabs {
             let bg = if tab.active {
@@ -304,6 +347,12 @@ impl<'a> DrawContext<'a> {
             let name_w = self.measure_ui_text(&tab.name);
             let close_w = self.char_width; // close button width
             let tab_w = pad + name_w + pad + close_w + pad * 0.5;
+
+            // Stop drawing tabs that would extend past the available width
+            // (leaves room for diff toolbar at the right edge)
+            if x + tab_w > x_limit {
+                break;
+            }
 
             unsafe {
                 self.rt.FillRectangle(&rect_f(x, y, tab_w, tab_h), &bg);
@@ -375,6 +424,12 @@ impl<'a> DrawContext<'a> {
     // ─── Breadcrumbs ─────────────────────────────────────────────────────────
 
     fn draw_breadcrumb_bar(&self, bc: &BreadcrumbBar) {
+        // Skip drawing when there are no segments — an empty breadcrumb background
+        // would cover the tab bar for groups whose active tab has no file path
+        // (e.g. scratch buffers, diff views).
+        if bc.segments.is_empty() {
+            return;
+        }
         let lh = self.line_height;
         let cw = self.char_width;
         let bx = bc.bounds.x as f32;
@@ -2114,7 +2169,9 @@ impl<'a> DrawContext<'a> {
 
         for (i, &(panel, icon)) in panels.iter().enumerate() {
             let y = top + i as f32 * icon_row_h;
-            let is_active = sidebar.visible && sidebar.active_panel == panel;
+            let is_active = sidebar.visible
+                && sidebar.ext_panel_name.is_none()
+                && sidebar.active_panel == panel;
 
             if is_active {
                 // Left accent bar
@@ -2133,6 +2190,55 @@ impl<'a> DrawContext<'a> {
 
             // Icon text (centered in activity bar cell)
             self.draw_icon_text(icon, 0.0, y, ab_w, icon_row_h, self.theme.activity_bar_fg);
+        }
+
+        // Extension panel icons (after fixed panels, before settings gear)
+        {
+            let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
+            ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
+            for (i, panel) in ext_panels.iter().enumerate() {
+                let y = top + (panels.len() + i) as f32 * icon_row_h;
+                if y + icon_row_h >= sidebar_bottom - icon_row_h {
+                    break; // leave room for settings gear
+                }
+                let is_active =
+                    sidebar.visible && sidebar.ext_panel_name.as_deref() == Some(&panel.name);
+                if is_active {
+                    let accent = self.solid_brush(self.theme.tab_active_accent);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(0.0, y, 2.0, icon_row_h), &accent);
+                    }
+                    let sel = self.solid_brush(self.theme.active_background);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, icon_row_h), &sel);
+                    }
+                }
+                // Map Nerd Font glyphs to Segoe MDL2 equivalents for Win-GUI.
+                // GTK renders these with the app font which has bundled Nerd Font
+                // glyphs, but Win-GUI's Consolas doesn't include them.
+                let icon_char = panel.resolved_icon();
+                let segoe_icon = match icon_char {
+                    '\u{f1d3}' => "\u{E81C}",              // git branch → History
+                    '\u{e702}' | '\u{e725}' => "\u{E8D4}", // git → BranchFork2
+                    '\u{f120}' | '\u{e795}' => "\u{E756}", // terminal → CommandPrompt
+                    '\u{f002}' | '\u{f422}' => "\u{E721}", // search → Search
+                    '\u{f07b}' | '\u{f07c}' => "\u{ED25}", // folder → FileExplorer
+                    '\u{f188}' => "\u{EBE8}",              // bug → Bug
+                    '\u{f085}' | '\u{e615}' => "\u{E713}", // cog → Settings
+                    '\u{f075}' | '\u{f27a}' => "\u{E8BD}", // comment → Chat
+                    _ => "\u{E74C}",                       // fallback → Page
+                };
+                self.draw_icon_text(
+                    segoe_icon,
+                    0.0,
+                    y,
+                    ab_w,
+                    icon_row_h,
+                    self.theme.activity_bar_fg,
+                );
+            }
         }
 
         // Settings gear pinned to bottom of activity bar (like TUI/VSCode)
@@ -2195,19 +2301,28 @@ impl<'a> DrawContext<'a> {
         }
 
         let panel_h = sidebar_bottom - top;
-        match sidebar.active_panel {
-            SidebarPanel::Explorer => {
-                self.draw_explorer_panel(sidebar, panel_x, panel_w, panel_h, top);
-            }
-            SidebarPanel::Git => self.draw_git_panel(screen, panel_x, panel_w, panel_h, top),
-            SidebarPanel::Debug => self.draw_debug_panel(screen, panel_x, panel_w, panel_h, top),
-            SidebarPanel::Extensions => {
-                self.draw_extensions_panel(screen, panel_x, panel_w, panel_h, top);
-            }
-            SidebarPanel::Search => self.draw_search_panel(screen, panel_x, panel_w, panel_h, top),
-            SidebarPanel::Ai => self.draw_ai_panel(screen, panel_x, panel_w, panel_h, top),
-            SidebarPanel::Settings => {
-                self.draw_settings_panel(engine, panel_x, panel_w, panel_h, top);
+        if sidebar.ext_panel_name.is_some() {
+            // Extension panel overrides the normal panel
+            self.draw_ext_panel(screen, engine, panel_x, panel_w, panel_h, top);
+        } else {
+            match sidebar.active_panel {
+                SidebarPanel::Explorer => {
+                    self.draw_explorer_panel(sidebar, panel_x, panel_w, panel_h, top);
+                }
+                SidebarPanel::Git => self.draw_git_panel(screen, panel_x, panel_w, panel_h, top),
+                SidebarPanel::Debug => {
+                    self.draw_debug_panel(screen, panel_x, panel_w, panel_h, top)
+                }
+                SidebarPanel::Extensions => {
+                    self.draw_extensions_panel(screen, panel_x, panel_w, panel_h, top);
+                }
+                SidebarPanel::Search => {
+                    self.draw_search_panel(engine, sidebar, panel_x, panel_w, panel_h, top);
+                }
+                SidebarPanel::Ai => self.draw_ai_panel(screen, panel_x, panel_w, panel_h, top),
+                SidebarPanel::Settings => {
+                    self.draw_settings_panel(engine, panel_x, panel_w, panel_h, top);
+                }
             }
         }
 
@@ -2556,28 +2671,42 @@ impl<'a> DrawContext<'a> {
 
     fn draw_search_panel(
         &self,
-        _screen: &ScreenLayout,
+        engine: &crate::core::engine::Engine,
+        sidebar: &WinSidebar,
         panel_x: f32,
         panel_w: f32,
-        _rt_h: f32,
+        panel_h: f32,
         top: f32,
     ) {
         let lh = self.line_height;
         let cw = self.char_width;
-        let _ = panel_w;
+        let fg = self.theme.foreground;
+        let dim = self.theme.line_number_fg;
 
-        self.draw_text("SEARCH", panel_x + cw, top, self.theme.foreground);
+        // Header
+        self.draw_text("SEARCH", panel_x + cw, top, fg);
 
-        // Search input box placeholder
+        // Search input box
         let input_y = top + lh * 1.5;
-        let input_bg = self.solid_brush(self.theme.background);
+        let input_active = sidebar.search_input_mode && !sidebar.replace_input_focused;
+        let input_bg_color = if input_active {
+            self.theme.active_background
+        } else {
+            self.theme.background
+        };
+        let input_bg = self.solid_brush(input_bg_color);
         unsafe {
             self.rt.FillRectangle(
                 &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
                 &input_bg,
             );
         }
-        let border = self.solid_brush(self.theme.separator);
+        let border_color = if input_active {
+            self.theme.cursor
+        } else {
+            self.theme.separator
+        };
+        let border = self.solid_brush(border_color);
         unsafe {
             self.rt.DrawRectangle(
                 &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
@@ -2586,12 +2715,132 @@ impl<'a> DrawContext<'a> {
                 None,
             );
         }
-        self.draw_text(
-            "Search (use :grep)",
-            panel_x + cw,
-            input_y,
-            self.theme.line_number_fg,
-        );
+        if engine.project_search_query.is_empty() {
+            self.draw_text("Search…", panel_x + cw, input_y, dim);
+        } else {
+            self.draw_text(&engine.project_search_query, panel_x + cw, input_y, fg);
+        }
+
+        // Replace input box
+        let replace_y = input_y + lh * 1.2;
+        let rep_active = sidebar.search_input_mode && sidebar.replace_input_focused;
+        let rep_bg_color = if rep_active {
+            self.theme.active_background
+        } else {
+            self.theme.background
+        };
+        let rep_bg = self.solid_brush(rep_bg_color);
+        unsafe {
+            self.rt.FillRectangle(
+                &rect_f(panel_x + cw * 0.5, replace_y, panel_w - cw, lh),
+                &rep_bg,
+            );
+            let rep_border_color = if rep_active {
+                self.theme.cursor
+            } else {
+                self.theme.separator
+            };
+            let rep_border = self.solid_brush(rep_border_color);
+            self.rt.DrawRectangle(
+                &rect_f(panel_x + cw * 0.5, replace_y, panel_w - cw, lh),
+                &rep_border,
+                1.0,
+                None,
+            );
+        }
+        if engine.project_replace_text.is_empty() {
+            self.draw_text("Replace…", panel_x + cw, replace_y, dim);
+        } else {
+            self.draw_text(&engine.project_replace_text, panel_x + cw, replace_y, fg);
+        }
+
+        // Toggle indicators
+        let toggle_y = replace_y + lh * 1.2;
+        let opts = &engine.project_search_options;
+        let active_color = self.theme.keyword;
+        let mut tx = panel_x + cw * 0.5;
+        let draw_toggle = |ctx: &DrawContext, label: &str, active: bool, x: &mut f32| {
+            let color = if active { active_color } else { dim };
+            ctx.draw_text(label, *x, toggle_y, color);
+            *x += (label.len() as f32 + 1.0) * cw;
+        };
+        draw_toggle(self, "Aa", opts.case_sensitive, &mut tx);
+        draw_toggle(self, "Ab|", opts.whole_word, &mut tx);
+        draw_toggle(self, ".*", opts.use_regex, &mut tx);
+        self.draw_text("Alt+C/W/R", tx + cw, toggle_y, dim);
+
+        // Status / hint
+        let status_y = toggle_y + lh;
+        let status = if engine.project_search_results.is_empty() {
+            if engine.project_search_query.is_empty() {
+                "Type to search, Enter to run".to_string()
+            } else {
+                format!("{} results", engine.project_search_results.len())
+            }
+        } else {
+            format!("{} results", engine.project_search_results.len())
+        };
+        self.draw_text(&status, panel_x + cw * 0.5, status_y, dim);
+
+        // Results list
+        let results_y = status_y + lh;
+        let results = &engine.project_search_results;
+        if results.is_empty() {
+            return;
+        }
+        let max_rows = ((top + panel_h - results_y) / lh).floor() as usize;
+        let root = engine
+            .workspace_root
+            .as_deref()
+            .unwrap_or(std::path::Path::new(""));
+        let mut last_file: Option<&std::path::Path> = None;
+        let mut row = 0;
+        let mut skip = sidebar.search_scroll_top;
+        let selected = engine.project_search_selected;
+
+        for (idx, m) in results.iter().enumerate() {
+            if row >= max_rows {
+                break;
+            }
+            // File header
+            if last_file != Some(m.file.as_path()) {
+                last_file = Some(m.file.as_path());
+                if skip > 0 {
+                    skip -= 1;
+                } else {
+                    let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
+                    let ry = results_y + row as f32 * lh;
+                    self.draw_text(
+                        &rel.display().to_string(),
+                        panel_x + cw * 0.5,
+                        ry,
+                        self.theme.keyword,
+                    );
+                    row += 1;
+                    if row >= max_rows {
+                        break;
+                    }
+                }
+            }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let ry = results_y + row as f32 * lh;
+            let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
+            // Highlight selected row
+            if idx == selected {
+                let sel_bg = self.solid_brush(self.theme.selection);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(panel_x + cw * 0.5, ry, panel_w - cw, lh), &sel_bg);
+                }
+                self.draw_text(&snippet, panel_x + cw, ry, fg);
+            } else {
+                self.draw_text(&snippet, panel_x + cw, ry, dim);
+            }
+            row += 1;
+        }
     }
 
     // ─── AI panel ────────────────────────────────────────────────────────────
@@ -2661,14 +2910,24 @@ impl<'a> DrawContext<'a> {
 
         // Input box at bottom
         let input_y = rt_h - lh * 2.0;
-        let input_bg = self.solid_brush(self.theme.background);
+        let input_bg_color = if ai.input_active {
+            self.theme.active_background
+        } else {
+            self.theme.background
+        };
+        let input_bg = self.solid_brush(input_bg_color);
         unsafe {
             self.rt.FillRectangle(
                 &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
                 &input_bg,
             );
         }
-        let border = self.solid_brush(self.theme.separator);
+        let border_color = if ai.input_active {
+            self.theme.cursor
+        } else {
+            self.theme.separator
+        };
+        let border = self.solid_brush(border_color);
         unsafe {
             self.rt.DrawRectangle(
                 &rect_f(panel_x + cw * 0.5, input_y, panel_w - cw, lh),
@@ -2677,8 +2936,10 @@ impl<'a> DrawContext<'a> {
                 None,
             );
         }
-        let input_text = if ai.input.is_empty() {
-            "Ask a question..."
+        let input_text = if ai.input.is_empty() && !ai.input_active {
+            "Click here to ask a question…"
+        } else if ai.input.is_empty() {
+            "Type your message…"
         } else {
             &ai.input
         };
@@ -2688,6 +2949,15 @@ impl<'a> DrawContext<'a> {
             self.theme.foreground
         };
         self.draw_text(input_text, panel_x + cw, input_y, input_color);
+        // Draw cursor when input is active
+        if ai.input_active {
+            let cursor_x = panel_x + cw + ai.input_cursor as f32 * self.char_width;
+            let cursor_brush = self.solid_brush(self.theme.cursor);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(cursor_x, input_y, 2.0, lh), &cursor_brush);
+            }
+        }
     }
 
     // ─── Notification toasts ────────────────────────────────────────────────
@@ -2917,6 +3187,323 @@ impl<'a> DrawContext<'a> {
         }
     }
 
+    // ─── Extension panel (plugin-provided dynamic panels) ──────────────────
+
+    fn draw_ext_panel(
+        &self,
+        screen: &ScreenLayout,
+        engine: &crate::core::engine::Engine,
+        panel_x: f32,
+        panel_w: f32,
+        panel_h: f32,
+        top: f32,
+    ) {
+        use crate::core::plugin::ExtPanelStyle;
+
+        let Some(ref panel) = screen.ext_panel else {
+            return;
+        };
+
+        let lh = self.line_height;
+        let bg = self.theme.tab_bar_bg;
+        let fg = self.theme.foreground;
+        let dim = self.theme.line_number_fg;
+        let accent = self.theme.keyword;
+        let sel_bg = self.theme.fuzzy_selected_bg;
+        let hdr_bg = self.theme.status_bg;
+        let hdr_fg = self.theme.status_fg;
+
+        // Background
+        let bg_brush = self.solid_brush(bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(panel_x, top, panel_w, panel_h), &bg_brush);
+        }
+
+        let mut ry: f32 = 0.0;
+
+        // ── Row 0: panel header ─────────────────────────────────────────
+        let hdr_brush = self.solid_brush(hdr_bg);
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(panel_x, top + ry, panel_w, lh), &hdr_brush);
+        }
+        let hdr_text = format!("  {}", panel.title);
+        self.draw_text(&hdr_text, panel_x + 2.0, top + ry, hdr_fg);
+        ry += lh;
+        if ry >= panel_h {
+            return;
+        }
+
+        // ── Search input row (when active or has text) ──────────────────
+        if panel.input_active || !panel.input_text.is_empty() {
+            self.draw_text(" / ", panel_x, top + ry, dim);
+            let prefix_w = self.mono_text_width(" / ");
+            let input_color = if panel.input_active { fg } else { dim };
+            self.draw_text(&panel.input_text, panel_x + prefix_w, top + ry, input_color);
+            if panel.input_active {
+                let tw = self.mono_text_width(&panel.input_text);
+                let cursor_brush = self.solid_brush(fg);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(panel_x + prefix_w + tw, top + ry, 1.5, lh),
+                        &cursor_brush,
+                    );
+                }
+            }
+            ry += lh;
+            if ry >= panel_h {
+                return;
+            }
+        }
+
+        // ── Build flat list of rows ─────────────────────────────────────
+        struct FlatRow {
+            text: String,
+            hint: String,
+            is_header: bool,
+            style: ExtPanelStyle,
+            is_separator: bool,
+            badges: Vec<crate::core::plugin::ExtPanelBadge>,
+            actions: Vec<crate::core::plugin::ExtPanelAction>,
+        }
+        let mut flat_rows: Vec<FlatRow> = Vec::new();
+        for section in &panel.sections {
+            let arrow = if section.expanded {
+                "\u{25BC}"
+            } else {
+                "\u{25B6}"
+            };
+            flat_rows.push(FlatRow {
+                text: format!(" {} {}", arrow, section.name),
+                hint: String::new(),
+                is_header: true,
+                style: ExtPanelStyle::Header,
+                is_separator: false,
+                badges: Vec::new(),
+                actions: Vec::new(),
+            });
+            if section.expanded {
+                for item in &section.items {
+                    if item.is_separator {
+                        flat_rows.push(FlatRow {
+                            text: String::new(),
+                            hint: String::new(),
+                            is_header: false,
+                            style: ExtPanelStyle::Dim,
+                            is_separator: true,
+                            badges: Vec::new(),
+                            actions: Vec::new(),
+                        });
+                        continue;
+                    }
+                    let indent = "  ".repeat(item.indent as usize + 1);
+                    let chevron = if item.expandable {
+                        if item.expanded {
+                            "\u{25BC} "
+                        } else {
+                            "\u{25B6} "
+                        }
+                    } else {
+                        ""
+                    };
+                    let icon_part = if item.icon.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{} ", item.icon)
+                    };
+                    flat_rows.push(FlatRow {
+                        text: format!("{}{}{}{}", indent, chevron, icon_part, item.text),
+                        hint: item.hint.clone(),
+                        style: item.style,
+                        is_header: false,
+                        is_separator: false,
+                        badges: item.badges.clone(),
+                        actions: item.actions.clone(),
+                    });
+                }
+            }
+        }
+
+        // ── Render visible rows ─────────────────────────────────────────
+        let content_h = panel_h - ry;
+        let max_rows = (content_h / lh) as usize;
+        let scroll = panel.scroll_top;
+        let visible_start = scroll.min(flat_rows.len());
+
+        for (ri, row) in flat_rows[visible_start..].iter().enumerate().take(max_rows) {
+            let row_y = top + ry + ri as f32 * lh;
+            let is_sel = (scroll + ri) == panel.selected;
+
+            // Separator (thin horizontal line)
+            if row.is_separator {
+                let sep_y = row_y + lh / 2.0;
+                let dim_brush = self.solid_brush(dim);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(panel_x + 8.0, sep_y, panel_w - 16.0, 1.0),
+                        &dim_brush,
+                    );
+                }
+                continue;
+            }
+
+            // Selection highlight
+            if is_sel && panel.has_focus {
+                let sel_brush = self.solid_brush(sel_bg);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(panel_x, row_y, panel_w, lh), &sel_brush);
+                }
+            }
+
+            // Choose foreground color based on style
+            let text_color = if row.is_header {
+                fg
+            } else {
+                match row.style {
+                    ExtPanelStyle::Header => fg,
+                    ExtPanelStyle::Dim => dim,
+                    ExtPanelStyle::Accent => accent,
+                    ExtPanelStyle::Normal => fg,
+                }
+            };
+
+            // Measure right-side decorations width first
+            let mut right_w: f32 = 0.0;
+            if !row.hint.is_empty() {
+                right_w += self.mono_text_width(&row.hint) + 4.0;
+            }
+            if is_sel && panel.has_focus {
+                for action in &row.actions {
+                    right_w += self.mono_text_width(&format!(" {} ", action.label)) + 4.0;
+                }
+            }
+            for badge in &row.badges {
+                right_w += self.mono_text_width(&format!(" {} ", badge.text)) + 4.0;
+            }
+
+            // Draw row text — truncate to fit before right decorations
+            let max_text_w = (panel_w - 6.0 - right_w).max(20.0);
+            let text_chars = row.text.chars().count() as f32 * self.char_width;
+            if text_chars <= max_text_w {
+                self.draw_text(&row.text, panel_x + 2.0, row_y, text_color);
+            } else {
+                // Truncate with ellipsis
+                let max_chars = ((max_text_w / self.char_width) as usize).saturating_sub(1);
+                let truncated: String = row
+                    .text
+                    .chars()
+                    .take(max_chars)
+                    .chain(std::iter::once('\u{2026}'))
+                    .collect();
+                self.draw_text(&truncated, panel_x + 2.0, row_y, text_color);
+            }
+
+            // Draw right-side decorations from right to left
+            let mut rx = panel_x + panel_w - 4.0;
+
+            // Hint (rightmost)
+            if !row.hint.is_empty() {
+                let hw = self.mono_text_width(&row.hint);
+                rx -= hw;
+                self.draw_text(&row.hint, rx, row_y, dim);
+                rx -= 4.0;
+            }
+
+            // Actions (only on selected row)
+            if is_sel && panel.has_focus {
+                for action in row.actions.iter().rev() {
+                    let action_text = format!(" {} ", action.label);
+                    let aw = self.mono_text_width(&action_text);
+                    rx -= aw;
+                    let accent_brush = self.solid_brush(accent);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(rx, row_y + 2.0, aw, lh - 4.0), &accent_brush);
+                    }
+                    self.draw_text(&action_text, rx, row_y, bg);
+                    rx -= 4.0;
+                }
+            }
+
+            // Badges
+            for badge in row.badges.iter().rev() {
+                let badge_text = format!(" {} ", badge.text);
+                let bw = self.mono_text_width(&badge_text);
+                rx -= bw;
+                let badge_color = parse_badge_color_d2d(&badge.color).unwrap_or(dim);
+                // Semi-transparent background
+                let badge_bg = self.solid_brush_alpha(badge_color, 0.25);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(rx, row_y + 2.0, bw, lh - 4.0), &badge_bg);
+                }
+                self.draw_text(&badge_text, rx, row_y, badge_color);
+                rx -= 4.0;
+            }
+        }
+
+        // ── Scrollbar ───────────────────────────────────────────────────
+        let total = flat_rows.len();
+        if total > max_rows && max_rows > 0 {
+            let track_h = content_h;
+            let thumb_h = (track_h * max_rows as f32 / total as f32).max(4.0);
+            let thumb_top = scroll as f32 * track_h / total as f32;
+            let sb_x = panel_x + panel_w - 5.0;
+            let dim_brush = self.solid_brush(dim);
+            unsafe {
+                self.rt.FillRectangle(
+                    &rect_f(sb_x, top + ry + thumb_top, 4.0, thumb_h),
+                    &dim_brush,
+                );
+            }
+        }
+
+        // ── Help popup overlay ──────────────────────────────────────────
+        if panel.help_open && !panel.help_bindings.is_empty() {
+            let bindings = &panel.help_bindings;
+            let popup_w = panel_w.min(280.0);
+            let popup_h = lh * (bindings.len() as f32 + 2.0);
+            let popup_x = panel_x + (panel_w - popup_w) / 2.0;
+            let popup_y = top + (panel_h - popup_h) / 2.0;
+
+            let popup_bg = self.solid_brush(self.theme.completion_bg);
+            let popup_border = self.solid_brush(self.theme.completion_border);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(popup_x, popup_y, popup_w, popup_h), &popup_bg);
+                self.rt.DrawRectangle(
+                    &rect_f(popup_x, popup_y, popup_w, popup_h),
+                    &popup_border,
+                    1.0,
+                    None,
+                );
+            }
+
+            // Title + close hint
+            self.draw_text(
+                "Keybindings",
+                popup_x + 8.0,
+                popup_y,
+                self.theme.completion_fg,
+            );
+            self.draw_text(
+                "x",
+                popup_x + popup_w - 16.0,
+                popup_y,
+                self.theme.completion_fg,
+            );
+
+            // Bindings
+            for (i, (key, desc)) in bindings.iter().enumerate() {
+                let bind_y = popup_y + lh * (i as f32 + 1.0);
+                self.draw_text(key, popup_x + 12.0, bind_y, self.theme.function);
+                self.draw_text(desc, popup_x + 100.0, bind_y, self.theme.completion_fg);
+            }
+        }
+    }
+
     // ─── Primitive helpers ───────────────────────────────────────────────────
 
     // ─── Terminal panel ────────────────────────────────────────────────────
@@ -2969,14 +3556,28 @@ impl<'a> DrawContext<'a> {
         }
     }
 
-    fn draw_terminal(&self, term: &crate::render::TerminalPanel) {
+    fn draw_terminal(&self, term: &crate::render::TerminalPanel, layout: &ScreenLayout) {
         let lh = self.line_height;
         let cw = self.char_width;
         let (width, height) = self.rt_size();
 
-        // Terminal panel sits above status bar + command line (2 rows)
+        // Below-terminal rows: when status_line_above_terminal is active,
+        // the separated status + cmd are above the terminal, so only cmd is below.
+        // When per-window status lines are active (no global status bar), only cmd is below.
+        let below_rows = if layout.separated_status_line.is_some() {
+            0.0 // status+cmd are above the terminal
+        } else if layout.status_left.is_empty() && layout.status_right.is_empty() {
+            1.0 // per-window status: only cmd line below
+        } else {
+            2.0 // global status bar + cmd line below
+        };
+        let above_rows = if layout.separated_status_line.is_some() {
+            2.0 // status + cmd above terminal
+        } else {
+            0.0
+        };
         let total_rows = term.content_rows as f32 + 1.0; // +1 for toolbar
-        let panel_y = height - (total_rows + 2.0) * lh; // 2 rows for status+cmd below
+        let panel_y = height - (total_rows + above_rows + below_rows) * lh;
 
         // Toolbar background
         let toolbar_bg = self.solid_brush(self.theme.tab_bar_bg);
@@ -3047,7 +3648,7 @@ impl<'a> DrawContext<'a> {
             // Left pane cells
             for (row_idx, row) in left_rows.iter().enumerate() {
                 let cy = content_y + row_idx as f32 * lh;
-                if cy + lh > height - 2.0 * lh {
+                if cy + lh > height - below_rows * lh {
                     break;
                 }
                 for (col_idx, cell) in row.iter().enumerate() {
@@ -3070,7 +3671,7 @@ impl<'a> DrawContext<'a> {
             let right_x = div_x + cw; // skip divider column
             for (row_idx, row) in term.rows.iter().enumerate() {
                 let cy = content_y + row_idx as f32 * lh;
-                if cy + lh > height - 2.0 * lh {
+                if cy + lh > height - below_rows * lh {
                     break;
                 }
                 for (col_idx, cell) in row.iter().enumerate() {
@@ -3085,7 +3686,7 @@ impl<'a> DrawContext<'a> {
             // Single pane
             for (row_idx, row) in term.rows.iter().enumerate() {
                 let cy = content_y + row_idx as f32 * lh;
-                if cy + lh > height - 2.0 * lh {
+                if cy + lh > height - below_rows * lh {
                     break;
                 }
                 for (col_idx, cell) in row.iter().enumerate() {
@@ -3456,6 +4057,11 @@ impl<'a> DrawContext<'a> {
             layout.GetMetrics(&mut metrics).expect("GetMetrics");
             metrics.width
         }
+    }
+
+    /// Approximate monospace text width using char_width × char count.
+    fn mono_text_width(&self, text: &str) -> f32 {
+        self.char_width * text.chars().count() as f32
     }
 
     fn solid_brush(&self, c: Color) -> ID2D1SolidColorBrush {
