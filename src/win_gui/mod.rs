@@ -4804,6 +4804,29 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             return;
         }
 
+        // Editor hover dwell: track mouse position over editor text for LSP hover popups.
+        // Only when not dragging anything and not over a popup.
+        if !lbutton
+            && !state.tab_dragging
+            && state.engine.context_menu.is_none()
+            && state.engine.menu_open_idx.is_none()
+        {
+            let mouse_on_popup = state
+                .popup_rects
+                .editor_hover
+                .as_ref()
+                .is_some_and(|r| r.contains(px, py));
+            if !mouse_on_popup {
+                if let Some((_wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+                    state.engine.editor_hover_mouse_move(line, col, false);
+                } else if state.engine.editor_hover.is_some()
+                    && !state.engine.editor_hover_has_focus
+                {
+                    state.engine.dismiss_editor_hover();
+                }
+            }
+        }
+
         // Cursor shape: resize arrow near sidebar edge or group divider
         let edge = state.sidebar.total_width();
         let near_sidebar = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
@@ -5273,8 +5296,21 @@ fn on_tick(hwnd: HWND) {
             needs_redraw = true;
         }
 
+        // Poll editor hover dwell timer (fires LSP hover request after delay)
+        if state.engine.poll_editor_hover() {
+            needs_redraw = true;
+        }
+
         // Poll terminals
         if state.engine.poll_terminal() {
+            needs_redraw = true;
+        }
+
+        // Run pending terminal commands (e.g. extension LSP/DAP installs).
+        if let Some(cmd) = state.engine.pending_terminal_command.take() {
+            let cols = 80; // updated by layout calculation on next frame
+            let rows = state.engine.session.terminal_panel_rows;
+            state.engine.terminal_run_command(&cmd, cols, rows);
             needs_redraw = true;
         }
 

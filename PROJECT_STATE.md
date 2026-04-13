@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 13, 2026 (Session 272 — Win-GUI git panel rendering parity, click/hover/double-click interactivity, tab scroll-into-view) | **Tests:** 5478
+**Last updated:** Apr 13, 2026 (Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover) | **Tests:** 5478
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 268 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 272 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,20 +26,22 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 272 — Win-GUI git panel rendering parity + tab scroll-into-view:**
+**Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover:**
 
-**Win-GUI git panel full renderer (rewrite):**
-1. **`draw_git_panel()` rewritten** (~300 lines, was ~100) — Full panel background fill, themed header with branch + ahead/behind, commit input box (multi-line with cursor), button row (Commit/Push/Pull/Sync with focus/hover states), 4 collapsible sections (Staged Changes, Changes, Worktrees, Recent Commits), selection highlight on focused item, file status coloring (added/deleted/modified), path truncation with ellipsis, scrollbar, hint bar ("Press '?' for help"), branch picker popup (search + create modes), help dialog overlay with 15 keybindings.
+**Critical LSP fix (Windows):**
+1. **`path_to_uri` broken on Windows** — Was producing `file://C:\path` (backslashes, two slashes) instead of RFC 3986 `file:///C:/path` (forward slashes, three slashes). rust-analyzer couldn't match hover/definition/diagnostic requests to known files, making all LSP features non-functional on Windows. Fixed URI generation and `uri_to_path` parsing.
 
-**Git panel click interactivity:**
-2. **Section item clicks** — Pixel-based Y coordinate mapping to `sc_visual_row_to_flat()` for section headers (expand/collapse) and file items (select).
-3. **Commit input click** — Clicking the commit message area activates input mode.
-4. **Button row clicks** — Commit/Push/Pull/Sync buttons dispatch via `handle_sc_key()`.
-5. **Double-click on files** — Opens diff split (or file for untracked) via `handle_sc_key("Return", ...)`.
-6. **Button hover tracking** — `on_mouse_move()` tracks mouse over button row, updates `sc_button_hovered` for visual highlight feedback.
-7. **Panel hover dwell** — `panel_hover_mouse_move("source_control", ...)` called on mouse move over section items, enabling commit log hover popups with full commit details. Dismiss on mouse-out (unless over popup).
+**Win-GUI hover popups:**
+2. **`editor_hover_mouse_move()` never called** — Added in `on_mouse_move` for editor area dwell tracking.
+3. **`poll_editor_hover()` never called** — Added in `on_tick` to fire the dwell timer and send LSP hover requests.
 
-**Tab bar scroll-into-view (Win-GUI bug fix):**
-8. **`set_tab_visible_count()` reporting** — Win-GUI now reports available tab bar width (in character columns) to the engine after each paint frame. Calls `ensure_all_groups_tabs_visible()` so newly opened tabs (e.g. from git diff) scroll into view. Previously `tab_bar_width` was never set, defaulting to `usize::MAX`, so `ensure_active_tab_visible()` was a no-op.
+**Extension install on Windows:**
+4. **Win-GUI never consumed `pending_terminal_command`** — Extension install terminal never opened. Added check in Win-GUI tick loop.
+5. **`terminal_run_command` used bash syntax on PowerShell** — Added PowerShell wrapper (`-Command`, `$LASTEXITCODE`, `Read-Host`) alongside existing bash wrapper.
+6. **`&&` invalid in PowerShell 5.x** — Changed install command separator to `;` (works in both bash and PowerShell).
+7. **Broken rustup proxy detection** — `binary_on_path` found proxy exe but it didn't work. Added `cargo_bin_probe_ok()` that runs `--version` to validate binaries in `~/.cargo/bin/`.
+8. **Rust extension install command** — Overridden on Windows from `cargo install rust-analyzer` to `rustup component add rust-analyzer`. Updated remote registry (`vimcode-ext`).
+9. **Install spinner never cleared** — `finalize_install_from_terminal` now calls `notify_done_by_kind`.
+10. **`lsp_did_open` called before install completes** — Skipped when install is pending.
 
-> Sessions 271 and earlier in **SESSION_HISTORY.md**.
+> Sessions 272 and earlier in **SESSION_HISTORY.md**.

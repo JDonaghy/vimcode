@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 271 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 272 archived here. Recent work summary in PROJECT_STATE.md.
+
+## Session 272 — Win-GUI git panel rendering parity + tab scroll-into-view
+Win-GUI git panel full renderer rewrite (~300 lines): themed header, commit input box, button row (Commit/Push/Pull/Sync with hover), 4 collapsible sections, selection highlight, file status coloring, scrollbar, branch picker popup, help dialog. Click interactivity: section items, commit input, buttons, double-click-to-open-diff. Button hover tracking. Panel hover dwell for commit log popups. Tab bar scroll-into-view fix (`set_tab_visible_count` reporting).
 
 ## Session 271 — Win-GUI extension panels + Nerd Font auto-detect + breadcrumb/tooltip fixes
 Win-GUI extension panel support: full `draw_ext_panel()` renderer (header, search input, flat rows with sections/items/badges/actions, scrollbar, help popup), activity bar ext panel icons (Segoe MDL2 mappings), click/keyboard/scroll handlers, `ext_panel_focus_pending` polling.

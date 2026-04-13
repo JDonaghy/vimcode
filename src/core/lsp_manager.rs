@@ -22,14 +22,75 @@ fn timestamp() -> String {
     format!("{secs}")
 }
 
+fn debug_log_path() -> PathBuf {
+    std::env::temp_dir().join("vimcode-lsp-debug.log")
+}
+
 pub fn install_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/vimcode-install.log")
+        .open(debug_log_path())
     {
-        let _ = writeln!(f, "{msg}");
-        let _ = writeln!(f, "---");
+        let _ = writeln!(f, "[{ts}] {msg}", ts = timestamp());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cargo-bin proxy validation (Windows)
+// ---------------------------------------------------------------------------
+
+/// On Windows, validate that a binary in `~/.cargo/bin/` actually works.
+/// Rustup installs proxy executables for components that aren't installed yet;
+/// these proxies exist on disk but exit with an error like "Unknown binary …
+/// in official toolchain".  A quick `--version` probe catches this.
+pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (path, binary);
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Only probe binaries found in ~/.cargo/bin/ — that's where rustup
+        // proxies live.  Binaries elsewhere are trusted as-is.
+        let cargo_bin = super::paths::home_dir().join(".cargo").join("bin");
+        let in_cargo_bin = path.parent().map(|p| p == cargo_bin).unwrap_or(false);
+        if !in_cargo_bin {
+            return true;
+        }
+
+        // Quick probe: run `<binary> --version` with a 3-second timeout.
+        use std::os::windows::process::CommandExt;
+        let result = std::process::Command::new(path)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    true
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    install_log(&format!(
+                        "[ext-check] PROBE FAILED for {binary} at {}: {}",
+                        path.display(),
+                        stderr.lines().next().unwrap_or("(no output)")
+                    ));
+                    false
+                }
+            }
+            Err(e) => {
+                install_log(&format!(
+                    "[ext-check] PROBE ERROR for {binary} at {}: {e}",
+                    path.display()
+                ));
+                false
+            }
+        }
     }
 }
 
@@ -285,14 +346,14 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
     ];
     for dir in &tool_dirs {
         let candidate = dir.join(binary);
-        if candidate.exists() {
+        if candidate.exists() && cargo_bin_probe_ok(&candidate, binary) {
             return Some(candidate);
         }
         // On Windows, also check with .exe suffix
         #[cfg(target_os = "windows")]
         if !binary.ends_with(".exe") {
             let exe = dir.join(format!("{binary}.exe"));
-            if exe.exists() {
+            if exe.exists() && cargo_bin_probe_ok(&exe, binary) {
                 return Some(exe);
             }
         }

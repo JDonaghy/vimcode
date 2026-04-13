@@ -3284,6 +3284,9 @@ fn binary_on_path(binary: &str) -> bool {
     for dir in std::env::split_paths(&path_var) {
         let full = dir.join(binary);
         if full.exists() {
+            if !super::lsp_manager::cargo_bin_probe_ok(&full, binary) {
+                continue;
+            }
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
                 full.display()
@@ -3295,6 +3298,9 @@ fn binary_on_path(binary: &str) -> bool {
         if !binary.ends_with(".exe") {
             let exe = dir.join(format!("{binary}.exe"));
             if exe.exists() {
+                if !super::lsp_manager::cargo_bin_probe_ok(&exe, binary) {
+                    continue;
+                }
                 super::lsp_manager::install_log(&format!(
                     "[ext-check] FOUND {binary}.exe at {}",
                     exe.display()

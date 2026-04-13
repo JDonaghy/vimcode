@@ -254,6 +254,8 @@ impl Engine {
     /// available on PATH and registers the LSP/DAP server if so.
     fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
         self.lsp_installing.remove(&ctx.install_key);
+        // Clear the "Installing …" spinner notification.
+        self.notify_done_by_kind(&NotificationKind::LspInstall, None);
 
         let ext_name = &ctx.ext_name;
         let manifest = self

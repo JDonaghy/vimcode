@@ -2,6 +2,12 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
+- **`x` with count + `.` repeat deletes too many characters** — Using `4x` to delete four characters, then moving to the next line and pressing `.` to repeat deletes more than four characters. The repeat count is not being preserved or restored correctly for the `x` command.
+
+- **Git panel operations have no progress indicator** — Commit, push, and pull operations in the git panel give no visual feedback that an operation is in progress. VSCode shows a spinner for a few seconds to confirm the action was triggered. VimCode should show a spinner (using the existing notification/progress system) while git operations are running.
+
+- **Git branch in status bar not updated on external change** — When the git branch is changed outside of VimCode (e.g. via CLI `git checkout`), the branch name in the status bar is not updated. Needs file watching on `.git/HEAD` or periodic polling to detect external branch switches.
+
 
 ### Win-GUI gaps (vs GTK reference) — found by systematic GTK↔Win-GUI comparison
 
