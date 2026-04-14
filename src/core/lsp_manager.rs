@@ -48,7 +48,7 @@ pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
     #[cfg(not(target_os = "windows"))]
     {
         let _ = (path, binary);
-        return true;
+        true
     }
     #[cfg(target_os = "windows")]
     {
