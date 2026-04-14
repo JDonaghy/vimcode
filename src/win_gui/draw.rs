@@ -14,6 +14,7 @@ use crate::render::{
 };
 
 use super::{SidebarPanel, WinSidebar};
+use crate::icons;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,8 @@ pub struct DrawContext<'a> {
     pub caption_hover: Option<usize>,
     /// Whether the window is currently maximized (affects the max/restore icon).
     pub is_maximized: bool,
+    /// True when icon_format uses "Symbols Nerd Font" (bundled) instead of Segoe MDL2.
+    pub nerd_icon_font: bool,
 }
 
 impl<'a> DrawContext<'a> {
@@ -486,11 +489,13 @@ impl<'a> DrawContext<'a> {
 
         let gutter_chars = rw.gutter_char_width;
         let gutter_px = gutter_chars as f32 * self.char_width;
+        let h_scroll_px = rw.scroll_left as f32 * self.char_width;
+        let text_x = rx + gutter_px - h_scroll_px;
 
         for (row_idx, line) in rw.lines.iter().enumerate() {
             let line_y = ry + (row_idx as f32) * self.line_height;
 
-            // Current line highlight
+            // Current line highlight (full width, not affected by scroll)
             if line.is_current_line && rw.cursorline && rw.is_active {
                 let cl_bg = self.solid_brush(self.theme.cursorline_bg);
                 unsafe {
@@ -506,7 +511,7 @@ impl<'a> DrawContext<'a> {
                 }
             }
 
-            // Gutter (line numbers)
+            // Gutter (line numbers — not affected by horizontal scroll)
             self.draw_text(
                 &line.gutter_text,
                 rx,
@@ -518,7 +523,7 @@ impl<'a> DrawContext<'a> {
                 },
             );
 
-            // Git gutter indicator
+            // Git gutter indicator (not affected by horizontal scroll)
             if let Some(ref diff) = line.git_diff {
                 let gutter_color = match diff {
                     crate::core::GitLineStatus::Added => self.theme.git_added,
@@ -538,23 +543,38 @@ impl<'a> DrawContext<'a> {
                     );
                 }
             }
+        }
 
-            // Selection highlight
+        // Clip text area (excludes gutter) so scrolled text doesn't bleed over line numbers
+        let text_clip_x = rx + gutter_px;
+        let text_clip_w = rw_w - gutter_px;
+        let text_clip_h = rw_h;
+        unsafe {
+            self.rt.PushAxisAlignedClip(
+                &rect_f(text_clip_x, ry, text_clip_w, text_clip_h),
+                D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
+
+        for (row_idx, line) in rw.lines.iter().enumerate() {
+            let line_y = ry + (row_idx as f32) * self.line_height;
+
+            // Selection highlight (scrolled with text)
             if let Some(ref sel) = rw.selection {
-                self.draw_selection_for_line(rw, line, row_idx, sel, rx + gutter_px, line_y);
+                self.draw_selection_for_line(rw, line, row_idx, sel, text_x, line_y);
             }
 
-            // Syntax-highlighted text spans
-            self.draw_styled_line(line, rx + gutter_px, line_y);
+            // Syntax-highlighted text spans (scrolled with text)
+            self.draw_styled_line(line, text_x, line_y);
 
-            // Diagnostic underlines (squiggles)
+            // Diagnostic underlines (scrolled with text)
             for diag in &line.diagnostics {
-                self.draw_diagnostic_underline(diag, rx + gutter_px, line_y);
+                self.draw_diagnostic_underline(diag, text_x, line_y);
             }
 
-            // Indent guides
+            // Indent guides (scrolled with text)
             for &guide_col in &line.indent_guides {
-                let gx = rx + gutter_px + guide_col as f32 * self.char_width;
+                let gx = text_x + guide_col as f32 * self.char_width;
                 let guide_brush = self.solid_brush_alpha(self.theme.line_number_fg, 0.3);
                 unsafe {
                     self.rt
@@ -562,19 +582,24 @@ impl<'a> DrawContext<'a> {
                 }
             }
 
-            // Ghost text (AI completions)
+            // Ghost text (scrolled with text)
             if let Some(ref ghost) = line.ghost_suffix {
                 let text_len = line.raw_text.trim_end_matches('\n').chars().count();
-                let gx = rx + gutter_px + text_len as f32 * self.char_width;
+                let gx = text_x + text_len as f32 * self.char_width;
                 self.draw_text(ghost, gx, line_y, self.theme.line_number_fg);
             }
 
-            // Inline annotation
+            // Inline annotation (scrolled with text)
             if let Some(ref ann) = line.annotation {
                 let text_len = line.raw_text.trim_end_matches('\n').chars().count();
-                let ax = rx + gutter_px + (text_len as f32 + 2.0) * self.char_width;
+                let ax = text_x + (text_len as f32 + 2.0) * self.char_width;
                 self.draw_text(ann, ax, line_y, self.theme.line_number_fg);
             }
+        }
+
+        // Pop text area clip
+        unsafe {
+            self.rt.PopAxisAlignedClip();
         }
 
         // Scrollbar (thin track on right edge)
@@ -605,6 +630,51 @@ impl<'a> DrawContext<'a> {
                 unsafe {
                     self.rt
                         .FillRectangle(&rect_f(sb_x, thumb_y, sb_width, thumb_h), &thumb_brush);
+                }
+            }
+        }
+
+        // Horizontal scrollbar (thin track at bottom of editor area)
+        {
+            let sb_height = super::SCROLLBAR_WIDTH;
+            let gutter_px = rw.gutter_char_width as f32 * self.char_width;
+            let has_v_scrollbar = rw.total_lines > rw.lines.len();
+            let v_sb_w = if has_v_scrollbar {
+                super::SCROLLBAR_WIDTH
+            } else {
+                0.0
+            };
+            let track_x = rx + gutter_px;
+            let track_w = rw.rect.width as f32 - gutter_px - v_sb_w;
+            let viewport_cols = (track_w / self.char_width).floor() as usize;
+            if rw.max_col > viewport_cols && track_w > 0.0 {
+                let editor_h = rw.rect.height as f32
+                    - if rw.status_line.is_some() {
+                        self.line_height
+                    } else {
+                        0.0
+                    };
+                let sb_y = ry + editor_h - sb_height;
+                // Track background
+                let track_brush = self.solid_brush(self.theme.scrollbar_track);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(track_x, sb_y, track_w, sb_height), &track_brush);
+                }
+                // Thumb
+                let ratio = viewport_cols as f32 / rw.max_col as f32;
+                let thumb_w = (track_w * ratio).max(20.0);
+                let max_scroll = rw.max_col.saturating_sub(viewport_cols);
+                let scroll_ratio = if max_scroll > 0 {
+                    rw.scroll_left as f32 / max_scroll as f32
+                } else {
+                    0.0
+                };
+                let thumb_x = track_x + scroll_ratio * (track_w - thumb_w);
+                let thumb_brush = self.solid_brush(self.theme.scrollbar_thumb);
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(thumb_x, sb_y, thumb_w, sb_height), &thumb_brush);
                 }
             }
         }
@@ -772,7 +842,8 @@ impl<'a> DrawContext<'a> {
         let rx = rw.rect.x as f32;
         let ry = rw.rect.y as f32;
         let gutter_px = rw.gutter_char_width as f32 * self.char_width;
-        let cx = rx + gutter_px + pos.col as f32 * self.char_width;
+        let h_scroll_px = rw.scroll_left as f32 * self.char_width;
+        let cx = rx + gutter_px + pos.col as f32 * self.char_width - h_scroll_px;
         let cy = ry + pos.view_line as f32 * self.line_height;
         let cursor_brush = self.solid_brush(self.theme.cursor);
 
@@ -2155,17 +2226,28 @@ impl<'a> DrawContext<'a> {
                 .FillRectangle(&rect_f(0.0, top, ab_w, rt_h - top), &ab_bg);
         }
 
-        // Activity bar icons — Segoe MDL2 Assets / Segoe Fluent Icons codepoints
-        // (these ship with Windows 10+ and render natively in DirectWrite)
+        // Activity bar icons — use Nerd Font codepoints when available (bundled
+        // vimcode-icons.ttf), fall back to Segoe MDL2 Assets / Segoe Fluent Icons.
         let icon_row_h = ab_w; // square cells matching the 48px activity bar width
-        let panels: &[(SidebarPanel, &str)] = &[
-            (SidebarPanel::Explorer, "\u{ED25}"),   // FileExplorer
-            (SidebarPanel::Search, "\u{E721}"),     // Search
-            (SidebarPanel::Debug, "\u{EBE8}"),      // Bug
-            (SidebarPanel::Git, "\u{E8D4}"),        // BranchFork2
-            (SidebarPanel::Extensions, "\u{EA86}"), // Puzzle
-            (SidebarPanel::Ai, "\u{E8BD}"),         // Chat
-        ];
+        let panels: &[(SidebarPanel, &str)] = if self.nerd_icon_font {
+            &[
+                (SidebarPanel::Explorer, icons::EXPLORER.nerd),
+                (SidebarPanel::Search, icons::SEARCH_COD.nerd),
+                (SidebarPanel::Debug, icons::DEBUG.nerd),
+                (SidebarPanel::Git, icons::GIT_BRANCH.nerd),
+                (SidebarPanel::Extensions, icons::EXTENSIONS.nerd),
+                (SidebarPanel::Ai, icons::AI_CHAT.nerd),
+            ]
+        } else {
+            &[
+                (SidebarPanel::Explorer, "\u{ED25}"),   // Segoe FileExplorer
+                (SidebarPanel::Search, "\u{E721}"),     // Segoe Search
+                (SidebarPanel::Debug, "\u{EBE8}"),      // Segoe Bug
+                (SidebarPanel::Git, "\u{E8D4}"),        // Segoe BranchFork2
+                (SidebarPanel::Extensions, "\u{EA86}"), // Segoe Puzzle
+                (SidebarPanel::Ai, "\u{E8BD}"),         // Segoe Chat
+            ]
+        };
 
         for (i, &(panel, icon)) in panels.iter().enumerate() {
             let y = top + i as f32 * icon_row_h;
@@ -2215,23 +2297,28 @@ impl<'a> DrawContext<'a> {
                             .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, icon_row_h), &sel);
                     }
                 }
-                // Map Nerd Font glyphs to Segoe MDL2 equivalents for Win-GUI.
-                // GTK renders these with the app font which has bundled Nerd Font
-                // glyphs, but Win-GUI's Consolas doesn't include them.
                 let icon_char = panel.resolved_icon();
-                let segoe_icon = match icon_char {
-                    '\u{f1d3}' => "\u{E81C}",              // git branch → History
-                    '\u{e702}' | '\u{e725}' => "\u{E8D4}", // git → BranchFork2
-                    '\u{f120}' | '\u{e795}' => "\u{E756}", // terminal → CommandPrompt
-                    '\u{f002}' | '\u{f422}' => "\u{E721}", // search → Search
-                    '\u{f07b}' | '\u{f07c}' => "\u{ED25}", // folder → FileExplorer
-                    '\u{f188}' => "\u{EBE8}",              // bug → Bug
-                    '\u{f085}' | '\u{e615}' => "\u{E713}", // cog → Settings
-                    '\u{f075}' | '\u{f27a}' => "\u{E8BD}", // comment → Chat
-                    _ => "\u{E74C}",                       // fallback → Page
+                let icon_str: String;
+                let icon_text = if self.nerd_icon_font {
+                    // Nerd Font available — render the glyph directly
+                    icon_str = String::from(icon_char);
+                    icon_str.as_str()
+                } else {
+                    // Map Nerd Font glyphs to Segoe MDL2 equivalents
+                    match icon_char {
+                        '\u{f1d3}' => "\u{E81C}",              // git branch → History
+                        '\u{e702}' | '\u{e725}' => "\u{E8D4}", // git → BranchFork2
+                        '\u{f120}' | '\u{e795}' => "\u{E756}", // terminal → CommandPrompt
+                        '\u{f002}' | '\u{f422}' => "\u{E721}", // search → Search
+                        '\u{f07b}' | '\u{f07c}' => "\u{ED25}", // folder → FileExplorer
+                        '\u{f188}' => "\u{EBE8}",              // bug → Bug
+                        '\u{f085}' | '\u{e615}' => "\u{E713}", // cog → Settings
+                        '\u{f075}' | '\u{f27a}' => "\u{E8BD}", // comment → Chat
+                        _ => "\u{E74C}",                       // fallback → Page
+                    }
                 };
                 self.draw_icon_text(
-                    segoe_icon,
+                    icon_text,
                     0.0,
                     y,
                     ab_w,
@@ -2257,8 +2344,13 @@ impl<'a> DrawContext<'a> {
                         .FillRectangle(&rect_f(2.0, y, ab_w - 2.0, icon_row_h), &sel);
                 }
             }
+            let gear_icon = if self.nerd_icon_font {
+                icons::SETTINGS.nerd
+            } else {
+                "\u{E713}" // Segoe Settings gear
+            };
             self.draw_icon_text(
-                "\u{E713}", // Settings gear
+                gear_icon,
                 0.0,
                 y,
                 ab_w,

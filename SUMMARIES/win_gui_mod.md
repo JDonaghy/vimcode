@@ -1,4 +1,4 @@
-# src/win_gui/mod.rs — Win-GUI Backend (5,999 lines)
+# src/win_gui/mod.rs — Win-GUI Backend (6,263 lines)
 
 Native Windows backend using windows-rs + Direct2D + DirectWrite. Behind `win-gui` Cargo feature.
 
@@ -6,7 +6,7 @@ Native Windows backend using windows-rs + Direct2D + DirectWrite. Behind `win-gu
 - `SidebarPanel` enum — Explorer, Search, Debug, Git, Extensions, Ai, Settings
 - `WinSidebar` — sidebar state: visible, active_panel, panel_width, explorer rows, scroll, ext_panel_name
 - `ExplorerRow` — depth, name, path, is_dir, is_expanded
-- `AppState` — engine, sidebar, render target, D2D/DWrite factories, fonts, cached slots, popup rects
+- `AppState` — engine, sidebar, render target, D2D/DWrite factories, fonts, cached slots, popup rects, nerd_icon_font flag
 - `TranslatedKey` — key_name, unicode, modifiers from WM_KEYDOWN
 
 ## Key Functions
@@ -15,7 +15,10 @@ Native Windows backend using windows-rs + Direct2D + DirectWrite. Behind `win-gu
 - `on_paint()` — computes window rects, builds ScreenLayout, calls draw_frame + draw_sidebar
 - `on_key_down()` — keyboard routing: ext panel, extensions, settings, search, AI, git, editor
 - `on_char()` — WM_CHAR routing for plain letter keys (same panel priority as on_key_down)
-- `on_mouse_down()` — click routing: dialog, context menu, title bar, nav arrows, activity bar, sidebar (explorer, git panel zones, extensions, search, debug, AI, ext panel), scrollbar, editor
+- `on_mouse_down()` — click routing: dialog, context menu, title bar, nav arrows, activity bar, sidebar (explorer, git panel zones, extensions, search, debug, AI, ext panel), vertical scrollbar, horizontal scrollbar, editor
+- `install_bundled_icon_font_windows()` — writes bundled Nerd Font TTF to per-user fonts dir + registry
+- `register_user_font()` — adds per-user font registry entry for DirectWrite visibility
+- `h_scrollbar_hit()` — horizontal scrollbar hit-test, returns window_id + new scroll_left
 - `on_mouse_dblclick()` — double-click: explorer (open permanent), git panel (open diff), extensions (open readme), editor (word select)
 - `on_mouse_move()` — hover: caption buttons, menu items, context menu, git panel buttons/items, tab tooltip, editor hover dwell (calls `editor_hover_mouse_move`)
 - `on_mouse_wheel()` — scroll routing: picker, hover, sidebar (ext panel, settings, AI, search, explorer), editor

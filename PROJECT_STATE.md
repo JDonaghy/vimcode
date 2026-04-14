@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 13, 2026 (Session 274 — Phase 2d behavioral parity tests, clippy CI fix) | **Tests:** 5494
+**Last updated:** Apr 13, 2026 (Session 275 — Win-GUI h-scrollbar, bundled Nerd Font, Phase 2c verification) | **Tests:** 5495
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 272 are in **SESSION_HISTORY.md**.
@@ -26,10 +26,10 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 274 — Phase 2d behavioral parity tests, clippy CI fix:**
+**Session 275 — Win-GUI horizontal scrollbar, bundled Nerd Font, Phase 2c source verification:**
 
-1. **Phase 2d behavioral backend parity tests** — 16 new end-to-end tests in `render.rs` that simulate user interaction sequences and verify engine state transitions. Covers: tab click/switch, tab close (clean + dirty gate), context menu lifecycle (open/confirm/dismiss), explorer/tab/editor context menu targets, double-click word selection, editor hover lifecycle (show/focus/scroll/dismiss), sidebar focus toggle + clear, terminal new/close/split, tab drag-drop to create splits, preview tab promotion via goto_tab, preview reuse invariant, mouse click cursor movement.
-2. **Clippy CI fix** — `return true` → `true` in `cargo_bin_probe_ok()` non-Windows cfg block (`lsp_manager.rs:51`). Fixed `needless_return` lint that broke the Linux CI build.
-3. **Updated `/complete-push` command** — Now requires clippy to pass on all feature configurations before pushing.
+1. **Win-GUI horizontal scrollbar drag** — Full horizontal scrollbar implementation: drawing (track + thumb at bottom of editor), `h_scrollbar_hit()` hit-testing, click-to-jump, drag-to-scroll via `h_scrollbar_drag` state, mouse-up cleanup. Text rendering now applies `scroll_left` offset (was missing — scrollbar moved but text stayed put). Added text-area clip rect to prevent scrolled text bleeding over gutter. Cursor also offset by `scroll_left`.
+2. **Win-GUI bundled Nerd Font via DirectWrite** — `install_bundled_icon_font_windows()` writes embedded 13KB `vimcode-icons.ttf` to `%LOCALAPPDATA%\Microsoft\Windows\Fonts\` (per-user, no admin). `register_user_font()` adds registry entry at `HKCU\...\Fonts`. `WM_FONTCHANGE` broadcast for same-session availability. `icon_text_format` now tries "Symbols Nerd Font" first, falls back to Segoe MDL2/Fluent. Activity bar and ext panel icons render native Nerd Font glyphs (using `icons::` constants matching GTK). Added `Win32_System_Registry` + `Win32_Security` Cargo features.
+3. **Phase 2c source-code verification** — `test_wingui_source_contains_required_calls` reads Win-GUI source files and greps for the engine method calls required by each `UiAction` variant (26 checks). Automated bug-finder: fails if a new action's required engine call is missing from source. Uses `CARGO_MANIFEST_DIR` for stable paths. 1 new test.
 
-> Sessions 273 and earlier in **SESSION_HISTORY.md**.
+> Sessions 274 and earlier in **SESSION_HISTORY.md**.

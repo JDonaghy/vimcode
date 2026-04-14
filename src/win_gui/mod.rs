@@ -281,6 +281,8 @@ struct AppState {
     ui_text_format: IDWriteTextFormat,
     /// Icon font for activity bar and toolbar icons (larger, tries Symbols Nerd Font).
     icon_text_format: IDWriteTextFormat,
+    /// True when icon_text_format uses "Symbols Nerd Font" (bundled) instead of Segoe MDL2.
+    nerd_icon_font: bool,
     render_target: Option<ID2D1HwndRenderTarget>,
     hwnd: HWND,
     char_width: f32,
@@ -308,6 +310,7 @@ struct AppState {
     mouse_text_drag: bool,
     sidebar_resize_drag: bool,
     scrollbar_drag: Option<WindowId>,
+    h_scrollbar_drag: Option<WindowId>,
     terminal_resize_drag: bool,
     /// Active group divider drag: split_index being dragged.
     group_divider_drag: Option<usize>,
@@ -349,6 +352,89 @@ thread_local! {
     static APP: RefCell<Option<AppState>> = const { RefCell::new(None) };
 }
 
+// ─── Bundled font installation ──────────────────────────────────────────────
+
+/// Install the bundled Nerd Font subset to the Windows per-user fonts directory
+/// so DirectWrite can find it by family name. Returns `true` if the font file is
+/// in place (already existed or was successfully written). Mirrors the GTK
+/// approach of installing to `~/.local/share/fonts/` on Linux.
+fn install_bundled_icon_font_windows() -> bool {
+    static FONT_BYTES: &[u8] = include_bytes!("../../data/fonts/vimcode-icons.ttf");
+
+    let local = match std::env::var("LOCALAPPDATA") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => return false,
+    };
+    let fonts_dir = local.join("Microsoft\\Windows\\Fonts");
+    let _ = std::fs::create_dir_all(&fonts_dir);
+    let dest = fonts_dir.join("vimcode-icons.ttf");
+
+    // Skip write if the file already exists with the correct size.
+    if dest.exists() {
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            if meta.len() == FONT_BYTES.len() as u64 {
+                // File already installed — ensure registry entry exists
+                register_user_font(&dest);
+                return true;
+            }
+        }
+    }
+
+    if std::fs::write(&dest, FONT_BYTES).is_ok() {
+        register_user_font(&dest);
+        // Broadcast font change so DirectWrite picks it up in this session
+        unsafe {
+            let _ = SendMessageW(
+                HWND_BROADCAST,
+                WM_FONTCHANGE,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Register a per-user font in the registry so DirectWrite sees it.
+fn register_user_font(font_path: &std::path::Path) {
+    use windows::Win32::System::Registry::*;
+
+    let key_path = w!("Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+    let mut hkey = HKEY::default();
+    let result = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_path,
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if result.is_err() {
+        return;
+    }
+
+    let value_name = w!("Symbols Nerd Font (TrueType)");
+    let path_str: Vec<u16> = font_path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let data_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(path_str.as_ptr() as *const u8, path_str.len() * 2) };
+
+    unsafe {
+        let _ = RegSetValueExW(hkey, value_name, Some(0), REG_SZ, Some(data_bytes));
+        let _ = RegCloseKey(hkey);
+    }
+}
+
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 pub fn run(file_path: Option<PathBuf>) {
@@ -364,8 +450,13 @@ pub fn run(file_path: Option<PathBuf>) {
 
     let mut engine = Engine::new();
     engine.menu_bar_visible = true;
-    // Auto-detect Nerd Font availability on Windows
-    let nerd_font_missing = engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
+
+    // Install the bundled Nerd Font subset so DirectWrite can find it.
+    let bundled_font_installed = install_bundled_icon_font_windows();
+
+    // Auto-detect Nerd Font availability on Windows (bundled font counts)
+    let nerd_available = bundled_font_installed || icons::detect_nerd_font_windows();
+    let nerd_font_missing = engine.settings.use_nerd_fonts && !nerd_available;
     if nerd_font_missing {
         engine.settings.use_nerd_fonts = false;
     }
@@ -467,15 +558,28 @@ pub fn run(file_path: Option<PathBuf>) {
     }
     .expect("CreateTextFormat for UI font");
 
-    // Icon text format for activity bar — use "Segoe Fluent Icons" (Win11) or
-    // "Segoe MDL2 Assets" (Win10+). These ship with Windows and have standard
-    // icon codepoints. GDI-registered fonts are NOT visible to DirectWrite, so
-    // we can't use the bundled Nerd Font TTF here.
+    // Icon text format for activity bar — try the bundled "Symbols Nerd Font"
+    // first (installed to per-user fonts above), then fall back to Windows icon
+    // fonts (Segoe Fluent Icons on Win11, Segoe MDL2 Assets on Win10+).
     let icon_font_size = 20.0 * dpi_scale; // 20px — matches GTK's 24px visually
+    let nerd_icon_font = bundled_font_installed
+        && unsafe {
+            dwrite_factory
+                .CreateTextFormat(
+                    w!("Symbols Nerd Font"),
+                    None,
+                    DWRITE_FONT_WEIGHT_REGULAR,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    icon_font_size,
+                    w!("en-us"),
+                )
+                .is_ok()
+        };
     let icon_text_format: IDWriteTextFormat = unsafe {
-        dwrite_factory
-            .CreateTextFormat(
-                w!("Segoe Fluent Icons"),
+        if nerd_icon_font {
+            dwrite_factory.CreateTextFormat(
+                w!("Symbols Nerd Font"),
                 None,
                 DWRITE_FONT_WEIGHT_REGULAR,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -483,9 +587,10 @@ pub fn run(file_path: Option<PathBuf>) {
                 icon_font_size,
                 w!("en-us"),
             )
-            .or_else(|_| {
-                dwrite_factory.CreateTextFormat(
-                    w!("Segoe MDL2 Assets"),
+        } else {
+            dwrite_factory
+                .CreateTextFormat(
+                    w!("Segoe Fluent Icons"),
                     None,
                     DWRITE_FONT_WEIGHT_REGULAR,
                     DWRITE_FONT_STYLE_NORMAL,
@@ -493,18 +598,29 @@ pub fn run(file_path: Option<PathBuf>) {
                     icon_font_size,
                     w!("en-us"),
                 )
-            })
-            .or_else(|_| {
-                dwrite_factory.CreateTextFormat(
-                    w!("Consolas"),
-                    None,
-                    DWRITE_FONT_WEIGHT_REGULAR,
-                    DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    icon_font_size,
-                    w!("en-us"),
-                )
-            })
+                .or_else(|_| {
+                    dwrite_factory.CreateTextFormat(
+                        w!("Segoe MDL2 Assets"),
+                        None,
+                        DWRITE_FONT_WEIGHT_REGULAR,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        icon_font_size,
+                        w!("en-us"),
+                    )
+                })
+                .or_else(|_| {
+                    dwrite_factory.CreateTextFormat(
+                        w!("Consolas"),
+                        None,
+                        DWRITE_FONT_WEIGHT_REGULAR,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        icon_font_size,
+                        w!("en-us"),
+                    )
+                })
+        }
     }
     .expect("CreateTextFormat for icon font");
     unsafe {
@@ -526,6 +642,7 @@ pub fn run(file_path: Option<PathBuf>) {
             text_format,
             ui_text_format,
             icon_text_format,
+            nerd_icon_font,
             render_target: None,
             hwnd,
             char_width,
@@ -542,6 +659,7 @@ pub fn run(file_path: Option<PathBuf>) {
             mouse_text_drag: false,
             sidebar_resize_drag: false,
             scrollbar_drag: None,
+            h_scrollbar_drag: None,
             terminal_resize_drag: false,
             group_divider_drag: None,
             terminal_text_drag: false,
@@ -1089,6 +1207,7 @@ fn on_paint(hwnd: HWND) {
             tab_tooltip_x: state.tab_tooltip_x,
             caption_hover: state.caption_hover,
             is_maximized: is_maximized(state.hwnd),
+            nerd_icon_font: state.nerd_icon_font,
         };
 
         unsafe {
@@ -3001,6 +3120,75 @@ fn scrollbar_hit(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize)
     None
 }
 
+/// Check if (px, py) is inside a horizontal scrollbar track; if so, return the
+/// window ID and the new `scroll_left` for that click position.
+fn h_scrollbar_hit(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize)> {
+    let lh = state.line_height;
+    let cw = state.char_width;
+    for cwr in &state.cached_window_rects {
+        let rx = cwr.rect.x as f32;
+        let ry = cwr.rect.y as f32;
+        let rw_px = cwr.rect.width as f32;
+        let rh_px = cwr.rect.height as f32;
+        let gutter_px = cwr.gutter_chars as f32 * cw;
+
+        let w = state.engine.windows.get(&cwr.window_id);
+        let max_col = w.map_or(0, |w| {
+            let bid = w.buffer_id;
+            state.engine.buffer_manager.get(bid).map_or(0, |bs| {
+                let mut mc = 0usize;
+                for i in 0..bs.buffer.len_lines() {
+                    let line_len = bs.buffer.content.line(i).len_chars();
+                    if line_len > mc {
+                        mc = line_len;
+                    }
+                }
+                mc
+            })
+        });
+
+        let has_v_scrollbar = {
+            let total_lines = w.map_or(1, |w| {
+                let bid = w.buffer_id;
+                state
+                    .engine
+                    .buffer_manager
+                    .get(bid)
+                    .map_or(1, |bs| bs.buffer.len_lines())
+            });
+            let has_status = w.is_some_and(|_| state.engine.settings.window_status_line);
+            let editor_h = rh_px - if has_status { lh } else { 0.0 };
+            let viewport_lines = (editor_h / lh).floor() as usize;
+            total_lines > viewport_lines
+        };
+
+        let v_sb_w = if has_v_scrollbar {
+            SCROLLBAR_WIDTH
+        } else {
+            0.0
+        };
+        let track_x = rx + gutter_px;
+        let track_w = rw_px - gutter_px - v_sb_w;
+        let viewport_cols = (track_w / cw).floor() as usize;
+
+        if max_col <= viewport_cols || track_w <= 0.0 {
+            continue; // no horizontal scrollbar for this window
+        }
+
+        let has_status = w.is_some_and(|_| state.engine.settings.window_status_line);
+        let editor_h = rh_px - if has_status { lh } else { 0.0 };
+        let sb_y = ry + editor_h - SCROLLBAR_WIDTH;
+
+        if px >= track_x && px < track_x + track_w && py >= sb_y && py < sb_y + SCROLLBAR_WIDTH {
+            let max_scroll = max_col.saturating_sub(viewport_cols);
+            let ratio = ((px - track_x) / track_w).clamp(0.0, 1.0);
+            let new_left = ((ratio * max_scroll as f32) as usize).min(max_scroll);
+            return Some((cwr.window_id, new_left));
+        }
+    }
+    None
+}
+
 fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
     let (px, py) = lparam_xy(lparam);
     let ix = (lparam.0 & 0xFFFF) as i16;
@@ -3571,11 +3759,21 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
-        // ── Scrollbar click-to-jump ──────────────────────────────────────
+        // ── Scrollbar click-to-jump (vertical) ──────────────────────────
         if let Some((wid, new_top)) = scrollbar_hit(state, px, py) {
             state.scrollbar_drag = Some(wid);
             state.engine.set_scroll_top_for_window(wid, new_top);
             state.engine.sync_scroll_binds();
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Horizontal scrollbar click-to-jump ──────────────────────────
+        if let Some((wid, new_left)) = h_scrollbar_hit(state, px, py) {
+            state.h_scrollbar_drag = Some(wid);
+            state.engine.set_scroll_left_for_window(wid, new_left);
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -4233,6 +4431,7 @@ fn on_mouse_up(hwnd: HWND) {
         state.mouse_text_drag = false;
         state.sidebar_resize_drag = false;
         state.scrollbar_drag = None;
+        state.h_scrollbar_drag = None;
         state.terminal_split_drag = false;
         state.group_divider_drag = None;
         // Auto-copy terminal selection on mouse release
@@ -4514,6 +4713,71 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 return;
             } else {
                 state.scrollbar_drag = None;
+            }
+        }
+
+        // Horizontal scrollbar drag in progress
+        if let Some(wid) = state.h_scrollbar_drag {
+            if lbutton {
+                if let Some(cwr) = state
+                    .cached_window_rects
+                    .iter()
+                    .find(|c| c.window_id == wid)
+                {
+                    let cw = state.char_width;
+                    let gutter_px = cwr.gutter_chars as f32 * cw;
+                    let rw_px = cwr.rect.width as f32;
+                    let rh_px = cwr.rect.height as f32;
+                    let lh = state.line_height;
+
+                    let w = state.engine.windows.get(&wid);
+                    let total_lines = w.map_or(1, |w| {
+                        let bid = w.buffer_id;
+                        state
+                            .engine
+                            .buffer_manager
+                            .get(bid)
+                            .map_or(1, |bs| bs.buffer.len_lines())
+                    });
+                    let has_status = state.engine.settings.window_status_line;
+                    let editor_h = rh_px - if has_status { lh } else { 0.0 };
+                    let viewport_lines = (editor_h / lh).floor() as usize;
+                    let has_v_scrollbar = total_lines > viewport_lines;
+                    let v_sb_w = if has_v_scrollbar {
+                        SCROLLBAR_WIDTH
+                    } else {
+                        0.0
+                    };
+
+                    let track_x = cwr.rect.x as f32 + gutter_px;
+                    let track_w = rw_px - gutter_px - v_sb_w;
+                    let viewport_cols = (track_w / cw).floor() as usize;
+
+                    let max_col = w.map_or(0, |w| {
+                        let bid = w.buffer_id;
+                        state.engine.buffer_manager.get(bid).map_or(0, |bs| {
+                            let mut mc = 0usize;
+                            for i in 0..bs.buffer.len_lines() {
+                                let line_len = bs.buffer.content.line(i).len_chars();
+                                if line_len > mc {
+                                    mc = line_len;
+                                }
+                            }
+                            mc
+                        })
+                    });
+                    let max_scroll = max_col.saturating_sub(viewport_cols);
+                    let rel_x = (px - track_x).clamp(0.0, track_w);
+                    let ratio = if track_w > 0.0 { rel_x / track_w } else { 0.0 };
+                    let new_left = ((ratio * max_scroll as f32) as usize).min(max_scroll);
+                    state.engine.set_scroll_left_for_window(wid, new_left);
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                return;
+            } else {
+                state.h_scrollbar_drag = None;
             }
         }
 

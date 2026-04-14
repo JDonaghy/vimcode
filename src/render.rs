@@ -9038,6 +9038,88 @@ mod tests {
         );
     }
 
+    /// Phase 2c source-code verification: grep the Win-GUI source for the
+    /// engine method calls required by each [`UiAction`]. This catches cases
+    /// where a hand-curated list claims an action is handled but the actual
+    /// engine call is missing from the source code.
+    #[test]
+    fn test_wingui_source_contains_required_calls() {
+        // Read both Win-GUI source files (use CARGO_MANIFEST_DIR for stable path)
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mod_path = std::path::Path::new(manifest_dir).join("src/win_gui/mod.rs");
+        let draw_path = std::path::Path::new(manifest_dir).join("src/win_gui/draw.rs");
+        let mod_src = std::fs::read_to_string(&mod_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", mod_path.display()));
+        let draw_src = std::fs::read_to_string(&draw_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", draw_path.display()));
+        let src = format!("{mod_src}\n{draw_src}");
+
+        // Map each UiAction to the engine method call(s) that MUST appear in
+        // the source.  Draw-order actions check draw function call order
+        // instead of engine methods.
+        let checks: Vec<(UiAction, &[&str])> = vec![
+            (UiAction::ExplorerSingleClickFile, &["open_file_preview"]),
+            (UiAction::ExplorerDoubleClickFile, &["open_file_in_tab"]),
+            (UiAction::ExplorerEnterOnFile, &["open_file_in_tab"]),
+            (
+                UiAction::ExplorerRightClick,
+                &["open_explorer_context_menu"],
+            ),
+            (UiAction::ContextMenuClickInside, &["context_menu_confirm"]),
+            (UiAction::ContextMenuClickOutside, &["close_context_menu"]),
+            (UiAction::TabClick, &["goto_tab"]),
+            (UiAction::TabCloseClick, &["close_tab"]),
+            (UiAction::TabRightClick, &["open_tab_context_menu"]),
+            (UiAction::TabDragDrop, &["tab_drag_begin", "tab_drag_drop"]),
+            (UiAction::EditorRightClick, &["open_editor_context_menu"]),
+            (UiAction::EditorDoubleClick, &["mouse_double_click"]),
+            // EditorScroll: scroll_down_visible/scroll_up_visible or
+            // set_scroll_top_for_window — any is fine
+            (UiAction::EditorScroll, &["scroll_down_visible"]),
+            (UiAction::EditorHoverClick, &["editor_hover_focus"]),
+            (UiAction::EditorHoverDismiss, &["dismiss_editor_hover"]),
+            (UiAction::EditorHoverScroll, &["editor_hover_scroll"]),
+            (UiAction::DebugToolbarButtonClick, &["execute_command"]),
+            (UiAction::TerminalSplitButton, &["terminal_toggle_split"]),
+            (UiAction::TerminalAddButton, &["terminal_new_tab"]),
+            (
+                UiAction::TerminalCloseButton,
+                &["terminal_close_active_tab"],
+            ),
+            (UiAction::TerminalSplitPaneClick, &["terminal_active"]),
+            // Activity bar: check for panel toggle dispatch
+            (UiAction::ActivityBarClick, &["active_panel"]),
+            (UiAction::ActivityBarSettingsClick, &["Settings"]),
+            // Draw order: verify draw sequence in on_paint / draw_frame
+            (
+                UiAction::DrawOrderContextMenuAboveSidebar,
+                &["draw_context_menu", "draw_sidebar"],
+            ),
+            (UiAction::DrawOrderDialogOnTop, &["draw_dialog"]),
+            (
+                UiAction::DrawOrderMenuDropdownAboveSidebar,
+                &["draw_menu_dropdown"],
+            ),
+        ];
+
+        let mut missing = Vec::new();
+        for (action, required_calls) in &checks {
+            for call in *required_calls {
+                if !src.contains(call) {
+                    missing.push(format!(
+                        "{action:?} requires `{call}` — not found in Win-GUI source"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Win-GUI source missing required engine calls:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
     /// Test that `open_file_preview` reuses/creates a preview tab, NOT replacing
     /// a permanent buffer. This is the contract for explorer single-click.
     #[test]

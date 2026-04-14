@@ -55,7 +55,7 @@
 **Low (missing features):**
 - ~~**Win-GUI: breadcrumb clicks not handled**~~ — Fixed: clicking breadcrumb segments opens scoped picker (directory→file picker, symbol→@picker).
 - ~~**Win-GUI: group divider drag not implemented**~~ — Fixed: cached dividers from ScreenLayout; full drag-to-resize with cursor change.
-- **Win-GUI: horizontal scrollbar drag not implemented** — Horizontal scrollbar renders but is not interactive. GTK has h-scrollbar click and drag. Win-GUI only handles vertical scrollbar drag.
+- ~~**Win-GUI: horizontal scrollbar drag not implemented**~~ — Fixed: full h-scrollbar interaction (draw, hit-test, click-to-jump, drag). Text rendering applies `scroll_left` offset with text-area clip rect. Cursor also offset.
 - ~~**Win-GUI: diff toolbar buttons not clickable**~~ — Fixed: ↑/↓/≡ button click handlers dispatch to `jump_prev_hunk()`/`jump_next_hunk()`/`diff_toggle_hide_unchanged()`.
 - ~~**Win-GUI: diff peek key routing missing**~~ — Already working: keys route through `handle_key()` → `handle_diff_peek_key()`.
 - ~~**Win-GUI: tab tooltip dismiss-on-mouseout missing**~~ — Fixed: mouse hover shows file path, mouseout clears tooltip.

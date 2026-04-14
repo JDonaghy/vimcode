@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 273 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 274 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 274 — Phase 2d behavioral parity tests, clippy CI fix:**
+Phase 2d behavioral backend parity tests — 16 new end-to-end tests in `render.rs` simulating user interaction sequences (tab click/close, context menus, double-click, hover lifecycle, sidebar focus, terminal ops, tab drag-drop, preview promotion). Clippy CI fix (`needless_return` in `lsp_manager.rs`). Updated `/complete-push` command to require clippy on all feature configs.
 
 **Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover:**
 Critical LSP fix: `path_to_uri` produced backslash URIs (`file://C:\path`) instead of RFC 3986 (`file:///C:/path`), breaking all LSP on Windows. Win-GUI hover: added `editor_hover_mouse_move()` + `poll_editor_hover()`. Extension install fixes: Win-GUI `pending_terminal_command`, PowerShell terminal wrapper, `&&`→`;`, rustup proxy detection (`cargo_bin_probe_ok`), rust-analyzer install via `rustup component add`, install spinner clear, `lsp_did_open` skip when install pending.
