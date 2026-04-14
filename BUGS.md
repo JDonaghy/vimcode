@@ -8,6 +8,17 @@
 
 - **Git branch in status bar not updated on external change** — When the git branch is changed outside of VimCode (e.g. via CLI `git checkout`), the branch name in the status bar is not updated. Needs file watching on `.git/HEAD` or periodic polling to detect external branch switches.
 
+- **Win-GUI: closing maximized window passes click through to window behind** — When vimcode-win is maximized and the user clicks the X (close) button, the window closes but the click also reaches the window underneath (e.g. another editor or browser), which may also close or activate. The close button handler likely doesn't consume the mouse event properly. Needs investigation of `WM_CLOSE`/`DestroyWindow` interaction with `ReleaseCapture` and whether the click propagates to the next window in the Z-order.
+
+- **TUI (vcd) find/replace dialog — multiple issues:**
+  1. **Selected text not populated** — Opening the find dialog with visually selected text does not populate the find box (works in Win-GUI but not TUI).
+  2. **"Find in selection" (≡) button broken** — Pressing the ≡ button closes the dialog instead of toggling selection mode. The button does highlight when clicking the left edge, suggesting a hit-test geometry mismatch. When it IS lit, search is not restricted to the selection — instead it extends the visual selection as next/prev match jumps the cursor.
+  3. **No × close button visible** — The × button is not rendering or is pushed off the edge of the panel.
+  4. **No mouse text selection in inputs** — Cannot drag-to-select, double-click-to-select-word, or Ctrl+A to select-all in the find/replace input fields (all three work in Win-GUI but not TUI).
+  5. **GTK version likely has the same gaps** — The mouse interaction features (drag-select, double-click word select, cached hit-rect approach) were only implemented for Win-GUI. GTK and TUI need the same treatment.
+
+  **Root cause:** Mouse interaction logic (drag-to-select, double-click word select, cached panel rect for accurate hit-testing) was implemented only in the Win-GUI backend. The TUI and GTK backends compute hit-test coordinates independently from the draw code, leading to geometry mismatches. The fix should centralize the hit-test geometry into the `FindReplacePanel` render struct (already has `group_bounds`) so all backends use the same source of truth. See plan item below.
+
 
 ### Win-GUI gaps (vs GTK reference) — found by systematic GTK↔Win-GUI comparison
 

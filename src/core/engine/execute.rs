@@ -1896,21 +1896,14 @@ impl Engine {
                 EngineAction::None
             }
             "find" => {
-                // Open incremental forward search (same as pressing /)
-                self.mode = Mode::Search;
-                self.command_buffer.clear();
-                self.search_direction = SearchDirection::Forward;
-                self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false;
-                self.count = None;
+                // Open the unified find/replace overlay
+                self.open_find_replace();
                 EngineAction::None
             }
             "replace" => {
-                // Open ex command mode pre-filled with %s/ for find & replace
-                self.mode = Mode::Command;
-                self.command_buffer = "%s/".to_string();
-                self.command_cursor = self.command_buffer.chars().count();
-                self.count = None;
+                // Open the unified find/replace overlay with replace row visible
+                self.open_find_replace();
+                self.find_replace_show_replace = true;
                 EngineAction::None
             }
             "sidebar" => EngineAction::ToggleSidebar,

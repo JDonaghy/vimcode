@@ -924,6 +924,18 @@ pub enum SearchDirection {
     Backward, // Last search was '?'
 }
 
+/// Toggle options for the inline find/replace overlay (Ctrl+F).
+#[derive(Debug, Clone, Default)]
+pub struct FindReplaceOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+    /// Replace preserving the case pattern of the match (e.g. "Foo"→"Bar", "FOO"→"BAR").
+    pub preserve_case: bool,
+    /// Only search within the current visual selection range.
+    pub in_selection: bool,
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
@@ -2247,6 +2259,27 @@ pub struct Engine {
     /// Saves the user's in-progress query when they start browsing history.
     pub picker_history_typing_buffer: String,
 
+    // --- Find/Replace overlay (Ctrl+F) ---
+    /// Whether the find/replace overlay is open.
+    pub find_replace_open: bool,
+    /// Current text in the find input field.
+    pub find_replace_query: String,
+    /// Current text in the replace input field.
+    pub find_replace_replacement: String,
+    /// Whether the replace row is visible.
+    pub find_replace_show_replace: bool,
+    /// Which input field has focus: 0 = find, 1 = replace.
+    pub find_replace_focus: u8,
+    /// Cursor position within the focused input field (char offset).
+    pub find_replace_cursor: usize,
+    /// Selection anchor in the focused input field (char offset). When Some and != cursor,
+    /// the text between anchor and cursor is selected. Typing replaces it.
+    pub find_replace_sel_anchor: Option<usize>,
+    /// Search options for the find/replace overlay.
+    pub find_replace_options: FindReplaceOptions,
+    /// Char range for "find in selection" mode: (start_char, end_char).
+    pub find_replace_selection_range: Option<(usize, usize)>,
+
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
     pub breadcrumb_focus: bool,
@@ -2876,6 +2909,15 @@ impl Engine {
             jump_list: Vec::new(),
             jump_list_pos: 0,
             search_word_bounded: false,
+            find_replace_open: false,
+            find_replace_query: String::new(),
+            find_replace_replacement: String::new(),
+            find_replace_show_replace: false,
+            find_replace_focus: 0,
+            find_replace_cursor: 0,
+            find_replace_sel_anchor: None,
+            find_replace_options: FindReplaceOptions::default(),
+            find_replace_selection_range: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,

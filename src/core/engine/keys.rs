@@ -142,6 +142,12 @@ impl Engine {
             }
         }
 
+        // Find/replace overlay intercepts all keys when open.
+        if self.find_replace_open {
+            self.handle_find_replace_key(key_name, unicode, ctrl, false);
+            return EngineAction::None;
+        }
+
         // Unified picker intercepts all keys when open.
         if self.picker_open {
             return self.handle_picker_key(key_name, unicode, ctrl);
@@ -270,6 +276,19 @@ impl Engine {
         // Capture cursor position before dispatching (used by cursor_move hook below).
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
+
+        // Ctrl+F: open find/replace from any mode (Visual captures the selection)
+        if ctrl
+            && key_name == "f"
+            && self.settings.ctrl_f_action == "find"
+            && matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Insert
+            )
+        {
+            self.open_find_replace();
+            return EngineAction::None;
+        }
 
         match self.mode {
             Mode::Normal => {
@@ -600,6 +619,11 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "f" => {
+                    if self.settings.ctrl_f_action == "find" {
+                        // Open find/replace overlay
+                        self.open_find_replace();
+                        return EngineAction::None;
+                    }
                     // Full page down (fold-aware)
                     let count = self.take_count();
                     let viewport = self.viewport_lines();

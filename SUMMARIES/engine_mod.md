@@ -1,4 +1,4 @@
-# src/core/engine/mod.rs — 3,624 lines
+# src/core/engine/mod.rs — 3,763 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
 
@@ -10,6 +10,7 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `StatusAction` — enum for clickable status bar segments (GoToLine, ChangeLanguage, ChangeIndentation, ChangeLineEnding, ChangeEncoding, SwitchBranch, LspInfo, ToggleSidebar, TogglePanel, ToggleMenuBar, DismissNotifications)
 - `NotificationKind` — enum for background operation types (LspInstall, LspIndexing, ExtensionInstall, GitOperation, ProjectSearch, ProjectReplace)
 - `Notification` — background operation tracking (id, kind, message, done, created_at, done_at)
+- `FindReplaceOptions` — toggle options for Ctrl+F overlay (case_sensitive, whole_word, use_regex, preserve_case, in_selection)
 - `Dialog` / `DialogButton` / `DialogInput` — modal dialog system
 - `PaletteCommand` — command palette entry (includes "Go: Command Center")
 - `DiffLine` / `AlignedDiffEntry` — diff display types

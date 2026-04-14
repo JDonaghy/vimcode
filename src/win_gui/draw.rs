@@ -1341,6 +1341,236 @@ impl<'a> DrawContext<'a> {
         }
     }
 
+    /// Draw the find/replace overlay (VSCode layout).
+    /// Returns cached geometry for click handling.
+    pub(super) fn draw_find_replace(
+        &self,
+        panel: &crate::render::FindReplacePanel,
+    ) -> super::FindReplaceRect {
+        let cw = self.char_width;
+        let lh = self.line_height;
+        let pad = 4.0;
+        let btn_s = lh; // square button size
+
+        // Layout: [chevron] [input 25ch] [Aa][ab][.*] [count] [↑][↓][≡][×]
+        let input_w = 25.0 * cw;
+        let toggles_w = 3.0 * (btn_s + 2.0); // Aa, ab, .*
+        let info_w = 9.0 * cw; // "99 of 999"
+        let nav_w = 4.0 * (btn_s + 2.0); // ↑ ↓ ≡ ×
+        let chevron_w = cw * 1.5;
+        let panel_w = chevron_w + input_w + pad + toggles_w + info_w + nav_w + pad;
+
+        let row_count = if panel.show_replace { 2.0 } else { 1.0 };
+        let panel_h = lh * row_count + pad * (row_count + 1.0);
+
+        // Position: top-right of active editor group
+        let gb = &panel.group_bounds;
+        let group_right = gb.x as f32 + gb.width as f32;
+        let x = (group_right - panel_w - 4.0).max(gb.x as f32);
+        let y = gb.y as f32 + pad;
+
+        // Background & border
+        let bg = self.solid_brush(self.theme.completion_bg);
+        let border = self.solid_brush(self.theme.separator);
+        unsafe {
+            self.rt.FillRectangle(&rect_f(x, y, panel_w, panel_h), &bg);
+            self.rt
+                .DrawRectangle(&rect_f(x, y, panel_w, panel_h), &border, 1.0, None);
+        }
+
+        let accent = self.solid_brush(self.theme.tab_active_accent);
+        let input_bg = self.solid_brush(self.theme.background);
+        let dim_fg = self.theme.foreground;
+        let btn_bg = self.solid_brush(self.theme.status_bg);
+
+        // --- Find row ---
+        let row_y = y + pad;
+        let chevron = if panel.show_replace { "▼" } else { "▶" };
+        self.draw_text(chevron, x + 2.0, row_y, dim_fg);
+        let input_x = x + chevron_w;
+
+        // Find input
+        unsafe {
+            self.rt
+                .FillRectangle(&rect_f(input_x, row_y, input_w, lh), &input_bg);
+            self.rt
+                .DrawRectangle(&rect_f(input_x, row_y, input_w, lh), &border, 0.5, None);
+        }
+        self.draw_text(&panel.query, input_x + 2.0, row_y, dim_fg);
+        if panel.focus == 0 {
+            // Draw selection highlight if any
+            if let Some(anchor) = panel.sel_anchor {
+                let sel_start = anchor.min(panel.cursor);
+                let sel_end = anchor.max(panel.cursor);
+                if sel_start != sel_end {
+                    let sx = input_x + 2.0 + sel_start as f32 * cw;
+                    let sw = (sel_end - sel_start) as f32 * cw;
+                    let sel_brush = self.solid_brush_alpha(self.theme.selection, 0.5);
+                    unsafe {
+                        self.rt
+                            .FillRectangle(&rect_f(sx, row_y, sw, lh), &sel_brush);
+                    }
+                }
+            }
+            // Cursor
+            let cursor_x = input_x + 2.0 + panel.cursor as f32 * cw;
+            let cursor_brush = self.solid_brush(dim_fg);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(cursor_x, row_y + 1.0, 2.0, lh - 2.0), &cursor_brush);
+            }
+        }
+
+        // Toggle buttons: [Aa] [ab] [.*]
+        let mut bx = input_x + input_w + pad;
+        for (label, active) in [
+            ("Aa", panel.case_sensitive),
+            ("ab", panel.whole_word),
+            (".*", panel.use_regex),
+        ] {
+            let tw = label.chars().count() as f32 * cw + 4.0;
+            if active {
+                unsafe {
+                    self.rt.FillRectangle(&rect_f(bx, row_y, tw, lh), &accent);
+                }
+                self.draw_text(label, bx + 2.0, row_y, self.theme.background);
+            } else {
+                unsafe {
+                    self.rt
+                        .DrawRectangle(&rect_f(bx, row_y, tw, lh), &border, 0.5, None);
+                }
+                self.draw_text(label, bx + 2.0, row_y, dim_fg);
+            }
+            bx += tw + 2.0;
+        }
+
+        // Match count (fixed-width slot)
+        bx += 2.0;
+        let info_text = &panel.match_info;
+        self.draw_text(info_text, bx, row_y, dim_fg);
+        bx += info_w;
+
+        // Nav buttons: [↑] [↓] [≡] [×]
+        let mut nav_x = [0.0f32; 4];
+        let nav_labels = [
+            "\u{2191}",
+            "\u{2193}",
+            crate::icons::FIND_IN_SEL.s(),
+            crate::icons::FIND_CLOSE.s(),
+        ];
+        let nav_active = [false, false, panel.in_selection, false];
+        for (i, label) in nav_labels.iter().enumerate() {
+            nav_x[i] = bx;
+            if nav_active[i] {
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(bx, row_y, btn_s, lh), &accent);
+                }
+                self.draw_text(label, bx + (btn_s - cw) * 0.5, row_y, self.theme.background);
+            } else {
+                unsafe {
+                    self.rt
+                        .DrawRectangle(&rect_f(bx, row_y, btn_s, lh), &border, 0.5, None);
+                }
+                self.draw_text(label, bx + (btn_s - cw) * 0.5, row_y, dim_fg);
+            }
+            bx += btn_s + 2.0;
+        }
+
+        // --- Replace row ---
+        let mut rep_btns = [0.0f32; 4];
+        if panel.show_replace {
+            let rep_y = row_y + lh + pad;
+
+            // Replace input (same position as find input)
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(input_x, rep_y, input_w, lh), &input_bg);
+                self.rt
+                    .DrawRectangle(&rect_f(input_x, rep_y, input_w, lh), &border, 0.5, None);
+            }
+            self.draw_text(&panel.replacement, input_x + 2.0, rep_y, dim_fg);
+            if panel.focus == 1 {
+                // Selection highlight
+                if let Some(anchor) = panel.sel_anchor {
+                    let sel_start = anchor.min(panel.cursor);
+                    let sel_end = anchor.max(panel.cursor);
+                    if sel_start != sel_end {
+                        let sx = input_x + 2.0 + sel_start as f32 * cw;
+                        let sw = (sel_end - sel_start) as f32 * cw;
+                        let sel_brush = self.solid_brush_alpha(self.theme.selection, 0.5);
+                        unsafe {
+                            self.rt
+                                .FillRectangle(&rect_f(sx, rep_y, sw, lh), &sel_brush);
+                        }
+                    }
+                }
+                // Cursor
+                let cursor_x = input_x + 2.0 + panel.cursor as f32 * cw;
+                let cursor_brush = self.solid_brush(dim_fg);
+                unsafe {
+                    self.rt.FillRectangle(
+                        &rect_f(cursor_x, rep_y + 1.0, 2.0, lh - 2.0),
+                        &cursor_brush,
+                    );
+                }
+            }
+
+            // Replace row buttons: [AB] [replace] [replace_all]
+            let mut rbx = input_x + input_w + pad;
+            let ab_w = 2.0 * cw + 4.0;
+            let ab_x = rbx;
+            if panel.preserve_case {
+                unsafe {
+                    self.rt
+                        .FillRectangle(&rect_f(rbx, rep_y, ab_w, lh), &accent);
+                }
+                self.draw_text("AB", rbx + 2.0, rep_y, self.theme.background);
+            } else {
+                unsafe {
+                    self.rt
+                        .DrawRectangle(&rect_f(rbx, rep_y, ab_w, lh), &border, 0.5, None);
+                }
+                self.draw_text("AB", rbx + 2.0, rep_y, dim_fg);
+            }
+            rbx += ab_w + 2.0;
+
+            let r1_x = rbx;
+            unsafe {
+                self.rt
+                    .DrawRectangle(&rect_f(rbx, rep_y, btn_s, lh), &border, 0.5, None);
+            }
+            self.draw_text(crate::icons::FIND_REPLACE.s(), rbx + 2.0, rep_y, dim_fg);
+            rbx += btn_s + 2.0;
+
+            let r_all_x = rbx;
+            unsafe {
+                self.rt
+                    .DrawRectangle(&rect_f(rbx, rep_y, btn_s, lh), &border, 0.5, None);
+            }
+            self.draw_text(crate::icons::FIND_REPLACE_ALL.s(), rbx + 2.0, rep_y, dim_fg);
+            rep_btns = [ab_x, ab_w, r1_x, r_all_x];
+        }
+
+        super::FindReplaceRect {
+            x,
+            y,
+            w: panel_w,
+            h: panel_h,
+            input_x,
+            input_w,
+            row_y,
+            nav_x,
+            btn_s,
+            rep_y: if panel.show_replace {
+                row_y + lh + pad
+            } else {
+                0.0
+            },
+            rep_btns,
+        }
+    }
+
     // ─── Diagnostic underlines ──────────────────────────────────────────────
 
     fn draw_diagnostic_underline(

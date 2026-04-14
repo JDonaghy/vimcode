@@ -166,7 +166,8 @@ cargo fmt
 - `f{c}` / `F{c}` / `t{c}` / `T{c}` — find/till character; `;` / `,` repeat
 - `%` — jump to matching bracket (`(`, `)`, `[`, `]`, `{`, `}`)
 - `Ctrl-D` / `Ctrl-U` — half-page down/up
-- `Ctrl-F` / `Ctrl-B` — full-page down/up
+- `Ctrl-F` — open find/replace overlay (set `ctrl_f_action` to `page_down` for Vim-style full-page down)
+- `Ctrl-B` — full-page up
 
 **Operators** (combine with any motion or text object)
 - `d` — delete
@@ -276,7 +277,7 @@ cargo fmt
 - `:%s/pattern/replacement/[flags]` — all lines
 - `:'<,'>s/...` — visual selection range
 - Flags: `g` (global), `i` (case-insensitive)
-- `Ctrl-F` — VSCode-style dialog (live search, replace, replace all)
+- `Ctrl-F` — find/replace overlay (live search, replace, replace all, case/word/regex toggles)
 - Full undo/redo support
 
 **Multiple Cursors**

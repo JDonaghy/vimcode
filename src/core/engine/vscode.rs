@@ -1230,6 +1230,14 @@ impl Engine {
                 "P" => {
                     self.open_picker(PickerSource::Commands);
                 }
+                // Find/Replace: Ctrl+F → find, Ctrl+H → find & replace
+                "f" => {
+                    self.open_find_replace();
+                }
+                "h" => {
+                    self.open_find_replace();
+                    self.find_replace_show_replace = true;
+                }
                 // Phase 3: Ctrl+B → toggle sidebar
                 "b" => {
                     self.finish_undo_group();

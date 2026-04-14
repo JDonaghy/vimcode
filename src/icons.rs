@@ -125,6 +125,13 @@ pub const GIT_STAGED: Icon = Icon::new("\u{f055}", "+");
 pub const LIGHTBULB: Icon = Icon::new("\u{f0eb}", "*");
 pub const PLUGIN_FALLBACK: Icon = Icon::new("\u{f03a}", "?");
 
+// ─── Find/Replace ───────────────────────────────────────────────────────────
+
+pub const FIND_REPLACE: Icon = Icon::new("\u{eb3c}", "R1"); // nf-cod-replace
+pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replace_all
+pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
+pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
+
 // ─── Tab Bar / Split Buttons (wide glyphs, TUI) ─────────────────────────────
 
 pub const DIFF_PREV: Icon = Icon::new("\u{F0143}", "<");

@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 274 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 275 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 275 — Win-GUI horizontal scrollbar, bundled Nerd Font, Phase 2c verification:**
+Win-GUI horizontal scrollbar drag (draw + click + drag + `scroll_left` text offset + text-area clip rect). Bundled Nerd Font via DirectWrite (per-user font install + registry + `icon_text_format`). Phase 2c source-code verification test (grep Win-GUI source for 26 required engine method calls). 1 new test.
 
 **Session 274 — Phase 2d behavioral parity tests, clippy CI fix:**
 Phase 2d behavioral backend parity tests — 16 new end-to-end tests in `render.rs` simulating user interaction sequences (tab click/close, context menus, double-click, hover lifecycle, sidebar focus, terminal ops, tab drag-drop, preview promotion). Clippy CI fix (`needless_return` in `lsp_manager.rs`). Updated `/complete-push` command to require clippy on all feature configs.

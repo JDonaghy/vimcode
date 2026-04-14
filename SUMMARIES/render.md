@@ -1,4 +1,4 @@
-# src/render.rs — ~9,645 lines
+# src/render.rs — ~9,738 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -38,6 +38,7 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `MenuBarData` / `MenuItemData` — menu bar + dropdown
 - `DebugToolbarData` / `DebugButton` — debug control buttons
 - `DialogPanel` / `ContextMenuPanel` — dialogs and context menus
+- `FindReplacePanel` — Ctrl+F find/replace overlay (query, replacement, toggles, match_info, sel_anchor, group_bounds)
 - `CommandLineData` / `WildmenuData` — command line + completion
 - `DiffPeekPopup` — inline diff hunk popup
 - `DiffToolbarData` — diff view toolbar

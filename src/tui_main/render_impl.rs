@@ -640,6 +640,12 @@ pub(super) fn draw_frame(
         render_folder_picker(frame, picker, area, theme);
     }
 
+    // ── Find/replace overlay (top-right of active group) ───────────────────
+    if let Some(ref find_replace) = screen.find_replace {
+        let editor_left = h_chunks[0].width + h_chunks[1].width;
+        render_find_replace_popup(frame.buffer_mut(), area, find_replace, theme, editor_left);
+    }
+
     // ── Unified picker modal (above terminal/status so it's fully visible) ──
     if let Some(ref picker) = screen.picker {
         render_picker_popup(frame, picker, area, theme);
@@ -3989,6 +3995,218 @@ pub(super) fn render_debug_toolbar(
         if col < area.x + area.width {
             set_cell(buf, col, y, ' ', bar_fg, bar_bg);
             col += 1;
+        }
+    }
+}
+
+// ─── Find/replace overlay ────────────────────────────────────────────────────
+
+pub(super) fn render_find_replace_popup(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    panel: &render::FindReplacePanel,
+    theme: &Theme,
+    editor_left: u16,
+) {
+    use super::set_cell;
+
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let accent_bg = rc(theme.tab_active_accent);
+
+    // Dimensions
+    let panel_w: u16 = 50.min(area.width.saturating_sub(2));
+    let row_count: u16 = if panel.show_replace { 2 } else { 1 };
+    let panel_h: u16 = row_count + 2; // +2 for top/bottom borders
+
+    // Position: top-right of active editor group.
+    // group_bounds is in row/col units (content-relative), offset by editor_left.
+    let gb = &panel.group_bounds;
+    let gb_right = editor_left + gb.x as u16 + gb.width as u16;
+    let x = gb_right.saturating_sub(panel_w + 1).max(editor_left);
+    let y = (gb.y as u16).max(1);
+
+    // Clear background
+    for row in y..y + panel_h {
+        for col in x..x + panel_w {
+            if col < area.width && row < area.height {
+                set_cell(buf, col, row, ' ', fg, bg);
+            }
+        }
+    }
+
+    // Top border
+    for col in x..x + panel_w {
+        set_cell(buf, col, y, '─', border_fg, bg);
+    }
+    set_cell(buf, x, y, '┌', border_fg, bg);
+    if x + panel_w > 0 {
+        set_cell(buf, x + panel_w - 1, y, '┐', border_fg, bg);
+    }
+
+    // Bottom border
+    let bot = y + panel_h - 1;
+    for col in x..x + panel_w {
+        set_cell(buf, col, bot, '─', border_fg, bg);
+    }
+    set_cell(buf, x, bot, '└', border_fg, bg);
+    if x + panel_w > 0 {
+        set_cell(buf, x + panel_w - 1, bot, '┘', border_fg, bg);
+    }
+
+    // Side borders
+    for row in y + 1..bot {
+        set_cell(buf, x, row, '│', border_fg, bg);
+        if x + panel_w > 0 {
+            set_cell(buf, x + panel_w - 1, row, '│', border_fg, bg);
+        }
+    }
+
+    // --- Find row: [▶] [query...] [Aa][ab][.*] [N of M] [↑][↓][≡][×] ---
+    let find_y = y + 1;
+    let content_x = x + 1;
+    let right_edge = x + panel_w - 1;
+
+    // Chevron
+    let chevron = if panel.show_replace { '▼' } else { '▶' };
+    set_cell(buf, content_x, find_y, chevron, fg, bg);
+
+    // Find input (after chevron)
+    let input_start = content_x + 2;
+    // Reserve space for: toggles(9) + count(7) + nav(8) = 24 chars
+    let input_w = panel_w.saturating_sub(2 + 2 + 24);
+    for (i, ch) in panel.query.chars().enumerate() {
+        let cx = input_start + i as u16;
+        if cx < input_start + input_w && cx < right_edge {
+            set_cell(buf, cx, find_y, ch, fg, bg);
+        }
+    }
+    if panel.focus == 0 {
+        // Selection highlight
+        if let Some(anchor) = panel.sel_anchor {
+            let s = anchor.min(panel.cursor) as u16;
+            let e = anchor.max(panel.cursor) as u16;
+            let sel_bg = rc(theme.selection);
+            for i in s..e {
+                let cx = input_start + i;
+                if cx < input_start + input_w && cx < right_edge {
+                    let ch = panel.query.chars().nth(i as usize).unwrap_or(' ');
+                    set_cell(buf, cx, find_y, ch, fg, sel_bg);
+                }
+            }
+        }
+        // Cursor
+        let cursor_col = input_start + panel.cursor as u16;
+        if cursor_col < input_start + input_w && cursor_col < right_edge {
+            let ch = panel.query.chars().nth(panel.cursor).unwrap_or(' ');
+            set_cell(buf, cursor_col, find_y, ch, bg, fg);
+        }
+    }
+
+    // Toggle buttons: [Aa] [ab] [.*]
+    let mut tx = input_start + input_w + 1;
+    for (label, active) in [
+        ("Aa", panel.case_sensitive),
+        ("ab", panel.whole_word),
+        (".*", panel.use_regex),
+    ] {
+        let (t_fg, t_bg) = if active { (bg, accent_bg) } else { (fg, bg) };
+        for ch in label.chars() {
+            if tx < right_edge {
+                set_cell(buf, tx, find_y, ch, t_fg, t_bg);
+                tx += 1;
+            }
+        }
+        tx += 1;
+    }
+
+    // Match count
+    let info = &panel.match_info;
+    for (i, ch) in info.chars().enumerate() {
+        let cx = tx + i as u16;
+        if cx < right_edge {
+            set_cell(buf, cx, find_y, ch, fg, bg);
+        }
+    }
+    tx += (info.len() as u16).max(5) + 1;
+
+    // Nav buttons: ↑ ↓ ≡ ×
+    let nav_items = [
+        ('↑', false),
+        ('↓', false),
+        ('≡', panel.in_selection),
+        ('×', false),
+    ];
+    for (ch, active) in nav_items {
+        if tx < right_edge {
+            let (n_fg, n_bg) = if active { (bg, accent_bg) } else { (fg, bg) };
+            set_cell(buf, tx, find_y, ch, n_fg, n_bg);
+            tx += 2;
+        }
+    }
+
+    // --- Replace row: [  ] [replacement...] [AB] [⇄] [⇉] ---
+    if panel.show_replace && row_count >= 2 {
+        let rep_y = find_y + 1;
+
+        // Replacement text (aligned with find input)
+        for (i, ch) in panel.replacement.chars().enumerate() {
+            let cx = input_start + i as u16;
+            if cx < input_start + input_w && cx < right_edge {
+                set_cell(buf, cx, rep_y, ch, fg, bg);
+            }
+        }
+        if panel.focus == 1 {
+            // Selection highlight
+            if let Some(anchor) = panel.sel_anchor {
+                let s = anchor.min(panel.cursor) as u16;
+                let e = anchor.max(panel.cursor) as u16;
+                let sel_bg = rc(theme.selection);
+                for i in s..e {
+                    let cx = input_start + i;
+                    if cx < input_start + input_w && cx < right_edge {
+                        let ch = panel.replacement.chars().nth(i as usize).unwrap_or(' ');
+                        set_cell(buf, cx, rep_y, ch, fg, sel_bg);
+                    }
+                }
+            }
+            // Cursor
+            let cursor_col = input_start + panel.cursor as u16;
+            if cursor_col < input_start + input_w && cursor_col < right_edge {
+                let ch = panel.replacement.chars().nth(panel.cursor).unwrap_or(' ');
+                set_cell(buf, cursor_col, rep_y, ch, bg, fg);
+            }
+        }
+
+        // AB (preserve case toggle)
+        let mut bx = input_start + input_w + 1;
+        let (ab_fg, ab_bg) = if panel.preserve_case {
+            (bg, accent_bg)
+        } else {
+            (fg, bg)
+        };
+        for ch in "AB".chars() {
+            if bx < right_edge {
+                set_cell(buf, bx, rep_y, ch, ab_fg, ab_bg);
+                bx += 1;
+            }
+        }
+        bx += 1;
+
+        // Replace current / Replace all (icon or fallback)
+        let sel_bg = rc(theme.fuzzy_selected_bg);
+        for label in [
+            crate::icons::FIND_REPLACE.s(),
+            crate::icons::FIND_REPLACE_ALL.s(),
+        ] {
+            for ch in label.chars() {
+                if bx < right_edge {
+                    set_cell(buf, bx, rep_y, ch, fg, sel_bg);
+                    bx += 1;
+                }
+            }
+            bx += 1;
         }
     }
 }

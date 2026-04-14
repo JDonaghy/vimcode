@@ -97,6 +97,152 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // ── Find/replace overlay click handling ──────────────────────────────────────
+    if engine.find_replace_open {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+            let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
+            let panel_w: u16 = 50.min(term_cols.saturating_sub(2));
+            let row_count: u16 = if engine.find_replace_show_replace {
+                2
+            } else {
+                1
+            };
+            let panel_h: u16 = row_count + 2;
+
+            // Compute group bounds (same as renderer)
+            let content_cols = term_cols.saturating_sub(editor_left);
+            let content_rows = term_rows.saturating_sub(2); // status + cmd
+            let tui_tab_bar_height = if engine.settings.breadcrumbs {
+                2.0
+            } else {
+                1.0
+            };
+            let content_bounds = crate::core::window::WindowRect::new(
+                0.0,
+                0.0,
+                content_cols as f64,
+                content_rows as f64,
+            );
+            let (win_rects, _) =
+                engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
+            let active_group = engine.active_group;
+            let group_wids: Vec<_> = engine
+                .editor_groups
+                .get(&active_group)
+                .map(|g| g.active_tab().layout.window_ids())
+                .unwrap_or_default();
+            let mut gb_x = f64::MAX;
+            let mut gb_y = f64::MAX;
+            let mut gb_max_x = 0.0f64;
+            for (wid, rect) in &win_rects {
+                if group_wids.contains(wid) {
+                    gb_x = gb_x.min(rect.x);
+                    gb_y = gb_y.min(rect.y);
+                    gb_max_x = gb_max_x.max(rect.x + rect.width);
+                }
+            }
+            let (panel_x, panel_y) = if gb_x < f64::MAX {
+                let gb_right = editor_left + gb_max_x as u16;
+                let px = gb_right.saturating_sub(panel_w + 1).max(editor_left);
+                let py = (gb_y as u16).max(1);
+                (px, py)
+            } else {
+                (term_cols.saturating_sub(panel_w + 1), 1u16)
+            };
+
+            let on_panel = col >= panel_x
+                && col < panel_x + panel_w
+                && row >= panel_y
+                && row < panel_y + panel_h;
+
+            if on_panel {
+                let find_y = panel_y + 1;
+                let content_x = panel_x + 1;
+                let input_start = content_x + 2; // after chevron
+                let input_w = panel_w.saturating_sub(2 + 2 + 24);
+
+                // --- Find row ---
+                if row == find_y {
+                    if col == content_x {
+                        // Chevron
+                        engine.find_replace_show_replace = !engine.find_replace_show_replace;
+                    } else if col >= input_start && col < input_start + input_w {
+                        // Find input
+                        engine.find_replace_focus = 0;
+                        let click_col = (col - input_start) as usize;
+                        engine.find_replace_cursor =
+                            click_col.min(engine.find_replace_query.chars().count());
+                    } else {
+                        // Buttons area
+                        let mut tx = input_start + input_w + 1;
+                        // Toggles: Aa(2) ab(2) .*(2) with gaps
+                        for i in 0..3 {
+                            if col >= tx && col < tx + 2 {
+                                match i {
+                                    0 => engine.toggle_find_replace_case(),
+                                    1 => engine.toggle_find_replace_whole_word(),
+                                    _ => engine.toggle_find_replace_regex(),
+                                }
+                                break;
+                            }
+                            tx += 3;
+                        }
+                        // Skip count area
+                        tx += 6;
+                        // Nav buttons: ↑ ↓ ≡ × (each 2 cols wide)
+                        for i in 0..4 {
+                            if col >= tx && col < tx + 2 {
+                                match i {
+                                    0 => engine.find_replace_prev(),
+                                    1 => engine.find_replace_next(),
+                                    2 => engine.toggle_find_replace_in_selection(),
+                                    _ => engine.close_find_replace(),
+                                }
+                                break;
+                            }
+                            tx += 2;
+                        }
+                    }
+                    return sidebar_width;
+                }
+
+                // --- Replace row ---
+                if engine.find_replace_show_replace && row_count >= 2 {
+                    let rep_y = find_y + 1;
+                    if row == rep_y {
+                        if col >= input_start && col < input_start + input_w {
+                            engine.find_replace_focus = 1;
+                            let click_col = (col - input_start) as usize;
+                            engine.find_replace_cursor =
+                                click_col.min(engine.find_replace_replacement.chars().count());
+                        } else {
+                            let mut bx = input_start + input_w + 1;
+                            // AB toggle (2 cols)
+                            if col >= bx && col < bx + 2 {
+                                engine.toggle_find_replace_preserve_case();
+                            }
+                            bx += 3;
+                            // Replace current (⇄, 2 cols)
+                            if col >= bx && col < bx + 2 {
+                                engine.find_replace_replace_current();
+                            }
+                            bx += 2;
+                            // Replace all (⇉, 2 cols)
+                            if col >= bx && col < bx + 2 {
+                                engine.find_replace_replace_all();
+                            }
+                        }
+                        return sidebar_width;
+                    }
+                }
+
+                return sidebar_width;
+            }
+            // Click outside — let it fall through
+        }
+    }
+
     // ── Dialog popup click handling ─────────────────────────────────────────────
     if engine.dialog.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {

@@ -1,9 +1,9 @@
 # VimCode Project State
 
-**Last updated:** Apr 13, 2026 (Session 275 — Win-GUI h-scrollbar, bundled Nerd Font, Phase 2c verification) | **Tests:** 5495
+**Last updated:** Apr 14, 2026 (Session 276 — Unified find/replace overlay) | **Tests:** 1383 (lib)
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 272 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 275 are in **SESSION_HISTORY.md**.
 
 ---
 
@@ -26,10 +26,13 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 275 — Win-GUI horizontal scrollbar, bundled Nerd Font, Phase 2c source verification:**
+**Session 276 — Unified find/replace overlay (Ctrl+F):**
 
-1. **Win-GUI horizontal scrollbar drag** — Full horizontal scrollbar implementation: drawing (track + thumb at bottom of editor), `h_scrollbar_hit()` hit-testing, click-to-jump, drag-to-scroll via `h_scrollbar_drag` state, mouse-up cleanup. Text rendering now applies `scroll_left` offset (was missing — scrollbar moved but text stayed put). Added text-area clip rect to prevent scrolled text bleeding over gutter. Cursor also offset by `scroll_left`.
-2. **Win-GUI bundled Nerd Font via DirectWrite** — `install_bundled_icon_font_windows()` writes embedded 13KB `vimcode-icons.ttf` to `%LOCALAPPDATA%\Microsoft\Windows\Fonts\` (per-user, no admin). `register_user_font()` adds registry entry at `HKCU\...\Fonts`. `WM_FONTCHANGE` broadcast for same-session availability. `icon_text_format` now tries "Symbols Nerd Font" first, falls back to Segoe MDL2/Fluent. Activity bar and ext panel icons render native Nerd Font glyphs (using `icons::` constants matching GTK). Added `Win32_System_Registry` + `Win32_Security` Cargo features.
-3. **Phase 2c source-code verification** — `test_wingui_source_contains_required_calls` reads Win-GUI source files and greps for the engine method calls required by each `UiAction` variant (26 checks). Automated bug-finder: fails if a new action's required engine call is missing from source. Uses `CARGO_MANIFEST_DIR` for stable paths. 1 new test.
+1. **Engine-level find/replace overlay** — New `FindReplacePanel` in `ScreenLayout`, rendered identically by all 3 backends (GTK Cairo, TUI ratatui, Win-GUI Direct2D). Replaces the GTK-only Revealer find dialog. VSCode-style layout: `[▶] [input] [Aa][ab][.*] [N of M] [↑][↓][≡][×]` find row, `[  ] [input] [AB] [R1][R*]` replace row. Positioned at top-right of active editor group (not window).
+2. **GTK Revealer cleanup** — Removed the native GTK Entry/Button find dialog (Revealer widget, 8 Msg variants, handler code, CSS classes). Ctrl+F now passes through to the engine.
+3. **Features:** Incremental search, replace current/all, case/whole-word/regex toggles, preserve-case toggle, find-in-selection (≡), match count, chevron expand/collapse for replace row, ↑/↓ navigation buttons, × close button, `ctrl_f_action` setting. Ctrl+Z undo passthrough. Ctrl+A select-all in input fields. Visual selection pre-fills find box (single-line) or auto-enables find-in-selection (multi-line). Regex uses multiline mode (`^`/`$` match line boundaries). Edit > Find and Edit > Replace menu items updated.
+4. **Win-GUI mouse interactions** — Drag-to-select in input fields (`fr_input_dragging` state), double-click word select, cached `FindReplaceRect` for pixel-accurate click handling. Selection highlight rendering in both find and replace inputs.
+5. **Nerd Font icons** — `FIND_REPLACE` (`\u{eb3c}`), `FIND_REPLACE_ALL` (`\u{eb3d}`), `FIND_IN_SEL` (`\u{eb54}`), `FIND_CLOSE` (`\u{ea76}`) with ASCII fallbacks.
+6. **Known TUI/GTK gaps** — Mouse drag-select, double-click word select, and accurate ≡/× click handling only work in Win-GUI. TUI/GTK need porting (see BUGS.md and PLAN.md). 13 new tests.
 
-> Sessions 274 and earlier in **SESSION_HISTORY.md**.
+> Session 275 and earlier in **SESSION_HISTORY.md**.

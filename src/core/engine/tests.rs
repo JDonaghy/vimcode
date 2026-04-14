@@ -2770,7 +2770,8 @@ fn test_count_scroll_commands() {
     press_ctrl(&mut engine, 'u');
     assert_eq!(engine.view().cursor.line, 10);
 
-    // Test 3 Ctrl-F (3 full pages down = 60 lines)
+    // Test 3 Ctrl-F (3 full pages down = 60 lines) — requires page_down mode
+    engine.settings.ctrl_f_action = "page_down".to_string();
     press_char(&mut engine, '3');
     press_ctrl(&mut engine, 'f');
     assert_eq!(engine.view().cursor.line, 70);
@@ -18769,4 +18770,248 @@ fn test_multi_group_window_rects_cover_all_groups() {
             gid
         );
     }
+}
+
+// ─── Find/Replace overlay tests ──────────────────────────────────────────────
+
+#[test]
+fn test_find_replace_open_close() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world hello");
+
+    // Ctrl+F opens find/replace
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    assert_eq!(engine.find_replace_focus, 0);
+
+    // Escape closes it
+    press_special(&mut engine, "Escape");
+    assert!(!engine.find_replace_open);
+}
+
+#[test]
+fn test_find_replace_incremental_search() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "  foo bar foo baz foo");
+
+    // Put cursor on a space so word_under_cursor returns None
+    engine.view_mut().cursor.col = 0;
+    engine.open_find_replace();
+    assert_eq!(engine.find_replace_query, "");
+
+    // Type "foo" — use handle_key since find_replace_open intercepts
+    engine.handle_key("f", Some('f'), false);
+    assert_eq!(engine.find_replace_query, "f");
+    engine.handle_key("o", Some('o'), false);
+    assert_eq!(engine.find_replace_query, "fo");
+    engine.handle_key("o", Some('o'), false);
+    assert_eq!(engine.find_replace_query, "foo");
+    assert_eq!(engine.search_query, "foo");
+    assert_eq!(engine.search_matches.len(), 3);
+}
+
+#[test]
+fn test_find_replace_next_prev() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\naaa\naaa\n");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "aaa".to_string();
+    engine.find_replace_cursor = 3;
+    engine.run_find_replace_search();
+
+    assert_eq!(engine.search_matches.len(), 3);
+
+    // Next
+    engine.handle_find_replace_key("Down", None, false, false);
+    assert_eq!(engine.search_index, Some(1));
+
+    // Prev
+    engine.handle_find_replace_key("Up", None, false, false);
+    assert_eq!(engine.search_index, Some(0));
+}
+
+#[test]
+fn test_find_replace_replace_current() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb aaa");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "aaa".to_string();
+    engine.find_replace_replacement = "ccc".to_string();
+    engine.find_replace_cursor = 3;
+    engine.run_find_replace_search();
+
+    assert_eq!(engine.search_matches.len(), 2);
+
+    engine.find_replace_replace_current();
+    assert_eq!(engine.buffer().to_string(), "ccc bbb aaa");
+    // After replace, should still have 1 match remaining
+    assert_eq!(engine.search_matches.len(), 1);
+}
+
+#[test]
+fn test_find_replace_replace_all() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb aaa ccc aaa");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "aaa".to_string();
+    engine.find_replace_replacement = "zzz".to_string();
+    engine.find_replace_cursor = 3;
+    engine.run_find_replace_search();
+
+    engine.find_replace_replace_all();
+    assert_eq!(engine.buffer().to_string(), "zzz bbb zzz ccc zzz");
+}
+
+#[test]
+fn test_find_replace_case_sensitive() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "Hello hello HELLO");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "hello".to_string();
+    engine.find_replace_cursor = 5;
+
+    // Default: case insensitive → 3 matches
+    engine.run_find_replace_search();
+    assert_eq!(engine.search_matches.len(), 3);
+
+    // Toggle case sensitive → 1 match
+    engine.toggle_find_replace_case();
+    assert_eq!(engine.search_matches.len(), 1);
+}
+
+#[test]
+fn test_find_replace_whole_word() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo foobar barfoo foo");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "foo".to_string();
+    engine.find_replace_cursor = 3;
+
+    // Without whole word → 4 matches (foo, foobar, barfoo, foo)
+    engine.run_find_replace_search();
+    assert_eq!(engine.search_matches.len(), 4);
+
+    // With whole word → 2 matches (only standalone "foo")
+    engine.toggle_find_replace_whole_word();
+    assert_eq!(engine.search_matches.len(), 2);
+}
+
+#[test]
+fn test_find_replace_regex() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo123 bar456 baz");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = r"\d+".to_string();
+    engine.find_replace_cursor = 3;
+
+    // Without regex → 0 matches (literal "\d+" not found)
+    engine.run_find_replace_search();
+    assert_eq!(engine.search_matches.len(), 0);
+
+    // With regex → 2 matches (123, 456)
+    engine.toggle_find_replace_regex();
+    assert_eq!(engine.search_matches.len(), 2);
+}
+
+#[test]
+fn test_find_replace_regex_multiline() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "The cat\nThe dog\na The fox\n");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "^The".to_string();
+    engine.find_replace_cursor = 4;
+    engine.find_replace_options.use_regex = true;
+    engine.run_find_replace_search();
+
+    // ^The should match "The" at the start of line 1 and line 2, but not "The" mid-line on line 3
+    assert_eq!(engine.search_matches.len(), 2);
+}
+
+#[test]
+fn test_find_replace_n_after_close() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb aaa ccc aaa");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_query = "aaa".to_string();
+    engine.find_replace_cursor = 3;
+    engine.run_find_replace_search();
+    engine.close_find_replace();
+
+    // search_query and search_matches should persist
+    assert_eq!(engine.search_query, "aaa");
+    assert_eq!(engine.search_matches.len(), 3);
+
+    // n should work after closing
+    press_char(&mut engine, 'n');
+    assert!(engine.search_index.is_some());
+}
+
+#[test]
+fn test_find_replace_prefill_from_search() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world hello");
+    engine.update_syntax();
+
+    // Do a Vim / search first
+    engine.search_query = "hello".to_string();
+    engine.run_search();
+
+    // Open find/replace — should pre-fill from search_query
+    engine.open_find_replace();
+    assert_eq!(engine.find_replace_query, "hello");
+}
+
+#[test]
+fn test_ctrl_f_setting() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nline2\n");
+    engine.update_syntax();
+    engine.set_viewport_lines(10);
+
+    // Default: ctrl_f_action = "find" → opens find/replace
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
+    press_special(&mut engine, "Escape");
+
+    // Change setting → Ctrl+F does page down
+    engine.settings.ctrl_f_action = "page_down".to_string();
+    press_ctrl(&mut engine, 'f');
+    assert!(!engine.find_replace_open);
+}
+
+#[test]
+fn test_find_replace_prefill_from_selection() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world hello");
+    engine.update_syntax();
+
+    // Select "world" using visual mode (v, then move to cover "world")
+    engine.view_mut().cursor.col = 6; // start of "world"
+    press_char(&mut engine, 'v'); // enter visual mode
+    engine.view_mut().cursor.col = 10; // end of "world"
+
+    // Open find/replace — should pre-fill from visual selection
+    engine.open_find_replace();
+    assert_eq!(engine.find_replace_query, "world");
+    // Should have exited visual mode
+    assert_eq!(engine.mode, Mode::Normal);
+    assert!(engine.visual_anchor.is_none());
 }

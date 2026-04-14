@@ -154,14 +154,6 @@ struct App {
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
-    // Find/Replace dialog state
-    find_dialog_visible: bool,
-    find_text: String,
-    replace_text: String,
-    #[allow(dead_code)] // For future case-sensitive search feature
-    find_case_sensitive: bool,
-    #[allow(dead_code)] // For future whole word search feature
-    find_whole_word: bool,
     /// Status text shown below the project search input ("N matches in M files").
     project_search_status: String,
     /// Ref to the search results ListBox so we can rebuild it after each search.
@@ -387,22 +379,6 @@ enum Msg {
     OpenSettingsFile,
     /// Settings file changed on disk.
     SettingsFileChanged,
-    /// Toggle find dialog visibility.
-    ToggleFindDialog,
-    /// Find text input changed.
-    FindTextChanged(String),
-    /// Replace text input changed.
-    ReplaceTextChanged(String),
-    /// Find next match.
-    FindNext,
-    /// Find previous match.
-    FindPrevious,
-    /// Replace current match and find next.
-    ReplaceNext,
-    /// Replace all matches.
-    ReplaceAll,
-    /// Close find dialog.
-    CloseFindDialog,
     /// Window size changed.
     WindowResized {
         width: i32,
@@ -1247,18 +1223,8 @@ impl SimpleComponent for App {
                                                 || f.downcast_ref::<gtk4::Text>().is_some()
                                         });
                                     if entry_has_focus {
-                                        // Escape: close the find dialog and return focus to editor.
-                                        if key_name == "Escape" {
-                                            sender.input(Msg::CloseFindDialog);
-                                            sender.input(Msg::Resize);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Ctrl-F: toggle find dialog.
-                                        if ctrl && !shift && unicode == Some('f') {
-                                            sender.input(Msg::ToggleFindDialog);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Let all other keys reach the Entry widget.
+                                        // Let all other keys reach the Entry widget
+                                        // (e.g. search panel input, terminal find input).
                                         return gtk4::glib::Propagation::Proceed;
                                     }
 
@@ -1371,7 +1337,7 @@ impl SimpleComponent for App {
                                         }
                                     }
 
-                                    // Ctrl-F: terminal find when terminal focused, else editor find dialog
+                                    // Ctrl-F: terminal find when terminal focused, else engine find/replace
                                     if ctrl && !shift && unicode == Some('f') {
                                         if engine.borrow().terminal_has_focus {
                                             if engine.borrow().terminal_find_active {
@@ -1380,7 +1346,10 @@ impl SimpleComponent for App {
                                                 sender.input(Msg::TerminalFindOpen);
                                             }
                                         } else {
-                                            sender.input(Msg::ToggleFindDialog);
+                                            // Pass Ctrl+F to engine (opens find/replace overlay
+                                            // or does page-down based on ctrl_f_action setting)
+                                            engine.borrow_mut().handle_key("f", Some('f'), true);
+                                            sender.input(Msg::SearchPollTick);
                                         }
                                         return gtk4::glib::Propagation::Stop;
                                     }
@@ -1742,124 +1711,12 @@ impl SimpleComponent for App {
                             },
                         },
 
-                        // Find/Replace Dialog (overlay at top-right)
-                        add_overlay = &gtk4::Revealer {
-                            set_transition_type: gtk4::RevealerTransitionType::SlideDown,
-                            set_transition_duration: 200,
-                            set_halign: gtk4::Align::End,
-                            set_valign: gtk4::Align::Start,
-                            set_margin_top: 10,
-                            set_margin_end: 10,
-
-                            #[watch]
-                            set_reveal_child: model.find_dialog_visible,
-
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Vertical,
-                                set_spacing: 8,
-                                set_css_classes: &["find-dialog"],
-                                set_width_request: 400,
-
-                                // Find input row
-                                gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Horizontal,
-                                    set_spacing: 4,
-
-                                    gtk4::Label {
-                                        set_text: "Find:",
-                                        set_width_request: 60,
-                                    },
-
-                                    #[name = "find_entry"]
-                                    gtk4::Entry {
-                                        set_placeholder_text: Some("Find in buffer"),
-                                        set_hexpand: true,
-
-                                        connect_changed[sender] => move |entry| {
-                                            let text = entry.text().to_string();
-                                            sender.input(Msg::FindTextChanged(text));
-                                        },
-
-                                        connect_activate[sender] => move |_| {
-                                            sender.input(Msg::FindNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "↑",
-                                        set_tooltip_text: Some("Previous (Shift+Enter)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::FindPrevious);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "↓",
-                                        set_tooltip_text: Some("Next (Enter)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::FindNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "×",
-                                        set_tooltip_text: Some("Close (Escape)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::CloseFindDialog);
-                                        },
-                                    },
-                                },
-
-                                // Replace input row
-                                gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Horizontal,
-                                    set_spacing: 4,
-
-                                    gtk4::Label {
-                                        set_text: "Replace:",
-                                        set_width_request: 60,
-                                    },
-
-                                    #[name = "replace_entry"]
-                                    gtk4::Entry {
-                                        set_placeholder_text: Some("Replace with"),
-                                        set_hexpand: true,
-
-                                        connect_changed[sender] => move |entry| {
-                                            let text = entry.text().to_string();
-                                            sender.input(Msg::ReplaceTextChanged(text));
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "Replace",
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::ReplaceNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "Replace All",
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::ReplaceAll);
-                                        },
-                                    },
-                                },
-
-                                // Match count label
-                                #[name = "match_count_label"]
-                                gtk4::Label {
-                                    set_text: "No matches",
-                                    set_halign: gtk4::Align::Start,
-                                    set_css_classes: &["find-match-count"],
-                                },
-                            }
-                        }
+                        // Find/Replace is now engine-level (drawn by Cairo in draw.rs)
                     }
                 }
                 }  // close main_hbox
             }  // close outer gtk4::Box
-            }  // close window_overlay
+            }  // close window_overlay (gtk4::Overlay)
         }
     }
 
@@ -2103,11 +1960,6 @@ impl SimpleComponent for App {
             h_sb_drag_cell: h_sb_drag_cell.clone(),
             settings_monitor,
             sender: sender.input_sender().clone(),
-            find_dialog_visible: false,
-            find_text: String::new(),
-            replace_text: String::new(),
-            find_case_sensitive: false,
-            find_whole_word: false,
             sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
             sidebar_revealer: sidebar_revealer_ref.clone(),
             explorer_panel_box: explorer_panel_box_ref.clone(),
@@ -4546,16 +4398,7 @@ impl SimpleComponent for App {
                 drop(engine);
                 self.draw_needed.set(true);
             }
-            Msg::ToggleFindDialog
-            | Msg::FindTextChanged(_)
-            | Msg::ReplaceTextChanged(_)
-            | Msg::FindNext
-            | Msg::FindPrevious
-            | Msg::ReplaceNext
-            | Msg::ReplaceAll
-            | Msg::CloseFindDialog
-            | Msg::WindowResized { .. }
-            | Msg::SidebarResized => {
+            Msg::WindowResized { .. } | Msg::SidebarResized => {
                 self.handle_find_replace_msg(msg);
             }
             Msg::ProjectSearchQueryChanged(q) => {
@@ -5900,6 +5743,111 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // Find/replace overlay: intercept clicks on the panel
+        if self.engine.borrow().find_replace_open {
+            let engine = self.engine.borrow();
+            let lh = self.cached_line_height.max(1.0);
+            let cw = self.cached_char_width.max(1.0);
+            let pad = 6.0;
+            let input_w = 200.0;
+            let btn_s = lh;
+            let chevron_w = 16.0;
+            let toggles_w = 3.0 * (btn_s + 4.0);
+            let info_w = 60.0;
+            let nav_w = 4.0 * (btn_s + 2.0);
+            let popup_w = chevron_w + input_w + pad + toggles_w + info_w + nav_w + pad;
+            let show_replace = engine.find_replace_show_replace;
+            let row_count = if show_replace { 2.0 } else { 1.0 };
+            let popup_h = lh * row_count + pad * (row_count + 1.0);
+            let popup_x = (width - popup_w - 10.0).max(0.0);
+            let popup_y_pos = lh * 2.5 + 2.0;
+            drop(engine);
+
+            if x >= popup_x
+                && x < popup_x + popup_w
+                && y >= popup_y_pos
+                && y < popup_y_pos + popup_h
+            {
+                let mut engine = self.engine.borrow_mut();
+                let row_y = popup_y_pos + pad;
+                let input_x = popup_x + chevron_w;
+
+                // --- Find row ---
+                if y >= row_y && y < row_y + lh {
+                    if x < input_x {
+                        // Chevron
+                        engine.find_replace_show_replace = !engine.find_replace_show_replace;
+                    } else if x < input_x + input_w {
+                        // Find input
+                        engine.find_replace_focus = 0;
+                        let click_col = ((x - input_x - 4.0) / cw).max(0.0) as usize;
+                        engine.find_replace_cursor =
+                            click_col.min(engine.find_replace_query.chars().count());
+                    } else {
+                        // Buttons: [Aa][ab][.*] [count] [↑][↓][≡][×]
+                        let mut bx = input_x + input_w + pad;
+                        for (i, label) in ["Aa", "ab", ".*"].iter().enumerate() {
+                            let tw = label.len() as f64 * cw + 8.0;
+                            if x >= bx && x < bx + tw {
+                                match i {
+                                    0 => engine.toggle_find_replace_case(),
+                                    1 => engine.toggle_find_replace_whole_word(),
+                                    _ => engine.toggle_find_replace_regex(),
+                                }
+                                break;
+                            }
+                            bx += tw + 4.0;
+                        }
+                        // Skip match count
+                        bx += info_w;
+                        // Nav: ↑ ↓ ≡ ×
+                        for i in 0..4 {
+                            if x >= bx && x < bx + btn_s {
+                                match i {
+                                    0 => engine.find_replace_prev(),
+                                    1 => engine.find_replace_next(),
+                                    2 => engine.toggle_find_replace_in_selection(),
+                                    _ => engine.close_find_replace(),
+                                }
+                                break;
+                            }
+                            bx += btn_s + 2.0;
+                        }
+                    }
+                }
+
+                // --- Replace row ---
+                if show_replace {
+                    let rep_y = row_y + lh + pad;
+                    if y >= rep_y && y < rep_y + lh {
+                        if x >= input_x && x < input_x + input_w {
+                            engine.find_replace_focus = 1;
+                            let click_col = ((x - input_x - 4.0) / cw).max(0.0) as usize;
+                            engine.find_replace_cursor =
+                                click_col.min(engine.find_replace_replacement.chars().count());
+                        } else if x >= input_x + input_w {
+                            let mut rbx = input_x + input_w + pad;
+                            let ab_w = 2.0 * cw + 8.0;
+                            if x >= rbx && x < rbx + ab_w {
+                                engine.toggle_find_replace_preserve_case();
+                            }
+                            rbx += ab_w + 4.0;
+                            if x >= rbx && x < rbx + btn_s {
+                                engine.find_replace_replace_current();
+                            }
+                            rbx += btn_s + 2.0;
+                            if x >= rbx && x < rbx + btn_s {
+                                engine.find_replace_replace_all();
+                            }
+                        }
+                    }
+                }
+
+                self.draw_needed.set(true);
+                return;
+            }
+        }
+
         // Picker popup: intercept all clicks when picker is open
         {
             let engine = self.engine.borrow();
@@ -7581,7 +7529,8 @@ impl App {
                         sender.input(Msg::OpenRecentDialog);
                     }
                     "find" => {
-                        sender.input(Msg::ToggleFindDialog);
+                        self.engine.borrow_mut().open_find_replace();
+                        self.draw_needed.set(true);
                     }
                     "quit_menu" => {
                         if self.engine.borrow().has_any_unsaved() {
@@ -9151,88 +9100,6 @@ impl App {
 
     fn handle_find_replace_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::ToggleFindDialog => {
-                self.find_dialog_visible = !self.find_dialog_visible;
-                self.draw_needed.set(true);
-            }
-            Msg::FindTextChanged(text) => {
-                self.find_text = text.clone();
-                let mut engine = self.engine.borrow_mut();
-                engine.search_query = text;
-                engine.run_search();
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceTextChanged(text) => {
-                self.replace_text = text;
-            }
-            Msg::FindNext => {
-                let mut engine = self.engine.borrow_mut();
-                engine.search_next();
-                self.draw_needed.set(true);
-            }
-            Msg::FindPrevious => {
-                let mut engine = self.engine.borrow_mut();
-                engine.search_prev();
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceNext => {
-                let mut engine = self.engine.borrow_mut();
-
-                // Replace current match and find next
-                if let Some(current_idx) = engine.search_index {
-                    if let Some(&(start, end)) = engine.search_matches.get(current_idx) {
-                        engine.start_undo_group();
-                        engine.delete_with_undo(start, end);
-                        engine.insert_with_undo(start, &self.replace_text);
-                        engine.finish_undo_group();
-
-                        // Re-run search and move to next
-                        engine.run_search();
-                        engine.search_next();
-                    }
-                }
-
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceAll => {
-                let mut engine = self.engine.borrow_mut();
-                let pattern = engine.search_query.clone();
-                let replacement = self.replace_text.clone();
-
-                // Replace in entire buffer
-                let last_line = engine.buffer().len_lines().saturating_sub(1);
-                match engine.replace_in_range(Some((0, last_line)), &pattern, &replacement, "g") {
-                    Ok(count) => {
-                        engine.message = format!(
-                            "Replaced {} occurrence{}",
-                            count,
-                            if count == 1 { "" } else { "s" }
-                        );
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
-                }
-
-                // Re-run search to update highlights
-                engine.run_search();
-                self.draw_needed.set(true);
-            }
-            Msg::CloseFindDialog => {
-                self.find_dialog_visible = false;
-
-                // Clear search highlights
-                let mut engine = self.engine.borrow_mut();
-                engine.search_matches.clear();
-                engine.search_index = None;
-
-                // Return focus to editor
-                if let Some(ref drawing_area) = *self.drawing_area.borrow() {
-                    drawing_area.grab_focus();
-                }
-
-                self.draw_needed.set(true);
-            }
             Msg::WindowResized { width, height } => {
                 // Update session state with new window geometry (debounced save)
                 let mut engine = self.engine.borrow_mut();

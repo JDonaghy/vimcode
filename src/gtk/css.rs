@@ -282,26 +282,6 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
             background: alpha({sb_thumb}, 0.7);
         }}
 
-        /* Find/Replace dialog — theme-aware */
-        .find-dialog {{
-            background-color: {editor_bg};
-            border: 1px solid {border_col};
-        }}
-        .find-dialog entry {{
-            background-color: {entry_bg};
-            color: {text_fg};
-            border: 1px solid {border_col};
-        }}
-        .find-dialog button {{
-            border: 1px solid {border_col};
-            color: {text_fg};
-        }}
-        .find-dialog button:hover {{
-            background-color: {hover_bg};
-        }}
-        .find-match-count {{
-            color: {comment_fg};
-        }}
         "#
     )
 }
@@ -456,39 +436,6 @@ pub(super) const STATIC_CSS: &str = "
         }
         .h-editor-scrollbar slider:hover {
             background: rgba(150, 150, 150, 0.7);
-        }
-
-        /* Find/Replace Dialog */
-        .find-dialog {
-            background-color: #2d2d30;
-            border: 1px solid #3e3e42;
-            border-radius: 4px;
-            padding: 12px;
-        }
-
-        .find-dialog entry {
-            background-color: #3c3c3c;
-            color: #cccccc;
-            padding: 6px;
-            border: 1px solid #3e3e42;
-            border-radius: 2px;
-        }
-
-        .find-dialog button {
-            background: transparent;
-            border: 1px solid #3e3e42;
-            color: #cccccc;
-            padding: 6px 12px;
-            border-radius: 2px;
-        }
-
-        .find-dialog button:hover {
-            background-color: #2a2d2e;
-        }
-
-        .find-match-count {
-            color: #858585;
-            font-size: 11px;
         }
 
         /* Settings sidebar form — color-dependent rules in make_theme_css() */

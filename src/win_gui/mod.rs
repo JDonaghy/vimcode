@@ -271,6 +271,25 @@ fn collect_explorer_rows(
     }
 }
 
+/// Cached find/replace overlay geometry for click handling.
+#[derive(Clone)]
+struct FindReplaceRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    input_x: f32,
+    input_w: f32,
+    row_y: f32,
+    /// X positions of nav buttons [↑, ↓, ≡, ×] (4 entries), each btn_s wide.
+    nav_x: [f32; 4],
+    btn_s: f32,
+    /// Replace row Y (only valid when show_replace was true at draw time).
+    rep_y: f32,
+    /// X positions of replace buttons: [AB_x, AB_w, R1_x, R*_x].
+    rep_btns: [f32; 4],
+}
+
 struct AppState {
     engine: Engine,
     theme: Theme,
@@ -298,6 +317,10 @@ struct AppState {
     cached_diff_toolbar_btns: Vec<(GroupId, f32, f32, f32, f32, f32, f32)>,
     /// Cached group dividers from last draw pass (for drag handling).
     cached_dividers: Vec<crate::core::window::GroupDivider>,
+    /// Cached find/replace overlay geometry from last draw pass.
+    cached_find_replace_rect: Option<FindReplaceRect>,
+    /// True when the user is dragging within a find/replace input field.
+    fr_input_dragging: bool,
 
     // ── Sidebar ───────────────────────────────────────────────────────────
     sidebar: WinSidebar,
@@ -653,6 +676,8 @@ pub fn run(file_path: Option<PathBuf>) {
             cached_breadcrumbs: Vec::new(),
             cached_diff_toolbar_btns: Vec::new(),
             cached_dividers: Vec::new(),
+            cached_find_replace_rect: None,
+            fr_input_dragging: false,
             sidebar: WinSidebar::new(),
             current_colorscheme: initial_colorscheme,
             current_font_size: initial_font_size,
@@ -1235,6 +1260,13 @@ fn on_paint(hwnd: HWND) {
             // Menu dropdown on top of sidebar
             if let Some(ref menu) = screen.menu_bar {
                 ctx.draw_menu_dropdown(menu);
+            }
+            // Find/replace overlay
+            if let Some(ref find_replace) = screen.find_replace {
+                let fr_rect = ctx.draw_find_replace(find_replace);
+                state.cached_find_replace_rect = Some(fr_rect);
+            } else {
+                state.cached_find_replace_rect = None;
             }
             // Dialog (on top of everything except notifications)
             if let Some(ref dialog) = screen.dialog {
@@ -3780,6 +3812,96 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
+        // ── Find/replace overlay click handling ────────────────────────────
+        if state.engine.find_replace_open {
+            if let Some(fr) = state.cached_find_replace_rect.clone() {
+                let lh = state.line_height;
+                let cw = state.char_width;
+
+                let on_panel = px >= fr.x && px < fr.x + fr.w && py >= fr.y && py < fr.y + fr.h;
+
+                if on_panel {
+                    // --- Find row ---
+                    if py >= fr.row_y && py < fr.row_y + lh {
+                        if px < fr.input_x {
+                            state.engine.find_replace_show_replace =
+                                !state.engine.find_replace_show_replace;
+                        } else if px < fr.input_x + fr.input_w {
+                            state.engine.find_replace_focus = 0;
+                            let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                            let pos =
+                                click_col.min(state.engine.find_replace_query.chars().count());
+                            state.engine.find_replace_cursor = pos;
+                            state.engine.find_replace_sel_anchor = Some(pos);
+                            state.fr_input_dragging = true;
+                        } else {
+                            // Toggle buttons (between input and first nav button)
+                            let mut bx = fr.input_x + fr.input_w + 4.0;
+                            for (i, label) in ["Aa", "ab", ".*"].iter().enumerate() {
+                                let tw = label.chars().count() as f32 * cw + 4.0;
+                                if px >= bx && px < bx + tw {
+                                    match i {
+                                        0 => state.engine.toggle_find_replace_case(),
+                                        1 => state.engine.toggle_find_replace_whole_word(),
+                                        _ => state.engine.toggle_find_replace_regex(),
+                                    }
+                                    break;
+                                }
+                                bx += tw + 2.0;
+                            }
+                            // Nav buttons (use exact cached positions)
+                            for i in 0..4 {
+                                if px >= fr.nav_x[i] && px < fr.nav_x[i] + fr.btn_s {
+                                    match i {
+                                        0 => state.engine.find_replace_prev(),
+                                        1 => state.engine.find_replace_next(),
+                                        2 => state.engine.toggle_find_replace_in_selection(),
+                                        _ => state.engine.close_find_replace(),
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Replace row ---
+                    if state.engine.find_replace_show_replace
+                        && fr.rep_y > 0.0
+                        && py >= fr.rep_y
+                        && py < fr.rep_y + lh
+                    {
+                        if px >= fr.input_x && px < fr.input_x + fr.input_w {
+                            state.engine.find_replace_focus = 1;
+                            let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                            let pos = click_col
+                                .min(state.engine.find_replace_replacement.chars().count());
+                            state.engine.find_replace_cursor = pos;
+                            state.engine.find_replace_sel_anchor = Some(pos);
+                            state.fr_input_dragging = true;
+                        } else {
+                            // [AB] button
+                            let [ab_x, ab_w, r1_x, r_all_x] = fr.rep_btns;
+                            if px >= ab_x && px < ab_x + ab_w {
+                                state.engine.toggle_find_replace_preserve_case();
+                            }
+                            if px >= r1_x && px < r1_x + fr.btn_s {
+                                state.engine.find_replace_replace_current();
+                            }
+                            if px >= r_all_x && px < r_all_x + fr.btn_s {
+                                state.engine.find_replace_replace_all();
+                            }
+                        }
+                    } // end replace row
+
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+            // Click outside panel — let it fall through to editor
+        }
+
         // ── Dialog button click handling (highest z-order) ────────────────
         if state.engine.dialog.is_some() {
             let lh = state.line_height;
@@ -4429,6 +4551,7 @@ fn on_mouse_up(hwnd: HWND) {
         }
 
         state.mouse_text_drag = false;
+        state.fr_input_dragging = false;
         state.sidebar_resize_drag = false;
         state.scrollbar_drag = None;
         state.h_scrollbar_drag = None;
@@ -4504,6 +4627,28 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+        }
+
+        // Find/replace input text selection drag
+        if state.fr_input_dragging && lbutton {
+            if let Some(ref fr) = state.cached_find_replace_rect {
+                let cw = state.char_width;
+                let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                let len = if state.engine.find_replace_focus == 0 {
+                    state.engine.find_replace_query.chars().count()
+                } else {
+                    state.engine.find_replace_replacement.chars().count()
+                };
+                state.engine.find_replace_cursor = click_col.min(len);
+                // anchor stays at the original click position → creates selection
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+        if state.fr_input_dragging && !lbutton {
+            state.fr_input_dragging = false;
         }
 
         // Terminal text selection drag in progress
@@ -5183,6 +5328,56 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
         let state = app.as_mut().expect("AppState");
 
         state.engine.terminal_has_focus = false;
+
+        // If find/replace overlay is open and double-click is on an input, select word
+        if state.engine.find_replace_open {
+            if let Some(ref fr) = state.cached_find_replace_rect {
+                if px >= fr.x && px < fr.x + fr.w && py >= fr.y && py < fr.y + fr.h {
+                    let lh = state.line_height;
+                    let cw = state.char_width;
+                    // Check if double-click is on find or replace input
+                    let on_find_input = py >= fr.row_y
+                        && py < fr.row_y + lh
+                        && px >= fr.input_x
+                        && px < fr.input_x + fr.input_w;
+                    let on_repl_input = fr.rep_y > 0.0
+                        && py >= fr.rep_y
+                        && py < fr.rep_y + lh
+                        && px >= fr.input_x
+                        && px < fr.input_x + fr.input_w;
+
+                    if on_find_input || on_repl_input {
+                        let focus = if on_find_input { 0u8 } else { 1 };
+                        state.engine.find_replace_focus = focus;
+                        let field: Vec<char> = if focus == 0 {
+                            state.engine.find_replace_query.chars().collect()
+                        } else {
+                            state.engine.find_replace_replacement.chars().collect()
+                        };
+                        let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                        let pos = click_col.min(field.len());
+                        // Find word boundaries around pos
+                        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                        let start = (0..=pos)
+                            .rev()
+                            .take_while(|&i| i < field.len() && is_word(field[i]))
+                            .last()
+                            .unwrap_or(pos);
+                        let end = (pos..field.len())
+                            .take_while(|&i| is_word(field[i]))
+                            .last()
+                            .map(|i| i + 1)
+                            .unwrap_or(pos);
+                        state.engine.find_replace_sel_anchor = Some(start);
+                        state.engine.find_replace_cursor = end;
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
 
         // Double-click on explorer file → open as Permanent (promotes preview tab)
         let ab_w = state.sidebar.activity_bar_px;

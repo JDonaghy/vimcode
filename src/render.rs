@@ -1259,7 +1259,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Replace",
                 shortcut: "",
-                vscode_shortcut: "",
+                vscode_shortcut: "Ctrl+H",
                 action: "replace",
                 enabled: true,
                 separator: false,
@@ -2466,6 +2466,8 @@ pub struct ScreenLayout {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
+    /// Inline find/replace overlay — `Some` when the find/replace popup is open.
+    pub find_replace: Option<FindReplacePanel>,
     /// Context menu popup — `Some` when an engine context menu is open.
     pub context_menu: Option<ContextMenuPanel>,
     /// Tab hover tooltip: shortened file path to display near the hovered tab.
@@ -2515,6 +2517,36 @@ pub struct DialogPanel {
 pub struct DialogInputPanel {
     /// Display text (masked for passwords).
     pub display: String,
+}
+
+/// The inline find/replace overlay displayed at the top-right of the active editor group.
+#[derive(Debug, Clone)]
+pub struct FindReplacePanel {
+    /// Current query text in the find field.
+    pub query: String,
+    /// Current replacement text (only shown when `show_replace` is true).
+    pub replacement: String,
+    /// Whether the replace row is visible.
+    pub show_replace: bool,
+    /// Which field has focus: 0 = find, 1 = replace.
+    pub focus: u8,
+    /// Cursor position within the focused field (char offset).
+    pub cursor: usize,
+    /// Selection anchor in the focused field. When Some, text between anchor and cursor is selected.
+    pub sel_anchor: Option<usize>,
+    /// "N of M" match count display, or "No results" / empty.
+    pub match_info: String,
+    /// Toggle button states (find row).
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+    /// Toggle button states (replace row).
+    pub preserve_case: bool,
+    /// Find in selection mode.
+    pub in_selection: bool,
+    /// Bounding rect of the active editor group (pixel coords for GTK/Win-GUI,
+    /// approximate for TUI). The overlay positions itself at the top-right of this rect.
+    pub group_bounds: WindowRect,
 }
 
 /// Format a button label with the hotkey character bracketed.
@@ -4916,6 +4948,67 @@ pub fn build_screen_layout(
             screen_col: cm.screen_x,
             screen_row: cm.screen_y,
         }),
+        find_replace: if engine.find_replace_open {
+            let match_info = if engine.search_matches.is_empty() {
+                if engine.find_replace_query.is_empty() {
+                    String::new()
+                } else {
+                    "No results".to_string()
+                }
+            } else {
+                match engine.search_index {
+                    Some(idx) => format!("{} of {}", idx + 1, engine.search_matches.len()),
+                    None => format!("{} matches", engine.search_matches.len()),
+                }
+            };
+            // Compute active group bounds from window rects
+            let active_group_bounds = {
+                let active_group = &engine.active_group;
+                let group_window_ids: Vec<_> = engine
+                    .editor_groups
+                    .get(active_group)
+                    .map(|g| g.active_tab().layout.window_ids())
+                    .unwrap_or_default();
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = 0.0f64;
+                let mut max_y = 0.0f64;
+                for (wid, rect) in window_rects {
+                    if group_window_ids.contains(wid) {
+                        min_x = min_x.min(rect.x);
+                        min_y = min_y.min(rect.y);
+                        max_x = max_x.max(rect.x + rect.width);
+                        max_y = max_y.max(rect.y + rect.height);
+                    }
+                }
+                if min_x < f64::MAX {
+                    WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+                } else {
+                    // Fallback: use first window rect or zero
+                    window_rects
+                        .first()
+                        .map(|(_, r)| *r)
+                        .unwrap_or_else(|| WindowRect::new(0.0, 0.0, 800.0, 600.0))
+                }
+            };
+            Some(FindReplacePanel {
+                query: engine.find_replace_query.clone(),
+                replacement: engine.find_replace_replacement.clone(),
+                show_replace: engine.find_replace_show_replace,
+                focus: engine.find_replace_focus,
+                cursor: engine.find_replace_cursor,
+                sel_anchor: engine.find_replace_sel_anchor,
+                match_info,
+                case_sensitive: engine.find_replace_options.case_sensitive,
+                whole_word: engine.find_replace_options.whole_word,
+                use_regex: engine.find_replace_options.use_regex,
+                preserve_case: engine.find_replace_options.preserve_case,
+                in_selection: engine.find_replace_options.in_selection,
+                group_bounds: active_group_bounds,
+            })
+        } else {
+            None
+        },
         tab_tooltip: engine.tab_hover_tooltip.clone(),
         tab_scroll_offset: engine
             .editor_groups

@@ -294,6 +294,15 @@ pub struct Settings {
     /// Disable if your terminal/font lacks Nerd Font glyphs to get ASCII fallbacks.
     #[serde(default = "default_use_nerd_fonts")]
     pub use_nerd_fonts: bool,
+
+    /// What Ctrl+F does: "find" opens the find/replace overlay (default),
+    /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
+    #[serde(default = "default_ctrl_f_action")]
+    pub ctrl_f_action: String,
+}
+
+fn default_ctrl_f_action() -> String {
+    "find".to_string()
 }
 
 fn default_indent_guides() -> bool {
@@ -735,6 +744,7 @@ impl Default for Settings {
             auto_pairs: default_auto_pairs(),
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
+            ctrl_f_action: default_ctrl_f_action(),
         }
     }
 }
@@ -1333,6 +1343,7 @@ impl Settings {
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
             "hover_delay" => self.hover_delay.to_string(),
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
+            "ctrl_f_action" => self.ctrl_f_action.clone(),
             "extension_registries" => self.extension_registries.join(", "),
             _ => String::new(),
         }
@@ -1446,6 +1457,14 @@ impl Settings {
                 self.use_nerd_fonts = value == "true";
                 crate::icons::set_nerd_fonts(self.use_nerd_fonts);
             }
+            "ctrl_f_action" => match value {
+                "find" | "page_down" => self.ctrl_f_action = value.to_string(),
+                _ => {
+                    return Err(format!(
+                        "Invalid ctrl_f_action: {value} (expected 'find' or 'page_down')"
+                    ))
+                }
+            },
             "extension_registries" => {
                 self.extension_registries = value
                     .split(',')
@@ -1882,6 +1901,14 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Press Enter to edit registry URLs (one per line, # comments)",
         category: "Extensions",
         setting_type: SettingType::BufferEditor,
+    },
+    // ── Keybindings ────────────────────────────────────────────────────────
+    SettingDef {
+        key: "ctrl_f_action",
+        label: "Ctrl+F Action",
+        description: "What Ctrl+F does: 'find' (find/replace overlay) or 'page_down' (Vim default)",
+        category: "Editor",
+        setting_type: SettingType::Enum(&["find", "page_down"]),
     },
     // ── TUI ─────────────────────────────────────────────────────────────────
     SettingDef {
