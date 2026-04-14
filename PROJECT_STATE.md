@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 13, 2026 (Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover) | **Tests:** 5478
+**Last updated:** Apr 13, 2026 (Session 274 — Phase 2d behavioral parity tests, clippy CI fix) | **Tests:** 5494
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 272 are in **SESSION_HISTORY.md**.
@@ -26,22 +26,10 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover:**
+**Session 274 — Phase 2d behavioral parity tests, clippy CI fix:**
 
-**Critical LSP fix (Windows):**
-1. **`path_to_uri` broken on Windows** — Was producing `file://C:\path` (backslashes, two slashes) instead of RFC 3986 `file:///C:/path` (forward slashes, three slashes). rust-analyzer couldn't match hover/definition/diagnostic requests to known files, making all LSP features non-functional on Windows. Fixed URI generation and `uri_to_path` parsing.
+1. **Phase 2d behavioral backend parity tests** — 16 new end-to-end tests in `render.rs` that simulate user interaction sequences and verify engine state transitions. Covers: tab click/switch, tab close (clean + dirty gate), context menu lifecycle (open/confirm/dismiss), explorer/tab/editor context menu targets, double-click word selection, editor hover lifecycle (show/focus/scroll/dismiss), sidebar focus toggle + clear, terminal new/close/split, tab drag-drop to create splits, preview tab promotion via goto_tab, preview reuse invariant, mouse click cursor movement.
+2. **Clippy CI fix** — `return true` → `true` in `cargo_bin_probe_ok()` non-Windows cfg block (`lsp_manager.rs:51`). Fixed `needless_return` lint that broke the Linux CI build.
+3. **Updated `/complete-push` command** — Now requires clippy to pass on all feature configurations before pushing.
 
-**Win-GUI hover popups:**
-2. **`editor_hover_mouse_move()` never called** — Added in `on_mouse_move` for editor area dwell tracking.
-3. **`poll_editor_hover()` never called** — Added in `on_tick` to fire the dwell timer and send LSP hover requests.
-
-**Extension install on Windows:**
-4. **Win-GUI never consumed `pending_terminal_command`** — Extension install terminal never opened. Added check in Win-GUI tick loop.
-5. **`terminal_run_command` used bash syntax on PowerShell** — Added PowerShell wrapper (`-Command`, `$LASTEXITCODE`, `Read-Host`) alongside existing bash wrapper.
-6. **`&&` invalid in PowerShell 5.x** — Changed install command separator to `;` (works in both bash and PowerShell).
-7. **Broken rustup proxy detection** — `binary_on_path` found proxy exe but it didn't work. Added `cargo_bin_probe_ok()` that runs `--version` to validate binaries in `~/.cargo/bin/`.
-8. **Rust extension install command** — Overridden on Windows from `cargo install rust-analyzer` to `rustup component add rust-analyzer`. Updated remote registry (`vimcode-ext`).
-9. **Install spinner never cleared** — `finalize_install_from_terminal` now calls `notify_done_by_kind`.
-10. **`lsp_did_open` called before install completes** — Skipped when install is pending.
-
-> Sessions 272 and earlier in **SESSION_HISTORY.md**.
+> Sessions 273 and earlier in **SESSION_HISTORY.md**.

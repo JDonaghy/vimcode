@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 272 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 273 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover:**
+Critical LSP fix: `path_to_uri` produced backslash URIs (`file://C:\path`) instead of RFC 3986 (`file:///C:/path`), breaking all LSP on Windows. Win-GUI hover: added `editor_hover_mouse_move()` + `poll_editor_hover()`. Extension install fixes: Win-GUI `pending_terminal_command`, PowerShell terminal wrapper, `&&`→`;`, rustup proxy detection (`cargo_bin_probe_ok`), rust-analyzer install via `rustup component add`, install spinner clear, `lsp_did_open` skip when install pending.
 
 ## Session 272 — Win-GUI git panel rendering parity + tab scroll-into-view
 Win-GUI git panel full renderer rewrite (~300 lines): themed header, commit input box, button row (Commit/Push/Pull/Sync with hover), 4 collapsible sections, selection highlight, file status coloring, scrollbar, branch picker popup, help dialog. Click interactivity: section items, commit input, buttons, double-click-to-open-diff. Button hover tracking. Panel hover dwell for commit log popups. Tab bar scroll-into-view fix (`set_tab_visible_count` reporting).
