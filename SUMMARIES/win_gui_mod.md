@@ -1,4 +1,4 @@
-# src/win_gui/mod.rs — Win-GUI Backend (6,263 lines)
+# src/win_gui/mod.rs — Win-GUI Backend (6,464 lines)
 
 Native Windows backend using windows-rs + Direct2D + DirectWrite. Behind `win-gui` Cargo feature.
 

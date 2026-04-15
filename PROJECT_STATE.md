@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 15, 2026 (Session 280 — Fix 6 Vim deviations, Neovim conformance harness) | **Tests:** 1463 (lib) + 31 (nvim conformance)
+**Last updated:** Apr 15, 2026 (Session 281 — Fix linewise paste clipboard bug) | **Tests:** 1468 (lib) + 31 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 281 — Fix linewise paste clipboard bug (#64):**
+
+1. **Fix #64: Linewise paste (P/p) lost `is_linewise` through clipboard round-trip** — Two bugs: (a) Win-GUI `clipboard_write` passed multi-line text as a `-Value` argument to `Set-Clipboard`, but PowerShell splits on newlines — only the first line was written. Fixed by piping via stdin. (b) `load_clipboard_for_paste()` compared clipboard text with an exact match, but the OS round-trip changes `\n` → `\r\n` and strips trailing newlines. Fixed by normalizing CRLF→LF and comparing without trailing newlines.
+2. **Created issues #64 (linewise paste) and #65 (Ctrl-V insert-mode cumulative indent).**
 
 **Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
 

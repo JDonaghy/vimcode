@@ -1,4 +1,4 @@
-# src/core/engine/tests.rs — 17,961 lines
+# src/core/engine/tests.rs — 21,225 lines
 
 All engine unit and integration tests. ~815 test functions covering every Vim feature, command, motion, text object, and edge case.
 
