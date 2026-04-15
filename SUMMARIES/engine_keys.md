@@ -1,4 +1,4 @@
-# src/core/engine/keys.rs — 7,221 lines
+# src/core/engine/keys.rs — 7,308 lines
 
 All keyboard input handling. Routes keys by mode, processes operators, macros, repeat, user keymaps, mouse events, and clipboard.
 

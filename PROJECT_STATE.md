@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 15, 2026 (Session 279 — Vim conformance matrix tests, `:set` audit) | **Tests:** 1463 (lib)
+**Last updated:** Apr 15, 2026 (Session 280 — Fix 6 Vim deviations, Neovim conformance harness) | **Tests:** 1463 (lib) + 31 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 278 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,16 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
+
+1. **Fix #31: `2d2w` count multiplication** — Added `operator_count` field to Engine. When operator is set, count is saved separately; `take_count()` multiplies operator_count × motion_count. `2d2w` now correctly deletes 4 words.
+2. **Fix #32: `<G` outdent** — Was a `send_keys()` test parser bug: `<G` was treated as a special key. Fixed parser to require closing `>`. Engine was already correct.
+3. **Fix #30: `di</da<` angle bracket text objects** — Added `'<' | '>'` match arm to `find_text_object_range()` using existing `find_bracket_object()`.
+4. **Fix #29: `da"/da'` trailing whitespace** — `find_quote_object()` for `modifier == 'a'` now includes trailing whitespace (or leading if no trailing), matching Vim spec.
+5. **Fix #28: `d}/d{` paragraph boundary** — `d{` range is `[target, cursor-1]` (blank line deleted, cursor line preserved). `d}` range is `[cursor, target-1]` (cursor line deleted, blank line preserved). Verified against Neovim headless.
+6. **Fix #33: Cursor position after `c+Esc`** — Added standard Vim cursor-left-on-Esc to insert mode Escape handler.
+7. **Neovim conformance test harness** — `tests/nvim_conformance.rs`: 31 automated tests that run key sequences through both Neovim (headless) and VimCode, comparing buffer content + cursor position. Just add entries to `CASES` array — no manual testing needed. Requires `nvim` on PATH; skips gracefully if missing.
 
 **Session 279 — Vim conformance matrix tests, `:set` option audit:**
 
