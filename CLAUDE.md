@@ -1,7 +1,8 @@
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Check `.opencode/specs/` for detailed feature specs before starting
-3. Prompt user to update `PROJECT_STATE.md` after significant tasks
+3. Run `gh issue list --milestone "Vim Conformance" --state open` for active conformance work
+4. Prompt user to update `PROJECT_STATE.md` after significant tasks
 
 ## Documentation Maintenance (MANDATORY)
 After completing any feature or significant change, update ALL of these files:
