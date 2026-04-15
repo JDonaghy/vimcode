@@ -1629,6 +1629,7 @@ impl Engine {
             '(' | ')' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
             '{' | '}' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
             '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
+            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos),
             'p' => self.find_paragraph_object(modifier, cursor_pos),
             's' => self.find_sentence_object(modifier, cursor_pos),
             't' => self.find_tag_text_object(modifier, cursor_pos),
@@ -1762,8 +1763,35 @@ impl Engine {
                 None
             }
         } else {
-            // Around: include quotes
-            Some((open_pos, close_pos + 1))
+            // Around: include quotes + trailing whitespace (or leading if no trailing)
+            let mut end = close_pos + 1;
+            let mut start = open_pos;
+            // Try trailing whitespace first
+            let mut trail = end;
+            while trail < line_end {
+                let ch = self.buffer().content.char(trail);
+                if ch == ' ' || ch == '\t' {
+                    trail += 1;
+                } else {
+                    break;
+                }
+            }
+            if trail > end {
+                end = trail;
+            } else {
+                // No trailing whitespace — try leading whitespace
+                let mut lead = start;
+                while lead > line_start {
+                    let ch = self.buffer().content.char(lead - 1);
+                    if ch == ' ' || ch == '\t' {
+                        lead -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                start = lead;
+            }
+            Some((start, end))
         }
     }
 
@@ -3708,7 +3736,9 @@ impl Engine {
     /// This clears the count field.
     #[allow(dead_code)] // Will be used in Step 2 for motion commands
     pub fn take_count(&mut self) -> usize {
-        self.count.take().unwrap_or(1)
+        let op_count = self.operator_count.take().unwrap_or(1);
+        let motion_count = self.count.take().unwrap_or(1);
+        op_count * motion_count
     }
 
     /// Peeks at the current count without consuming it. Used for UI display.

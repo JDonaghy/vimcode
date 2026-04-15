@@ -4131,7 +4131,7 @@ fn test_da_quote_double() {
     press_char(&mut engine, 'a');
     press_char(&mut engine, '"');
 
-    assert_eq!(engine.buffer().to_string(), "foo  bar");
+    assert_eq!(engine.buffer().to_string(), "foo bar");
     assert_eq!(engine.view().cursor.col, 4);
 }
 
@@ -19479,14 +19479,15 @@ fn send_keys(engine: &mut Engine, keys: &str) {
     let mut chars = keys.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '<' {
-            // Check if this looks like a <SpecialKey> sequence:
-            // peek at the next char — if it's uppercase or part of "C-", parse as special.
-            // Otherwise treat '<' as a literal key.
-            let is_special = chars
+            // Only parse as <SpecialKey> if the remaining string contains a matching '>'.
+            // Collect the rest of the iterator to peek ahead.
+            let rest: String = chars.clone().collect();
+            let has_closing = rest.contains('>');
+            let starts_special = chars
                 .peek()
                 .map(|&c| c.is_ascii_uppercase() || c == 'C')
                 .unwrap_or(false);
-            if is_special {
+            if has_closing && starts_special {
                 let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
                 match name.as_str() {
                     "Esc" => press_special(engine, "Escape"),
@@ -19683,24 +19684,53 @@ fn test_matrix_delete_linewise_motions() {
             0,
             0,
         ),
-        // paragraph motions
-        // NOTE: Neovim d} preserves the blank line ("\nline three"), VimCode deletes it.
-        // TODO: Fix paragraph motion boundary to match Vim — d} should stop AT the blank
-        // line, not past it.
+        // paragraph motions — { and } are exclusive at the motion destination
+        // d}: cursor line included, target blank line excluded
         (
             "d}",
             "line one\n\nline three",
             0,
             0,
             "d}",
-            "line three",
+            "\nline three",
             0,
             0,
         ),
-        // NOTE: Neovim d{ from line 3 col 0 gives "line one\nline three" (cursor at
-        // line 1 col 0). VimCode gives "line one" — deletes too much.
-        // TODO: Fix d{ paragraph motion to match Vim.
-        ("d{", "line one\n\nline three", 2, 0, "d{", "line one", 0, 0),
+        // d{: destination (blank line) included, cursor line excluded
+        // Neovim: "line one\n\nline three" d{ from line 2 → "line one\nline three"
+        (
+            "d{",
+            "line one\n\nline three",
+            2,
+            0,
+            "d{",
+            "line one\nline three",
+            1,
+            0,
+        ),
+        // d{ multi-line: "aaa\n\nbbb\nccc\nddd" d{ from ddd → "aaa\nddd"
+        (
+            "d{_multi",
+            "aaa\n\nbbb\nccc\nddd",
+            4,
+            0,
+            "d{",
+            "aaa\nddd",
+            1,
+            0,
+        ),
+        // d} from blank line: blank line + content deleted, target blank excluded
+        // "aaa\n\nbbb\nccc\n\nddd" d} from line 1 → "aaa\n\nddd"
+        (
+            "d}_from_blank",
+            "aaa\n\nbbb\nccc\n\nddd",
+            1,
+            0,
+            "d}",
+            "aaa\n\nddd",
+            1,
+            0,
+        ),
         // dd
         ("dd_mid", "one\ntwo\nthree", 1, 0, "dd", "one\nthree", 1, 0),
         // d with count on j
@@ -19854,16 +19884,14 @@ fn test_matrix_delete_text_objects() {
             0,
             5,
         ),
-        // NOTE: Neovim da" gives "say now" (col 4). VimCode gives "say  now" (col 4)
-        // — VimCode deletes the quotes+content but not the trailing space.
-        // TODO: Fix a" text object to include trailing whitespace per Vim spec.
+        // da" includes trailing whitespace per Vim spec
         (
             "da_dq",
             "say \"hello world\" now",
             0,
             5,
             "da\"",
-            "say  now",
+            "say now",
             0,
             4,
         ),
@@ -19878,14 +19906,14 @@ fn test_matrix_delete_text_objects() {
             0,
             5,
         ),
-        // NOTE: Same trailing-whitespace issue as da" — see TODO above.
+        // da' includes trailing whitespace per Vim spec
         (
             "da_sq",
             "say 'hello world' now",
             0,
             5,
             "da'",
-            "say  now",
+            "say now",
             0,
             4,
         ),
@@ -19898,10 +19926,9 @@ fn test_matrix_delete_text_objects() {
         // bracket objects
         ("di[", "arr[x + y] end", 0, 4, "di[", "arr[] end", 0, 4),
         ("da[", "arr[x + y] end", 0, 4, "da[", "arr end", 0, 3),
-        // angle bracket objects — NOT YET IMPLEMENTED (missing from find_text_object_range)
-        // TODO: Add < > to find_text_object_range as find_bracket_object('<', '>')
-        // ("di<", "tag<x + y>end", 0, 4, "di<", "tag<>end", 0, 4),
-        // ("da<", "tag<x + y>end", 0, 4, "da<", "tagend", 0, 3),
+        // angle bracket objects
+        ("di<", "tag<x + y>end", 0, 4, "di<", "tag<>end", 0, 4),
+        ("da<", "tag<x + y>end", 0, 4, "da<", "tagend", 0, 3),
         // tag objects
         ("dit", "<div>hello</div>", 0, 5, "dit", "<div></div>", 0, 5),
         ("dat", "<div>hello</div>", 0, 5, "dat", "", 0, 0),
@@ -20028,8 +20055,8 @@ fn test_matrix_change_char_motions() {
             0,
             0,
         ),
-        // NOTE: Neovim c^<Esc> cursor at col 1. VimCode: col 2 (insert position, not -1).
-        ("c^", "  hello world", 0, 5, "c^<Esc>", "  lo world", 0, 2),
+        // Vim: Esc from insert moves cursor one left
+        ("c^", "  hello world", 0, 5, "c^<Esc>", "  lo world", 0, 1),
         ("cw", "hello world foo", 0, 0, "cw<Esc>", " world foo", 0, 0),
         ("cW", "hello.world foo", 0, 0, "cW<Esc>", " foo", 0, 0),
         ("cb", "hello world foo", 0, 6, "cb<Esc>", "world foo", 0, 0),
@@ -20141,7 +20168,7 @@ fn test_matrix_change_linewise_motions() {
 #[test]
 fn test_matrix_change_text_objects() {
     let cases: &[(&str, &str, usize, usize, &str, &str, usize, usize)] = &[
-        // NOTE: Neovim ciw<Esc> cursor at col 5 (one-left of insert). VimCode: col 6.
+        // Vim moves cursor one left when exiting insert mode via Esc
         (
             "ciw",
             "hello world foo",
@@ -20150,9 +20177,8 @@ fn test_matrix_change_text_objects() {
             "ciw<Esc>",
             "hello  foo",
             0,
-            6,
+            5,
         ),
-        // NOTE: Neovim caw<Esc> cursor at col 5. VimCode: col 6.
         (
             "caw",
             "hello world foo",
@@ -20161,10 +20187,8 @@ fn test_matrix_change_text_objects() {
             "caw<Esc>",
             "hello foo",
             0,
-            6,
+            5,
         ),
-        // NOTE: Neovim ci"<Esc> cursor at col 4. VimCode: col 5 (Esc doesn't
-        // move left when between delimiters). Same +1 pattern for all bracket objects.
         (
             "ci_dq",
             "say \"hello world\" now",
@@ -20173,10 +20197,10 @@ fn test_matrix_change_text_objects() {
             "ci\"<Esc>",
             "say \"\" now",
             0,
-            5,
+            4,
         ),
-        ("ci(", "fn(a, b) end", 0, 3, "ci(<Esc>", "fn() end", 0, 3),
-        ("ci{", "if {x + y} end", 0, 4, "ci{<Esc>", "if {} end", 0, 4),
+        ("ci(", "fn(a, b) end", 0, 3, "ci(<Esc>", "fn() end", 0, 2),
+        ("ci{", "if {x + y} end", 0, 4, "ci{<Esc>", "if {} end", 0, 3),
         (
             "cit",
             "<div>hello</div>",
@@ -20185,7 +20209,7 @@ fn test_matrix_change_text_objects() {
             "cit<Esc>",
             "<div></div>",
             0,
-            5,
+            4,
         ),
     ];
 
@@ -20431,6 +20455,13 @@ fn test_matrix_yank_with_count() {
     assert_eq!(engine.buffer().to_string(), "one two three four");
     let (content, _) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "one two ");
+
+    // 3y2w = yank 6 words (operator_count=3 × motion_count=2)
+    let mut engine = setup_engine("a b c d e f g h", 0, 0);
+    send_keys(&mut engine, "3y2w");
+    let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "a b c d e f ", "3y2w should yank 6 words");
+    assert!(!is_linewise, "3y2w should be charwise");
 }
 
 #[test]
@@ -20514,9 +20545,14 @@ fn test_matrix_outdent_motions() {
             "<j",
             "hello\nworld\nfoo",
         ),
-        // NOTE: <G (outdent to end of file) doesn't work in VimCode.
-        // >G works fine. TODO: Fix < operator + G motion.
-        // ("<G", "    one\n    two\n    three", 0, 0, "<G", "one\ntwo\nthree"),
+        (
+            "<G",
+            "    one\n    two\n    three",
+            0,
+            0,
+            "<G",
+            "one\ntwo\nthree",
+        ),
     ];
 
     for &(label, buf, cline, ccol, keys, expected_buf) in cases {
@@ -20580,10 +20616,10 @@ fn test_matrix_count_variations() {
     let cases: &[(&str, &str, usize, usize, &str, &str)] = &[
         ("3dw", "one two three four five", 0, 0, "3dw", "four five"),
         ("d3w", "one two three four five", 0, 0, "d3w", "four five"),
-        // NOTE: Neovim 2d2w deletes 4 words (2*2). VimCode's count accumulation
-        // treats "2d2w" as d22w (count becomes 22), deleting everything.
-        // TODO: Fix count handling so operator count and motion count multiply.
-        // ("2d2w", "one two three four five", 0, 0, "2d2w", "five"),
+        // operator_count × motion_count: 2d2w = d4w (deletes 4 words)
+        ("2d2w", "one two three four five", 0, 0, "2d2w", "five"),
+        // 3d2w = d6w (deletes 6 words)
+        ("3d2w", "a b c d e f g h", 0, 0, "3d2w", "g h"),
         ("3dd", "a\nb\nc\nd\ne", 0, 0, "3dd", "d\ne"),
         (
             "2gUw",
