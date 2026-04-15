@@ -580,8 +580,14 @@ impl Engine {
             return self.handle_leader_key(unicode);
         }
 
-        // Detect leader keypress (non-ctrl, no pending key sequence, matches configured leader char).
-        if !ctrl && self.pending_key.is_none() && unicode == Some(self.settings.leader) {
+        // Detect leader keypress (non-ctrl, no pending key/operator/find, matches configured leader char).
+        if !ctrl
+            && self.pending_key.is_none()
+            && self.pending_operator.is_none()
+            && self.pending_find_operator.is_none()
+            && self.pending_text_object.is_none()
+            && unicode == Some(self.settings.leader)
+        {
             self.leader_partial = Some(String::new());
             return EngineAction::None;
         }
@@ -4161,6 +4167,31 @@ impl Engine {
         }
 
         self.apply_charwise_operator(operator, delete_start, delete_end, changed);
+
+        // Record for dot repeat (d/y/>/</gu/gU/g~ with motion).
+        // 'c' is recorded after Esc from insert mode, not here.
+        if operator != 'c' && operator != 'y' {
+            let motion_enum = match motion {
+                'w' => Some(Motion::WordForward),
+                'b' => Some(Motion::WordBackward),
+                'e' => Some(Motion::WordEnd),
+                _ => None,
+            };
+            if let Some(m) = motion_enum {
+                self.last_change = Some(Change {
+                    op: match operator {
+                        'd' => ChangeOp::Delete,
+                        '>' => ChangeOp::Indent,
+                        '<' => ChangeOp::Dedent,
+                        '~' => ChangeOp::ToggleCase,
+                        _ => ChangeOp::Delete,
+                    },
+                    text: String::new(),
+                    count,
+                    motion: Some(m),
+                });
+            }
+        }
     }
 
     pub(crate) fn apply_operator_bracket_motion(&mut self, operator: char, changed: &mut bool) {
@@ -6383,6 +6414,20 @@ impl Engine {
                         Motion::DeleteLine => {
                             // Repeat dd
                             self.delete_lines(final_count, changed);
+                        }
+                        Motion::WordForward
+                        | Motion::WordBackward
+                        | Motion::WordEnd
+                        | Motion::WordBackwardEnd => {
+                            // Repeat dw/db/de/dge
+                            let m = match motion {
+                                Motion::WordForward => 'w',
+                                Motion::WordBackward => 'b',
+                                Motion::WordEnd => 'e',
+                                Motion::WordBackwardEnd => 'e', // ge uses 'e' in backward direction
+                                _ => unreachable!(),
+                            };
+                            self.apply_operator_with_motion('d', m, final_count, changed);
                         }
                         _ => {}
                     }

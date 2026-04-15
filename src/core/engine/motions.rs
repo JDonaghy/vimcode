@@ -147,20 +147,30 @@ impl Engine {
             return;
         }
 
-        // Move back one character first
-        pos -= 1;
+        let ch = self.buffer().content.char(pos);
 
-        // Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
+        // Step 1: If on a non-whitespace char, go to the start of the current word.
+        // If on whitespace, just move back one to begin searching.
+        if !ch.is_whitespace() {
+            if is_word_char(ch) {
+                while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+                    pos -= 1;
+                }
+            } else {
+                while pos > 0 {
+                    let prev = self.buffer().content.char(pos - 1);
+                    if is_word_char(prev) || prev.is_whitespace() {
+                        break;
+                    }
+                    pos -= 1;
+                }
+            }
         }
 
-        // If we're at position 0 and it's whitespace, stop
         if pos == 0 {
-            if self.buffer().content.char(pos).is_whitespace() {
-                return;
-            }
-            // At position 0 and it's not whitespace, this is the end of the first word
+            // Already at start of first word — nowhere to go further back.
+            // But Vim's `ge` from start of first word goes to col 0 (no-op if
+            // already there). We're already there.
             let new_line = self.buffer().content.char_to_line(pos);
             let line_start = self.buffer().line_to_char(new_line);
             self.view_mut().cursor.line = new_line;
@@ -168,38 +178,20 @@ impl Engine {
             return;
         }
 
-        // Now we're on a non-whitespace char - find the start of this word
-        let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
-            // Move to start of word
-            while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
-                pos -= 1;
-            }
-        } else {
-            // Non-word punctuation
-            while pos > 0 {
-                let prev = self.buffer().content.char(pos - 1);
-                if is_word_char(prev) || prev.is_whitespace() {
-                    break;
-                }
-                pos -= 1;
-            }
-        }
-
-        // Now pos is at the start of a word, go back to find the end of the previous word
-        if pos == 0 {
-            // Already at start of buffer
-            return;
-        }
-
+        // Step 2: Move back one char (from start of current word or from whitespace)
         pos -= 1;
 
-        // Skip whitespace backward
+        // Step 3: Skip whitespace backward
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
             pos -= 1;
         }
 
-        // Now we're at the end of the previous word
+        // If at pos 0 and it's whitespace, no previous word exists
+        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
+            return;
+        }
+
+        // pos is now at the last char of the previous word (the target)
         let new_line = self.buffer().content.char_to_line(pos);
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
@@ -305,11 +297,14 @@ impl Engine {
         if pos == 0 {
             return;
         }
-        pos -= 1;
 
-        // Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
+        let ch = self.buffer().content.char(pos);
+
+        // Step 1: If on a non-whitespace char, go to the start of the current WORD.
+        if !ch.is_whitespace() {
+            while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
+                pos -= 1;
+            }
         }
 
         if pos == 0 {
@@ -320,22 +315,19 @@ impl Engine {
             return;
         }
 
-        // Skip non-whitespace backward to start of WORD
-        while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
-            pos -= 1;
-        }
-
-        // We now point to start of a WORD; go back one more
-        if pos == 0 {
-            return;
-        }
+        // Step 2: Move back one char
         pos -= 1;
 
-        // Skip whitespace backward
+        // Step 3: Skip whitespace backward
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
             pos -= 1;
         }
 
+        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
+            return;
+        }
+
+        // pos is now at the last char of the previous WORD
         let new_line = self.buffer().content.char_to_line(pos);
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
