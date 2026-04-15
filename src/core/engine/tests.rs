@@ -2948,7 +2948,7 @@ fn test_count_dd_last_lines() {
     press_char(&mut engine, 'd');
     press_char(&mut engine, 'd');
 
-    assert_eq!(engine.buffer().to_string(), "line1");
+    assert_eq!(engine.buffer().to_string(), "line1\n");
 }
 
 #[test]
@@ -19670,7 +19670,7 @@ fn test_matrix_delete_linewise_motions() {
             2,
             0,
             "dG",
-            "one\ntwo",
+            "one\ntwo\n",
             1,
             0,
         ),
@@ -21509,4 +21509,290 @@ fn test_lua_set_lines_insert_at_beginning() {
     engine.execute_command("InsLines");
     // set_lines(0, 0, {"new first"}) inserts before line 0
     assert_eq!(engine.buffer().to_string(), "new first\naaa\nbbb\n");
+}
+
+// ── Phase 4: Neovim test suite mining ────────────────────────────────────
+// Tests translated from Neovim's test_normal.vim and test_textobjects.vim.
+// Reference values verified against Neovim 0.12.1.
+
+/// Helper: set up engine, run feed_keys, assert buffer and cursor.
+fn nvim_case(
+    text: &str,
+    cursor_line: usize,
+    cursor_col: usize,
+    keys: &str,
+    expected: &str,
+    exp_line: usize,
+    exp_col: usize,
+) {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, text);
+    engine.update_syntax();
+    engine.view_mut().cursor.line = cursor_line;
+    engine.view_mut().cursor.col = cursor_col;
+    engine.feed_keys(keys);
+    assert_eq!(
+        engine.buffer().to_string(),
+        expected,
+        "buffer mismatch for keys={keys:?} on {text:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.line,
+        exp_line,
+        "cursor line mismatch for keys={keys:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        exp_col,
+        "cursor col mismatch for keys={keys:?}"
+    );
+}
+
+// ── Neovim: text objects — quotes ────────────────────────────────────────
+
+#[test]
+fn test_nvim_di_quote_basic() {
+    // di" on "hello" deletes inner contents. Neovim: cursor on closing quote (col 5).
+    nvim_case("say \"hello\" end\n", 0, 5, "di\"", "say \"\" end\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_da_quote_basic() {
+    // da" deletes quotes, contents, and trailing space. Neovim: "say end", col 4.
+    nvim_case("say \"hello\" end\n", 0, 5, "da\"", "say end\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_di_single_quote() {
+    // Neovim: cursor on closing quote (col 5).
+    nvim_case("say 'hello' end\n", 0, 5, "di'", "say '' end\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_ci_quote_enters_insert() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "say \"hello\" end\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 5;
+    engine.feed_keys("ci\"world<Esc>");
+    assert_eq!(engine.buffer().to_string(), "say \"world\" end\n");
+}
+
+// ── Neovim: text objects — parentheses ──────────────────────────────────
+
+#[test]
+fn test_nvim_di_paren_basic() {
+    nvim_case("foo(bar)baz\n", 0, 4, "di(", "foo()baz\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_da_paren_basic() {
+    nvim_case("foo(bar)baz\n", 0, 4, "da(", "foobaz\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_di_paren_nested() {
+    // di) from inside nested parens deletes innermost
+    nvim_case("foo(bar(baz)quux)\n", 0, 8, "di)", "foo(bar()quux)\n", 0, 8);
+}
+
+#[test]
+fn test_nvim_di_bracket() {
+    nvim_case("arr[idx]\n", 0, 4, "di[", "arr[]\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_di_brace() {
+    nvim_case("if {cond} end\n", 0, 4, "di{", "if {} end\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_di_angle() {
+    nvim_case("tag<attr>end\n", 0, 4, "di<", "tag<>end\n", 0, 4);
+}
+
+// ── Neovim: text objects — words ─────────────────────────────────────────
+
+#[test]
+fn test_nvim_diw_middle_of_word() {
+    nvim_case("foo bar baz\n", 0, 5, "diw", "foo  baz\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_daw_removes_trailing_space() {
+    nvim_case("foo bar baz\n", 0, 4, "daw", "foo baz\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_diw_at_start_of_line() {
+    nvim_case("foobar,eins,foobar\n", 0, 0, "diw", ",eins,foobar\n", 0, 0);
+}
+
+// ── Neovim: operator edge cases ─────────────────────────────────────────
+
+#[test]
+fn test_nvim_3d2w() {
+    // 3d2w should delete 6 words
+    nvim_case(
+        "one two three four five six seven eight\n",
+        0,
+        0,
+        "3d2w",
+        "seven eight\n",
+        0,
+        0,
+    );
+}
+
+#[test]
+fn test_nvim_d_dollar_at_eol() {
+    // d$ at end of line should delete last char
+    nvim_case("abcdef\n", 0, 5, "d$", "abcde\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_d0_at_col0() {
+    // d0 at col 0 is a no-op
+    nvim_case("hello\n", 0, 0, "d0", "hello\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_cc_replaces_line() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nsecond\n");
+    engine.update_syntax();
+    engine.feed_keys("ccnew<Esc>");
+    assert_eq!(engine.buffer().to_string(), "new\nsecond\n");
+}
+
+#[test]
+fn test_nvim_dd_last_line() {
+    // Neovim: dd on last line leaves "first\n". VimCode leaves "first" (no trailing newline).
+    nvim_case("first\nsecond\n", 1, 0, "dd", "first\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_yy_does_not_move_cursor() {
+    nvim_case("aaa\nbbb\nccc\n", 1, 2, "yy", "aaa\nbbb\nccc\n", 1, 2);
+}
+
+#[test]
+fn test_nvim_dgg_from_last_line() {
+    // dgg from last line deletes everything. Neovim: single empty line.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys("dgg");
+    let buf = engine.buffer().to_string();
+    assert!(
+        buf.is_empty() || buf == "\n",
+        "dgg from last line should leave empty buffer, got: {:?}",
+        buf
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+// ── Neovim: visual mode operators ───────────────────────────────────────
+
+#[test]
+fn test_nvim_visual_line_delete() {
+    nvim_case("aaa\nbbb\nccc\n", 1, 0, "Vd", "aaa\nccc\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_visual_multiline_delete() {
+    nvim_case("aaa\nbbb\nccc\nddd\n", 1, 0, "Vjd", "aaa\nddd\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_visual_char_yank() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("wvey");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "world", "visual yank should capture 'world'");
+}
+
+// ── Neovim: edge cases with empty/single-char lines ─────────────────────
+
+#[test]
+fn test_nvim_dw_on_empty_line() {
+    // Neovim: dw on empty line deletes the empty line, joining with next.
+    // VimCode: treats dw as no-op on empty line.
+    nvim_case("hello\n\nworld\n", 1, 0, "dw", "hello\nworld\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_dd_single_line_buffer() {
+    // dd on single line leaves empty buffer. Neovim: empty line, cursor (1,1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "only\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    // VimCode may leave "" or "\n" — just verify single empty line
+    let buf = engine.buffer().to_string();
+    assert!(
+        buf.is_empty() || buf == "\n",
+        "dd on single line should leave empty buffer, got: {:?}",
+        buf
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+#[test]
+fn test_nvim_cw_at_end_of_word() {
+    // Neovim: cw at col 2 of "foo" changes just "o" → "foX bar".
+    // VimCode: cw eats "o bar" (includes trailing space), giving "foX".
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2;
+    engine.feed_keys("cwX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "foX bar\n");
+}
+
+#[test]
+fn test_nvim_de_single_char_word() {
+    // Neovim: de on "a" at col 0 deletes to end of word "a" — but since "a" is
+    // a single-char word, 'e' moves to end of next word "b". Deletes "a b".
+    // Result: " c", cursor col 0.
+    nvim_case("a b c\n", 0, 0, "de", " c\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_dot_repeat_dw() {
+    nvim_case("one two three four\n", 0, 0, "dw.", "three four\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_dot_repeat_with_count() {
+    // 2dw then . should repeat 2dw
+    nvim_case("a b c d e f g h\n", 0, 0, "2dw.", "e f g h\n", 0, 0);
+}
+
+// ── Neovim: g~/gU/gu operators ──────────────────────────────────────────
+
+#[test]
+fn test_nvim_guu_lowercase_line() {
+    nvim_case("HELLO WORLD\n", 0, 0, "guu", "hello world\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_gugu_same_as_guu() {
+    // Neovim: gugu is equivalent to guu (gu operator doubled = linewise).
+    // VimCode: doesn't recognize gugu as gu+gu(line).
+    nvim_case("HELLO\n", 0, 0, "gugu", "hello\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_g_tilde_tilde_toggle_line() {
+    nvim_case("Hello World\n", 0, 0, "g~~", "hELLO wORLD\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_guw_lowercase_word() {
+    nvim_case("HELLO world\n", 0, 0, "guw", "hello world\n", 0, 0);
 }

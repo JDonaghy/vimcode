@@ -2614,7 +2614,7 @@ pub(super) fn draw_find_replace_popup(
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
-    editor_width: f64,
+    _editor_width: f64,
     _editor_height: f64,
     line_height: f64,
 ) {
