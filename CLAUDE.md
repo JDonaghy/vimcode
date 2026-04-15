@@ -1,8 +1,28 @@
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Check `.opencode/specs/` for detailed feature specs before starting
-3. Run `gh issue list --milestone "Vim Conformance" --state open` for active conformance work
+3. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
 4. Prompt user to update `PROJECT_STATE.md` after significant tasks
+
+## Issue-Driven Workflow
+All non-trivial work should be tracked via GitHub Issues. Issues are the source of truth for what needs doing, why, and what the design is.
+
+**Starting work on an issue:**
+1. Create a feature branch from `develop`: `git checkout -b issue-{number}-{short-description} develop`
+2. Do the work on that branch, committing as you go
+3. When done, create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
+4. The user reviews and merges the PR, which closes the issue and deletes the branch
+
+**Creating issues:**
+- At session end, create issues for any planned but unstarted work discussed during the session
+- Include full design context in the issue body — file paths, API details, expected behavior, Neovim reference values
+- Use milestones to group related work (e.g., "Vim Conformance")
+- Use labels for categorization (`conformance`, `testing`, `bug:vim-deviation`, `lua-api`, etc.)
+- Issues should be self-contained — a new session should be able to pick one up and implement it from the issue body alone
+
+**Bug fixes found during other work:**
+- If a bug is found while working on something else, create a separate issue for it
+- Fix it on the current branch if it's small and directly related, or leave it for a separate branch if it's independent
 
 ## Documentation Maintenance (MANDATORY)
 After completing any feature or significant change, update ALL of these files:
