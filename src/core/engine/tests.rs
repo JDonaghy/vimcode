@@ -2948,7 +2948,7 @@ fn test_count_dd_last_lines() {
     press_char(&mut engine, 'd');
     press_char(&mut engine, 'd');
 
-    assert_eq!(engine.buffer().to_string(), "line1");
+    assert_eq!(engine.buffer().to_string(), "line1\n");
 }
 
 #[test]
@@ -19670,7 +19670,7 @@ fn test_matrix_delete_linewise_motions() {
             2,
             0,
             "dG",
-            "one\ntwo",
+            "one\ntwo\n",
             1,
             0,
         ),
@@ -21667,7 +21667,6 @@ fn test_nvim_cc_replaces_line() {
 }
 
 #[test]
-#[ignore = "vim deviation: dd on last line strips trailing newline"]
 fn test_nvim_dd_last_line() {
     // Neovim: dd on last line leaves "first\n". VimCode leaves "first" (no trailing newline).
     nvim_case("first\nsecond\n", 1, 0, "dd", "first\n", 0, 0);
@@ -21720,7 +21719,6 @@ fn test_nvim_visual_char_yank() {
 // ── Neovim: edge cases with empty/single-char lines ─────────────────────
 
 #[test]
-#[ignore = "vim deviation: dw on empty line should join with next line"]
 fn test_nvim_dw_on_empty_line() {
     // Neovim: dw on empty line deletes the empty line, joining with next.
     // VimCode: treats dw as no-op on empty line.
@@ -21745,7 +21743,6 @@ fn test_nvim_dd_single_line_buffer() {
 }
 
 #[test]
-#[ignore = "vim deviation: cw at end of word eats trailing space"]
 fn test_nvim_cw_at_end_of_word() {
     // Neovim: cw at col 2 of "foo" changes just "o" → "foX bar".
     // VimCode: cw eats "o bar" (includes trailing space), giving "foX".
@@ -21784,7 +21781,6 @@ fn test_nvim_guu_lowercase_line() {
 }
 
 #[test]
-#[ignore = "vim deviation: gugu not recognized as gu+gu (line operator)"]
 fn test_nvim_gugu_same_as_guu() {
     // Neovim: gugu is equivalent to guu (gu operator doubled = linewise).
     // VimCode: doesn't recognize gugu as gu+gu(line).

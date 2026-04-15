@@ -1862,20 +1862,58 @@ impl Engine {
                     }
                 }
                 Some('~') => {
-                    // g~{motion}: toggle case operator — set pending_operator and await motion
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('~');
+                    if self.pending_operator == Some('~') {
+                        // g~g~: doubled operator — apply linewise (same as g~~)
+                        let count = self.take_count();
+                        let mut changed = false;
+                        self.apply_linewise_operator(
+                            '~',
+                            self.view().cursor.line,
+                            self.view().cursor.line + count.max(1) - 1,
+                            &mut changed,
+                        );
+                        self.pending_operator = None;
+                    } else {
+                        // g~{motion}: toggle case operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('~');
+                    }
                 }
                 Some('u') => {
-                    // gu{motion}: lowercase operator
-                    // Check if operator is pending (e.g. c/d + g + u) — handled elsewhere
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('u');
+                    if self.pending_operator == Some('u') {
+                        // gugu: doubled operator — apply linewise (same as guu)
+                        let count = self.take_count();
+                        let mut changed = false;
+                        self.apply_linewise_operator(
+                            'u',
+                            self.view().cursor.line,
+                            self.view().cursor.line + count.max(1) - 1,
+                            &mut changed,
+                        );
+                        self.pending_operator = None;
+                    } else {
+                        // gu{motion}: lowercase operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('u');
+                    }
                 }
                 Some('U') => {
-                    // gU{motion}: uppercase operator
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('U');
+                    if self.pending_operator == Some('U') {
+                        // gUgU: doubled operator — apply linewise (same as gUU)
+                        let count = self.take_count();
+                        let mut changed = false;
+                        self.apply_linewise_operator(
+                            'U',
+                            self.view().cursor.line,
+                            self.view().cursor.line + count.max(1) - 1,
+                            &mut changed,
+                        );
+                        self.pending_operator = None;
+                    } else {
+                        // gU{motion}: uppercase operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('U');
+                    }
                 }
                 Some('n') => {
                     // gn: enter visual mode selecting next search match
@@ -3108,11 +3146,13 @@ impl Engine {
                 self.count = None;
             }
             Some('w') => {
-                // dw/cw: delete/change to start of next word
-                // Special case: cw behaves like ce (Vim compatibility)
+                // dw: delete to start of next word
+                // cw: special case — does NOT include trailing whitespace when
+                //     cursor is in a word. Vim's `:help cw` says cw/cW only
+                //     change up to end of the word, not across whitespace.
                 let count = self.take_count();
                 if operator == 'c' {
-                    self.apply_operator_with_motion(operator, 'e', count, changed);
+                    self.apply_cw_special(count, false, changed);
                 } else {
                     self.apply_operator_with_motion(operator, 'w', count, changed);
                 }
@@ -3120,39 +3160,34 @@ impl Engine {
             Some('W') => {
                 // dW/cW: delete/change WORD forward
                 let count = self.take_count();
-                let start_cursor = self.view().cursor;
-                let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
                 if operator == 'c' {
-                    // cW behaves like cE (Vim compat)
-                    for _ in 0..count {
-                        self.move_bigword_end();
-                    }
+                    // cW: special case — stop at end of WORD, no trailing whitespace
+                    self.apply_cw_special(count, true, changed);
                 } else {
+                    let start_cursor = self.view().cursor;
+                    let start_pos =
+                        self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
                     for _ in 0..count {
                         self.move_bigword_forward();
                     }
-                }
-                let end_cursor = self.view().cursor;
-                let mut end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
-                self.view_mut().cursor = start_cursor;
-                // For cW (treated as cE), include the character under cursor
-                if operator == 'c' {
-                    end_pos = (end_pos + 1).min(self.buffer().len_chars());
-                }
-                // Clamp at line boundary for forward W (like w)
-                if operator != 'c' && end_cursor.line > start_cursor.line {
-                    let line_char_start = self.buffer().line_to_char(start_cursor.line);
-                    let line_len = self.buffer().line_len_chars(start_cursor.line);
-                    let has_nl =
-                        self.buffer().content.line(start_cursor.line).chars().last() == Some('\n');
-                    end_pos = if has_nl {
-                        (line_char_start + line_len - 1).min(end_pos)
-                    } else {
-                        (line_char_start + line_len).min(end_pos)
-                    };
-                }
-                if start_pos < end_pos {
-                    self.apply_charwise_operator(operator, start_pos, end_pos, changed);
+                    let end_cursor = self.view().cursor;
+                    let mut end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                    self.view_mut().cursor = start_cursor;
+                    // Clamp at line boundary for forward W (like w)
+                    if end_cursor.line > start_cursor.line {
+                        let line_char_start = self.buffer().line_to_char(start_cursor.line);
+                        let line_len = self.buffer().line_len_chars(start_cursor.line);
+                        let has_nl = self.buffer().content.line(start_cursor.line).chars().last()
+                            == Some('\n');
+                        end_pos = if has_nl {
+                            (line_char_start + line_len - 1).min(end_pos)
+                        } else {
+                            (line_char_start + line_len).min(end_pos)
+                        };
+                    }
+                    if start_pos < end_pos {
+                        self.apply_charwise_operator(operator, start_pos, end_pos, changed);
+                    }
                 }
             }
             Some('B') => {
@@ -4108,6 +4143,66 @@ impl Engine {
         EngineAction::None
     }
 
+    /// Special `cw`/`cW` handler: change to end of word without including
+    /// trailing whitespace.  Vim's `:help cw`: "When the cursor is in a word,
+    /// `cw` and `cW` do not include the white space after a word."
+    fn apply_cw_special(&mut self, count: usize, bigword: bool, changed: &mut bool) {
+        let start_cursor = self.view().cursor;
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+        let total = self.buffer().len_chars();
+
+        // Check if cursor is on a word char — if not, fall back to ce.
+        if start_pos < total {
+            let ch = self.buffer().content.char(start_pos);
+            let on_word = if bigword {
+                !ch.is_whitespace()
+            } else {
+                is_word_char(ch)
+            };
+            if !on_word {
+                // Not on a word char: cw behaves like ce
+                self.apply_operator_with_motion(
+                    'c',
+                    if bigword { 'E' } else { 'e' },
+                    count,
+                    changed,
+                );
+                return;
+            }
+        }
+
+        // Find end of Nth word. For count=1, stop at end of current word.
+        // For count>1, skip whitespace between words but NOT after the last.
+        let mut end = start_pos;
+        for i in 0..count {
+            // Skip to end of current word
+            if bigword {
+                while end < total && !self.buffer().content.char(end).is_whitespace() {
+                    end += 1;
+                }
+            } else {
+                while end < total && is_word_char(self.buffer().content.char(end)) {
+                    end += 1;
+                }
+            }
+            // Between words (not after last): skip whitespace to reach next word
+            if i + 1 < count {
+                while end < total && self.buffer().content.char(end).is_whitespace() {
+                    end += 1;
+                }
+            }
+        }
+
+        if start_pos >= end {
+            return;
+        }
+
+        // Record motion for dot repeat
+        self.pending_change_motion = Some((if bigword { 'W' } else { 'w' }, count));
+
+        self.apply_charwise_operator('c', start_pos, end, changed);
+    }
+
     pub(crate) fn apply_operator_with_motion(
         &mut self,
         operator: char,
@@ -4139,15 +4234,24 @@ impl Engine {
         // When the motion lands on the next line (col 0), clamp the end to
         // just before the newline on the start line, so dw/yw on the last word
         // of a line does not delete/yank the newline character.
+        // Exception: on an empty line (only '\n'), dw should delete the newline
+        // and join with the next line (Neovim behavior).
         let end_pos = if motion == 'w' && end_cursor.line > start_cursor.line {
             let line = start_cursor.line;
             let line_char_start = self.buffer().line_to_char(line);
             let line_len = self.buffer().line_len_chars(line);
-            let has_newline = self.buffer().content.line(line).chars().last() == Some('\n');
-            if has_newline {
-                (line_char_start + line_len - 1).min(end_pos) // before the \n
+            let is_empty_line =
+                line_len == 1 && self.buffer().content.line(line).chars().next() == Some('\n');
+            if is_empty_line {
+                // Empty line: dw deletes the newline (joins with next line)
+                end_pos
             } else {
-                (line_char_start + line_len).min(end_pos)
+                let has_newline = self.buffer().content.line(line).chars().last() == Some('\n');
+                if has_newline {
+                    (line_char_start + line_len - 1).min(end_pos) // before the \n
+                } else {
+                    (line_char_start + line_len).min(end_pos)
+                }
             }
         } else {
             end_pos

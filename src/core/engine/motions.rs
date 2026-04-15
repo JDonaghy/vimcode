@@ -2677,13 +2677,10 @@ impl Engine {
             // Delete lines including their newlines
             (line_start, line_end)
         } else {
-            // Deleting to end of buffer
-            if start_line > 0 {
-                // Delete the newline before the first line being deleted
-                (line_start - 1, line_end)
-            } else {
-                (line_start, line_end)
-            }
+            // Deleting to end of buffer: just delete from start of first
+            // deleted line to EOF. This preserves the previous line's
+            // trailing newline (if any).
+            (line_start, line_end)
         };
 
         self.delete_with_undo(delete_start, delete_end);
