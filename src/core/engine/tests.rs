@@ -22066,3 +22066,274 @@ fn test_nvim_2s_substitute_count() {
     engine.feed_keys("2sXY<Esc>");
     assert_eq!(engine.buffer().to_string(), "XYllo\n");
 }
+
+// ── Phase 4 Batch 3: f/t/F/T motions (Neovim-verified) ─────────────────
+
+#[test]
+fn test_nvim_f_forward_char() {
+    // Neovim: f( → col 4 (1-indexed) = col 3
+    nvim_case("abc(def)ghi\n", 0, 0, "f(", "abc(def)ghi\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_t_till_char() {
+    // Neovim: t( → col 3 (1-indexed) = col 2
+    nvim_case("abc(def)ghi\n", 0, 0, "t(", "abc(def)ghi\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_f_backward_char() {
+    // F) from end: col 8 (1-indexed) = col 7
+    nvim_case("abc(def)ghi\n", 0, 10, "F)", "abc(def)ghi\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_t_backward_char() {
+    // T) from end: col 9 (1-indexed) = col 8
+    nvim_case("abc(def)ghi\n", 0, 10, "T)", "abc(def)ghi\n", 0, 8);
+}
+
+#[test]
+fn test_nvim_f_semicolon_repeat() {
+    // f( then ; repeats forward
+    nvim_case("a(b(c(d\n", 0, 0, "f(;", "a(b(c(d\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_f_comma_reverse() {
+    // f( then ; then , reverses
+    nvim_case("a(b(c(d\n", 0, 0, "f(;,", "a(b(c(d\n", 0, 1);
+}
+
+#[test]
+fn test_nvim_2f_count() {
+    // 2f( jumps to second occurrence: col 4 (1-indexed) = col 3
+    nvim_case("a(b(c(d\n", 0, 0, "2f(", "a(b(c(d\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_df_delete_to_char() {
+    // df( deletes "abc(" → "def)ghi"
+    nvim_case("abc(def)ghi\n", 0, 0, "df(", "def)ghi\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_dt_delete_till_char() {
+    // dt( deletes "abc" → "(def)ghi"
+    nvim_case("abc(def)ghi\n", 0, 0, "dt(", "(def)ghi\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_cf_change_to_char() {
+    // cf( deletes "abc(" and enters insert, type "X" → "Xdef)ghi"
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc(def)ghi\n");
+    engine.update_syntax();
+    engine.feed_keys("cf(X<Esc>");
+    assert_eq!(engine.buffer().to_string(), "Xdef)ghi\n");
+}
+
+#[test]
+fn test_nvim_d_big_f_backward() {
+    // dF) from $ (col 10 = 'i'): deletes ")gh" backward through ")".
+    // Neovim: "abc(defi", col 8 (1-indexed) = col 7.
+    nvim_case("abc(def)ghi\n", 0, 10, "dF)", "abc(defi\n", 0, 7);
+}
+
+// ── Phase 4 Batch 3: * and # word search ────────────────────────────────
+
+#[test]
+fn test_nvim_star_search() {
+    // * on "foo" jumps to next "foo": col 9 (1-indexed) = col 8
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo\n");
+    engine.update_syntax();
+    engine.feed_keys("*");
+    assert_eq!(engine.view().cursor.col, 8, "* should jump to next match");
+}
+
+#[test]
+fn test_nvim_hash_search() {
+    // # on "foo" (at col 8) jumps backward to col 0
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 8;
+    engine.feed_keys("#");
+    assert_eq!(engine.view().cursor.col, 0, "# should jump to prev match");
+}
+
+#[test]
+fn test_nvim_star_multiline() {
+    // * wraps to next line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar\nbaz foo\n");
+    engine.update_syntax();
+    engine.feed_keys("*");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+// ── Phase 4 Batch 3: Undo/Redo ─────────────────────────────────────────
+
+#[test]
+fn test_nvim_undo_dw() {
+    // dw then u restores the deleted word
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("dw");
+    assert_eq!(engine.buffer().to_string(), "world\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+}
+
+#[test]
+fn test_nvim_undo_dd() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    assert_eq!(engine.buffer().to_string(), "bbb\nccc\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\nccc\n");
+}
+
+#[test]
+fn test_nvim_undo_insert() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("iXYZ<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XYZhello\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+}
+
+#[test]
+fn test_nvim_redo() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("dw");
+    assert_eq!(engine.buffer().to_string(), "world\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+    engine.feed_keys("<C-r>");
+    assert_eq!(engine.buffer().to_string(), "world\n");
+}
+
+#[test]
+fn test_nvim_undo_multiple_changes() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb ccc\n");
+    engine.update_syntax();
+    engine.feed_keys("dw"); // "bbb ccc\n"
+    engine.feed_keys("dw"); // "ccc\n"
+    engine.feed_keys("u"); // "bbb ccc\n"
+    assert_eq!(engine.buffer().to_string(), "bbb ccc\n");
+    engine.feed_keys("u"); // "aaa bbb ccc\n"
+    assert_eq!(engine.buffer().to_string(), "aaa bbb ccc\n");
+}
+
+#[test]
+fn test_nvim_undo_xxx() {
+    // 3 x deletes then undo restores one (last x)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.feed_keys("xxx");
+    assert_eq!(engine.buffer().to_string(), "def\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "cdef\n");
+}
+
+// ── Phase 4 Batch 3: Marks ─────────────────────────────────────────────
+
+#[test]
+fn test_nvim_mark_and_jump() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    // Set mark 'a' on line 0
+    engine.feed_keys("ma");
+    // Move to line 2
+    engine.feed_keys("jj");
+    assert_eq!(engine.view().cursor.line, 2);
+    // Jump back to mark
+    engine.feed_keys("'a");
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+#[test]
+fn test_nvim_backtick_mark_exact() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("ma");
+    engine.feed_keys("0");
+    assert_eq!(engine.view().cursor.col, 0);
+    engine.feed_keys("`a");
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "backtick mark should restore exact col"
+    );
+}
+
+#[test]
+#[ignore = "vim deviation: d'mark (delete to mark) not implemented"]
+fn test_nvim_delete_to_mark() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd\n");
+    engine.update_syntax();
+    engine.feed_keys("ma");
+    engine.feed_keys("jj"); // line 2
+    engine.feed_keys("d'a"); // delete from line 2 to mark on line 0
+                             // Should delete lines 0-2, leaving "ddd"
+    assert_eq!(engine.buffer().to_string(), "ddd\n");
+}
+
+// ── Phase 4 Batch 3: Miscellaneous ─────────────────────────────────────
+
+#[test]
+fn test_nvim_percent_match_paren() {
+    nvim_case("foo(bar)baz\n", 0, 3, "%", "foo(bar)baz\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_percent_match_back() {
+    nvim_case("foo(bar)baz\n", 0, 7, "%", "foo(bar)baz\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_percent_match_bracket() {
+    nvim_case("foo[bar]baz\n", 0, 3, "%", "foo[bar]baz\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_percent_match_brace() {
+    nvim_case("foo{bar}baz\n", 0, 3, "%", "foo{bar}baz\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_d_percent() {
+    // d% from ( deletes "(bar)"
+    nvim_case("foo(bar)baz\n", 0, 3, "d%", "foobaz\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_ctrl_a_increment() {
+    nvim_case("42\n", 0, 0, "<C-a>", "43\n", 0, 1);
+}
+
+#[test]
+fn test_nvim_ctrl_x_decrement() {
+    nvim_case("42\n", 0, 0, "<C-x>", "41\n", 0, 1);
+}
+
+#[test]
+fn test_nvim_ctrl_a_with_count() {
+    nvim_case("10\n", 0, 0, "5<C-a>", "15\n", 0, 1);
+}
