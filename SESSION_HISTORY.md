@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 278 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 279 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 279 — Vim conformance matrix tests, `:set` option audit:**
+Operator × motion matrix tests (Phase 1): 29 new parametric tests with 93 total test cases covering d/c/y/>>/<</ gU/gu/g~ × motions + text objects, count variations, dot-repeat. Test infrastructure: `send_keys(engine, "d2w")` helper. Bug fixes: ge/gE motion (rewrote backward word-end), leader key intercepting df<space>, dw/de/db dot-repeat, send_keys `<<` parsing. `:set` option audit (Phase 2): 18 tests for round-trip, behavior, and ex-command handling. 6 Vim deviations documented as GitHub issues (#28-#33). 47 new tests (total: 1463).
 
 **Session 278 — Find/replace hit regions, colorcolumn, `x`+`.` fix, CLAUDE.md rules:**
 Centralized find/replace hit-test geometry — `FindReplaceClickTarget` enum (13 variants), `FrHitRegion` struct, `compute_find_replace_hit_regions()` in `engine/mod.rs`. All 3 backends use shared hit regions. Shared click dispatch via `Engine::handle_find_replace_click()`. TUI mouse rewrite with hit-region-based dispatch, drag-to-select, double-click word select. GTK click handler fixed (3 geometry mismatches). Win-GUI migrated to shared dispatch. Visual selection preserved during Ctrl+F. Dynamic panel width. `:set colorcolumn` implemented with parsing, derived theme color, 3-backend rendering. `x` count+`.` repeat fixed. CLAUDE.md rules elevated. Crate extraction + Vim conformance roadmap items. 27 new tests.
