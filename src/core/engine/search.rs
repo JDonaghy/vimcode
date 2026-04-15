@@ -1,5 +1,33 @@
 use super::*;
 
+/// Find word boundaries around char position `pos` in `text`.
+/// Returns `(start, end)` where `start..end` is the word range.
+/// A "word" character is alphanumeric or underscore.
+/// If `pos` is not on a word character, returns `(pos, pos)`.
+/// Used by TUI/GTK/Win-GUI backends for double-click word select in find/replace.
+#[allow(dead_code)]
+pub fn find_word_boundaries(text: &str, pos: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if pos >= chars.len() {
+        return (chars.len(), chars.len());
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if !is_word(chars[pos]) {
+        return (pos, pos);
+    }
+    let start = (0..=pos)
+        .rev()
+        .take_while(|&i| is_word(chars[i]))
+        .last()
+        .unwrap_or(pos);
+    let end = (pos..chars.len())
+        .take_while(|&i| is_word(chars[i]))
+        .last()
+        .map(|i| i + 1)
+        .unwrap_or(pos);
+    (start, end)
+}
+
 impl Engine {
     // =======================================================================
     // Cursor helpers (delegating to buffer/view)
@@ -679,9 +707,12 @@ impl Engine {
             None
         };
 
-        // Exit visual mode now that we've captured the selection
+        // Keep visual selection visible while find/replace is open (like `:` in visual mode).
+        // Don't clear visual_anchor — build_selection() will render the highlight.
+        // Freeze the cursor position so the selection doesn't change as search moves the cursor.
         if had_selection {
-            self.visual_anchor = None;
+            self.find_replace_visual_end = Some(*self.cursor());
+            self.command_from_visual = Some(self.mode);
             self.mode = Mode::Normal;
         }
 
@@ -730,6 +761,12 @@ impl Engine {
         self.find_replace_open = false;
         self.find_replace_options.in_selection = false;
         self.find_replace_selection_range = None;
+        // Clear visual selection that was preserved while overlay was open
+        if self.command_from_visual.is_some() {
+            self.visual_anchor = None;
+            self.command_from_visual = None;
+            self.find_replace_visual_end = None;
+        }
     }
 
     /// Run a search using the find/replace overlay's query and options.
@@ -938,6 +975,37 @@ impl Engine {
     pub fn toggle_find_replace_in_selection(&mut self) {
         self.find_replace_options.in_selection = !self.find_replace_options.in_selection;
         self.run_find_replace_search();
+    }
+
+    /// Dispatch a find/replace click target to the appropriate engine method.
+    /// Backends resolve native coordinates → `FindReplaceClickTarget`, then call this.
+    pub fn handle_find_replace_click(&mut self, target: FindReplaceClickTarget) {
+        use FindReplaceClickTarget::*;
+        match target {
+            Chevron => {
+                self.find_replace_show_replace = !self.find_replace_show_replace;
+            }
+            FindInput(pos) => {
+                self.find_replace_focus = 0;
+                self.find_replace_cursor = pos.min(self.find_replace_query.chars().count());
+                self.find_replace_sel_anchor = Some(self.find_replace_cursor);
+            }
+            ReplaceInput(pos) => {
+                self.find_replace_focus = 1;
+                self.find_replace_cursor = pos.min(self.find_replace_replacement.chars().count());
+                self.find_replace_sel_anchor = Some(self.find_replace_cursor);
+            }
+            ToggleCase => self.toggle_find_replace_case(),
+            ToggleWholeWord => self.toggle_find_replace_whole_word(),
+            ToggleRegex => self.toggle_find_replace_regex(),
+            PrevMatch => self.find_replace_prev(),
+            NextMatch => self.find_replace_next(),
+            ToggleInSelection => self.toggle_find_replace_in_selection(),
+            Close => self.close_find_replace(),
+            TogglePreserveCase => self.toggle_find_replace_preserve_case(),
+            ReplaceCurrent => self.find_replace_replace_current(),
+            ReplaceAll => self.find_replace_replace_all(),
+        }
     }
 
     /// Get the selected range in the focused input field, if any.

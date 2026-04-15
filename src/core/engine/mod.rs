@@ -936,6 +936,159 @@ pub struct FindReplaceOptions {
     pub in_selection: bool,
 }
 
+/// Click target within the find/replace overlay.
+/// Backends resolve native coordinates → `FindReplaceClickTarget`, then call
+/// `Engine::handle_find_replace_click()` for shared dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindReplaceClickTarget {
+    /// Toggle replace row visibility (the ▶/▼ chevron).
+    Chevron,
+    /// Click in the find input field at the given char offset.
+    FindInput(usize),
+    /// Click in the replace input field at the given char offset.
+    ReplaceInput(usize),
+    ToggleCase,
+    ToggleWholeWord,
+    ToggleRegex,
+    PrevMatch,
+    NextMatch,
+    ToggleInSelection,
+    Close,
+    TogglePreserveCase,
+    ReplaceCurrent,
+    ReplaceAll,
+}
+
+/// A hit region within the find/replace panel, expressed in character-cell units
+/// relative to the panel's top-left **content** corner (inside borders).
+#[derive(Debug, Clone)]
+pub struct FrHitRegion {
+    /// Column offset from panel content-left edge.
+    pub col: u16,
+    /// Row: 0 = find row, 1 = replace row.
+    pub row: u16,
+    /// Width of this region in char cells.
+    pub width: u16,
+}
+
+/// Default panel width for the find/replace overlay (in char cells, including borders).
+pub const FR_PANEL_WIDTH: u16 = 50;
+
+/// Compute hit regions for the find/replace overlay.
+/// Layout: `[chevron(2)] [input(variable)] [Aa(2+1)][ab(2+1)][.*(2+1)] [count(max(len,5)+1)] [↑(2)][↓(2)][≡(2)][×(2)]`
+/// All positions are in char-cell units relative to the panel content corner (inside borders).
+pub fn compute_find_replace_hit_regions(
+    panel_w: u16,
+    show_replace: bool,
+    match_info: &str,
+) -> (Vec<(FrHitRegion, FindReplaceClickTarget)>, u16) {
+    use FindReplaceClickTarget::*;
+
+    let mut regions = Vec::with_capacity(16);
+    let content_w = panel_w.saturating_sub(2);
+
+    // Chevron: cols 0..2
+    regions.push((
+        FrHitRegion {
+            col: 0,
+            row: 0,
+            width: 2,
+        },
+        Chevron,
+    ));
+
+    // Find input: starts at col 2, right side uses remaining space for buttons.
+    // Right side: toggles(3×3=9) + gap(1) + match_info(max(len,5)) + gap(1) + nav(4×2=8) = dynamic
+    let info_len = (match_info.len() as u16).max(5);
+    let right_side_w: u16 = 9 + info_len + 1 + 8; // toggles + count + gap + nav
+    let input_start: u16 = 2;
+    let input_w = content_w.saturating_sub(2 + right_side_w);
+    regions.push((
+        FrHitRegion {
+            col: input_start,
+            row: 0,
+            width: input_w,
+        },
+        FindInput(0),
+    ));
+
+    // Toggle buttons: [Aa(2)gap(1)] [ab(2)gap(1)] [.*(2)gap(1)]
+    let mut tx = input_start + input_w + 1;
+    for target in [ToggleCase, ToggleWholeWord, ToggleRegex] {
+        regions.push((
+            FrHitRegion {
+                col: tx,
+                row: 0,
+                width: 2,
+            },
+            target,
+        ));
+        tx += 3;
+    }
+
+    // Match count (not clickable)
+    tx += info_len + 1;
+
+    // Nav buttons: [↑(2)][↓(2)][≡(2)][×(2)]
+    for target in [PrevMatch, NextMatch, ToggleInSelection, Close] {
+        regions.push((
+            FrHitRegion {
+                col: tx,
+                row: 0,
+                width: 2,
+            },
+            target,
+        ));
+        tx += 2;
+    }
+
+    // Replace row (row 1)
+    if show_replace {
+        regions.push((
+            FrHitRegion {
+                col: input_start,
+                row: 1,
+                width: input_w,
+            },
+            ReplaceInput(0),
+        ));
+
+        let mut bx = input_start + input_w + 1;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: 2,
+            },
+            TogglePreserveCase,
+        ));
+        bx += 3;
+
+        let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: r1_w,
+            },
+            ReplaceCurrent,
+        ));
+        bx += r1_w + 1;
+
+        let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: ra_w,
+            },
+            ReplaceAll,
+        ));
+    }
+
+    (regions, input_w)
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
@@ -1932,6 +2085,10 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+    /// When Command mode is entered from Visual mode, stores the original
+    /// visual mode variant so the selection remains visible and `'<,'>` range
+    /// resolves correctly.  Cleared on command execution or Escape.
+    pub command_from_visual: Option<Mode>,
 
     // --- Count state ---
     /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
@@ -2279,6 +2436,10 @@ pub struct Engine {
     pub find_replace_options: FindReplaceOptions,
     /// Char range for "find in selection" mode: (start_char, end_char).
     pub find_replace_selection_range: Option<(usize, usize)>,
+    /// Frozen cursor position from when find/replace was opened in visual mode.
+    /// Used by `build_selection()` to render the original selection without it
+    /// changing as the cursor jumps to search matches.
+    pub find_replace_visual_end: Option<crate::core::cursor::Cursor>,
 
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
@@ -2829,6 +2990,7 @@ impl Engine {
             selected_register: None,
             marks: HashMap::new(),
             visual_anchor: None,
+            command_from_visual: None,
             count: None,
             last_find: None,
             pending_operator: None,
@@ -2918,6 +3080,7 @@ impl Engine {
             find_replace_sel_anchor: None,
             find_replace_options: FindReplaceOptions::default(),
             find_replace_selection_range: None,
+            find_replace_visual_end: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,
@@ -3752,6 +3915,7 @@ mod panels;
 mod picker;
 mod plugins;
 mod search;
+pub use search::find_word_boundaries;
 mod source_control;
 mod spell_ops;
 mod terminal_ops;

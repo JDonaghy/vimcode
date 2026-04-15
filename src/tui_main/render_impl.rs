@@ -4074,8 +4074,10 @@ pub(super) fn render_find_replace_popup(
 
     // Find input (after chevron)
     let input_start = content_x + 2;
-    // Reserve space for: toggles(9) + count(7) + nav(8) = 24 chars
-    let input_w = panel_w.saturating_sub(2 + 2 + 24);
+    // Reserve space for right-side buttons: toggles(9) + count(dynamic) + gap + nav(8)
+    let info_len = (panel.match_info.len() as u16).max(5);
+    let right_side_w: u16 = 9 + info_len + 1 + 8;
+    let input_w = panel_w.saturating_sub(2 + 2 + right_side_w);
     for (i, ch) in panel.query.chars().enumerate() {
         let cx = input_start + i as u16;
         if cx < input_start + input_w && cx < right_edge {

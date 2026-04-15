@@ -2,7 +2,7 @@
 
 **[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
 
-A Vim+VSCode hybrid editor written in Rust. 137K lines of code, 5,495 tests, four rendering backends.
+A Vim+VSCode hybrid editor written in Rust. 137K lines of code, 5,501 tests, four rendering backends.
 
 ### Who’s this for?
 
@@ -46,7 +46,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,495 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,501 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -235,6 +235,7 @@ cargo fmt
 - `A` (block) — append text after right edge of block (applied to all lines on Escape)
 - `o` — swap cursor to opposite end of selection (character/line visual)
 - `O` — swap cursor to opposite column corner (visual block)
+- `:` — enter command mode with `'<,'>` range prefix (e.g. `:'<,'>s/old/new/g`); selection stays visible
 - `gv` — reselect last visual selection
 - `r{char}` — replace all selected characters with `{char}`
 

@@ -2519,6 +2519,11 @@ pub struct DialogInputPanel {
     pub display: String,
 }
 
+// Re-export hit-test types and functions from engine so backends can use `render::*`.
+pub use crate::core::engine::{
+    compute_find_replace_hit_regions, FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH,
+};
+
 /// The inline find/replace overlay displayed at the top-right of the active editor group.
 #[derive(Debug, Clone)]
 pub struct FindReplacePanel {
@@ -2547,6 +2552,11 @@ pub struct FindReplacePanel {
     /// Bounding rect of the active editor group (pixel coords for GTK/Win-GUI,
     /// approximate for TUI). The overlay positions itself at the top-right of this rect.
     pub group_bounds: WindowRect,
+    /// Panel width in char cells (used by backends for positioning).
+    pub panel_width: u16,
+    /// Hit regions for click handling, in char-cell units relative to the panel
+    /// content corner (inside borders). Computed once in `build_screen_layout()`.
+    pub hit_regions: Vec<(FrHitRegion, FindReplaceClickTarget)>,
 }
 
 /// Format a button label with the hotkey character bracketed.
@@ -4991,6 +5001,12 @@ pub fn build_screen_layout(
                         .unwrap_or_else(|| WindowRect::new(0.0, 0.0, 800.0, 600.0))
                 }
             };
+            let panel_w = FR_PANEL_WIDTH;
+            let (hit_regions, _input_w) = compute_find_replace_hit_regions(
+                panel_w,
+                engine.find_replace_show_replace,
+                &match_info,
+            );
             Some(FindReplacePanel {
                 query: engine.find_replace_query.clone(),
                 replacement: engine.find_replace_replacement.clone(),
@@ -5005,6 +5021,8 @@ pub fn build_screen_layout(
                 preserve_case: engine.find_replace_options.preserve_case,
                 in_selection: engine.find_replace_options.in_selection,
                 group_bounds: active_group_bounds,
+                panel_width: panel_w,
+                hit_regions,
             })
         } else {
             None
@@ -7213,9 +7231,29 @@ fn build_selection(
     visible_lines: usize,
 ) -> Option<SelectionRange> {
     let anchor = engine.visual_anchor?;
-    let cursor = engine.cursor();
+    // When find/replace is open from visual mode, use the frozen cursor position
+    // so the selection doesn't change as search jumps the live cursor to matches.
+    let frozen_end;
+    let cursor = if engine.find_replace_open {
+        if let Some(end) = engine.find_replace_visual_end {
+            frozen_end = end;
+            &frozen_end
+        } else {
+            engine.cursor()
+        }
+    } else {
+        engine.cursor()
+    };
 
-    let kind = match engine.mode {
+    let visual_mode = match engine.mode {
+        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => Some(engine.mode),
+        // Show selection while typing a command/search entered from visual mode,
+        // or while find/replace overlay is open from visual mode
+        Mode::Command | Mode::Search => engine.command_from_visual,
+        Mode::Normal if engine.find_replace_open => engine.command_from_visual,
+        _ => None,
+    };
+    let kind = match visual_mode? {
         Mode::Visual => SelectionKind::Char,
         Mode::VisualLine => SelectionKind::Line,
         Mode::VisualBlock => SelectionKind::Block,

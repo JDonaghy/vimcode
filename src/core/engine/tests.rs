@@ -19011,7 +19011,332 @@ fn test_find_replace_prefill_from_selection() {
     // Open find/replace — should pre-fill from visual selection
     engine.open_find_replace();
     assert_eq!(engine.find_replace_query, "world");
-    // Should have exited visual mode
+    // Mode is Normal but visual selection is preserved for highlighting
+    assert_eq!(engine.mode, Mode::Normal);
+    assert!(engine.visual_anchor.is_some());
+    assert_eq!(engine.command_from_visual, Some(Mode::Visual));
+
+    // Closing find/replace clears the visual state
+    engine.close_find_replace();
+    assert!(engine.visual_anchor.is_none());
+    assert!(engine.command_from_visual.is_none());
+}
+
+// ====================================================================
+// Visual-mode `:` command with '<,'> range prefix
+// ====================================================================
+
+#[test]
+fn test_visual_colon_enters_command_with_range() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "line one\nline two\nline three\n");
+
+    // Enter visual mode and select lines 1-2
+    press_char(&mut engine, 'V'); // VisualLine
+    press_char(&mut engine, 'j'); // extend to line 2
+
+    assert_eq!(engine.mode, Mode::VisualLine);
+    assert!(engine.visual_anchor.is_some());
+
+    // Press `:` — should enter Command mode with '<,'> prefix
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "'<,'>");
+    assert_eq!(engine.command_cursor, 5);
+
+    // Visual anchor should still be set (selection visible)
+    assert!(engine.visual_anchor.is_some());
+    // command_from_visual should record the original visual mode
+    assert_eq!(engine.command_from_visual, Some(Mode::VisualLine));
+}
+
+#[test]
+fn test_visual_colon_charwise_mode() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+
+    // Enter charwise visual mode
+    press_char(&mut engine, 'v');
+    assert_eq!(engine.mode, Mode::Visual);
+
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "'<,'>");
+    assert_eq!(engine.command_from_visual, Some(Mode::Visual));
+    assert!(engine.visual_anchor.is_some());
+}
+
+#[test]
+fn test_visual_colon_escape_clears_visual() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "line one\nline two\n");
+
+    // Visual select → : → Escape should clear visual state
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+    assert!(engine.visual_anchor.is_some());
+
+    press_special(&mut engine, "Escape");
     assert_eq!(engine.mode, Mode::Normal);
     assert!(engine.visual_anchor.is_none());
+    assert!(engine.command_from_visual.is_none());
+}
+
+#[test]
+fn test_visual_colon_substitute_on_selection() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar\nfoo baz\nfoo qux\n");
+
+    // Select lines 1 and 2 (0-indexed)
+    press_char(&mut engine, 'j'); // move to line 1
+    press_char(&mut engine, 'V'); // visual line
+    press_char(&mut engine, 'j'); // extend to line 2
+
+    // Press : to enter command mode with range
+    press_char(&mut engine, ':');
+    assert_eq!(engine.command_buffer, "'<,'>");
+
+    // Type substitute command
+    for ch in "s/foo/replaced/g".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.command_buffer, "'<,'>s/foo/replaced/g");
+
+    // Execute
+    press_special(&mut engine, "Return");
+    assert_eq!(engine.mode, Mode::Normal);
+    assert!(engine.visual_anchor.is_none());
+    assert!(engine.command_from_visual.is_none());
+
+    // Line 0 should be unchanged, lines 1-2 should be replaced
+    let text = engine.buffer().content.to_string();
+    assert!(text.starts_with("foo bar\n"), "line 0 unchanged");
+    assert!(text.contains("replaced baz\n"), "line 1 replaced");
+    assert!(text.contains("replaced qux\n"), "line 2 replaced");
+    // Line 0 should still have foo
+    assert!(text.starts_with("foo bar\n"), "line 0 still has foo");
+}
+
+#[test]
+fn test_visual_colon_execute_clears_visual_state() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, ':');
+
+    // Type a no-op command (just the range, which won't match anything)
+    // Use a real command: number (shows line numbers)
+    for ch in "number".chars() {
+        press_char(&mut engine, ch);
+    }
+    press_special(&mut engine, "Return");
+
+    assert_eq!(engine.mode, Mode::Normal);
+    assert!(engine.visual_anchor.is_none());
+    assert!(engine.command_from_visual.is_none());
+}
+
+#[test]
+fn test_visual_block_colon_range() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\ndef\nghi\n");
+
+    // Enter visual block mode
+    press_ctrl(&mut engine, 'v');
+    assert_eq!(engine.mode, Mode::VisualBlock);
+
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "'<,'>");
+    assert_eq!(engine.command_from_visual, Some(Mode::VisualBlock));
+    assert!(engine.visual_anchor.is_some());
+}
+
+// ─── Find/replace shared dispatch tests ─────────────────────────────────────
+
+#[test]
+fn test_find_word_boundaries_basic() {
+    use super::find_word_boundaries;
+    assert_eq!(find_word_boundaries("hello world", 2), (0, 5));
+    assert_eq!(find_word_boundaries("hello world", 0), (0, 5));
+    assert_eq!(find_word_boundaries("hello world", 4), (0, 5));
+    assert_eq!(find_word_boundaries("hello world", 6), (6, 11));
+}
+
+#[test]
+fn test_find_word_boundaries_underscore() {
+    use super::find_word_boundaries;
+    assert_eq!(find_word_boundaries("foo_bar baz", 3), (0, 7));
+    assert_eq!(find_word_boundaries("foo_bar baz", 5), (0, 7));
+}
+
+#[test]
+fn test_find_word_boundaries_non_word() {
+    use super::find_word_boundaries;
+    // Clicking on a space returns (pos, pos)
+    assert_eq!(find_word_boundaries("hello world", 5), (5, 5));
+    // Clicking on punctuation
+    assert_eq!(find_word_boundaries("a.b", 1), (1, 1));
+}
+
+#[test]
+fn test_find_word_boundaries_empty() {
+    use super::find_word_boundaries;
+    assert_eq!(find_word_boundaries("", 0), (0, 0));
+}
+
+#[test]
+fn test_find_word_boundaries_single_char() {
+    use super::find_word_boundaries;
+    assert_eq!(find_word_boundaries("x", 0), (0, 1));
+}
+
+#[test]
+fn test_handle_find_replace_click_chevron() {
+    let mut engine = Engine::new();
+    engine.find_replace_open = true;
+    engine.find_replace_show_replace = false;
+    engine.handle_find_replace_click(FindReplaceClickTarget::Chevron);
+    assert!(engine.find_replace_show_replace);
+    engine.handle_find_replace_click(FindReplaceClickTarget::Chevron);
+    assert!(!engine.find_replace_show_replace);
+}
+
+#[test]
+fn test_handle_find_replace_click_find_input() {
+    let mut engine = Engine::new();
+    engine.find_replace_open = true;
+    engine.find_replace_query = "hello world".to_string();
+    engine.find_replace_focus = 1; // start on replace
+    engine.handle_find_replace_click(FindReplaceClickTarget::FindInput(3));
+    assert_eq!(engine.find_replace_focus, 0);
+    assert_eq!(engine.find_replace_cursor, 3);
+    assert_eq!(engine.find_replace_sel_anchor, Some(3));
+}
+
+#[test]
+fn test_handle_find_replace_click_replace_input() {
+    let mut engine = Engine::new();
+    engine.find_replace_open = true;
+    engine.find_replace_replacement = "abc".to_string();
+    engine.handle_find_replace_click(FindReplaceClickTarget::ReplaceInput(5));
+    assert_eq!(engine.find_replace_focus, 1);
+    // Clamped to replacement length
+    assert_eq!(engine.find_replace_cursor, 3);
+}
+
+#[test]
+fn test_handle_find_replace_click_toggles() {
+    let mut engine = Engine::new();
+    engine.find_replace_open = true;
+    engine.buffer_mut().insert(0, "test content");
+
+    assert!(!engine.find_replace_options.case_sensitive);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleCase);
+    assert!(engine.find_replace_options.case_sensitive);
+
+    assert!(!engine.find_replace_options.whole_word);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleWholeWord);
+    assert!(engine.find_replace_options.whole_word);
+
+    assert!(!engine.find_replace_options.use_regex);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleRegex);
+    assert!(engine.find_replace_options.use_regex);
+
+    assert!(!engine.find_replace_options.preserve_case);
+    engine.handle_find_replace_click(FindReplaceClickTarget::TogglePreserveCase);
+    assert!(engine.find_replace_options.preserve_case);
+
+    assert!(!engine.find_replace_options.in_selection);
+    engine.handle_find_replace_click(FindReplaceClickTarget::ToggleInSelection);
+    assert!(engine.find_replace_options.in_selection);
+}
+
+#[test]
+fn test_handle_find_replace_click_close() {
+    let mut engine = Engine::new();
+    engine.find_replace_open = true;
+    engine.handle_find_replace_click(FindReplaceClickTarget::Close);
+    assert!(!engine.find_replace_open);
+}
+
+#[test]
+fn test_find_replace_hit_regions_count() {
+    use super::{compute_find_replace_hit_regions, FR_PANEL_WIDTH};
+    // Without replace: chevron + input + 3 toggles + 4 nav = 9
+    let (regions, _) = compute_find_replace_hit_regions(FR_PANEL_WIDTH, false, "1 of 5");
+    assert_eq!(regions.len(), 9);
+
+    // With replace: + input + AB + replace + replace_all = 9 + 4 = 13
+    let (regions, _) = compute_find_replace_hit_regions(FR_PANEL_WIDTH, true, "1 of 5");
+    assert_eq!(regions.len(), 13);
+}
+
+#[test]
+fn test_find_replace_hit_regions_no_overlap() {
+    use super::{compute_find_replace_hit_regions, FindReplaceClickTarget, FR_PANEL_WIDTH};
+    let (regions, _) = compute_find_replace_hit_regions(FR_PANEL_WIDTH, true, "12 of 345");
+
+    // Check that no two regions on the same row overlap
+    for i in 0..regions.len() {
+        for j in (i + 1)..regions.len() {
+            let (a, _) = &regions[i];
+            let (b, _) = &regions[j];
+            if a.row == b.row {
+                let a_end = a.col + a.width;
+                let b_end = b.col + b.width;
+                assert!(
+                    a_end <= b.col || b_end <= a.col,
+                    "Overlap on row {}: region {:?} (col {}..{}) overlaps {:?} (col {}..{})",
+                    a.row,
+                    regions[i].1,
+                    a.col,
+                    a_end,
+                    regions[j].1,
+                    b.col,
+                    b_end,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_find_replace_hit_regions_close_button_present() {
+    use super::{compute_find_replace_hit_regions, FindReplaceClickTarget, FR_PANEL_WIDTH};
+    let (regions, _) = compute_find_replace_hit_regions(FR_PANEL_WIDTH, false, "No results");
+    let has_close = regions
+        .iter()
+        .any(|(_, t)| matches!(t, FindReplaceClickTarget::Close));
+    assert!(has_close, "Close button must be in hit regions");
+}
+
+#[test]
+fn test_visual_selection_prefills_find_replace() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world foo bar");
+
+    // Select "world" (cols 6-10)
+    press_char(&mut engine, 'v'); // enter visual
+    for _ in 0..5 {
+        press_char(&mut engine, 'l');
+    }
+    // w is at col 0, need to position first
+    // Reset: go to "world"
+    engine.mode = Mode::Normal;
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 6;
+    press_char(&mut engine, 'v');
+    for _ in 0..4 {
+        press_char(&mut engine, 'l');
+    }
+    // Now visual selection covers "world" (cols 6-10)
+
+    engine.open_find_replace();
+    assert!(engine.find_replace_open);
+    assert_eq!(engine.find_replace_query, "world");
 }

@@ -1034,6 +1034,8 @@ fn event_loop(
     let mut dragging_group_divider: Option<usize> = None;
     // True while user is drag-selecting text inside the editor hover popup.
     let mut hover_selecting: bool = false;
+    // True while user is drag-selecting text inside a find/replace input field.
+    let mut fr_input_dragging: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -3639,6 +3641,7 @@ fn event_loop(
                                 editor_hover_popup_rect,
                                 &editor_hover_link_rects,
                                 &mut hover_selecting,
+                                &mut fr_input_dragging,
                             );
                             sync_sidebar_focus(&sidebar, engine);
                             if mouse_should_quit {
@@ -3689,6 +3692,7 @@ fn event_loop(
                     editor_hover_popup_rect,
                     &editor_hover_link_rects,
                     &mut hover_selecting,
+                    &mut fr_input_dragging,
                 );
                 sync_sidebar_focus(&sidebar, engine);
                 if mouse_should_quit {

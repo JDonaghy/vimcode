@@ -1,4 +1,4 @@
-# src/core/engine/mod.rs — 3,763 lines
+# src/core/engine/mod.rs — 3,920 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
 
@@ -11,6 +11,8 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `NotificationKind` — enum for background operation types (LspInstall, LspIndexing, ExtensionInstall, GitOperation, ProjectSearch, ProjectReplace)
 - `Notification` — background operation tracking (id, kind, message, done, created_at, done_at)
 - `FindReplaceOptions` — toggle options for Ctrl+F overlay (case_sensitive, whole_word, use_regex, preserve_case, in_selection)
+- `FindReplaceClickTarget` — enum (13 variants) for shared click dispatch in find/replace overlay
+- `FrHitRegion` — hit region in char-cell units relative to find/replace panel content corner
 - `Dialog` / `DialogButton` / `DialogInput` — modal dialog system
 - `PaletteCommand` — command palette entry (includes "Go: Command Center")
 - `DiffLine` / `AlignedDiffEntry` — diff display types
@@ -33,6 +35,9 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `Engine::dismiss_notification(id)` — remove notification by ID
 - `Engine::dismiss_done_notifications()` — remove all completed notifications
 - `Engine::tick_notifications()` — auto-dismiss completed notifications after 5s timeout
+- `compute_find_replace_hit_regions(panel_w, show_replace, match_info)` — compute hit regions for find/replace overlay in char-cell units
+- `find_word_boundaries(text, pos)` — find word boundaries around char position (re-exported from search)
+- `FR_PANEL_WIDTH` — default panel width constant (50 chars)
 - `normalize_ex_command(input)` — abbreviation expansion for ex commands
 - `build_aligned_diff(left, right)` — side-by-side diff alignment
 - `lcs_diff(a, b)` — LCS-based line diff

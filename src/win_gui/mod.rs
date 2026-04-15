@@ -3812,86 +3812,87 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
-        // ── Find/replace overlay click handling ────────────────────────────
+        // ── Find/replace overlay click handling (shared dispatch) ──────────
         if state.engine.find_replace_open {
             if let Some(fr) = state.cached_find_replace_rect.clone() {
+                use crate::core::engine::FindReplaceClickTarget;
+
                 let lh = state.line_height;
                 let cw = state.char_width;
 
                 let on_panel = px >= fr.x && px < fr.x + fr.w && py >= fr.y && py < fr.y + fr.h;
 
                 if on_panel {
+                    let mut target: Option<FindReplaceClickTarget> = None;
+
                     // --- Find row ---
                     if py >= fr.row_y && py < fr.row_y + lh {
                         if px < fr.input_x {
-                            state.engine.find_replace_show_replace =
-                                !state.engine.find_replace_show_replace;
+                            target = Some(FindReplaceClickTarget::Chevron);
                         } else if px < fr.input_x + fr.input_w {
-                            state.engine.find_replace_focus = 0;
                             let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
-                            let pos =
-                                click_col.min(state.engine.find_replace_query.chars().count());
-                            state.engine.find_replace_cursor = pos;
-                            state.engine.find_replace_sel_anchor = Some(pos);
+                            target = Some(FindReplaceClickTarget::FindInput(click_col));
                             state.fr_input_dragging = true;
                         } else {
-                            // Toggle buttons (between input and first nav button)
+                            // Toggle buttons (pixel hit-test from draw cache)
                             let mut bx = fr.input_x + fr.input_w + 4.0;
+                            let toggle_targets = [
+                                FindReplaceClickTarget::ToggleCase,
+                                FindReplaceClickTarget::ToggleWholeWord,
+                                FindReplaceClickTarget::ToggleRegex,
+                            ];
                             for (i, label) in ["Aa", "ab", ".*"].iter().enumerate() {
                                 let tw = label.chars().count() as f32 * cw + 4.0;
                                 if px >= bx && px < bx + tw {
-                                    match i {
-                                        0 => state.engine.toggle_find_replace_case(),
-                                        1 => state.engine.toggle_find_replace_whole_word(),
-                                        _ => state.engine.toggle_find_replace_regex(),
-                                    }
+                                    target = Some(toggle_targets[i]);
                                     break;
                                 }
                                 bx += tw + 2.0;
                             }
                             // Nav buttons (use exact cached positions)
-                            for i in 0..4 {
-                                if px >= fr.nav_x[i] && px < fr.nav_x[i] + fr.btn_s {
-                                    match i {
-                                        0 => state.engine.find_replace_prev(),
-                                        1 => state.engine.find_replace_next(),
-                                        2 => state.engine.toggle_find_replace_in_selection(),
-                                        _ => state.engine.close_find_replace(),
+                            if target.is_none() {
+                                let nav_targets = [
+                                    FindReplaceClickTarget::PrevMatch,
+                                    FindReplaceClickTarget::NextMatch,
+                                    FindReplaceClickTarget::ToggleInSelection,
+                                    FindReplaceClickTarget::Close,
+                                ];
+                                for i in 0..4 {
+                                    if px >= fr.nav_x[i] && px < fr.nav_x[i] + fr.btn_s {
+                                        target = Some(nav_targets[i]);
+                                        break;
                                     }
-                                    break;
                                 }
                             }
                         }
                     }
 
                     // --- Replace row ---
-                    if state.engine.find_replace_show_replace
+                    if target.is_none()
+                        && state.engine.find_replace_show_replace
                         && fr.rep_y > 0.0
                         && py >= fr.rep_y
                         && py < fr.rep_y + lh
                     {
                         if px >= fr.input_x && px < fr.input_x + fr.input_w {
-                            state.engine.find_replace_focus = 1;
                             let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
-                            let pos = click_col
-                                .min(state.engine.find_replace_replacement.chars().count());
-                            state.engine.find_replace_cursor = pos;
-                            state.engine.find_replace_sel_anchor = Some(pos);
+                            target = Some(FindReplaceClickTarget::ReplaceInput(click_col));
                             state.fr_input_dragging = true;
                         } else {
-                            // [AB] button
                             let [ab_x, ab_w, r1_x, r_all_x] = fr.rep_btns;
                             if px >= ab_x && px < ab_x + ab_w {
-                                state.engine.toggle_find_replace_preserve_case();
-                            }
-                            if px >= r1_x && px < r1_x + fr.btn_s {
-                                state.engine.find_replace_replace_current();
-                            }
-                            if px >= r_all_x && px < r_all_x + fr.btn_s {
-                                state.engine.find_replace_replace_all();
+                                target = Some(FindReplaceClickTarget::TogglePreserveCase);
+                            } else if px >= r1_x && px < r1_x + fr.btn_s {
+                                target = Some(FindReplaceClickTarget::ReplaceCurrent);
+                            } else if px >= r_all_x && px < r_all_x + fr.btn_s {
+                                target = Some(FindReplaceClickTarget::ReplaceAll);
                             }
                         }
-                    } // end replace row
+                    }
+
+                    if let Some(t) = target {
+                        state.engine.handle_find_replace_click(t);
+                    }
 
                     unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);

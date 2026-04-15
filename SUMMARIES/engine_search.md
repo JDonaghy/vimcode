@@ -1,6 +1,9 @@
-# src/core/engine/search.rs — 1,209 lines
+# src/core/engine/search.rs — 1,277 lines
 
-Cursor helpers, search helpers (word under cursor, word-bounded search), and the unified find/replace overlay (Ctrl+F).
+Cursor helpers, search helpers (word under cursor, word-bounded search), the unified find/replace overlay (Ctrl+F), and shared click dispatch.
+
+## Free Functions
+- `find_word_boundaries(text, pos)` — find word start/end around char position (for double-click word select)
 
 ## Key Methods — Cursor & Search Helpers
 - `get_max_cursor_col()`, `clamp_cursor_col()` — cursor column bounds
@@ -11,8 +14,9 @@ Cursor helpers, search helpers (word under cursor, word-bounded search), and the
 - `build_word_bounded_matches()` — whole-word match filtering
 
 ## Key Methods — Find/Replace Overlay
-- `open_find_replace()` — open overlay, capture visual selection (single-line → query, multi-line → in_selection), pre-fill from search_query
-- `close_find_replace()` — close overlay, reset in_selection state
+- `open_find_replace()` — open overlay, capture visual selection (single-line → query, multi-line → in_selection), pre-fill from search_query, preserve visual highlight via `command_from_visual` + frozen `find_replace_visual_end`
+- `close_find_replace()` — close overlay, reset in_selection state, clear visual state
+- `handle_find_replace_click(target)` — shared dispatch for all find/replace mouse click targets (13 variants)
 - `run_find_replace_search()` — populate search_matches using FindReplaceOptions (case, word, regex with multiline, in_selection filtering)
 - `find_replace_next()` / `find_replace_prev()` — navigate matches
 - `find_replace_replace_current()` — replace match at search_index, advance cursor past replacement

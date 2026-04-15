@@ -1,7 +1,13 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 275 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 277 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 277 — Visual-mode `:` with `'<,'>` range prefix:**
+Pressing `:` in Visual, VisualLine, or VisualBlock mode enters Command mode with `'<,'>` pre-populated in the command buffer. `command_from_visual: Option<Mode>` on Engine tracks originating visual mode; `build_selection()` renders highlight during command input; selection cleared on Escape/Enter. Status line shows COMMAND. 6 new tests.
+
+**Session 276 — Unified find/replace overlay (Ctrl+F):**
+Engine-level `FindReplacePanel` in `ScreenLayout`, rendered identically by all 3 backends (GTK Cairo, TUI ratatui, Win-GUI Direct2D). Replaces GTK-only Revealer find dialog. VSCode-style layout: find row with toggles (Aa/ab/.*), match count, nav buttons, close button; replace row with replace/replace-all buttons. Features: incremental search, case/whole-word/regex/preserve-case/in-selection toggles, chevron expand/collapse, `ctrl_f_action` setting, Ctrl+Z undo passthrough, Ctrl+A select-all in inputs, visual selection pre-fill, regex multiline mode, Edit menu integration. Win-GUI mouse interactions (drag-select, double-click word, cached `FindReplaceRect`). Nerd Font icons with ASCII fallbacks. 13 new tests.
 
 **Session 275 — Win-GUI horizontal scrollbar, bundled Nerd Font, Phase 2c verification:**
 Win-GUI horizontal scrollbar drag (draw + click + drag + `scroll_left` text offset + text-area clip rect). Bundled Nerd Font via DirectWrite (per-user font install + registry + `icon_text_format`). Phase 2c source-code verification test (grep Win-GUI source for 26 required engine method calls). 1 new test.

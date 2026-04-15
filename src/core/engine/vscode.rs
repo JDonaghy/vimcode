@@ -16,7 +16,8 @@ impl Engine {
             };
         }
         match self.mode {
-            Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
+            Mode::Normal | Mode::Search => "NORMAL",
+            Mode::Command => "COMMAND",
             Mode::Insert => "INSERT",
             Mode::Replace => "REPLACE",
             Mode::Visual => "VISUAL",

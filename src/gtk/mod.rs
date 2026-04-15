@@ -151,6 +151,8 @@ struct App {
     tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>>,
     /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
     h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
+    /// True while user is drag-selecting text inside a find/replace input field.
+    fr_input_dragging: bool,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
@@ -1958,6 +1960,7 @@ impl SimpleComponent for App {
             h_sb_hovered_cell: h_sb_hovered_cell.clone(),
             tab_close_hover_cell: tab_close_hover_cell.clone(),
             h_sb_drag_cell: h_sb_drag_cell.clone(),
+            fr_input_dragging: false,
             settings_monitor,
             sender: sender.input_sender().clone(),
             sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
@@ -5743,104 +5746,101 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
-        // Find/replace overlay: intercept clicks on the panel
+        // ── Find/replace overlay click handling (using shared hit regions) ──
         if self.engine.borrow().find_replace_open {
-            let engine = self.engine.borrow();
-            let lh = self.cached_line_height.max(1.0);
             let cw = self.cached_char_width.max(1.0);
-            let pad = 6.0;
-            let input_w = 200.0;
-            let btn_s = lh;
-            let chevron_w = 16.0;
-            let toggles_w = 3.0 * (btn_s + 4.0);
-            let info_w = 60.0;
-            let nav_w = 4.0 * (btn_s + 2.0);
-            let popup_w = chevron_w + input_w + pad + toggles_w + info_w + nav_w + pad;
-            let show_replace = engine.find_replace_show_replace;
-            let row_count = if show_replace { 2.0 } else { 1.0 };
-            let popup_h = lh * row_count + pad * (row_count + 1.0);
-            let popup_x = (width - popup_w - 10.0).max(0.0);
-            let popup_y_pos = lh * 2.5 + 2.0;
-            drop(engine);
+            let lh = self.cached_line_height.max(1.0);
 
-            if x >= popup_x
-                && x < popup_x + popup_w
-                && y >= popup_y_pos
-                && y < popup_y_pos + popup_h
-            {
-                let mut engine = self.engine.borrow_mut();
-                let row_y = popup_y_pos + pad;
-                let input_x = popup_x + chevron_w;
+            let (hit_regions, on_panel, rel_col, rel_row) = {
+                let engine = self.engine.borrow();
 
-                // --- Find row ---
-                if y >= row_y && y < row_y + lh {
-                    if x < input_x {
-                        // Chevron
-                        engine.find_replace_show_replace = !engine.find_replace_show_replace;
-                    } else if x < input_x + input_w {
-                        // Find input
-                        engine.find_replace_focus = 0;
-                        let click_col = ((x - input_x - 4.0) / cw).max(0.0) as usize;
-                        engine.find_replace_cursor =
-                            click_col.min(engine.find_replace_query.chars().count());
+                // Build match_info (same logic as build_screen_layout)
+                let match_info = if engine.search_matches.is_empty() {
+                    if engine.find_replace_query.is_empty() {
+                        String::new()
                     } else {
-                        // Buttons: [Aa][ab][.*] [count] [↑][↓][≡][×]
-                        let mut bx = input_x + input_w + pad;
-                        for (i, label) in ["Aa", "ab", ".*"].iter().enumerate() {
-                            let tw = label.len() as f64 * cw + 8.0;
-                            if x >= bx && x < bx + tw {
-                                match i {
-                                    0 => engine.toggle_find_replace_case(),
-                                    1 => engine.toggle_find_replace_whole_word(),
-                                    _ => engine.toggle_find_replace_regex(),
-                                }
-                                break;
-                            }
-                            bx += tw + 4.0;
+                        "No results".to_string()
+                    }
+                } else {
+                    match engine.search_index {
+                        Some(idx) => {
+                            format!("{} of {}", idx + 1, engine.search_matches.len())
                         }
-                        // Skip match count
-                        bx += info_w;
-                        // Nav: ↑ ↓ ≡ ×
-                        for i in 0..4 {
-                            if x >= bx && x < bx + btn_s {
-                                match i {
-                                    0 => engine.find_replace_prev(),
-                                    1 => engine.find_replace_next(),
-                                    2 => engine.toggle_find_replace_in_selection(),
-                                    _ => engine.close_find_replace(),
-                                }
-                                break;
-                            }
-                            bx += btn_s + 2.0;
-                        }
+                        None => format!("{} matches", engine.search_matches.len()),
+                    }
+                };
+
+                let panel_w = render::FR_PANEL_WIDTH;
+                let (hit_regions, _) = render::compute_find_replace_hit_regions(
+                    panel_w,
+                    engine.find_replace_show_replace,
+                    &match_info,
+                );
+
+                // Replicate draw.rs pixel layout for panel bounding box
+                let pad = 6.0;
+                let input_w_px = 200.0;
+                let btn_s = lh;
+                let chevron_w = 16.0;
+                let toggles_w = 3.0 * (btn_s + 4.0);
+                let info_w = 80.0;
+                let nav_w = 4.0 * (btn_s + 2.0);
+                let popup_w = chevron_w + input_w_px + pad + toggles_w + info_w + nav_w + pad;
+                let row_count_f = if engine.find_replace_show_replace {
+                    2.0
+                } else {
+                    1.0
+                };
+                let popup_h = lh * row_count_f + pad * (row_count_f + 1.0);
+                let popup_x = (width - popup_w - 10.0).max(0.0);
+                let popup_y = lh * 2.5 + 2.0; // approximate position
+
+                let on_panel =
+                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
+
+                // Translate pixel to panel-relative row + char column
+                let row_y = popup_y + pad;
+                let rel_row = if y >= row_y && y < row_y + lh {
+                    0u16
+                } else if y >= row_y + lh + pad && y < row_y + lh + pad + lh {
+                    1u16
+                } else {
+                    u16::MAX
+                };
+                let content_px = popup_x + chevron_w; // content starts after chevron
+                let rel_col = ((x - content_px) / cw).max(0.0) as u16;
+
+                (hit_regions, on_panel, rel_col, rel_row)
+            };
+
+            if on_panel {
+                let mut matched_target = None;
+                for (region, target) in &hit_regions {
+                    if region.row == rel_row
+                        && rel_col >= region.col
+                        && rel_col < region.col + region.width
+                    {
+                        matched_target = Some((*target, region.col));
+                        break;
                     }
                 }
 
-                // --- Replace row ---
-                if show_replace {
-                    let rep_y = row_y + lh + pad;
-                    if y >= rep_y && y < rep_y + lh {
-                        if x >= input_x && x < input_x + input_w {
-                            engine.find_replace_focus = 1;
-                            let click_col = ((x - input_x - 4.0) / cw).max(0.0) as usize;
-                            engine.find_replace_cursor =
-                                click_col.min(engine.find_replace_replacement.chars().count());
-                        } else if x >= input_x + input_w {
-                            let mut rbx = input_x + input_w + pad;
-                            let ab_w = 2.0 * cw + 8.0;
-                            if x >= rbx && x < rbx + ab_w {
-                                engine.toggle_find_replace_preserve_case();
-                            }
-                            rbx += ab_w + 4.0;
-                            if x >= rbx && x < rbx + btn_s {
-                                engine.find_replace_replace_current();
-                            }
-                            rbx += btn_s + 2.0;
-                            if x >= rbx && x < rbx + btn_s {
-                                engine.find_replace_replace_all();
-                            }
+                if let Some((target, region_col)) = matched_target {
+                    use core::engine::FindReplaceClickTarget::*;
+
+                    let target = match target {
+                        FindInput(_) => FindInput(rel_col.saturating_sub(region_col) as usize),
+                        ReplaceInput(_) => {
+                            ReplaceInput(rel_col.saturating_sub(region_col) as usize)
                         }
+                        other => other,
+                    };
+
+                    if matches!(target, FindInput(_) | ReplaceInput(_)) {
+                        self.fr_input_dragging = true;
                     }
+
+                    self.engine.borrow_mut().handle_find_replace_click(target);
                 }
 
                 self.draw_needed.set(true);

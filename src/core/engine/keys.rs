@@ -5195,6 +5195,11 @@ impl Engine {
                     } else {
                         Mode::Normal
                     };
+                    // Clear visual state if we came from visual mode
+                    if self.command_from_visual.is_some() {
+                        self.visual_anchor = None;
+                        self.command_from_visual = None;
+                    }
                     self.command_buffer.clear();
                     self.command_cursor = 0;
                     self.command_history_index = None;
@@ -5216,9 +5221,16 @@ impl Engine {
                 self.history.add_command(&cmd);
                 self.command_history_index = None;
                 self.command_typing_buffer.clear();
+                // Clear visual state before executing (anchor is still available
+                // for `'<,'>` range resolution via get_visual_selection_range)
+                let was_from_visual = self.command_from_visual.take();
                 let _ = self.session.save();
                 let _ = self.history.save();
                 let result = self.execute_command(&cmd);
+                // Clear visual anchor after execution
+                if was_from_visual.is_some() {
+                    self.visual_anchor = None;
+                }
                 // If still in VSCode mode after the command, return to Insert (EDIT) mode.
                 // (If the command switched to Vim mode, is_vscode_mode() will be false,
                 //  so mode stays Normal — which is correct.)
@@ -5912,8 +5924,9 @@ impl Engine {
                     return EngineAction::None;
                 }
                 ':' => {
+                    self.command_from_visual = Some(self.mode);
                     self.mode = Mode::Command;
-                    self.command_buffer = "'<,'>".to_string(); // Auto-populate visual range
+                    self.command_buffer = "'<,'>".to_string();
                     self.command_cursor = self.command_buffer.chars().count();
                     self.count = None;
                     return EngineAction::None;
