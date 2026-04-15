@@ -7329,4 +7329,68 @@ impl Engine {
         self.registers.insert('+', (text.clone(), false));
         self.registers.insert('*', (text, false));
     }
+
+    /// Feed a key sequence string into the engine, parsing special key notation.
+    ///
+    /// Supports: plain characters (`dw`), special keys (`<Esc>`, `<CR>`, `<BS>`,
+    /// `<Tab>`, `<Del>`, `<Up>`, `<Down>`, `<Left>`, `<Right>`), and Ctrl
+    /// combinations (`<C-a>`).  This is the same notation used in Neovim's
+    /// `nvim_feedkeys` / `nvim_input`.
+    pub fn feed_keys(&mut self, keys: &str) {
+        let mut chars = keys.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '<' {
+                // Only parse as <SpecialKey> if the remaining string contains '>'.
+                let rest: String = chars.clone().collect();
+                let has_closing = rest.contains('>');
+                let starts_special = chars
+                    .peek()
+                    .map(|&c| c.is_ascii_uppercase() || c == 'C')
+                    .unwrap_or(false);
+                if has_closing && starts_special {
+                    let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
+                    match name.as_str() {
+                        "Esc" => {
+                            self.handle_key("Escape", None, false);
+                        }
+                        "CR" | "Enter" => {
+                            self.handle_key("Return", None, false);
+                        }
+                        "BS" => {
+                            self.handle_key("BackSpace", None, false);
+                        }
+                        "Tab" => {
+                            self.handle_key("Tab", None, false);
+                        }
+                        "Del" | "Delete" => {
+                            self.handle_key("Delete", None, false);
+                        }
+                        "Up" => {
+                            self.handle_key("Up", None, false);
+                        }
+                        "Down" => {
+                            self.handle_key("Down", None, false);
+                        }
+                        "Left" => {
+                            self.handle_key("Left", None, false);
+                        }
+                        "Right" => {
+                            self.handle_key("Right", None, false);
+                        }
+                        n if n.starts_with("C-") => {
+                            let ctrl_char = n.chars().nth(2).unwrap_or(' ');
+                            self.handle_key(&ctrl_char.to_string(), Some(ctrl_char), true);
+                        }
+                        other => {
+                            self.handle_key(other, None, false);
+                        }
+                    }
+                } else {
+                    self.handle_key(&ch.to_string(), Some(ch), false);
+                }
+            } else {
+                self.handle_key(&ch.to_string(), Some(ch), false);
+            }
+        }
+    }
 }

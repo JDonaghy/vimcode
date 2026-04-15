@@ -359,6 +359,59 @@ impl Engine {
         for cmd in ctx.run_commands {
             let _ = self.execute_command(&cmd);
         }
+        // Apply range-based line replacements (Neovim-compatible set_lines)
+        if !ctx.set_lines_range.is_empty() {
+            self.start_undo_group();
+            let buf_id = self.active_buffer_id();
+            // Process in reverse order so earlier indices stay valid
+            let mut ranges = ctx.set_lines_range;
+            ranges.reverse();
+            for (start, end, new_lines) in ranges {
+                if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                    let line_count = state.buffer.len_lines();
+                    let s = start.min(line_count);
+                    let e = end.min(line_count);
+                    if s <= e {
+                        // Delete old lines [s, e)
+                        if s < e && s < line_count {
+                            let char_start = state.buffer.line_to_char(s);
+                            let char_end = if e < line_count {
+                                state.buffer.line_to_char(e)
+                            } else {
+                                state.buffer.len_chars()
+                            };
+                            if char_start < char_end {
+                                let old: String =
+                                    state.buffer.content.slice(char_start..char_end).to_string();
+                                state.record_delete(char_start, &old);
+                                state.buffer.delete_range(char_start, char_end);
+                            }
+                        }
+                        // Insert new lines at position s
+                        if !new_lines.is_empty() {
+                            let insert_at = if s < state.buffer.len_lines() {
+                                state.buffer.line_to_char(s)
+                            } else {
+                                state.buffer.len_chars()
+                            };
+                            let mut text = String::new();
+                            for line in &new_lines {
+                                text.push_str(line);
+                                text.push('\n');
+                            }
+                            state.record_insert(insert_at, &text);
+                            state.buffer.insert(insert_at, &text);
+                        }
+                        state.dirty = true;
+                    }
+                }
+            }
+            self.finish_undo_group();
+        }
+        // Apply feedkeys sequences
+        for keys in ctx.feedkeys_sequences {
+            self.feed_keys(&keys);
+        }
         // Spawn background threads for async shell requests.
         for req in ctx.async_shell_requests {
             let (tx, rx) = std::sync::mpsc::channel();
