@@ -134,9 +134,9 @@ impl Color {
     pub fn colorcolumn_tint(self) -> Self {
         let lum = 0.299 * self.r as f64 + 0.587 * self.g as f64 + 0.114 * self.b as f64;
         if lum < 128.0 {
-            self.lighten(0.04)
+            self.lighten(0.08)
         } else {
-            self.darken(0.03)
+            self.darken(0.06)
         }
     }
 
@@ -2820,9 +2820,10 @@ impl Theme {
     /// All values are derived directly from the Cairo RGB tuples in the
     /// original `draw_*` functions.
     pub fn onedark() -> Self {
+        let bg = Color::from_hex("#1a1a1a");
         Self {
             // (0.1, 0.1, 0.1)
-            background: Color::from_hex("#1a1a1a"),
+            background: bg,
             // (0.12, 0.12, 0.12)
             active_background: Color::from_hex("#1e1e1e"),
             // (0.9, 0.9, 0.9)
@@ -2983,7 +2984,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#606060"),
-            colorcolumn_bg: Color::from_hex("#1a1a1a").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
@@ -2999,8 +3000,9 @@ impl Theme {
 
     /// Gruvbox Dark colour scheme.
     pub fn gruvbox_dark() -> Self {
+        let bg = Color::from_hex("#282828");
         Self {
-            background: Color::from_hex("#282828"),
+            background: bg,
             active_background: Color::from_hex("#32302f"),
             foreground: Color::from_hex("#ebdbb2"),
 
@@ -3132,7 +3134,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#3c3836"),
             indent_guide_active_fg: Color::from_hex("#504945"),
-            colorcolumn_bg: Color::from_hex("#282828").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
@@ -3148,8 +3150,9 @@ impl Theme {
 
     /// Tokyo Night colour scheme.
     pub fn tokyo_night() -> Self {
+        let bg = Color::from_hex("#1a1b26");
         Self {
-            background: Color::from_hex("#1a1b26"),
+            background: bg,
             active_background: Color::from_hex("#1f2335"),
             foreground: Color::from_hex("#c0caf5"),
 
@@ -3281,7 +3284,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#292e42"),
             indent_guide_active_fg: Color::from_hex("#3b4261"),
-            colorcolumn_bg: Color::from_hex("#1a1b26").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
@@ -3297,8 +3300,9 @@ impl Theme {
 
     /// Solarized Dark colour scheme.
     pub fn solarized_dark() -> Self {
+        let bg = Color::from_hex("#002b36");
         Self {
-            background: Color::from_hex("#002b36"),
+            background: bg,
             active_background: Color::from_hex("#073642"),
             foreground: Color::from_hex("#839496"),
 
@@ -3430,7 +3434,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#073642"),
             indent_guide_active_fg: Color::from_hex("#0d4a5a"),
-            colorcolumn_bg: Color::from_hex("#002b36").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
@@ -3446,8 +3450,9 @@ impl Theme {
 
     /// VSCode Dark+ colour scheme.
     pub fn vscode_dark() -> Self {
+        let bg = Color::from_hex("#1e1e1e");
         Self {
-            background: Color::from_hex("#1e1e1e"),
+            background: bg,
             active_background: Color::from_hex("#252526"),
             foreground: Color::from_hex("#d4d4d4"),
 
@@ -3579,7 +3584,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#707070"),
-            colorcolumn_bg: Color::from_hex("#1e1e1e").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
@@ -3595,8 +3600,9 @@ impl Theme {
 
     /// VS Code Light+ (Default Light+) colour scheme.
     pub fn vscode_light() -> Self {
+        let bg = Color::from_hex("#ffffff");
         Self {
-            background: Color::from_hex("#ffffff"),
+            background: bg,
             active_background: Color::from_hex("#f3f3f3"),
             foreground: Color::from_hex("#333333"),
 
@@ -3727,7 +3733,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#d3d3d3"),
             indent_guide_active_fg: Color::from_hex("#939393"),
-            colorcolumn_bg: Color::from_hex("#ffffff").colorcolumn_tint(), // derived from background
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
