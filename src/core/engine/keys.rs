@@ -6598,22 +6598,53 @@ impl Engine {
                         let start_cursor = self.view().cursor;
                         let start_pos =
                             self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
-                        for _ in 0..change.count {
-                            match motion_char {
-                                'w' => self.move_word_forward(),
-                                'b' => self.move_word_backward(),
-                                'e' => self.move_word_end(),
-                                _ => {}
-                            }
-                        }
-                        let end_cursor = self.view().cursor;
-                        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
-                        self.view_mut().cursor = start_cursor;
+                        let total = self.buffer().len_chars();
 
-                        let delete_end = if motion_char == 'e' {
-                            (end_pos + 1).min(self.buffer().len_chars())
+                        // For cw dot repeat, use cw-special logic: find end of
+                        // word without eating trailing whitespace.
+                        let delete_end = if motion_char == 'w' || motion_char == 'W' {
+                            let bigword = motion_char == 'W';
+                            let mut end = start_pos;
+                            for i in 0..change.count {
+                                if bigword {
+                                    while end < total
+                                        && !self.buffer().content.char(end).is_whitespace()
+                                    {
+                                        end += 1;
+                                    }
+                                } else {
+                                    while end < total
+                                        && is_word_char(self.buffer().content.char(end))
+                                    {
+                                        end += 1;
+                                    }
+                                }
+                                if i + 1 < change.count {
+                                    while end < total
+                                        && self.buffer().content.char(end).is_whitespace()
+                                    {
+                                        end += 1;
+                                    }
+                                }
+                            }
+                            end
                         } else {
-                            end_pos
+                            for _ in 0..change.count {
+                                match motion_char {
+                                    'b' => self.move_word_backward(),
+                                    'e' => self.move_word_end(),
+                                    _ => {}
+                                }
+                            }
+                            let end_cursor = self.view().cursor;
+                            let end_pos =
+                                self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                            self.view_mut().cursor = start_cursor;
+                            if motion_char == 'e' {
+                                (end_pos + 1).min(total)
+                            } else {
+                                end_pos
+                            }
                         };
                         if start_pos < delete_end {
                             self.start_undo_group();
