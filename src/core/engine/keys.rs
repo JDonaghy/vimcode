@@ -7290,17 +7290,41 @@ impl Engine {
 
     /// Pre-load clipboard text into `"`, `+`, and `*` before a p/P keypress.
     ///
-    /// If the clipboard content exactly matches what is already in `"`, the
-    /// existing `is_linewise` flag is **preserved** — this covers the common
-    /// `yy` → `p` flow where the yank wrote linewise text to both the register
-    /// and the system clipboard.  When the clipboard holds different text (from
-    /// another application) `is_linewise` is set to `false` as usual.
+    /// If the clipboard content matches what is already in `"`, the existing
+    /// `is_linewise` flag is **preserved** — this covers the common `yy` → `p`
+    /// flow where the yank wrote linewise text to both the register and the
+    /// system clipboard.  When the clipboard holds different text (from another
+    /// application) `is_linewise` is set to `false` as usual.
+    ///
+    /// The text is normalized (`\r\n` → `\n`) before storing, and the comparison
+    /// ignores a trailing newline difference, because the OS clipboard round-trip
+    /// can alter line endings (e.g. Windows `Get-Clipboard` returns `\r\n` and
+    /// may strip trailing newlines).
     pub fn load_clipboard_for_paste(&mut self, text: String) {
+        // Normalize CRLF → LF so pasted text doesn't introduce \r into the buffer.
+        let text = text.replace("\r\n", "\n");
+
         let existing_lw = self
             .registers
             .get(&'"')
-            .map(|(c, lw)| c == &text && *lw)
+            .map(|(reg_content, lw)| {
+                if !*lw {
+                    return false;
+                }
+                // Compare without trailing \n — clipboard may strip it
+                let clip_trimmed = text.trim_end_matches('\n');
+                let reg_trimmed = reg_content.trim_end_matches('\n');
+                clip_trimmed == reg_trimmed
+            })
             .unwrap_or(false);
+
+        // For linewise content, ensure it ends with \n so paste inserts complete lines.
+        let text = if existing_lw && !text.ends_with('\n') {
+            format!("{text}\n")
+        } else {
+            text
+        };
+
         self.registers.insert('"', (text.clone(), existing_lw));
         self.registers.insert('+', (text.clone(), false));
         self.registers.insert('*', (text, false));

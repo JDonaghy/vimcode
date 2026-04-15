@@ -6354,17 +6354,22 @@ fn setup_win_clipboard(engine: &mut Engine) {
             .map(|s| s.trim_end_matches("\r\n").to_string())
     }));
     engine.clipboard_write = Some(Box::new(|text: &str| {
+        use std::io::Write;
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Set-Clipboard", "-Value", text])
+        // Pipe text via stdin — passing multi-line text as a -Value argument
+        // breaks on newlines (PowerShell treats them as argument separators).
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "$input | Set-Clipboard"])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| e.to_string())
-            .and_then(|mut c| c.wait().map_err(|e| e.to_string()))
-            .map(|_| ())
+            .map_err(|e| e.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait().map_err(|e| e.to_string()).map(|_| ())
     }));
 }
 
