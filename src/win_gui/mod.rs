@@ -3857,9 +3857,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                     FindReplaceClickTarget::ToggleInSelection,
                                     FindReplaceClickTarget::Close,
                                 ];
-                                for i in 0..4 {
-                                    if px >= fr.nav_x[i] && px < fr.nav_x[i] + fr.btn_s {
-                                        target = Some(nav_targets[i]);
+                                for (&nx, nt) in fr.nav_x.iter().zip(nav_targets) {
+                                    if px >= nx && px < nx + fr.btn_s {
+                                        target = Some(nt);
                                         break;
                                     }
                                 }

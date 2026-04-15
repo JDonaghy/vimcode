@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 14, 2026 (Session 278 — Find/replace hit regions + shared dispatch) | **Tests:** 1403 (lib)
+**Last updated:** Apr 14, 2026 (Session 278 — Find/replace hit regions, colorcolumn, `x`+`.` fix) | **Tests:** 1416 (lib)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 277 are in **SESSION_HISTORY.md**.
@@ -26,16 +26,19 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 278 — Find/replace hit regions, shared dispatch, visual selection preservation:**
+**Session 278 — Find/replace hit regions, colorcolumn, `x`+`.` fix, CLAUDE.md rules:**
 
-1. **Centralized find/replace hit-test geometry** — `FindReplaceClickTarget` enum (13 variants), `FrHitRegion` struct, and `compute_find_replace_hit_regions()` in `engine/mod.rs` compute clickable regions in abstract char-cell units. All 3 backends now use the same hit regions instead of computing geometry independently.
-2. **Shared click dispatch** — `Engine::handle_find_replace_click()` in `search.rs` dispatches all find/replace mouse actions. Eliminates ~30 lines of duplicated match-on-index dispatch per backend.
-3. **TUI mouse rewrite** — Replaced 145-line independent geometry block with hit-region-based dispatch. Added `fr_input_dragging` for drag-to-select, double-click word select via shared `find_word_boundaries()`.
-4. **GTK click handler fixed** — Rewrote using hit regions. Fixes 3 geometry mismatches: `info_w` (60→80), `popup_y` calculation, toggle button widths (char_width×len → Pango measurement alignment).
-5. **Win-GUI migrated to shared dispatch** — Pixel hit-testing unchanged (already working), but action dispatch uses `handle_find_replace_click()`.
-6. **Visual selection preserved during Ctrl+F** — Opening find/replace from Visual mode keeps the selection highlight visible (frozen via `find_replace_visual_end`). Cursor jumps to matches but selection stays fixed. Cleared on overlay close.
-7. **Dynamic panel width for match count** — Find/replace panel input field shrinks dynamically when match count string is long (e.g. "62 of 112"), ensuring ≡ and × buttons always fit within the panel. Fixes TUI button overflow.
-8. **Crate extraction roadmap** — Added 7 future plan items: hit regions for tab bar, status bar, sidebar, context menus; abstract event layer; `vimcode-core` crate extraction; proof-of-concept SQL client.
-9. **14 new tests** — `find_word_boundaries` (5), `handle_find_replace_click` (5), hit region computation (3), visual selection pre-fill (1).
+1. **Centralized find/replace hit-test geometry** — `FindReplaceClickTarget` enum (13 variants), `FrHitRegion` struct, `compute_find_replace_hit_regions()` in `engine/mod.rs`. All 3 backends use shared hit regions instead of computing geometry independently.
+2. **Shared click dispatch** — `Engine::handle_find_replace_click()` eliminates ~30 lines of duplicated dispatch per backend.
+3. **TUI mouse rewrite** — Hit-region-based dispatch, `fr_input_dragging` for drag-to-select, double-click word select via `find_word_boundaries()`.
+4. **GTK click handler fixed** — Hit regions fix 3 geometry mismatches (`info_w`, `popup_y`, toggle widths).
+5. **Win-GUI migrated to shared dispatch** — Pixel hit-testing preserved, action dispatch shared.
+6. **Visual selection preserved during Ctrl+F** — Frozen via `find_replace_visual_end`, cleared on overlay close.
+7. **Dynamic panel width** — Input field shrinks for long match counts, ensuring ≡/× buttons always visible.
+8. **`:set colorcolumn` implemented** — `colorcolumn_positions()` parses comma-separated columns with `+N`/`-N` relative offsets. `colorcolumn_bg` theme color derived from `background.colorcolumn_tint()`. Rendered in all 3 backends. VSCode import: `editorRuler.foreground`. 10 new tests.
+9. **`x` with count + `.` repeat fixed** — `repeat_last_change()` was looping `final_count` times with `change.count` inside (4×4=16 instead of 4). Fixed for both `x` and `dd`. 3 new tests.
+10. **CLAUDE.md rules elevated** — Theme colors (never hardcode hex), testing (never `cargo test` with win-gui), hit region pattern.
+11. **Crate extraction roadmap** — 7 future plan items. Vim conformance roadmap — 5 audit items.
+12. **27 new tests** — find/replace (14), colorcolumn (10), `x`+`.` repeat (3). Total: 1416.
 
 > Session 277 and earlier in **SESSION_HISTORY.md**.
