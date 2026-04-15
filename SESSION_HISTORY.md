@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 277 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 278 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 278 — Find/replace hit regions, colorcolumn, `x`+`.` fix, CLAUDE.md rules:**
+Centralized find/replace hit-test geometry — `FindReplaceClickTarget` enum (13 variants), `FrHitRegion` struct, `compute_find_replace_hit_regions()` in `engine/mod.rs`. All 3 backends use shared hit regions. Shared click dispatch via `Engine::handle_find_replace_click()`. TUI mouse rewrite with hit-region-based dispatch, drag-to-select, double-click word select. GTK click handler fixed (3 geometry mismatches). Win-GUI migrated to shared dispatch. Visual selection preserved during Ctrl+F. Dynamic panel width. `:set colorcolumn` implemented with parsing, derived theme color, 3-backend rendering. `x` count+`.` repeat fixed. CLAUDE.md rules elevated. Crate extraction + Vim conformance roadmap items. 27 new tests.
 
 **Session 277 — Visual-mode `:` with `'<,'>` range prefix:**
 Pressing `:` in Visual, VisualLine, or VisualBlock mode enters Command mode with `'<,'>` pre-populated in the command buffer. `command_from_visual: Option<Mode>` on Engine tracks originating visual mode; `build_selection()` renders highlight during command input; selection cleared on Escape/Enter. Status line shows COMMAND. 6 new tests.
