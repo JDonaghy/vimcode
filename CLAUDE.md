@@ -155,7 +155,30 @@ This prevents CI failures and maintains code quality.
 - Core: Return `Result<T, E>` for I/O, silent no-ops for bounds
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
+## Theme Colors (CRITICAL)
+**NEVER introduce new hex color literals for derived theme fields.** Every new color added to the `Theme` struct must be derived from an existing foundational theme field (`background`, `foreground`, etc.) using `lighten()`/`darken()`/`cursorline_tint()`/`colorcolumn_tint()` or similar. Use a local variable to avoid repeating hex strings:
+```rust
+pub fn onedark() -> Self {
+    let bg = Color::from_hex("#1a1a1a");
+    Self {
+        background: bg,
+        new_derived_color: bg.some_tint(),  // GOOD: derived from variable
+        // bad_color: Color::from_hex("#2c313a"),  // BAD: hardcoded hex
+    }
+}
+```
+**Why:** Hardcoded hex values don't adapt to custom themes or VSCode theme imports. Only foundational colors (background, foreground, keyword, string, etc.) should have hex literals. VSCode theme imports (`from_vscode_json`) can override derived values with user-specified exact colors.
+
+## Testing (CRITICAL)
+**NEVER run `cargo test` with the `win-gui` feature enabled.** This spawns hundreds of real Win32 windows and locks up the machine. Use these commands instead:
+- **Run tests:** `cargo test --no-default-features --lib` (no GTK, no win-gui)
+- **Build win-gui:** `cargo build --bin vimcode-win --features win-gui --no-default-features`
+- **Clippy win-gui:** `cargo clippy --features win-gui --no-default-features`
+- NEVER combine `cargo test` with `--features win-gui`
+
 ## Common Patterns
+
+**Hit regions for clickable UI elements:** When adding clickable elements to the find/replace overlay (or future UI panels), define hit regions in `engine/mod.rs` using `FrHitRegion` + `FindReplaceClickTarget` types. Compute regions once in `build_screen_layout()`, then backends walk the region list to resolve clicks. Dispatch through a shared `Engine::handle_*_click()` method. This avoids per-backend geometry duplication and is the established pattern for crate extraction. See `compute_find_replace_hit_regions()` as the reference implementation.
 
 **Add Normal Mode Key:** `engine/keys.rs` → `handle_normal_key()` → add match arm → test
 
