@@ -22337,3 +22337,263 @@ fn test_nvim_ctrl_x_decrement() {
 fn test_nvim_ctrl_a_with_count() {
     nvim_case("10\n", 0, 0, "5<C-a>", "15\n", 0, 1);
 }
+
+// ── Phase 4 Batch 4: Change operations ──────────────────────────────────
+
+#[test]
+#[ignore = "vim deviation: C (change to EOL) starts one char too early"]
+fn test_nvim_c_dollar_change_to_eol() {
+    // C at col 6 should change "world" to "XX" → "hello XX".
+    // VimCode: changes from col 5, giving "helloXX ".
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("CXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello XX\n");
+}
+
+#[test]
+fn test_nvim_s_big_substitute_line() {
+    // S replaces entire line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nsecond\n");
+    engine.update_syntax();
+    engine.feed_keys("SXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XX\nsecond\n");
+}
+
+#[test]
+fn test_nvim_o_open_below() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("oXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "aaa\nXX\nbbb\n");
+    assert_eq!(engine.view().cursor.line, 1);
+}
+
+#[test]
+fn test_nvim_o_big_open_above() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("OXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XX\naaa\nbbb\n");
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+#[test]
+fn test_nvim_r_replace_mode() {
+    // R enters replace mode, overwrites chars
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("RXY<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XYllo\n");
+}
+
+#[test]
+fn test_nvim_r_replace_mode_past_eol() {
+    // R past end of line extends the line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\n");
+    engine.update_syntax();
+    engine.feed_keys("RXYZA<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XYZA\n");
+}
+
+// ── Phase 4 Batch 4: Registers ──────────────────────────────────────────
+
+#[test]
+fn test_nvim_named_register_yank() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayw");
+    let (content, _) = engine.registers.get(&'a').unwrap();
+    assert_eq!(content, "hello ");
+}
+
+#[test]
+fn test_nvim_named_register_paste() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayy");
+    engine.feed_keys("j");
+    engine.feed_keys("\"ap");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\naaa\n");
+}
+
+#[test]
+#[ignore = "vim deviation: uppercase register append (\"Ayy) not implemented"]
+fn test_nvim_append_register() {
+    // "ayy then j"Ayy should append to register a → "aaa\nbbb\n"
+    // VimCode: uppercase register does not append, just overwrites.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayyj\"Ayy");
+    let (content, _) = engine.registers.get(&'a').unwrap();
+    assert_eq!(content, "aaa\nbbb\n");
+}
+
+#[test]
+fn test_nvim_numbered_register_shift() {
+    // dd shifts numbered registers: first dd → @1="aaa\n", second dd → @1="bbb\n", @2="aaa\n"
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    let r1a = engine.registers.get(&'1').unwrap().0.clone();
+    assert_eq!(r1a, "aaa\n");
+    engine.feed_keys("dd");
+    let r1b = engine.registers.get(&'1').unwrap().0.clone();
+    let r2 = engine.registers.get(&'2').unwrap().0.clone();
+    assert_eq!(r1b, "bbb\n");
+    assert_eq!(r2, "aaa\n");
+}
+
+#[test]
+fn test_nvim_small_delete_register() {
+    // de (char delete < 1 line) goes to "- register
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("de");
+    let (content, _) = engine.registers.get(&'-').unwrap();
+    assert_eq!(content, "hello");
+}
+
+#[test]
+fn test_nvim_black_hole_register() {
+    // "_dd deletes without affecting registers
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayy"); // @a = "aaa\n"
+    engine.feed_keys("\"_dd"); // delete "aaa" to black hole
+                               // @a should still be "aaa\n"
+    let (a_content, _) = engine.registers.get(&'a').unwrap();
+    assert_eq!(a_content, "aaa\n");
+    // buffer should just have "bbb\n"
+    assert_eq!(engine.buffer().to_string(), "bbb\n");
+}
+
+#[test]
+fn test_nvim_dot_register() {
+    // @. contains last inserted text
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("iABC<Esc>");
+    assert_eq!(engine.last_inserted_text, "ABC");
+}
+
+#[test]
+fn test_nvim_yank_does_not_set_numbered() {
+    // yy should NOT shift numbered registers (only deletes do)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("yy");
+    // @0 should have the yank, @1 should be empty
+    let (r0, _) = engine.registers.get(&'0').unwrap();
+    assert_eq!(r0, "aaa\n");
+    assert!(engine.registers.get(&'1').is_none(), "yy should not set @1");
+}
+
+// ── Phase 4 Batch 4: Insert mode special keys ──────────────────────────
+
+#[test]
+fn test_nvim_insert_ctrl_w_delete_word() {
+    // Ctrl-W in insert mode deletes the word before cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("A world<C-w><Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello \n");
+}
+
+#[test]
+fn test_nvim_insert_ctrl_u_delete_to_start() {
+    // Ctrl-U in insert mode deletes to start of line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("A world<C-u><Esc>");
+    assert_eq!(engine.buffer().to_string(), "\n");
+}
+
+// ── Phase 4 Batch 4: Edge cases ─────────────────────────────────────────
+
+#[test]
+fn test_nvim_p_charwise_after() {
+    // p pastes charwise content after cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.feed_keys("yl"); // yank "a"
+    engine.feed_keys("$p"); // paste after last char
+    assert_eq!(engine.buffer().to_string(), "abcdefa\n");
+}
+
+#[test]
+fn test_nvim_p_charwise_before() {
+    // P pastes charwise content before cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.feed_keys("yl"); // yank "a"
+    engine.feed_keys("$P"); // paste before last char
+    assert_eq!(engine.buffer().to_string(), "abcdeaf\n");
+}
+
+#[test]
+fn test_nvim_dw_last_word_on_line() {
+    // dw on last word of line should not delete the newline
+    nvim_case(
+        "hello world\nsecond\n",
+        0,
+        6,
+        "dw",
+        "hello \nsecond\n",
+        0,
+        5,
+    );
+}
+
+#[test]
+fn test_nvim_yiw_at_word_boundary() {
+    // yiw at start of word
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("yiw");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "world");
+}
+
+#[test]
+fn test_nvim_ciw_replaces_word() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world end\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("ciwXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello XX end\n");
+}
+
+#[test]
+fn test_nvim_dot_count_override() {
+    // 2dw then 3. should delete 3 words (count overrides)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a b c d e f g h\n");
+    engine.update_syntax();
+    engine.feed_keys("2dw"); // delete "a b "
+    assert_eq!(engine.buffer().to_string(), "c d e f g h\n");
+    engine.feed_keys("3."); // 3 overrides the saved count of 2
+    assert_eq!(engine.buffer().to_string(), "f g h\n");
+}
