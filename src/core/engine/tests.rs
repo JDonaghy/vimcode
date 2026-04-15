@@ -22597,3 +22597,240 @@ fn test_nvim_dot_count_override() {
     engine.feed_keys("3."); // 3 overrides the saved count of 2
     assert_eq!(engine.buffer().to_string(), "f g h\n");
 }
+
+// ── Phase 4 Batch 5: Visual block ───────────────────────────────────────
+
+#[test]
+fn test_nvim_visual_block_delete() {
+    // Ctrl-V select 2×3 block, delete
+    // "abcd\nefgh\nijkl" → select cols 1-2 on 3 lines → "ad\neh\nil"
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcd\nefgh\nijkl\n");
+    engine.update_syntax();
+    engine.feed_keys("l");
+    engine.handle_key("v", None, true); // Ctrl-V
+    engine.feed_keys("jjld");
+    assert_eq!(engine.buffer().to_string(), "ad\neh\nil\n");
+}
+
+#[test]
+fn test_nvim_visual_block_insert() {
+    // Ctrl-V on 3 lines, I to insert "X" on each
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.handle_key("v", None, true); // Ctrl-V
+    engine.feed_keys("jjIX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "Xaaa\nXbbb\nXccc\n");
+}
+
+#[test]
+fn test_nvim_visual_block_append() {
+    // Ctrl-V on 3 lines, $ then A to append "X"
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.handle_key("v", None, true); // Ctrl-V
+    engine.feed_keys("jj$AX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "aaaX\nbbbX\ncccX\n");
+}
+
+// ── Phase 4 Batch 5: Bigword motions ────────────────────────────────────
+
+#[test]
+fn test_nvim_w_bigword() {
+    // W skips over punctuation as part of the word
+    nvim_case("foo.bar baz\n", 0, 0, "W", "foo.bar baz\n", 0, 8);
+}
+
+#[test]
+fn test_nvim_b_bigword() {
+    // B from end jumps back over "baz" to "foo.bar"
+    // Neovim: col 9 (1-indexed) = col 8
+    nvim_case("foo.bar baz\n", 0, 10, "B", "foo.bar baz\n", 0, 8);
+}
+
+#[test]
+fn test_nvim_e_bigword() {
+    // E from start goes to end of "foo.bar": col 7 (1-indexed) = col 6
+    nvim_case("foo.bar baz\n", 0, 0, "E", "foo.bar baz\n", 0, 6);
+}
+
+#[test]
+fn test_nvim_dw_bigword() {
+    // dW deletes "foo.bar " → "baz"
+    nvim_case("foo.bar baz\n", 0, 0, "dW", "baz\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_de_bigword() {
+    // dE deletes "foo.bar" → " baz"
+    nvim_case("foo.bar baz\n", 0, 0, "dE", " baz\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_ge_backward_word_end() {
+    // ge from end of line goes to end of previous word
+    // "foo bar baz" at col 10 ($), ge → col 7 (1-indexed) = col 6
+    nvim_case("foo bar baz\n", 0, 10, "ge", "foo bar baz\n", 0, 6);
+}
+
+#[test]
+fn test_nvim_dge() {
+    // dge from col 10 ($): Neovim deletes "ba" + "z" → "foo ba"
+    // Actually Neovim: "foo ba", col 6 (1-indexed) = col 5
+    nvim_case("foo bar baz\n", 0, 10, "dge", "foo ba\n", 0, 5);
+}
+
+// ── Phase 4 Batch 5: Indentation ────────────────────────────────────────
+
+#[test]
+fn test_nvim_double_gt_indent() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys(">>");
+    let buf = engine.buffer().to_string();
+    // Should be indented by shiftwidth (default 4 spaces or 1 tab)
+    assert!(
+        buf.starts_with("    hello") || buf.starts_with("\thello"),
+        ">> should indent; got: {:?}",
+        buf
+    );
+}
+
+#[test]
+fn test_nvim_double_lt_outdent() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    hello\n");
+    engine.update_syntax();
+    engine.feed_keys("<<");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+}
+
+#[test]
+fn test_nvim_2_double_gt_indent_two_lines() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("2>>");
+    let buf = engine.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert!(
+        lines[0].starts_with("    ") || lines[0].starts_with("\t"),
+        "first line should be indented"
+    );
+    assert!(
+        lines[1].starts_with("    ") || lines[1].starts_with("\t"),
+        "second line should be indented"
+    );
+    // Third line untouched
+    assert_eq!(lines[2], "ccc");
+}
+
+// ── Phase 4 Batch 5: Line motions ───────────────────────────────────────
+
+#[test]
+fn test_nvim_plus_motion() {
+    // + goes to first non-blank of next line
+    // Neovim: line 2, col 3 (1-indexed) = line 1, col 2
+    nvim_case(
+        "  aaa\n  bbb\n  ccc\n",
+        0,
+        0,
+        "+",
+        "  aaa\n  bbb\n  ccc\n",
+        1,
+        2,
+    );
+}
+
+#[test]
+fn test_nvim_minus_motion() {
+    // - goes to first non-blank of previous line
+    nvim_case(
+        "  aaa\n  bbb\n  ccc\n",
+        1,
+        0,
+        "-",
+        "  aaa\n  bbb\n  ccc\n",
+        0,
+        2,
+    );
+}
+
+#[test]
+fn test_nvim_underscore_motion() {
+    // _ goes to first non-blank of current line
+    nvim_case("  hello\n", 0, 0, "_", "  hello\n", 0, 2);
+}
+
+// ── Phase 4 Batch 5: D, Y, gJ ──────────────────────────────────────────
+
+#[test]
+fn test_nvim_d_big_delete_to_eol() {
+    // D at col 6: "hello " (Neovim: col 6, 1-indexed = col 5)
+    nvim_case("hello world\n", 0, 6, "D", "hello \n", 0, 5);
+}
+
+#[test]
+fn test_nvim_y_big_yank_line() {
+    // Y yanks entire line (linewise), same as yy
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("Y");
+    let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
+    assert_eq!(content, "hello world\n");
+    assert!(is_lw, "Y should be linewise");
+}
+
+#[test]
+#[ignore = "vim deviation: gJ cursor position wrong (col 0 instead of join point)"]
+fn test_nvim_gj_join_no_space() {
+    // gJ joins without space. Neovim: cursor at col 3 (join point). VimCode: col 0.
+    nvim_case("aaa\nbbb\n", 0, 0, "gJ", "aaabbb\n", 0, 3);
+}
+
+// ── Phase 4 Batch 5: Ex commands ────────────────────────────────────────
+
+#[test]
+#[ignore = "vim deviation: :2d (ex delete with line number) not implemented"]
+fn test_nvim_ex_delete_line() {
+    // :2d should delete line 2. VimCode: no-op.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.execute_command("2d");
+    assert_eq!(engine.buffer().to_string(), "aaa\nccc\n");
+}
+
+#[test]
+fn test_nvim_ex_substitute() {
+    // :s/foo/bar/ replaces first occurrence on current line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo baz foo\n");
+    engine.update_syntax();
+    engine.execute_command("s/foo/bar/");
+    assert_eq!(engine.buffer().to_string(), "bar baz foo\n");
+}
+
+#[test]
+fn test_nvim_ex_substitute_global() {
+    // :s/foo/bar/g replaces all occurrences on current line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo baz foo\n");
+    engine.update_syntax();
+    engine.execute_command("s/foo/bar/g");
+    assert_eq!(engine.buffer().to_string(), "bar baz bar\n");
+}
+
+#[test]
+fn test_nvim_ex_percent_substitute() {
+    // :%s/foo/bar/g replaces in entire buffer
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo\nbar\nfoo\n");
+    engine.update_syntax();
+    engine.execute_command("%s/foo/bar/g");
+    assert_eq!(engine.buffer().to_string(), "bar\nbar\nbar\n");
+}
