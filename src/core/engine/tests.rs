@@ -20709,3 +20709,327 @@ fn test_matrix_dot_repeat_preserves_count() {
     send_keys(&mut engine, "3dd.");
     assert_eq!(engine.buffer().to_string(), "g");
 }
+
+// ============================================================================
+// Phase 2: `:set` Option Audit
+// Every configurable option should have an observable effect.
+// ============================================================================
+
+#[test]
+fn test_set_option_round_trip() {
+    // Verify every setting can be set and read back via set_value_str/get_value_str.
+    let mut engine = Engine::new();
+    let cases: &[(&str, &str)] = &[
+        ("tabstop", "8"),
+        ("shift_width", "2"),
+        ("expand_tab", "false"),
+        ("auto_indent", "false"),
+        ("wrap", "false"),
+        ("scrolloff", "10"),
+        ("textwidth", "100"),
+        ("hlsearch", "false"),
+        ("ignorecase", "true"),
+        ("smartcase", "true"),
+        ("incremental_search", "false"),
+        ("splitbelow", "true"),
+        ("splitright", "true"),
+        ("autoread", "true"),
+        ("swap_file", "false"),
+        ("updatetime", "2000"),
+        ("hover_delay", "500"),
+        ("match_brackets", "false"),
+        ("auto_pairs", "true"),
+        ("colorcolumn", "80,120"),
+        ("colorscheme", "gruvbox-dark"),
+        ("font_size", "16"),
+        ("spelllang", "en_GB"),
+        ("ai_provider", "openai"),
+        ("ai_model", "gpt-4"),
+        ("ctrl_f_action", "page_down"),
+        ("hide_single_tab", "true"),
+        ("breadcrumbs", "false"),
+        ("indent_guides", "false"),
+        ("terminal_scrollback_lines", "5000"),
+        ("show_hidden_files", "true"),
+        ("explorer_sort_case_insensitive", "true"),
+        ("autohide_panels", "true"),
+    ];
+
+    for &(key, value) in cases {
+        let result = engine.settings.set_value_str(key, value);
+        assert!(
+            result.is_ok(),
+            "set_value_str({key}, {value}) failed: {result:?}"
+        );
+        let readback = engine.settings.get_value_str(key);
+        assert_eq!(
+            readback, value,
+            "round-trip failed for {key}: set {value}, got {readback}"
+        );
+    }
+}
+
+#[test]
+fn test_set_option_tabstop_behavior() {
+    // tabstop affects how Tab characters are rendered (column width)
+    let mut engine = Engine::new();
+    engine.settings.tabstop = 8;
+    assert_eq!(engine.settings.tabstop, 8);
+    engine.settings.tabstop = 2;
+    assert_eq!(engine.settings.tabstop, 2);
+}
+
+#[test]
+fn test_set_option_expand_tab_behavior() {
+    // expand_tab: Tab key inserts spaces instead of \t
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "");
+    engine.update_syntax();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+
+    // Enter insert mode and press Tab
+    send_keys(&mut engine, "i<Tab><Esc>");
+    let content = engine.buffer().to_string();
+    assert!(
+        !content.contains('\t'),
+        "expand_tab=true should insert spaces, got: {content:?}"
+    );
+    assert!(
+        content.contains("    "),
+        "expand_tab=true should insert 4 spaces"
+    );
+}
+
+#[test]
+fn test_set_option_expand_tab_false() {
+    // expand_tab=false: Tab key inserts \t
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "");
+    engine.update_syntax();
+    engine.settings.expand_tab = false;
+
+    send_keys(&mut engine, "i<Tab><Esc>");
+    let content = engine.buffer().to_string();
+    assert!(
+        content.contains('\t'),
+        "expand_tab=false should insert tab char, got: {content:?}"
+    );
+}
+
+#[test]
+fn test_set_option_shift_width_behavior() {
+    // shift_width controls >> indent amount
+    let mut engine = setup_engine("hello", 0, 0);
+    engine.settings.shift_width = 2;
+    engine.settings.expand_tab = true;
+    send_keys(&mut engine, ">>");
+    assert_eq!(engine.buffer().to_string(), "  hello");
+
+    let mut engine = setup_engine("hello", 0, 0);
+    engine.settings.shift_width = 8;
+    engine.settings.expand_tab = true;
+    send_keys(&mut engine, ">>");
+    assert_eq!(engine.buffer().to_string(), "        hello");
+}
+
+#[test]
+fn test_set_option_ignorecase_behavior() {
+    // ignorecase affects search matching
+    let mut engine = setup_engine("Hello World hello world", 0, 0);
+    engine.settings.ignorecase = true;
+    engine.settings.smartcase = false;
+
+    // Search for "hello" — should match both "Hello" and "hello"
+    type_command(&mut engine, "set ignorecase");
+    send_keys(&mut engine, "/hello<CR>");
+    assert!(
+        engine.search_matches.len() >= 2,
+        "ignorecase should match both cases: found {} matches",
+        engine.search_matches.len()
+    );
+}
+
+#[test]
+fn test_set_option_ignorecase_false() {
+    let mut engine = setup_engine("Hello World hello world", 0, 0);
+    engine.settings.ignorecase = false;
+    engine.settings.smartcase = false;
+
+    send_keys(&mut engine, "/hello<CR>");
+    // Should match only lowercase "hello"
+    assert!(
+        engine.search_matches.len() <= 1,
+        "noignorecase should match case-sensitively: found {} matches",
+        engine.search_matches.len()
+    );
+}
+
+#[test]
+fn test_set_option_smartcase_behavior() {
+    // smartcase: case-insensitive search unless the query contains uppercase
+    let mut engine = setup_engine("Hello World hello world", 0, 0);
+    engine.settings.ignorecase = true;
+    engine.settings.smartcase = true;
+
+    // Lowercase query — matches case-insensitively
+    send_keys(&mut engine, "/hello<CR>");
+    let all_case_matches = engine.search_matches.len();
+
+    // Uppercase query — should match only "Hello"
+    send_keys(&mut engine, "/Hello<CR>");
+    let case_sensitive_matches = engine.search_matches.len();
+
+    assert!(
+        all_case_matches >= 2,
+        "smartcase lowercase query should be case-insensitive"
+    );
+    assert!(
+        case_sensitive_matches <= 1,
+        "smartcase uppercase query should be case-sensitive"
+    );
+}
+
+#[test]
+fn test_set_option_scrolloff_behavior() {
+    // scrolloff keeps N lines visible above/below cursor when scrolling
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..100 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.update_syntax();
+    engine.settings.scrolloff = 5;
+
+    // Move to line 50 — scroll_top should keep 5 lines above cursor visible
+    engine.view_mut().cursor.line = 50;
+    engine.ensure_cursor_visible();
+    let scroll_top = engine.view().scroll_top;
+    // Cursor should not be within scrolloff of scroll_top
+    assert!(
+        engine.view().cursor.line >= scroll_top + 5,
+        "scrolloff=5: cursor at line 50 should have >= 5 lines above viewport top ({scroll_top})"
+    );
+}
+
+#[test]
+fn test_set_option_splitbelow_behavior() {
+    // splitbelow: :split puts new window below current
+    let mut engine = setup_engine("hello", 0, 0);
+    engine.settings.splitbelow = true;
+    engine.execute_command("split");
+    // Should have 2 windows now
+    assert!(engine.windows.len() >= 2, "split should create 2 windows");
+}
+
+#[test]
+fn test_set_option_splitright_behavior() {
+    // splitright: :vsplit puts new window to the right
+    let mut engine = setup_engine("hello", 0, 0);
+    engine.settings.splitright = true;
+    engine.execute_command("vsplit");
+    assert!(engine.windows.len() >= 2, "vsplit should create 2 windows");
+}
+
+#[test]
+fn test_set_option_auto_pairs_behavior() {
+    // auto_pairs: typing ( inserts () with cursor between
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "");
+    engine.update_syntax();
+    engine.settings.auto_pairs = true;
+
+    send_keys(&mut engine, "i(<Esc>");
+    let content = engine.buffer().to_string();
+    assert_eq!(content, "()", "auto_pairs should insert matching paren");
+}
+
+#[test]
+fn test_set_option_auto_pairs_disabled() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "");
+    engine.update_syntax();
+    engine.settings.auto_pairs = false;
+
+    send_keys(&mut engine, "i(<Esc>");
+    let content = engine.buffer().to_string();
+    assert_eq!(content, "(", "auto_pairs=false should not auto-close");
+}
+
+#[test]
+fn test_set_option_hlsearch_behavior() {
+    // hlsearch: search matches are highlighted (search_matches populated)
+    let mut engine = setup_engine("hello world hello", 0, 0);
+    engine.settings.hlsearch = true;
+
+    send_keys(&mut engine, "/hello<CR>");
+    assert!(
+        !engine.search_matches.is_empty(),
+        "hlsearch=true should populate search_matches"
+    );
+}
+
+#[test]
+fn test_set_option_wrap_behavior() {
+    // wrap affects the view's wrap state
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    assert!(engine.settings.wrap);
+    engine.settings.wrap = false;
+    assert!(!engine.settings.wrap);
+}
+
+#[test]
+fn test_set_via_ex_command() {
+    // Verify :set command dispatches to settings correctly
+    let mut engine = Engine::new();
+
+    // Boolean toggles
+    type_command(&mut engine, "set ignorecase");
+    assert!(engine.settings.ignorecase, ":set ignorecase should enable");
+
+    type_command(&mut engine, "set noignorecase");
+    assert!(
+        !engine.settings.ignorecase,
+        ":set noignorecase should disable"
+    );
+
+    // Value assignment
+    type_command(&mut engine, "set tabstop=8");
+    assert_eq!(engine.settings.tabstop, 8, ":set tabstop=8 should work");
+
+    type_command(&mut engine, "set shiftwidth=2");
+    assert_eq!(engine.settings.shift_width, 2);
+
+    type_command(&mut engine, "set scrolloff=10");
+    assert_eq!(engine.settings.scrolloff, 10);
+
+    type_command(&mut engine, "set textwidth=80");
+    assert_eq!(engine.settings.textwidth, 80);
+}
+
+#[test]
+fn test_set_query_shows_value() {
+    // :set option? should show current value in message
+    let mut engine = Engine::new();
+    engine.settings.tabstop = 4;
+    engine.execute_command("set tabstop?");
+    assert!(
+        engine.message.contains("4"),
+        ":set tabstop? should show value: got {}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_set_invalid_option_error() {
+    // :set with unknown option should produce error message
+    let mut engine = Engine::new();
+    engine.execute_command("set nonexistent_option=42");
+    assert!(
+        engine.message.contains("Unknown") || engine.message.contains("unknown"),
+        "unknown option should show error: got {}",
+        engine.message
+    );
+}
