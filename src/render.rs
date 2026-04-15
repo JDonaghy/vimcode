@@ -299,6 +299,9 @@ pub struct RenderedLine {
     /// Column positions where indent guide lines should be drawn.
     /// Empty when `indent_guides` setting is off.
     pub indent_guides: Vec<usize>,
+    /// Column positions where colorcolumn background should be drawn.
+    /// Parsed from `settings.colorcolumn` (e.g. "80,120").
+    pub colorcolumns: Vec<usize>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -2772,6 +2775,9 @@ pub struct Theme {
     pub indent_guide_fg: Color,
     pub indent_guide_active_fg: Color,
 
+    // Color column (`:set colorcolumn=80`)
+    pub colorcolumn_bg: Color,
+
     // Bracket match highlight
     pub bracket_match_bg: Color,
 
@@ -2966,6 +2972,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#606060"),
+            colorcolumn_bg: Color::from_hex("#2c313a"),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
@@ -3114,6 +3121,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#3c3836"),
             indent_guide_active_fg: Color::from_hex("#504945"),
+            colorcolumn_bg: Color::from_hex("#32302f"),
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
@@ -3262,6 +3270,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#292e42"),
             indent_guide_active_fg: Color::from_hex("#3b4261"),
+            colorcolumn_bg: Color::from_hex("#292e42"),
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
@@ -3410,6 +3419,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#073642"),
             indent_guide_active_fg: Color::from_hex("#0d4a5a"),
+            colorcolumn_bg: Color::from_hex("#073642"),
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
@@ -3558,6 +3568,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#707070"),
+            colorcolumn_bg: Color::from_hex("#1e1e1e").lighten(0.03),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
@@ -3705,6 +3716,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#d3d3d3"),
             indent_guide_active_fg: Color::from_hex("#939393"),
+            colorcolumn_bg: Color::from_hex("#e8e8e8"),
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
@@ -3830,6 +3842,9 @@ impl Theme {
         // ── Cursor line highlight ─────────────────────────────────────────
         if let Some(c) = color("editor.lineHighlightBackground") {
             theme.cursorline_bg = c;
+        }
+        if let Some(c) = color("editorRuler.foreground") {
+            theme.colorcolumn_bg = c;
         }
 
         // ── Search ────────────────────────────────────────────────────────
@@ -6142,6 +6157,7 @@ fn build_rendered_window(
                     folded_line_count: 0,
                     is_ghost_continuation: false,
                     indent_guides: vec![],
+                    colorcolumns: vec![],
                 });
                 aligned_idx += 1;
             }
@@ -6398,6 +6414,7 @@ fn build_rendered_window(
                     },
                     is_ghost_continuation: false,
                     indent_guides: Vec::new(), // filled below
+                    colorcolumns: Vec::new(),  // filled below
                 });
 
                 // After the cursor segment, insert ghost continuation rows.
@@ -6427,6 +6444,7 @@ fn build_rendered_window(
                             ghost_suffix: Some(cont.clone()),
                             is_ghost_continuation: true,
                             indent_guides: Vec::new(),
+                            colorcolumns: Vec::new(),
                         });
                     }
                 }
@@ -6462,6 +6480,7 @@ fn build_rendered_window(
                 },
                 is_ghost_continuation: false,
                 indent_guides: Vec::new(), // filled below
+                colorcolumns: Vec::new(),  // filled below
             });
 
             // After the cursor line, insert ghost continuation rows.
@@ -6492,6 +6511,7 @@ fn build_rendered_window(
                         ghost_suffix: Some(cont.clone()),
                         is_ghost_continuation: true,
                         indent_guides: Vec::new(),
+                        colorcolumns: Vec::new(),
                     });
                 }
             }
@@ -6655,6 +6675,14 @@ fn build_rendered_window(
                 col += tabstop;
             }
             line.indent_guides = guides;
+        }
+    }
+
+    // ── Color columns ──────────────────────────────────────────────────────
+    let cc_positions = engine.settings.colorcolumn_positions();
+    if !cc_positions.is_empty() {
+        for line in lines.iter_mut() {
+            line.colorcolumns = cc_positions.clone();
         }
     }
 

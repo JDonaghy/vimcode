@@ -2852,6 +2852,25 @@ pub(super) fn render_window(
             }
         }
 
+        // Color columns: tint background at specified column positions
+        if !line.colorcolumns.is_empty() {
+            let cc_bg = rc(theme.colorcolumn_bg);
+            for &cc_col in &line.colorcolumns {
+                if cc_col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (cc_col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
+                    cell.set_bg(cc_bg);
+                }
+            }
+        }
+
         // Ghost continuation lines — draw full line in ghost colour.
         if line.is_ghost_continuation {
             if let Some(ghost) = &line.ghost_suffix {

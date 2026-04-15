@@ -868,6 +868,41 @@ impl Settings {
         Ok(arg.to_string())
     }
 
+    /// Parse the `colorcolumn` string into a sorted, deduplicated list of column numbers.
+    /// Supports: `"80"`, `"80,120"`, `"+1"` (textwidth + 1), `"-2"` (textwidth - 2).
+    pub fn colorcolumn_positions(&self) -> Vec<usize> {
+        if self.colorcolumn.is_empty() {
+            return Vec::new();
+        }
+        let mut cols: Vec<usize> = Vec::new();
+        for part in self.colorcolumn.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(offset_str) = part.strip_prefix('+') {
+                if let Ok(offset) = offset_str.parse::<usize>() {
+                    if self.textwidth > 0 {
+                        cols.push(self.textwidth + offset);
+                    }
+                }
+            } else if let Some(offset_str) = part.strip_prefix('-') {
+                if let Ok(offset) = offset_str.parse::<usize>() {
+                    if self.textwidth > offset {
+                        cols.push(self.textwidth - offset);
+                    }
+                }
+            } else if let Ok(col) = part.parse::<usize>() {
+                if col > 0 {
+                    cols.push(col);
+                }
+            }
+        }
+        cols.sort_unstable();
+        cols.dedup();
+        cols
+    }
+
     /// Return a compact one-line summary of all current settings.
     /// Shown when the user types `:set` with no arguments.
     pub fn display_all(&self) -> String {

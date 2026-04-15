@@ -582,6 +582,20 @@ impl<'a> DrawContext<'a> {
                 }
             }
 
+            // Color columns (scrolled with text)
+            if !line.colorcolumns.is_empty() {
+                let cc_brush = self.solid_brush(self.theme.colorcolumn_bg);
+                for &cc_col in &line.colorcolumns {
+                    let cx = text_x + cc_col as f32 * self.char_width;
+                    unsafe {
+                        self.rt.FillRectangle(
+                            &rect_f(cx, line_y, self.char_width, self.line_height),
+                            &cc_brush,
+                        );
+                    }
+                }
+            }
+
             // Ghost text (scrolled with text)
             if let Some(ref ghost) = line.ghost_suffix {
                 let text_len = line.raw_text.trim_end_matches('\n').chars().count();

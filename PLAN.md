@@ -244,6 +244,13 @@
 - [x] **Win-GUI: load bundled Nerd Font via DirectWrite** — Bundled `vimcode-icons.ttf` installed to `%LOCALAPPDATA%\Microsoft\Windows\Fonts\` (per-user, no admin) with registry entry at `HKCU\...\Fonts`. `icon_text_format` tries "Symbols Nerd Font" first, falls back to Segoe MDL2/Fluent. Activity bar and ext panel icons render native Nerd Font glyphs using `icons::` constants (matching GTK). Added `Win32_System_Registry` + `Win32_Security` Cargo features.
 - [x] **Phase 2c source-code verification** — `test_wingui_source_contains_required_calls` reads Win-GUI source files and greps for 26 required engine method calls (one per `UiAction` variant). Fails if any required call is missing. Uses `CARGO_MANIFEST_DIR` for stable paths across test binaries.
 
+### Vim Conformance & Gap Detection
+- [ ] **`:set` option audit** — Systematic test verifying every `:set` option has an observable effect. For each setting: set it to a non-default value, then assert something changed (a field, render output, or behavior). Catches "dead settings" like colorcolumn was. Preliminary audit found only colorcolumn dead; this would be the comprehensive version.
+- [ ] **Operator × motion matrix** — Generate and test a matrix of ~15 operators (`d`, `c`, `y`, `>`, `<`, `gq`, `=`, etc.) × ~40 motions (`w`, `e`, `b`, `0`, `$`, `gg`, `G`, `{`, `}`, `f`, `t`, `%`, etc.) × count × `.` repeat. Each test: start with known buffer, apply operator+motion, assert buffer content + cursor position + register content. Catches composition bugs like the `4x` + `.` repeat bug.
+- [ ] **Mine Neovim/Vim test suites for edge cases** — Neovim's `test/functional/` and Vim's `src/testdir/` contain hundreds of behavioral tests. Translate the most relevant ones (operators, motions, text objects, registers, undo, visual mode) into Rust integration tests. Focus on areas we already implement.
+- [ ] **`:help` coverage audit** — Walk Vim's documentation section by section, tag each feature as: implemented, partially implemented, not implemented, or intentionally skipped. Produce a coverage report. Focus on Normal mode commands, ex commands, and options.
+- [ ] **Automated buffer fuzzing** — Generate random key sequences, run in both Vim (headless) and VimCode engine, compare resulting buffer content and cursor position. Effective at finding edge cases in obscure key combinations.
+
 ### Robustness (Low Priority)
 - [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness
 

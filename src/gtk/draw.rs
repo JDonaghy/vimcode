@@ -1485,6 +1485,17 @@ pub(super) fn draw_window(
             }
         }
 
+        // Color columns: tinted background rectangle at each column
+        if !rl.colorcolumns.is_empty() {
+            let (cr2, cg, cb) = theme.colorcolumn_bg.to_cairo();
+            cr.set_source_rgb(cr2, cg, cb);
+            for &cc_col in &rl.colorcolumns {
+                let cx = text_x_offset + cc_col as f64 * char_width;
+                cr.rectangle(cx, y, char_width, line_height);
+                cr.fill().ok();
+            }
+        }
+
         // Bracket match highlighting
         for &(bm_view_line, bm_col) in &rw.bracket_match_positions {
             if bm_view_line == view_idx {

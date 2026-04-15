@@ -19392,3 +19392,78 @@ fn test_dd_then_dot_repeat() {
     press_char(&mut engine, '.');
     assert_eq!(engine.buffer().content.to_string(), "line5\n");
 }
+
+// ─── Colorcolumn parsing tests ───────────────────────────────────────────────
+
+#[test]
+fn test_colorcolumn_positions_single() {
+    let mut settings = Settings::default();
+    settings.colorcolumn = "80".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![80]);
+}
+
+#[test]
+fn test_colorcolumn_positions_multiple() {
+    let mut settings = Settings::default();
+    settings.colorcolumn = "80,120".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![80, 120]);
+}
+
+#[test]
+fn test_colorcolumn_positions_relative_plus() {
+    let mut settings = Settings::default();
+    settings.textwidth = 80;
+    settings.colorcolumn = "+1".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![81]);
+}
+
+#[test]
+fn test_colorcolumn_positions_relative_minus() {
+    let mut settings = Settings::default();
+    settings.textwidth = 80;
+    settings.colorcolumn = "-2".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![78]);
+}
+
+#[test]
+fn test_colorcolumn_positions_mixed() {
+    let mut settings = Settings::default();
+    settings.textwidth = 80;
+    settings.colorcolumn = "100,+1,72".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![72, 81, 100]);
+}
+
+#[test]
+fn test_colorcolumn_positions_empty() {
+    let settings = Settings::default();
+    assert_eq!(settings.colorcolumn_positions(), Vec::<usize>::new());
+}
+
+#[test]
+fn test_colorcolumn_positions_dedup() {
+    let mut settings = Settings::default();
+    settings.colorcolumn = "80,80,80".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![80]);
+}
+
+#[test]
+fn test_colorcolumn_positions_zero_ignored() {
+    let mut settings = Settings::default();
+    settings.colorcolumn = "0,80".to_string();
+    assert_eq!(settings.colorcolumn_positions(), vec![80]);
+}
+
+#[test]
+fn test_set_colorcolumn_stores_value() {
+    let mut engine = Engine::new();
+    engine.execute_command("set cc=80,120");
+    assert_eq!(engine.settings.colorcolumn, "80,120");
+}
+
+#[test]
+fn test_set_colorcolumn_query() {
+    let mut engine = Engine::new();
+    engine.settings.colorcolumn = "80".to_string();
+    engine.execute_command("set cc?");
+    assert_eq!(engine.message, "colorcolumn=80");
+}
