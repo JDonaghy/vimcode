@@ -22834,3 +22834,200 @@ fn test_nvim_ex_percent_substitute() {
     engine.execute_command("%s/foo/bar/g");
     assert_eq!(engine.buffer().to_string(), "bar\nbar\nbar\n");
 }
+
+// ── Phase 4 Batch 6: Jump list and special marks ────────────────────────
+
+#[test]
+fn test_nvim_ctrl_o_jump_back() {
+    // G then gg then Ctrl-O should jump back to last line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd\neee\n");
+    engine.update_syntax();
+    engine.feed_keys("G"); // jump to line 4
+    engine.feed_keys("gg"); // jump to line 0
+    engine.feed_keys("<C-o>"); // jump back to line 4
+    assert_eq!(engine.view().cursor.line, 4);
+}
+
+#[test]
+fn test_nvim_double_quote_jump_previous() {
+    // '' jumps to previous context (like Ctrl-O for line)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd\neee\n");
+    engine.update_syntax();
+    engine.feed_keys("G");
+    engine.feed_keys("gg");
+    engine.feed_keys("''");
+    assert_eq!(engine.view().cursor.line, 4);
+}
+
+// ── Phase 4 Batch 6: Text object edge cases ─────────────────────────────
+
+#[test]
+fn test_nvim_di_paren_empty() {
+    // di( on "()" is a no-op (nothing inside)
+    nvim_case("()\n", 0, 0, "di(", "()\n", 0, 0);
+}
+
+#[test]
+#[ignore = "vim deviation: ci( on empty parens is no-op instead of entering insert"]
+fn test_nvim_ci_paren_empty() {
+    // ci( on "()" should enter insert between parens. VimCode: no-op.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "()\n");
+    engine.update_syntax();
+    engine.feed_keys("ci(XX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "(XX)\n");
+}
+
+#[test]
+fn test_nvim_da_paren_nested_from_inner() {
+    // da( with cursor on 'c' inside inner parens: deletes inner "(c)"
+    nvim_case("a(b(c)d)e\n", 0, 4, "da(", "a(bd)e\n", 0, 3);
+}
+
+#[test]
+fn test_nvim_di_quote_empty() {
+    // di" on empty quotes "" is a no-op
+    nvim_case("say \"\" end\n", 0, 4, "di\"", "say \"\" end\n", 0, 4);
+}
+
+// ── Phase 4 Batch 6: J edge cases ───────────────────────────────────────
+
+#[test]
+#[ignore = "vim deviation: J cursor position wrong (see #73)"]
+fn test_nvim_j_join_strips_indent() {
+    // J strips leading whitespace from second line. Cursor at join point.
+    nvim_case("aaa\n   bbb\n", 0, 0, "J", "aaa bbb\n", 0, 3);
+}
+
+#[test]
+#[ignore = "vim deviation: J adds extra space when line already has trailing space"]
+fn test_nvim_j_join_trailing_space() {
+    // J on line with trailing spaces: Neovim doesn't add another space.
+    // VimCode adds one, giving "aaa    bbb" instead of "aaa   bbb".
+    nvim_case("aaa   \nbbb\n", 0, 0, "J", "aaa   bbb\n", 0, 5);
+}
+
+// ── Phase 4 Batch 6: Tilde at EOL ───────────────────────────────────────
+
+#[test]
+fn test_nvim_tilde_at_eol() {
+    // ~ on last char toggles it and cursor stays on last char
+    // Neovim: "abC", col 3 (1-indexed) = col 2. But cursor can't go past EOL
+    // in normal mode so stays at col 2.
+    nvim_case("abc\n", 0, 2, "~", "abC\n", 0, 2);
+}
+
+// ── Phase 4 Batch 6: Miscellaneous edge cases ───────────────────────────
+
+#[test]
+fn test_nvim_d_dollar_on_single_char_line() {
+    nvim_case("a\nbbb\n", 0, 0, "d$", "\nbbb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_yiw_includes_full_word() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2; // middle of "hello"
+    engine.feed_keys("yiw");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "hello");
+}
+
+#[test]
+fn test_nvim_yaw_includes_space() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world end\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 6; // on "world"
+    engine.feed_keys("yaw");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    // "a word" includes trailing space
+    assert_eq!(content, "world ");
+}
+
+#[test]
+#[ignore = "vim deviation: di{ on multiline braces collapses to single line"]
+fn test_nvim_di_brace_multiline() {
+    // di{ on multiline should leave "if {\n}\n". VimCode: "if {}\n" (single line).
+    nvim_case("if {\n  body\n}\n", 1, 0, "di{", "if {\n}\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_w_across_lines() {
+    // w at end of line moves to start of next line
+    nvim_case("aaa\nbbb\n", 0, 0, "w", "aaa\nbbb\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_b_across_lines() {
+    // b at start of line moves to start of last word on prev line
+    nvim_case("aaa bbb\nccc\n", 1, 0, "b", "aaa bbb\nccc\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_e_across_lines() {
+    // e at end of word on line goes to end of first word on next line
+    nvim_case("aaa\nbbb\n", 0, 2, "e", "aaa\nbbb\n", 1, 2);
+}
+
+#[test]
+fn test_nvim_cit_change_inner_tag() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "<div>hello</div>\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 5;
+    engine.feed_keys("citXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "<div>XX</div>\n");
+}
+
+#[test]
+fn test_nvim_2dd_deletes_two_lines() {
+    nvim_case("aaa\nbbb\nccc\nddd\n", 0, 0, "2dd", "ccc\nddd\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_5x_delete_clamped() {
+    // 5x on "abc" should delete only 3 chars (clamped to line length)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.feed_keys("5x");
+    let buf = engine.buffer().to_string();
+    assert!(
+        buf.is_empty() || buf == "\n",
+        "5x on 'abc' should leave empty line; got: {:?}",
+        buf
+    );
+}
+
+#[test]
+fn test_nvim_p_after_dd_linewise() {
+    // dd then p pastes the deleted line below
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    assert_eq!(engine.buffer().to_string(), "bbb\nccc\n");
+    engine.feed_keys("p");
+    assert_eq!(engine.buffer().to_string(), "bbb\naaa\nccc\n");
+}
+
+#[test]
+fn test_nvim_xp_swap_chars() {
+    // xp is the classic "swap two characters" idiom
+    nvim_case("abcd\n", 0, 1, "xp", "acbd\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_ddp_swap_lines() {
+    // ddp swaps current line with next
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("ddp");
+    assert_eq!(engine.buffer().to_string(), "bbb\naaa\nccc\n");
+}
