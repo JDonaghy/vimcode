@@ -1,6 +1,10 @@
 # Known Bugs
 
-- **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
+> **Bug tracking has moved to GitHub Issues.** Run `gh issue list --label bug --state open` to see all open bugs.
+> Vim conformance deviations: `gh issue list --label bug:vim-deviation --state open`
+> This file is kept for historical reference only — new bugs should be filed as GitHub issues.
+
+- **(Intermittent) TUI rendering artifacts** — See [#58](https://github.com/JDonaghy/vimcode/issues/58). Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
 - ~~**`x` with count + `.` repeat deletes too many characters**~~ — Fixed: `repeat_last_change()` was looping `final_count` times AND using `change.count` inside each iteration, causing `4x` then `.` to delete 4×4=16 chars. Fixed by removing the loop and using `final_count` directly for both `Motion::Right` (x) and `Motion::DeleteLine` (dd). 3 new tests.
 

@@ -28,7 +28,7 @@ All non-trivial work should be tracked via GitHub Issues. Issues are the source 
 After completing any feature or significant change, update ALL of these files:
 - **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
 - **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
-- **`PLAN.md`** — update recently completed section at top; tick off roadmap items
+- **GitHub Issues** — close completed issues, create new ones for planned work; update milestones as needed (PLAN.md archived — issues are the source of truth)
 - **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
 - **`SUMMARIES/`** — update any summary file whose source file was modified (new methods, changed types, significant line count changes); see below
 
