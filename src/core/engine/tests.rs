@@ -21069,3 +21069,157 @@ fn test_set_invalid_option_error() {
         engine.message
     );
 }
+
+#[test]
+fn test_3yy_P_pastes_above_line_not_inline() {
+    // Issue #64: 3yy then P with cursor mid-line should paste 3 lines above,
+    // not insert into the middle of the current line.
+    let mut engine = engine_with_text("aaa\nbbb\nccc\nddd\neee\n");
+    // Yank first 3 lines (aaa, bbb, ccc)
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'y');
+    press_char(&mut engine, 'y');
+
+    // Verify register is linewise
+    let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
+    assert_eq!(content, "aaa\nbbb\nccc\n");
+    assert!(is_lw, "3yy should set is_linewise=true");
+
+    // Move to line 3 (ddd), col 1 (middle of line)
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'l');
+    assert_eq!(engine.view().cursor.line, 3, "should be on line 3");
+    assert_eq!(engine.view().cursor.col, 1, "should be at col 1");
+
+    // P — paste before (above) as whole lines
+    press_char(&mut engine, 'P');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "aaa\nbbb\nccc\naaa\nbbb\nccc\nddd\neee\n",
+        "3yy then P should paste 3 lines above 'ddd', not into the middle of it"
+    );
+    // Cursor should be on first pasted line (line 3), col 0
+    assert_eq!(engine.view().cursor.line, 3, "cursor on first pasted line");
+    assert_eq!(engine.view().cursor.col, 0, "cursor at col 0");
+}
+
+#[test]
+fn test_3yy_p_pastes_below_line_not_inline() {
+    // Same as above but for p (paste after/below).
+    let mut engine = engine_with_text("aaa\nbbb\nccc\nddd\neee\n");
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'y');
+    press_char(&mut engine, 'y');
+
+    // Move to line 3 (ddd), col 1
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'l');
+
+    // p — paste after (below) as whole lines
+    press_char(&mut engine, 'p');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "aaa\nbbb\nccc\nddd\naaa\nbbb\nccc\neee\n",
+        "3yy then p should paste 3 lines below 'ddd', not into the middle of it"
+    );
+    assert_eq!(engine.view().cursor.line, 4, "cursor on first pasted line");
+    assert_eq!(engine.view().cursor.col, 0, "cursor at col 0");
+}
+
+#[test]
+fn test_3yy_P_via_clipboard_intercept_pastes_linewise() {
+    // Issue #64: Simulate the real backend flow where load_clipboard_for_paste
+    // is called before P. The linewise flag must survive the clipboard round-trip.
+    let mut engine = engine_with_text("aaa\nbbb\nccc\nddd\neee\n");
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'y');
+    press_char(&mut engine, 'y');
+
+    let clipboard_text = engine.registers.get(&'"').unwrap().0.clone();
+
+    // Move to line 3 (ddd), col 1
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'l');
+
+    // Simulate backend clipboard intercept before P
+    engine.load_clipboard_for_paste(clipboard_text);
+    press_char(&mut engine, 'P');
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "aaa\nbbb\nccc\naaa\nbbb\nccc\nddd\neee\n",
+        "P via clipboard intercept should paste linewise above 'ddd'"
+    );
+    assert_eq!(engine.view().cursor.line, 3, "cursor on first pasted line");
+    assert_eq!(engine.view().cursor.col, 0, "cursor at col 0");
+}
+
+#[test]
+fn test_3yy_P_via_clipboard_crlf_round_trip() {
+    // Issue #64: On Windows, Get-Clipboard returns \r\n and may strip the
+    // trailing newline. The linewise flag must still be preserved.
+    let mut engine = engine_with_text("aaa\nbbb\nccc\nddd\neee\n");
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'y');
+    press_char(&mut engine, 'y');
+
+    // Register has "aaa\nbbb\nccc\n" with is_linewise=true
+    let (reg, lw) = engine.registers.get(&'"').unwrap().clone();
+    assert_eq!(reg, "aaa\nbbb\nccc\n");
+    assert!(lw);
+
+    // Simulate Windows clipboard round-trip: \r\n line endings, trailing \r\n stripped
+    engine.load_clipboard_for_paste("aaa\r\nbbb\r\nccc".to_string());
+
+    // The " register should have normalized LF text with trailing \n restored
+    let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
+    assert_eq!(
+        content, "aaa\nbbb\nccc\n",
+        "CRLF should be normalized to LF with trailing newline"
+    );
+    assert!(
+        is_lw,
+        "is_linewise should survive CRLF clipboard round-trip"
+    );
+
+    // Move to line 3 (ddd), col 1
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'l');
+
+    // Now reload clipboard and paste (simulating the actual P intercept)
+    engine.load_clipboard_for_paste("aaa\r\nbbb\r\nccc".to_string());
+    press_char(&mut engine, 'P');
+
+    // Linewise paste should insert above 'ddd', not inline
+    assert_eq!(
+        engine.buffer().to_string(),
+        "aaa\nbbb\nccc\naaa\nbbb\nccc\nddd\neee\n",
+        "P via CRLF clipboard should paste linewise above 'ddd'"
+    );
+    assert_eq!(engine.view().cursor.line, 3, "cursor on first pasted line");
+    assert_eq!(engine.view().cursor.col, 0, "cursor at col 0");
+}
+
+#[test]
+fn test_load_clipboard_foreign_content_not_linewise() {
+    // When clipboard content is from an external app (doesn't match register),
+    // is_linewise should be false even if register was linewise.
+    let mut engine = engine_with_text("aaa\nbbb\n");
+    press_char(&mut engine, 'y');
+    press_char(&mut engine, 'y');
+    assert!(engine.registers.get(&'"').unwrap().1, "should be linewise");
+
+    engine.load_clipboard_for_paste("completely different text".to_string());
+    let (_, is_lw) = engine.registers.get(&'"').unwrap();
+    assert!(!is_lw, "foreign clipboard content should not be linewise");
+}
