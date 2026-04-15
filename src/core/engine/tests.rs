@@ -19684,7 +19684,8 @@ fn test_matrix_delete_linewise_motions() {
             0,
             0,
         ),
-        // paragraph motions — Vim's } and { are exclusive: blank line boundary preserved
+        // paragraph motions — { and } are exclusive at the motion destination
+        // d}: cursor line included, target blank line excluded
         (
             "d}",
             "line one\n\nline three",
@@ -19695,28 +19696,39 @@ fn test_matrix_delete_linewise_motions() {
             0,
             0,
         ),
-        // d{ from line after blank: blank line preserved, cursor line + content deleted
+        // d{: destination (blank line) included, cursor line excluded
+        // Neovim: "line one\n\nline three" d{ from line 2 → "line one\nline three"
         (
             "d{",
             "line one\n\nline three",
             2,
             0,
             "d{",
-            "line one\n",
-            0,
+            "line one\nline three",
+            1,
             0,
         ),
-        // d{ with multiple lines after blank
-        ("d{_multi", "aaa\n\nbbb\nccc", 3, 0, "d{", "aaa\n", 0, 0),
-        // d} from blank line: blank line preserved, paragraph content deleted
+        // d{ multi-line: "aaa\n\nbbb\nccc\nddd" d{ from ddd → "aaa\nddd"
+        (
+            "d{_multi",
+            "aaa\n\nbbb\nccc\nddd",
+            4,
+            0,
+            "d{",
+            "aaa\nddd",
+            1,
+            0,
+        ),
+        // d} from blank line: blank line + content deleted, target blank excluded
+        // "aaa\n\nbbb\nccc\n\nddd" d} from line 1 → "aaa\n\nddd"
         (
             "d}_from_blank",
             "aaa\n\nbbb\nccc\n\nddd",
             1,
             0,
             "d}",
-            "aaa\n\n\nddd",
-            2,
+            "aaa\n\nddd",
+            1,
             0,
         ),
         // dd

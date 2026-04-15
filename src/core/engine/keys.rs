@@ -3325,9 +3325,10 @@ impl Engine {
             }
             Some('{') => {
                 // d{: delete backward to previous paragraph boundary (linewise).
-                // Vim's { is exclusive: the blank line boundary is preserved.
-                // Range: [target_line + 1, cursor_line] when target is blank,
-                //        [target_line, cursor_line] when target is BOF (line 0, not blank).
+                // { is exclusive: the destination (backward) is included but cursor
+                // line is excluded.  Range: [target_line, cursor_line - 1].
+                // Neovim example: "aaa\n\nbbb\nccc\nddd" cursor on ddd (line 4):
+                //   d{ → "aaa\nddd" (deletes blank + bbb + ccc, keeps cursor line)
                 let count = self.take_count();
                 let cursor_line = self.view().cursor.line;
                 for _ in 0..count {
@@ -3335,24 +3336,23 @@ impl Engine {
                 }
                 let target_line = self.view().cursor.line;
                 if target_line < cursor_line {
-                    let range_start = if self.is_line_empty(target_line) {
-                        target_line + 1
-                    } else {
-                        target_line
-                    };
-                    if range_start <= cursor_line {
-                        self.apply_linewise_operator(operator, range_start, cursor_line, changed);
-                    }
+                    self.apply_linewise_operator(
+                        operator,
+                        target_line,
+                        cursor_line.saturating_sub(1),
+                        changed,
+                    );
                 } else if target_line == cursor_line && target_line == 0 {
-                    // Already at top — delete current line
                     self.apply_linewise_operator(operator, cursor_line, cursor_line, changed);
                 }
             }
             Some('}') => {
                 // d}: delete forward to next paragraph boundary (linewise).
-                // Vim's } is exclusive: the target blank line is excluded.
-                // When cursor is on a blank line, skip it for the range start
-                // (the blank line between paragraphs is a boundary, not content).
+                // } is exclusive: cursor line is included but the destination
+                // (the blank line } lands on) is excluded.
+                // Range: [cursor_line, target_line - 1] when target is blank.
+                // Neovim example: "line one\n\nline three" cursor on line one:
+                //   d} → "\nline three" (deletes line one, keeps blank line)
                 let count = self.take_count();
                 let cursor_line = self.view().cursor.line;
                 for _ in 0..count {
@@ -3360,7 +3360,7 @@ impl Engine {
                 }
                 let target_line = self.view().cursor.line;
                 let last_line = self.buffer().len_lines().saturating_sub(1);
-                // Exclude target blank line (unless at EOF)
+                // Exclude target blank line, unless } hit EOF (last line)
                 let range_end = if target_line > cursor_line
                     && self.is_line_empty(target_line)
                     && target_line <= last_line
@@ -3369,13 +3369,8 @@ impl Engine {
                 } else {
                     target_line
                 };
-                // Skip blank lines at cursor for range start
-                let mut range_start = cursor_line;
-                while range_start < range_end && self.is_line_empty(range_start) {
-                    range_start += 1;
-                }
-                if range_start <= range_end {
-                    self.apply_linewise_operator(operator, range_start, range_end, changed);
+                if cursor_line <= range_end {
+                    self.apply_linewise_operator(operator, cursor_line, range_end, changed);
                 }
             }
             Some('(') => {
