@@ -19340,3 +19340,55 @@ fn test_visual_selection_prefills_find_replace() {
     assert!(engine.find_replace_open);
     assert_eq!(engine.find_replace_query, "world");
 }
+
+// ─── x with count + . repeat tests ──────────────────────────────────────────
+
+#[test]
+fn test_x_with_count_then_dot_repeat() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdefghijklmnop");
+
+    // 4x deletes "abcd", leaving "efghijklmnop"
+    engine.handle_key("4", Some('4'), false);
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().content.to_string(), "efghijklmnop");
+    assert_eq!(engine.view().cursor.col, 0);
+
+    // . repeats: deletes "efgh", leaving "ijklmnop"
+    press_char(&mut engine, '.');
+    assert_eq!(engine.buffer().content.to_string(), "ijklmnop");
+}
+
+#[test]
+fn test_x_with_count_then_dot_with_new_count() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdefghijklmnop");
+
+    // 4x deletes "abcd"
+    engine.handle_key("4", Some('4'), false);
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().content.to_string(), "efghijklmnop");
+
+    // 2. repeats with count 2: deletes "ef", leaving "ghijklmnop"
+    engine.handle_key("2", Some('2'), false);
+    press_char(&mut engine, '.');
+    assert_eq!(engine.buffer().content.to_string(), "ghijklmnop");
+}
+
+#[test]
+fn test_dd_then_dot_repeat() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "line1\nline2\nline3\nline4\nline5\n");
+
+    // 2dd deletes lines 1-2
+    engine.handle_key("2", Some('2'), false);
+    press_char(&mut engine, 'd');
+    press_char(&mut engine, 'd');
+    assert_eq!(engine.buffer().content.to_string(), "line3\nline4\nline5\n");
+
+    // . repeats: deletes lines 3-4
+    press_char(&mut engine, '.');
+    assert_eq!(engine.buffer().content.to_string(), "line5\n");
+}

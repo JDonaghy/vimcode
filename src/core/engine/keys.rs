@@ -6350,44 +6350,43 @@ impl Engine {
                 *changed = true;
             }
             ChangeOp::Delete => {
-                // Repeat delete with motion
+                // Repeat delete with motion — use final_count (not change.count)
+                // so that `4x` then `.` deletes 4 chars, and `2.` deletes 2 chars.
                 if let Some(motion) = &change.motion {
-                    for _ in 0..final_count {
-                        self.start_undo_group();
-                        match motion {
-                            Motion::Right => {
-                                // Delete character(s) at cursor (like x)
-                                let line = self.view().cursor.line;
-                                let col = self.view().cursor.col;
-                                let char_idx = self.buffer().line_to_char(line) + col;
-                                let line_end = self.buffer().line_to_char(line)
-                                    + self.buffer().line_len_chars(line);
-                                let available = line_end - char_idx;
-                                let to_delete = change.count.min(available);
+                    self.start_undo_group();
+                    match motion {
+                        Motion::Right => {
+                            // Delete character(s) at cursor (like x)
+                            let line = self.view().cursor.line;
+                            let col = self.view().cursor.col;
+                            let char_idx = self.buffer().line_to_char(line) + col;
+                            let line_end = self.buffer().line_to_char(line)
+                                + self.buffer().line_len_chars(line);
+                            let available = line_end - char_idx;
+                            let to_delete = final_count.min(available);
 
-                                if to_delete > 0 && char_idx < self.buffer().len_chars() {
-                                    let deleted_chars: String = self
-                                        .buffer()
-                                        .content
-                                        .slice(char_idx..char_idx + to_delete)
-                                        .chars()
-                                        .collect();
-                                    let reg = self.active_register();
-                                    self.set_register(reg, deleted_chars, false);
-                                    self.clear_selected_register();
-                                    self.delete_with_undo(char_idx, char_idx + to_delete);
-                                    self.clamp_cursor_col();
-                                    *changed = true;
-                                }
+                            if to_delete > 0 && char_idx < self.buffer().len_chars() {
+                                let deleted_chars: String = self
+                                    .buffer()
+                                    .content
+                                    .slice(char_idx..char_idx + to_delete)
+                                    .chars()
+                                    .collect();
+                                let reg = self.active_register();
+                                self.set_register(reg, deleted_chars, false);
+                                self.clear_selected_register();
+                                self.delete_with_undo(char_idx, char_idx + to_delete);
+                                self.clamp_cursor_col();
+                                *changed = true;
                             }
-                            Motion::DeleteLine => {
-                                // Repeat dd
-                                self.delete_lines(change.count, changed);
-                            }
-                            _ => {}
                         }
-                        self.finish_undo_group();
+                        Motion::DeleteLine => {
+                            // Repeat dd
+                            self.delete_lines(final_count, changed);
+                        }
+                        _ => {}
                     }
+                    self.finish_undo_group();
                 }
             }
             ChangeOp::Change => {

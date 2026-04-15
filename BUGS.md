@@ -2,7 +2,7 @@
 
 - **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
 
-- **`x` with count + `.` repeat deletes too many characters** — Using `4x` to delete four characters, then moving to the next line and pressing `.` to repeat deletes more than four characters. The repeat count is not being preserved or restored correctly for the `x` command.
+- ~~**`x` with count + `.` repeat deletes too many characters**~~ — Fixed: `repeat_last_change()` was looping `final_count` times AND using `change.count` inside each iteration, causing `4x` then `.` to delete 4×4=16 chars. Fixed by removing the loop and using `final_count` directly for both `Motion::Right` (x) and `Motion::DeleteLine` (dd). 3 new tests.
 
 - **Git panel operations have no progress indicator** — Commit, push, and pull operations in the git panel give no visual feedback that an operation is in progress. VSCode shows a spinner for a few seconds to confirm the action was triggered. VimCode should show a spinner (using the existing notification/progress system) while git operations are running.
 
