@@ -2093,6 +2093,9 @@ pub struct Engine {
     // --- Count state ---
     /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
     pub count: Option<usize>,
+    /// Count prefix before operator (e.g., `2` in `2d3w`). Saved when operator is set,
+    /// then multiplied with motion count in `take_count()`.
+    pub operator_count: Option<usize>,
 
     // --- Character find state ---
     /// Last character find motion: (motion_type, target_char)
@@ -2992,6 +2995,7 @@ impl Engine {
             visual_anchor: None,
             command_from_visual: None,
             count: None,
+            operator_count: None,
             last_find: None,
             pending_operator: None,
             pending_find_operator: None,

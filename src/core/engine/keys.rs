@@ -1231,7 +1231,8 @@ impl Engine {
             }
             Some('d') => {
                 // 'd' can be both operator (dw) and motion (dd)
-                // Set as pending_operator first
+                // Save count as operator_count so 2d3w = 6w (count multiplication)
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('d');
             }
             Some('D') => {
@@ -1243,6 +1244,7 @@ impl Engine {
             }
             Some('c') => {
                 // 'c' operator (change) - delete then enter insert mode
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('c');
             }
             Some('C') => {
@@ -1429,18 +1431,22 @@ impl Engine {
             }
             Some('>') => {
                 // > operator: set pending for >>
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('>');
             }
             Some('<') => {
                 // < operator: set pending for <<
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('<');
             }
             Some('=') => {
                 // = operator: auto-indent (== indents current line)
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('=');
             }
             Some('!') => {
                 // ! operator: filter through external command
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('!');
             }
             Some('u') => {
@@ -1456,6 +1462,7 @@ impl Engine {
                 self.repeat_last_change(count, changed);
             }
             Some('y') => {
+                self.operator_count = self.count.take();
                 self.pending_operator = Some('y');
             }
             Some('Y') => {
@@ -1575,6 +1582,7 @@ impl Engine {
                 "Escape" => {
                     // Clear count, pending key, and any extra cursors in normal mode
                     self.count = None;
+                    self.operator_count = None;
                     self.pending_key = None;
                     self.view_mut().extra_cursors.clear();
                     // Clear search highlights (like :noh)
@@ -1658,6 +1666,7 @@ impl Engine {
                 Some('g') => {
                     if let Some(op) = self.pending_operator.take() {
                         // dgg/ygg/cgg/zfgg etc: linewise operator to target line
+                        self.operator_count = None;
                         let count = self.count.take();
                         let target_line = count
                             .map(|n| {
@@ -1854,15 +1863,18 @@ impl Engine {
                 }
                 Some('~') => {
                     // g~{motion}: toggle case operator — set pending_operator and await motion
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('~');
                 }
                 Some('u') => {
                     // gu{motion}: lowercase operator
                     // Check if operator is pending (e.g. c/d + g + u) — handled elsewhere
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('u');
                 }
                 Some('U') => {
                     // gU{motion}: uppercase operator
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('U');
                 }
                 Some('n') => {
@@ -2043,10 +2055,12 @@ impl Engine {
                 }
                 Some('q') => {
                     // gq{motion}: format text operator
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('q');
                 }
                 Some('w') => {
                     // gw{motion}: format text, keep cursor
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('Q');
                 }
                 Some('R') => {
@@ -2059,6 +2073,7 @@ impl Engine {
                 }
                 Some('?') => {
                     // g?{motion}: ROT13 encode operator
+                    self.operator_count = self.count.take();
                     self.pending_operator = Some('R');
                 }
                 Some('c') => {
@@ -2644,6 +2659,7 @@ impl Engine {
                     Some('D') => self.cmd_fold_delete_recursive(),
                     // Fold: create (zf{motion})
                     Some('f') => {
+                        self.operator_count = self.count.take();
                         self.pending_operator = Some('Z');
                     }
                     Some('F') => {
@@ -2702,6 +2718,7 @@ impl Engine {
                     Some(cursor_line.saturating_sub(count))
                 }
                 Some('G') => {
+                    self.operator_count = None;
                     let count = self.count.take();
                     Some(
                         count
@@ -3289,6 +3306,8 @@ impl Engine {
             }
             Some('G') => {
                 // dG: delete from current line to end (or to line N if count given)
+                // G uses motion count as line number, not multiplied with operator count
+                self.operator_count = None;
                 let count = self.count.take();
                 let current_line = self.view().cursor.line;
                 let target_line = count
@@ -3305,34 +3324,49 @@ impl Engine {
                 self.apply_linewise_operator(operator, start, end, changed);
             }
             Some('{') => {
-                // d{: delete from current line backward to previous blank line (linewise)
+                // d{: delete backward to previous paragraph boundary (linewise).
+                // Vim's { is exclusive: the delete range is [target_line, cursor_line - 1],
+                // i.e. the cursor's own line is excluded.
                 let count = self.take_count();
-                let start_line = self.view().cursor.line;
+                let cursor_line = self.view().cursor.line;
                 for _ in 0..count {
                     self.move_paragraph_backward();
                 }
-                let end_line = self.view().cursor.line;
-                let (s, e) = if end_line <= start_line {
-                    (end_line, start_line)
-                } else {
-                    (start_line, end_line)
-                };
-                self.apply_linewise_operator(operator, s, e, changed);
+                let target_line = self.view().cursor.line;
+                if target_line < cursor_line {
+                    self.apply_linewise_operator(
+                        operator,
+                        target_line,
+                        cursor_line.saturating_sub(1),
+                        changed,
+                    );
+                } else if target_line == cursor_line && target_line == 0 {
+                    // Already at top — Vim deletes current line
+                    self.apply_linewise_operator(operator, cursor_line, cursor_line, changed);
+                }
             }
             Some('}') => {
-                // d}: delete from current line forward to next blank line (linewise)
+                // d}: delete forward to next paragraph boundary (linewise).
+                // Vim's } is exclusive: the delete range is [cursor_line, target_line - 1],
+                // i.e. the target blank line is excluded. Unless target is EOF.
                 let count = self.take_count();
-                let start_line = self.view().cursor.line;
+                let cursor_line = self.view().cursor.line;
                 for _ in 0..count {
                     self.move_paragraph_forward();
                 }
-                let end_line = self.view().cursor.line;
-                let (s, e) = if start_line <= end_line {
-                    (start_line, end_line)
+                let target_line = self.view().cursor.line;
+                let last_line = self.buffer().len_lines().saturating_sub(1);
+                let range_end = if target_line > cursor_line
+                    && target_line < last_line
+                    && self.is_line_empty(target_line)
+                {
+                    target_line.saturating_sub(1)
                 } else {
-                    (end_line, start_line)
+                    target_line
                 };
-                self.apply_linewise_operator(operator, s, e, changed);
+                if cursor_line <= range_end {
+                    self.apply_linewise_operator(operator, cursor_line, range_end, changed);
+                }
             }
             Some('(') => {
                 // d(: delete to previous sentence start (charwise)
@@ -4803,6 +4837,10 @@ impl Engine {
                 let cur = self.view().cursor;
                 self.last_insert_pos = Some((cur.line, cur.col));
                 self.set_mode(Mode::Normal);
+                // Vim moves cursor one left when leaving insert mode (unless at col 0)
+                if self.view().cursor.col > 0 {
+                    self.view_mut().cursor.col -= 1;
+                }
                 self.clamp_cursor_col();
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
