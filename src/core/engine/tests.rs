@@ -19684,7 +19684,7 @@ fn test_matrix_delete_linewise_motions() {
             0,
             0,
         ),
-        // paragraph motions — Vim's } and { are exclusive, so the target line is excluded
+        // paragraph motions — Vim's } and { are exclusive: blank line boundary preserved
         (
             "d}",
             "line one\n\nline three",
@@ -19695,14 +19695,28 @@ fn test_matrix_delete_linewise_motions() {
             0,
             0,
         ),
+        // d{ from line after blank: blank line preserved, cursor line + content deleted
         (
             "d{",
             "line one\n\nline three",
             2,
             0,
             "d{",
-            "line one\nline three",
+            "line one\n",
+            0,
+            0,
+        ),
+        // d{ with multiple lines after blank
+        ("d{_multi", "aaa\n\nbbb\nccc", 3, 0, "d{", "aaa\n", 0, 0),
+        // d} from blank line: blank line preserved, paragraph content deleted
+        (
+            "d}_from_blank",
+            "aaa\n\nbbb\nccc\n\nddd",
             1,
+            0,
+            "d}",
+            "aaa\n\n\nddd",
+            2,
             0,
         ),
         // dd
@@ -20429,6 +20443,13 @@ fn test_matrix_yank_with_count() {
     assert_eq!(engine.buffer().to_string(), "one two three four");
     let (content, _) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "one two ");
+
+    // 3y2w = yank 6 words (operator_count=3 × motion_count=2)
+    let mut engine = setup_engine("a b c d e f g h", 0, 0);
+    send_keys(&mut engine, "3y2w");
+    let (content, is_linewise) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "a b c d e f ", "3y2w should yank 6 words");
+    assert!(!is_linewise, "3y2w should be charwise");
 }
 
 #[test]
