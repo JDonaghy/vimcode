@@ -251,6 +251,9 @@
 - [ ] **`:help` coverage audit** — Walk Vim's documentation section by section, tag each feature as: implemented, partially implemented, not implemented, or intentionally skipped. Produce a coverage report. Focus on Normal mode commands, ex commands, and options.
 - [ ] **Automated buffer fuzzing** — Generate random key sequences, run in both Vim (headless) and VimCode engine, compare resulting buffer content and cursor position. Effective at finding edge cases in obscure key combinations.
 
+### Theme Quality
+- [ ] **Audit hardcoded colors in theme constructors** — Scan all 6 built-in theme constructors (`onedark`, `gruvbox_dark`, `tokyo_night`, `solarized_dark`, `vscode_dark`, `vscode_light`) for hex color literals that should be derived from other theme fields. Every color should either (a) be a foundational color defined once (background, foreground, keyword, etc.) or (b) be derived from a foundational color via `lighten`/`darken`/`cursorline_tint`/`colorcolumn_tint`. Convert any remaining hardcoded variants to derived values so that custom themes automatically get correct derived colors. Verify that adding a new theme with just the foundational colors produces a fully functional colorscheme.
+
 ### Robustness (Low Priority)
 - [x] **Consolidate sidebar focus state into engine** — `explorer_has_focus`/`search_has_focus` on Engine struct; `sidebar_has_focus()` aggregator + `clear_sidebar_focus()` helper; `handle_key()` guards; TUI `sync_sidebar_focus()` keeps state consistent; GTK sync on focus toggle/editor focus; 8 tests verify key routing correctness
 
