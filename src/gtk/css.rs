@@ -24,7 +24,7 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
     let entry_bg = theme.active_background.to_hex();
     let border_col = theme.separator.to_hex();
     let sb_thumb = theme.scrollbar_thumb.to_hex();
-    let comment_fg = theme.comment.to_hex();
+    let _comment_fg = theme.comment.to_hex();
     format!(
         r#"
         /* Activity Bar */
