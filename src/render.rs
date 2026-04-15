@@ -129,6 +129,17 @@ impl Color {
         }
     }
 
+    /// Derive a subtle colorcolumn background from this colour.
+    /// Slightly less prominent than cursorline — a gentle column tint.
+    pub fn colorcolumn_tint(self) -> Self {
+        let lum = 0.299 * self.r as f64 + 0.587 * self.g as f64 + 0.114 * self.b as f64;
+        if lum < 128.0 {
+            self.lighten(0.04)
+        } else {
+            self.darken(0.03)
+        }
+    }
+
     /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
     /// Cairo's `set_source_rgb` / `set_source_rgba`.
     pub fn to_cairo(self) -> (f64, f64, f64) {
@@ -2972,7 +2983,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#606060"),
-            colorcolumn_bg: Color::from_hex("#2c313a"),
+            colorcolumn_bg: Color::from_hex("#1a1a1a").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
@@ -3121,7 +3132,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#3c3836"),
             indent_guide_active_fg: Color::from_hex("#504945"),
-            colorcolumn_bg: Color::from_hex("#32302f"),
+            colorcolumn_bg: Color::from_hex("#282828").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
@@ -3270,7 +3281,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#292e42"),
             indent_guide_active_fg: Color::from_hex("#3b4261"),
-            colorcolumn_bg: Color::from_hex("#292e42"),
+            colorcolumn_bg: Color::from_hex("#1a1b26").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
@@ -3419,7 +3430,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#073642"),
             indent_guide_active_fg: Color::from_hex("#0d4a5a"),
-            colorcolumn_bg: Color::from_hex("#073642"),
+            colorcolumn_bg: Color::from_hex("#002b36").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
@@ -3568,7 +3579,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#707070"),
-            colorcolumn_bg: Color::from_hex("#1e1e1e").lighten(0.03),
+            colorcolumn_bg: Color::from_hex("#1e1e1e").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
@@ -3716,7 +3727,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#d3d3d3"),
             indent_guide_active_fg: Color::from_hex("#939393"),
-            colorcolumn_bg: Color::from_hex("#e8e8e8"),
+            colorcolumn_bg: Color::from_hex("#ffffff").colorcolumn_tint(), // derived from background
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
