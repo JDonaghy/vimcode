@@ -1,5 +1,6 @@
-Read CLAUDE.md, PROJECT_STATE.md, PLAN.md, and BUGS.md only.
+Read CLAUDE.md and PROJECT_STATE.md for context.
+Run `gh issue list --state open` and `gh issue list --state open --milestone` to see all open issues and milestones.
 Do not scan or explore the src/ directory yet.
-Summarize the next incomplete task from PLAN.md and bugs from BUGS.md.
+Summarize the open issues grouped by milestone, highlight which are highest priority or have dependencies, and recommend what to work on next.
 List what files you expect to touch and why.
 Then wait for my confirmation before doing anything.
