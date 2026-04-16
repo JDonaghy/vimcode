@@ -1248,10 +1248,14 @@ impl Engine {
                 self.pending_operator = Some('c');
             }
             Some('C') => {
-                // C: delete from cursor to end of line, enter insert mode
+                // C: delete from cursor to end of line, enter insert mode.
+                // Save cursor col before delete — clamp_cursor_col will pull
+                // it left, but for C we need to insert at the original position.
                 let count = self.take_count();
+                let saved_col = self.view().cursor.col;
                 self.start_undo_group();
                 self.delete_to_end_of_line_with_count(count, changed);
+                self.view_mut().cursor.col = saved_col;
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
                 self.count = None;
@@ -6702,13 +6706,11 @@ impl Engine {
                 // Handle other operations
             }
             ChangeOp::Replace => {
-                // Repeat r command
+                // Repeat r command — final_count is the number of chars to replace
                 if let Some(replacement_char) = change.text.chars().next() {
-                    for _ in 0..final_count {
-                        self.start_undo_group();
-                        self.replace_chars(replacement_char, change.count, changed);
-                        self.finish_undo_group();
-                    }
+                    self.start_undo_group();
+                    self.replace_chars(replacement_char, final_count, changed);
+                    self.finish_undo_group();
                 }
             }
             ChangeOp::ToggleCase => {

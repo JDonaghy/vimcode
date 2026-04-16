@@ -1991,8 +1991,8 @@ fn test_replace_char_with_count() {
     press_char(&mut engine, 'x');
 
     assert_eq!(engine.buffer().to_string(), "xxxlo");
-    // Cursor should stay at starting position
-    assert_eq!(engine.view().cursor.col, 0);
+    // Cursor on last replaced char (Neovim behavior)
+    assert_eq!(engine.view().cursor.col, 2);
 }
 
 #[test]
@@ -21995,14 +21995,12 @@ fn test_nvim_2di_paren_no_double_nest() {
 // ── Phase 4 Batch 2: Miscellaneous edge cases ──────────────────────────
 
 #[test]
-#[ignore = "vim deviation: J cursor position wrong (col 0 instead of join point)"]
 fn test_nvim_J_join_two_lines() {
     // Neovim: cursor at col 3 (the space). VimCode: col 0.
     nvim_case("aaa\nbbb\n", 0, 0, "J", "aaa bbb\n", 0, 3);
 }
 
 #[test]
-#[ignore = "vim deviation: 3J joins 4 lines instead of 3"]
 fn test_nvim_3J_join_three_lines() {
     // Neovim: 3J joins 3 lines (current + 2). VimCode joins 4.
     nvim_case(
@@ -22032,7 +22030,6 @@ fn test_nvim_r_replace_char() {
 }
 
 #[test]
-#[ignore = "vim deviation: 3r cursor at col 0 instead of col 2"]
 fn test_nvim_3r_replace_chars() {
     // Neovim: cursor at col 2 (last replaced char). VimCode: col 0.
     nvim_case("hello\n", 0, 0, "3rX", "XXXlo\n", 0, 2);
@@ -22341,7 +22338,6 @@ fn test_nvim_ctrl_a_with_count() {
 // ── Phase 4 Batch 4: Change operations ──────────────────────────────────
 
 #[test]
-#[ignore = "vim deviation: C (change to EOL) starts one char too early"]
 fn test_nvim_c_dollar_change_to_eol() {
     // C at col 6 should change "world" to "XX" → "hello XX".
     // VimCode: changes from col 5, giving "helloXX ".
@@ -22786,7 +22782,6 @@ fn test_nvim_y_big_yank_line() {
 }
 
 #[test]
-#[ignore = "vim deviation: gJ cursor position wrong (col 0 instead of join point)"]
 fn test_nvim_gj_join_no_space() {
     // gJ joins without space. Neovim: cursor at col 3 (join point). VimCode: col 0.
     nvim_case("aaa\nbbb\n", 0, 0, "gJ", "aaabbb\n", 0, 3);
@@ -22870,7 +22865,6 @@ fn test_nvim_di_paren_empty() {
 }
 
 #[test]
-#[ignore = "vim deviation: ci( on empty parens is no-op instead of entering insert"]
 fn test_nvim_ci_paren_empty() {
     // ci( on "()" should enter insert between parens. VimCode: no-op.
     let mut engine = Engine::new();
@@ -22895,14 +22889,12 @@ fn test_nvim_di_quote_empty() {
 // ── Phase 4 Batch 6: J edge cases ───────────────────────────────────────
 
 #[test]
-#[ignore = "vim deviation: J cursor position wrong (see #73)"]
 fn test_nvim_j_join_strips_indent() {
     // J strips leading whitespace from second line. Cursor at join point.
     nvim_case("aaa\n   bbb\n", 0, 0, "J", "aaa bbb\n", 0, 3);
 }
 
 #[test]
-#[ignore = "vim deviation: J adds extra space when line already has trailing space"]
 fn test_nvim_j_join_trailing_space() {
     // J on line with trailing spaces: Neovim doesn't add another space.
     // VimCode adds one, giving "aaa    bbb" instead of "aaa   bbb".
@@ -23059,14 +23051,12 @@ fn test_nvim_y2w_then_check() {
 }
 
 #[test]
-#[ignore = "vim deviation: ib/aB text object aliases not recognized"]
 fn test_nvim_dib_same_as_di_paren() {
     // ib is alias for i(, aB is alias for a{. VimCode: not recognized.
     nvim_case("(hello)\n", 0, 1, "dib", "()\n", 0, 1);
 }
 
 #[test]
-#[ignore = "vim deviation: ib/aB text object aliases not recognized"]
 fn test_nvim_dab_same_as_da_brace() {
     nvim_case("x{hello}y\n", 0, 2, "daB", "xy\n", 0, 1);
 }
