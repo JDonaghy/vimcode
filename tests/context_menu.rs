@@ -191,7 +191,8 @@ fn test_copy_relative_path_subdir() {
     let cwd = e.cwd.clone();
     let path = cwd.join("src").join("main.rs");
     let rel = e.copy_relative_path(&path);
-    assert_eq!(rel, "src/main.rs");
+    // On Windows the separator is '\', on Unix '/'. Normalize for comparison.
+    assert_eq!(rel.replace('\\', "/"), "src/main.rs");
 }
 
 #[test]
