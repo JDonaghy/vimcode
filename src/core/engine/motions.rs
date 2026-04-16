@@ -1200,6 +1200,10 @@ impl Engine {
             "Escape" => {
                 self.virtual_replace = false;
                 self.mode = Mode::Normal;
+                // Vim steps cursor one left when leaving Replace mode (unless at col 0)
+                if self.view().cursor.col > 0 {
+                    self.view_mut().cursor.col -= 1;
+                }
                 self.clamp_cursor_col();
             }
             "BackSpace" => {

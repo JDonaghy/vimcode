@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 285 — Phase 4 batch 13, 25 new conformance tests, 0 deviations) | **Tests:** 1811 (lib) + 327 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 286 — Fix #101 Replace mode Esc cursor) | **Tests:** 1813 (lib) + 327 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 286 — Fix #101 Replace mode Esc cursor position:**
+
+1. **Fix #101: Replace mode cursor stepback on Esc** — `handle_replace_key` Esc handler in `src/core/engine/motions.rs` was missing the cursor-step-back that Insert mode already had. Added the same `col > 0 → col -= 1` logic. Also covers `gR` virtual replace.
+2. **2 previously-ignored tests now passing** (1811 → 1813 lib, 11 → 9 ignored).
 
 **Session 285 — Phase 4 batch 13 (#25), 25 new conformance tests, 0 new deviations:**
 

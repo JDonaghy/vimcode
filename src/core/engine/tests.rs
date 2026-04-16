@@ -24357,7 +24357,6 @@ fn test_nvim_ctrl_x_count_prefix() {
 // -- Replace mode --
 
 #[test]
-#[ignore = "vim deviation #101: Replace mode cursor lands at col+1 after Esc"]
 fn test_nvim_R_replaces_chars() {
     // R enters replace mode; subsequent chars overwrite
     // Vim: after RXYZ<Esc>, cursor on last replaced char (Z) at col 2. VimCode: col 3.
@@ -24365,7 +24364,6 @@ fn test_nvim_R_replaces_chars() {
 }
 
 #[test]
-#[ignore = "vim deviation #101: Replace mode cursor lands at col+1 after Esc"]
 fn test_nvim_R_past_eol_appends() {
     // R past end-of-line appends rather than overwriting
     nvim_case("ab\n", 0, 0, "RXYZ<Esc>", "XYZ\n", 0, 2);
