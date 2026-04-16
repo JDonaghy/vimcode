@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 282 — Insert paste fix, Phase 4 batches 10-11, 8 deviations fixed) | **Tests:** 1757 (lib) + 270 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 283 — Fix 3 Vim deviations: visual J, :%join, insert Ctrl-U) | **Tests:** 1761 (lib) + 270 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,14 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 283 — Fix 3 Vim deviations (#97, #98, #99):**
+
+1. **Fix #97: Visual line J now joins selected lines** — Added `J` handler in visual mode operator dispatch. `VjjJ` correctly joins all selected lines.
+2. **Fix #98: :%join range now supported** — Added `%` range prefix handling in `execute_command()`. Also supports `%d` and `%y`.
+3. **Fix #99: Ctrl-U in insert mode respects insert point** — Added `insert_enter_col` field to track where insert mode was entered. Ctrl-U now deletes only back to that boundary instead of line start.
+4. **Closed #65** (already fixed in session 282, issue left open).
+5. **4 previously-ignored tests now passing** (1757 → 1761 lib tests).
 
 **Session 282 — Insert paste fix (#65), Phase 4 batches 10-11 (#25), 8 deviations fixed:**
 
