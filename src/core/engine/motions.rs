@@ -945,12 +945,14 @@ impl Engine {
     pub(crate) fn join_lines_no_space(&mut self, count: usize, changed: &mut bool) {
         let total_lines = self.buffer().len_lines();
         let start_line = self.view().cursor.line;
-        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        let joins = if count <= 1 { 1 } else { count - 1 };
+        let joins = joins.min(total_lines.saturating_sub(start_line + 1));
         if joins == 0 {
             return;
         }
 
         self.start_undo_group();
+        let mut join_col = 0usize;
         for _ in 0..joins {
             let cur_line = self.view().cursor.line;
             let next_line = cur_line + 1;
@@ -961,21 +963,14 @@ impl Engine {
             let cur_line_len = self.buffer().line_len_chars(cur_line);
             let cur_line_start = self.buffer().line_to_char(cur_line);
             let newline_pos = cur_line_start + cur_line_len - 1;
+            join_col = newline_pos - cur_line_start;
 
-            // Count leading whitespace on next line
-            let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
-            let leading_ws = next_line_content
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
-                .count();
-
-            // Delete newline + all leading whitespace of next line (no space inserted)
-            let next_line_start = self.buffer().line_to_char(next_line);
-            let del_end = next_line_start + leading_ws;
-            self.delete_with_undo(newline_pos, del_end);
+            // gJ does NOT strip leading whitespace — just remove the newline
+            self.delete_with_undo(newline_pos, newline_pos + 1);
         }
         self.finish_undo_group();
 
+        self.view_mut().cursor.col = join_col;
         self.clamp_cursor_col();
         *changed = true;
     }
@@ -1626,8 +1621,8 @@ impl Engine {
             'W' => self.find_bigword_object(modifier, cursor_pos),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
-            '(' | ')' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
-            '{' | '}' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
+            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
+            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
             '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
             '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos),
             'p' => self.find_paragraph_object(modifier, cursor_pos),
@@ -2523,6 +2518,18 @@ impl Engine {
 
         let (start_pos, end_pos) = range;
         if start_pos >= end_pos {
+            // Empty inner range (e.g. ci( on "()"). For 'c' operator,
+            // still enter insert mode at the position between the delimiters.
+            if operator == 'c' {
+                let line = self.buffer().content.char_to_line(start_pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = start_pos - line_start;
+                self.mode = Mode::Insert;
+                self.start_undo_group();
+                self.insert_text_buffer.clear();
+                *changed = true;
+            }
             return;
         }
 
@@ -3797,8 +3804,8 @@ impl Engine {
             self.delete_with_undo(char_idx, char_idx + to_replace);
             self.insert_with_undo(char_idx, &replacement_str);
 
-            // Keep cursor at the start position (Vim behavior)
-            self.view_mut().cursor.col = col;
+            // Cursor on last replaced char (Neovim behavior)
+            self.view_mut().cursor.col = col + to_replace - 1;
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -4518,13 +4525,15 @@ impl Engine {
         let total_lines = self.buffer().len_lines();
         let start_line = self.view().cursor.line;
 
-        // We join (count) times; each join merges current line with next
-        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        // Vim: J joins 2 lines (1 join), 3J joins 3 lines (2 joins).
+        let joins = if count <= 1 { 1 } else { count - 1 };
+        let joins = joins.min(total_lines.saturating_sub(start_line + 1));
         if joins == 0 {
             return;
         }
 
         self.start_undo_group();
+        let mut join_col = 0usize; // track the join point for cursor placement
         for _ in 0..joins {
             let cur_line = self.view().cursor.line;
             let next_line = cur_line + 1;
@@ -4553,22 +4562,25 @@ impl Engine {
             let del_end = next_line_start + leading_ws;
             self.delete_with_undo(newline_pos, del_end);
 
-            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws
-            // Also don't add space if the current line ends with a space
+            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
+            // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
-            // Check if current line ends with space (after the newline was removed)
-            let cur_end_char =
-                self.buffer().line_to_char(cur_line) + self.buffer().line_len_chars(cur_line);
-            let ends_with_space = cur_end_char > self.buffer().line_to_char(cur_line)
-                && self.buffer().content.char(cur_end_char - 1) == ' ';
+            let ends_with_ws = newline_pos > cur_line_start
+                && self.buffer().content.char(newline_pos - 1).is_whitespace();
 
-            if should_add_space && !ends_with_space {
+            if should_add_space && !ends_with_ws {
                 self.insert_with_undo(newline_pos, " ");
+                // Cursor at the inserted space
+                join_col = newline_pos - cur_line_start;
+            } else {
+                // No space inserted — cursor at last char before where next line starts
+                join_col = (newline_pos - cur_line_start).saturating_sub(1);
             }
         }
         self.finish_undo_group();
 
-        // Cursor stays at start of original line
+        // Cursor at the join point (where the space was inserted)
+        self.view_mut().cursor.col = join_col;
         self.clamp_cursor_col();
         *changed = true;
     }
