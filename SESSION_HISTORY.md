@@ -1,7 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 279 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 280 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
+Fix #31 (2d2w count multiplication), #32 (<G send_keys parser), #30 (di</da< angle brackets), #29 (da"/da' trailing whitespace), #28 (d}/d{ paragraph boundary), #33 (c+Esc cursor). Neovim conformance test harness: 31 automated tests comparing VimCode vs Neovim headless.
 
 **Session 279 — Vim conformance matrix tests, `:set` option audit:**
 Operator × motion matrix tests (Phase 1): 29 new parametric tests with 93 total test cases covering d/c/y/>>/<</ gU/gu/g~ × motions + text objects, count variations, dot-repeat. Test infrastructure: `send_keys(engine, "d2w")` helper. Bug fixes: ge/gE motion (rewrote backward word-end), leader key intercepting df<space>, dw/de/db dot-repeat, send_keys `<<` parsing. `:set` option audit (Phase 2): 18 tests for round-trip, behavior, and ex-command handling. 6 Vim deviations documented as GitHub issues (#28-#33). 47 new tests (total: 1463).

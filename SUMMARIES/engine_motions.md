@@ -1,4 +1,4 @@
-# src/core/engine/motions.rs — 4,842 lines
+# src/core/engine/motions.rs — 4,851 lines
 
 Cursor movement, text objects, word/paragraph/sentence navigation, bracket matching, completion, code folding, indent/format, and delete operations.
 
