@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 283 — Fix 3 Vim deviations: visual J, :%join, insert Ctrl-U) | **Tests:** 1761 (lib) + 270 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 284 — Phase 4 batch 12, 27 new conformance tests) | **Tests:** 1786 (lib) + 302 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 284 — Phase 4 batch 12 (#25), 27 new conformance tests, 1 new deviation (#101):**
+
+1. **Phase 4 batch 12: 27 new Neovim-verified tests** — Covering areas previously under-tested: search (`/`, `?`, `n`, `N`, count prefix, wrap-around), scroll commands (`zz`, `<C-d>`, `<C-u>`, `<C-b>`), number increment/decrement (`<C-a>`, `<C-x>` with count and negatives), replace mode (`R`, `r<CR>`, `3rX`), case change (`gUU`, `guw`, `gUw`), and count+motion combos (`5l`, `3j`, `3dd`, `3yy+p`).
+2. **1 new deviation documented (#101)**: Replace mode cursor lands at col+1 after `<Esc>` instead of on the last replaced char (Vim behavior). Documented as 2 ignored tests.
 
 **Session 283 — Fix 3 Vim deviations (#97, #98, #99):**
 
