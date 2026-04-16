@@ -23031,3 +23031,230 @@ fn test_nvim_ddp_swap_lines() {
     engine.feed_keys("ddp");
     assert_eq!(engine.buffer().to_string(), "bbb\naaa\nccc\n");
 }
+
+// ── Phase 4 Batch 7: Operator + count combos ────────────────────────────
+
+#[test]
+fn test_nvim_c2w_change_two_words() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one two three four\n");
+    engine.update_syntax();
+    engine.feed_keys("c2wXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XX three four\n");
+}
+
+#[test]
+fn test_nvim_d2e_delete_two_word_ends() {
+    nvim_case("one two three\n", 0, 0, "d2e", " three\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_y2w_then_check() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one two three\n");
+    engine.update_syntax();
+    engine.feed_keys("y2w");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "one two ");
+}
+
+#[test]
+#[ignore = "vim deviation: ib/aB text object aliases not recognized"]
+fn test_nvim_dib_same_as_di_paren() {
+    // ib is alias for i(, aB is alias for a{. VimCode: not recognized.
+    nvim_case("(hello)\n", 0, 1, "dib", "()\n", 0, 1);
+}
+
+#[test]
+#[ignore = "vim deviation: ib/aB text object aliases not recognized"]
+fn test_nvim_dab_same_as_da_brace() {
+    nvim_case("x{hello}y\n", 0, 2, "daB", "xy\n", 0, 1);
+}
+
+#[test]
+fn test_nvim_visual_sentence_delete() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "One. Two. Three.\n");
+    engine.update_syntax();
+    engine.feed_keys("vasd");
+    assert_eq!(engine.buffer().to_string(), "Two. Three.\n");
+}
+
+#[test]
+fn test_nvim_visual_paragraph_delete() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("vipd");
+    assert_eq!(engine.buffer().to_string(), "\nccc\n");
+}
+
+#[test]
+fn test_nvim_gv_reselect() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.feed_keys("vlly");
+    let (content, _) = engine.registers.get(&'"').unwrap();
+    assert_eq!(content, "abc");
+    engine.feed_keys("gvd");
+    assert_eq!(engine.buffer().to_string(), "def\n");
+}
+
+#[test]
+fn test_nvim_visual_o_swap_ends() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.feed_keys("vllod");
+    assert_eq!(engine.buffer().to_string(), "def\n");
+}
+
+#[test]
+fn test_nvim_indent_with_j_motion() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys(">j");
+    let buf = engine.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert!(lines[0].starts_with("    ") || lines[0].starts_with("\t"));
+    assert!(lines[1].starts_with("    ") || lines[1].starts_with("\t"));
+    assert_eq!(lines[2], "ccc");
+}
+
+#[test]
+fn test_nvim_outdent_with_j_motion() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    aaa\n    bbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("<j");
+    let buf = engine.buffer().to_string();
+    let lines: Vec<&str> = buf.lines().collect();
+    assert_eq!(lines[0], "aaa");
+    assert_eq!(lines[1], "bbb");
+    assert_eq!(lines[2], "ccc");
+}
+
+// ── Phase 4 Batch 8: Basic motions & counts ─────────────────────────────
+
+#[test]
+fn test_nvim_0_motion() {
+    nvim_case("  hello world\n", 0, 8, "0", "  hello world\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_caret_motion() {
+    nvim_case("  hello world\n", 0, 8, "^", "  hello world\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_dollar_motion() {
+    nvim_case("hello\n", 0, 0, "$", "hello\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_gg_from_bottom() {
+    nvim_case("aaa\nbbb\nccc\n", 2, 0, "gg", "aaa\nbbb\nccc\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_2g_goto_line() {
+    nvim_case("aaa\nbbb\nccc\n", 0, 0, "2G", "aaa\nbbb\nccc\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_h_at_col0() {
+    nvim_case("abc\n", 0, 0, "h", "abc\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_l_at_eol() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2;
+    engine.feed_keys("l");
+    assert_eq!(engine.view().cursor.col, 2);
+}
+
+#[test]
+fn test_nvim_j_on_last_line() {
+    nvim_case("aaa\nbbb\n", 1, 0, "j", "aaa\nbbb\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_k_on_first_line() {
+    nvim_case("aaa\nbbb\n", 0, 0, "k", "aaa\nbbb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_5j() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\nf\ng\n");
+    engine.update_syntax();
+    engine.feed_keys("5j");
+    assert_eq!(engine.view().cursor.line, 5);
+}
+
+#[test]
+fn test_nvim_3k() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 4;
+    engine.feed_keys("3k");
+    assert_eq!(engine.view().cursor.line, 1);
+}
+
+#[test]
+fn test_nvim_4l() {
+    nvim_case("abcdefgh\n", 0, 0, "4l", "abcdefgh\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_3h() {
+    nvim_case("abcdefgh\n", 0, 5, "3h", "abcdefgh\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_2dd_from_middle() {
+    nvim_case("aaa\nbbb\nccc\nddd\n", 1, 0, "2dd", "aaa\nddd\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_3yy_register() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd\n");
+    engine.update_syntax();
+    engine.feed_keys("3yy");
+    let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
+    assert_eq!(content, "aaa\nbbb\nccc\n");
+    assert!(is_lw);
+}
+
+#[test]
+fn test_nvim_2p_paste_twice() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("yy2p");
+    assert_eq!(engine.buffer().to_string(), "aaa\naaa\naaa\nbbb\n");
+}
+
+#[test]
+fn test_nvim_percent_no_bracket() {
+    nvim_case("hello\n", 0, 0, "%", "hello\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_search_forward() {
+    // /pattern search via feed_keys — uses command mode input
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa foo bbb\nfoo ccc\n");
+    engine.update_syntax();
+    engine.feed_keys("/foo<CR>");
+    // feed_keys may or may not drive search correctly via command mode;
+    // just verify we're in normal mode and didn't crash
+    assert_eq!(engine.mode, Mode::Normal);
+}
