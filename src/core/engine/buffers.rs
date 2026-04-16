@@ -3109,6 +3109,30 @@ impl Engine {
         }
     }
 
+    /// Re-read the current git branch if enough time has passed since the last
+    /// check. Catches external branch changes (e.g. `git checkout` in a shell).
+    /// Returns `true` if the branch changed (so the caller can redraw).
+    /// Called from the backend's tick function.
+    pub fn tick_git_branch(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let should_check = match self.last_git_branch_check {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= std::time::Duration::from_secs(2),
+        };
+        if !should_check {
+            return false;
+        }
+        self.last_git_branch_check = Some(now);
+        let dir = self.git_dir();
+        let fresh = crate::core::git::current_branch(&dir);
+        if fresh != self.git_branch {
+            self.git_branch = fresh;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Poll the file watcher for external modifications and show reload dialogs.
     /// Called from the backend's tick function.
     pub fn tick_file_watcher(&mut self) {

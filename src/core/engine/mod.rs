@@ -2177,6 +2177,8 @@ pub struct Engine {
     // --- Git integration ---
     /// Current git branch name (None if not in a git repo or git not available).
     pub git_branch: Option<String>,
+    /// When we last polled for an external branch change (for tick_git_branch rate limit).
+    pub last_git_branch_check: Option<std::time::Instant>,
 
     // --- Scroll binding ---
     /// Pairs of windows whose scroll_top should stay in sync (e.g. :Gblame).
@@ -3037,6 +3039,7 @@ impl Engine {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 git::current_branch(&cwd)
             },
+            last_git_branch_check: None,
             scroll_bind_pairs: Vec::new(),
             completion_candidates: Vec::new(),
             completion_idx: None,

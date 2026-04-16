@@ -24683,3 +24683,36 @@ fn test_nvim_paste_linewise_above() {
     engine.feed_keys("yyP");
     assert_eq!(engine.buffer().to_string(), "foo\nfoo\nbar\n");
 }
+
+// ── Git branch refresh (#60) ───────────────────────────────────────────
+
+#[test]
+fn test_tick_git_branch_rate_limited() {
+    // Two calls back-to-back: second must return false (within the 2s window)
+    // even if the first did work.
+    let mut engine = Engine::new();
+    engine.tick_git_branch();
+    // Force a fake "branch changed" so the second call would otherwise return true.
+    engine.git_branch = Some("pretend-different".to_string());
+    assert!(
+        !engine.tick_git_branch(),
+        "second tick within 2s must be rate-limited"
+    );
+}
+
+#[test]
+fn test_tick_git_branch_detects_change() {
+    // Bypass the rate limit and confirm a branch mismatch is reported.
+    let mut engine = Engine::new();
+    engine.git_branch = Some("stale-value-not-matching-anything".to_string());
+    engine.last_git_branch_check = None; // force a real check
+    // The return value depends on whether tests run inside a git repo.
+    // Our CWD during tests *is* the vimcode repo, so current_branch() returns
+    // Some(real branch) which differs from our stale value — tick returns true.
+    let changed = engine.tick_git_branch();
+    assert!(changed, "stale branch should be detected as changed");
+    assert_ne!(
+        engine.git_branch.as_deref(),
+        Some("stale-value-not-matching-anything")
+    );
+}

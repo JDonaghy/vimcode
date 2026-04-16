@@ -5811,6 +5811,11 @@ fn on_tick(hwnd: HWND) {
         // File watcher (external modification detection)
         state.engine.tick_file_watcher();
 
+        // Poll for external git branch changes (rate-limited to once per 2s inside).
+        if state.engine.tick_git_branch() {
+            needs_redraw = true;
+        }
+
         // Notification ticker
         state.engine.tick_notifications();
         needs_redraw = true;

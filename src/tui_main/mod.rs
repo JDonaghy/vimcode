@@ -1501,6 +1501,10 @@ fn event_loop(
             engine.tick_swap_files();
             // Check for externally modified files.
             engine.tick_file_watcher();
+            // Poll for external git branch changes (rate-limited to once per 2s).
+            if engine.tick_git_branch() {
+                needs_redraw = true;
+            }
             // Auto-dismiss completed notifications after timeout.
             // Force redraw every idle tick when notifications are visible (spinner animation).
             if !engine.notifications.is_empty() {

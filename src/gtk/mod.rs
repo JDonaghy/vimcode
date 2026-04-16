@@ -5690,6 +5690,10 @@ impl App {
         }
         // Tick swap file writes (only does work when updatetime elapsed).
         self.engine.borrow_mut().tick_swap_files();
+        // Poll for external git branch changes (rate-limited to once per 2s inside).
+        if self.engine.borrow_mut().tick_git_branch() {
+            self.draw_needed.set(true);
+        }
         // Auto-dismiss completed notifications after timeout; force redraw for spinner animation.
         {
             let mut engine = self.engine.borrow_mut();

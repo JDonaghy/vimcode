@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 286 — Fix #101 Replace mode Esc cursor) | **Tests:** 1813 (lib) + 327 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 287 — Fix #60 Git branch external refresh) | **Tests:** 1815 (lib) + 327 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 287 — Fix #60 Git branch status bar refresh:**
+
+1. **Fix #60: Status bar now detects external branch changes** — Added `tick_git_branch()` method on Engine that polls `git::current_branch()` at most once per 2 seconds and returns `true` if the branch changed. Wired into all three backends (GTK, TUI, Win-GUI) via their existing tick loops; a detected change triggers a redraw.
+2. **2 new unit tests** (rate-limit + change detection) — 1813 → 1815 lib tests.
 
 **Session 286 — Fix #101 Replace mode Esc cursor position:**
 
