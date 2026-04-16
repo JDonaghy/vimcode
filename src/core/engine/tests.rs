@@ -3133,12 +3133,12 @@ fn test_count_cleared_on_mode_changes() {
     assert_eq!(engine.peek_count(), Some(5)); // Count preserved
     press_special(&mut engine, "Escape"); // Escape clears count
 
-    // Test visual line mode PRESERVES count (for use with motions)
+    // Test visual line mode CONSUMES count (3V selects 3 lines)
     press_char(&mut engine, '3');
     assert_eq!(engine.peek_count(), Some(3));
     press_char(&mut engine, 'V');
-    assert_eq!(engine.peek_count(), Some(3)); // Count preserved
-    press_special(&mut engine, "Escape"); // Escape clears count
+    assert_eq!(engine.peek_count(), None); // Count consumed by V
+    press_special(&mut engine, "Escape"); // Escape exits visual
 
     // Test command mode clears count
     press_char(&mut engine, '7');
@@ -21823,10 +21823,15 @@ fn test_nvim_vlld_char_visual() {
 }
 
 #[test]
-#[ignore = "vim deviation: v$d leaves empty first line instead of joining"]
 fn test_nvim_v_dollar_d() {
-    // v$d should delete "abc\n" leaving "def\n". VimCode leaves "\ndef\n".
+    // v$d includes the newline (Vim curswant=MAXCOL behavior)
     nvim_case("abc\ndef\n", 0, 0, "v$d", "def\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_lv_dollar_d() {
+    // lv$d from col 1 — also includes newline, joins with next line
+    nvim_case("abc\ndef\n", 0, 0, "lv$d", "adef\n", 0, 1);
 }
 
 #[test]
@@ -21856,9 +21861,8 @@ fn test_nvim_vey_yank() {
 }
 
 #[test]
-#[ignore = "vim deviation: count before V does not extend visual line selection"]
 fn test_nvim_visual_line_yank_count() {
-    // 2Vy should yank 2 lines. VimCode only yanks 1 (count ignored before V).
+    // 2Vy yanks 2 lines (count extends visual line selection)
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
     engine.update_syntax();
@@ -21869,9 +21873,13 @@ fn test_nvim_visual_line_yank_count() {
 }
 
 #[test]
-#[ignore = "vim deviation: visual selection + gu does not lowercase"]
 fn test_nvim_visual_gu_lowercase() {
     nvim_case("HELLO WORLD\n", 0, 0, "vegu", "hello WORLD\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_visual_gu_uppercase() {
+    nvim_case("hello world\n", 0, 0, "vegU", "HELLO world\n", 0, 0);
 }
 
 #[test]
@@ -22280,7 +22288,6 @@ fn test_nvim_backtick_mark_exact() {
 }
 
 #[test]
-#[ignore = "vim deviation: d'mark (delete to mark) not implemented"]
 fn test_nvim_delete_to_mark() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\nccc\nddd\n");
@@ -22423,10 +22430,8 @@ fn test_nvim_named_register_paste() {
 }
 
 #[test]
-#[ignore = "vim deviation: uppercase register append (\"Ayy) not implemented"]
 fn test_nvim_append_register() {
     // "ayy then j"Ayy should append to register a → "aaa\nbbb\n"
-    // VimCode: uppercase register does not append, just overwrites.
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\n");
     engine.update_syntax();
@@ -22790,9 +22795,8 @@ fn test_nvim_gj_join_no_space() {
 // ── Phase 4 Batch 5: Ex commands ────────────────────────────────────────
 
 #[test]
-#[ignore = "vim deviation: :2d (ex delete with line number) not implemented"]
 fn test_nvim_ex_delete_line() {
-    // :2d should delete line 2. VimCode: no-op.
+    // :2d deletes line 2
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
     engine.update_syntax();
@@ -22942,9 +22946,8 @@ fn test_nvim_yaw_includes_space() {
 }
 
 #[test]
-#[ignore = "vim deviation: di{ on multiline braces collapses to single line"]
 fn test_nvim_di_brace_multiline() {
-    // di{ on multiline should leave "if {\n}\n". VimCode: "if {}\n" (single line).
+    // di{ on multiline: linewise inner deletion preserves brace lines
     nvim_case("if {\n  body\n}\n", 1, 0, "di{", "if {\n}\n", 1, 0);
 }
 
@@ -23262,7 +23265,6 @@ fn test_nvim_ciw_middle_of_word() {
 }
 
 #[test]
-#[ignore = "vim deviation: count with f in operator mode (d2f.) off by one"]
 fn test_nvim_d2f_delete_to_second_match() {
     nvim_case("a.b.c.d\n", 0, 0, "d2f.", "c.d\n", 0, 0);
 }
@@ -23321,9 +23323,8 @@ fn test_nvim_d_big_on_last_line() {
 }
 
 #[test]
-#[ignore = "vim deviation: count with o (3o) does not repeat line insertion"]
 fn test_nvim_o_with_count() {
-    // 3o should insert "XX" on 3 new lines below. VimCode: inserts only 1.
+    // 3o inserts typed text on 3 new lines below
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\n");
     engine.update_syntax();
@@ -23458,15 +23459,15 @@ fn test_nvim_yb_yank_backward() {
 }
 
 #[test]
-#[ignore = "vim deviation: d0 off by one (keeps char at cursor col)"]
 fn test_nvim_d0_at_middle() {
-    nvim_case("hello world\n", 0, 5, "d0", "world\n", 0, 0);
+    // Verified: Neovim 0.12.1 — d0 is exclusive, cursor char NOT included
+    nvim_case("hello world\n", 0, 5, "d0", " world\n", 0, 0);
 }
 
 #[test]
-#[ignore = "vim deviation: d^ off by one (keeps char at cursor col)"]
 fn test_nvim_d_caret_with_indent() {
-    nvim_case("    hello\n", 0, 6, "d^", "    lo\n", 0, 4);
+    // Verified: Neovim 0.12.1 — d^ is exclusive, cursor char NOT included
+    nvim_case("    hello\n", 0, 6, "d^", "    llo\n", 0, 4);
 }
 
 #[test]
@@ -23481,7 +23482,6 @@ fn test_nvim_2fw() {
 }
 
 #[test]
-#[ignore = "vim deviation: dt. does not delete (t motion in operator mode)"]
 fn test_nvim_dt_then_semicolon() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a.b.c.d\n");

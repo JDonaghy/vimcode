@@ -2085,6 +2085,10 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+    /// Set when `$` is used in visual mode — the selection extends through the
+    /// end of the line (including newline), matching Vim's curswant=MAXCOL.
+    /// Cleared when any other motion is used or visual mode exits.
+    pub visual_dollar: bool,
     /// When Command mode is entered from Visual mode, stores the original
     /// visual mode variant so the selection remains visible and `'<,'>` range
     /// resolves correctly.  Cleared on command execution or Escape.
@@ -2692,6 +2696,9 @@ pub struct Engine {
     /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
     pub visual_block_insert_info: Option<(usize, usize, usize, bool)>,
+    /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
+    /// on additional new lines (Vim behavior for 3oXX<Esc>).
+    pub insert_open_count: usize,
     /// Force motion mode: 'v' = charwise, 'V' = linewise.
     /// Set by pressing v/V/CTRL-V while an operator is pending (e.g., dVj).
     pub force_motion_mode: Option<char>,
@@ -2993,6 +3000,7 @@ impl Engine {
             selected_register: None,
             marks: HashMap::new(),
             visual_anchor: None,
+            visual_dollar: false,
             command_from_visual: None,
             count: None,
             operator_count: None,
@@ -3227,6 +3235,7 @@ impl Engine {
             insert_ctrl_o_active: false,
             insert_ctrl_v_pending: false,
             visual_block_insert_info: None,
+            insert_open_count: 0,
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),

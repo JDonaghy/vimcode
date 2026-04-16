@@ -1375,7 +1375,7 @@ impl Engine {
     /// Find a character on the current line.
     /// motion_type: 'f' (forward inclusive), 'F' (backward inclusive),
     ///              't' (forward till/exclusive), 'T' (backward till/exclusive)
-    pub(crate) fn find_char(&mut self, motion_type: char, target: char) {
+    pub(crate) fn find_char(&mut self, motion_type: char, target: char) -> bool {
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
         let line_start = self.buffer().line_to_char(line);
@@ -1388,7 +1388,7 @@ impl Engine {
                     let ch = self.buffer().content.char(line_start + i);
                     if ch == target && ch != '\n' {
                         self.view_mut().cursor.col = i;
-                        return;
+                        return true;
                     }
                 }
             }
@@ -1399,7 +1399,7 @@ impl Engine {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
                             self.view_mut().cursor.col = i;
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -1412,7 +1412,7 @@ impl Engine {
                         if i > 0 {
                             self.view_mut().cursor.col = i - 1;
                         }
-                        return;
+                        return true;
                     }
                 }
             }
@@ -1423,7 +1423,7 @@ impl Engine {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
                             self.view_mut().cursor.col = i + 1;
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -1431,6 +1431,7 @@ impl Engine {
             _ => {}
         }
         // Character not found - cursor doesn't move (Vim behavior)
+        false
     }
 
     /// Repeat the last character find motion.
@@ -1836,7 +1837,23 @@ impl Engine {
         if modifier == 'i' {
             // Inner: exclude brackets
             if open_pos < close_pos {
-                Some((open_pos + 1, close_pos))
+                let open_line = self.buffer().content.char_to_line(open_pos);
+                let close_line = self.buffer().content.char_to_line(close_pos);
+                if open_line != close_line {
+                    // Multiline: Vim makes inner bracket objects linewise —
+                    // delete from start of line after open bracket to start of
+                    // line with close bracket.
+                    let start = self.buffer().line_to_char(open_line + 1);
+                    let end = self.buffer().line_to_char(close_line);
+                    if start <= end {
+                        Some((start, end))
+                    } else {
+                        // Empty interior (brackets on adjacent lines)
+                        Some((start, start))
+                    }
+                } else {
+                    Some((open_pos + 1, close_pos))
+                }
             } else {
                 None
             }
@@ -3521,6 +3538,24 @@ impl Engine {
     /// Sets a register's content. `is_linewise` affects paste behavior.
     /// For `+` and `*` registers, also writes to the system clipboard.
     pub(crate) fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        // Uppercase register (A-Z): append to lowercase register
+        if reg.is_ascii_uppercase() {
+            let lower = reg.to_ascii_lowercase();
+            let (existing, existing_lw) = self.registers.get(&lower).cloned().unwrap_or_default();
+            let combined_lw = existing_lw || is_linewise;
+            let combined = if existing.is_empty() {
+                content.clone()
+            } else if existing_lw {
+                // Linewise: just concatenate (existing already ends with \n)
+                format!("{}{}", existing, content)
+            } else {
+                format!("{}\n{}", existing, content)
+            };
+            self.registers
+                .insert(lower, (combined.clone(), combined_lw));
+            self.registers.insert('"', (combined, combined_lw));
+            return;
+        }
         self.registers.insert(reg, (content.clone(), is_linewise));
         // Also copy to unnamed register if using a named register
         if reg != '"' {
