@@ -314,8 +314,12 @@ fn cmd_k_shorthand_mark() {
 fn cmd_pwd() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "pwd");
-    // Message should contain a path (has a / on unix)
-    assert!(e.message.contains('/'));
+    // Message should contain a path separator (/ on unix, \ on Windows)
+    assert!(
+        e.message.contains('/') || e.message.contains('\\'),
+        "pwd should show a path; got: {}",
+        e.message
+    );
 }
 
 #[test]
