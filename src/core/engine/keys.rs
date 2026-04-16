@@ -704,11 +704,7 @@ impl Engine {
                     let total = self.buffer().len_lines();
                     let cur_line = self.view().cursor.line + 1;
                     let col = self.view().cursor.col + 1;
-                    let pct = if total == 0 {
-                        0
-                    } else {
-                        (cur_line * 100) / total
-                    };
+                    let pct = (cur_line * 100).checked_div(total).unwrap_or(0);
                     self.message = format!(
                         "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
                     );

@@ -7,7 +7,11 @@
 //!
 //! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
 //! All rendering data comes from `render`.
-#![allow(unused_assignments)]
+#![allow(
+    unused_assignments,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop
+)]
 
 use std::collections::HashSet;
 use std::fs;
@@ -573,7 +577,7 @@ fn filter_dir_entries(all: &[PathBuf], query: &str) -> Vec<PathBuf> {
             dir_fuzzy_score(&display, &q).map(|s| (s, p))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
     scored
         .into_iter()
         .take(CAP)

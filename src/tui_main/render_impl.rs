@@ -2039,11 +2039,9 @@ pub(super) fn render_picker_popup(
         let track_len = visible_rows;
         let thumb_size = ((visible_rows * visible_rows) / total_items).max(1);
         let max_scroll = total_items.saturating_sub(visible_rows);
-        let thumb_offset = if max_scroll > 0 {
-            (picker.scroll_top * (track_len.saturating_sub(thumb_size))) / max_scroll
-        } else {
-            0
-        };
+        let thumb_offset = (picker.scroll_top * (track_len.saturating_sub(thumb_size)))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
         for row_off in 0..track_len {
             let ry = results_start + row_off as u16;
             if ry >= y + height - 1 || ry >= term_area.height {

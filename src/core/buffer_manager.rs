@@ -595,7 +595,7 @@ impl BufferState {
                     let end = pos + text.chars().count();
                     self.buffer.delete_range(*pos, end);
                     // Position cursor at the deletion point
-                    let safe_pos = (*pos).min(self.buffer.len_chars().saturating_sub(1).max(0));
+                    let safe_pos = (*pos).min(self.buffer.len_chars().saturating_sub(1));
                     let line = if self.buffer.len_chars() == 0 {
                         0
                     } else {
