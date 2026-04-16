@@ -1293,9 +1293,17 @@ impl Engine {
             }
             Some('S') => {
                 // S: substitute line (delete entire line content, enter insert mode)
+                // With auto_indent, preserve the leading whitespace (Vim behavior).
                 let count = self.take_count();
                 let start_line = self.view().cursor.line;
                 let _end_line = (start_line + count).min(self.buffer().len_lines());
+
+                // Capture indent before deletion
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(start_line)
+                } else {
+                    String::new()
+                };
 
                 self.start_undo_group();
 
@@ -1334,7 +1342,13 @@ impl Engine {
                     }
                 }
 
-                self.view_mut().cursor.col = 0;
+                // Re-insert preserved indent
+                if !indent.is_empty() {
+                    let line_start = self.buffer().line_to_char(start_line);
+                    self.insert_with_undo(line_start, &indent);
+                }
+
+                self.view_mut().cursor.col = indent.len();
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
                 self.count = None;
@@ -2398,8 +2412,12 @@ impl Engine {
                 }
             }
             'r' => {
-                // Replace character: r followed by a character replaces char under cursor
-                if let Some(replacement) = unicode {
+                // Replace character: r followed by a character replaces char under cursor.
+                // Special case: Return/Enter replaces with newline (splits line).
+                let replacement = unicode.or_else(|| {
+                    if key_name == "Return" { Some('\n') } else { None }
+                });
+                if let Some(replacement) = replacement {
                     let count = self.take_count();
                     self.start_undo_group();
                     self.replace_chars(replacement, count, changed);
