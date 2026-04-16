@@ -23960,3 +23960,226 @@ fn test_nvim_g_comma_changelist_forward() {
     assert!(pos_fwd.1 >= pos_back.1 || pos_fwd.0 > pos_back.0,
         "g, should move cursor forward in changelist");
 }
+
+// ── Phase 4 Batch 11: Marks, Registers, Join edge cases, Insert keys ──────
+
+// -- Mark operations --
+
+#[test]
+fn test_nvim_mark_overwrite() {
+    // Setting a mark twice overwrites the old position
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("ma");       // mark 'a' at line 0
+    engine.feed_keys("jjma");     // overwrite mark 'a' at line 2
+    engine.feed_keys("gg'a");     // jump to mark 'a'
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_nvim_mark_unset_error() {
+    // Jumping to an unset mark shows an error message
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "test\n");
+    engine.update_syntax();
+    engine.feed_keys("'z");
+    assert!(!engine.message.is_empty(), "should show error for unset mark");
+}
+
+#[test]
+fn test_nvim_mark_tick_first_nonblank() {
+    // ' (tick) jumps to mark's line at first non-blank character
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n    bbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("jllma");   // mark 'a' at line 1, col 6
+    engine.feed_keys("gg'a");     // tick-jump to mark 'a'
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 4); // first non-blank
+}
+
+#[test]
+fn test_nvim_mark_backtick_exact_col() {
+    // ` (backtick) jumps to exact line and column
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nfoo bar baz\n");
+    engine.update_syntax();
+    engine.feed_keys("jllllmb");  // mark 'b' at line 1, col 4
+    engine.feed_keys("gg`b");     // backtick-jump to mark 'b'
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+// -- Register operations --
+
+#[test]
+fn test_nvim_x_fills_unnamed_register() {
+    // x puts deleted char into unnamed register
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ABC\n");
+    engine.update_syntax();
+    engine.feed_keys("x");
+    let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(text, "A");
+    assert!(!is_linewise);
+}
+
+#[test]
+fn test_nvim_dd_fills_unnamed_linewise() {
+    // dd puts deleted line into unnamed register as linewise
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "first\nsecond\nthird\n");
+    engine.update_syntax();
+    engine.feed_keys("jdd");
+    let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(text, "second\n");
+    assert!(is_linewise);
+}
+
+#[test]
+fn test_nvim_dd_fills_register_1() {
+    // dd puts deleted line into numbered register 1
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    let (text, _) = engine.registers.get(&'1').cloned().unwrap_or_default();
+    assert_eq!(text, "one\n");
+}
+
+#[test]
+fn test_nvim_yank_register_0_preserved() {
+    // Register 0 holds last yank, not affected by deletes
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.feed_keys("yy");   // yank "alpha\n" to register 0
+    engine.feed_keys("jdd");  // delete "beta\n" to unnamed and register 1
+    let (reg0, _) = engine.registers.get(&'0').cloned().unwrap_or_default();
+    assert_eq!(reg0, "alpha\n");
+    // Unnamed register should now have the deleted text
+    let (unnamed, _) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(unnamed, "beta\n");
+}
+
+#[test]
+fn test_nvim_macro_record_and_play() {
+    // Record a macro into register q, then play it back
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n\n");
+    engine.update_syntax();
+    engine.feed_keys("qqiHello<Esc>q"); // record: insert "Hello"
+    engine.feed_keys("j@q");             // play on next line
+    assert_eq!(engine.buffer().to_string(), "Hello\nHello\n");
+}
+
+#[test]
+fn test_nvim_macro_with_count() {
+    // 3@q plays macro 3 times
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    engine.update_syntax();
+    engine.feed_keys("qqA!<Esc>q"); // record: append "!"
+    engine.feed_keys("3@q");        // play 3 more times
+    assert_eq!(engine.buffer().to_string(), "x!!!!\n");
+}
+
+// -- Join edge cases --
+
+#[test]
+fn test_nvim_J_last_line_noop() {
+    // J on the last line does nothing
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "only line\n");
+    engine.update_syntax();
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "only line\n");
+}
+
+#[test]
+fn test_nvim_J_with_empty_next_line() {
+    // J joining with an empty next line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("J");
+    // Vim joins "hello" with empty line, producing "hello " (trailing space)
+    // then "world" remains on the next line
+    assert_eq!(engine.buffer().to_string(), "hello \nworld\n");
+}
+
+#[test]
+fn test_nvim_gJ_preserves_leading_whitespace() {
+    // gJ joins without adding space, preserving second line's leading whitespace
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n  def\n");
+    engine.update_syntax();
+    engine.feed_keys("gJ");
+    assert_eq!(engine.buffer().to_string(), "abc  def\n");
+}
+
+#[test]
+fn test_nvim_4J_join_four_lines() {
+    // 4J joins four lines into one
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys("4J");
+    assert_eq!(engine.buffer().to_string(), "one two three four\nfive\n");
+}
+
+#[test]
+#[ignore = "vim deviation: J in visual line mode does not join selected lines"]
+fn test_nvim_visual_J_three_lines() {
+    // Visual select 3 lines then J joins them
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aa\nbb\ncc\ndd\n");
+    engine.update_syntax();
+    engine.feed_keys("VjjJ");
+    assert_eq!(engine.buffer().to_string(), "aa bb cc\ndd\n");
+}
+
+#[test]
+#[ignore = "vim deviation: :%join range not supported yet"]
+fn test_nvim_percent_join_command() {
+    // :%join joins all lines
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":%join<CR>");
+    assert_eq!(engine.buffer().to_string(), "a b c d\n");
+}
+
+// -- Insert mode editing keys --
+
+#[test]
+fn test_nvim_insert_ctrl_w_delete_word_back() {
+    // Ctrl-W in insert mode deletes word backward
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys("ihello world<C-w><Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello \n");
+}
+
+#[test]
+#[ignore = "vim deviation: Ctrl-U deletes to line start instead of insert start"]
+fn test_nvim_insert_ctrl_u_after_append() {
+    // Ctrl-U in insert mode should only delete text typed since entering insert mode
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "prefix\n");
+    engine.update_syntax();
+    engine.feed_keys("Asuffix<C-u><Esc>");
+    assert_eq!(engine.buffer().to_string(), "prefix\n");
+}
+
+#[test]
+fn test_nvim_insert_ctrl_w_at_line_start() {
+    // Ctrl-W at start of inserted text is a no-op
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("i<C-w><Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+}
