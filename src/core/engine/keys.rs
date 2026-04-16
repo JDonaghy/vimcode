@@ -901,6 +901,7 @@ impl Engine {
             }
             Some('o') => {
                 let count = self.take_count();
+                self.insert_open_count = count;
                 self.start_undo_group();
                 let line = self.view().cursor.line;
                 let indent = self.smart_indent_for_newline(line);
@@ -927,13 +928,8 @@ impl Engine {
                 } else {
                     line_end
                 };
-                // Insert newlines (with indent on the first new line for count==1).
-                // For count > 1 only the first new line gets the indent; the rest are blank.
-                let text = if count == 1 {
-                    format!("\n{}", indent)
-                } else {
-                    format!("\n{}{}", indent, "\n".repeat(count - 1))
-                };
+                // Open one new line (count is handled on Escape via insert_open_count)
+                let text = format!("\n{}", indent);
                 self.insert_with_undo(insert_pos, &text);
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.line += 1;
@@ -944,6 +940,7 @@ impl Engine {
             }
             Some('O') => {
                 let count = self.take_count();
+                self.insert_open_count = count;
                 self.start_undo_group();
                 let line = self.view().cursor.line;
                 let indent = if self.settings.auto_indent {
@@ -953,12 +950,8 @@ impl Engine {
                 };
                 let indent_len = indent.len();
                 let line_start = self.buffer().line_to_char(line);
-                // Insert indent + newlines above current line.
-                let text = if count == 1 {
-                    format!("{}\n", indent)
-                } else {
-                    format!("{}\n{}", indent, "\n".repeat(count - 1))
-                };
+                // Open one new line above (count is handled on Escape via insert_open_count)
+                let text = format!("{}\n", indent);
                 self.insert_with_undo(line_start, &text);
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.col = indent_len;
@@ -1528,8 +1521,15 @@ impl Engine {
                 self.visual_anchor = Some(self.view().cursor);
             }
             Some('V') => {
+                let count = self.take_count();
                 self.set_mode(Mode::VisualLine);
                 self.visual_anchor = Some(self.view().cursor);
+                // Count extends selection: 2V selects 2 lines (current + 1 below)
+                if count > 1 {
+                    let target = (self.view().cursor.line + count - 1)
+                        .min(self.buffer().len_lines().saturating_sub(1));
+                    self.view_mut().cursor.line = target;
+                }
             }
             Some('%') => {
                 let pre_line = self.view().cursor.line;
@@ -2330,8 +2330,15 @@ impl Engine {
             }
             '"' => {
                 // Register selection: "x sets selected_register for next operation
+                // Uppercase A-Z appends to lowercase register
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase() || ch == '"' || ch == '+' || ch == '*' {
+                    if ch.is_ascii_lowercase()
+                        || ch.is_ascii_uppercase()
+                        || ch == '"'
+                        || ch == '+'
+                        || ch == '*'
+                        || ch.is_ascii_digit()
+                    {
                         self.selected_register = Some(ch);
                     }
                 }
@@ -2443,6 +2450,34 @@ impl Engine {
                 }
             }
             '\'' => {
+                // d'{mark} / y'{mark} / c'{mark}: linewise operator to mark
+                if let Some(op) = self.pending_operator.take() {
+                    if let Some(ch) = unicode {
+                        let target_line = if ch.is_ascii_lowercase() {
+                            let buffer_id = self.active_window().buffer_id;
+                            self.marks
+                                .get(&buffer_id)
+                                .and_then(|m| m.get(&ch))
+                                .map(|c| c.line)
+                        } else if ch.is_ascii_uppercase() {
+                            self.global_marks.get(&ch).map(|&(_, line, _)| line)
+                        } else {
+                            None
+                        };
+                        if let Some(target) = target_line {
+                            let current = self.view().cursor.line;
+                            let (start, end) = if current <= target {
+                                (current, target)
+                            } else {
+                                (target, current)
+                            };
+                            self.apply_linewise_operator(op, start, end, changed);
+                        } else {
+                            self.message = format!("Mark '{}' not set", ch);
+                        }
+                    }
+                    return EngineAction::None;
+                }
                 // Jump to mark line: '{a-z|A-Z|'|.|<|>}
                 if let Some(ch) = unicode {
                     match ch {
@@ -3550,6 +3585,11 @@ impl Engine {
                 // Deferred: need one more keystroke for the target char
                 self.pending_find_operator = Some((operator, unicode.unwrap()));
             }
+            Some('\'') => {
+                // d'{mark}: linewise delete to mark — wait for mark char
+                self.pending_key = Some('\'');
+                self.pending_operator = Some(operator);
+            }
             _ => {
                 // Invalid motion - cancel operator
                 self.count = None;
@@ -3896,18 +3936,26 @@ impl Engine {
         target: char,
         changed: &mut bool,
     ) {
+        let count = self.take_count();
         let start_col = self.view().cursor.col;
         let line = self.view().cursor.line;
         let line_start = self.buffer().line_to_char(line);
 
-        // Execute the find motion
-        self.find_char(find_type, target);
+        // Execute the find motion (repeat for count)
+        let mut found = false;
+        for _ in 0..count {
+            if self.find_char(find_type, target) {
+                found = true;
+            } else {
+                break;
+            }
+        }
         self.last_find = Some((find_type, target));
 
-        let end_col = self.view().cursor.col;
-        if end_col == start_col {
-            return; // find_char didn't move — no match found
+        if !found {
+            return; // find_char found no match
         }
+        let end_col = self.view().cursor.col;
 
         // Calculate range
         let (range_start, range_end) = if find_type == 'f' || find_type == 't' {
@@ -4946,6 +4994,28 @@ impl Engine {
                         self.finish_undo_group();
                     }
                 }
+                // Repeat o/O insert for count > 1: duplicate typed text on new lines
+                if self.insert_open_count > 1 && !self.insert_text_buffer.is_empty() {
+                    let text = self.insert_text_buffer.clone();
+                    let repeat = self.insert_open_count - 1;
+                    self.start_undo_group();
+                    for _ in 0..repeat {
+                        let line = self.view().cursor.line;
+                        let line_start = self.buffer().line_to_char(line);
+                        let line_len = self.buffer().line_len_chars(line);
+                        // Insert before the trailing newline
+                        let insert_pos = line_start + line_len;
+                        let has_nl =
+                            line_len > 0 && self.buffer().content.char(insert_pos - 1) == '\n';
+                        let insert_pos = if has_nl { insert_pos - 1 } else { insert_pos };
+                        let new_line = format!("\n{}", text);
+                        self.insert_with_undo(insert_pos, &new_line);
+                        self.view_mut().cursor.line += 1;
+                        self.view_mut().cursor.col = text.chars().count();
+                    }
+                    self.finish_undo_group();
+                }
+                self.insert_open_count = 0;
                 // Track cursor pos for gi (insert at last insert position)
                 let cur = self.view().cursor;
                 self.last_insert_pos = Some((cur.line, cur.col));
@@ -5908,6 +5978,7 @@ impl Engine {
         if key_name == "Escape" {
             self.mode = Mode::Normal;
             self.visual_anchor = None;
+            self.visual_dollar = false;
             self.count = None; // Clear count on mode exit
             return EngineAction::None;
         }
@@ -6260,9 +6331,10 @@ impl Engine {
         // Handle multi-key sequences (gg, {, }, text objects, register selection)
         if let Some(pending) = self.pending_key.take() {
             if pending == '"' {
-                // Register selection: "x
+                // Register selection: "x (uppercase A-Z appends to lowercase)
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase()
+                        || ch.is_ascii_uppercase()
                         || ch.is_ascii_digit()
                         || ch == '"'
                         || ch == '+'
@@ -6371,6 +6443,36 @@ impl Engine {
                     }
                 }
                 return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('u') {
+                // gu in visual mode: lowercase selection
+                self.count = None;
+                self.lowercase_visual_selection(changed);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('U') {
+                // gU in visual mode: uppercase selection
+                self.count = None;
+                self.uppercase_visual_selection(changed);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('~') {
+                // g~ in visual mode: toggle case of selection
+                self.count = None;
+                self.transform_visual_selection(
+                    |s| {
+                        s.chars()
+                            .map(|c| {
+                                if c.is_uppercase() {
+                                    c.to_lowercase().next().unwrap_or(c)
+                                } else if c.is_lowercase() {
+                                    c.to_uppercase().next().unwrap_or(c)
+                                } else {
+                                    c
+                                }
+                            })
+                            .collect()
+                    },
+                    changed,
+                );
+                return EngineAction::None;
             }
         }
 
@@ -6418,13 +6520,18 @@ impl Engine {
                     self.move_word_end();
                 }
             }
-            Some('0') => self.view_mut().cursor.col = 0,
+            Some('0') => {
+                self.view_mut().cursor.col = 0;
+                self.visual_dollar = false;
+            }
             Some('$') => {
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
+                self.visual_dollar = true;
             }
             Some('g') => {
                 self.pending_key = Some('g');
+                self.visual_dollar = false;
             }
             Some('G') => {
                 let last_line = self.buffer().len_lines().saturating_sub(1);

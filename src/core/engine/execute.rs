@@ -17,6 +17,13 @@ impl Engine {
         let normalized = normalize_ex_command(cmd);
         let cmd: &str = &normalized;
 
+        // Handle :{range}{cmd} — commands with line number prefixes (e.g. :2d, :3,5d)
+        if cmd.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            if let Some(action) = self.try_execute_ranged_command(cmd) {
+                return action;
+            }
+        }
+
         // Handle :term / :terminal — open integrated terminal
         if cmd == "terminal" {
             return EngineAction::OpenTerminal;
@@ -3076,5 +3083,85 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Try to parse and execute a ranged ex command like `:2d`, `:3,5d`, `:10y`.
+    /// Returns `Some(action)` if it handled the command, `None` otherwise.
+    fn try_execute_ranged_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        // Parse leading range: N or N,M
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+
+        // Parse first number
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+        let first_num: usize = cmd[..i].parse().ok()?;
+
+        let (start_line, end_line, rest) = if i < bytes.len() && bytes[i] == b',' {
+            // Range: N,M
+            let comma = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let second_num: usize = cmd[comma + 1..i].parse().ok()?;
+            (first_num, second_num, &cmd[i..])
+        } else {
+            // Single line: N
+            (first_num, first_num, &cmd[i..])
+        };
+
+        let rest = rest.trim();
+        let max_line = self.buffer().len_lines();
+        let start = start_line.min(max_line);
+        let end = end_line.min(max_line);
+
+        match rest {
+            "d" | "delete" => {
+                // :Nd or :N,Md — delete lines (1-indexed)
+                if start == 0 || end == 0 || start > end {
+                    self.message = "Invalid range".to_string();
+                    return Some(EngineAction::None);
+                }
+                let start_0 = start - 1;
+                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
+                let count = end_0 - start_0 + 1;
+                self.view_mut().cursor.line = start_0;
+                self.view_mut().cursor.col = 0;
+                let mut changed = false;
+                self.start_undo_group();
+                self.delete_lines(count, &mut changed);
+                self.finish_undo_group();
+                Some(EngineAction::None)
+            }
+            "y" | "yank" => {
+                // :Ny or :N,My — yank lines (1-indexed)
+                if start == 0 || end == 0 || start > end {
+                    self.message = "Invalid range".to_string();
+                    return Some(EngineAction::None);
+                }
+                let start_0 = start - 1;
+                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
+                let saved = self.view().cursor;
+                self.view_mut().cursor.line = start_0;
+                let count = end_0 - start_0 + 1;
+                self.yank_lines(count);
+                self.view_mut().cursor = saved;
+                Some(EngineAction::None)
+            }
+            _ if rest.is_empty() && first_num > 0 => {
+                // :N alone — go to line N (1-indexed)
+                let target = (first_num - 1).min(self.buffer().len_lines().saturating_sub(1));
+                self.view_mut().cursor.line = target;
+                self.view_mut().cursor.col = 0;
+                self.clamp_cursor_col();
+                Some(EngineAction::None)
+            }
+            _ => None, // Unknown ranged command — fall through
+        }
     }
 }

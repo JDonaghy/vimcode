@@ -57,10 +57,15 @@ impl Engine {
             Mode::Visual => {
                 // Character mode: extract from start to end (inclusive)
                 let start_char = self.buffer().line_to_char(start.line) + start.col;
-                let end_char = self.buffer().line_to_char(end.line) + end.col;
+                let mut end_char_inclusive = self.buffer().line_to_char(end.line) + end.col + 1;
 
-                // Include the character at the end position (Vim-like inclusive)
-                let end_char_inclusive = (end_char + 1).min(self.buffer().len_chars());
+                // When $ was used, extend through the newline (Vim curswant=MAXCOL)
+                if self.visual_dollar {
+                    let line_len = self.buffer().line_len_chars(end.line);
+                    end_char_inclusive = self.buffer().line_to_char(end.line) + line_len;
+                }
+
+                let end_char_inclusive = end_char_inclusive.min(self.buffer().len_chars());
 
                 let text = self
                     .buffer()
@@ -141,6 +146,7 @@ impl Engine {
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+        self.visual_dollar = false;
     }
 
     pub fn delete_visual_selection(&mut self, changed: &mut bool) {
@@ -174,7 +180,13 @@ impl Engine {
                 Mode::Visual => {
                     // Delete characters
                     let start_char = self.buffer().line_to_char(start.line) + start.col;
-                    let end_char = self.buffer().line_to_char(end.line) + end.col + 1;
+                    let mut end_char = self.buffer().line_to_char(end.line) + end.col + 1;
+
+                    // When $ was used, extend through the newline (Vim curswant=MAXCOL)
+                    if self.visual_dollar {
+                        let line_len = self.buffer().line_len_chars(end.line);
+                        end_char = self.buffer().line_to_char(end.line) + line_len;
+                    }
 
                     self.delete_with_undo(start_char, end_char.min(self.buffer().len_chars()));
 
@@ -220,6 +232,7 @@ impl Engine {
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+        self.visual_dollar = false;
     }
 
     /// Paste over visual selection: replace selected text with register content.
@@ -403,6 +416,7 @@ impl Engine {
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+        self.visual_dollar = false;
     }
 }
 
