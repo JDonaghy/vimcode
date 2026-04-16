@@ -310,8 +310,53 @@ impl Engine {
     }
 
     pub(crate) fn change_visual_selection(&mut self, changed: &mut bool) {
-        // Change is like delete, but then enter insert mode
-        self.delete_visual_selection(changed);
+        let was_visual_line = self.mode == Mode::VisualLine;
+
+        if was_visual_line {
+            // In visual-line mode, "c" replaces the selected lines with an
+            // empty line and enters insert mode on it (Vim behavior).  We
+            // delete the line *contents* of all selected lines and collapse
+            // them into a single empty line, preserving the trailing newline
+            // so text typed afterwards stays on its own line.
+            if let Some((text, _)) = self.get_visual_selection_text() {
+                let reg = self.selected_register.unwrap_or('"');
+                self.set_delete_register(reg, text, true);
+                self.selected_register = None;
+            }
+            if let Some((start, end)) = self.get_visual_selection_range() {
+                self.start_undo_group();
+                let start_char = self.buffer().line_to_char(start.line);
+                // Delete up to (but not including) the newline of the last selected line,
+                // unless the last selected line is the very last line in the buffer.
+                let end_char = if end.line + 1 < self.buffer().len_lines() {
+                    // There's a line after the selection — delete through
+                    // end.line's newline but stop before end.line+1's content.
+                    self.buffer().line_to_char(end.line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+                // We want to leave a single empty line.  Delete everything
+                // from start_char..end_char, then re-insert a "\n" if we
+                // consumed the trailing newline of the last selected line.
+                let deleted_trailing_nl = end.line + 1 < self.buffer().len_lines();
+                self.delete_with_undo(start_char, end_char);
+                if deleted_trailing_nl {
+                    // Re-insert the newline we consumed so the cursor sits
+                    // on its own (empty) line.
+                    self.insert_with_undo(start_char, "\n");
+                }
+                self.finish_undo_group();
+                *changed = true;
+                self.view_mut().cursor.line = start.line;
+                self.view_mut().cursor.col = 0;
+            }
+            // Exit visual mode, enter insert mode
+            self.visual_anchor = None;
+            self.visual_dollar = false;
+        } else {
+            // Charwise / blockwise: delete selection normally
+            self.delete_visual_selection(changed);
+        }
 
         // The delete already finished the undo group and set mode to Normal
         // Now start a new undo group for the insert mode typing

@@ -1677,14 +1677,25 @@ impl Engine {
             end += 1;
         }
 
-        // For 'aw', include trailing whitespace
+        // For 'aw', include trailing whitespace; if none, include leading whitespace
         if modifier == 'a' {
+            let end_before = end;
             while end < total_chars {
                 let ch = self.buffer().content.char(end);
                 if !ch.is_whitespace() || ch == '\n' {
                     break;
                 }
                 end += 1;
+            }
+            // No trailing whitespace consumed — try leading instead
+            if end == end_before {
+                while start > 0 {
+                    let ch = self.buffer().content.char(start - 1);
+                    if !ch.is_whitespace() || ch == '\n' {
+                        break;
+                    }
+                    start -= 1;
+                }
             }
         }
 

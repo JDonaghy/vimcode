@@ -1293,9 +1293,17 @@ impl Engine {
             }
             Some('S') => {
                 // S: substitute line (delete entire line content, enter insert mode)
+                // With auto_indent, preserve the leading whitespace (Vim behavior).
                 let count = self.take_count();
                 let start_line = self.view().cursor.line;
                 let _end_line = (start_line + count).min(self.buffer().len_lines());
+
+                // Capture indent before deletion
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(start_line)
+                } else {
+                    String::new()
+                };
 
                 self.start_undo_group();
 
@@ -1334,7 +1342,13 @@ impl Engine {
                     }
                 }
 
-                self.view_mut().cursor.col = 0;
+                // Re-insert preserved indent
+                if !indent.is_empty() {
+                    let line_start = self.buffer().line_to_char(start_line);
+                    self.insert_with_undo(line_start, &indent);
+                }
+
+                self.view_mut().cursor.col = indent.len();
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
                 self.count = None;
@@ -2398,8 +2412,12 @@ impl Engine {
                 }
             }
             'r' => {
-                // Replace character: r followed by a character replaces char under cursor
-                if let Some(replacement) = unicode {
+                // Replace character: r followed by a character replaces char under cursor.
+                // Special case: Return/Enter replaces with newline (splits line).
+                let replacement = unicode.or_else(|| {
+                    if key_name == "Return" { Some('\n') } else { None }
+                });
+                if let Some(replacement) = replacement {
                     let count = self.take_count();
                     self.start_undo_group();
                     self.replace_chars(replacement, count, changed);
@@ -2485,8 +2503,9 @@ impl Engine {
                             // '' jump to position before last jump
                             if let Some((line, _)) = self.last_jump_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
-                                self.view_mut().cursor.col = 0;
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous jump position".to_string();
@@ -2496,8 +2515,9 @@ impl Engine {
                             // '. jump to last edit position
                             if let Some((line, _)) = self.last_edit_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
-                                self.view_mut().cursor.col = 0;
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous edit position".to_string();
@@ -2507,8 +2527,9 @@ impl Engine {
                             // '< jump to start of last visual selection
                             if let Some((line, _)) = self.visual_mark_start {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
-                                self.view_mut().cursor.col = 0;
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous visual selection".to_string();
@@ -2518,8 +2539,9 @@ impl Engine {
                             // '> jump to end of last visual selection
                             if let Some((line, _)) = self.visual_mark_end {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
-                                self.view_mut().cursor.col = 0;
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous visual selection".to_string();
@@ -2529,8 +2551,9 @@ impl Engine {
                             let buffer_id = self.active_window().buffer_id;
                             if let Some(buffer_marks) = self.marks.get(&buffer_id) {
                                 if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                    self.view_mut().cursor.line = mark_cursor.line;
-                                    self.view_mut().cursor.col = 0;
+                                    let target = mark_cursor.line;
+                                    self.view_mut().cursor.line = target;
+                                    self.view_mut().cursor.col = self.first_non_blank_col(target);
                                     self.clamp_cursor_col();
                                 } else {
                                     self.message = format!("Mark '{}' not set", ch);
@@ -2542,8 +2565,9 @@ impl Engine {
                         _ if ch.is_ascii_uppercase() => {
                             if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
-                                self.view_mut().cursor.col = 0;
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
@@ -7615,6 +7639,26 @@ impl Engine {
             } else {
                 self.handle_key(&ch.to_string(), Some(ch), false);
             }
+            // Drain macro playback queue (populated by @q etc.)
+            self.drain_macro_queue();
+        }
+    }
+
+    /// Drain the macro playback queue, executing each queued keystroke.
+    fn drain_macro_queue(&mut self) {
+        // Guard against infinite recursion from self-referencing macros
+        let max_iterations = 100_000;
+        let mut iterations = 0;
+        while !self.macro_playback_queue.is_empty() && iterations < max_iterations {
+            if let Some((key_name, unicode, ctrl, consumed)) = self.decode_macro_sequence() {
+                for _ in 0..consumed {
+                    self.macro_playback_queue.pop_front();
+                }
+                self.handle_key(&key_name, unicode, ctrl);
+            } else {
+                self.macro_playback_queue.pop_front();
+            }
+            iterations += 1;
         }
     }
 }

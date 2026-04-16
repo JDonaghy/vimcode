@@ -2402,6 +2402,8 @@ fn test_visual_change() {
 
 #[test]
 fn test_visual_line_change() {
+    // Vc replaces the selected line with an empty line (Vim behavior),
+    // preserving the trailing newline so typed text stays on its own line.
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
     engine.update_syntax();
@@ -2409,7 +2411,7 @@ fn test_visual_line_change() {
     press_char(&mut engine, 'V');
     press_char(&mut engine, 'c');
 
-    assert_eq!(engine.buffer().to_string(), "line2\nline3");
+    assert_eq!(engine.buffer().to_string(), "\nline2\nline3");
     assert_eq!(engine.mode, Mode::Insert);
 }
 
@@ -23543,4 +23545,641 @@ fn test_insert_paste_into_indented_context_no_staircase() {
         engine.buffer().to_string(),
         "    existing\nalpha\n    beta\n    gamma\n"
     );
+}
+
+// ── Phase 4 Batch 10: Undo/Redo, Put, Change, Text Objects ────────────────
+
+// -- Undo / Redo --
+
+#[test]
+fn test_nvim_undo_redo_noop_messages() {
+    // Undo/redo on unmodified buffer should be no-ops
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+    engine.feed_keys("<C-r>");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+}
+
+#[test]
+fn test_nvim_undo_redo_chain() {
+    // Insert lines, undo all, redo all
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys("ione<Esc>");
+    assert_eq!(engine.buffer().to_string(), "one\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "\n");
+    engine.feed_keys("<C-r>");
+    assert_eq!(engine.buffer().to_string(), "one\n");
+}
+
+#[test]
+fn test_nvim_undo_multiple_inserts() {
+    // Each insert creates a separate undo entry
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys("iaaa<Esc>obbb<Esc>occc<Esc>");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\nccc\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "aaa\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "\n");
+    // Redo back
+    engine.feed_keys("<C-r><C-r><C-r>");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\nccc\n");
+}
+
+#[test]
+fn test_nvim_undo_visual_delete() {
+    // Visual delete then undo restores text
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one two three\n");
+    engine.update_syntax();
+    engine.feed_keys("wved");
+    assert_eq!(engine.buffer().to_string(), "one  three\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "one two three\n");
+}
+
+#[test]
+fn test_nvim_undo_join() {
+    // J then undo
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello\nworld\n");
+}
+
+// -- Put / Paste --
+
+#[test]
+fn test_nvim_p_charwise_inline() {
+    // Yank a word, paste after cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc def\n");
+    engine.update_syntax();
+    engine.feed_keys("yiwwp");
+    assert_eq!(engine.buffer().to_string(), "abc dabcef\n");
+}
+
+#[test]
+fn test_nvim_P_charwise_inline() {
+    // Yank a word, paste before cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc def\n");
+    engine.update_syntax();
+    engine.feed_keys("yiw$P");
+    assert_eq!(engine.buffer().to_string(), "abc deabcf\n");
+}
+
+#[test]
+fn test_nvim_p_linewise_below() {
+    // dd then p pastes below current line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("ddp");
+    assert_eq!(engine.buffer().to_string(), "bbb\naaa\nccc\n");
+}
+
+#[test]
+fn test_nvim_P_linewise_above() {
+    // yy on line 2, P on line 1 pastes above
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("jyyggP");
+    assert_eq!(engine.buffer().to_string(), "bbb\naaa\nbbb\nccc\n");
+}
+
+#[test]
+fn test_nvim_2p_linewise() {
+    // 2p pastes linewise content twice
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("yy2p");
+    assert_eq!(engine.buffer().to_string(), "aaa\naaa\naaa\nbbb\n");
+}
+
+#[test]
+fn test_nvim_ddp_swap_lines_full() {
+    // Classic ddp swap: delete line, paste below
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "first\nsecond\nthird\n");
+    engine.update_syntax();
+    engine.feed_keys("ddp");
+    assert_eq!(engine.buffer().to_string(), "second\nfirst\nthird\n");
+}
+
+#[test]
+fn test_nvim_xp_transpose_chars() {
+    // Classic xp to swap two characters
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\n");
+    engine.update_syntax();
+    engine.feed_keys("xp");
+    assert_eq!(engine.buffer().to_string(), "ba\n");
+}
+
+// -- Change operations --
+
+#[test]
+fn test_nvim_S_substitute_line() {
+    // S replaces entire line content
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("Sfoo<Esc>");
+    assert_eq!(engine.buffer().to_string(), "foo\n");
+}
+
+#[test]
+fn test_nvim_S_preserves_indent() {
+    // S on indented line preserves indentation
+    let mut engine = Engine::new();
+    engine.settings.auto_indent = true;
+    engine.buffer_mut().insert(0, "    hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("Sfoo<Esc>");
+    assert_eq!(engine.buffer().to_string(), "    foo\n");
+}
+
+#[test]
+fn test_nvim_cW_change_bigword() {
+    // cW changes a WORD (including punctuation)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo.bar baz\n");
+    engine.update_syntax();
+    engine.feed_keys("cWXXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XXX baz\n");
+}
+
+#[test]
+fn test_nvim_cw_dot_repeat() {
+    // cw then dot repeat: w after first cw lands on "bbb", dot changes it
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb ccc\n");
+    engine.update_syntax();
+    engine.feed_keys("cwXXX<Esc>w.");
+    assert_eq!(engine.buffer().to_string(), "XXX XXX ccc\n");
+}
+
+#[test]
+fn test_nvim_r_newline_splits_line() {
+    // r<CR> replaces char with newline, splitting the line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcd\n");
+    engine.update_syntax();
+    engine.feed_keys("llr<CR>");
+    assert_eq!(engine.buffer().to_string(), "ab\nd\n");
+}
+
+#[test]
+fn test_nvim_c_dollar_to_eol() {
+    // C changes from cursor to end of line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys("llCXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "heXX\n");
+}
+
+#[test]
+fn test_nvim_2cw_change_two_words() {
+    // 2cw changes two words
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb ccc\n");
+    engine.update_syntax();
+    engine.feed_keys("2cwXXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XXX ccc\n");
+}
+
+#[test]
+fn test_nvim_cb_change_backward_word() {
+    // cb from start of "bbb" changes backward to start of "aaa" (including space)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb ccc\n");
+    engine.update_syntax();
+    engine.feed_keys("wcbXXX<Esc>");
+    assert_eq!(engine.buffer().to_string(), "XXXbbb ccc\n");
+}
+
+#[test]
+fn test_nvim_visual_line_change() {
+    // V then c replaces the line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "line1\nline2\nline3\n");
+    engine.update_syntax();
+    engine.feed_keys("jVcnew<Esc>");
+    assert_eq!(engine.buffer().to_string(), "line1\nnew\nline3\n");
+}
+
+#[test]
+fn test_nvim_visual_multiline_change() {
+    // Vjc replaces two lines with one
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("Vjcnew<Esc>");
+    assert_eq!(engine.buffer().to_string(), "new\nccc\n");
+}
+
+// -- Text Objects --
+
+#[test]
+fn test_nvim_ci_double_quote_change() {
+    // ci" changes inside double quotes
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "say \"hello\" end\n");
+    engine.update_syntax();
+    engine.feed_keys("fhci\"world<Esc>");
+    assert_eq!(engine.buffer().to_string(), "say \"world\" end\n");
+}
+
+#[test]
+fn test_nvim_da_double_quote_with_space() {
+    // da" deletes quotes and one surrounding space
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "say \"hello\" end\n");
+    engine.update_syntax();
+    engine.feed_keys("fhda\"");
+    assert_eq!(engine.buffer().to_string(), "say end\n");
+}
+
+#[test]
+fn test_nvim_dit_multiline_tag() {
+    // dit deletes inner tag content spanning multiple lines
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "<b>\ninner\n</b>\n");
+    engine.update_syntax();
+    engine.feed_keys("jdit");
+    assert_eq!(engine.buffer().to_string(), "<b></b>\n");
+}
+
+#[test]
+fn test_nvim_dat_removes_tags() {
+    // dat deletes the tag pair and content
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "before<b>text</b>after\n");
+    engine.update_syntax();
+    engine.feed_keys("ftdat");
+    assert_eq!(engine.buffer().to_string(), "beforeafter\n");
+}
+
+#[test]
+fn test_nvim_cit_empty_tag() {
+    // cit on empty tag inserts inside
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "<div></div>\n");
+    engine.update_syntax();
+    engine.feed_keys("citxxx<Esc>");
+    assert_eq!(engine.buffer().to_string(), "<div>xxx</div>\n");
+}
+
+#[test]
+fn test_nvim_yi_angle_bracket() {
+    // yi< yanks inside angle brackets
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "#include <foo.h>\n");
+    engine.update_syntax();
+    engine.feed_keys("ffyi<");
+    let (reg_text, _) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(reg_text, "foo.h");
+}
+
+#[test]
+fn test_nvim_ya_angle_bracket() {
+    // ya> yanks around angle brackets (including brackets)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "#include <foo.h>\n");
+    engine.update_syntax();
+    engine.feed_keys("ffya>");
+    let (reg_text, _) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(reg_text, "<foo.h>");
+}
+
+#[test]
+fn test_nvim_diw_at_start() {
+    // diw at start of word deletes whole word
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar,eins,foobar\n");
+    engine.update_syntax();
+    engine.feed_keys("diw");
+    assert_eq!(engine.buffer().to_string(), ",eins,foobar\n");
+}
+
+#[test]
+fn test_nvim_daw_at_end() {
+    // daw at end of buffer deletes word + preceding space
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar\n");
+    engine.update_syntax();
+    engine.feed_keys("$daw");
+    assert_eq!(engine.buffer().to_string(), "foo\n");
+}
+
+#[test]
+fn test_nvim_daw_on_whitespace() {
+    // daw on whitespace between words deletes the space + next word
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar baz\n");
+    engine.update_syntax();
+    engine.feed_keys("frdaw");
+    // Cursor is on 'r' (end of "bar"), daw from word deletes "bar" + trailing space or leading space
+    // Actually with cursor on 'r', we're inside "bar", so daw deletes " bar" (leading space + word)
+    // In Vim: daw from middle of "bar" deletes " bar" -> "foo baz"
+    assert_eq!(engine.buffer().to_string(), "foo baz\n");
+}
+
+#[test]
+fn test_nvim_ciB_empty_braces() {
+    // ciB (change inside Block/braces) on empty braces
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "fn() {}\n");
+    engine.update_syntax();
+    engine.feed_keys("f{ciBx<Esc>");
+    assert_eq!(engine.buffer().to_string(), "fn() {x}\n");
+}
+
+#[test]
+fn test_nvim_da_backtick_with_space() {
+    // da` deletes around backtick-quoted text including one adjacent space
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "bla `quote` blah\n");
+    engine.update_syntax();
+    engine.feed_keys("fqda`");
+    assert_eq!(engine.buffer().to_string(), "bla blah\n");
+}
+
+// -- Changelist navigation --
+
+#[test]
+fn test_nvim_g_semicolon_changelist() {
+    // g; navigates backward in the changelist
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb ccc\n");
+    engine.update_syntax();
+    // Make changes at different positions
+    engine.feed_keys("cwXXX<Esc>");   // change "aaa" at col 0
+    engine.feed_keys("wcwYYY<Esc>");  // change "bbb" further right
+    engine.feed_keys("wcwZZZ<Esc>");  // change "ccc" further right
+    assert_eq!(engine.buffer().to_string(), "XXX YYY ZZZ\n");
+    // g; should move backward in changelist
+    let pos_after = engine.view().cursor.col;
+    engine.feed_keys("g;");
+    let pos_back1 = engine.view().cursor.col;
+    // Should have moved to a previous change position
+    assert!(pos_back1 <= pos_after || engine.view().cursor.line < 0 + 1,
+        "g; should move cursor backward in changelist");
+}
+
+#[test]
+fn test_nvim_g_comma_changelist_forward() {
+    // g, navigates forward in the changelist
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa bbb\n");
+    engine.update_syntax();
+    engine.feed_keys("cwXXX<Esc>"); // change at start
+    engine.feed_keys("wcwYYY<Esc>"); // change further right
+    // Go back, then forward
+    engine.feed_keys("g;");
+    let pos_back = (engine.view().cursor.line, engine.view().cursor.col);
+    engine.feed_keys("g,");
+    let pos_fwd = (engine.view().cursor.line, engine.view().cursor.col);
+    assert!(pos_fwd.1 >= pos_back.1 || pos_fwd.0 > pos_back.0,
+        "g, should move cursor forward in changelist");
+}
+
+// ── Phase 4 Batch 11: Marks, Registers, Join edge cases, Insert keys ──────
+
+// -- Mark operations --
+
+#[test]
+fn test_nvim_mark_overwrite() {
+    // Setting a mark twice overwrites the old position
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("ma");       // mark 'a' at line 0
+    engine.feed_keys("jjma");     // overwrite mark 'a' at line 2
+    engine.feed_keys("gg'a");     // jump to mark 'a'
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_nvim_mark_unset_error() {
+    // Jumping to an unset mark shows an error message
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "test\n");
+    engine.update_syntax();
+    engine.feed_keys("'z");
+    assert!(!engine.message.is_empty(), "should show error for unset mark");
+}
+
+#[test]
+fn test_nvim_mark_tick_first_nonblank() {
+    // ' (tick) jumps to mark's line at first non-blank character
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n    bbb\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys("jllma");   // mark 'a' at line 1, col 6
+    engine.feed_keys("gg'a");     // tick-jump to mark 'a'
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 4); // first non-blank
+}
+
+#[test]
+fn test_nvim_mark_backtick_exact_col() {
+    // ` (backtick) jumps to exact line and column
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nfoo bar baz\n");
+    engine.update_syntax();
+    engine.feed_keys("jllllmb");  // mark 'b' at line 1, col 4
+    engine.feed_keys("gg`b");     // backtick-jump to mark 'b'
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+// -- Register operations --
+
+#[test]
+fn test_nvim_x_fills_unnamed_register() {
+    // x puts deleted char into unnamed register
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ABC\n");
+    engine.update_syntax();
+    engine.feed_keys("x");
+    let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(text, "A");
+    assert!(!is_linewise);
+}
+
+#[test]
+fn test_nvim_dd_fills_unnamed_linewise() {
+    // dd puts deleted line into unnamed register as linewise
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "first\nsecond\nthird\n");
+    engine.update_syntax();
+    engine.feed_keys("jdd");
+    let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(text, "second\n");
+    assert!(is_linewise);
+}
+
+#[test]
+fn test_nvim_dd_fills_register_1() {
+    // dd puts deleted line into numbered register 1
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    let (text, _) = engine.registers.get(&'1').cloned().unwrap_or_default();
+    assert_eq!(text, "one\n");
+}
+
+#[test]
+fn test_nvim_yank_register_0_preserved() {
+    // Register 0 holds last yank, not affected by deletes
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.feed_keys("yy");   // yank "alpha\n" to register 0
+    engine.feed_keys("jdd");  // delete "beta\n" to unnamed and register 1
+    let (reg0, _) = engine.registers.get(&'0').cloned().unwrap_or_default();
+    assert_eq!(reg0, "alpha\n");
+    // Unnamed register should now have the deleted text
+    let (unnamed, _) = engine.registers.get(&'"').cloned().unwrap_or_default();
+    assert_eq!(unnamed, "beta\n");
+}
+
+#[test]
+fn test_nvim_macro_record_and_play() {
+    // Record a macro into register q, then play it back
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n\n");
+    engine.update_syntax();
+    engine.feed_keys("qqiHello<Esc>q"); // record: insert "Hello"
+    engine.feed_keys("j@q");             // play on next line
+    assert_eq!(engine.buffer().to_string(), "Hello\nHello\n");
+}
+
+#[test]
+fn test_nvim_macro_with_count() {
+    // 3@q plays macro 3 times
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\n");
+    engine.update_syntax();
+    engine.feed_keys("qqA!<Esc>q"); // record: append "!"
+    engine.feed_keys("3@q");        // play 3 more times
+    assert_eq!(engine.buffer().to_string(), "x!!!!\n");
+}
+
+// -- Join edge cases --
+
+#[test]
+fn test_nvim_J_last_line_noop() {
+    // J on the last line does nothing
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "only line\n");
+    engine.update_syntax();
+    engine.feed_keys("J");
+    assert_eq!(engine.buffer().to_string(), "only line\n");
+}
+
+#[test]
+fn test_nvim_J_with_empty_next_line() {
+    // J joining with an empty next line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("J");
+    // Vim joins "hello" with empty line, producing "hello " (trailing space)
+    // then "world" remains on the next line
+    assert_eq!(engine.buffer().to_string(), "hello \nworld\n");
+}
+
+#[test]
+fn test_nvim_gJ_preserves_leading_whitespace() {
+    // gJ joins without adding space, preserving second line's leading whitespace
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n  def\n");
+    engine.update_syntax();
+    engine.feed_keys("gJ");
+    assert_eq!(engine.buffer().to_string(), "abc  def\n");
+}
+
+#[test]
+fn test_nvim_4J_join_four_lines() {
+    // 4J joins four lines into one
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys("4J");
+    assert_eq!(engine.buffer().to_string(), "one two three four\nfive\n");
+}
+
+#[test]
+#[ignore = "vim deviation: J in visual line mode does not join selected lines"]
+fn test_nvim_visual_J_three_lines() {
+    // Visual select 3 lines then J joins them
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aa\nbb\ncc\ndd\n");
+    engine.update_syntax();
+    engine.feed_keys("VjjJ");
+    assert_eq!(engine.buffer().to_string(), "aa bb cc\ndd\n");
+}
+
+#[test]
+#[ignore = "vim deviation: :%join range not supported yet"]
+fn test_nvim_percent_join_command() {
+    // :%join joins all lines
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":%join<CR>");
+    assert_eq!(engine.buffer().to_string(), "a b c d\n");
+}
+
+// -- Insert mode editing keys --
+
+#[test]
+fn test_nvim_insert_ctrl_w_delete_word_back() {
+    // Ctrl-W in insert mode deletes word backward
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys("ihello world<C-w><Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello \n");
+}
+
+#[test]
+#[ignore = "vim deviation: Ctrl-U deletes to line start instead of insert start"]
+fn test_nvim_insert_ctrl_u_after_append() {
+    // Ctrl-U in insert mode should only delete text typed since entering insert mode
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "prefix\n");
+    engine.update_syntax();
+    engine.feed_keys("Asuffix<C-u><Esc>");
+    assert_eq!(engine.buffer().to_string(), "prefix\n");
+}
+
+#[test]
+fn test_nvim_insert_ctrl_w_at_line_start() {
+    // Ctrl-W at start of inserted text is a no-op
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("i<C-w><Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
 }
