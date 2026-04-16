@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 15, 2026 (Session 281 — Fix linewise paste, Phase 3 Lua API) | **Tests:** 1485 (lib) + 31 (nvim conformance)
+**Last updated:** Apr 15, 2026 (Session 281 — Linewise paste fix, Phase 3 Lua API, Phase 4 test mining) | **Tests:** 1679 (lib) + 31 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -30,7 +30,8 @@ When implementing a new key/command, add tests covering:
 
 1. **Fix #64: Linewise paste (P/p) lost `is_linewise` through clipboard round-trip** — Two bugs: (a) Win-GUI `clipboard_write` passed multi-line text as a `-Value` argument to `Set-Clipboard`, but PowerShell splits on newlines — only the first line was written. Fixed by piping via stdin. (b) `load_clipboard_for_paste()` compared clipboard text with an exact match, but the OS round-trip changes `\n` → `\r\n` and strips trailing newlines. Fixed by normalizing CRLF→LF and comparing without trailing newlines.
 2. **Phase 3 (#24): feedkeys, eval, get_lines, set_lines Lua API** — Added 4 Neovim-compatible Lua API functions: `vimcode.feedkeys(keys)` for injecting keystrokes, `vimcode.eval(expr)` for registers/options/cursor, `vimcode.buf.get_lines(start, end)` and `vimcode.buf.set_lines(start, end, lines)` for 0-indexed range buffer access. Public `Engine::feed_keys()` method extracted from test helper. 18 new tests.
-3. **Created issues #64 (linewise paste) and #65 (Ctrl-V insert-mode cumulative indent).**
+3. **Phase 4 first third (#25): Neovim test mining** — 233 tests mined from Neovim's test_normal.vim, test_textobjects.vim, test_visual.vim, test_search.vim across 9 batches. 22 Vim deviations discovered: 4 fixed (dw empty line, dd trailing newline, cw whitespace, gugu), 18 filed as #73-90. Fixed cw dot-repeat trailing space. Fixed pre-existing d}/dge integration test expectations. Created #91/#92 for remaining two thirds.
+4. **Created issues #64-65, #68-90, #91-92.**
 
 **Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
 
