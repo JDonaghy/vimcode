@@ -1,4 +1,4 @@
-# src/core/engine/keys.rs — 7,533 lines
+# src/core/engine/keys.rs — 7,664 lines
 
 All keyboard input handling. Routes keys by mode, processes operators, macros, repeat, user keymaps, mouse events, and clipboard.
 
@@ -39,4 +39,6 @@ All keyboard input handling. Routes keys by mode, processes operators, macros, r
 - `mouse_double_click(window_id, line, col)` — word selection on double-click
 - `paste_clipboard_to_input()` — paste into active input field
 - `load_clipboard_register(text)` — load system clipboard into `"` register
-- `feed_keys(keys)` — inject key sequence string (Neovim notation: `<Esc>`, `<CR>`, `<C-a>`)
+- `feed_keys(keys)` — inject key sequence string (Neovim notation: `<Esc>`, `<CR>`, `<C-a>`); drains macro playback queue after each key
+- `drain_macro_queue()` — consume pending macro keystrokes from playback queue
+- `paste_in_insert_mode(text)` — paste text at cursor in insert mode (no auto-indent)

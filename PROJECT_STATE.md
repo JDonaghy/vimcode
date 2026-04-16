@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 15, 2026 (Session 281 — Linewise paste fix, Phase 3 Lua API, Phase 4 test mining, 12 deviations fixed) | **Tests:** 1689 (lib) + 31 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 282 — Insert paste fix, Phase 4 batches 10-11, 8 deviations fixed) | **Tests:** 1757 (lib) + 270 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,13 +26,11 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 281 — Fix linewise paste clipboard bug (#64), Phase 3 Lua API (#24):**
+**Session 282 — Insert paste fix (#65), Phase 4 batches 10-11 (#25), 8 deviations fixed:**
 
-1. **Fix #64: Linewise paste (P/p) lost `is_linewise` through clipboard round-trip** — Two bugs: (a) Win-GUI `clipboard_write` passed multi-line text as a `-Value` argument to `Set-Clipboard`, but PowerShell splits on newlines — only the first line was written. Fixed by piping via stdin. (b) `load_clipboard_for_paste()` compared clipboard text with an exact match, but the OS round-trip changes `\n` → `\r\n` and strips trailing newlines. Fixed by normalizing CRLF→LF and comparing without trailing newlines.
-2. **Phase 3 (#24): feedkeys, eval, get_lines, set_lines Lua API** — Added 4 Neovim-compatible Lua API functions: `vimcode.feedkeys(keys)` for injecting keystrokes, `vimcode.eval(expr)` for registers/options/cursor, `vimcode.buf.get_lines(start, end)` and `vimcode.buf.set_lines(start, end, lines)` for 0-indexed range buffer access. Public `Engine::feed_keys()` method extracted from test helper. 18 new tests.
-3. **Phase 4 first third (#25): Neovim test mining** — 233 tests mined from Neovim's test_normal.vim, test_textobjects.vim, test_visual.vim, test_search.vim across 9 batches. 22 Vim deviations discovered, 12 fixed, 10 remaining as open issues. Fixed cw dot-repeat trailing space. Fixed pre-existing d}/dge/da` integration test expectations.
-4. **Fixed 12 Vim deviations**: #64 (linewise paste), #68 (dw empty line), #69 (dd trailing newline), #70 (cw whitespace), #71 (gugu), #73 (J cursor + 3J count), #74 (3rX cursor), #81 (C off-by-one), #83 (gJ cursor), #84 (ci( empty), #86 (J trailing space), #87 (ib/aB aliases).
-5. **CI improvements**: Windows TUI now runs integration tests, fixed snapshot and GTK clippy warnings.
-6. **Created issues #64-65, #68-90.**
+1. **Fix #65: Ctrl-V paste in insert mode added cumulative indentation** — `paste_in_insert_mode()` was applying auto-indent to each pasted line, causing a staircase effect. Fixed by suppressing auto-indent during paste (pasted text already has its own whitespace).
+2. **Phase 4 batches 10-11 (#25): 58 new Neovim-mined tests** — Mined from test_undo.vim, test_change.vim, test_put.vim, test_marks.vim, test_registers.vim, test_join.vim. Covering: undo/redo (5), put/paste (7), change operations (11), text objects (9), marks (4), registers (6), macros (2), join edge cases (5), insert mode keys (3), changelist navigation (2).
+3. **Fixed 8 Vim deviations**: Vc/Vjc visual line change ate trailing newline; r\<CR\> was a no-op; S didn't preserve indent; daw at end of line didn't consume leading whitespace; tick mark jump ('a) went to col 0 instead of first non-blank; feed_keys didn't drain macro playback queue; updated test_visual_line_change to correct Vim expectation.
+4. **3 new deviations documented** (ignored tests): visual J in line mode, :%join range not supported, Ctrl-U in insert deletes to line start instead of insert start.
 
-> Session 280 and earlier in **SESSION_HISTORY.md**.
+> Session 281 and earlier in **SESSION_HISTORY.md**.
