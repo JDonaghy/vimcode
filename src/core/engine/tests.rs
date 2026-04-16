@@ -23498,3 +23498,49 @@ fn test_nvim_ct_change_till() {
     engine.feed_keys("ct(XX<Esc>");
     assert_eq!(engine.buffer().to_string(), "XX(def\n");
 }
+
+// ── Issue #65: Ctrl-V paste in insert mode must not add cumulative indent ──
+
+#[test]
+fn test_insert_paste_preserves_original_indentation() {
+    // Pasting multi-line text in insert mode should preserve the original
+    // indentation verbatim, not re-indent each line relative to the cursor.
+    let mut engine = Engine::new();
+    engine.settings.auto_indent = true;
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+
+    // Enter insert mode at line 0
+    engine.feed_keys("i");
+    assert_eq!(engine.mode, Mode::Insert);
+
+    // Simulate pasting indented text via paste_in_insert_mode
+    engine.paste_in_insert_mode("aaa\n    bbb\n    ccc\n    ddd");
+
+    // The indentation must be preserved exactly — no staircase effect.
+    assert_eq!(
+        engine.buffer().to_string(),
+        "aaa\n    bbb\n    ccc\n    ddd\n"
+    );
+}
+
+#[test]
+fn test_insert_paste_into_indented_context_no_staircase() {
+    // Even when cursor is on an indented line, paste must not add extra indent.
+    let mut engine = Engine::new();
+    engine.settings.auto_indent = true;
+    engine.buffer_mut().insert(0, "    existing\n");
+    engine.update_syntax();
+
+    // Position cursor at end of the indented line, enter insert mode
+    engine.feed_keys("A");
+    assert_eq!(engine.mode, Mode::Insert);
+
+    // Paste multi-line text — should not inherit the "    " indent
+    engine.paste_in_insert_mode("\nalpha\n    beta\n    gamma");
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "    existing\nalpha\n    beta\n    gamma\n"
+    );
+}

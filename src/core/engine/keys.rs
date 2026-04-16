@@ -5290,31 +5290,11 @@ impl Engine {
         let col = self.view().cursor.col;
         let char_idx = self.buffer().line_to_char(line) + col;
 
-        // Handle auto-indent: split on newlines and add indent after each.
-        let indent = if self.settings.auto_indent {
-            self.get_line_indent_str(line)
-        } else {
-            String::new()
-        };
-
         // Build the final string to insert.
-        // Replace \r\n and \r with \n, then auto-indent after each newline.
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        let to_insert = if indent.is_empty() {
-            normalized
-        } else {
-            // Add indent after every newline except at the very end.
-            let mut result = String::with_capacity(normalized.len() * 2);
-            let parts: Vec<&str> = normalized.split('\n').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i > 0 {
-                    result.push('\n');
-                    result.push_str(&indent);
-                }
-                result.push_str(part);
-            }
-            result
-        };
+        // Replace \r\n and \r with \n. Do NOT auto-indent — pasted text
+        // already carries its own whitespace; adding indent causes a
+        // cumulative staircase effect (see #65).
+        let to_insert = text.replace("\r\n", "\n").replace('\r', "\n");
 
         self.insert_with_undo(char_idx, &to_insert);
         self.insert_text_buffer.push_str(&to_insert);
