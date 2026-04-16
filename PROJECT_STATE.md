@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 284 — Phase 4 batch 12, 27 new conformance tests) | **Tests:** 1786 (lib) + 302 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 285 — Phase 4 batch 13, 25 new conformance tests, 0 deviations) | **Tests:** 1811 (lib) + 327 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 285 — Phase 4 batch 13 (#25), 25 new conformance tests, 0 new deviations:**
+
+1. **Phase 4 batch 13: 25 new Neovim-verified tests** — Covering substitute (`:s/`, `:%s/`, flags `g`/`i`, empty replacement, no-match), global (`:g/pat/d`, `:v/pat/d`), tab navigation (`:tabnew`, `gt` cycle), G-motions (`dG`, `dgg`, `yG`), bigword motions (`W`, `B`, `E`, `gE`), f/F with count, comma-reverse, `%` bracket matching, register `"1` (last delete), linewise paste (`yyp`, `yyP`).
+2. **All 25 tests pass on first run** — no new deviations discovered in these areas.
 
 **Session 284 — Phase 4 batch 12 (#25), 27 new conformance tests, 1 new deviation (#101):**
 
