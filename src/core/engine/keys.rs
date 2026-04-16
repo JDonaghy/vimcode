@@ -276,6 +276,7 @@ impl Engine {
         // Capture cursor position before dispatching (used by cursor_move hook below).
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
+        let pre_mode = self.mode;
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         if ctrl
@@ -350,6 +351,11 @@ impl Engine {
                     }
                 }
             }
+        }
+
+        // Track where insert mode was entered (for Ctrl-U boundary)
+        if !matches!(pre_mode, Mode::Insert) && self.mode == Mode::Insert {
+            self.insert_enter_col = self.view().cursor.col;
         }
 
         if changed {
@@ -2415,7 +2421,11 @@ impl Engine {
                 // Replace character: r followed by a character replaces char under cursor.
                 // Special case: Return/Enter replaces with newline (splits line).
                 let replacement = unicode.or_else(|| {
-                    if key_name == "Return" { Some('\n') } else { None }
+                    if key_name == "Return" {
+                        Some('\n')
+                    } else {
+                        None
+                    }
                 });
                 if let Some(replacement) = replacement {
                     let count = self.take_count();
@@ -4679,15 +4689,17 @@ impl Engine {
             return;
         }
 
-        // Ctrl+U: delete from cursor to start of line
+        // Ctrl+U: delete from cursor back to insert-start column (Vim behavior)
         if ctrl && key_name == "u" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
-            if col > 0 {
+            let del_to = self.insert_enter_col;
+            if col > del_to {
                 let line_start = self.buffer().line_to_char(line);
-                let char_idx = line_start + col;
-                self.delete_with_undo(line_start, char_idx);
-                self.view_mut().cursor.col = 0;
+                let from = line_start + del_to;
+                let to = line_start + col;
+                self.delete_with_undo(from, to);
+                self.view_mut().cursor.col = del_to;
                 *changed = true;
             }
             return;
@@ -6115,6 +6127,25 @@ impl Engine {
                 'U' if self.pending_key.is_none() => {
                     self.count = None; // Clear count (not used for visual operators)
                     self.uppercase_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                'J' if self.pending_key.is_none() => {
+                    // Visual J: join all selected lines
+                    self.count = None;
+                    if let Some((start, end)) = self.get_visual_selection_range() {
+                        let start_line = start.line;
+                        let end_line = end.line;
+                        let line_count = end_line - start_line + 1;
+                        // Exit visual mode first
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                        // Move cursor to start of selection, then join
+                        self.view_mut().cursor.line = start_line;
+                        self.view_mut().cursor.col = start.col;
+                        if line_count > 1 {
+                            self.join_lines(line_count, changed);
+                        }
+                    }
                     return EngineAction::None;
                 }
                 '>' => {

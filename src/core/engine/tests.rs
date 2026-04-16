@@ -21905,9 +21905,9 @@ fn test_nvim_visual_indent() {
 }
 
 #[test]
-#[ignore = "vim deviation: J in visual line mode does not join selected lines"]
 fn test_nvim_visual_join() {
-    // VjjJ should join the 3 selected lines. VimCode: no-op.
+    // VjjJ should join the 3 selected lines.
+    // Cursor ends at last join point (col 7, between "bbb" and "ccc").
     nvim_case(
         "aaa\nbbb\nccc\nddd\n",
         0,
@@ -21915,7 +21915,7 @@ fn test_nvim_visual_join() {
         "VjjJ",
         "aaa bbb ccc\nddd\n",
         0,
-        0,
+        7,
     );
 }
 
@@ -22521,12 +22521,12 @@ fn test_nvim_insert_ctrl_w_delete_word() {
 
 #[test]
 fn test_nvim_insert_ctrl_u_delete_to_start() {
-    // Ctrl-U in insert mode deletes to start of line
+    // Ctrl-U in insert mode deletes back to insert point, not line start
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello\n");
     engine.update_syntax();
     engine.feed_keys("A world<C-u><Esc>");
-    assert_eq!(engine.buffer().to_string(), "\n");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
 }
 
 // ── Phase 4 Batch 4: Edge cases ─────────────────────────────────────────
@@ -23931,17 +23931,19 @@ fn test_nvim_g_semicolon_changelist() {
     engine.buffer_mut().insert(0, "aaa bbb ccc\n");
     engine.update_syntax();
     // Make changes at different positions
-    engine.feed_keys("cwXXX<Esc>");   // change "aaa" at col 0
-    engine.feed_keys("wcwYYY<Esc>");  // change "bbb" further right
-    engine.feed_keys("wcwZZZ<Esc>");  // change "ccc" further right
+    engine.feed_keys("cwXXX<Esc>"); // change "aaa" at col 0
+    engine.feed_keys("wcwYYY<Esc>"); // change "bbb" further right
+    engine.feed_keys("wcwZZZ<Esc>"); // change "ccc" further right
     assert_eq!(engine.buffer().to_string(), "XXX YYY ZZZ\n");
     // g; should move backward in changelist
     let pos_after = engine.view().cursor.col;
     engine.feed_keys("g;");
     let pos_back1 = engine.view().cursor.col;
     // Should have moved to a previous change position
-    assert!(pos_back1 <= pos_after || engine.view().cursor.line < 0 + 1,
-        "g; should move cursor backward in changelist");
+    assert!(
+        pos_back1 <= pos_after || engine.view().cursor.line < 0 + 1,
+        "g; should move cursor backward in changelist"
+    );
 }
 
 #[test]
@@ -23952,13 +23954,15 @@ fn test_nvim_g_comma_changelist_forward() {
     engine.update_syntax();
     engine.feed_keys("cwXXX<Esc>"); // change at start
     engine.feed_keys("wcwYYY<Esc>"); // change further right
-    // Go back, then forward
+                                     // Go back, then forward
     engine.feed_keys("g;");
     let pos_back = (engine.view().cursor.line, engine.view().cursor.col);
     engine.feed_keys("g,");
     let pos_fwd = (engine.view().cursor.line, engine.view().cursor.col);
-    assert!(pos_fwd.1 >= pos_back.1 || pos_fwd.0 > pos_back.0,
-        "g, should move cursor forward in changelist");
+    assert!(
+        pos_fwd.1 >= pos_back.1 || pos_fwd.0 > pos_back.0,
+        "g, should move cursor forward in changelist"
+    );
 }
 
 // ── Phase 4 Batch 11: Marks, Registers, Join edge cases, Insert keys ──────
@@ -23971,9 +23975,9 @@ fn test_nvim_mark_overwrite() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
     engine.update_syntax();
-    engine.feed_keys("ma");       // mark 'a' at line 0
-    engine.feed_keys("jjma");     // overwrite mark 'a' at line 2
-    engine.feed_keys("gg'a");     // jump to mark 'a'
+    engine.feed_keys("ma"); // mark 'a' at line 0
+    engine.feed_keys("jjma"); // overwrite mark 'a' at line 2
+    engine.feed_keys("gg'a"); // jump to mark 'a'
     assert_eq!(engine.view().cursor.line, 2);
 }
 
@@ -23984,7 +23988,10 @@ fn test_nvim_mark_unset_error() {
     engine.buffer_mut().insert(0, "test\n");
     engine.update_syntax();
     engine.feed_keys("'z");
-    assert!(!engine.message.is_empty(), "should show error for unset mark");
+    assert!(
+        !engine.message.is_empty(),
+        "should show error for unset mark"
+    );
 }
 
 #[test]
@@ -23993,8 +24000,8 @@ fn test_nvim_mark_tick_first_nonblank() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "aaa\n    bbb\nccc\n");
     engine.update_syntax();
-    engine.feed_keys("jllma");   // mark 'a' at line 1, col 6
-    engine.feed_keys("gg'a");     // tick-jump to mark 'a'
+    engine.feed_keys("jllma"); // mark 'a' at line 1, col 6
+    engine.feed_keys("gg'a"); // tick-jump to mark 'a'
     assert_eq!(engine.view().cursor.line, 1);
     assert_eq!(engine.view().cursor.col, 4); // first non-blank
 }
@@ -24005,8 +24012,8 @@ fn test_nvim_mark_backtick_exact_col() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello world\nfoo bar baz\n");
     engine.update_syntax();
-    engine.feed_keys("jllllmb");  // mark 'b' at line 1, col 4
-    engine.feed_keys("gg`b");     // backtick-jump to mark 'b'
+    engine.feed_keys("jllllmb"); // mark 'b' at line 1, col 4
+    engine.feed_keys("gg`b"); // backtick-jump to mark 'b'
     assert_eq!(engine.view().cursor.line, 1);
     assert_eq!(engine.view().cursor.col, 4);
 }
@@ -24054,8 +24061,8 @@ fn test_nvim_yank_register_0_preserved() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
     engine.update_syntax();
-    engine.feed_keys("yy");   // yank "alpha\n" to register 0
-    engine.feed_keys("jdd");  // delete "beta\n" to unnamed and register 1
+    engine.feed_keys("yy"); // yank "alpha\n" to register 0
+    engine.feed_keys("jdd"); // delete "beta\n" to unnamed and register 1
     let (reg0, _) = engine.registers.get(&'0').cloned().unwrap_or_default();
     assert_eq!(reg0, "alpha\n");
     // Unnamed register should now have the deleted text
@@ -24070,7 +24077,7 @@ fn test_nvim_macro_record_and_play() {
     engine.buffer_mut().insert(0, "\n\n");
     engine.update_syntax();
     engine.feed_keys("qqiHello<Esc>q"); // record: insert "Hello"
-    engine.feed_keys("j@q");             // play on next line
+    engine.feed_keys("j@q"); // play on next line
     assert_eq!(engine.buffer().to_string(), "Hello\nHello\n");
 }
 
@@ -24081,7 +24088,7 @@ fn test_nvim_macro_with_count() {
     engine.buffer_mut().insert(0, "x\n");
     engine.update_syntax();
     engine.feed_keys("qqA!<Esc>q"); // record: append "!"
-    engine.feed_keys("3@q");        // play 3 more times
+    engine.feed_keys("3@q"); // play 3 more times
     assert_eq!(engine.buffer().to_string(), "x!!!!\n");
 }
 
@@ -24123,14 +24130,15 @@ fn test_nvim_gJ_preserves_leading_whitespace() {
 fn test_nvim_4J_join_four_lines() {
     // 4J joins four lines into one
     let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine
+        .buffer_mut()
+        .insert(0, "one\ntwo\nthree\nfour\nfive\n");
     engine.update_syntax();
     engine.feed_keys("4J");
     assert_eq!(engine.buffer().to_string(), "one two three four\nfive\n");
 }
 
 #[test]
-#[ignore = "vim deviation: J in visual line mode does not join selected lines"]
 fn test_nvim_visual_J_three_lines() {
     // Visual select 3 lines then J joins them
     let mut engine = Engine::new();
@@ -24141,7 +24149,6 @@ fn test_nvim_visual_J_three_lines() {
 }
 
 #[test]
-#[ignore = "vim deviation: :%join range not supported yet"]
 fn test_nvim_percent_join_command() {
     // :%join joins all lines
     let mut engine = Engine::new();
@@ -24164,7 +24171,6 @@ fn test_nvim_insert_ctrl_w_delete_word_back() {
 }
 
 #[test]
-#[ignore = "vim deviation: Ctrl-U deletes to line start instead of insert start"]
 fn test_nvim_insert_ctrl_u_after_append() {
     // Ctrl-U in insert mode should only delete text typed since entering insert mode
     let mut engine = Engine::new();

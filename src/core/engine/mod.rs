@@ -2691,6 +2691,8 @@ pub struct Engine {
     pub insert_ctrl_g_pending: bool,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
+    /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
+    pub insert_enter_col: usize,
     /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
     pub insert_ctrl_v_pending: bool,
     /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
@@ -3233,6 +3235,7 @@ impl Engine {
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
+            insert_enter_col: 0,
             insert_ctrl_v_pending: false,
             visual_block_insert_info: None,
             insert_open_count: 0,

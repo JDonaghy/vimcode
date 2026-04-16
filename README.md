@@ -1026,7 +1026,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:m[ove] {dest}` | Move current line to after line {dest} (0-indexed) |
 | `:t {dest}` / `:co[py] {dest}` | Copy current line to after line {dest} (0-indexed) |
 | `:sort [n] [r] [u] [i]` | Sort lines: `n`=numeric, `r`=reverse, `u`=unique, `i`=ignorecase |
-| `:j[oin]` | Join current line with the next (remove newline) |
+| `:j[oin]` / `:%j[oin]` | Join current line with next / join all lines |
 | `:y[ank] [reg]` | Yank current line into register (default `"`) |
 | `:pu[t] [reg]` | Put register contents after current line |
 | `:>` / `:<` | Indent / dedent current line by one shiftwidth |

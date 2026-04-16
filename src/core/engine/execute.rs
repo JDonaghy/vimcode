@@ -24,6 +24,45 @@ impl Engine {
             }
         }
 
+        // Handle :%{cmd} — whole-buffer range prefix (e.g. :%join, :%d)
+        if let Some(rest) = cmd.strip_prefix('%') {
+            let rest = rest.trim();
+            let rest_normalized = normalize_ex_command(rest);
+            match rest_normalized.as_ref() {
+                "join" => {
+                    let total_lines = self.buffer().len_lines();
+                    if total_lines > 1 {
+                        self.view_mut().cursor.line = 0;
+                        self.view_mut().cursor.col = 0;
+                        let mut changed = false;
+                        self.join_lines(total_lines, &mut changed);
+                    }
+                    return EngineAction::None;
+                }
+                "delete" | "d" => {
+                    let total_lines = self.buffer().len_lines();
+                    self.view_mut().cursor.line = 0;
+                    self.view_mut().cursor.col = 0;
+                    let mut changed = false;
+                    self.start_undo_group();
+                    self.delete_lines(total_lines, &mut changed);
+                    self.finish_undo_group();
+                    return EngineAction::None;
+                }
+                "yank" | "y" => {
+                    let total_lines = self.buffer().len_lines();
+                    let saved = self.view().cursor;
+                    self.view_mut().cursor.line = 0;
+                    self.yank_lines(total_lines);
+                    self.view_mut().cursor = saved;
+                    return EngineAction::None;
+                }
+                _ => {
+                    // Fall through for commands that handle % themselves (s/, norm, etc.)
+                }
+            }
+        }
+
         // Handle :term / :terminal — open integrated terminal
         if cmd == "terminal" {
             return EngineAction::OpenTerminal;
