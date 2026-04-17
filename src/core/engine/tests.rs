@@ -25988,3 +25988,78 @@ fn test_gf_no_file_shows_message() {
         engine.message
     );
 }
+
+// --- g0/g^/g$: screen-line motions ---
+
+#[test]
+fn test_g0_no_wrap_goes_to_col_zero() {
+    let mut engine = engine_with_text("    hello world\n");
+    engine.settings.wrap = false;
+    engine.view_mut().cursor.col = 8;
+    engine.feed_keys("g0");
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_g0_wrap_goes_to_segment_start() {
+    let mut engine = engine_with_text("abcdefghijklmnopqrstuvwxyz0123456789\n");
+    engine.settings.wrap = true;
+    engine.view_mut().viewport_cols = 10;
+    // Cursor at col 15 → segment 1 (cols 10..19) → g0 should go to 10
+    engine.view_mut().cursor.col = 15;
+    engine.feed_keys("g0");
+    assert_eq!(engine.view().cursor.col, 10);
+}
+
+#[test]
+fn test_g_caret_no_wrap_goes_to_first_non_blank() {
+    let mut engine = engine_with_text("    hello\n");
+    engine.settings.wrap = false;
+    engine.view_mut().cursor.col = 8;
+    engine.feed_keys("g^");
+    assert_eq!(engine.view().cursor.col, 4);
+}
+
+#[test]
+fn test_g_caret_wrap_goes_to_first_non_blank_in_segment() {
+    // Line: "          abcdefghij..." (10 spaces + text)
+    // With viewport=10, segment 0 = spaces, segment 1 starts at col 10 = 'a'
+    let mut engine = engine_with_text("          abcdefghijklmno\n");
+    engine.settings.wrap = true;
+    engine.view_mut().viewport_cols = 10;
+    // Cursor at col 15 → segment 1 (cols 10..19) → first non-blank is col 10 ('a')
+    engine.view_mut().cursor.col = 15;
+    engine.feed_keys("g^");
+    assert_eq!(engine.view().cursor.col, 10);
+}
+
+#[test]
+fn test_g_dollar_no_wrap_goes_to_end_of_line() {
+    let mut engine = engine_with_text("hello\n");
+    engine.settings.wrap = false;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("g$");
+    assert_eq!(engine.view().cursor.col, 4); // 'o' is at col 4
+}
+
+#[test]
+fn test_g_dollar_wrap_goes_to_end_of_segment() {
+    let mut engine = engine_with_text("abcdefghijklmnopqrstuvwxyz0123456789\n");
+    engine.settings.wrap = true;
+    engine.view_mut().viewport_cols = 10;
+    // Cursor at col 3 → segment 0 (cols 0..9) → g$ should go to col 9
+    engine.view_mut().cursor.col = 3;
+    engine.feed_keys("g$");
+    assert_eq!(engine.view().cursor.col, 9);
+}
+
+#[test]
+fn test_g_dollar_wrap_last_segment_goes_to_line_end() {
+    let mut engine = engine_with_text("abcdefghijklmno\n"); // 15 chars + newline
+    engine.settings.wrap = true;
+    engine.view_mut().viewport_cols = 10;
+    // Cursor at col 12 → segment 1 (cols 10..14) → g$ should go to col 14
+    engine.view_mut().cursor.col = 12;
+    engine.feed_keys("g$");
+    assert_eq!(engine.view().cursor.col, 14);
+}

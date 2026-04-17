@@ -894,6 +894,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `ga` | Print ASCII value of character under cursor |
 | `g8` | Print UTF-8 hex bytes of character under cursor |
 | `go` | Go to byte offset N in file |
+| `g0` / `g<Home>` | Start of screen line (wrap-aware) |
+| `g^` | First non-blank on screen line (wrap-aware) |
+| `g$` / `g<End>` | End of screen line (wrap-aware) |
 | `gm` | Move cursor to middle of screen line |
 | `gM` | Move cursor to middle of text line |
 | `gI` | Insert at column 1 (absolute beginning of line) |
