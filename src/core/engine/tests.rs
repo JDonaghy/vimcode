@@ -25091,13 +25091,12 @@ fn test_nvim_range_delete_two_lines() {
 
 #[test]
 fn test_nvim_copy_current_to_after() {
-    // :copy 2 copies current line to after line 2
+    // :copy 2 copies current line (line 1 = "a") to after line 2 ("b").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\n");
     engine.update_syntax();
     engine.feed_keys(":copy 2<CR>");
-    // "a" copied after line 2 ("c") → "a\nb\nc\na\n"
-    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\n");
+    assert_eq!(engine.buffer().to_string(), "a\nb\na\nc\n");
 }
 
 // -- :move (simple form with space) --
@@ -25377,15 +25376,12 @@ fn test_nvim_pwd_sets_message() {
 
 #[test]
 fn test_nvim_copy_range_to_after() {
-    // :1,2co3 — range is 1-based (lines 1-2 = indices 0-1), dest "3" is
-    // VimCode-0-based (line 3 = "d"). So we insert "a\nb\n" after "d".
-    // NOTE: Vim uses 1-based dest everywhere; VimCode's parse_line_address
-    // treats numeric dest as 0-based. Tracked as a separate deviation.
+    // :1,2co3 copies lines 1-2 ("a", "b") to after line 3 ("c").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
     engine.update_syntax();
     engine.feed_keys(":1,2co3<CR>");
-    assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd\na\nb\n");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\nb\nd\n");
 }
 
 #[test]
@@ -25402,13 +25398,12 @@ fn test_nvim_copy_single_line_to_after() {
 
 #[test]
 fn test_nvim_move_single_line_forward() {
-    // :1m3 — range "1" = 1-based line 1 = index 0 ("a"), dest "3" = 0-based
-    // line 3 ("d"). Move "a\n" from top to after "d".
+    // :1m3 moves line 1 ("a") to after line 3 ("c").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
     engine.update_syntax();
     engine.feed_keys(":1m3<CR>");
-    assert_eq!(engine.buffer().to_string(), "b\nc\nd\na\n");
+    assert_eq!(engine.buffer().to_string(), "b\nc\na\nd\n");
 }
 
 #[test]
@@ -25435,32 +25430,32 @@ fn test_nvim_move_range_forward() {
 
 #[test]
 fn test_nvim_t_concat_form() {
-    // :t3 copies current line to after line 3 (current = line 0 = "a")
+    // :t3 copies current line (line 1 = "a") to after line 3 ("c").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
     engine.update_syntax();
     engine.feed_keys(":t3<CR>");
-    assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd\na\n");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\nd\n");
 }
 
 #[test]
 fn test_nvim_m_concat_form() {
-    // :m3 moves current line (0 = "a") to after line 3 → b\nc\nd\na\n
+    // :m3 moves current line ("a") to after line 3 ("c").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
     engine.update_syntax();
     engine.feed_keys(":m3<CR>");
-    assert_eq!(engine.buffer().to_string(), "b\nc\nd\na\n");
+    assert_eq!(engine.buffer().to_string(), "b\nc\na\nd\n");
 }
 
 #[test]
 fn test_nvim_co_concat_form() {
-    // :co2 copies current line to after line 2
+    // :co2 copies current line ("a") to after line 2 ("b").
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\n");
     engine.update_syntax();
     engine.feed_keys(":co2<CR>");
-    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\n");
+    assert_eq!(engine.buffer().to_string(), "a\nb\na\nc\n");
 }
 
 // -- :sort! bang for reverse --
@@ -25506,6 +25501,52 @@ fn test_nvim_sort_with_existing_r_flag_still_works() {
     engine.update_syntax();
     engine.feed_keys(":sort r<CR>");
     assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+}
+
+// ── #114 follow-up: 1-based line addresses ─────────────────────────────
+
+#[test]
+fn test_nvim_copy_address_is_1_based() {
+    // :copy 1 copies current line to after line 1 (= "a", the first line).
+    // Under VimCode's old 0-based parse_line_address, this would have put
+    // the copy after "b" instead.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2; // yanking "c"
+    engine.feed_keys(":copy 1<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nc\nb\nc\n");
+}
+
+#[test]
+fn test_nvim_move_address_is_1_based() {
+    // :3m1 moves line 3 ("c") to after line 1 ("a").
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":3m1<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nc\nb\nd\n");
+}
+
+#[test]
+fn test_nvim_copy_to_0_inserts_before_first_line() {
+    // :copy 0 (or :co0) inserts the copy at the very top (before line 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2; // yank "c"
+    engine.feed_keys(":copy 0<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\na\nb\nc\n");
+}
+
+#[test]
+fn test_nvim_move_to_0_moves_to_top() {
+    // :3m0 moves line 3 ("c") to the very top.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":3m0<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\na\nb\nd\n");
 }
 
 // ── Phase 4 Batch 16: visual block I/A, :retab, :noh, marks, more edges ──

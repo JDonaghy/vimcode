@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 293 — Fix #116 visual block $ virtual-end append) | **Tests:** 1900 (lib) + 410 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 294 — Fix #114 1-based ex-command addresses) | **Tests:** 1904 (lib) + 414 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 294 — Fix #114: ex-command numeric line addresses are now 1-based:**
+
+1. **Fix #114 — `parse_line_address` now 1-based for bare numbers** — Matches Vim's convention throughout. `":3"` → index 2, `":0"` → index 0 (used by copy/move as "before line 1"). Relative addresses (`+N`, `-N`, `.`, `$`) unchanged — they were already correct.
+2. **Added `dest_is_zero` special case** to `execute_copy_command` (the single-line form) so `:copy 0` inserts at top, matching the existing range-version behaviour.
+3. **6 existing tests updated** to encode 1-based semantics (`:1,2co3`, `:1m3`, `:t3`, `:m3`, `:co2`, `:copy 2`); 4 new tests added covering 1-based specifically and the `:N m 0` / `:copy 0` special case.
 
 **Session 293 — Fix #116 visual block virtual-end append:**
 
