@@ -25369,3 +25369,141 @@ fn test_nvim_pwd_sets_message() {
         ":pwd should populate the message"
     );
 }
+
+// ── Phase 4 Batch 15.5: #112 ex-command form fixes ────────────────────────
+// Ranged :copy/:move, concatenated :tN/:mN/:coN, and :sort! bang.
+
+// -- Ranged :copy (:N,Mco<dest>) --
+
+#[test]
+fn test_nvim_copy_range_to_after() {
+    // :1,2co3 — range is 1-based (lines 1-2 = indices 0-1), dest "3" is
+    // VimCode-0-based (line 3 = "d"). So we insert "a\nb\n" after "d".
+    // NOTE: Vim uses 1-based dest everywhere; VimCode's parse_line_address
+    // treats numeric dest as 0-based. Tracked as a separate deviation.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":1,2co3<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd\na\nb\n");
+}
+
+#[test]
+fn test_nvim_copy_single_line_to_after() {
+    // :2co4 copies line 2 to after line 4
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":2co4<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd\nb\n");
+}
+
+// -- Ranged :move --
+
+#[test]
+fn test_nvim_move_single_line_forward() {
+    // :1m3 — range "1" = 1-based line 1 = index 0 ("a"), dest "3" = 0-based
+    // line 3 ("d"). Move "a\n" from top to after "d".
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":1m3<CR>");
+    assert_eq!(engine.buffer().to_string(), "b\nc\nd\na\n");
+}
+
+#[test]
+fn test_nvim_move_line_to_top() {
+    // :3m0 moves line 3 to the top
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":3m0<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\na\nb\nd\n");
+}
+
+#[test]
+fn test_nvim_move_range_forward() {
+    // :1,2m4 moves lines 1-2 to after line 4
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":1,2m4<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\nd\na\nb\n");
+}
+
+// -- Concatenated forms (no space): :tN, :mN, :coN --
+
+#[test]
+fn test_nvim_t_concat_form() {
+    // :t3 copies current line to after line 3 (current = line 0 = "a")
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":t3<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd\na\n");
+}
+
+#[test]
+fn test_nvim_m_concat_form() {
+    // :m3 moves current line (0 = "a") to after line 3 → b\nc\nd\na\n
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":m3<CR>");
+    assert_eq!(engine.buffer().to_string(), "b\nc\nd\na\n");
+}
+
+#[test]
+fn test_nvim_co_concat_form() {
+    // :co2 copies current line to after line 2
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys(":co2<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\n");
+}
+
+// -- :sort! bang for reverse --
+
+#[test]
+fn test_nvim_sort_bang_reverses() {
+    // :sort! reverses alphabetical order (synonym for :sort r)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort!<CR>");
+    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+}
+
+#[test]
+fn test_nvim_sort_bang_with_flags() {
+    // :sort! u combines reverse with unique
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\na\nc\nb\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort! u<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\nb\na\n");
+}
+
+// -- Regressions: make sure existing forms still work --
+
+#[test]
+fn test_nvim_colon_zero_still_goes_to_first() {
+    // :0 must still move cursor to line 0 (not be rejected as invalid range)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys(":0<CR>");
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+#[test]
+fn test_nvim_sort_with_existing_r_flag_still_works() {
+    // :sort r (old form) should keep working unchanged.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort r<CR>");
+    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+}

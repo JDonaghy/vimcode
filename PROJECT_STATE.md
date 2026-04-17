@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 290 — Phase 4 batch 15, 23 new conformance tests, #112 filed) | **Tests:** 1869 (lib) + 379 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 291 — Fix #112 ranged/concat/bang ex-command forms) | **Tests:** 1881 (lib) + 391 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 291 — Fix #112: ranged/concat/bang ex-command forms, #114 filed:**
+
+1. **Fix #112 — Ranged `:copy`/`:move`, concat `:tN`/`:mN`/`:coN`, `:sort!`** — Added `execute_copy_range()` and `execute_move_range()` helpers with 1-based range semantics matching Vim. Extended `try_execute_ranged_command()` to dispatch `m`/`move`/`t`/`co`/`copy` keywords. Added `split_cmd_and_arg()` helper that matches a command name followed by a valid separator (digit/space/sign/`./$`). Accepted `:sort!` bang as reverse synonym.
+2. **#114 filed** — VimCode's `parse_line_address` treats numeric dest as 0-based, but Vim uses 1-based throughout. Fix requires auditing existing callers; scoped as a separate issue so this PR stays focused.
+3. **12 new unit tests** covering all new forms + regressions (`:0` still goes to line 0, `:sort r` still works).
 
 **Session 290 — Phase 4 batch 15 (#25), 23 new conformance tests, #112 filed:**
 
