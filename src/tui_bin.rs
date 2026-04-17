@@ -3,7 +3,12 @@
 //! Build with: `cargo build --release --bin vimcode-tui --no-default-features`
 
 // Shared modules contain code used only by the GTK binary — suppress warnings.
-#![allow(dead_code, unused_imports, unused_assignments, clippy::collapsible_match)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_assignments,
+    clippy::collapsible_match
+)]
 
 use std::collections::HashSet;
 use std::path::PathBuf;
