@@ -1529,6 +1529,38 @@ impl Engine {
         }
     }
 
+    /// Jump to the last-accessed tab (g<Tab> / :tablast-accessed).
+    /// Uses the MRU list: index 0 is current, index 1 is previous.
+    /// Calling again toggles back (Vim behaviour).
+    pub fn goto_last_accessed_tab(&mut self) {
+        // Prune stale entries
+        self.tab_mru.retain(|&(g, idx)| {
+            self.editor_groups
+                .get(&g)
+                .is_some_and(|grp| idx < grp.tabs.len())
+        });
+        // Ensure current is at index 0
+        let current = (self.active_group, self.active_group().active_tab);
+        if self.tab_mru.first() != Some(&current) {
+            self.tab_mru.retain(|e| *e != current);
+            self.tab_mru.insert(0, current);
+        }
+        if self.tab_mru.len() < 2 {
+            return; // No previous tab to jump to
+        }
+        let (group_id, tab_idx) = self.tab_mru[1];
+        if self.editor_groups.contains_key(&group_id) {
+            self.active_group = group_id;
+            self.active_group_mut().active_tab = tab_idx;
+            self.line_annotations.clear();
+            self.blame_annotations_active = false;
+            self.tab_mru_touch();
+            self.tab_nav_push();
+            self.lsp_ensure_active_buffer();
+            self.ensure_active_tab_visible();
+        }
+    }
+
     /// Open the tab switcher popup, pre-selecting the second MRU entry.
     pub fn open_tab_switcher(&mut self) {
         // Build a clean MRU list: only include entries that still exist

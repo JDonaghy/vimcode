@@ -280,6 +280,7 @@ See [README.md](README.md) for full feature documentation.
 | `gf` | Go to file under cursor | ✅ | |
 | `gF` | Go to file at line | ✅ | |
 | `gt` / `gT` | Next/prev tab | ✅ | |
+| `g<Tab>` | Last-accessed tab | ✅ | Toggle between two most recent tabs |
 | `g~{motion}` | Toggle case | ✅ | |
 | `gu{motion}` | Lowercase | ✅ | |
 | `gU{motion}` | Uppercase | ✅ | |
@@ -304,7 +305,7 @@ See [README.md](README.md) for full feature documentation.
 | `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 35/35 (100%)**
+**g-commands: 36/36 (100%)**
 
 ---
 

@@ -25803,3 +25803,70 @@ fn test_nvim_set_query_tabstop() {
         engine.message
     );
 }
+
+// --- g<Tab>: jump to last-accessed tab ---
+
+#[test]
+fn test_gtab_jumps_to_last_accessed_tab() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    engine.new_tab(None); // tab 2 (active)
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    // Go to tab 0
+    engine.goto_tab(0);
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    // g<Tab> should jump back to tab 2 (last accessed)
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 2);
+}
+
+#[test]
+fn test_gtab_toggles_between_two_tabs() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    engine.goto_tab(0);
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    // Switch to tab 1 via gt
+    engine.feed_keys("gt");
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    // g<Tab> should go back to tab 0
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    // Another g<Tab> should toggle back to tab 1
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 1);
+}
+
+#[test]
+fn test_gtab_noop_with_single_tab() {
+    let mut engine = Engine::new();
+    // Only one tab — g<Tab> should be a no-op
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 0);
+}
+
+#[test]
+fn test_gtab_with_three_tabs() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    engine.new_tab(None); // tab 2 (active)
+
+    // Visit tab 0
+    engine.goto_tab(0);
+    // Visit tab 1
+    engine.goto_tab(1);
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    // g<Tab> should go to tab 0 (the last one before tab 1)
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    // g<Tab> again should go back to tab 1
+    engine.feed_keys("g<Tab>");
+    assert_eq!(engine.active_group().active_tab, 1);
+}

@@ -335,7 +335,7 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 **Tabs**
 - `:tabnew` — new tab; `:tabclose` — close tab
-- `gt` / `gT` or `g` + `t` / `T` — next/previous tab
+- `gt` / `gT` or `g` + `t` / `T` — next/previous tab; `g<Tab>` — toggle last-accessed tab
 - `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU tab switcher popup (cycles most-recently-used tabs; Enter confirms, Escape cancels); release modifier to auto-confirm (GTK)
 - `Alt+t` — MRU tab switcher (works in both TUI and GTK; hold Alt and press `t` to cycle; release Alt or wait 500ms to confirm in TUI)
 
@@ -918,6 +918,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `q:` | Open command-line history window (Enter executes, `q` closes) |
 | `q/` / `q?` | Open search history window (Enter searches, `q` closes) |
 | `gt` / `gT` | Next / previous tab |
+| `g<Tab>` | Jump to last-accessed tab (toggle) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
 | `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
 | `Ctrl+Alt+Left` / `Ctrl+Alt+Right` | Navigate back / forward through tab history |
