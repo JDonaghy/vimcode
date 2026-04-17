@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 294 — Fix #114 1-based ex-command addresses) | **Tests:** 1904 (lib) + 414 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 295 — Phase 5 begins, g-prefix audit, 4 gaps filed) | **Tests:** 1904 (lib) + 414 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,17 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 295 — Phase 5 (#26) begins: `g`-prefix coverage audit:**
+
+1. **Started Phase 5 `:help` coverage audit** — a new kind of conformance work that catches missing features rather than behavioural bugs. Scope: walk Vim's documentation section by section.
+2. **First slice: `g`-prefix normal-mode commands** — 58 commands total. ✅ 36 implemented, 🟡 2 partial, ❌ 14 not implemented, ⏭️ 6 intentionally skipped (Ex mode, Select mode, mouse tag nav, debug features, redundant with VimCode's status bar).
+3. **4 gap issues filed** for actionable missing features:
+   - **#120** `gF` — edit file + jump to line number (the \`:N\` suffix case)
+   - **#121** `g@` — user-definable operator via \`operatorfunc\` (enables plugin-defined operators)
+   - **#122** `g<Tab>` — jump to last-accessed tab
+   - **#123** Screen-line motions: \`g\$\`, \`g0\`, \`g^\`, \`g<End>\`, \`g<Home>\`
+4. **New `COVERAGE_PHASE5.md`** — living document tracking the Phase 5 audit by slice.
 
 **Session 294 — Fix #114: ex-command numeric line addresses are now 1-based:**
 
