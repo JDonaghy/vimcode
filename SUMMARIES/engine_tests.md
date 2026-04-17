@@ -1,6 +1,6 @@
-# src/core/engine/tests.rs — 25,509 lines
+# src/core/engine/tests.rs — 25,764 lines
 
-All engine unit and integration tests. ~925 test functions covering every Vim feature, command, motion, text object, and edge case. Includes 391 Neovim-mined conformance tests (`test_nvim_*`).
+All engine unit and integration tests. ~930 test functions covering every Vim feature, command, motion, text object, and edge case. Includes 410 Neovim-mined conformance tests (`test_nvim_*`).
 
 ## Test Helpers
 - `engine_with(text)` — create engine with initial buffer content; resets settings and keymaps for hermeticity

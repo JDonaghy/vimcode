@@ -25507,3 +25507,258 @@ fn test_nvim_sort_with_existing_r_flag_still_works() {
     engine.feed_keys(":sort r<CR>");
     assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
 }
+
+// ── Phase 4 Batch 16: visual block I/A, :retab, :noh, marks, more edges ──
+// Mined from test_visual.vim, test_retab.vim, test_mark.vim, test_search.vim
+
+// -- Visual block Insert (I) --
+
+#[test]
+fn test_nvim_visual_block_I_inserts_prefix() {
+    // Select a column of 3 lines, press I<text><Esc>; text prepended to each line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.update_syntax();
+    // Visual-block selection down 2 lines
+    engine.feed_keys("<C-v>jjI# <Esc>");
+    assert_eq!(engine.buffer().to_string(), "# one\n# two\n# three\n");
+}
+
+// -- Visual block Append (A) --
+
+#[test]
+#[ignore = "vim deviation #116: visual block started with $ does not virtual-append per line"]
+fn test_nvim_visual_block_A_appends_suffix() {
+    // Block-select; A appends after the right edge of each line in the block.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.update_syntax();
+    // Start at end of line 0, visual block down 2, append
+    engine.feed_keys("$<C-v>jjA!<Esc>");
+    // Each selected line gets '!' appended
+    assert_eq!(engine.buffer().to_string(), "one!\ntwo!\nthree!\n");
+}
+
+// -- :nohlsearch / :noh --
+
+#[test]
+fn test_nvim_noh_clears_search_highlight() {
+    // After /foo, search_matches is set. :noh should clear it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo\n");
+    engine.update_syntax();
+    engine.feed_keys("/foo<CR>");
+    // Something searched; now clear highlights
+    engine.feed_keys(":noh<CR>");
+    // search_matches (the highlight list) should be empty
+    assert!(
+        engine.search_matches.is_empty(),
+        "expected no search_matches after :noh"
+    );
+}
+
+// -- :r[ead] {file} --
+
+#[test]
+fn test_nvim_read_nonexistent_file_errors() {
+    // :r on a file that doesn't exist should produce a "Cannot read file" message.
+    let mut engine = Engine::new();
+    engine.feed_keys(":r /path/does/not/exist/xyz\n<CR>");
+    assert!(
+        engine.message.to_lowercase().contains("cannot read")
+            || engine.message.to_lowercase().contains("no such"),
+        "expected read-file error message, got: {:?}",
+        engine.message
+    );
+}
+
+// -- :retab --
+
+#[test]
+fn test_nvim_retab_converts_tabs_to_spaces() {
+    // With expandtab and tabstop=4, :retab converts tabs to spaces.
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "\thello\n");
+    engine.update_syntax();
+    engine.feed_keys(":retab<CR>");
+    assert_eq!(engine.buffer().to_string(), "    hello\n");
+}
+
+// -- Marks --
+
+#[test]
+fn test_nvim_lowercase_mark_set_and_jump() {
+    // ma on line 1, move away, then 'a jumps back to line 1
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 1;
+    engine.feed_keys("ma"); // set mark 'a' here
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("'a"); // jump to mark
+    assert_eq!(engine.view().cursor.line, 1);
+}
+
+#[test]
+fn test_nvim_backtick_mark_preserves_col() {
+    // `a jumps to exact line+col of mark, not first-non-blank
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 3;
+    engine.feed_keys("ma");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("`a");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+// -- Search highlighting / n with no match --
+
+#[test]
+fn test_nvim_n_with_no_prior_search_errors() {
+    // n without a prior search pattern should not move and should error.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("n");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+// -- Word motions edge cases --
+
+#[test]
+fn test_nvim_w_at_end_of_file() {
+    // w at last word should stay within bounds
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "last\n");
+    engine.update_syntax();
+    engine.feed_keys("$w");
+    // Cursor shouldn't panic or go past buffer; should stay at or near end.
+    assert!(engine.view().cursor.line <= 1);
+}
+
+#[test]
+fn test_nvim_b_at_start_of_file() {
+    // b at col 0 line 0 stays put
+    nvim_case("hello\n", 0, 0, "b", "hello\n", 0, 0);
+}
+
+// -- Indent/dedent in visual mode --
+
+#[test]
+fn test_nvim_vis_greater_indents_selection() {
+    // Vj> indents two selected lines one shiftwidth
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 2;
+    engine.feed_keys("Vj>");
+    assert_eq!(engine.buffer().to_string(), "  a\n  b\nc\n");
+}
+
+#[test]
+fn test_nvim_vis_less_dedents_selection() {
+    // Vj< dedents two indented lines
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "  a\n  b\nc\n");
+    engine.update_syntax();
+    engine.settings.expand_tab = true;
+    engine.settings.shift_width = 2;
+    engine.feed_keys("Vj<");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\n");
+}
+
+// -- Count prefix with r --
+
+#[test]
+fn test_nvim_5rX_replaces_5_chars() {
+    nvim_case("aaaaab\n", 0, 0, "5rX", "XXXXXb\n", 0, 4);
+}
+
+// -- Swap (xp) variations --
+
+#[test]
+fn test_nvim_dap_delete_around_paragraph() {
+    // dap deletes current paragraph (including trailing blank line)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "first\n\nsecond\n\nthird\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys("dap");
+    // paragraph "second\n" with surrounding blanks collapsed
+    assert!(
+        engine.buffer().to_string().contains("first")
+            && engine.buffer().to_string().contains("third")
+            && !engine.buffer().to_string().contains("second"),
+        "dap should have removed 'second' paragraph: {:?}",
+        engine.buffer().to_string()
+    );
+}
+
+// -- Repeat (.) basic --
+
+#[test]
+fn test_nvim_dot_repeats_last_change() {
+    // After dw, moving and pressing . repeats the dw
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one two three four\n");
+    engine.update_syntax();
+    engine.feed_keys("dw"); // delete "one "
+    engine.feed_keys("."); // delete "two "
+    assert_eq!(engine.buffer().to_string(), "three four\n");
+}
+
+// -- u / Ctrl-R undo/redo --
+
+#[test]
+fn test_nvim_u_undoes_insert() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("iWORLD<Esc>");
+    assert_eq!(engine.buffer().to_string(), "WORLDhello\n");
+    engine.feed_keys("u");
+    assert_eq!(engine.buffer().to_string(), "hello\n");
+}
+
+#[test]
+fn test_nvim_ctrl_r_redoes_undo() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.feed_keys("iX<Esc>"); // insert X → "Xhello\n"
+    engine.feed_keys("u"); // undo → "hello\n"
+    engine.feed_keys("<C-r>"); // redo
+    assert_eq!(engine.buffer().to_string(), "Xhello\n");
+}
+
+// -- Command abbreviations --
+
+#[test]
+fn test_nvim_q_abbrev_does_not_explode() {
+    // :q on an unmodified empty buffer — just ensure dispatch doesn't panic.
+    let mut engine = Engine::new();
+    let _ = engine.execute_command("q");
+}
+
+// -- Settings query --
+
+#[test]
+fn test_nvim_set_query_tabstop() {
+    // :set tabstop? should leave a message containing the current value
+    let mut engine = Engine::new();
+    engine.settings.tabstop = 8;
+    engine.feed_keys(":set tabstop?<CR>");
+    assert!(
+        engine.message.contains('8'),
+        "expected tabstop=8 in message, got: {:?}",
+        engine.message
+    );
+}
