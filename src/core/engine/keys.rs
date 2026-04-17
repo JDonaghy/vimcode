@@ -1828,6 +1828,14 @@ impl Engine {
                 Some('T') => {
                     self.prev_tab();
                 }
+                Some('\t') => {
+                    // g<Tab>: jump to last-accessed tab
+                    self.goto_last_accessed_tab();
+                }
+                None if key_name == "Tab" => {
+                    // g<Tab> via feed_keys (unicode is None for special keys)
+                    self.goto_last_accessed_tab();
+                }
                 Some('s') => {
                     return self.cmd_git_stage_hunk();
                 }

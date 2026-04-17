@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 295 — Phase 5 begins, g-prefix audit, 4 gaps filed) | **Tests:** 1904 (lib) + 414 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 296 — g<Tab> last-accessed tab, #122) | **Tests:** 1915 (lib) + 414 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
