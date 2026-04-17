@@ -269,7 +269,9 @@ See [README.md](README.md) for full feature documentation.
 |---------|-------------|--------|-------|
 | `gg` | Go to first line / line N | ✅ | |
 | `g_` | Last non-blank char | ✅ | |
-| `g0` | Start of screen line | ✅ | |
+| `g0` / `g<Home>` | Start of screen line | ✅ | Wrap-aware |
+| `g^` | First non-blank on screen line | ✅ | Wrap-aware |
+| `g$` / `g<End>` | End of screen line | ✅ | Wrap-aware |
 | `gj` / `gk` | Visual line up/down | ✅ | Wrap mode |
 | `gE` | End of previous WORD | ✅ | |
 | `ge` | End of previous word | ✅ | |
@@ -305,7 +307,7 @@ See [README.md](README.md) for full feature documentation.
 | `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 36/36 (100%)**
+**g-commands: 40/40 (100%)**
 
 ---
 

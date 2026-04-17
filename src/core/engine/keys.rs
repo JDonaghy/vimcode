@@ -1917,6 +1917,18 @@ impl Engine {
                         self.move_visual_up();
                     }
                 }
+                Some('0') => {
+                    // g0: start of screen line
+                    self.move_screen_line_start();
+                }
+                Some('^') => {
+                    // g^: first non-blank on screen line
+                    self.move_screen_line_first_non_blank();
+                }
+                Some('$') => {
+                    // g$: end of screen line
+                    self.move_screen_line_end();
+                }
                 Some('~') => {
                     if self.pending_operator == Some('~') {
                         // g~g~: doubled operator — apply linewise (same as g~~)
@@ -2173,6 +2185,14 @@ impl Engine {
                 Some('c') => {
                     // gc: commentary — wait for next key (gcc = current line)
                     self.pending_key = Some('\x03'); // sentinel for gc handler
+                }
+                None if key_name == "Home" => {
+                    // g<Home>: same as g0
+                    self.move_screen_line_start();
+                }
+                None if key_name == "End" => {
+                    // g<End>: same as g$
+                    self.move_screen_line_end();
                 }
                 _ => {}
             },

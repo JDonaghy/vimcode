@@ -42,11 +42,11 @@ Total: **58 commands**  ·  ✅ 36  ·  🟡 2  ·  ❌ 14  ·  ⏭️ 6
 | `go` | ✅ | Goto byte N |
 | `g'` / `` g` `` | ✅ | Mark jump without touching jumplist |
 | `g<Down>` / `g<Up>` | 🟡 | Aliases for `gj`/`gk` — *verify separately* |
-| `g$` | ❌ | Rightmost char on screen line (wrap-aware) |
-| `g0` | ❌ | Leftmost char on screen line (wrap-aware) |
-| `g^` | ❌ | Leftmost non-blank on screen line |
-| `g<End>` | ❌ | Like `g$` but non-blank |
-| `g<Home>` | ❌ | Alias for `g0` |
+| `g$` | ✅ | Rightmost char on screen line (wrap-aware) |
+| `g0` | ✅ | Leftmost char on screen line (wrap-aware) |
+| `g^` | ✅ | Leftmost non-blank on screen line |
+| `g<End>` | ✅ | Alias for `g$` |
+| `g<Home>` | ✅ | Alias for `g0` |
 
 ### Operators / edits
 
@@ -98,7 +98,7 @@ Total: **58 commands**  ·  ✅ 36  ·  🟡 2  ·  ❌ 14  ·  ⏭️ 6
 ### Summary
 
 **Headline gaps worth filing as issues:**
-- **`g$` / `g0` / `g^` / `g<End>` / `g<Home>`** — screen-line motions (wrap-aware horizontal) — [#123](https://github.com/JDonaghy/vimcode/issues/123)
+- ~~**`g$` / `g0` / `g^` / `g<End>` / `g<Home>`** — screen-line motions (wrap-aware horizontal) — [#123](https://github.com/JDonaghy/vimcode/issues/123)~~ ✅ implemented
 - ~~**`gF`** — edit-file-and-jump-to-line — [#120](https://github.com/JDonaghy/vimcode/issues/120)~~ ✅ implemented
 - **`g@`** — user-definable operator (via `operatorfunc`) — [#121](https://github.com/JDonaghy/vimcode/issues/121)
 - ~~**`g<Tab>`** — jump to last-accessed tab — [#122](https://github.com/JDonaghy/vimcode/issues/122)~~ ✅ implemented

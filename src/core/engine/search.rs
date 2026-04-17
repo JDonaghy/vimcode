@@ -207,6 +207,70 @@ impl Engine {
         self.ensure_cursor_visible();
     }
 
+    /// Move cursor to the start of the current screen line (`g0` / `g<Home>`).
+    /// When wrap is off, equivalent to `0`.
+    pub(crate) fn move_screen_line_start(&mut self) {
+        if !self.settings.wrap {
+            self.view_mut().cursor.col = 0;
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            self.view_mut().cursor.col = (col / vp) * vp;
+        }
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to the first non-blank character on the current screen line (`g^`).
+    /// When wrap is off, equivalent to `^`.
+    pub(crate) fn move_screen_line_first_non_blank(&mut self) {
+        if !self.settings.wrap {
+            let line = self.view().cursor.line;
+            let fnb = self.first_non_blank_col(line);
+            self.view_mut().cursor.col = fnb;
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            let seg_start = (col / vp) * vp;
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            let line_len = self.buffer().line_len_chars(line);
+            let seg_end = (seg_start + vp).min(line_len);
+            let mut target = seg_start;
+            for i in seg_start..seg_end {
+                let ch = self.buffer().content.char(line_start + i);
+                if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                    target = i;
+                    break;
+                }
+            }
+            self.view_mut().cursor.col = target;
+        }
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to the end of the current screen line (`g$` / `g<End>`).
+    /// When wrap is off, equivalent to `$`.
+    pub(crate) fn move_screen_line_end(&mut self) {
+        let line = self.view().cursor.line;
+        let line_len = self
+            .buffer()
+            .content
+            .line(line)
+            .len_chars()
+            .saturating_sub(1); // exclude newline
+        if !self.settings.wrap {
+            self.view_mut().cursor.col = line_len.saturating_sub(1);
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            let seg_start = (col / vp) * vp;
+            let seg_end = (seg_start + vp).min(line_len);
+            self.view_mut().cursor.col = seg_end.saturating_sub(1);
+        }
+        self.clamp_cursor_col();
+        self.ensure_cursor_visible();
+    }
+
     /// Synchronise the scroll_top of scroll-bound window pairs.
     /// Called after every key that may move the cursor or scroll, and also
     /// after direct scroll_top mutations (e.g. scrollbar drag).
