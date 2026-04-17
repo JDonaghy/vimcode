@@ -24189,3 +24189,252 @@ fn test_nvim_insert_ctrl_w_at_line_start() {
     engine.feed_keys("i<C-w><Esc>");
     assert_eq!(engine.buffer().to_string(), "hello\n");
 }
+
+// ── Phase 4 Batch 12: Search, scroll, increment, replace ────────────────
+// Mined from test_search.vim, test_scroll.vim, test_increment.vim, test_normal.vim
+
+// -- Search forward/backward --
+
+#[test]
+fn test_nvim_search_basic_n() {
+    // /foo then n jumps to next match
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo baz\n");
+    engine.update_syntax();
+    engine.feed_keys("/foo<CR>");
+    assert_eq!(engine.view().cursor.col, 0);
+    engine.feed_keys("n");
+    assert_eq!(engine.view().cursor.col, 8);
+}
+
+#[test]
+fn test_nvim_search_N_reverse() {
+    // N reverses direction of last search
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 16;
+    engine.feed_keys("/foo<CR>");
+    assert_eq!(engine.view().cursor.col, 16);
+    engine.feed_keys("N");
+    assert_eq!(engine.view().cursor.col, 8);
+}
+
+#[test]
+fn test_nvim_search_wraps_around() {
+    // Forward search wraps to start of buffer
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys("/alpha<CR>");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_nvim_search_backward_question() {
+    // ?pat searches backward
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo baz\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 14;
+    engine.feed_keys("?foo<CR>");
+    assert_eq!(engine.view().cursor.col, 8);
+}
+
+#[test]
+fn test_nvim_search_no_match_noop() {
+    // Search for non-existent pattern leaves cursor in place
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 3;
+    engine.feed_keys("/xyz<CR>");
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+#[test]
+fn test_nvim_search_count_prefix_n() {
+    // 3n jumps to 3rd next match
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x x x x x\n");
+    engine.update_syntax();
+    engine.feed_keys("/x<CR>");
+    assert_eq!(engine.view().cursor.col, 0);
+    engine.feed_keys("3n");
+    assert_eq!(engine.view().cursor.col, 6);
+}
+
+// -- Scroll commands --
+
+#[test]
+fn test_nvim_zz_centers_cursor() {
+    // zz scrolls view so cursor line is centered (no change to buffer or cursor line)
+    let mut engine = Engine::new();
+    let lines: String = (0..50).map(|i| format!("line {i}\n")).collect();
+    engine.buffer_mut().insert(0, &lines);
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 25;
+    engine.feed_keys("zz");
+    assert_eq!(engine.view().cursor.line, 25);
+}
+
+#[test]
+fn test_nvim_ctrl_d_scroll_down() {
+    // Ctrl-D scrolls down half a page
+    let mut engine = Engine::new();
+    let lines: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    engine.buffer_mut().insert(0, &lines);
+    engine.update_syntax();
+    let start_line = engine.view().cursor.line;
+    engine.feed_keys("<C-d>");
+    assert!(engine.view().cursor.line > start_line);
+}
+
+#[test]
+fn test_nvim_ctrl_u_scroll_up() {
+    // Ctrl-U scrolls up half a page
+    let mut engine = Engine::new();
+    let lines: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    engine.buffer_mut().insert(0, &lines);
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 50;
+    engine.feed_keys("<C-u>");
+    assert!(engine.view().cursor.line < 50);
+}
+
+#[test]
+fn test_nvim_ctrl_b_page_up() {
+    // Ctrl-B scrolls up a full page
+    let mut engine = Engine::new();
+    let lines: String = (0..100).map(|i| format!("line {i}\n")).collect();
+    engine.buffer_mut().insert(0, &lines);
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 80;
+    engine.feed_keys("<C-b>");
+    assert!(engine.view().cursor.line < 80);
+}
+
+// -- Number increment/decrement (Ctrl-A / Ctrl-X) --
+
+#[test]
+fn test_nvim_ctrl_a_basic() {
+    // Ctrl-A increments number under cursor
+    nvim_case("counter = 41\n", 0, 0, "<C-a>", "counter = 42\n", 0, 11);
+}
+
+#[test]
+fn test_nvim_ctrl_a_seeks_forward() {
+    // Ctrl-A finds number to the right if cursor not on number
+    nvim_case("abc 5 def\n", 0, 0, "<C-a>", "abc 6 def\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_ctrl_x_basic() {
+    // Ctrl-X decrements number
+    nvim_case("val = 10\n", 0, 0, "<C-x>", "val = 9\n", 0, 6);
+}
+
+#[test]
+fn test_nvim_ctrl_a_negative_to_positive() {
+    // Ctrl-A on -1 yields 0
+    nvim_case("x = -1\n", 0, 4, "<C-a>", "x = 0\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_ctrl_a_count_prefix() {
+    // 5<C-a> increments by 5
+    nvim_case("n = 10\n", 0, 0, "5<C-a>", "n = 15\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_ctrl_x_count_prefix() {
+    // 3<C-x> decrements by 3
+    nvim_case("n = 10\n", 0, 0, "3<C-x>", "n = 7\n", 0, 4);
+}
+
+// -- Replace mode --
+
+#[test]
+#[ignore = "vim deviation #101: Replace mode cursor lands at col+1 after Esc"]
+fn test_nvim_R_replaces_chars() {
+    // R enters replace mode; subsequent chars overwrite
+    // Vim: after RXYZ<Esc>, cursor on last replaced char (Z) at col 2. VimCode: col 3.
+    nvim_case("abcdef\n", 0, 0, "RXYZ<Esc>", "XYZdef\n", 0, 2);
+}
+
+#[test]
+#[ignore = "vim deviation #101: Replace mode cursor lands at col+1 after Esc"]
+fn test_nvim_R_past_eol_appends() {
+    // R past end-of-line appends rather than overwriting
+    nvim_case("ab\n", 0, 0, "RXYZ<Esc>", "XYZ\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_r_replace_with_newline() {
+    // r<CR> replaces char with newline (splits line)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2;
+    engine.feed_keys("r<CR>");
+    assert_eq!(engine.buffer().to_string(), "ab\ndef\n");
+}
+
+#[test]
+fn test_nvim_r_count_replace() {
+    // 3rX replaces 3 chars with X
+    nvim_case("abcdef\n", 0, 0, "3rX", "XXXdef\n", 0, 2);
+}
+
+// -- Case change --
+
+#[test]
+fn test_nvim_gUU_uppercase_line() {
+    // gUU uppercases current line
+    nvim_case("hello world\n", 0, 0, "gUU", "HELLO WORLD\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_gu_word_motion() {
+    // guw lowercases current word
+    nvim_case("HELLO WORLD\n", 0, 0, "guw", "hello WORLD\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_gU_word_motion() {
+    // gUw uppercases current word
+    nvim_case("hello world\n", 0, 0, "gUw", "HELLO world\n", 0, 0);
+}
+
+// -- Count with motion --
+
+#[test]
+fn test_nvim_count_l_moves_n_chars() {
+    // 5l moves 5 chars right
+    nvim_case("abcdefgh\n", 0, 0, "5l", "abcdefgh\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_count_j_moves_n_lines() {
+    // 3j moves 3 lines down
+    nvim_case("a\nb\nc\nd\ne\n", 0, 0, "3j", "a\nb\nc\nd\ne\n", 3, 0);
+}
+
+#[test]
+fn test_nvim_count_dd_deletes_n_lines() {
+    // 3dd deletes 3 lines
+    nvim_case("a\nb\nc\nd\ne\n", 0, 0, "3dd", "d\ne\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_count_yy_yanks_n_lines() {
+    // 3yy yanks 3 lines, then p pastes them
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys("3yy");
+    engine.feed_keys("p");
+    assert_eq!(engine.buffer().to_string(), "a\na\nb\nc\nb\nc\nd\n");
+}
