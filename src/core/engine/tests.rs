@@ -26157,3 +26157,48 @@ end)
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- Tab bar hit regions ---
+
+#[test]
+fn test_tab_bar_handle_click_switches_tab() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    // Switch to tab 0 via handle_tab_bar_click
+    let group_id = engine.active_group;
+    engine.handle_tab_bar_click(group_id, TabBarClickTarget::Tab(0));
+    assert_eq!(engine.active_group().active_tab, 0);
+}
+
+#[test]
+fn test_tab_bar_handle_click_close_tab() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+    assert_eq!(engine.active_group().tabs.len(), 2);
+
+    let group_id = engine.active_group;
+    let needs_confirm = engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(1));
+    assert!(!needs_confirm); // Not dirty
+    assert_eq!(engine.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
+    let mut engine = Engine::new();
+    engine.new_tab(None); // tab 1
+                          // Make the buffer dirty
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    let group_id = engine.active_group;
+    let needs_confirm = engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(1));
+    assert!(needs_confirm); // Should request confirmation
+                            // Tab should NOT be closed yet
+    assert_eq!(engine.active_group().tabs.len(), 2);
+}

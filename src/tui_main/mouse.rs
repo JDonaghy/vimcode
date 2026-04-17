@@ -2476,115 +2476,47 @@ pub(super) fn handle_mouse(
             if let Some((
                 group_id,
                 local_col,
-                bar_width,
-                group_tabs,
-                diff_toolbar_ref,
-                was_active,
-                scroll_offset,
+                _bar_width,
+                _group_tabs,
+                _diff_toolbar_ref,
+                _was_active,
+                _scroll_offset,
             )) = matched_group
             {
-                engine.active_group = group_id;
-
-                let mut x: u16 = 0;
-                let mut tab_matched = false;
-                // Collect tab hit info from immutable borrow, then apply mutably.
-                let mut hit_info: Option<(usize, bool)> = None;
-                for (i, tab) in group_tabs.iter().enumerate().skip(scroll_offset) {
-                    let name_width = tab.name.chars().count() as u16;
-                    let tab_width = name_width + TAB_CLOSE_COLS;
-                    if local_col >= x && local_col < x + tab_width {
-                        tab_matched = true;
-                        let valid = engine
-                            .editor_groups
-                            .get(&group_id)
-                            .is_some_and(|g| i < g.tabs.len());
-                        if valid {
-                            let is_close = local_col >= x + name_width;
-                            hit_info = Some((i, is_close));
-                        }
-                        break;
-                    }
-                    x += tab_width;
-                }
-                if let Some((tab_idx, is_close)) = hit_info {
-                    engine.active_group = group_id;
-                    if is_close {
-                        if let Some(g) = engine.editor_groups.get_mut(&group_id) {
-                            g.active_tab = tab_idx;
-                        }
-                        engine.line_annotations.clear();
-                        if engine.dirty() {
-                            *close_tab_confirm = true;
-                        } else {
-                            engine.close_tab();
-                        }
-                    } else {
-                        engine.goto_tab(tab_idx);
-                        // Record drag start position for tab drag-and-drop.
-                        *tab_drag_start = Some((col, row));
-                        engine.lsp_ensure_active_buffer();
-                        if let Some(path) = engine.file_path().cloned() {
-                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
-                        }
-                    }
-                }
-                if !tab_matched {
-                    // Calculate diff toolbar zone (label + 3 buttons).
-                    let diff_total_cols = if let Some(dt) = diff_toolbar_ref {
-                        let label_cols = dt
-                            .change_label
-                            .as_ref()
-                            .map(|l| l.len() as u16 + 1)
-                            .unwrap_or(0);
-                        DIFF_TOOLBAR_BTN_COLS + label_cols
-                    } else {
-                        0
-                    };
-                    // Split buttons exist on active group, or all groups in diff mode.
-                    let had_split = was_active || engine.is_in_diff_view();
-                    let split_cols = if had_split { TAB_SPLIT_BOTH_COLS } else { 0 };
-                    let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
-                    let split_start = split_end.saturating_sub(split_cols);
-                    let diff_end = split_start;
-                    let diff_start = diff_end.saturating_sub(diff_total_cols);
-                    // Hit-test diff toolbar buttons FIRST (they sit left of
-                    // split buttons, so check them before split to avoid
-                    // boundary overlap).
-                    if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
-                        // Hit-test diff toolbar buttons (prev, next, fold).
-                        // Layout: [label][prev][next][fold].
-                        let in_diff = local_col - diff_start;
-                        let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
-                        let in_btns = in_diff.saturating_sub(label_cols);
-                        let has_win = engine.windows.contains_key(&engine.active_window_id());
-                        if in_diff < label_cols {
-                            // Clicked on the label — no-op.
-                        } else if in_btns < DIFF_BTN_COLS {
-                            if has_win {
-                                engine.jump_prev_hunk();
+                // Use pre-computed hit regions from the GroupTabBar.
+                let hit_target = split
+                    .group_tab_bars
+                    .iter()
+                    .find(|gtb| gtb.group_id == group_id)
+                    .and_then(|gtb| {
+                        crate::render::resolve_tab_bar_click(&gtb.hit_regions, local_col)
+                    });
+                if let Some(target) = hit_target {
+                    use crate::core::engine::TabBarClickTarget;
+                    match target {
+                        TabBarClickTarget::Tab(_) => {
+                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
+                            if needs_confirm {
+                                *close_tab_confirm = true;
                             }
-                        } else if in_btns < DIFF_BTN_COLS * 2 {
-                            if has_win {
-                                engine.jump_next_hunk();
+                            *tab_drag_start = Some((col, row));
+                            if let Some(path) = engine.file_path().cloned() {
+                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
                             }
-                        } else {
-                            engine.diff_toggle_hide_unchanged();
                         }
-                    } else if had_split
-                        && local_col >= split_start
-                        && local_col < split_start + TAB_SPLIT_BOTH_COLS
-                        && bar_width >= TAB_SPLIT_BOTH_COLS
-                    {
-                        // Hit-test split buttons.
-                        let in_split = local_col - split_start;
-                        if in_split >= TAB_SPLIT_BTN_COLS {
-                            engine.open_editor_group(SplitDirection::Horizontal);
-                        } else {
-                            engine.open_editor_group(SplitDirection::Vertical);
+                        TabBarClickTarget::CloseTab(_) => {
+                            let needs_confirm = engine.handle_tab_bar_click(group_id, target);
+                            if needs_confirm {
+                                *close_tab_confirm = true;
+                            }
                         }
-                    } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
-                        // Editor action menu button ("…") at far right.
-                        engine.open_editor_action_menu(group_id, col, row + 1);
+                        TabBarClickTarget::ActionMenu => {
+                            engine.active_group = group_id;
+                            engine.open_editor_action_menu(group_id, col, row + 1);
+                        }
+                        _ => {
+                            engine.handle_tab_bar_click(group_id, target);
+                        }
                     }
                 }
                 return sidebar_width;

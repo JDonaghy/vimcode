@@ -422,6 +422,162 @@ pub struct GroupTabBar {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Index of the first visible tab (scroll offset for overflow tab bars).
     pub tab_scroll_offset: usize,
+    /// Pre-computed click regions for this tab bar, in char-cell units
+    /// relative to the tab bar's left edge (column 0 = left edge of group bounds).
+    pub hit_regions: Vec<(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )>,
+}
+
+// ── Tab bar hit region constants (char-cell units) ──────────────────────────
+
+/// Columns used by each tab's close button (the × itself + trailing space).
+pub const TAB_CLOSE_COLS: u16 = 2;
+/// Columns occupied by each split button (1 space + 2-wide glyph).
+const TAB_SPLIT_BTN_COLS: u16 = 3;
+/// Total columns reserved for both split buttons (right + down).
+const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+/// Columns for the editor action menu button ("…").
+const TAB_ACTION_BTN_COLS: u16 = 3;
+/// Columns per diff toolbar button (1 space + 1 char + 1 space).
+const DIFF_BTN_COLS: u16 = 3;
+/// Total columns for all three diff toolbar buttons.
+const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
+
+/// Compute hit regions for a group's tab bar.
+///
+/// Layout (left to right):
+/// `[tab0][tab1]...[tabN]  [diff_toolbar?] [split_btns?] [action_btn]`
+///
+/// All positions are in char-cell columns relative to the tab bar left edge.
+pub fn compute_tab_bar_hit_regions(
+    tabs: &[TabInfo],
+    tab_scroll_offset: usize,
+    bar_width: u16,
+    has_diff_toolbar: bool,
+    diff_label_cols: u16,
+    has_split_buttons: bool,
+) -> Vec<(
+    crate::core::engine::TabBarHitRegion,
+    crate::core::engine::TabBarClickTarget,
+)> {
+    use crate::core::engine::{TabBarClickTarget, TabBarHitRegion};
+
+    let mut regions = Vec::new();
+
+    // ── Right-side buttons (from right edge inward) ─────────────
+
+    // Action menu button at far right
+    let action_start = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
+    regions.push((
+        TabBarHitRegion {
+            col: action_start,
+            width: TAB_ACTION_BTN_COLS,
+        },
+        TabBarClickTarget::ActionMenu,
+    ));
+
+    // Split buttons (left of action menu)
+    let split_cols = if has_split_buttons {
+        TAB_SPLIT_BOTH_COLS
+    } else {
+        0
+    };
+    let split_end = action_start;
+    let split_start = split_end.saturating_sub(split_cols);
+    if has_split_buttons {
+        regions.push((
+            TabBarHitRegion {
+                col: split_start,
+                width: TAB_SPLIT_BTN_COLS,
+            },
+            TabBarClickTarget::SplitRight,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: split_start + TAB_SPLIT_BTN_COLS,
+                width: TAB_SPLIT_BTN_COLS,
+            },
+            TabBarClickTarget::SplitDown,
+        ));
+    }
+
+    // Diff toolbar (left of split buttons)
+    if has_diff_toolbar {
+        let diff_total = DIFF_TOOLBAR_BTN_COLS + diff_label_cols;
+        let diff_end = split_start;
+        let diff_start = diff_end.saturating_sub(diff_total);
+        let btn_start = diff_start + diff_label_cols;
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffPrev,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start + DIFF_BTN_COLS,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffNext,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start + DIFF_BTN_COLS * 2,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffToggle,
+        ));
+    }
+
+    // ── Tab slots (from left edge) ─────────────────────────────
+
+    let mut x: u16 = 0;
+    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
+        let name_width = tab.name.chars().count() as u16;
+        let tab_width = name_width + TAB_CLOSE_COLS;
+        if x + tab_width > bar_width {
+            break; // Overflow — remaining tabs are hidden
+        }
+        // Tab body (click to switch)
+        regions.push((
+            TabBarHitRegion {
+                col: x,
+                width: name_width,
+            },
+            TabBarClickTarget::Tab(i),
+        ));
+        // Close button
+        regions.push((
+            TabBarHitRegion {
+                col: x + name_width,
+                width: TAB_CLOSE_COLS,
+            },
+            TabBarClickTarget::CloseTab(i),
+        ));
+        x += tab_width;
+    }
+
+    regions
+}
+
+/// Resolve a column position (in char cells, relative to the tab bar left edge)
+/// to a `TabBarClickTarget` by walking the hit region list.
+pub fn resolve_tab_bar_click(
+    hit_regions: &[(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )],
+    col: u16,
+) -> Option<crate::core::engine::TabBarClickTarget> {
+    for (region, target) in hit_regions {
+        if col >= region.col && col < region.col + region.width {
+            return Some(*target);
+        }
+    }
+    None
 }
 
 /// One segment in the breadcrumb bar (either a path component or a symbol).
@@ -4775,12 +4931,30 @@ pub fn build_screen_layout(
                     .get(&gid)
                     .map(|g| g.tab_scroll_offset)
                     .unwrap_or(0);
+                let bar_width = bounds.width as u16;
+                let has_diff_toolbar = diff_toolbar.is_some();
+                let diff_label_cols = diff_toolbar
+                    .as_ref()
+                    .and_then(|dt| dt.change_label.as_ref())
+                    .map(|l| l.len() as u16 + 1)
+                    .unwrap_or(0);
+                let is_active = gid == engine.active_group;
+                let has_split = is_active || engine.is_in_diff_view();
+                let hit_regions = compute_tab_bar_hit_regions(
+                    &tabs,
+                    tab_scroll_offset,
+                    bar_width,
+                    has_diff_toolbar,
+                    diff_label_cols,
+                    has_split,
+                );
                 GroupTabBar {
                     group_id: gid,
                     tabs,
                     bounds,
                     diff_toolbar,
                     tab_scroll_offset,
+                    hit_regions,
                 }
             })
             .collect();
