@@ -2840,33 +2840,10 @@ fn status_segment_hit_test(
     width: usize,
     click_col: usize,
 ) -> Option<crate::render::StatusAction> {
-    // Compute right-side total width
-    let right_width: usize = status
-        .right_segments
-        .iter()
-        .map(|s| s.text.chars().count())
-        .sum();
-    let right_start = width.saturating_sub(right_width);
-
-    // Check left segments
-    let mut col = 0;
-    for seg in &status.left_segments {
-        let seg_len = seg.text.chars().count();
-        if click_col >= col && click_col < col + seg_len {
-            return seg.action.clone();
-        }
-        col += seg_len;
-    }
-
-    // Check right segments
-    let mut col = right_start;
-    for seg in &status.right_segments {
-        let seg_len = seg.text.chars().count();
-        if click_col >= col && click_col < col + seg_len {
-            return seg.action.clone();
-        }
-        col += seg_len;
-    }
-
-    None
+    let regions = crate::render::compute_status_hit_regions(
+        &status.left_segments,
+        &status.right_segments,
+        width,
+    );
+    crate::render::resolve_status_bar_click(&regions, click_col as u16)
 }
