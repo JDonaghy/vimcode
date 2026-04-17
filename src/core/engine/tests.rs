@@ -25804,7 +25804,6 @@ fn test_nvim_set_query_tabstop() {
     );
 }
 
-<<<<<<< HEAD
 // --- g<Tab>: jump to last-accessed tab ---
 
 #[test]
