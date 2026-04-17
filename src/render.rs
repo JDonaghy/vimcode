@@ -8071,6 +8071,50 @@ pub fn build_window_status_line(
     }
 }
 
+/// Compute hit regions from status line segments.
+/// `bar_width` is the total width in char cells.
+/// Returns `(col, width, action)` tuples for all interactive segments.
+pub fn compute_status_hit_regions(
+    left: &[StatusSegment],
+    right: &[StatusSegment],
+    bar_width: usize,
+) -> Vec<(u16, u16, StatusAction)> {
+    let mut regions = Vec::new();
+    // Left segments: accumulate from col 0
+    let mut col: u16 = 0;
+    for seg in left {
+        let w = seg.text.chars().count() as u16;
+        if let Some(ref action) = seg.action {
+            regions.push((col, w, action.clone()));
+        }
+        col += w;
+    }
+    // Right segments: right-aligned
+    let right_width: usize = right.iter().map(|s| s.text.chars().count()).sum();
+    let mut col = bar_width.saturating_sub(right_width) as u16;
+    for seg in right {
+        let w = seg.text.chars().count() as u16;
+        if let Some(ref action) = seg.action {
+            regions.push((col, w, action.clone()));
+        }
+        col += w;
+    }
+    regions
+}
+
+/// Resolve a column position to a `StatusAction` using pre-computed hit regions.
+pub fn resolve_status_bar_click(
+    hit_regions: &[(u16, u16, StatusAction)],
+    col: u16,
+) -> Option<StatusAction> {
+    for &(start, width, ref action) in hit_regions {
+        if col >= start && col < start + width {
+            return Some(action.clone());
+        }
+    }
+    None
+}
+
 fn build_command_line(engine: &Engine) -> CommandLineData {
     let (text, right_align, show_cursor, cursor_anchor_text) = match engine.mode {
         Mode::Command if engine.history_search_active => {
