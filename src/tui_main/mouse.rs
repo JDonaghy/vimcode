@@ -1853,35 +1853,23 @@ pub(super) fn handle_mouse(
     if col < ab_width {
         // Activity bar spans full height below the menu bar row (matching GTK layout).
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        // Activity bar starts at row `menu_rows` in absolute terminal coordinates.
         if row < menu_rows {
-            return sidebar_width; // click in menu bar area, ignore
-        }
-        let bar_row = row - menu_rows; // row relative to activity bar start
-        let bar_height = term_height.saturating_sub(menu_rows);
-        let settings_row = bar_height.saturating_sub(1);
-        // Row 0: hamburger (menu bar toggle)
-        if bar_row == 0 {
-            engine.toggle_menu_bar();
             return sidebar_width;
         }
-        let target_panel = match bar_row {
-            1 => Some(TuiPanel::Explorer),
-            2 => Some(TuiPanel::Search),
-            3 => Some(TuiPanel::Debug),
-            4 => Some(TuiPanel::Git),
-            5 => Some(TuiPanel::Extensions),
-            6 => Some(TuiPanel::Ai),
-            r if r == settings_row && settings_row >= 7 => Some(TuiPanel::Settings),
-            _ => None,
-        };
-        // Check if click is on an extension panel icon (rows 7+)
-        if target_panel.is_none() && bar_row >= 7 {
-            let ext_idx = (bar_row - 7) as usize;
-            let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
-            ext_names.sort();
-            if ext_idx < ext_names.len() {
-                let name = ext_names[ext_idx].clone();
+        let bar_row = row - menu_rows;
+        let bar_height = term_height.saturating_sub(menu_rows);
+        // Resolve click target using shared function
+        let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
+        ext_names.sort();
+        let ab_target =
+            crate::core::engine::resolve_activity_bar_click(bar_row, bar_height, &ext_names);
+        use crate::core::engine::{ActivityBarTarget, SidebarPanel};
+        match ab_target {
+            Some(ActivityBarTarget::MenuToggle) => {
+                engine.toggle_menu_bar();
+                return sidebar_width;
+            }
+            Some(ActivityBarTarget::ExtensionPanel(name)) => {
                 if sidebar.ext_panel_name.as_deref() == Some(&name) && sidebar.visible {
                     sidebar.visible = false;
                     sidebar.ext_panel_name = None;
@@ -1900,7 +1888,21 @@ pub(super) fn handle_mouse(
                 let _ = engine.session.save();
                 return sidebar_width;
             }
+            _ => {}
         }
+        // Map shared SidebarPanel to TUI-local TuiPanel
+        let target_panel = match ab_target {
+            Some(ActivityBarTarget::Panel(p)) => match p {
+                SidebarPanel::Explorer => Some(TuiPanel::Explorer),
+                SidebarPanel::Search => Some(TuiPanel::Search),
+                SidebarPanel::Debug => Some(TuiPanel::Debug),
+                SidebarPanel::Git => Some(TuiPanel::Git),
+                SidebarPanel::Extensions => Some(TuiPanel::Extensions),
+                SidebarPanel::Ai => Some(TuiPanel::Ai),
+            },
+            Some(ActivityBarTarget::Settings) => Some(TuiPanel::Settings),
+            _ => None,
+        };
         if let Some(panel) = target_panel {
             // Clear extension panel state when switching to a built-in panel
             sidebar.ext_panel_name = None;
