@@ -300,6 +300,7 @@ See [README.md](README.md) for full feature documentation.
 | `gI` | Insert at column 1 | ✅ | |
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
+| `g@{motion}` | Call operatorfunc | ✅ | Lua plugin API: `vimcode.set_operatorfunc(fn)` |
 | `g+` / `g-` | Undo tree newer/older | ✅ | Chronological timeline navigation |
 | `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
@@ -307,7 +308,7 @@ See [README.md](README.md) for full feature documentation.
 | `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 40/40 (100%)**
+**g-commands: 41/41 (100%)**
 
 ---
 

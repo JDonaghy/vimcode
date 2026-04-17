@@ -81,7 +81,7 @@ Total: **58 commands**  ·  ✅ 36  ·  🟡 2  ·  ❌ 14  ·  ⏭️ 6
 | `gs` | ✅ | Sleep N seconds |
 | `gh` | 🟡 | Enters a Select-ish state — *verify separately* |
 | `gF` | ✅ | Edit file + jump to line number (fixed in #120) |
-| `g@` | ❌ | Call `operatorfunc` ([#121](https://github.com/JDonaghy/vimcode/issues/121)) |
+| `g@` | ✅ | Call `operatorfunc` (fixed in #121) |
 | `g<` | ❌ | Display previous command output |
 | `g<Tab>` | ✅ | Last-accessed tab page (fixed in #122) |
 | `gH` | ❌ | Start Select-line mode (Select mode not supported) |
@@ -100,7 +100,7 @@ Total: **58 commands**  ·  ✅ 36  ·  🟡 2  ·  ❌ 14  ·  ⏭️ 6
 **Headline gaps worth filing as issues:**
 - ~~**`g$` / `g0` / `g^` / `g<End>` / `g<Home>`** — screen-line motions (wrap-aware horizontal) — [#123](https://github.com/JDonaghy/vimcode/issues/123)~~ ✅ implemented
 - ~~**`gF`** — edit-file-and-jump-to-line — [#120](https://github.com/JDonaghy/vimcode/issues/120)~~ ✅ implemented
-- **`g@`** — user-definable operator (via `operatorfunc`) — [#121](https://github.com/JDonaghy/vimcode/issues/121)
+- ~~**`g@`** — user-definable operator (via `operatorfunc`) — [#121](https://github.com/JDonaghy/vimcode/issues/121)~~ ✅ implemented
 - ~~**`g<Tab>`** — jump to last-accessed tab — [#122](https://github.com/JDonaghy/vimcode/issues/122)~~ ✅ implemented
 - **Tag navigation cluster** (`g]`, `g CTRL-]`) — covered by a broader tag-support story (separate issue if we commit to tag support)
 

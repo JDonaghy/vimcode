@@ -26063,3 +26063,97 @@ fn test_g_dollar_wrap_last_segment_goes_to_line_end() {
     engine.feed_keys("g$");
     assert_eq!(engine.view().cursor.col, 14);
 }
+
+// --- g@: user-defined operatorfunc ---
+
+#[test]
+fn test_g_at_sets_pending_operator() {
+    // g@ without a registered operatorfunc should still accept motions
+    // (it just does nothing when the callback is missing)
+    let mut engine = engine_with_text("hello world\n");
+    engine.feed_keys("g@w");
+    // No crash, cursor should still be valid
+    assert!(engine.view().cursor.line == 0);
+}
+
+#[test]
+fn test_g_at_calls_operatorfunc_linewise() {
+    // Register a Lua operatorfunc that records the motion type in a message
+    let dir = write_plugin_lua(
+        "test_opfunc_line",
+        r#"
+vimcode.set_operatorfunc(function(motion_type)
+    vimcode.message("opfunc:" .. motion_type)
+end)
+"#,
+    );
+    let mut engine = engine_with_text("line one\nline two\nline three\n");
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.plugin_manager = Some(mgr);
+        }
+        Err(_) => return,
+    }
+
+    // g@j should trigger linewise operatorfunc (j is a linewise motion)
+    engine.feed_keys("g@j");
+    assert_eq!(engine.message, "opfunc:line");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_g_at_calls_operatorfunc_charwise() {
+    let dir = write_plugin_lua(
+        "test_opfunc_char",
+        r#"
+vimcode.set_operatorfunc(function(motion_type)
+    vimcode.message("opfunc:" .. motion_type)
+end)
+"#,
+    );
+    let mut engine = engine_with_text("hello world\n");
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.plugin_manager = Some(mgr);
+        }
+        Err(_) => return,
+    }
+
+    // g@w should trigger charwise operatorfunc (w is a charwise motion)
+    engine.feed_keys("g@w");
+    assert_eq!(engine.message, "opfunc:char");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_g_at_operatorfunc_can_modify_buffer() {
+    // Register an operatorfunc that uppercases all lines via set_lines
+    let dir = write_plugin_lua(
+        "test_opfunc_modify",
+        r#"
+vimcode.set_operatorfunc(function(motion_type)
+    local lines = vimcode.buf.lines()
+    for i, line in ipairs(lines) do
+        vimcode.buf.set_line(i, string.upper(line))
+    end
+end)
+"#,
+    );
+    let mut engine = engine_with_text("hello\nworld\n");
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.plugin_manager = Some(mgr);
+        }
+        Err(_) => return,
+    }
+
+    engine.feed_keys("g@j");
+    assert_eq!(engine.buffer().to_string(), "HELLO\nWORLD\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
