@@ -255,6 +255,7 @@ end)
 vimcode.message(text)           -- Display a status bar message
 vimcode.cwd()                   -- Get current working directory (string)
 vimcode.command_run(cmd)        -- Execute a VimCode command (e.g., "w", "q", "split")
+vimcode.set_operatorfunc(fn)    -- Register a function for g@{motion} (receives "line"/"char")
 ```
 
 ### Buffer Functions (`vimcode.buf.*`)

@@ -2182,6 +2182,11 @@ impl Engine {
                     self.operator_count = self.count.take();
                     self.pending_operator = Some('R');
                 }
+                Some('@') => {
+                    // g@{motion}: call user-defined operatorfunc
+                    self.operator_count = self.count.take();
+                    self.pending_operator = Some('@');
+                }
                 Some('c') => {
                     // gc: commentary — wait for next key (gcc = current line)
                     self.pending_key = Some('\x03'); // sentinel for gc handler
@@ -3883,6 +3888,13 @@ impl Engine {
                 self.command_buffer = format!("{},{}!", start_line + 1, end_line + 1);
                 self.command_cursor = self.command_buffer.chars().count();
             }
+            '@' => {
+                // g@: call user-defined operatorfunc (charwise)
+                let start_line = self.buffer().content.char_to_line(start);
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = start - self.buffer().line_to_char(start_line);
+                self.plugin_run_operatorfunc("char");
+            }
             _ => {}
         }
     }
@@ -4009,6 +4021,13 @@ impl Engine {
                 self.mode = Mode::Command;
                 self.command_buffer = format!("{},{}!", start_line + 1, end_line + 1);
                 self.command_cursor = self.command_buffer.chars().count();
+            }
+            '@' => {
+                // g@: call user-defined operatorfunc (linewise)
+                // Set '[ and '] marks for the range, then call the plugin
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = 0;
+                self.plugin_run_operatorfunc("line");
             }
             _ => {}
         }
@@ -7415,6 +7434,20 @@ impl Engine {
         };
         let ctx = self.make_plugin_ctx(false);
         let (found, ctx) = pm.call_keymap(mode, key, ctx);
+        self.plugin_manager = Some(pm);
+        self.apply_plugin_ctx(ctx);
+        found
+    }
+
+    /// Run the user-defined operatorfunc (g@) with the given motion type.
+    /// Returns `true` if an operatorfunc was registered and executed.
+    pub(crate) fn plugin_run_operatorfunc(&mut self, motion_type: &str) -> bool {
+        let pm = match self.plugin_manager.take() {
+            Some(p) => p,
+            None => return false,
+        };
+        let ctx = self.make_plugin_ctx(false);
+        let (found, ctx) = pm.call_operatorfunc(motion_type, ctx);
         self.plugin_manager = Some(pm);
         self.apply_plugin_ctx(ctx);
         found

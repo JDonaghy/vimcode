@@ -421,6 +421,38 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
+    /// Check if an operatorfunc has been registered via `vimcode.set_operatorfunc()`.
+    pub fn has_operatorfunc(&self) -> bool {
+        self.lua
+            .named_registry_value::<LuaRegistryKey>("__operatorfunc")
+            .is_ok()
+    }
+
+    /// Call the registered operatorfunc with the given motion type ("line", "char", "block").
+    /// Returns the updated context with any modifications made by the callback.
+    pub fn call_operatorfunc(
+        &self,
+        motion_type: &str,
+        ctx: PluginCallContext,
+    ) -> (bool, PluginCallContext) {
+        let key = match self
+            .lua
+            .named_registry_value::<LuaRegistryKey>("__operatorfunc")
+        {
+            Ok(k) => k,
+            Err(_) => return (false, ctx),
+        };
+        self.lua.set_app_data(ctx);
+        if let Ok(f) = self.lua.registry_value::<LuaFunction>(&key) {
+            let _ = f.call::<String, ()>(motion_type.to_string());
+        }
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (true, ctx)
+    }
+
     /// Check if any registered keymap for `mode` starts with `prefix`.
     pub fn has_keymap_prefix(&self, mode: &str, prefix: &str) -> bool {
         self.keymaps
@@ -495,6 +527,17 @@ impl PluginManager {
                 if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
                     reg.keymaps.insert((mode, k), key);
                 }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.set_operatorfunc(fn) — register a function for g@{motion}
+        vimcode.set(
+            "set_operatorfunc",
+            lua.create_function(|lua, f: LuaFunction| {
+                let key = lua.create_registry_value(f)?;
+                // Store in named registry slot for retrieval by call_operatorfunc
+                lua.set_named_registry_value("__operatorfunc", key)?;
                 Ok(())
             })?,
         )?;

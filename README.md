@@ -905,6 +905,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `gq{motion}` | Format text (reflow to textwidth) |
 | `gw{motion}` | Format text, keep cursor position |
 | `g?{motion}` | ROT13 encode text |
+| `g@{motion}` | Call user-defined operator (Lua `vimcode.set_operatorfunc(fn)`) |
 | `!{motion}{cmd}` | Filter lines through external command |
 | `N%` | Go to N% of file (e.g. `50%` goes to middle) |
 | `CTRL-^` | Switch to alternate (last edited) buffer |
