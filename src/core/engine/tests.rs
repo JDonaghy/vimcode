@@ -26202,3 +26202,22 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
                             // Tab should NOT be closed yet
     assert_eq!(engine.active_group().tabs.len(), 2);
 }
+
+// --- Ctrl-]: tag jump (LSP go-to-definition) ---
+
+#[test]
+fn test_ctrl_bracket_right_pushes_jump_location() {
+    // Ctrl-] should push jump location (same as gd)
+    let mut engine = engine_with_text("hello world\nfoo bar\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+
+    // Ctrl-] — no LSP in tests, but jump list should be updated
+    engine.handle_key("bracketright", None, true);
+
+    // Jump list should have the position before the Ctrl-] press
+    assert!(
+        !engine.jump_list.is_empty(),
+        "jump list should have an entry"
+    );
+}

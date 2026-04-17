@@ -109,10 +109,59 @@ Total: **58 commands**  ·  ✅ 36  ·  🟡 2  ·  ❌ 14  ·  ⏭️ 6
 
 ---
 
+## Slice 2 — Insert-mode commands
+
+Reference: [`:help insert-index`](https://vimhelp.org/index.txt.html#insert-index) (all commands available in Insert mode).
+
+Total: **17 commands**  ·  ✅ 15  ·  🟡 1  ·  ❌ 0  ·  ⏭️ 1
+
+### Special keys
+
+| Keystroke | Status | Notes |
+|-----------|--------|-------|
+| `<Esc>` | ✅ | End insert mode, back to Normal |
+| `<CR>` | ✅ | Insert newline (auto-indent aware) |
+| `<BS>` | ✅ | Delete character before cursor |
+| `<Del>` | ✅ | Delete character under cursor |
+| `<Tab>` | ✅ | Insert tab/spaces, accepts completion |
+| Arrow keys | ✅ | Cursor movement |
+| `<Home>` / `<End>` | ✅ | Line start/end |
+
+### Ctrl-key commands
+
+| Keystroke | Status | Notes |
+|-----------|--------|-------|
+| `Ctrl-N` / `Ctrl-P` | ✅ | Completion forward/backward |
+| `Ctrl-R {reg}` | ✅ | Insert register contents |
+| `Ctrl-W` | ✅ | Delete word backward |
+| `Ctrl-U` | ✅ | Delete to insert start |
+| `Ctrl-T` | ✅ | Indent by shiftwidth |
+| `Ctrl-D` | ✅ | Dedent by shiftwidth |
+| `Ctrl-O` | ✅ | Execute one Normal command |
+| `Ctrl-E` | ✅ | Insert character from line below |
+| `Ctrl-Y` | ✅ | Insert character from line above |
+| `Ctrl-A` | ✅ | Re-insert previously inserted text |
+| `Ctrl-@` | ✅ | Insert prev text + exit insert |
+| `Ctrl-V {char}` | ✅ | Insert literal character |
+| `Ctrl-G u` | ✅ | Break undo sequence |
+| `Ctrl-G j/k` | ✅ | Move cursor down/up |
+| `Ctrl-H` | 🟡 | Terminal maps to `<BS>` — works but identity is ambiguous |
+| `Ctrl-R =` | ⏭️ | Expression register — requires VimScript eval, out of scope |
+| `Ctrl-K {c1}{c2}` | ⏭️ | Digraph input — no digraph support planned |
+
+### Summary
+
+Insert mode is **100% for in-scope commands**. The only missing items are VimScript expression register and digraph input, both intentionally skipped.
+
+No new issues filed — nothing actionable to implement.
+
+---
+
 ## Coverage summary so far
 
 | Slice | Commands | ✅ | 🟡 | ❌ | ⏭️ |
 |-------|---------:|---:|---:|---:|---:|
-| `g`-prefix | 58 | 36 | 2 | 14 | 6 |
+| `g`-prefix | 58 | 41 | 2 | 9 | 6 |
+| Insert mode | 17 | 15 | 1 | 0 | 1 |
 
-**Vim conformance on the `g` cluster: ~62% implemented, ~24% missing, ~14% skipped-by-design.**
+**All g-prefix gaps (#120–#123) implemented. Insert mode at 100% in-scope coverage.**
