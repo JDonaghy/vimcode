@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 291 — Fix #112 ranged/concat/bang ex-command forms) | **Tests:** 1881 (lib) + 391 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 292 — Phase 4 batch 16, 18 new conformance tests, #116 filed) | **Tests:** 1899 (lib) + 410 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 292 — Phase 4 batch 16 (#25), 18 new conformance tests, #116 filed:**
+
+1. **Phase 4 batch 16: 18 new Neovim-verified tests** — Covering visual block `I` (insert prefix), visual block `A` (append suffix), `:noh` clears search highlights, `:r` on nonexistent file, `:retab` tab-to-spaces, lowercase marks (`ma` / `'a` / `` `a ``), `n` with no prior search, word motions at EOF/BOF, visual indent/dedent (`V>`, `V<`), `5rX` count-prefix replace, `dap` delete-around-paragraph, `.` repeat last change, `u`/`<C-r>` undo-redo, `:set tabstop?` query.
+2. **#116 filed** — Visual block started with `$<C-v>jjA` should virtual-append at each line's actual end (Vim behavior). VimCode uses the starting cursor column, so appending on a longer line inserts mid-word instead of at the end.
 
 **Session 291 — Fix #112: ranged/concat/bang ex-command forms, #114 filed:**
 
