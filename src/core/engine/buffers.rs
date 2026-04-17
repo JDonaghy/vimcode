@@ -3126,7 +3126,11 @@ impl Engine {
         let dir = self.git_dir();
         let fresh = crate::core::git::current_branch(&dir);
         if fresh != self.git_branch {
-            self.git_branch = fresh;
+            self.git_branch = fresh.clone();
+            // Notify plugins (e.g. git-insights panel) so they can refresh.
+            // Arg is the new branch name, or empty string if detached/not a repo.
+            let arg = fresh.unwrap_or_default();
+            self.plugin_event("git_branch_changed", &arg);
             true
         } else {
             false
