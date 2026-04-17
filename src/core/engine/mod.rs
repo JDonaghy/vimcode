@@ -1089,6 +1089,41 @@ pub fn compute_find_replace_hit_regions(
     (regions, input_w)
 }
 
+// ── Tab bar hit regions ─────────────────────────────────────────────────────
+
+/// Click target within a group's tab bar.
+/// Backends resolve native coordinates → `TabBarClickTarget`, then call
+/// `Engine::handle_tab_bar_click()` for shared dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabBarClickTarget {
+    /// Click on a tab (switch to it). Index into the group's tab list.
+    Tab(usize),
+    /// Click on a tab's close button. Index into the group's tab list.
+    CloseTab(usize),
+    /// Split editor right button.
+    SplitRight,
+    /// Split editor down button.
+    SplitDown,
+    /// Action menu button (the "…" overflow menu).
+    ActionMenu,
+    /// Diff toolbar: previous change.
+    DiffPrev,
+    /// Diff toolbar: next change.
+    DiffNext,
+    /// Diff toolbar: toggle inline/side-by-side.
+    DiffToggle,
+}
+
+/// A hit region within a group's tab bar, expressed in character-cell units
+/// relative to the tab bar's left edge.
+#[derive(Debug, Clone)]
+pub struct TabBarHitRegion {
+    /// Column offset from the tab bar left edge.
+    pub col: u16,
+    /// Width of this region in char cells.
+    pub width: u16,
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {

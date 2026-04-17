@@ -1612,6 +1612,52 @@ impl Engine {
         self.tab_switcher_open = false;
     }
 
+    /// Handle a click on a tab bar hit region.
+    /// `group_id` identifies which group's tab bar was clicked.
+    /// Returns `true` if a close-dirty-tab confirmation is needed.
+    pub fn handle_tab_bar_click(&mut self, group_id: GroupId, target: TabBarClickTarget) -> bool {
+        self.active_group = group_id;
+        match target {
+            TabBarClickTarget::Tab(idx) => {
+                self.goto_tab(idx);
+                self.lsp_ensure_active_buffer();
+            }
+            TabBarClickTarget::CloseTab(idx) => {
+                if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                    g.active_tab = idx;
+                }
+                self.line_annotations.clear();
+                if self.dirty() {
+                    return true; // Caller should show confirmation
+                }
+                self.close_tab();
+            }
+            TabBarClickTarget::SplitRight => {
+                self.open_editor_group(SplitDirection::Vertical);
+            }
+            TabBarClickTarget::SplitDown => {
+                self.open_editor_group(SplitDirection::Horizontal);
+            }
+            TabBarClickTarget::ActionMenu => {
+                // Caller handles this — needs screen coordinates
+            }
+            TabBarClickTarget::DiffPrev => {
+                if self.windows.contains_key(&self.active_window_id()) {
+                    self.jump_prev_hunk();
+                }
+            }
+            TabBarClickTarget::DiffNext => {
+                if self.windows.contains_key(&self.active_window_id()) {
+                    self.jump_next_hunk();
+                }
+            }
+            TabBarClickTarget::DiffToggle => {
+                self.diff_toggle_hide_unchanged();
+            }
+        }
+        false
+    }
+
     /// Get display info for each MRU entry: (filename, path, is_dirty).
     pub fn tab_switcher_items(&self) -> Vec<(String, String, bool)> {
         self.tab_mru
