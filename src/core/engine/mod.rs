@@ -1089,6 +1089,62 @@ pub fn compute_find_replace_hit_regions(
     (regions, input_w)
 }
 
+// ── Activity bar hit regions ────────────────────────────────────────────────
+
+/// Click target within the activity bar icon column.
+/// Backends resolve row position → `ActivityBarTarget`, then apply
+/// panel-switching logic locally (since sidebar visibility is backend state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityBarTarget {
+    /// Hamburger menu (row 0) — toggles menu bar.
+    MenuToggle,
+    /// Built-in panel by name.
+    Panel(SidebarPanel),
+    /// Extension panel by registered name.
+    ExtensionPanel(String),
+    /// Settings (bottom row).
+    Settings,
+}
+
+/// Built-in sidebar panels (shared across backends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPanel {
+    Explorer,
+    Search,
+    Debug,
+    Git,
+    Extensions,
+    Ai,
+}
+
+/// Resolve an activity bar row (0-indexed from the top of the activity bar)
+/// to a click target. `bar_height` is the total activity bar height in rows.
+/// `ext_panel_names` is the sorted list of registered extension panel names.
+pub fn resolve_activity_bar_click(
+    row: u16,
+    bar_height: u16,
+    ext_panel_names: &[String],
+) -> Option<ActivityBarTarget> {
+    let settings_row = bar_height.saturating_sub(1);
+    match row {
+        0 => Some(ActivityBarTarget::MenuToggle),
+        1 => Some(ActivityBarTarget::Panel(SidebarPanel::Explorer)),
+        2 => Some(ActivityBarTarget::Panel(SidebarPanel::Search)),
+        3 => Some(ActivityBarTarget::Panel(SidebarPanel::Debug)),
+        4 => Some(ActivityBarTarget::Panel(SidebarPanel::Git)),
+        5 => Some(ActivityBarTarget::Panel(SidebarPanel::Extensions)),
+        6 => Some(ActivityBarTarget::Panel(SidebarPanel::Ai)),
+        r if r == settings_row && settings_row >= 7 => Some(ActivityBarTarget::Settings),
+        r if r >= 7 => {
+            let ext_idx = (r - 7) as usize;
+            ext_panel_names
+                .get(ext_idx)
+                .map(|name| ActivityBarTarget::ExtensionPanel(name.clone()))
+        }
+        _ => None,
+    }
+}
+
 // ── Tab bar hit regions ─────────────────────────────────────────────────────
 
 /// Click target within a group's tab bar.

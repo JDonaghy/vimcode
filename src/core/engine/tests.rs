@@ -26221,3 +26221,56 @@ fn test_ctrl_bracket_right_pushes_jump_location() {
         "jump list should have an entry"
     );
 }
+
+// --- Activity bar hit regions ---
+
+#[test]
+fn test_activity_bar_resolve_builtin_panels() {
+    use crate::core::engine::{resolve_activity_bar_click, ActivityBarTarget, SidebarPanel};
+    let ext_names: Vec<String> = vec![];
+
+    assert_eq!(
+        resolve_activity_bar_click(0, 30, &ext_names),
+        Some(ActivityBarTarget::MenuToggle)
+    );
+    assert_eq!(
+        resolve_activity_bar_click(1, 30, &ext_names),
+        Some(ActivityBarTarget::Panel(SidebarPanel::Explorer))
+    );
+    assert_eq!(
+        resolve_activity_bar_click(4, 30, &ext_names),
+        Some(ActivityBarTarget::Panel(SidebarPanel::Git))
+    );
+    assert_eq!(
+        resolve_activity_bar_click(6, 30, &ext_names),
+        Some(ActivityBarTarget::Panel(SidebarPanel::Ai))
+    );
+    // Settings at bottom row
+    assert_eq!(
+        resolve_activity_bar_click(29, 30, &ext_names),
+        Some(ActivityBarTarget::Settings)
+    );
+    // Empty gap between panels and settings
+    assert_eq!(resolve_activity_bar_click(10, 30, &ext_names), None);
+}
+
+#[test]
+fn test_activity_bar_resolve_extension_panels() {
+    use crate::core::engine::{resolve_activity_bar_click, ActivityBarTarget};
+    let ext_names = vec!["git-insights".to_string(), "todo-panel".to_string()];
+
+    // Row 7 = first extension panel
+    assert_eq!(
+        resolve_activity_bar_click(7, 30, &ext_names),
+        Some(ActivityBarTarget::ExtensionPanel(
+            "git-insights".to_string()
+        ))
+    );
+    // Row 8 = second extension panel
+    assert_eq!(
+        resolve_activity_bar_click(8, 30, &ext_names),
+        Some(ActivityBarTarget::ExtensionPanel("todo-panel".to_string()))
+    );
+    // Row 9 with only 2 extensions = None (gap)
+    assert_eq!(resolve_activity_bar_click(9, 30, &ext_names), None);
+}
