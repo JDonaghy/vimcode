@@ -2785,8 +2785,12 @@ impl Engine {
             format!("{}\n", line_text)
         };
 
-        // Insert copy after dest_line (after the line at dest_line index)
-        let insert_pos = if dest_line >= num_lines {
+        // Insert copy after dest_line. The special address "0" means "insert
+        // before line 1" — at char 0 — and is NOT a normal "after line N" op.
+        let dest_is_zero = dest.trim() == "0";
+        let insert_pos = if dest_is_zero {
+            0
+        } else if dest_line >= num_lines {
             self.buffer().len_chars()
         } else {
             let after = dest_line.min(num_lines - 1);
@@ -2801,7 +2805,9 @@ impl Engine {
         self.insert_with_undo(insert_pos, &line_text);
         self.finish_undo_group();
 
-        let new_line = if dest_line < current_line {
+        let new_line = if dest_is_zero {
+            0
+        } else if dest_line < current_line {
             current_line + 1
         } else {
             dest_line + 1
@@ -2813,7 +2819,15 @@ impl Engine {
     }
 
     /// Parse a line address string to a 0-based line index.
-    /// Supports: "0", "1"-"N" (1-based absolute), ".", "$", "+N", "-N".
+    ///
+    /// Bare numeric addresses are **1-based** (matches Vim's convention): `"1"`
+    /// → index 0, `"3"` → index 2. The special address `"0"` means "before line 1"
+    /// — callers that use the result as an insert point should treat 0 as "insert
+    /// at the very top". For callers that use the result as a cursor line,
+    /// clamping to 0 is already safe.
+    ///
+    /// Supports: `"0"` (before first line), `"1"`-`"N"` (1-based absolute),
+    /// `"."` (current), `"$"` (last), `"+N"`/`"-N"` (relative to current).
     pub(crate) fn parse_line_address(&self, addr: &str, current: usize, total: usize) -> usize {
         let addr = addr.trim();
         if addr == "." {
@@ -2831,8 +2845,12 @@ impl Engine {
             return current.saturating_sub(n);
         }
         if let Ok(n) = addr.parse::<usize>() {
-            // 0-based absolute line index
-            return n.min(total.saturating_sub(1));
+            // 1-based absolute line index. "0" maps to index 0 and is treated
+            // specially by copy/move callers as "before line 1".
+            if n == 0 {
+                return 0;
+            }
+            return (n - 1).min(total.saturating_sub(1));
         }
         current
     }
