@@ -2699,7 +2699,10 @@ pub struct Engine {
     pub insert_ctrl_v_pending: bool,
     /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
-    pub visual_block_insert_info: Option<(usize, usize, usize, bool)>,
+    /// (start_line, end_line, col, is_append, virtual_end).
+    /// `virtual_end` = true when the block was started with `$`: the insert column
+    /// for each line is that line's own end, not the captured `col`.
+    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool)>,
     /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
     /// on additional new lines (Vim behavior for 3oXX<Esc>).
     pub insert_open_count: usize,

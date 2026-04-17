@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 292 — Phase 4 batch 16, 18 new conformance tests, #116 filed) | **Tests:** 1899 (lib) + 410 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 293 — Fix #116 visual block $ virtual-end append) | **Tests:** 1900 (lib) + 410 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,10 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 293 — Fix #116 visual block virtual-end append:**
+
+1. **Fix #116: `<C-v>jj$A<text>` now appends at each line's actual end** — Extended `visual_block_insert_info` tuple with a `virtual_end: bool` flag. When `$` is pressed in visual block mode (sets `visual_dollar = true`), `A` captures that flag and the Esc handler appends `<text>` at each selected line's own end instead of the captured column. Correctly clarified the ignored test's keystroke sequence — the virtual-end trigger is `<C-v>...$A`, not `$<C-v>...A`.
 
 **Session 292 — Phase 4 batch 16 (#25), 18 new conformance tests, #116 filed:**
 

@@ -25527,15 +25527,15 @@ fn test_nvim_visual_block_I_inserts_prefix() {
 // -- Visual block Append (A) --
 
 #[test]
-#[ignore = "vim deviation #116: visual block started with $ does not virtual-append per line"]
 fn test_nvim_visual_block_A_appends_suffix() {
-    // Block-select; A appends after the right edge of each line in the block.
+    // Block-select with $ inside visual mode; A appends at each line's actual
+    // end (Vim "virtual-end" behaviour). Pressing $ BEFORE <C-v> is different
+    // — it anchors the block at a fixed column and does NOT virtualise the
+    // right edge. This test exercises the virtual-end path.
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
     engine.update_syntax();
-    // Start at end of line 0, visual block down 2, append
-    engine.feed_keys("$<C-v>jjA!<Esc>");
-    // Each selected line gets '!' appended
+    engine.feed_keys("<C-v>jj$A!<Esc>");
     assert_eq!(engine.buffer().to_string(), "one!\ntwo!\nthree!\n");
 }
 

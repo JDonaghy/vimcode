@@ -4986,7 +4986,7 @@ impl Engine {
                 }
                 self.pending_change_motion = None;
                 // Apply visual block insert/append to remaining lines
-                if let Some((start_line, end_line, col, _is_append)) =
+                if let Some((start_line, end_line, col, _is_append, virtual_end)) =
                     self.visual_block_insert_info.take()
                 {
                     let text = self.insert_text_buffer.clone();
@@ -5013,15 +5013,21 @@ impl Engine {
                             } else {
                                 line_len
                             };
-                            // Pad with spaces if line is shorter than insert column
-                            let insert_col = col.min(line_len_no_nl);
-                            let pad = col.saturating_sub(line_len_no_nl);
+                            // In virtual-end mode (`$<C-v>...A`), the insert column is this
+                            // specific line's own end — no padding needed, just append.
+                            // Otherwise use the captured column and pad if the line is shorter.
+                            let target_col = if virtual_end { line_len_no_nl } else { col };
+                            let insert_col = target_col.min(line_len_no_nl);
+                            let pad = target_col.saturating_sub(line_len_no_nl);
                             let char_idx = self.buffer().line_to_char(line) + insert_col;
                             if pad > 0 {
                                 let spaces = " ".repeat(pad);
                                 self.insert_with_undo(char_idx, &spaces);
                             }
-                            self.insert_with_undo(self.buffer().line_to_char(line) + col, &text);
+                            self.insert_with_undo(
+                                self.buffer().line_to_char(line) + target_col,
+                                &text,
+                            );
                         }
                         self.finish_undo_group();
                     }
@@ -6263,7 +6269,7 @@ impl Engine {
                             let left_col = anchor.col.min(cursor.col);
                             // Store block info for applying on Escape
                             self.visual_block_insert_info =
-                                Some((start_line, end_line, left_col, false));
+                                Some((start_line, end_line, left_col, false, false));
                             // Exit visual mode and enter insert at left col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;
@@ -6280,21 +6286,37 @@ impl Engine {
                     return EngineAction::None;
                 }
                 'A' => {
-                    // Visual block A: append at right column of block on all lines
+                    // Visual block A: append at right column of block on all lines.
+                    // When the block was started with $, use each line's actual end
+                    // instead of the captured column (Vim "virtual end" behaviour).
                     if self.mode == Mode::VisualBlock {
                         if let Some(anchor) = self.visual_anchor {
                             let cursor = self.view().cursor;
                             let start_line = anchor.line.min(cursor.line);
                             let end_line = anchor.line.max(cursor.line);
-                            let right_col = anchor.col.max(cursor.col);
-                            // Store block info for applying on Escape (is_append=true)
+                            let virtual_end = self.visual_dollar;
+                            let first_line_col = if virtual_end {
+                                // Actual end of content (excluding trailing newline) of first line.
+                                let line_len = self.buffer().line_len_chars(start_line);
+                                let line_start = self.buffer().line_to_char(start_line);
+                                if line_len > 0
+                                    && self.buffer().content.char(line_start + line_len - 1) == '\n'
+                                {
+                                    line_len - 1
+                                } else {
+                                    line_len
+                                }
+                            } else {
+                                anchor.col.max(cursor.col) + 1
+                            };
                             self.visual_block_insert_info =
-                                Some((start_line, end_line, right_col + 1, true));
-                            // Exit visual mode and enter insert after right col of first line
+                                Some((start_line, end_line, first_line_col, true, virtual_end));
+                            // Exit visual mode and enter insert at the chosen col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;
+                            self.visual_dollar = false;
                             self.view_mut().cursor.line = start_line;
-                            self.view_mut().cursor.col = right_col + 1;
+                            self.view_mut().cursor.col = first_line_col;
                             self.start_undo_group();
                             self.insert_text_buffer.clear();
                         }
