@@ -512,6 +512,7 @@ vimcode.set_comment_style("haskell", {
 | `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |
 | `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on panel item |
+| `git_branch_changed` | new branch name (or `""`) | External git branch change detected (rate-limited to once per 2s) |
 | `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
 | Custom | shell output | `async_shell()` callback event |
 

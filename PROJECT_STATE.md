@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 287 — Fix #60 Git branch external refresh) | **Tests:** 1815 (lib) + 327 (nvim conformance)
+**Last updated:** Apr 16, 2026 (Session 288 — #107 git_branch_changed plugin event) | **Tests:** 1817 (lib) + 327 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,13 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 288 — #107 git_branch_changed plugin event (follow-up to #60):**
+
+1. **Fire `git_branch_changed` plugin event** from `tick_git_branch()` when an external branch change is detected. Plugins (e.g. git-insights panel) can now subscribe via `vimcode.on("git_branch_changed", fn)` and refresh their UI instead of going stale.
+2. **No new Lua API surface** — plugins already have `vimcode.git.branch()` to re-query state on the event.
+3. **2 new unit tests**: plugin event fires on change, does NOT fire when branch unchanged (1815 → 1817 lib tests).
+4. **EXTENSIONS.md updated** with the new event.
 
 **Session 287 — Fix #60 Git branch status bar refresh:**
 

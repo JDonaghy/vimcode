@@ -24715,3 +24715,64 @@ fn test_tick_git_branch_detects_change() {
         Some("stale-value-not-matching-anything")
     );
 }
+
+#[test]
+fn test_tick_git_branch_fires_plugin_event() {
+    // When tick_git_branch detects a change, plugins subscribed to
+    // git_branch_changed should be invoked with the new branch name.
+    let dir = write_plugin_lua(
+        "test_git_branch_event",
+        r#"vimcode.on("git_branch_changed", function(branch)
+            vimcode.message("branch:" .. branch)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.plugin_manager = Some(mgr);
+        }
+        Err(_) => return,
+    }
+    // Force a change detection on the next tick.
+    engine.git_branch = Some("stale-value-not-matching-anything".to_string());
+    engine.last_git_branch_check = None;
+    let changed = engine.tick_git_branch();
+    assert!(changed, "tick should detect a change");
+    assert!(
+        engine.message.starts_with("branch:"),
+        "plugin should have set a 'branch:' message, got: {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_tick_git_branch_no_event_when_unchanged() {
+    // When tick_git_branch sees no change, plugins must NOT be invoked.
+    let dir = write_plugin_lua(
+        "test_git_branch_noevent",
+        r#"vimcode.on("git_branch_changed", function(branch)
+            vimcode.message("unexpected:" .. branch)
+        end)"#,
+    );
+    let mut engine = Engine::new();
+    match plugin::PluginManager::new() {
+        Ok(mut mgr) => {
+            mgr.load_plugins_dir(&dir, &[]);
+            engine.plugin_manager = Some(mgr);
+        }
+        Err(_) => return,
+    }
+    // Prime the cache: whatever git::current_branch() returns is what we hold.
+    engine.last_git_branch_check = None;
+    engine.tick_git_branch(); // may or may not return true depending on prior state
+    engine.message.clear();
+    // Second tick without rate limit: branch is already up-to-date → no event.
+    engine.last_git_branch_check = None;
+    let changed = engine.tick_git_branch();
+    assert!(!changed, "second tick should see no change");
+    assert_eq!(
+        engine.message, "",
+        "plugin event must not fire when branch unchanged"
+    );
+}
