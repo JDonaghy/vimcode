@@ -24703,12 +24703,11 @@ fn test_tick_git_branch_rate_limited() {
 #[test]
 fn test_tick_git_branch_detects_change() {
     // Bypass the rate limit and confirm a branch mismatch is reported.
+    // Tests run inside the vimcode repo, so current_branch() returns Some(real branch),
+    // which differs from our stale value and tick should return true.
     let mut engine = Engine::new();
     engine.git_branch = Some("stale-value-not-matching-anything".to_string());
-    engine.last_git_branch_check = None; // force a real check
-    // The return value depends on whether tests run inside a git repo.
-    // Our CWD during tests *is* the vimcode repo, so current_branch() returns
-    // Some(real branch) which differs from our stale value — tick returns true.
+    engine.last_git_branch_check = None;
     let changed = engine.tick_git_branch();
     assert!(changed, "stale branch should be detected as changed");
     assert_ne!(
