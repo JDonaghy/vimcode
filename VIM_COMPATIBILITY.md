@@ -615,14 +615,14 @@ These are not in Vim but are part of VimCode:
 | Search & Marks | 26 | 26 | 100% |
 | Normal — Other | 32 | 33 | 97% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 35 | 35 | 100% |
+| g-Commands | 41 | 41 | 100% |
 | z-Commands | 23 | 23 | 100% |
 | Window (CTRL-W) | 33 | 33 | 100% |
 | Bracket ([ / ]) | 13 | 13 | 100% |
 | Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
 | Ex Commands | 70 | 70 | 100% |
-| **Total** | **415** | **418** | **99%** |
+| **Total** | **421** | **424** | **99%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
