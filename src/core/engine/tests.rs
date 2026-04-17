@@ -24438,3 +24438,250 @@ fn test_nvim_count_yy_yanks_n_lines() {
     engine.feed_keys("p");
     assert_eq!(engine.buffer().to_string(), "a\na\nb\nc\nb\nc\nd\n");
 }
+
+// ── Phase 4 Batch 13: Substitute, global, tabs, G-motions, bigword ──────
+// Mined from test_substitute.vim, test_global.vim, test_tabpage.vim, test_normal.vim
+
+// -- Substitute :s/pat/rep/ --
+
+#[test]
+fn test_nvim_substitute_basic() {
+    // :s/foo/bar/ replaces first foo on current line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo foo foo\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/foo/bar/<CR>");
+    assert_eq!(engine.buffer().to_string(), "bar foo foo\n");
+}
+
+#[test]
+fn test_nvim_substitute_g_flag() {
+    // :s/foo/bar/g replaces all foo on current line
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo foo foo\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/foo/bar/g<CR>");
+    assert_eq!(engine.buffer().to_string(), "bar bar bar\n");
+}
+
+#[test]
+fn test_nvim_substitute_all_lines_percent() {
+    // :%s/foo/bar/g replaces all foo in buffer
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo\nbar foo\nfoo foo\n");
+    engine.update_syntax();
+    engine.feed_keys(":%s/foo/X/g<CR>");
+    assert_eq!(engine.buffer().to_string(), "X\nbar X\nX X\n");
+}
+
+#[test]
+fn test_nvim_substitute_i_flag_case_insensitive() {
+    // :s/foo/X/i matches regardless of case
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "Foo FOO foo\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/foo/X/i<CR>");
+    assert_eq!(engine.buffer().to_string(), "X FOO foo\n");
+}
+
+#[test]
+fn test_nvim_substitute_empty_replacement() {
+    // :s/foo// removes match
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello foo world\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/foo//<CR>");
+    assert_eq!(engine.buffer().to_string(), "hello  world\n");
+}
+
+#[test]
+fn test_nvim_substitute_no_match_noop() {
+    // :s/xyz/X/ when no match leaves buffer unchanged
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/xyz/X/<CR>");
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+}
+
+// -- Global :g/pat/cmd --
+
+#[test]
+fn test_nvim_global_delete_matching() {
+    // :g/foo/d deletes all lines containing foo
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "aaa\nfoo bar\nbbb\nfoo baz\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys(":g/foo/d<CR>");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\nccc\n");
+}
+
+#[test]
+fn test_nvim_global_inverse_v() {
+    // :v/foo/d deletes all lines NOT containing foo
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "aaa\nfoo bar\nbbb\nfoo baz\nccc\n");
+    engine.update_syntax();
+    engine.feed_keys(":v/foo/d<CR>");
+    assert_eq!(engine.buffer().to_string(), "foo bar\nfoo baz\n");
+}
+
+// -- Tab navigation --
+
+#[test]
+fn test_nvim_tabnew_creates_tab() {
+    // :tabnew creates a new tab; tab count increases
+    let mut engine = Engine::new();
+    let tabs_before = engine.active_group().tabs.len();
+    engine.feed_keys(":tabnew<CR>");
+    assert_eq!(engine.active_group().tabs.len(), tabs_before + 1);
+}
+
+#[test]
+fn test_nvim_gt_cycles_tabs() {
+    // gt switches to next tab; gT to previous
+    let mut engine = Engine::new();
+    engine.feed_keys(":tabnew<CR>");
+    engine.feed_keys(":tabnew<CR>");
+    // Now have 3 tabs; active_tab should be 2
+    let active_before = engine.active_group().active_tab;
+    engine.feed_keys("gt");
+    let active_after = engine.active_group().active_tab;
+    assert_ne!(active_before, active_after);
+}
+
+// -- dG / yG / cG: operator + goto-end --
+
+#[test]
+fn test_nvim_dG_delete_to_end() {
+    // dG deletes from current line to end of buffer
+    nvim_case("aaa\nbbb\nccc\nddd\n", 1, 0, "dG", "aaa\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_dgg_delete_to_start() {
+    // dgg deletes from current line to start of buffer
+    nvim_case("aaa\nbbb\nccc\nddd\n", 2, 0, "dgg", "ddd\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_yG_yank_to_end() {
+    // yG yanks lines to end of buffer, then p pastes below
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 1;
+    engine.feed_keys("yG");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("p");
+    assert_eq!(engine.buffer().to_string(), "aaa\nbbb\nccc\nbbb\nccc\n");
+}
+
+// -- Bigword motions --
+
+#[test]
+fn test_nvim_W_big_word_skips_punct() {
+    // W jumps over punctuation as part of WORD
+    nvim_case("foo.bar baz\n", 0, 0, "W", "foo.bar baz\n", 0, 8);
+}
+
+#[test]
+fn test_nvim_B_big_word_back() {
+    // B jumps back over WORDs
+    nvim_case("foo.bar baz\n", 0, 8, "B", "foo.bar baz\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_E_big_word_end() {
+    // E jumps to end of current WORD
+    nvim_case("foo.bar baz\n", 0, 0, "E", "foo.bar baz\n", 0, 6);
+}
+
+#[test]
+fn test_nvim_gE_big_word_end_back() {
+    // gE jumps backward to end of previous WORD
+    nvim_case("foo.bar baz\n", 0, 10, "gE", "foo.bar baz\n", 0, 6);
+}
+
+// -- f/t/F/T with count --
+
+#[test]
+fn test_nvim_f_count_finds_nth() {
+    // 2fo finds 2nd 'o' forward
+    nvim_case(
+        "hello world, foo\n",
+        0,
+        0,
+        "2fo",
+        "hello world, foo\n",
+        0,
+        7,
+    );
+}
+
+#[test]
+fn test_nvim_F_backward_find() {
+    // Fo finds 'o' backward
+    nvim_case("hello world\n", 0, 10, "Fo", "hello world\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_comma_reverses_f() {
+    // , reverses direction of last f/F/t/T
+    nvim_case("aaa b c b aaa\n", 0, 0, "fb;,", "aaa b c b aaa\n", 0, 4);
+}
+
+// -- % bracket matching --
+
+#[test]
+fn test_nvim_percent_jumps_to_match() {
+    // % jumps from ( to matching )
+    nvim_case("foo (bar baz)\n", 0, 4, "%", "foo (bar baz)\n", 0, 12);
+}
+
+#[test]
+fn test_nvim_percent_square_brackets() {
+    // % matches [ and ]
+    nvim_case("arr[0]\n", 0, 3, "%", "arr[0]\n", 0, 5);
+}
+
+// -- Numbered register retention --
+
+#[test]
+fn test_nvim_register_1_holds_last_delete() {
+    // Deleted text goes into register "1
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("dd");
+    assert_eq!(
+        engine.registers.get(&'1').map(|(s, _)| s.as_str()),
+        Some("hello\n")
+    );
+}
+
+// -- Linewise vs charwise paste --
+
+#[test]
+fn test_nvim_paste_linewise_below_current() {
+    // yy then p pastes line below current
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo\nbar\n");
+    engine.update_syntax();
+    engine.feed_keys("yyp");
+    assert_eq!(engine.buffer().to_string(), "foo\nfoo\nbar\n");
+}
+
+#[test]
+fn test_nvim_paste_linewise_above() {
+    // yy then P pastes line above current
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo\nbar\n");
+    engine.update_syntax();
+    engine.feed_keys("yyP");
+    assert_eq!(engine.buffer().to_string(), "foo\nfoo\nbar\n");
+}
