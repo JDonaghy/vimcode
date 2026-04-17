@@ -422,6 +422,7 @@ impl PluginManager {
     }
 
     /// Check if an operatorfunc has been registered via `vimcode.set_operatorfunc()`.
+    #[allow(dead_code)]
     pub fn has_operatorfunc(&self) -> bool {
         self.lua
             .named_registry_value::<LuaRegistryKey>("__operatorfunc")
