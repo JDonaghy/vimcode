@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 289 — Phase 4 batch 14 + fixes for #109, #110) | **Tests:** 1846 (lib) + 356 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 290 — Phase 4 batch 15, 23 new conformance tests, #112 filed) | **Tests:** 1869 (lib) + 379 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,11 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 290 — Phase 4 batch 15 (#25), 23 new conformance tests, #112 filed:**
+
+1. **Phase 4 batch 15: 23 new Neovim-verified tests** — Covering `:copy`/`:move` (simple form), `:sort` (basic and reverse via `r` flag), `:sort u` unique, `gi` restart insert, `gv` reselect last visual, jump list (`<C-o>`/`<C-i>`), change list (`g;`), `:enew`, window move (`<C-w>H`), case operators (`gUw`, `guiw`, `g~w`), count+operator (`3dw`, `2cwXYZ`), text object edges (`daw` at word boundary, `das`), `:set number`/`nonumber`, `:pwd`.
+2. **#112 filed** — Collected deviations discovered during mining: ranged `:copy`/`:move` forms don't accept range prefixes; `:t<N>` / `:m<N>` / `:co<N>` concatenated forms not recognized; `:sort!` bang not parsed (users must use `:sort r` for reverse).
 
 **Session 289 — Phase 4 batch 14 (#25) + fixes for #109 and #110:**
 

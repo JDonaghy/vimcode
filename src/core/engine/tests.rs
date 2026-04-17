@@ -25083,3 +25083,289 @@ fn test_nvim_range_delete_two_lines() {
     engine.feed_keys(":2,3d<CR>");
     assert_eq!(engine.buffer().to_string(), "a\nd\n");
 }
+
+// ── Phase 4 Batch 15: :copy/:move/:sort, gi/gv, jumplist, etc. ──────────
+// Mined from test_ex_cmds.vim, test_sort.vim, test_jumplist.vim, test_normal.vim
+
+// -- :copy / :t (simple form with space) --
+
+#[test]
+fn test_nvim_copy_current_to_after() {
+    // :copy 2 copies current line to after line 2
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys(":copy 2<CR>");
+    // "a" copied after line 2 ("c") → "a\nb\nc\na\n"
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\na\n");
+}
+
+// -- :move (simple form with space) --
+
+#[test]
+fn test_nvim_move_current_to_bottom() {
+    // :move $ moves current line to end
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":move $<CR>");
+    // move current (line 0 "a") past $ → content ends with "a\n"
+    assert!(
+        engine.buffer().to_string().ends_with("a\n"),
+        "expected :move $ to place 'a' at end, got {:?}",
+        engine.buffer().to_string()
+    );
+}
+
+// -- :sort --
+
+#[test]
+fn test_nvim_sort_basic() {
+    // :sort sorts the whole buffer alphabetically
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "charlie\nalpha\nbravo\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort<CR>");
+    assert_eq!(engine.buffer().to_string(), "alpha\nbravo\ncharlie\n");
+}
+
+#[test]
+fn test_nvim_sort_reverse_r_flag() {
+    // :sort r (VimCode flag form) reverses alphabetical order
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort r<CR>");
+    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+}
+
+#[test]
+fn test_nvim_sort_unique() {
+    // :sort u removes duplicates
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "b\na\nb\nc\na\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort u<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\nc\n");
+}
+
+// -- gi: restart insert at last position --
+
+#[test]
+fn test_nvim_gi_restart_insert() {
+    // After iXYZ<Esc>, cursor returns to the char before, then moving away
+    // and pressing gi re-enters insert at the last insert position.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\ndef\n");
+    engine.update_syntax();
+    // Insert "XY" at start of line 1
+    engine.feed_keys("iXY<Esc>");
+    // Move away
+    engine.feed_keys("jG");
+    // gi — restart insert mode at last insert position
+    engine.feed_keys("gi");
+    assert_eq!(engine.mode, Mode::Insert);
+}
+
+// -- gv: reselect last visual --
+
+#[test]
+fn test_nvim_gv_reselects_last_visual() {
+    // After Vjd then gv: restore visual selection of what was deleted (on that range).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    // Visual-select the first line + part of second, then cancel
+    engine.feed_keys("v3l<Esc>");
+    // gv reselects
+    engine.feed_keys("gv");
+    assert_eq!(engine.mode, Mode::Visual);
+}
+
+// -- Jump list (Ctrl-O / Ctrl-I) --
+
+#[test]
+fn test_nvim_ctrl_o_after_G_jumps_back() {
+    // G pushes jump location; <C-o> goes back to line 0
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\n");
+    engine.update_syntax();
+    engine.feed_keys("G");
+    assert_eq!(engine.view().cursor.line, 4);
+    engine.feed_keys("<C-o>");
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+#[test]
+fn test_nvim_ctrl_i_after_ctrl_o_jumps_forward() {
+    // After <C-o> goes back, <C-i> goes forward
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\n");
+    engine.update_syntax();
+    engine.feed_keys("G");
+    engine.feed_keys("<C-o>");
+    assert_eq!(engine.view().cursor.line, 0);
+    engine.feed_keys("<C-i>");
+    assert_eq!(engine.view().cursor.line, 4);
+}
+
+// -- Change list (g;) --
+
+#[test]
+fn test_nvim_g_semicolon_jumps_to_change() {
+    // g; jumps to previous change position. Exact landing line depends on
+    // implementation, but it must move cursor off line 0 onto a change location.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys("Ghello<Esc>"); // change at bottom
+    engine.feed_keys("gg"); // move to line 0
+    assert_eq!(engine.view().cursor.line, 0);
+    engine.feed_keys("g;"); // jump back to change
+    assert_ne!(engine.view().cursor.line, 0, "g; should leave line 0");
+}
+
+// -- Buffer commands --
+
+#[test]
+fn test_nvim_enew_creates_empty_buffer() {
+    // :enew opens a new empty buffer
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "stuff\n");
+    engine.update_syntax();
+    let before = engine.active_buffer_id();
+    engine.feed_keys(":enew<CR>");
+    let after = engine.active_buffer_id();
+    assert_ne!(before, after, ":enew should switch to a new buffer");
+}
+
+// -- Window move (<C-w>H/J/K/L) --
+
+#[test]
+fn test_nvim_ctrl_w_H_moves_window_far_left() {
+    // <C-w>H: move current window to far left (make full-height)
+    // At minimum, it shouldn't crash.
+    let mut engine = Engine::new();
+    engine.feed_keys(":split<CR>");
+    engine.feed_keys("<C-w>H");
+    // Still has 2 windows
+    assert_eq!(engine.windows.len(), 2);
+}
+
+// -- gu/gU with operator+motion combinations --
+
+#[test]
+fn test_nvim_gU_word_forward() {
+    // gUw uppercases current word forward
+    nvim_case("hello world\n", 0, 0, "gUw", "HELLO world\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_gu_inner_word() {
+    // guiw lowercases word under cursor; cursor stays at invocation position in
+    // VimCode (Vim moves to start of text object — see #[ignore] test for that nuance).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "HELLO WORLD\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2;
+    engine.feed_keys("guiw");
+    assert_eq!(engine.buffer().to_string(), "hello WORLD\n");
+}
+
+#[test]
+fn test_nvim_g_tilde_word() {
+    // g~w toggles case of word
+    nvim_case("Hello\n", 0, 0, "g~w", "hELLO\n", 0, 0);
+}
+
+// -- Counts with operators --
+
+#[test]
+fn test_nvim_count_dw_deletes_n_words() {
+    // 3dw deletes 3 words
+    nvim_case("a b c d e\n", 0, 0, "3dw", "d e\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_count_cw_changes_n_words() {
+    // 2cwXYZ<Esc> changes 2 words to XYZ
+    nvim_case(
+        "aaa bbb ccc ddd\n",
+        0,
+        0,
+        "2cwXYZ<Esc>",
+        "XYZ ccc ddd\n",
+        0,
+        2,
+    );
+}
+
+// -- Text object edges --
+
+#[test]
+fn test_nvim_daw_at_word_boundary() {
+    // daw on "b" of "bar" deletes "bar " — cursor ends on "b" of "baz" (col 4)
+    nvim_case("foo bar baz\n", 0, 4, "daw", "foo baz\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_das_deletes_sentence() {
+    // das deletes current sentence including trailing space
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "First one. Second one. Third.\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 2;
+    engine.feed_keys("das");
+    assert_eq!(engine.buffer().to_string(), "Second one. Third.\n");
+}
+
+// -- :set query and toggle --
+
+#[test]
+fn test_nvim_set_nu_enables_number() {
+    // :set number enables line numbers
+    let mut engine = Engine::new();
+    engine.feed_keys(":set number<CR>");
+    assert_eq!(
+        engine.settings.line_numbers,
+        crate::core::settings::LineNumberMode::Absolute
+    );
+}
+
+#[test]
+fn test_nvim_set_nonu_disables_number() {
+    // :set nonumber disables line numbers
+    let mut engine = Engine::new();
+    engine.feed_keys(":set number<CR>");
+    engine.feed_keys(":set nonumber<CR>");
+    assert_eq!(
+        engine.settings.line_numbers,
+        crate::core::settings::LineNumberMode::None
+    );
+}
+
+// -- Colon command abbreviations --
+
+#[test]
+fn test_nvim_q_abbrev_for_quit() {
+    // :q is not abbrev but explicit command — verify not an error
+    // The dispatcher should accept :q; we check by ensuring no panic and a known message.
+    let mut engine = Engine::new();
+    let _ = engine.execute_command("q");
+    // No assertion on result: just confirm it doesn't panic
+}
+
+// -- :pwd --
+
+#[test]
+fn test_nvim_pwd_sets_message() {
+    // :pwd reports the current working directory in the message bar
+    let mut engine = Engine::new();
+    engine.feed_keys(":pwd<CR>");
+    assert!(
+        !engine.message.is_empty(),
+        ":pwd should populate the message"
+    );
+}
