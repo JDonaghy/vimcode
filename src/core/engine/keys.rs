@@ -758,6 +758,12 @@ impl Engine {
                     self.message.clear();
                     return EngineAction::None;
                 }
+                "bracketright" | "]" => {
+                    // Ctrl-]: tag jump → LSP go-to-definition
+                    self.push_jump_location();
+                    self.lsp_request_definition();
+                    return EngineAction::None;
+                }
                 "backslash" => {
                     // Ctrl+\: Split editor group to the right (VSCode style)
                     self.open_editor_group(SplitDirection::Vertical);
