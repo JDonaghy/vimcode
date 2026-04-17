@@ -25870,3 +25870,121 @@ fn test_gtab_with_three_tabs() {
     engine.feed_keys("g<Tab>");
     assert_eq!(engine.active_group().active_tab, 1);
 }
+
+// --- gF: open file under cursor + jump to line ---
+
+#[test]
+fn test_gf_open_file_at_line() {
+    use std::io::Write;
+    // Create a temp file with 10 lines
+    let dir = std::env::temp_dir().join("vimcode_test_gf");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("target.txt");
+    {
+        let mut f = std::fs::File::create(&file).unwrap();
+        for i in 1..=10 {
+            writeln!(f, "line {i}").unwrap();
+        }
+    }
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    // Buffer contains "target.txt:5"
+    let text = format!("{}:5", file.display());
+    engine.buffer_mut().insert(0, &text);
+    engine.update_syntax();
+
+    // gF should open the file and jump to line 5 (0-based: 4)
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'F');
+
+    // Verify we're in the target file at line 4 (0-based)
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file.as_path())
+    );
+    assert_eq!(engine.view().cursor.line, 4);
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_gf_open_file_no_line_suffix() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_gf2");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("plain.txt");
+    {
+        let mut f = std::fs::File::create(&file).unwrap();
+        writeln!(f, "hello").unwrap();
+    }
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    // Buffer contains just the file path, no :N suffix
+    let text = format!("{}", file.display());
+    engine.buffer_mut().insert(0, &text);
+    engine.update_syntax();
+
+    // gF should still open the file (at line 0, no line suffix)
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'F');
+
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file.as_path())
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_gf_open_file_with_line_and_col_suffix() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_test_gf3");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("multi.txt");
+    {
+        let mut f = std::fs::File::create(&file).unwrap();
+        for i in 1..=20 {
+            writeln!(f, "content line {i}").unwrap();
+        }
+    }
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    // Buffer contains "multi.txt:10:3" (line:col format from grep output)
+    let text = format!("{}:10:3", file.display());
+    engine.buffer_mut().insert(0, &text);
+    engine.update_syntax();
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'F');
+
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file.as_path())
+    );
+    // Line 10 → 0-based index 9
+    assert_eq!(engine.view().cursor.line, 9);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_gf_no_file_shows_message() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "nonexistent_file_xyz.txt:42");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'F');
+
+    assert!(
+        engine.message.contains("No file path"),
+        "expected error message, got: {:?}",
+        engine.message
+    );
+}

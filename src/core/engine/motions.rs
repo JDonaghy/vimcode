@@ -1072,6 +1072,107 @@ impl Engine {
         None
     }
 
+    /// Like `file_path_under_cursor`, but also parses a trailing `:<line>`
+    /// suffix (e.g. `src/main.rs:42`, `foo.txt:10:3`). Returns the resolved
+    /// path and an optional 1-based line number.
+    pub(crate) fn file_path_and_line_under_cursor(
+        &self,
+    ) -> Option<(std::path::PathBuf, Option<usize>)> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.chars().collect();
+
+        // Path chars: same as file_path_under_cursor but ALLOW ':' so we capture the suffix
+        let is_path_or_colon =
+            |c: char| !c.is_whitespace() && c != '"' && c != '\'' && c != ',' && c != ';';
+
+        let mut start = col;
+        let mut end = col;
+
+        while start > 0 && is_path_or_colon(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_path_or_colon(chars[end]) {
+            end += 1;
+        }
+        while end > start && (chars[end - 1] == '\n' || chars[end - 1] == '\r') {
+            end -= 1;
+        }
+        // Strip trailing colon (e.g. "foo.rs:" at end of sentence)
+        while end > start && chars[end - 1] == ':' {
+            end -= 1;
+        }
+
+        if start >= end {
+            return None;
+        }
+
+        let token: String = chars[start..end].iter().collect();
+        if token.is_empty() {
+            return None;
+        }
+
+        // Split off `:line` or `:line:col` suffix — try progressively stripping
+        // colon-delimited numeric suffixes to find a valid file path.
+        let mut path_part = token.as_str();
+        let mut line_num: Option<usize> = None;
+
+        // Try stripping `:col` then `:line` (handles `path:line:col`)
+        for _ in 0..2 {
+            if let Some(colon_pos) = path_part.rfind(':') {
+                let suffix = &path_part[colon_pos + 1..];
+                if let Ok(n) = suffix.parse::<usize>() {
+                    // Remember the first (outermost) number stripped as line, but
+                    // on the second pass it becomes the actual line number.
+                    line_num = Some(n);
+                    path_part = &path_part[..colon_pos];
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if path_part.is_empty() {
+            return None;
+        }
+
+        let path = std::path::PathBuf::from(path_part);
+
+        // Resolve path: workspace root, then current file's dir
+        let resolved = if path.is_absolute() {
+            if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        } else {
+            let mut found = None;
+            if let Some(ref root) = self.workspace_root {
+                let abs = root.join(&path);
+                if abs.exists() {
+                    found = Some(abs);
+                }
+            }
+            if found.is_none() {
+                if let Some(file_path) = self.active_buffer_state().file_path.as_ref() {
+                    if let Some(dir) = file_path.parent() {
+                        let abs = dir.join(&path);
+                        if abs.exists() {
+                            found = Some(abs);
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        resolved.map(|p| (p, line_num))
+    }
+
     // --- g* / g#: partial word search ---
 
     pub(crate) fn search_word_under_cursor_partial(&mut self, forward: bool) {
