@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 289 — Phase 4 batch 14, 25 new conformance tests, 2 new deviations) | **Tests:** 1842 (lib) + 354 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 289 — Phase 4 batch 14 + fixes for #109, #110) | **Tests:** 1846 (lib) + 356 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,11 +26,12 @@ When implementing a new key/command, add tests covering:
 
 ## Recent Work
 
-**Session 289 — Phase 4 batch 14 (#25), 25 new conformance tests, 2 new deviations (#109, #110):**
+**Session 289 — Phase 4 batch 14 (#25) + fixes for #109 and #110:**
 
 1. **Phase 4 batch 14: 25 new Neovim-verified tests** — Covering areas still uncovered: named registers (`"ayy`/`"ap`/`"Ayy`/`"add`), folding (`zf`/`zR`/`zd`), window splits (`<C-w>s/v/w/q/o`, `:split`, `:vsplit`), `:echo`, `:w` error case, word-end motions (`e`, `ge`), increment/decrement edge cases, search history, numeric `:N` and `:N,M` ranges.
-2. **2 new deviations documented** (#109 Ctrl-A on hex increments leading 0; #110 yank to named register also overwrites register 0) — 2 ignored tests document expected Vim behavior.
-3. **Closed #60** housekeeping (PR #106 was already merged but issue wasn't auto-closed).
+2. **Fix #109: Ctrl-A/Ctrl-X now parse hex (`0x..`) numbers correctly** — Added hex-prefix detection in `increment_number_at_cursor()` so cursor landing on or before the leading `0` of `0x09` now increments as hex → `0x0a` instead of decimal `1x09`. Also covers `-0x..`. 2 extra tests added (cursor-inside-hex, decrement).
+3. **Fix #110: Yank to named register no longer overwrites register 0** — Updated `set_yank_register()` to only update `"0` when the target is the unnamed register (`"`). Matches Vim's `:help registers` semantics.
+4. **Closed #60** housekeeping (PR #106 was already merged but issue wasn't auto-closed).
 
 **Session 288 — #107 git_branch_changed plugin event (follow-up to #60):**
 

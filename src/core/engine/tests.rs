@@ -24837,7 +24837,6 @@ fn test_nvim_delete_to_named_register() {
 }
 
 #[test]
-#[ignore = "vim deviation #110: yank to named register also overwrites register 0"]
 fn test_nvim_register_digit_preserves_after_named() {
     // Yanking to "a should NOT affect register 0 (which holds last yank)
     let mut engine = Engine::new();
@@ -25027,10 +25026,21 @@ fn test_nvim_ge_word_end_backward() {
 // -- Increment / decrement edge cases --
 
 #[test]
-#[ignore = "vim deviation #109: Ctrl-A on hex (0x..) treats the leading 0 as decimal"]
 fn test_nvim_ctrl_a_on_hex() {
     // Ctrl-A on 0x09 → 0x0a (Vim treats 0x-prefix as hex)
     nvim_case("val=0x09\n", 0, 0, "<C-a>", "val=0x0a\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_ctrl_a_on_hex_cursor_inside() {
+    // Cursor on the final '9' of 0x09; Ctrl-A should still increment hex.
+    nvim_case("v=0x09\n", 0, 5, "<C-a>", "v=0x0a\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_ctrl_x_on_hex_decrement() {
+    // Ctrl-X on 0x10 → 0x0f
+    nvim_case("n=0x10\n", 0, 0, "<C-x>", "n=0x0f\n", 0, 5);
 }
 
 #[test]

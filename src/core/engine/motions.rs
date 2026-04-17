@@ -526,6 +526,32 @@ impl Engine {
             }
         };
 
+        // Hex prefix detection: if start is on '0' (or '-0') with 'x'/'X' following,
+        // extend num_end forward to cover all hex digits so parsing sees "0xXX".
+        // Without this, cursor landing on the leading '0' of "0x09" would only see
+        // the digit "0" and increment it as decimal to "1x09" (Vim deviation #109).
+        let hex_prefix_at = if start_col + 1 < chars.len()
+            && chars[start_col] == '0'
+            && (chars[start_col + 1] == 'x' || chars[start_col + 1] == 'X')
+        {
+            Some(start_col)
+        } else if start_col + 2 < chars.len()
+            && chars[start_col] == '-'
+            && chars[start_col + 1] == '0'
+            && (chars[start_col + 2] == 'x' || chars[start_col + 2] == 'X')
+        {
+            Some(start_col + 1)
+        } else {
+            None
+        };
+        if let Some(p) = hex_prefix_at {
+            let mut end = p + 2;
+            while end < chars.len() && chars[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            num_end = end;
+        }
+
         let num_str: String = chars[start_col..num_end].iter().collect();
         let trimmed = num_str.trim_start_matches('-');
         let negative = num_str.starts_with('-');
@@ -3591,11 +3617,16 @@ impl Engine {
         self.registers.get(&reg)
     }
 
-    /// Sets a yank register. Like set_register, but ALSO always updates "0.
+    /// Sets a yank register. Like set_register, but ALSO updates "0 when the
+    /// target is the unnamed register. Yanks to a named register (e.g. "ayy)
+    /// leave "0 untouched, matching Vim's :help registers semantics.
     pub(crate) fn set_yank_register(&mut self, reg: char, content: String, is_linewise: bool) {
         self.set_register(reg, content.clone(), is_linewise);
-        // "0 is the yank-only register — set on every yank, never on deletes.
-        self.registers.insert('0', (content, is_linewise));
+        if reg == '"' {
+            // "0 is the yank-only register — set on every unnamed yank, never on
+            // deletes or on yanks to an explicit named register.
+            self.registers.insert('0', (content, is_linewise));
+        }
     }
 
     /// Sets a delete register. Like set_register, but:
