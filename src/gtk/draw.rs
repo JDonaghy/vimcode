@@ -6204,11 +6204,7 @@ pub(super) fn draw_ai_sidebar(
     cr.fill().ok();
 
     let cursor = ai.input_cursor.min(input_chars.len());
-    let cursor_line = if input_content_w > 0 {
-        cursor / input_content_w
-    } else {
-        0
-    };
+    let cursor_line = cursor.checked_div(input_content_w).unwrap_or(0);
     let cursor_col = if input_content_w > 0 {
         cursor % input_content_w
     } else {
