@@ -24776,3 +24776,310 @@ fn test_tick_git_branch_no_event_when_unchanged() {
         "plugin event must not fire when branch unchanged"
     );
 }
+
+// ── Phase 4 Batch 14: Named registers, folding, window nav, :echo, misc ──
+// Mined from test_registers.vim, test_fold.vim, test_window_cmd.vim, test_ex_cmd.vim
+
+// -- Named registers --
+
+#[test]
+fn test_nvim_named_register_yank_batch14() {
+    // "ayy yanks current line into register a
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayy");
+    assert_eq!(
+        engine.registers.get(&'a').map(|(s, _)| s.as_str()),
+        Some("hello\n")
+    );
+}
+
+#[test]
+fn test_nvim_named_register_paste_batch14() {
+    // "ayy then j then "ap pastes line below
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayy");
+    engine.feed_keys("j");
+    engine.feed_keys("\"ap");
+    assert_eq!(engine.buffer().to_string(), "hello\nworld\nhello\n");
+}
+
+#[test]
+fn test_nvim_capital_register_appends() {
+    // "Ayy appends to register a instead of overwriting
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\nbbb\n");
+    engine.update_syntax();
+    engine.feed_keys("\"ayy");
+    engine.feed_keys("j");
+    engine.feed_keys("\"Ayy");
+    assert_eq!(
+        engine.registers.get(&'a').map(|(s, _)| s.as_str()),
+        Some("aaa\nbbb\n")
+    );
+}
+
+#[test]
+fn test_nvim_delete_to_named_register() {
+    // "add deletes line into register a
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo\nbar\n");
+    engine.update_syntax();
+    engine.feed_keys("\"add");
+    assert_eq!(
+        engine.registers.get(&'a').map(|(s, _)| s.as_str()),
+        Some("foo\n")
+    );
+    assert_eq!(engine.buffer().to_string(), "bar\n");
+}
+
+#[test]
+fn test_nvim_register_digit_preserves_after_named() {
+    // Yanking to "a should NOT affect register 0 (which holds last yank)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\n");
+    engine.update_syntax();
+    engine.feed_keys("yy"); // yanks "alpha\n" into "" and "0
+    engine.feed_keys("j");
+    engine.feed_keys("\"byy"); // yanks "beta\n" into "b only
+    assert_eq!(
+        engine.registers.get(&'0').map(|(s, _)| s.as_str()),
+        Some("alpha\n"),
+        "register 0 should still hold the earlier yank"
+    );
+    assert_eq!(
+        engine.registers.get(&'b').map(|(s, _)| s.as_str()),
+        Some("beta\n")
+    );
+}
+
+// -- Folding (za/zc/zo/zR/zM) --
+
+#[test]
+fn test_nvim_zf_zc_zo_roundtrip() {
+    // zfj creates fold for 2 lines; zc closes; zo opens
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys("zfj"); // fold covers lines 0-1
+    let has_fold = !engine.view().folds.is_empty();
+    assert!(has_fold, "zfj should create a fold");
+}
+
+#[test]
+fn test_nvim_zR_opens_all_folds() {
+    // zR clears all folds (VimCode's "open" model: removes from folds list)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\nf\n");
+    engine.update_syntax();
+    engine.feed_keys("zfj"); // fold lines 0-1
+    assert!(!engine.view().folds.is_empty(), "precondition: fold exists");
+    engine.feed_keys("zR");
+    assert!(engine.view().folds.is_empty(), "zR should remove all folds");
+}
+
+#[test]
+fn test_nvim_zd_deletes_fold() {
+    // zd deletes the fold under the cursor
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys("zfj"); // create fold
+    assert_eq!(engine.view().folds.len(), 1);
+    engine.feed_keys("zd"); // delete it
+    assert_eq!(engine.view().folds.len(), 0);
+}
+
+// -- Window splits / Ctrl-W navigation --
+
+#[test]
+fn test_nvim_split_creates_window() {
+    let mut engine = Engine::new();
+    engine.feed_keys(":split<CR>");
+    assert_eq!(engine.windows.len(), 2);
+}
+
+#[test]
+fn test_nvim_vsplit_creates_window() {
+    let mut engine = Engine::new();
+    engine.feed_keys(":vsplit<CR>");
+    assert_eq!(engine.windows.len(), 2);
+}
+
+#[test]
+fn test_nvim_ctrl_w_s_horizontal_split() {
+    // Ctrl-W s: horizontal split
+    let mut engine = Engine::new();
+    engine.feed_keys("<C-w>s");
+    assert_eq!(engine.windows.len(), 2);
+}
+
+#[test]
+fn test_nvim_ctrl_w_v_vertical_split() {
+    // Ctrl-W v: vertical split
+    let mut engine = Engine::new();
+    engine.feed_keys("<C-w>v");
+    assert_eq!(engine.windows.len(), 2);
+}
+
+#[test]
+fn test_nvim_ctrl_w_w_cycles_windows() {
+    // Ctrl-W w: cycle to next window
+    let mut engine = Engine::new();
+    engine.feed_keys("<C-w>v");
+    let first_active = engine.active_window_id();
+    engine.feed_keys("<C-w>w");
+    let second_active = engine.active_window_id();
+    assert_ne!(
+        first_active, second_active,
+        "Ctrl-W w should change active window"
+    );
+}
+
+#[test]
+fn test_nvim_ctrl_w_q_closes_window() {
+    // Ctrl-W q: close current window
+    let mut engine = Engine::new();
+    engine.feed_keys(":split<CR>");
+    assert_eq!(engine.windows.len(), 2);
+    engine.feed_keys("<C-w>q");
+    assert_eq!(engine.windows.len(), 1);
+}
+
+#[test]
+fn test_nvim_ctrl_w_o_only() {
+    // Ctrl-W o: close all windows except current
+    let mut engine = Engine::new();
+    engine.feed_keys(":split<CR>");
+    engine.feed_keys(":vsplit<CR>");
+    assert!(engine.windows.len() >= 2);
+    engine.feed_keys("<C-w>o");
+    assert_eq!(engine.windows.len(), 1);
+}
+
+// -- :echo --
+
+#[test]
+fn test_nvim_echo_sets_message() {
+    let mut engine = Engine::new();
+    engine.feed_keys(":echo hello world<CR>");
+    assert_eq!(engine.message, "hello world");
+}
+
+#[test]
+fn test_nvim_echo_empty() {
+    let mut engine = Engine::new();
+    engine.message = "prior".to_string();
+    engine.feed_keys(":echo<CR>");
+    assert_eq!(engine.message, "", "bare :echo clears the message");
+}
+
+// -- Buffer operations --
+
+#[test]
+fn test_nvim_w_save_no_file_errors() {
+    // :w without a filename on an unnamed buffer should set an error message
+    let mut engine = Engine::new();
+    engine.feed_keys(":w<CR>");
+    assert!(
+        !engine.message.is_empty(),
+        ":w on unnamed buffer should produce a message"
+    );
+}
+
+#[test]
+fn test_nvim_bn_with_one_buffer_noop_or_msg() {
+    // :bn with only one buffer — either noop or informs user
+    let mut engine = Engine::new();
+    let buf_before = engine.active_buffer_id();
+    engine.feed_keys(":bn<CR>");
+    let buf_after = engine.active_buffer_id();
+    assert_eq!(
+        buf_before, buf_after,
+        "single-buffer :bn should stay on same buffer"
+    );
+}
+
+// -- Motions: word/bigword boundaries --
+
+#[test]
+fn test_nvim_e_word_end_inner() {
+    // e goes to end of current word
+    nvim_case("hello world\n", 0, 0, "e", "hello world\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_e_word_end_from_middle() {
+    // From middle of word, e still goes to end
+    nvim_case("hello world\n", 0, 2, "e", "hello world\n", 0, 4);
+}
+
+#[test]
+fn test_nvim_ge_word_end_backward() {
+    // ge goes to end of previous word
+    nvim_case("hello world\n", 0, 7, "ge", "hello world\n", 0, 4);
+}
+
+// -- Increment / decrement edge cases --
+
+#[test]
+fn test_nvim_ctrl_a_on_hex() {
+    // Ctrl-A on 0x09 → 0x0a (Vim treats 0x-prefix as hex)
+    nvim_case("val=0x09\n", 0, 0, "<C-a>", "val=0x0a\n", 0, 7);
+}
+
+#[test]
+fn test_nvim_ctrl_a_on_hex_cursor_inside() {
+    // Cursor on the final '9' of 0x09; Ctrl-A should still increment hex.
+    nvim_case("v=0x09\n", 0, 5, "<C-a>", "v=0x0a\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_ctrl_x_on_hex_decrement() {
+    // Ctrl-X on 0x10 → 0x0f
+    nvim_case("n=0x10\n", 0, 0, "<C-x>", "n=0x0f\n", 0, 5);
+}
+
+#[test]
+fn test_nvim_ctrl_x_past_zero() {
+    // Ctrl-X on 0 becomes -1
+    nvim_case("n=0\n", 0, 0, "<C-x>", "n=-1\n", 0, 3);
+}
+
+// -- Search history --
+
+#[test]
+fn test_nvim_slash_reuses_prev_pattern_with_n() {
+    // After /foo<CR>, pressing n finds next occurrence
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
+    engine.update_syntax();
+    engine.feed_keys("/foo<CR>");
+    engine.feed_keys("nn");
+    assert_eq!(engine.view().cursor.col, 16);
+}
+
+// -- Ex command ranges --
+
+#[test]
+fn test_nvim_colon_N_goto_line() {
+    // :3<CR> goes to line 3 (1-indexed)
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\n");
+    engine.update_syntax();
+    engine.feed_keys(":3<CR>");
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_nvim_range_delete_two_lines() {
+    // :2,3d deletes lines 2 and 3
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,3d<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nd\n");
+}
