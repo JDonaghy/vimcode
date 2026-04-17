@@ -7,7 +7,11 @@
 //!
 //! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
 //! All rendering data comes from `render`.
-#![allow(unused_assignments)]
+#![allow(
+    unused_assignments,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop
+)]
 
 use std::collections::HashSet;
 use std::fs;
