@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 16, 2026 (Session 288 — #107 git_branch_changed plugin event) | **Tests:** 1817 (lib) + 327 (nvim conformance)
+**Last updated:** Apr 17, 2026 (Session 289 — Phase 4 batch 14, 25 new conformance tests, 2 new deviations) | **Tests:** 1842 (lib) + 354 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,12 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 289 — Phase 4 batch 14 (#25), 25 new conformance tests, 2 new deviations (#109, #110):**
+
+1. **Phase 4 batch 14: 25 new Neovim-verified tests** — Covering areas still uncovered: named registers (`"ayy`/`"ap`/`"Ayy`/`"add`), folding (`zf`/`zR`/`zd`), window splits (`<C-w>s/v/w/q/o`, `:split`, `:vsplit`), `:echo`, `:w` error case, word-end motions (`e`, `ge`), increment/decrement edge cases, search history, numeric `:N` and `:N,M` ranges.
+2. **2 new deviations documented** (#109 Ctrl-A on hex increments leading 0; #110 yank to named register also overwrites register 0) — 2 ignored tests document expected Vim behavior.
+3. **Closed #60** housekeeping (PR #106 was already merged but issue wasn't auto-closed).
 
 **Session 288 — #107 git_branch_changed plugin event (follow-up to #60):**
 
