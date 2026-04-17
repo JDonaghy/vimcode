@@ -310,7 +310,7 @@ impl Engine {
         if !ctx.insert_lines.is_empty() {
             let buf_id = self.active_buffer_id();
             let mut insertions = ctx.insert_lines;
-            insertions.sort_by(|a, b| b.0.cmp(&a.0));
+            insertions.sort_by_key(|b| std::cmp::Reverse(b.0));
             for (line_1, text) in insertions {
                 let line_idx = line_1.saturating_sub(1);
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {

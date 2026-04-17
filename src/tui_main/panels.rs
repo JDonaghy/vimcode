@@ -2948,11 +2948,9 @@ pub(super) fn render_editor_hover_popup(
             let track_h = num_lines as usize;
             let thumb_h = (track_h * track_h / total).max(1);
             let max_scroll = total.saturating_sub(MAX_HEIGHT as usize);
-            let thumb_top = if max_scroll > 0 {
-                scroll * (track_h - thumb_h) / max_scroll
-            } else {
-                0
-            };
+            let thumb_top = (scroll * (track_h - thumb_h))
+                .checked_div(max_scroll)
+                .unwrap_or(0);
             for i in 0..track_h {
                 let ry = y + 1 + i as u16;
                 if ry >= term_area.height {
@@ -3296,7 +3294,7 @@ pub(super) fn render_ai_sidebar(
         (panel_bg, dim_fg)
     };
     let cursor = ai.input_cursor.min(input_chars.len());
-    let cursor_line = if content_w > 0 { cursor / content_w } else { 0 };
+    let cursor_line = cursor.checked_div(content_w).unwrap_or(0);
     let cursor_col = if content_w > 0 {
         cursor % content_w
     } else {

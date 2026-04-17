@@ -729,7 +729,7 @@ impl Engine {
             .enumerate()
             .filter_map(|(i, b)| Self::fuzzy_score(&b.name, q).map(|s| (i, s)))
             .collect();
-        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.sort_by_key(|b| std::cmp::Reverse(b.1));
         results.truncate(50);
         results
     }
