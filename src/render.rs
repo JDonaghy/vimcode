@@ -5403,7 +5403,7 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
             text: StyledText::plain(label),
             badge,
             is_expanded: Some(is_expanded),
-            decoration: Decoration::Normal,
+            decoration: Decoration::Header,
         });
 
         if !is_expanded {

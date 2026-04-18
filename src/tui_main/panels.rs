@@ -1,5 +1,111 @@
 use super::*;
 
+/// Convert the TUI's explorer state (`TuiSidebar.rows` + engine indicators)
+/// into a generic `quadraui::TreeView` that backends can render through
+/// `quadraui_tui::draw_tree()`.
+///
+/// Scope for Phase A.2a: basic tree rendering only — selection, indent,
+/// icons, decoration (error / warning / modified), and one right-aligned
+/// badge per row (diagnostics priority, else git status label). Inline
+/// rename rows, new-entry rows, drop-target highlight, active-file
+/// highlight, and indent guide lines are **not** represented here; those
+/// remain the responsibility of the legacy rendering path in `render_sidebar`
+/// until future primitives (`Form`, `TextInput`) or `TreeView` extensions
+/// cover them.
+pub(super) fn explorer_to_tree_view(sidebar: &TuiSidebar, engine: &Engine) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, Icon as QIcon, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let (git_statuses, diag_counts) = engine.explorer_indicators();
+
+    let mut rows: Vec<TreeRow> = Vec::with_capacity(sidebar.rows.len());
+    for (row_idx, row) in sidebar.rows.iter().enumerate() {
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+
+        let diag = diag_counts.get(&canon).copied();
+        let git_label = git_statuses.get(&canon).copied();
+
+        // Row decoration reflects the highest-priority health status.
+        let decoration = match diag {
+            Some((e, _)) if e > 0 => Decoration::Error,
+            Some((_, w)) if w > 0 => Decoration::Warning,
+            _ if git_label.is_some() => Decoration::Modified,
+            _ => Decoration::Normal,
+        };
+
+        // Badge priority: errors > warnings > git status (single indicator;
+        // the pre-migration TUI showed up to three, but the primitive carries
+        // only one badge slot. Restoring multi-indicator rendering is a
+        // follow-up when the primitive gains that capability.)
+        let badge = if let Some((errors, warnings)) = diag {
+            if errors > 0 {
+                Some(Badge::plain(if errors > 9 {
+                    "9+".to_string()
+                } else {
+                    errors.to_string()
+                }))
+            } else if warnings > 0 {
+                Some(Badge::plain(if warnings > 9 {
+                    "9+".to_string()
+                } else {
+                    warnings.to_string()
+                }))
+            } else {
+                git_label.map(|label| Badge::plain(label.to_string()))
+            }
+        } else {
+            git_label.map(|label| Badge::plain(label.to_string()))
+        };
+
+        // Icon: folder glyph for dirs, extension-mapped for files. We hand
+        // quadraui the already-resolved string for both fields — the toggle
+        // between nerd font and fallback is handled inside vimcode before we
+        // build the TreeView, and the primitive re-reads it each frame.
+        let icon = if row.is_dir {
+            Some(QIcon::new(
+                crate::icons::FOLDER.nerd.to_string(),
+                crate::icons::FOLDER.fallback.to_string(),
+            ))
+        } else {
+            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let glyph = crate::icons::file_icon(ext).to_string();
+            Some(QIcon::new(glyph, ".".to_string()))
+        };
+
+        rows.push(TreeRow {
+            path: vec![row_idx as u16],
+            indent: row.depth as u16,
+            icon,
+            text: StyledText::plain(&row.name),
+            badge,
+            is_expanded: if row.is_dir {
+                Some(row.is_expanded)
+            } else {
+                None
+            },
+            decoration,
+        });
+    }
+
+    let selected_path = if sidebar.selected < rows.len() {
+        Some(vec![sidebar.selected as u16])
+    } else {
+        None
+    };
+
+    TreeView {
+        id: WidgetId::new("explorer-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: sidebar.scroll_top,
+        style: TreeStyle::default(),
+        has_focus: sidebar.has_focus,
+    }
+}
+
 pub(super) fn render_activity_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -186,6 +292,25 @@ pub(super) fn render_sidebar(
         for x in area.x..area.x + area.width {
             set_cell(buf, x, y, ' ', default_fg, row_bg);
         }
+    }
+
+    // Phase A.2a migration: when no special mode is active (rename /
+    // new-entry / drop-target), render the explorer via the shared
+    // `quadraui::TreeView` primitive. The legacy inline renderer below
+    // still owns the edge cases that introduce virtual rows or overlay
+    // input UI on specific rows.
+    let has_special_mode = engine.explorer_rename.is_some() || engine.explorer_new_entry.is_some();
+    if !has_special_mode {
+        let tree = explorer_to_tree_view(sidebar, engine);
+        let tree_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(1), // reserve rightmost col for scrollbar
+            height: area.height,
+        };
+        super::quadraui_tui::draw_tree(buf, tree_area, &tree, theme);
+        render_explorer_scrollbar(buf, area, sidebar, theme);
+        return;
     }
 
     // ── Explorer indicators (git status + diagnostics) ─────────────────
@@ -500,9 +625,20 @@ pub(super) fn render_sidebar(
         }
     }
 
-    // Vertical scrollbar (rightmost column, tree rows only — not header)
+    render_explorer_scrollbar(buf, area, sidebar, theme);
+}
+
+/// Vertical scrollbar for the explorer panel. Rendered after the tree
+/// rows by both the quadraui path and the legacy special-mode path so
+/// both share identical scroll indication.
+fn render_explorer_scrollbar(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    sidebar: &TuiSidebar,
+    theme: &Theme,
+) {
     let total_rows = sidebar.rows.len();
-    let visible_rows_count = tree_height;
+    let visible_rows_count = area.height as usize;
     if total_rows > visible_rows_count && area.width >= 2 {
         let track_fg = rc(theme.separator);
         let thumb_fg = rc(theme.status_fg);

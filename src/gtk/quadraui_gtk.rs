@@ -71,15 +71,22 @@ pub(super) fn draw_tree(
         }
 
         let is_branch = row.is_expanded.is_some();
-        let row_h = if is_branch { line_height } else { item_height };
+        let is_header = matches!(row.decoration, quadraui::Decoration::Header);
+        // Header rows get the tall row-height used by SC section titles;
+        // regular branches (like explorer folders) and leaves use `item_height`
+        // so dirs don't jump vertically relative to siblings.
+        let row_h = if is_header { line_height } else { item_height };
+        let _ = is_branch;
 
         let is_selected =
             tree.has_focus && tree.selected_path.as_ref().is_some_and(|p| p == &row.path);
 
-        // Determine default fg and bg for this row.
+        // Header rows get a distinct background (SC section styling).
+        // Ordinary branches render like leaves so folders don't visually
+        // separate from sibling files in a recursive tree.
         let (def_fg, row_bg) = if is_selected {
             ((hdr_fg_r, hdr_fg_g, hdr_fg_b), (sel_r, sel_g, sel_b))
-        } else if is_branch {
+        } else if is_header {
             ((hdr_fg_r, hdr_fg_g, hdr_fg_b), (hdr_r, hdr_g, hdr_b))
         } else if matches!(row.decoration, quadraui::Decoration::Muted) {
             ((dim_r, dim_g, dim_b), (bg_r, bg_g, bg_b))

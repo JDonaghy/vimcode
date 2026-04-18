@@ -48,11 +48,15 @@ pub(super) fn draw_tree(buf: &mut Buffer, area: Rect, tree: &quadraui::TreeView,
             break;
         }
 
-        let is_branch = row.is_expanded.is_some();
+        let is_header = matches!(row.decoration, quadraui::Decoration::Header);
         let is_selected =
             tree.has_focus && tree.selected_path.as_ref().is_some_and(|p| p == &row.path);
 
-        let (default_fg, bg) = match (is_branch, is_selected) {
+        // Header rows (e.g. SC section titles) get a distinct background;
+        // ordinary branches (e.g. folders in the file explorer) render
+        // like leaves so they don't stand out from sibling files. Selection
+        // takes priority over both.
+        let (default_fg, bg) = match (is_header, is_selected) {
             (_, true) => (hdr_fg, sel_bg),
             (true, false) => (hdr_fg, hdr_bg),
             (false, false) => (item_fg, row_bg),
