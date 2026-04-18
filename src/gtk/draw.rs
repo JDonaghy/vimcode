@@ -627,6 +627,7 @@ pub(super) fn draw_editor(
         height as f64,
         char_width,
         line_height,
+        mouse_pos,
     );
 }
 
@@ -3453,6 +3454,7 @@ pub(super) fn draw_context_menu_popup(
     editor_height: f64,
     char_width: f64,
     line_height: f64,
+    mouse_pos: (f64, f64),
 ) {
     let Some(cm) = &screen.context_menu else {
         return;
@@ -3493,6 +3495,38 @@ pub(super) fn draw_context_menu_popup(
     cr.rectangle(px, py, popup_w, popup_h);
     cr.stroke().ok();
 
+    // Compute hovered item from mouse position (avoids engine borrow in motion callback).
+    let hover_idx: Option<usize> = if mouse_pos.0 >= 0.0 {
+        let mcol = (mouse_pos.0 / char_width) as u16;
+        let mrow = (mouse_pos.1 / line_height) as u16;
+        let tw = (editor_width / char_width) as u16;
+        let th = (editor_height / line_height) as u16;
+        match crate::core::engine::resolve_context_menu_click(
+            &cm.items
+                .iter()
+                .map(|i| crate::core::engine::ContextMenuItem {
+                    label: i.label.clone(),
+                    action: String::new(),
+                    shortcut: i.shortcut.clone(),
+                    separator_after: i.separator_after,
+                    enabled: i.enabled,
+                })
+                .collect::<Vec<_>>(),
+            cm.screen_col,
+            cm.screen_row,
+            tw,
+            th,
+            mcol,
+            mrow,
+        ) {
+            crate::core::engine::ContextMenuClickResult::Item(idx) => Some(idx),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let selected = hover_idx.unwrap_or(cm.selected_idx);
+
     // Items.
     let mut visual_row: usize = 0;
     let item_x = px + char_width;
@@ -3500,7 +3534,7 @@ pub(super) fn draw_context_menu_popup(
         let item_y = py + (visual_row + 1) as f64 * line_height;
 
         // Selection highlight.
-        if i == cm.selected_idx && item.enabled {
+        if i == selected && item.enabled {
             let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
             cr.set_source_rgb(r, g, b);
             cr.rectangle(px + 1.0, item_y, popup_w - 2.0, line_height);

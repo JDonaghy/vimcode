@@ -3896,9 +3896,19 @@ impl SimpleComponent for App {
         {
             let pos_cell = mouse_pos_cell.clone();
             let pos_cell_leave = mouse_pos_cell.clone();
+            let engine_motion = engine.clone();
+            let da_motion = widgets.drawing_area.clone();
             let mc = gtk4::EventControllerMotion::new();
             mc.connect_motion(move |_, x, y| {
                 pos_cell.set((x, y));
+                // Trigger redraw for context menu hover highlight.
+                // Uses try_borrow to avoid panic if engine is borrowed by draw.
+                if let Ok(eng) = engine_motion.try_borrow() {
+                    if eng.context_menu.is_some() {
+                        drop(eng);
+                        da_motion.queue_draw();
+                    }
+                }
             });
             mc.connect_leave(move |_| {
                 pos_cell_leave.set((-1.0, -1.0));
