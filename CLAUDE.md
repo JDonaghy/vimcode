@@ -147,21 +147,23 @@ Engine
 
 ## Commands
 ```bash
-cargo build               # Compile
-cargo test                # Run all tests
-cargo clippy -- -D warnings  # Lint (must pass)
-cargo fmt                 # Format
+cargo build                       # Compile
+cargo test --no-default-features  # Run all tests (NEVER use --features win-gui — see Testing)
+cargo clippy -- -D warnings       # Lint (must pass)
+cargo fmt                         # Format
 ```
 
 ## Quality Checks (MANDATORY Before Commits)
 **CRITICAL:** After making ANY code changes and before creating commits, ALWAYS run:
 1. `cargo fmt` - Format code
 2. `cargo clippy -- -D warnings` - Check linting (must have zero warnings)
-3. `cargo test` - Verify all tests pass
+3. `cargo test --no-default-features` - Verify all tests pass (lib + integration; NEVER use `--features win-gui`)
 4. `cargo build` - Ensure compilation succeeds
 
 If any check fails, fix immediately and re-run. Only commit when ALL checks pass.
 This prevents CI failures and maintains code quality.
+
+**Important:** `cargo test --no-default-features --lib` is faster for fast-iteration dev loops (lib tests only), but the pre-commit and pre-release gate **must** run the full `cargo test --no-default-features` — otherwise integration-test failures (e.g. the #114 regression that landed in v0.10.0) slip through.
 
 ## Branching & Releases
 - All work happens on `develop`; `main` is the release branch
@@ -193,7 +195,8 @@ pub fn onedark() -> Self {
 
 ## Testing (CRITICAL)
 **NEVER run `cargo test` with the `win-gui` feature enabled.** This spawns hundreds of real Win32 windows and locks up the machine. Use these commands instead:
-- **Run tests:** `cargo test --no-default-features --lib` (no GTK, no win-gui)
+- **Full test suite (pre-commit, pre-release gate):** `cargo test --no-default-features` — lib + integration tests; no GTK, no win-gui. Required before any commit that might land in a release.
+- **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only, much faster. Use for inner-loop edit/test cycles, NOT as a release gate.
 - **Build win-gui:** `cargo build --bin vimcode-win --features win-gui --no-default-features`
 - **Clippy win-gui:** `cargo clippy --features win-gui --no-default-features`
 - NEVER combine `cargo test` with `--features win-gui`
