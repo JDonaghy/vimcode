@@ -6027,10 +6027,16 @@ impl App {
             drop(engine);
 
             if let Some(idx) = clicked_btn {
-                let _action = self.engine.borrow_mut().dialog_click_button(idx);
+                let action = self.engine.borrow_mut().dialog_click_button(idx);
                 if self.engine.borrow().explorer_needs_refresh {
                     self.engine.borrow_mut().explorer_needs_refresh = false;
                     sender.input(Msg::RefreshFileTree);
+                }
+                match action {
+                    EngineAction::Quit | EngineAction::SaveQuit => {
+                        self.save_session_and_exit();
+                    }
+                    _ => {}
                 }
             } else if outside {
                 self.engine.borrow_mut().dialog = None;
@@ -9357,41 +9363,33 @@ impl App {
                     // No unsaved changes — save session and exit immediately.
                     self.save_session_and_exit();
                 }
-                // Show a confirmation dialog listing the choice.
-                let dialog = gtk4::Dialog::with_buttons(
-                    Some("Unsaved Changes"),
-                    Some(&self.window),
-                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                    &[
-                        ("Save All & Quit", gtk4::ResponseType::Accept),
-                        ("Quit Without Saving", gtk4::ResponseType::Reject),
-                        ("Cancel", gtk4::ResponseType::Cancel),
+                use crate::core::engine::DialogButton;
+                self.engine.borrow_mut().show_dialog(
+                    "quit_unsaved",
+                    "Unsaved Changes",
+                    vec![
+                        "You have unsaved changes.".to_string(),
+                        "Do you want to save before quitting?".to_string(),
+                    ],
+                    vec![
+                        DialogButton {
+                            label: "Save All & Quit".into(),
+                            hotkey: 's',
+                            action: "save_quit".into(),
+                        },
+                        DialogButton {
+                            label: "Quit Without Saving".into(),
+                            hotkey: 'q',
+                            action: "discard_quit".into(),
+                        },
+                        DialogButton {
+                            label: "Cancel".into(),
+                            hotkey: '\0',
+                            action: "cancel".into(),
+                        },
                     ],
                 );
-                let label = gtk4::Label::new(Some(
-                    "You have unsaved changes.\nDo you want to save before quitting?",
-                ));
-                label.set_margin_top(12);
-                label.set_margin_bottom(12);
-                label.set_margin_start(12);
-                label.set_margin_end(12);
-                dialog.content_area().append(&label);
-                let engine_clone = self.engine.clone();
-                let s = sender.input_sender().clone();
-                dialog.connect_response(move |dlg, resp| {
-                    dlg.close();
-                    match resp {
-                        gtk4::ResponseType::Accept => {
-                            engine_clone.borrow_mut().save_all_dirty();
-                            s.send(Msg::QuitConfirmed).ok();
-                        }
-                        gtk4::ResponseType::Reject => {
-                            s.send(Msg::QuitConfirmed).ok();
-                        }
-                        _ => {} // Cancel — do nothing
-                    }
-                });
-                dialog.present();
+                self.draw_needed.set(true);
             }
 
             Msg::QuitConfirmed => {
@@ -9400,38 +9398,29 @@ impl App {
             }
 
             Msg::ShowCloseTabConfirm => {
-                let dialog = gtk4::Dialog::with_buttons(
-                    Some("Unsaved Changes"),
-                    Some(&self.window),
-                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                    &[
-                        ("Save & Close Tab", gtk4::ResponseType::Accept),
-                        ("Discard & Close Tab", gtk4::ResponseType::Reject),
-                        ("Cancel", gtk4::ResponseType::Cancel),
+                use crate::core::engine::DialogButton;
+                self.engine.borrow_mut().show_dialog(
+                    "close_tab_confirm",
+                    "Unsaved Changes",
+                    vec!["This file has unsaved changes.".to_string()],
+                    vec![
+                        DialogButton {
+                            label: "Save & Close".into(),
+                            hotkey: 's',
+                            action: "save_close".into(),
+                        },
+                        DialogButton {
+                            label: "Discard & Close".into(),
+                            hotkey: 'd',
+                            action: "discard".into(),
+                        },
+                        DialogButton {
+                            label: "Cancel".into(),
+                            hotkey: '\0',
+                            action: "cancel".into(),
+                        },
                     ],
                 );
-                let label = gtk4::Label::new(Some(
-                    "This file has unsaved changes.\nDo you want to save before closing the tab?",
-                ));
-                label.set_margin_top(12);
-                label.set_margin_bottom(12);
-                label.set_margin_start(12);
-                label.set_margin_end(12);
-                dialog.content_area().append(&label);
-                let s = sender.input_sender().clone();
-                dialog.connect_response(move |dlg, resp| {
-                    dlg.close();
-                    match resp {
-                        gtk4::ResponseType::Accept => {
-                            s.send(Msg::CloseTabConfirmed { save: true }).ok();
-                        }
-                        gtk4::ResponseType::Reject => {
-                            s.send(Msg::CloseTabConfirmed { save: false }).ok();
-                        }
-                        _ => {} // Cancel — do nothing
-                    }
-                });
-                dialog.present();
                 self.draw_needed.set(true);
             }
 
