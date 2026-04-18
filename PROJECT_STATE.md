@@ -1,9 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Apr 18, 2026 (Session 297 — quadraui UI-crate design + v0.10.0 release) | **Tests:** 1939 (lib) + 414 (nvim conformance)
+**Last updated:** Apr 18, 2026 (Session 297 — v0.10.0 release + quadraui Phase A.0 and A.1a shipped) | **Tests:** 5219 total (full `cargo test --no-default-features`); 1939 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
+> **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
 
 ---
 
@@ -25,6 +26,23 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 297 (continued) — Phase A.0 + A.1a shipped after the release:**
+
+1. **Codified branch-first workflow in CLAUDE.md** — all changes go through a local branch off `develop`; no direct commits to `develop`. After local commit, user chooses either Path A (fast-forward merge + push) or Path B (push branch + open PR).
+2. **Tightened the test-gate in CLAUDE.md** — pre-release must run full `cargo test --no-default-features`, not just `--lib`. The `--lib` shortcut missed the 2 integration test regressions that broke CI on the v0.10.0 merge (#114 follow-up, landed as `83d93b3`).
+3. **Phase A.0 shipped** (`36ccad3`) — added `quadraui/` workspace member + `vimcode` path dep. Placeholder lib.rs, no primitives. Zero functional change.
+4. **Phase A.1a shipped** (`bac137e`) — first real primitive migration:
+   - Defined `quadraui::types` (Color, Icon, StyledText, WidgetId, Modifiers, TreePath, SelectionMode, Decoration, Badge, TreeStyle) and `quadraui::primitives::tree` (TreeView, TreeRow, TreeEvent). All owned + serde-compatible per plugin invariants.
+   - Added `render::source_control_to_tree_view()` adapter (vimcode → quadraui).
+   - New `src/tui_main/quadraui_tui` module with `draw_tree()` rendering TreeView into a ratatui Buffer.
+   - TUI source-control panel's ~230-line section-rendering loop replaced with one `draw_tree()` call — no visible regression, smoke-tested.
+   - Full-gate passes: 5219 tests, 0 failed.
+5. **Added `PLAN.md`** — session-level coordination doc for in-flight multi-stage features. Captures current stage map, branch patterns, pickup instructions for A.1b (GTK) and A.1c (Win-GUI) on another machine, and the design invariants that must be preserved across all stages.
+
+**Next up:** Phase A.1b (GTK `draw_tree`) and A.1c (Win-GUI `draw_tree`) are independent and can be done in either order. See PLAN.md for branch names and per-platform setup.
+
+---
 
 **Session 297 — `quadraui` cross-platform UI crate design + v0.10.0 release:**
 

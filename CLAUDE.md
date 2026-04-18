@@ -1,8 +1,9 @@
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
-2. Check `.opencode/specs/` for detailed feature specs before starting
-3. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
-4. Prompt user to update `PROJECT_STATE.md` after significant tasks
+2. Read `PLAN.md` if present — it is the pickup doc for any in-flight multi-stage feature (e.g. the current `quadraui` wave). Follow its stage map and branch-pattern hints.
+3. Check `.opencode/specs/` for detailed feature specs before starting
+4. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
+5. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
 ## Development Workflow
 
@@ -40,7 +41,8 @@ All non-trivial work should be tracked via GitHub Issues. Issues are the source 
 After completing any feature or significant change, update ALL of these files:
 - **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
 - **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
-- **GitHub Issues** — close completed issues, create new ones for planned work; update milestones as needed (PLAN.md archived — issues are the source of truth)
+- **GitHub Issues** — close completed issues, create new ones for planned work; update milestones as needed. Issues are the source of truth for individual tasks.
+- **`PLAN.md`** — session-level coordination doc for in-flight multi-stage features (extractions, refactors, waves that span several sub-stages). Update after every session that advances a stage: mark completed stages ✅ with their commit SHA, adjust scope notes, bump the date. When the active wave finishes, move the section to a completed list or delete (git history retains it).
 - **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
 - **`SUMMARIES/`** — update any summary file whose source file was modified (new methods, changed types, significant line count changes); see below
 
