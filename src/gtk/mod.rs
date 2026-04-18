@@ -3972,39 +3972,45 @@ impl SimpleComponent for App {
             let da_hover = widgets.drawing_area.clone();
             let motion = gtk4::EventControllerMotion::new();
             motion.connect_motion(move |_, x, y| {
-                let Ok(mut engine) = engine_hover.try_borrow_mut() else {
-                    return; // Engine already borrowed (e.g. by draw function)
+                // Resolve hover target from immutable borrow, then update if changed.
+                let hover_result = {
+                    let Ok(engine) = engine_hover.try_borrow() else {
+                        return;
+                    };
+                    let Some(ref cm) = engine.context_menu else {
+                        return;
+                    };
+                    let lh = lh_cell.get();
+                    let cw = cw_cell.get();
+                    if lh < 1.0 || cw < 1.0 {
+                        return;
+                    }
+                    let col = (x / cw) as u16;
+                    let row = (y / lh) as u16;
+                    let tw = (da_hover.width() as f64 / cw) as u16;
+                    let th = (da_hover.height() as f64 / lh) as u16;
+                    let result = crate::core::engine::resolve_context_menu_click(
+                        &cm.items,
+                        cm.screen_x,
+                        cm.screen_y,
+                        tw,
+                        th,
+                        col,
+                        row,
+                    );
+                    let old = cm.selected;
+                    // engine (Ref) dropped here at end of block
+                    (result, old)
                 };
-                if engine.context_menu.is_none() {
-                    return;
-                }
-                let lh = lh_cell.get();
-                let cw = cw_cell.get();
-                if lh < 1.0 || cw < 1.0 {
-                    return;
-                }
-                let click_col = (x / cw) as u16;
-                let click_row = (y / lh) as u16;
-                let da_w = da_hover.width() as f64;
-                let da_h = da_hover.height() as f64;
-                let term_w = (da_w / cw) as u16;
-                let term_h = (da_h / lh) as u16;
-
-                let cm = engine.context_menu.as_ref().unwrap();
-                let result = crate::core::engine::resolve_context_menu_click(
-                    &cm.items,
-                    cm.screen_x,
-                    cm.screen_y,
-                    term_w,
-                    term_h,
-                    click_col,
-                    click_row,
-                );
-                if let crate::core::engine::ContextMenuClickResult::Item(idx) = result {
-                    if engine.context_menu.as_ref().unwrap().selected != idx {
-                        engine.context_menu.as_mut().unwrap().selected = idx;
-                        drop(engine);
-                        da_hover.queue_draw();
+                if let crate::core::engine::ContextMenuClickResult::Item(idx) = hover_result.0 {
+                    if hover_result.1 != idx {
+                        if let Ok(mut eng) = engine_hover.try_borrow_mut() {
+                            if let Some(ref mut cm) = eng.context_menu {
+                                cm.selected = idx;
+                            }
+                            drop(eng);
+                            da_hover.queue_draw();
+                        }
                     }
                 }
             });

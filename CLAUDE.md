@@ -10,8 +10,9 @@ All non-trivial work should be tracked via GitHub Issues. Issues are the source 
 **Starting work on an issue:**
 1. Create a feature branch from `develop`: `git checkout -b issue-{number}-{short-description} develop`
 2. Do the work on that branch, committing as you go
-3. When done, create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
-4. The user reviews and merges the PR. When the user confirms the merge, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close
+3. **Do NOT push or create a PR until the user has run smoke tests and confirmed the changes work.** Commit locally, offer smoke tests, wait for approval before pushing.
+4. When the user approves, push and create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
+5. The user reviews and merges the PR. When the user confirms the merge, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close
 
 **Creating issues:**
 - At session end, create issues for any planned but unstarted work discussed during the session
