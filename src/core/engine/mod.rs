@@ -1227,7 +1227,7 @@ pub fn resolve_context_menu_click(
     }
 
     // Inside popup — find which item
-    let inner_row = click_row - py - 1; // -1 for top border
+    let inner_row = click_row.saturating_sub(py).saturating_sub(1); // -1 for top border
     let mut visual_row: u16 = 0;
     for (i, item) in items.iter().enumerate() {
         if visual_row == inner_row && item.enabled {
