@@ -1180,6 +1180,123 @@ pub struct TabBarHitRegion {
     pub width: u16,
 }
 
+// ── Context menu hit regions ────────────────────────────────────────────────
+
+/// Result of resolving a click against a context menu popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextMenuClickResult {
+    /// Click on a menu item at this index.
+    Item(usize),
+    /// Click inside the popup but not on any item (e.g. separator, border).
+    InsidePopup,
+    /// Click outside the popup — should dismiss the menu.
+    Outside,
+}
+
+/// Compute the context menu popup bounds and resolve a click position.
+///
+/// `items` — the menu items (separator_after items add an extra visual row).
+/// `screen_x`, `screen_y` — popup origin (top-left, clamped to screen).
+/// `term_w`, `term_h` — terminal dimensions.
+/// `click_col`, `click_row` — absolute click position.
+///
+/// Returns the click result.
+pub fn resolve_context_menu_click(
+    items: &[ContextMenuItem],
+    screen_x: u16,
+    screen_y: u16,
+    term_w: u16,
+    term_h: u16,
+    click_col: u16,
+    click_row: u16,
+) -> ContextMenuClickResult {
+    if items.is_empty() {
+        return ContextMenuClickResult::Outside;
+    }
+    let sep_count = items.iter().filter(|i| i.separator_after).count() as u16;
+    let popup_h = items.len() as u16 + sep_count + 2; // items + separators + top/bottom border
+    let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
+    let px = screen_x.min(term_w.saturating_sub(popup_w));
+    let py = screen_y.min(term_h.saturating_sub(popup_h));
+
+    // Outside popup?
+    if click_col < px || click_col >= px + popup_w || click_row < py || click_row >= py + popup_h {
+        return ContextMenuClickResult::Outside;
+    }
+
+    // Inside popup — find which item
+    let inner_row = click_row - py - 1; // -1 for top border
+    let mut visual_row: u16 = 0;
+    for (i, item) in items.iter().enumerate() {
+        if visual_row == inner_row && item.enabled {
+            return ContextMenuClickResult::Item(i);
+        }
+        visual_row += 1;
+        if item.separator_after {
+            visual_row += 1;
+        }
+    }
+    ContextMenuClickResult::InsidePopup
+}
+
+// ── Dialog hit regions ──────────────────────────────────────────────────────
+
+/// Result of resolving a click against a modal dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogClickResult {
+    /// Click on a button at this index.
+    Button(usize),
+    /// Click inside the dialog but not on a button.
+    InsideDialog,
+    /// Click outside the dialog — should dismiss.
+    Outside,
+}
+
+/// Pre-computed dialog layout bounds (in char-cell units, absolute screen position).
+pub struct DialogLayout {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Row containing the buttons (absolute screen row).
+    pub btn_y: u16,
+}
+
+/// Resolve a click position against a dialog popup.
+pub fn resolve_dialog_click(
+    buttons: &[DialogButton],
+    layout: &DialogLayout,
+    click_col: u16,
+    click_row: u16,
+    format_label: &dyn Fn(&str, char) -> String,
+) -> DialogClickResult {
+    // Outside dialog?
+    if click_col < layout.x
+        || click_col >= layout.x + layout.width
+        || click_row < layout.y
+        || click_row >= layout.y + layout.height
+    {
+        return DialogClickResult::Outside;
+    }
+
+    // Check button row
+    if click_row == layout.btn_y {
+        let mut col_offset = layout.x + 2; // left padding
+        for (i, btn) in buttons.iter().enumerate() {
+            let label = format_label(&btn.label, btn.hotkey);
+            let btn_w = label.len() as u16 + 4;
+            if click_col >= col_offset && click_col < col_offset + btn_w {
+                return DialogClickResult::Button(i);
+            }
+            col_offset += btn_w;
+        }
+    }
+
+    DialogClickResult::InsideDialog
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {

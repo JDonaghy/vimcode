@@ -26274,3 +26274,124 @@ fn test_activity_bar_resolve_extension_panels() {
     // Row 9 with only 2 extensions = None (gap)
     assert_eq!(resolve_activity_bar_click(9, 30, &ext_names), None);
 }
+
+// --- Context menu hit regions ---
+
+#[test]
+fn test_context_menu_click_item() {
+    use crate::core::engine::{
+        resolve_context_menu_click, ContextMenuClickResult, ContextMenuItem,
+    };
+    let items = vec![
+        ContextMenuItem {
+            label: "Cut".to_string(),
+            action: "cut".to_string(),
+            shortcut: "".to_string(),
+            separator_after: false,
+            enabled: true,
+        },
+        ContextMenuItem {
+            label: "Copy".to_string(),
+            action: "copy".to_string(),
+            shortcut: "".to_string(),
+            separator_after: true, // separator after this item
+            enabled: true,
+        },
+        ContextMenuItem {
+            label: "Paste".to_string(),
+            action: "paste".to_string(),
+            shortcut: "".to_string(),
+            separator_after: false,
+            enabled: true,
+        },
+    ];
+    // Popup at (10, 5), terminal 80x24
+    // popup_h = 3 items + 1 separator + 2 border = 6
+    // Item 0 "Cut" at visual row 0 (inner_row 0)
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 6),
+        ContextMenuClickResult::Item(0)
+    );
+    // Item 1 "Copy" at visual row 1 (inner_row 1)
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 7),
+        ContextMenuClickResult::Item(1)
+    );
+    // Separator at visual row 2 → InsidePopup
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 8),
+        ContextMenuClickResult::InsidePopup
+    );
+    // Item 2 "Paste" at visual row 3 (inner_row 3)
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 9),
+        ContextMenuClickResult::Item(2)
+    );
+    // Outside
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 0, 0),
+        ContextMenuClickResult::Outside
+    );
+}
+
+#[test]
+fn test_context_menu_disabled_item() {
+    use crate::core::engine::{
+        resolve_context_menu_click, ContextMenuClickResult, ContextMenuItem,
+    };
+    let items = vec![ContextMenuItem {
+        label: "Disabled".to_string(),
+        action: "noop".to_string(),
+        shortcut: "".to_string(),
+        separator_after: false,
+        enabled: false,
+    }];
+    // Click on disabled item → InsidePopup (not Item)
+    assert_eq!(
+        resolve_context_menu_click(&items, 10, 5, 80, 24, 15, 6),
+        ContextMenuClickResult::InsidePopup
+    );
+}
+
+// --- Dialog hit regions ---
+
+#[test]
+fn test_dialog_click_button() {
+    use crate::core::engine::{resolve_dialog_click, DialogButton, DialogClickResult};
+    let buttons = vec![
+        DialogButton {
+            label: "Cancel".to_string(),
+            hotkey: 'c',
+            action: "cancel".to_string(),
+        },
+        DialogButton {
+            label: "OK".to_string(),
+            hotkey: 'o',
+            action: "ok".to_string(),
+        },
+    ];
+    // Dialog at (20, 10), width 40, height 6, buttons on row 14
+    let layout = DialogLayout {
+        x: 20,
+        y: 10,
+        width: 40,
+        height: 6,
+        btn_y: 14,
+    };
+    let fmt = |label: &str, _hotkey: char| label.to_string();
+    // Button 0 "Cancel" starts at col 22 (layout.x + 2), width ~10
+    assert_eq!(
+        resolve_dialog_click(&buttons, &layout, 23, 14, &fmt),
+        DialogClickResult::Button(0)
+    );
+    // Outside dialog
+    assert_eq!(
+        resolve_dialog_click(&buttons, &layout, 0, 0, &fmt),
+        DialogClickResult::Outside
+    );
+    // Inside but not on buttons
+    assert_eq!(
+        resolve_dialog_click(&buttons, &layout, 30, 12, &fmt),
+        DialogClickResult::InsideDialog
+    );
+}
