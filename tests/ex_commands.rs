@@ -490,14 +490,15 @@ fn cmd_copy_bare_shows_usage() {
 #[test]
 fn cmd_copy_with_address() {
     let mut e = engine_with("line1\nline2\nline3\n");
-    // :t 1 copies current line (line1) after line index 1
+    // :t 1 copies current line (line1) after line 1 (1-based).
+    // Result: line1, line1(copy), line2, line3
     exec(&mut e, "t 1");
     let lines = get_lines(&e);
     assert_eq!(lines.len(), 4);
-    // After copy: line1, line2, line1(copy), line3
-    // Address 1 → 0-based index 1 → insert after it
     assert_eq!(lines[0], "line1");
-    assert_eq!(lines[2], "line1"); // the copy
+    assert_eq!(lines[1], "line1"); // the copy, inserted after line 1
+    assert_eq!(lines[2], "line2");
+    assert_eq!(lines[3], "line3");
 }
 
 #[test]
