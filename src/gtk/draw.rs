@@ -617,6 +617,17 @@ pub(super) fn draw_editor(
         line_height,
     );
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
+
+    draw_context_menu_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        char_width,
+        line_height,
+    );
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
@@ -3428,6 +3439,112 @@ pub(super) fn draw_dialog_popup(
         }
     }
     rects
+}
+
+/// Draw an engine-driven context menu popup on the DrawingArea.
+/// Uses the same data as TUI/Win-GUI for visual consistency.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_context_menu_popup(
+    cr: &Context,
+    _layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    char_width: f64,
+    line_height: f64,
+) {
+    let Some(cm) = &screen.context_menu else {
+        return;
+    };
+    if cm.items.is_empty() {
+        return;
+    }
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
+
+    // Calculate popup dimensions.
+    let sep_count = cm.items.iter().filter(|i| i.separator_after).count();
+    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
+    let popup_w = content_cols as f64 * char_width;
+    let popup_h = (cm.items.len() + sep_count + 2) as f64 * line_height;
+
+    // Position: use char-cell coordinates from engine, scaled to pixels.
+    let raw_x = cm.screen_col as f64 * char_width;
+    let raw_y = cm.screen_row as f64 * line_height;
+    let px = raw_x.min(editor_width - popup_w);
+    let py = raw_y.min(editor_height - popup_h);
+
+    // Background.
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(px, py, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border.
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(px, py, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Items.
+    let mut visual_row: usize = 0;
+    let item_x = px + char_width;
+    for (i, item) in cm.items.iter().enumerate() {
+        let item_y = py + (visual_row + 1) as f64 * line_height;
+
+        // Selection highlight.
+        if i == cm.selected_idx && item.enabled {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(px + 1.0, item_y, popup_w - 2.0, line_height);
+            cr.fill().ok();
+        }
+
+        // Label.
+        let fg = if item.enabled {
+            theme.fuzzy_fg
+        } else {
+            theme.line_number_fg
+        };
+        let (r, g, b) = fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        ui_layout.set_text(&item.label);
+        ui_layout.set_attributes(None);
+        cr.move_to(item_x, item_y);
+        pangocairo::show_layout(cr, &ui_layout);
+
+        // Shortcut (right-aligned).
+        if !item.shortcut.is_empty() {
+            ui_layout.set_text(&item.shortcut);
+            let (sw, _) = ui_layout.pixel_size();
+            let sc_x = px + popup_w - sw as f64 - char_width;
+            let (r, g, b) = theme.line_number_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.move_to(sc_x, item_y);
+            pangocairo::show_layout(cr, &ui_layout);
+        }
+
+        visual_row += 1;
+
+        // Separator line.
+        if item.separator_after {
+            let sep_y = py + (visual_row + 1) as f64 * line_height + line_height / 2.0;
+            let (r, g, b) = theme.fuzzy_border.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.set_line_width(0.5);
+            cr.move_to(px + 4.0, sep_y);
+            cr.line_to(px + popup_w - 4.0, sep_y);
+            cr.stroke().ok();
+            visual_row += 1;
+        }
+    }
 }
 
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
