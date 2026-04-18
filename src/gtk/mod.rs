@@ -3964,6 +3964,51 @@ impl SimpleComponent for App {
             widgets.drawing_area.add_controller(rc_gesture);
         }
 
+        // Context menu hover: update selected item as mouse moves over the popup.
+        {
+            let engine_hover = engine.clone();
+            let lh_cell = line_height_cell.clone();
+            let cw_cell = char_width_cell.clone();
+            let da_hover = widgets.drawing_area.clone();
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, x, y| {
+                let mut engine = engine_hover.borrow_mut();
+                if engine.context_menu.is_none() {
+                    return;
+                }
+                let lh = lh_cell.get();
+                let cw = cw_cell.get();
+                if lh < 1.0 || cw < 1.0 {
+                    return;
+                }
+                let click_col = (x / cw) as u16;
+                let click_row = (y / lh) as u16;
+                let da_w = da_hover.width() as f64;
+                let da_h = da_hover.height() as f64;
+                let term_w = (da_w / cw) as u16;
+                let term_h = (da_h / lh) as u16;
+
+                let cm = engine.context_menu.as_ref().unwrap();
+                let result = crate::core::engine::resolve_context_menu_click(
+                    &cm.items,
+                    cm.screen_x,
+                    cm.screen_y,
+                    term_w,
+                    term_h,
+                    click_col,
+                    click_row,
+                );
+                if let crate::core::engine::ContextMenuClickResult::Item(idx) = result {
+                    if engine.context_menu.as_ref().unwrap().selected != idx {
+                        engine.context_menu.as_mut().unwrap().selected = idx;
+                        drop(engine);
+                        da_hover.queue_draw();
+                    }
+                }
+            });
+            widgets.drawing_area.add_controller(motion);
+        }
+
         // Tab switcher auto-confirm: poll modifier state every 50ms while open.
         // When neither Ctrl nor Alt is held, confirm immediately.
         {
