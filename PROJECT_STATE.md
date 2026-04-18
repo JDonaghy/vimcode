@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 17, 2026 (Session 296 — g<Tab> last-accessed tab, #122) | **Tests:** 1915 (lib) + 414 (nvim conformance)
+**Last updated:** Apr 18, 2026 (Session 297 — quadraui UI-crate design + v0.10.0 release) | **Tests:** 1939 (lib) + 414 (nvim conformance)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -25,6 +25,15 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 297 — `quadraui` cross-platform UI crate design + v0.10.0 release:**
+
+1. **Design doc `docs/UI_CRATE_DESIGN.md` finalised** — captures the full plan for extracting a `quadraui` crate supporting Windows (Direct2D), Linux (GTK4), macOS (Core Graphics, v1.x), and TUI (ratatui) backends. vimcode becomes the first test app; other keyboard-driven apps (SQL client, k8s dashboard) are the second-wave consumers that prove the abstraction.
+2. **13 design decisions resolved** in §7: retained-tree + events model, one `Backend` trait, `BufferView` adapter for `TextEditor` (text engine stays separate), a11y-ready data fields in v1 with platform wiring in v1.1, Option B workspace layout (`quadraui/` as workspace member from day 1), `quadraui` as working crate name (crates.io available), stage-by-stage PRs to develop instead of long-lived refactor branch, macOS ships in v1.x not blocking 1.0.
+3. **Plugin-friendly design invariants** documented in §10 — 6 properties (`WidgetId` owned not `&'static`, events dispatched as data not closures, serde-compatible structs, no global event handlers, ownership model) that must hold so Lua plugins can later declare quadraui primitive UIs without breaking API changes.
+4. **9 new GitHub issues filed** under new **"Cross-Platform UI Crate"** milestone: #139 TreeTable primitive, #140 DataTable (decide: standalone or TreeTable-with-depth-0), #141 Toast primitive, #142 Spinner+ProgressBar, #143 Form fields (Slider/ColorPicker/Dropdown), #144 live-append TextDisplay streaming, #145 k8s dashboard as Phase D validation app, #146 Lua plugin API extension for quadraui primitives, #147 bundled Postman-like HTTP client extension (depends on #146).
+5. **Release 0.10.0** cut from develop as a stable baseline before Phase A work begins — bumped `Cargo.toml` 0.9.0 → 0.10.0, regenerated `flatpak/cargo-sources.json` (635 crate entries). All quality gates pass: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --no-default-features --lib` (1939 passed / 0 failed / 9 pre-existing ignored), `cargo build`.
+6. **Next step — Phase A.0 workspace scaffold**: single PR adding empty `quadraui/` workspace member + vimcode path dep. Then Phase A stages migrate panels one at a time (TreeView → SC panel, then explorer, then Form → settings, etc.).
 
 **Session 295 — Phase 5 (#26) begins: `g`-prefix coverage audit:**
 

@@ -146,14 +146,16 @@ A primitive is a widget type the crate renders across all backends. Apps compose
 | Primitive | Purpose |
 |-----------|---------|
 | `TreeView` | Hierarchical rows, expand/collapse, icons, multi-selection, context menu. |
+| `TreeTable` | Tree whose rows have multiple columns; leaves can be grid rows. Subsumes `DataTable` (depth-0 tree). Tracking: #139. |
 | `ListView` | Flat rows with optional section headers, selection, context menu. |
-| `DataTable` | Grid with sortable column headers, row selection, cell editing. For SQL results, k8s lists. |
-| `TextEditor` | Multi-cursor text editor with syntax highlighting, folds, gutter, virtual text. vimcode-class. |
-| `TextDisplay` | Read-only rich/plain text view; used for markdown preview, LSP hover, log output. |
-| `Form` | Vertical stack of labeled fields: `Toggle`, `TextInput`, `Dropdown`, `Slider`, `Button`, `ColorPicker`. |
+| `DataTable` | Grid with sortable column headers, row selection, cell editing. Likely implemented as `TreeTable` with `max_depth=0` — decision tracked in #140. |
+| `TextEditor` | Multi-cursor text editor with syntax highlighting, folds, gutter, virtual text. vimcode-class. Consumes a `BufferView` description; text engine stays in a separate crate. |
+| `TextDisplay` | Read-only rich/plain text view; used for markdown preview, LSP hover, log output. Live-append for streaming tracked in #144. |
+| `Terminal` | VT100-compatible terminal emulator. vimcode already ships one; Phase A extracts it as a primitive. |
+| `Form` | Vertical stack of labeled fields: `Toggle`, `TextInput`, `Dropdown`, `Slider`, `Button`, `ColorPicker`. Richer field types tracked in #143. |
 | `SearchBox` | Text input with embedded search affordances (clear button, match count, up/down). |
-| `ProgressBar` | Determinate or indeterminate. |
-| `Spinner` | Indeterminate activity indicator. |
+| `ProgressBar` | Determinate or indeterminate. Tracking: #142. |
+| `Spinner` | Indeterminate activity indicator. Tracking: #142. |
 
 ### 4.4 Transient / popup
 
@@ -247,7 +249,7 @@ Purpose of this section: **stress-test the primitive set** against three concret
 
 **Gaps found:**
 - **Live-streaming content** — logs and `kubectl exec` output arrive asynchronously. The crate needs a primitive or pattern for "content appended to `TextDisplay`/`TextEditor` from a channel" without the app rebuilding the whole buffer each frame. Probably: `TextDisplay` has an append API the app calls when new data arrives, and only that slice invalidates.
-- **Terminal emulation (VT100)** — if an app wants a real shell, the crate needs to either expose a terminal primitive or let the app own one. vimcode already has `terminal_*` methods; consider extracting.
+- **Terminal emulation (VT100)** — `Terminal` is a v1 core primitive (§4.3). vimcode's existing `terminal_*` methods provide the reference implementation; extraction is Phase A work.
 - **Status indicators with colour** — pods have states (Running/Pending/Failed). `ListView`/`DataTable` cells need rich content (coloured dot + text). `StyledText` + per-cell rendering handles this.
 - **Custom keyboard shortcuts per-panel** — `l` opens logs, `e` opens edit, etc. The crate must support per-widget keybinding tables, not just global accelerators.
 
@@ -255,13 +257,12 @@ Purpose of this section: **stress-test the primitive set** against three concret
 
 Building just for vimcode we'd get away with ~12 primitives. To support SQL and k8s apps too, add:
 
-- `DataTable` (with sort, resize, multi-select, cell edit)
-- `Divider` (shared drag semantics)
-- Live-append support on `TextDisplay` / `TextEditor`
-- A terminal primitive (or a documented pattern for hosting one)
-- `Toast` + long-running task abstraction with cancel
+- `TreeTable` (tracking #139) — subsumes `DataTable` as a depth-0 case (#140)
+- `Divider` (shared drag semantics across `Split` / `Tabs` / column resize)
+- Live-append support on `TextDisplay` / `TextEditor` (tracking #144)
+- `Toast` + long-running task abstraction with cancel (tracking #141, #142)
 
-None of these are surprises. None invalidate the retained-tree + events model. All are achievable in v1 if designed in now.
+`Terminal` is already a v1 primitive (vimcode ships one). None of these are surprises. None invalidate the retained-tree + events model.
 
 ---
 
@@ -314,23 +315,31 @@ Each primitive's `draw_*` method is responsible for:
 
 ---
 
-## 7. Key design decisions requiring a call
+## 7. Key design decisions
 
-Each decision gets a default recommendation in parens; any of them is negotiable.
+All 13 decisions below were resolved in the 2026-04-18 design session (either explicitly or by accepting the default recommendation).
 
-1. **Retained-tree vs immediate-mode API.** (Retained tree, built each frame. Matches existing `build_screen_layout`.)
-2. **Primitive-owned vs app-owned scroll state.** (Primitive-owned keyed by `WidgetId`. Exposed via events for the scroll-binding case.)
-3. **One `Backend` trait vs separate traits per primitive.** (One trait, to keep the contract in one file. Primitives with complex state may get helper traits.)
-4. **How does a `TextEditor` primitive consume vimcode's Engine?** (The `TextEditor` primitive consumes a `BufferView` description that any app can produce. vimcode's engine becomes an adapter that produces `BufferView` per frame. This cleanly separates vimcode's text model from the generic editor widget.)
-5. **Do we support multiple `Window`s per process?** (Yes, v1. Required for detaching tabs, dialogs on multi-monitor, and cross-platform parity. TUI backend collapses to one Window.)
-6. **Accessibility.** (v2. Emit an a11y tree but don't wire to platform a11y APIs until there's user demand.)
-7. **IME / composition.** (v1.1. Ship without full IME; add when first non-Latin user complains. Text input primitives must at minimum not crash.)
-8. **Theming system.** (Palette-based `Theme` struct with derived colours, like vimcode's existing one. Exposed; apps can override. VSCode theme JSON importer.)
-9. **Native menu bars.** (v1. macOS uses global menu; Win/Linux uses in-window. Crate owns the platform integration.)
-10. **Packaging.** (Single crate `???` with backends behind Cargo features: `win-gui`, `gtk`, `tui`, `cocoa`. Apps pick.)
-11. **Naming.** (Working names: `panes`, `uniform`, `uix`, `shipyard-ui`, `cosmos`. Unclaimed on crates.io matters. Decide before extraction.)
-12. **Language / toolchain.** (Rust 2021, MSRV tracks latest stable −2. No C/C++ except vendored trees like tree-sitter. mlua for plugin support.)
-13. **License.** (MIT + Apache-2.0, standard Rust dual. vimcode's current license prevails.)
+1. ✅ **Retained-tree vs immediate-mode API.** Retained tree, built each frame. Matches existing `build_screen_layout`.
+2. ✅ **Primitive-owned vs app-owned scroll state.** Primitive-owned keyed by `WidgetId`. Exposed via events for the scroll-binding case.
+3. ✅ **One `Backend` trait vs separate traits per primitive.** One trait, to keep the contract in one file. Primitives with complex state may get helper traits.
+4. ✅ **How does a `TextEditor` primitive consume vimcode's Engine?** The `TextEditor` primitive consumes a `BufferView` description that any app can produce. vimcode's engine becomes an adapter that produces `BufferView` per frame. The text engine (rope, tree-sitter, LSP) stays in a separate crate — not part of quadraui.
+5. ✅ **Do we support multiple `Window`s per process?** Yes, v1. Required for detaching tabs, dialogs on multi-monitor, and cross-platform parity. TUI backend collapses to one Window.
+6. ✅ **Accessibility.** v1 ships with a11y-ready data fields on every primitive (`a11y_role`, `a11y_label`, focus order). Platform wiring (UI Automation, NSAccessibility, AT-SPI) lands in v1.1. This keeps the door open without blocking v1.
+7. ✅ **IME / composition.** v1.1. Ship without full IME; add when first non-Latin user complains. Text input primitives must at minimum not crash.
+8. ✅ **Theming system.** Palette-based `Theme` struct with derived colours, like vimcode's existing one. Exposed; apps can override. VSCode theme JSON importer.
+9. ✅ **Native menu bars.** v1. macOS uses global menu; Win/Linux uses in-window. Crate owns the platform integration.
+10. ✅ **Packaging.** Single crate `quadraui` with backends behind Cargo features: `gtk`, `tui`, `win-gui`, `cocoa` (v1.1). Apps pick.
+11. ✅ **Naming.** `quadraui` — evokes the four backends, available on crates.io as of 2026-04-18. Working name; will be confirmed at Phase B extraction.
+12. ✅ **Language / toolchain.** Rust 2021, MSRV tracks latest stable −2. No C/C++ except vendored trees like tree-sitter. mlua for plugin support.
+13. ✅ **License.** MIT + Apache-2.0, standard Rust dual. vimcode's current license prevails.
+
+**Additional decisions from the same session:**
+
+- **Workspace layout.** `quadraui/` is a workspace member of the vimcode repo from day one. `vimcode` depends via path. Extraction to a standalone repo is a Phase B activity. See §8.
+- **Branching.** Stage-by-stage PRs to `develop` — no long-lived refactor branch. Each Phase A stage adds primitives alongside existing code (coexistence rule) so nothing ever ships half-migrated.
+- **macOS timing.** quadraui 1.0 ships Win+Linux+TUI; macOS lands in 1.x. Don't block v1 on a new backend.
+- **Validation app.** A cross-platform k8s dashboard (tracking issue #145) is the planned second consumer that proves extraction. Phase D work.
+- **Postman-like HTTP client** will be a bundled vimcode extension (tracking #147), not a standalone consumer. Requires a plugin API extension (#146) to expose quadraui primitives to Lua.
 
 ---
 
@@ -339,31 +348,21 @@ Each decision gets a default recommendation in parens; any of them is negotiable
 Gradual, in-place. No big-bang rewrite.
 
 **Phase A — primitives live alongside `ScreenLayout` (months 1–2)**
-Introduce each primitive's data struct inside `src/render.rs` or a new `src/ui/` module. Implement it in all three existing backends. Replace vimcode's custom panel by panel.
-
-Proposed order (each is ~1–2 sessions of work, small and shippable):
-
-1. `TreeView` — start with source-control panel (simplest, already has `SourceControlData`). Prove the primitive. Replace the GTK `TreeView` widget with `DrawingArea` + `draw_tree`.
-2. `TreeView` again — explorer. This is the biggest GTK-specific refactor (native `gtk4::TreeView` → fully-drawn). Does not ship until it matches feature parity with the current explorer.
-3. `Form` — replace settings panel. Currently bypasses `ScreenLayout`; this folds it in.
-4. `Palette` — command palette already follows the pattern; just formalize the primitive.
-5. `ListView` — git status list, quickfix list.
-6. `DataTable` — new primitive, no vimcode panel needs it yet. Build while knowledge is fresh; don't use vimcode to validate — build a tiny example app (SQL query runner?) to validate.
-7. `StatusBar` / `TabBar` / `ActivityBar` — already mostly unified; finish the migration per issue #133.
+Phase A.0 scaffolds the `quadraui/` workspace member (empty crate, path dependency from vimcode). Each subsequent stage (A.1 through A.9 — see §11 for the full table) adds one primitive and migrates one vimcode panel to consume it. Each stage is a short-lived branch + normal PR to `develop` — no long-lived refactor branch, no big-bang rewrite.
 
 **Phase B — extract the crate (month 3)**
-Once all panels go through primitives, move `src/ui/` out of `vimcode` into a new workspace member `ui-crate/`. vimcode depends on it as a path dependency. No functional change expected.
+The `quadraui/` workspace member exists from Phase A.0. Phase B is the point where we promote it from "internal vimcode helper" to publishable library: stabilize the API, add a real README + examples, publish a pre-release to crates.io. Since workspace membership is in place from the start, there's no "move files" step — just API hardening.
 
-**Phase C — macOS backend (month 4, issue #47)**
-Implement the `Backend` trait for macOS (Core Graphics + Core Text). Because the trait surface is small and every primitive has a reference implementation in the other three backends, this should be achievable in one focused push. `NATIVE_GUI_LESSONS.md` pre-empts many bugs.
+**Phase C — macOS backend (v1.x, issue #47)**
+Implement the `Backend` trait for macOS (Core Graphics + Core Text). Deferred out of v1 per §7 decision #6 / §7 macOS timing note — v1 ships Win+Linux+TUI, macOS lands in 1.x. `NATIVE_GUI_LESSONS.md` captures cross-backend pitfalls that should transfer.
 
 **Phase D — polish + v1 release (month 5)**
-Stabilize the API. Write one small example app (SQL runner?) as a second consumer to prove extraction. Document public API. Publish to crates.io.
+Stabilize the API. Build the cross-platform k8s dashboard (#145) as the second consumer to prove extraction works. Document public API. Publish to crates.io.
 
 **Phase E — mature (months 6+)**
-Accessibility tree. IME. Animation primitives. Community examples.
+Platform a11y wiring (v1.1). IME / composition (v1.1). macOS backend (Phase C deferred to v1.x). Animation primitives. Community examples.
 
-This timeline is aggressive but achievable given how much of the work is already done in vimcode. The unknown unknowns are macOS + DataTable + live-streaming content.
+This timeline is aggressive but achievable given how much of the work is already done in vimcode. The unknown unknowns are `TreeTable` (#139), live-streaming content (#144), and the k8s app's uncovered design pressure.
 
 ---
 
@@ -372,7 +371,7 @@ This timeline is aggressive but achievable given how much of the work is already
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | Primitive set doesn't cover real-world apps and requires frequent breaking changes post-v1 | Medium | Stress-test with SQL and k8s sketches *before* extraction (§5). Build one non-vimcode example app in Phase D. |
-| Accessibility debt blocks adoption | Low (for target users) | Document as v2. Target user = keyboard-driven power users who already disable screen readers. |
+| Accessibility debt blocks adoption | Low (for target users) | v1 ships with a11y-ready data fields on every primitive; platform wiring (UIA / NSAccessibility / AT-SPI) lands in v1.1 once a concrete user need surfaces. |
 | Fully-drawn approach feels "off" on macOS vs native Cocoa apps | Medium | Careful `PlatformStyle` work. Use platform font/accent religiously. Hide window chrome behind native title bar. |
 | macOS backend blows out timeline due to CG/CT learning curve | Medium-High | Budget extra time. `NATIVE_GUI_LESSONS.md` from Win-GUI should transfer. |
 | Text editor primitive too coupled to vimcode's Engine to extract | Medium | `BufferView` adapter pattern (§7.4) separates concerns. Validate during Phase A. |
@@ -381,31 +380,46 @@ This timeline is aggressive but achievable given how much of the work is already
 
 ---
 
-## 10. Open questions for you
+## 10. Design invariants for plugin-driven UI
 
-Before any code is written:
+Properties that every primitive's API **must** preserve so vimcode's Lua plugin system can later declare UI using quadraui primitives (tracking issue #146, #147). Violating any of these would force a breaking change to quadraui when we add plugin-driven UI.
 
-1. **Naming.** Do you have a preference? (See §7.11 for candidates.)
-2. **Workspace vs monorepo.** Does the UI crate live inside `vimcode/ui-crate/` as a workspace member, or in a separate repo from day one? (I'd recommend workspace member until v1 to iterate fast, then split.)
-3. **Is `TextEditor` part of this crate, or its own crate that this one embeds?** It's huge — syntax, folds, multi-cursor, LSP plumbing. Extracting separately could be cleaner, but then the primitive catalog has a hole. (I lean toward: `TextEditor` is a primitive in this crate; the *text engine* — rope, tree-sitter, LSP — is a separate crate the primitive depends on.)
-4. **What's your appetite for accessibility in v1?** Deferring has real users-we-won't-have consequences.
-5. **Are there apps you'd want to build personally on this crate after vimcode?** The answer shapes which primitives get priority. (If you've got a SQL client itch, `DataTable` moves up.)
-6. **macOS timing.** Block extraction on macOS backend, or extract three-backend first and add macOS after? (I'd recommend extract first, macOS second — don't make the crate release hostage to a whole new backend.)
+1. **`WidgetId` is owned / allocatable** (e.g. `String` or `Cow<'static, str>`) — not `&'static str`. Plugins generate IDs at runtime.
+2. **Events dispatched as plain data**, not Rust closures. Backend emits `UiEvent`; app routes to plugin by widget ID. No closures crossing the Rust/Lua boundary.
+3. **Primitive data structs are serde-compatible** (`Serialize` + `Deserialize`). Lua tables convert via JSON to Rust structs.
+4. **WidgetId namespace support.** Apps can reserve an ID prefix per plugin (e.g. `"plugin:my-ext:send"`) so plugin IDs don't collide with core IDs.
+5. **No global event handlers.** Every widget has an ID; every event references it. No magic "on_change" that doesn't carry the widget.
+6. **Primitives don't borrow from app state** (or use clear `'a` lifetimes). Plugins can pass owned data without borrow-checker puzzles.
+
+These are already the design's intent. This section exists so a future refactor doesn't drift from them without noticing.
 
 ---
 
 ## 11. What happens next
 
-If this sketch is roughly right, the follow-up work is:
+**Resolved decisions recap:** The 2026-04-18 design session closed all open questions (see §7). Milestone **"Cross-Platform UI Crate"** on GitHub tracks the work.
 
-1. **Pick 2–3 open questions in §10 and decide.** Especially naming, workspace layout, and whether to build one example app before extraction.
-2. **Freeze a v1 primitive list.** Anything not in the list is v1.1.
-3. **Write a one-pager for each primitive** — full data struct, full event enum, drawing contract, keyboard contract. These pages become the crate API docs.
-4. **Start Phase A.1 — `TreeView` primitive for source-control panel.** Smallest real slice. If it takes less than 2 sessions, the design is sound.
+**Immediate next step — release vimcode 0.10.0.** Cut a minor release from the current develop so quadraui work starts from a stable baseline. PR develop → main, tag `v0.10.0`.
 
-If this sketch is wrong, easiest places it's wrong:
-- The retained-tree model is insufficient for `TextEditor` (text editing + IME may need finer-grained incremental updates)
-- The primitive set is too coarse (SQL/k8s apps want something not on the list)
-- The "fully drawn, no native widgets" call is wrong on macOS specifically (Cocoa conventions run deeper than Win11 and Linux)
+**Then Phase A.0 — workspace scaffold.** Single PR that adds an empty `quadraui/` workspace member with a placeholder `lib.rs`. vimcode adds it as a path dependency. No primitives yet. Compile passes. This is the smallest possible first PR and unblocks all subsequent stages.
 
-Those are the three places to kick the tyres hardest.
+**Phase A.1 onward — primitives one at a time.** Each stage is its own PR:
+
+| Stage | Primitive | vimcode panel to migrate |
+|-------|-----------|--------------------------|
+| A.1 | `TreeView` | Source-control panel |
+| A.2 | `TreeView` | Explorer (replaces native `gtk4::TreeView`) |
+| A.3 | `Form` | Settings panel |
+| A.4 | `Palette` | Command palette (formalize existing pattern) |
+| A.5 | `ListView` | Quickfix, git status list |
+| A.6 | `StatusBar` / `TabBar` / `ActivityBar` | Complete issue #133 |
+| A.7 | `Terminal` | Extract from vimcode's `terminal_*` methods |
+| A.8 | `TextDisplay` | Markdown preview, LSP hover |
+| A.9 | `TextEditor` + `BufferView` adapter | Main editor (biggest stage) |
+
+**If this sketch is wrong, easiest places it's wrong:**
+- The retained-tree model is insufficient for `TextEditor` (text editing + IME may need finer-grained incremental updates than a rebuild-every-frame description tree supports)
+- The primitive set is too coarse — validation app (#145) surfaces something not on the list
+- The "fully drawn, no native widgets" call is wrong on macOS specifically (Cocoa conventions run deeper than Win11 and Linux; decision deferred since macOS is v1.x)
+
+Those are the three places to kick the tyres hardest as Phase A work proceeds.
