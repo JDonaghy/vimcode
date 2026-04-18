@@ -1544,9 +1544,6 @@ pub(super) fn render_source_control(
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
     let row_bg = rc(theme.tab_bar_bg);
-    let add_fg = rc(theme.git_added);
-    let del_fg = rc(theme.git_deleted);
-    let mod_fg = rc(theme.git_modified);
 
     // Build SC data from engine state via the render abstraction.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
@@ -1746,237 +1743,18 @@ pub(super) fn render_source_control(
         return;
     }
 
-    // Sections: staged, unstaged, and optionally worktrees (only when linked worktrees exist).
-    #[allow(clippy::type_complexity)]
-    let sections: [(
-        &str,
-        &[render::ScFileItem],
-        Option<&[render::ScWorktreeItem]>,
-        usize,
-    ); 3] = [
-        ("\u{f055} STAGED CHANGES", &sc.staged, None, 0),
-        ("\u{f02b} CHANGES", &sc.unstaged, None, 1),
-        ("\u{e702} WORKTREES", &[], Some(&sc.worktrees), 2),
-    ];
-    // Only show WORKTREES section when there are linked worktrees (>1 total).
-    let show_worktrees = sc.worktrees.len() > 1;
-
-    let mut row_y = section_start_y; // start after header + commit rows + button row
-    let max_y = area.y + area.height;
-    let mut flat_row: usize = 0; // tracks position in flat selection space
-
-    for (section_label, file_items, wt_items, sec_idx) in &sections {
-        // Skip the WORKTREES section unless there are linked worktrees.
-        if *sec_idx == 2 && !show_worktrees {
-            continue;
-        }
-        if row_y >= max_y {
-            break;
-        }
-        let is_expanded = sc.sections_expanded[*sec_idx];
-        let expand_icon = if is_expanded { '\u{25bc}' } else { '\u{25b6}' }; // ▼ / ▶
-
-        // Section header row
-        let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
-        let (hdr_r_fg, hdr_r_bg) = if is_hdr_selected {
-            (hdr_fg, sel_bg)
-        } else {
-            (hdr_fg, hdr_bg)
-        };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, row_y, ' ', hdr_r_fg, hdr_r_bg);
-        }
-        // Expand icon + label
-        let hdr_text = format!(" {} {}", expand_icon, section_label);
-        // Item count badge
-        let badge_text = {
-            let count = if *sec_idx == 2 {
-                wt_items.map(|v| v.len()).unwrap_or(0)
-            } else {
-                file_items.len()
-            };
-            if count > 0 {
-                format!(" ({})", count)
-            } else {
-                String::new()
-            }
-        };
-        let full_hdr = format!("{}{}", hdr_text, badge_text);
-        for (i, ch) in full_hdr.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, row_y, ch, hdr_r_fg, hdr_r_bg);
-        }
-        row_y += 1;
-        flat_row += 1;
-
-        if !is_expanded {
-            continue;
-        }
-
-        // Items
-        let item_count = if *sec_idx == 2 {
-            wt_items.map(|v| v.len()).unwrap_or(0)
-        } else {
-            file_items.len()
-        };
-
-        // Determine if we need a scrollbar.
-        // For simplicity we don't scroll SC sections (they're usually small).
-        // Reserve rightmost col for scrollbar if needed.
-        let need_sb = item_count > (max_y.saturating_sub(row_y)) as usize;
-        let text_w = if need_sb {
-            (area.width as usize).saturating_sub(1)
-        } else {
-            area.width as usize
-        };
-
-        if item_count == 0 {
-            // "(no changes)" hint
-            if row_y < max_y {
-                let hint = "  (no changes)";
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', dim_fg, row_bg);
-                }
-                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
-                    set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, row_bg);
-                }
-                row_y += 1;
-            }
-        } else if *sec_idx == 2 {
-            // Worktrees section
-            if let Some(wts) = wt_items {
-                for wt in *wts {
-                    if row_y >= max_y {
-                        break;
-                    }
-                    let is_selected = sc.has_focus && sc.selected == flat_row;
-                    let (row_fg, r_bg) = if is_selected {
-                        (item_fg, sel_bg)
-                    } else {
-                        (item_fg, row_bg)
-                    };
-                    for x in area.x..area.x + area.width {
-                        set_cell(buf, x, row_y, ' ', row_fg, r_bg);
-                    }
-                    let check = if wt.is_current { '\u{2713}' } else { ' ' }; // ✓
-                    let main_marker = if wt.is_main { " [main]" } else { "" };
-                    let text = format!("  {} {} {}{}", check, wt.branch, wt.path, main_marker);
-                    for (i, ch) in text.chars().enumerate().take(text_w) {
-                        set_cell(buf, area.x + i as u16, row_y, ch, row_fg, r_bg);
-                    }
-                    row_y += 1;
-                    flat_row += 1;
-                }
-            }
-        } else {
-            // File items (staged or unstaged)
-            for fi in *file_items {
-                if row_y >= max_y {
-                    break;
-                }
-                let is_selected = sc.has_focus && sc.selected == flat_row;
-                let r_bg = if is_selected { sel_bg } else { row_bg };
-                let status_color = match fi.status_char {
-                    'A' => add_fg,
-                    'D' => del_fg,
-                    _ => mod_fg,
-                };
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', dim_fg, r_bg);
-                }
-                // Status char colored, then path dimmed
-                let prefix = format!("  {} ", fi.status_char);
-                for (i, ch) in prefix.chars().enumerate().take(text_w) {
-                    let ch_fg = if ch == fi.status_char {
-                        status_color
-                    } else {
-                        dim_fg
-                    };
-                    set_cell(buf, area.x + i as u16, row_y, ch, ch_fg, r_bg);
-                }
-                let path_start = prefix.chars().count();
-                let path_color = if is_selected { item_fg } else { dim_fg };
-                for (i, ch) in fi.path.chars().enumerate() {
-                    let col = path_start + i;
-                    if col >= text_w {
-                        break;
-                    }
-                    set_cell(buf, area.x + col as u16, row_y, ch, path_color, r_bg);
-                }
-                row_y += 1;
-                flat_row += 1;
-            }
-        }
-    }
-
-    // ── Log section (RECENT COMMITS) ─────────────────────────────────────────
-    if row_y < max_y {
-        let is_expanded = sc.sections_expanded[3];
-        let expand_icon = if is_expanded { '\u{25bc}' } else { '\u{25b6}' };
-
-        // Section header
-        let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
-        let (log_hdr_fg, log_hdr_bg) = if is_hdr_selected {
-            (hdr_fg, sel_bg)
-        } else {
-            (hdr_fg, hdr_bg)
-        };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, row_y, ' ', log_hdr_fg, log_hdr_bg);
-        }
-        let count_badge = if !sc.log.is_empty() {
-            format!(" ({})", sc.log.len())
-        } else {
-            String::new()
-        };
-        let hdr_text = format!(" {} \u{f417} RECENT COMMITS{}", expand_icon, count_badge);
-        for (i, ch) in hdr_text.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, row_y, ch, log_hdr_fg, log_hdr_bg);
-        }
-        row_y += 1;
-        flat_row += 1;
-
-        if is_expanded && row_y < max_y {
-            if sc.log.is_empty() {
-                // "(no commits)" hint
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', dim_fg, row_bg);
-                }
-                let hint = "  (no commits)";
-                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
-                    set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, row_bg);
-                }
-                row_y += 1;
-            } else {
-                for entry in &sc.log {
-                    if row_y >= max_y {
-                        break;
-                    }
-                    let is_selected = sc.has_focus && sc.selected == flat_row;
-                    let r_bg = if is_selected { sel_bg } else { row_bg };
-                    for x in area.x..area.x + area.width {
-                        set_cell(buf, x, row_y, ' ', dim_fg, r_bg);
-                    }
-                    // Hash in dim color, message in item_fg
-                    let hash_text = format!("  {} ", entry.hash);
-                    let hash_w = hash_text.chars().count();
-                    for (i, ch) in hash_text.chars().enumerate().take(area.width as usize) {
-                        set_cell(buf, area.x + i as u16, row_y, ch, dim_fg, r_bg);
-                    }
-                    let msg_fg = if is_selected { item_fg } else { dim_fg };
-                    for (i, ch) in entry.message.chars().enumerate() {
-                        let col = hash_w + i;
-                        if col >= area.width as usize {
-                            break;
-                        }
-                        set_cell(buf, area.x + col as u16, row_y, ch, msg_fg, r_bg);
-                    }
-                    row_y += 1;
-                    flat_row += 1;
-                }
-            }
-        }
-    }
-    let _ = (row_y, flat_row); // consumed by rendering loop
+    // Section rendering — migrated to the `quadraui::TreeView` primitive.
+    // The adapter `render::source_control_to_tree_view()` builds a flat
+    // TreeView (Staged / Changes / Worktrees / Log) and `quadraui_tui::draw_tree`
+    // rasterises it into the reserved area below the header + commit + buttons.
+    let section_area = Rect {
+        x: area.x,
+        y: section_start_y,
+        width: area.width,
+        height: (area.y + area.height).saturating_sub(section_start_y),
+    };
+    let sc_tree = render::source_control_to_tree_view(sc, theme);
+    super::quadraui_tui::draw_tree(buf, section_area, &sc_tree, theme);
 
     // ── Branch picker / create popup ─────────────────────────────────────────
     if let Some(ref bp) = sc.branch_picker {

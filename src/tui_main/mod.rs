@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 mod mouse;
 mod panels;
+mod quadraui_tui;
 mod render_impl;
 
 #[allow(unused_imports)]

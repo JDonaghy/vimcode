@@ -5342,6 +5342,177 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
     })
 }
 
+/// Convert vimcode's internal `Color` to quadraui's `Color`. Alpha is fully opaque.
+fn to_q_color(c: Color) -> quadraui::Color {
+    quadraui::Color::rgb(c.r, c.g, c.b)
+}
+
+/// Adapt a `SourceControlData` (vimcode's internal representation) into a
+/// generic `quadraui::TreeView` that backends can render through the shared
+/// tree-primitive drawing path.
+///
+/// Scope: covers the four expandable sections only — Staged, Changes,
+/// Worktrees, and Recent Commits. The header row, commit input, and action
+/// button row remain the responsibility of the existing SC panel code;
+/// they will migrate in later A.x stages when their primitives land.
+///
+/// Row order mirrors `render_source_control()` in the TUI so `sc.selected`
+/// (a flat row index within the sections area) maps one-to-one onto the
+/// returned `TreeView.rows`.
+pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+
+    let add_fg = to_q_color(theme.git_added);
+    let del_fg = to_q_color(theme.git_deleted);
+    let mod_fg = to_q_color(theme.git_modified);
+    let dim_fg = to_q_color(theme.status_inactive_fg);
+    let show_worktrees = sc.worktrees.len() > 1;
+
+    // Section order: 0=Staged, 1=Changes, 2=Worktrees (conditional), 3=Log.
+    // Matches `render_source_control()` in tui_main/panels.rs.
+    // Labels include Nerd Font glyphs; backends that don't have the icon font
+    // will still show the text portion.
+    let sections: [(u16, &str, usize); 4] = [
+        (0, "\u{f055} STAGED CHANGES", sc.staged.len()),
+        (1, "\u{f02b} CHANGES", sc.unstaged.len()),
+        (2, "\u{e702} WORKTREES", sc.worktrees.len()),
+        (3, "\u{f417} RECENT COMMITS", sc.log.len()),
+    ];
+
+    for (sec_idx, label, count) in sections {
+        if sec_idx == 2 && !show_worktrees {
+            continue;
+        }
+        let is_expanded = sc.sections_expanded[sec_idx as usize];
+
+        // Section header row (branch in tree terms).
+        let badge = if count > 0 {
+            Some(Badge::plain(format!("({})", count)))
+        } else {
+            None
+        };
+        rows.push(TreeRow {
+            path: vec![sec_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(label),
+            badge,
+            is_expanded: Some(is_expanded),
+            decoration: Decoration::Normal,
+        });
+
+        if !is_expanded {
+            continue;
+        }
+
+        match sec_idx {
+            0 | 1 => {
+                let items = if sec_idx == 0 {
+                    &sc.staged
+                } else {
+                    &sc.unstaged
+                };
+                if items.is_empty() {
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, 0],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![StyledSpan {
+                                text: "(no changes)".to_string(),
+                                fg: Some(dim_fg),
+                                bg: None,
+                                bold: false,
+                                italic: true,
+                                underline: false,
+                            }],
+                        },
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Muted,
+                    });
+                } else {
+                    for (i, fi) in items.iter().enumerate() {
+                        let status_color = match fi.status_char {
+                            'A' => add_fg,
+                            'D' => del_fg,
+                            _ => mod_fg,
+                        };
+                        rows.push(TreeRow {
+                            path: vec![sec_idx, i as u16],
+                            indent: 1,
+                            icon: None,
+                            text: StyledText {
+                                spans: vec![
+                                    StyledSpan::with_fg(fi.status_char.to_string(), status_color),
+                                    StyledSpan::plain(format!(" {}", fi.path)),
+                                ],
+                            },
+                            badge: None,
+                            is_expanded: None,
+                            decoration: Decoration::Normal,
+                        });
+                    }
+                }
+            }
+            2 => {
+                for (i, wt) in sc.worktrees.iter().enumerate() {
+                    let check = if wt.is_current { "\u{2713} " } else { "  " };
+                    let main_marker = if wt.is_main { " [main]" } else { "" };
+                    let text = format!("{}{} {}{}", check, wt.branch, wt.path, main_marker);
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, i as u16],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText::plain(text),
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                    });
+                }
+            }
+            3 => {
+                for (i, entry) in sc.log.iter().enumerate() {
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, i as u16],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(entry.hash.clone(), dim_fg),
+                                StyledSpan::plain(format!(" {}", entry.message)),
+                            ],
+                        },
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Muted,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Map flat `sc.selected` → `selected_path`. When selected is out of range
+    // (e.g. sections collapsed), we fall back to no selection.
+    let selected_path = rows.get(sc.selected).map(|r| r.path.clone());
+
+    TreeView {
+        id: WidgetId::new("sc-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: 0,
+        style: TreeStyle::default(),
+        has_focus: sc.has_focus,
+    }
+}
+
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     // Always build so backends can check ext_sidebar_has_focus.
     let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
