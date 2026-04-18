@@ -5412,52 +5412,36 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
 
         match sec_idx {
             0 | 1 => {
+                // NOTE: no "(no changes)" placeholder row — adding one would
+                // shift the flat row count away from
+                // `engine.sc_flat_to_section_idx`, which breaks the
+                // `sc.selected` → `selected_path` mapping and causes Tab /
+                // Enter / staging to act on the wrong section.
                 let items = if sec_idx == 0 {
                     &sc.staged
                 } else {
                     &sc.unstaged
                 };
-                if items.is_empty() {
+                for (i, fi) in items.iter().enumerate() {
+                    let status_color = match fi.status_char {
+                        'A' => add_fg,
+                        'D' => del_fg,
+                        _ => mod_fg,
+                    };
                     rows.push(TreeRow {
-                        path: vec![sec_idx, 0],
+                        path: vec![sec_idx, i as u16],
                         indent: 1,
                         icon: None,
                         text: StyledText {
-                            spans: vec![StyledSpan {
-                                text: "(no changes)".to_string(),
-                                fg: Some(dim_fg),
-                                bg: None,
-                                bold: false,
-                                italic: true,
-                                underline: false,
-                            }],
+                            spans: vec![
+                                StyledSpan::with_fg(fi.status_char.to_string(), status_color),
+                                StyledSpan::plain(format!(" {}", fi.path)),
+                            ],
                         },
                         badge: None,
                         is_expanded: None,
-                        decoration: Decoration::Muted,
+                        decoration: Decoration::Normal,
                     });
-                } else {
-                    for (i, fi) in items.iter().enumerate() {
-                        let status_color = match fi.status_char {
-                            'A' => add_fg,
-                            'D' => del_fg,
-                            _ => mod_fg,
-                        };
-                        rows.push(TreeRow {
-                            path: vec![sec_idx, i as u16],
-                            indent: 1,
-                            icon: None,
-                            text: StyledText {
-                                spans: vec![
-                                    StyledSpan::with_fg(fi.status_char.to_string(), status_color),
-                                    StyledSpan::plain(format!(" {}", fi.path)),
-                                ],
-                            },
-                            badge: None,
-                            is_expanded: None,
-                            decoration: Decoration::Normal,
-                        });
-                    }
                 }
             }
             2 => {

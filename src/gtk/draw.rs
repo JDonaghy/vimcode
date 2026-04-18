@@ -4812,7 +4812,6 @@ pub(super) fn draw_source_control_panel(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
     let (add_r, add_g, add_b) = theme.diff_added_bg.to_cairo();
     let (del_r, del_g, del_b) = theme.diff_removed_bg.to_cairo();
 
@@ -5000,166 +4999,26 @@ pub(super) fn draw_source_control_panel(
         y_commit = btn_y_base + btn_h + btn_pad;
     }
 
-    // Helper to draw a section — uses y_off (float) for vertical positioning.
-    let item_height = (line_height * 1.4).round();
-    let draw_section = |cr: &Context,
-                        layout: &pango::Layout,
-                        title: &str,
-                        items: &[String],
-                        expanded: bool,
-                        y_off: &mut f64,
-                        flat_start: usize,
-                        selected: usize| {
-        let arrow = if expanded { "▼" } else { "▶" };
-        let header_text = format!("  {} {} ({})", arrow, title, items.len());
-        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, *y_off, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-        layout.set_text(&header_text);
-        let (_, lh) = layout.pixel_size();
-        cr.move_to(x + 2.0, *y_off + (line_height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        *y_off += line_height;
-
-        if expanded {
-            for (i, item) in items.iter().enumerate() {
-                let flat_idx = flat_start + 1 + i; // +1 for section header
-                let is_sel = flat_idx == selected;
-                if is_sel {
-                    cr.set_source_rgb(sel_r, sel_g, sel_b);
-                    cr.rectangle(x, *y_off, w, item_height);
-                    cr.fill().ok();
-                }
-                cr.set_source_rgb(
-                    if is_sel { hdr_fg_r } else { dim_r },
-                    if is_sel { hdr_fg_g } else { dim_g },
-                    if is_sel { hdr_fg_b } else { dim_b },
-                );
-                layout.set_text(&format!("    {}", item));
-                let (_, lh) = layout.pixel_size();
-                cr.move_to(x + 2.0, *y_off + (item_height - lh as f64) / 2.0);
-                pangocairo::show_layout(cr, layout);
-                *y_off += item_height;
-                if *y_off > y + h {
-                    break;
-                }
-            }
-        }
-    };
-
-    // Compute flat start offsets
-    let staged_items: Vec<String> = sc
-        .staged
-        .iter()
-        .map(|f| format!("{} {}", f.status_char, f.path))
-        .collect();
-    let unstaged_items: Vec<String> = sc
-        .unstaged
-        .iter()
-        .map(|f| format!("{} {}", f.status_char, f.path))
-        .collect();
-    let wt_items: Vec<String> = sc
-        .worktrees
-        .iter()
-        .map(|wt| {
-            let marker = if wt.is_current { "\u{2714} " } else { "  " };
-            format!("{}{} {}", marker, wt.branch, wt.path)
-        })
-        .collect();
-
-    let staged_flat_start = 0usize;
-    let unstaged_flat_start = 1 + if sc.sections_expanded[0] {
-        sc.staged.len()
-    } else {
-        0
-    };
-    let wt_flat_start = unstaged_flat_start
-        + 1
-        + if sc.sections_expanded[1] {
-            sc.unstaged.len()
-        } else {
-            0
-        };
-    let show_worktrees = sc.worktrees.len() > 1;
-    let log_flat_start = if show_worktrees {
-        wt_flat_start
-            + 1
-            + if sc.sections_expanded[2] {
-                sc.worktrees.len()
-            } else {
-                0
-            }
-    } else {
-        wt_flat_start
-    };
-
-    // Track vertical position for sections (float, since item_height != line_height).
-    let mut y_off = y_commit;
-
-    // Draw staged section
-    if y_off < y + h {
-        draw_section(
-            cr,
-            layout,
-            "STAGED CHANGES",
-            &staged_items,
-            sc.sections_expanded[0],
-            &mut y_off,
-            staged_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Color hint for diff-add
-    let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
-
-    // Draw unstaged section
-    if y_off < y + h {
-        draw_section(
-            cr,
-            layout,
-            "CHANGES",
-            &unstaged_items,
-            sc.sections_expanded[1],
-            &mut y_off,
-            unstaged_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Draw worktrees section (only when there are linked worktrees beyond the main one).
-    if y_off < y + h && show_worktrees {
-        draw_section(
-            cr,
-            layout,
-            "WORKTREES",
-            &wt_items,
-            sc.sections_expanded[2],
-            &mut y_off,
-            wt_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Draw log section (RECENT COMMITS) — always present.
-    if y_off < y + h {
-        let log_items: Vec<String> = sc
-            .log
-            .iter()
-            .map(|e| format!("{} {}", e.hash, e.message))
-            .collect();
-        draw_section(
-            cr,
-            layout,
-            &format!("{} RECENT COMMITS", icons::GIT_HISTORY.nerd),
-            &log_items,
-            sc.sections_expanded[3],
-            &mut y_off,
-            log_flat_start,
-            sc.selected,
-        );
-    }
+    // Section rendering — migrated to the `quadraui::TreeView` primitive
+    // (Phase A.1b). Adapter builds a TreeView covering the four sections
+    // (Staged / Changes / Worktrees / Log); `quadraui_gtk::draw_tree` renders
+    // it with Cairo + Pango. Row heights match the previous layout
+    // (`line_height` for headers, `line_height * 1.4` for items) so the
+    // click-hit math in `src/gtk/mod.rs::Msg::ScSidebarClick` continues to work.
+    let _ = (add_r, add_g, add_b, del_r, del_g, del_b); // reserved for future diff-tint use
+    let sc_tree = render::source_control_to_tree_view(sc, theme);
+    let sections_h = (y + h - y_commit).max(0.0);
+    super::quadraui_gtk::draw_tree(
+        cr,
+        layout,
+        x,
+        y_commit,
+        w,
+        sections_h,
+        &sc_tree,
+        theme,
+        line_height,
+    );
 
     // ── Branch picker / create overlay ───────────────────────────────────────
     if let Some(ref bp) = sc.branch_picker {
