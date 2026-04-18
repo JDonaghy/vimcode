@@ -251,8 +251,8 @@ pub(super) fn handle_mouse(
     if engine.dialog.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-            // Recompute dialog geometry (same formula as render_dialog_popup).
             let dialog = engine.dialog.as_ref().unwrap();
+            // Compute dialog layout (same formula as render_dialog_popup)
             let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
             let btn_row_len: usize = dialog
                 .buttons
@@ -267,30 +267,38 @@ pub(super) fn handle_mouse(
             let py = (term_height.saturating_sub(height)) / 2;
             let btn_y = py + height - 2;
 
-            if row == btn_y {
-                // Walk the button positions to find which was clicked.
-                let mut col_offset = px + 2;
-                for (idx, btn) in dialog.buttons.iter().enumerate() {
-                    let label = render::format_button_label(&btn.label, btn.hotkey);
-                    let btn_w = label.len() as u16 + 4; // "  label  "
-                    if col >= col_offset && col < col_offset + btn_w {
-                        let action = engine.dialog_click_button(idx);
-                        if engine.explorer_needs_refresh {
-                            engine.explorer_needs_refresh = false;
-                            sidebar.build_rows();
-                        }
-                        if handle_action(engine, action) {
-                            *should_quit = true;
-                        }
-                        return sidebar_width;
+            let layout = crate::core::engine::DialogLayout {
+                x: px,
+                y: py,
+                width,
+                height,
+                btn_y,
+            };
+            let result = crate::core::engine::resolve_dialog_click(
+                &dialog.buttons,
+                &layout,
+                col,
+                row,
+                &|label, hotkey| render::format_button_label(label, hotkey),
+            );
+            use crate::core::engine::DialogClickResult;
+            match result {
+                DialogClickResult::Button(idx) => {
+                    let action = engine.dialog_click_button(idx);
+                    if engine.explorer_needs_refresh {
+                        engine.explorer_needs_refresh = false;
+                        sidebar.build_rows();
                     }
-                    col_offset += btn_w;
+                    if handle_action(engine, action) {
+                        *should_quit = true;
+                    }
+                    return sidebar_width;
                 }
-            }
-            // Click outside dialog — dismiss (Escape equivalent).
-            if col < px || col >= px + width || row < py || row >= py + height {
-                engine.dialog = None;
-                engine.pending_move = None;
+                DialogClickResult::Outside => {
+                    engine.dialog = None;
+                    engine.pending_move = None;
+                }
+                DialogClickResult::InsideDialog => {}
             }
         }
         return sidebar_width;
@@ -1132,59 +1140,47 @@ pub(super) fn handle_mouse(
 
     // ── Context menu click intercept ────────────────────────────────────────────
     if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
-        // Check if click is inside the context menu popup
         if let Some(ref cm) = engine.context_menu {
-            let sep_count = cm.items.iter().filter(|i| i.separator_after).count() as u16;
-            let popup_h = cm.items.len() as u16 + sep_count + 2;
-            let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-            let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-            let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
             let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let px = cm.screen_x.min(term_w.saturating_sub(popup_w));
-            let py = cm.screen_y.min(term_height.saturating_sub(popup_h));
-
-            if col >= px && col < px + popup_w && row >= py && row < py + popup_h {
-                // Click inside — map to item
-                let inner_row = row - py;
-                if inner_row >= 1 && inner_row < popup_h - 1 {
-                    // Walk items + separators to find which was clicked
-                    let mut visual_row: u16 = 1;
-                    for (idx, item) in cm.items.iter().enumerate() {
-                        if visual_row == inner_row {
-                            if item.enabled {
-                                engine.context_menu.as_mut().unwrap().selected = idx;
-                                let ctx = engine.context_menu_target_path();
-                                if let Some(act) = engine.context_menu_confirm() {
-                                    if let Some((ctx_path, ctx_is_dir)) = ctx {
-                                        handle_explorer_context_action(
-                                            &act,
-                                            engine,
-                                            sidebar,
-                                            *terminal_size,
-                                            ctx_path,
-                                            ctx_is_dir,
-                                        );
-                                    }
-                                }
-                            }
-                            return sidebar_width;
-                        }
-                        visual_row += 1;
-                        if item.separator_after {
-                            if visual_row == inner_row {
-                                // Clicked on separator line — ignore
-                                return sidebar_width;
-                            }
-                            visual_row += 1;
+            let result = crate::core::engine::resolve_context_menu_click(
+                &cm.items,
+                cm.screen_x,
+                cm.screen_y,
+                term_w,
+                term_height,
+                col,
+                row,
+            );
+            use crate::core::engine::ContextMenuClickResult;
+            match result {
+                ContextMenuClickResult::Item(idx) => {
+                    engine.context_menu.as_mut().unwrap().selected = idx;
+                    let ctx = engine.context_menu_target_path();
+                    if let Some(act) = engine.context_menu_confirm() {
+                        if let Some((ctx_path, ctx_is_dir)) = ctx {
+                            handle_explorer_context_action(
+                                &act,
+                                engine,
+                                sidebar,
+                                *terminal_size,
+                                ctx_path,
+                                ctx_is_dir,
+                            );
                         }
                     }
+                    return sidebar_width;
                 }
-                return sidebar_width;
+                ContextMenuClickResult::InsidePopup => {
+                    return sidebar_width;
+                }
+                ContextMenuClickResult::Outside => {
+                    engine.close_context_menu();
+                    // Fall through to process the click normally
+                }
             }
+        } else {
+            engine.close_context_menu();
         }
-        // Click outside — close menu
-        engine.close_context_menu();
-        // Fall through to process the click normally
     }
 
     // ── Context menu mouse hover ──────────────────────────────────────────────
