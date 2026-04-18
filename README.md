@@ -2,7 +2,7 @@
 
 **[vimcode.org](https://vimcode.org)** | [Documentation](https://github.com/JDonaghy/vimcode/wiki) | [Releases](https://github.com/JDonaghy/vimcode/releases)
 
-A Vim+VSCode hybrid editor written in Rust. 128K lines of code, 5,391 tests, four rendering backends.
+A Vim+VSCode hybrid editor written in Rust. 137K lines of code, 5,501 tests, four rendering backends.
 
 ### Who’s this for?
 
@@ -46,7 +46,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,391 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,501 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -166,7 +166,8 @@ cargo fmt
 - `f{c}` / `F{c}` / `t{c}` / `T{c}` — find/till character; `;` / `,` repeat
 - `%` — jump to matching bracket (`(`, `)`, `[`, `]`, `{`, `}`)
 - `Ctrl-D` / `Ctrl-U` — half-page down/up
-- `Ctrl-F` / `Ctrl-B` — full-page down/up
+- `Ctrl-F` — open find/replace overlay (set `ctrl_f_action` to `page_down` for Vim-style full-page down)
+- `Ctrl-B` — full-page up
 
 **Operators** (combine with any motion or text object)
 - `d` — delete
@@ -234,6 +235,7 @@ cargo fmt
 - `A` (block) — append text after right edge of block (applied to all lines on Escape)
 - `o` — swap cursor to opposite end of selection (character/line visual)
 - `O` — swap cursor to opposite column corner (visual block)
+- `:` — enter command mode with `'<,'>` range prefix (e.g. `:'<,'>s/old/new/g`); selection stays visible
 - `gv` — reselect last visual selection
 - `r{char}` — replace all selected characters with `{char}`
 
@@ -276,7 +278,7 @@ cargo fmt
 - `:%s/pattern/replacement/[flags]` — all lines
 - `:'<,'>s/...` — visual selection range
 - Flags: `g` (global), `i` (case-insensitive)
-- `Ctrl-F` — VSCode-style dialog (live search, replace, replace all)
+- `Ctrl-F` — find/replace overlay (live search, replace, replace all, case/word/regex toggles)
 - Full undo/redo support
 
 **Multiple Cursors**
@@ -333,7 +335,7 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 **Tabs**
 - `:tabnew` — new tab; `:tabclose` — close tab
-- `gt` / `gT` or `g` + `t` / `T` — next/previous tab
+- `gt` / `gT` or `g` + `t` / `T` — next/previous tab; `g<Tab>` — toggle last-accessed tab
 - `Ctrl+Tab` / `Ctrl+Shift+Tab` — MRU tab switcher popup (cycles most-recently-used tabs; Enter confirms, Escape cancels); release modifier to auto-confirm (GTK)
 - `Alt+t` — MRU tab switcher (works in both TUI and GTK; hold Alt and press `t` to cycle; release Alt or wait 500ms to confirm in TUI)
 
@@ -892,6 +894,9 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `ga` | Print ASCII value of character under cursor |
 | `g8` | Print UTF-8 hex bytes of character under cursor |
 | `go` | Go to byte offset N in file |
+| `g0` / `g<Home>` | Start of screen line (wrap-aware) |
+| `g^` | First non-blank on screen line (wrap-aware) |
+| `g$` / `g<End>` | End of screen line (wrap-aware) |
 | `gm` | Move cursor to middle of screen line |
 | `gM` | Move cursor to middle of text line |
 | `gI` | Insert at column 1 (absolute beginning of line) |
@@ -900,6 +905,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `gq{motion}` | Format text (reflow to textwidth) |
 | `gw{motion}` | Format text, keep cursor position |
 | `g?{motion}` | ROT13 encode text |
+| `g@{motion}` | Call user-defined operator (Lua `vimcode.set_operatorfunc(fn)`) |
 | `!{motion}{cmd}` | Filter lines through external command |
 | `N%` | Go to N% of file (e.g. `50%` goes to middle) |
 | `CTRL-^` | Switch to alternate (last edited) buffer |
@@ -916,6 +922,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `q:` | Open command-line history window (Enter executes, `q` closes) |
 | `q/` / `q?` | Open search history window (Enter searches, `q` closes) |
 | `gt` / `gT` | Next / previous tab |
+| `g<Tab>` | Jump to last-accessed tab (toggle) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | MRU tab switcher (forward / backward) |
 | `Alt+t` | MRU tab switcher (TUI + GTK compatible) |
 | `Ctrl+Alt+Left` / `Ctrl+Alt+Right` | Navigate back / forward through tab history |
@@ -1024,7 +1031,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:m[ove] {dest}` | Move current line to after line {dest} (0-indexed) |
 | `:t {dest}` / `:co[py] {dest}` | Copy current line to after line {dest} (0-indexed) |
 | `:sort [n] [r] [u] [i]` | Sort lines: `n`=numeric, `r`=reverse, `u`=unique, `i`=ignorecase |
-| `:j[oin]` | Join current line with the next (remove newline) |
+| `:j[oin]` / `:%j[oin]` | Join current line with next / join all lines |
 | `:y[ank] [reg]` | Yank current line into register (default `"`) |
 | `:pu[t] [reg]` | Put register contents after current line |
 | `:>` / `:<` | Indent / dedent current line by one shiftwidth |
@@ -1148,7 +1155,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 ## Architecture
 
 ```
-src/                  (~128,000 lines total)
+src/                  (~137,000 lines total)
 ├── main.rs              (~57 lines)  Thin CLI dispatcher → gtk::run() or tui_main::run()
 ├── win_gui_bin.rs       (~36 lines)  Windows native GUI entry point → win_gui::run()
 ├── gtk/             (~18,156 lines)  GTK4/Relm4 UI backend (Linux + macOS)
@@ -1163,11 +1170,11 @@ src/                  (~128,000 lines total)
 │   ├── panels.rs     (~4,040 lines)  Activity bar, sidebar, status/command lines, all panel renders
 │   ├── render_impl.rs(~3,947 lines)  draw_frame orchestrator, tab bar, editor windows, popups
 │   └── mouse.rs      (~2,654 lines)  All mouse click/drag/scroll interaction handling
-├── win_gui/          (~5,322 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
-│   ├── mod.rs        (~2,710 lines)  HWND, D2D render target, event loop, DWM title bar, IME
-│   ├── draw.rs       (~2,395 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar
-│   └── input.rs        (~217 lines)  Keyboard and mouse input translation
-├── render.rs         (~7,815 lines)  Platform-agnostic ScreenLayout bridge + shared hit-testing geometry
+├── win_gui/         (~10,877 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
+│   ├── mod.rs        (~6,263 lines)  HWND, D2D render target, event loop, DWM title bar, IME, font install
+│   ├── draw.rs       (~4,614 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar
+│   └── input.rs        (~217 lines)  Keyboard and mouse input translation (if present)
+├── render.rs         (~9,645 lines)  Platform-agnostic ScreenLayout bridge + shared hit-testing geometry
 ├── icons.rs           (~160 lines)  Icon registry with Nerd Font + ASCII fallback
 └── core/            (~81,824 lines)  Zero GUI/rendering deps — fully testable in isolation
     ├── engine/      (~59,947 lines)  Orchestrator: 20 submodules (keys, motions, buffers, tests, …)

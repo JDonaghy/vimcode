@@ -168,11 +168,38 @@ impl TerminalPane {
         // 1. It runs in a login shell (picks up user PATH for sudo, dotnet, etc.)
         // 2. Exit code is captured and displayed
         // 3. The pane stays open until the user presses Enter
-        let wrapped = format!(
-            "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy",
-            cmd = command
-        );
         let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+
+        let (shell_flag, wrapped) = if is_powershell {
+            // PowerShell wrapper: run command, check $LASTEXITCODE, wait for Enter.
+            let ps = format!(
+                concat!(
+                    "{cmd}; ",
+                    "$__ec = $LASTEXITCODE; ",
+                    "Write-Host ''; ",
+                    "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
+                    "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
+                    "}} else {{ ",
+                    "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
+                    "}}; ",
+                    "Write-Host ''; ",
+                    "Write-Host 'Press Enter to close…'; ",
+                    "Read-Host"
+                ),
+                cmd = command
+            );
+            ("-Command", ps)
+        } else {
+            // Unix shell wrapper (bash/zsh/sh).
+            let sh = format!(
+                "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy",
+                cmd = command
+            );
+            ("-c", sh)
+        };
+
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -182,7 +209,7 @@ impl TerminalPane {
         })?;
 
         let mut cmd = CommandBuilder::new(&shell);
-        cmd.args(["-c", &wrapped]);
+        cmd.args([shell_flag, &wrapped]);
         cmd.env("TERM", "xterm-256color");
         cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
@@ -404,7 +431,20 @@ fn normalize_selection(sel: &TermSelection) -> (u16, u16, u16, u16) {
     }
 }
 
-/// Return the user's preferred shell from `$SHELL`, falling back to `/bin/bash`.
+/// Return the user's preferred shell.
+///
+/// On Unix: reads `$SHELL`, falls back to `/bin/bash`.
+/// On Windows: reads `$SHELL`, falls back to `powershell.exe`.
 pub fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    if let Ok(shell) = std::env::var("SHELL") {
+        return shell;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "/bin/bash".to_string()
+    }
 }

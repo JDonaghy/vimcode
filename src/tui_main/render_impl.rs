@@ -640,6 +640,12 @@ pub(super) fn draw_frame(
         render_folder_picker(frame, picker, area, theme);
     }
 
+    // ── Find/replace overlay (top-right of active group) ───────────────────
+    if let Some(ref find_replace) = screen.find_replace {
+        let editor_left = h_chunks[0].width + h_chunks[1].width;
+        render_find_replace_popup(frame.buffer_mut(), area, find_replace, theme, editor_left);
+    }
+
     // ── Unified picker modal (above terminal/status so it's fully visible) ──
     if let Some(ref picker) = screen.picker {
         render_picker_popup(frame, picker, area, theme);
@@ -719,10 +725,11 @@ pub(super) fn tab_tooltip_at_col(
             let tab_data = group.tabs.get(i)?;
             let window = engine.windows.get(&tab_data.active_window)?;
             let state = engine.buffer_manager.get(window.buffer_id)?;
-            let path = state.file_path.as_ref()?;
+            let raw_path = state.file_path.as_ref()?;
+            let path = crate::core::paths::strip_unc_prefix(raw_path);
             let home = crate::core::paths::home_dir();
             if let Ok(rest) = path.strip_prefix(&home) {
-                return Some(format!("~/{}", rest.display()));
+                return Some(format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()));
             }
             return Some(path.display().to_string());
         }
@@ -1190,7 +1197,14 @@ pub(super) fn render_tab_bar(
         bx += TAB_SPLIT_BTN_COLS;
         // Split-down button (caret-down ▾)
         set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell(buf, bx + 1, area.y, '\u{f0d7}', btn_fg, bar_bg);
+        set_cell(
+            buf,
+            bx + 1,
+            area.y,
+            crate::icons::SPLIT_DOWN.c(),
+            btn_fg,
+            bar_bg,
+        );
         set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
     }
 
@@ -2025,11 +2039,9 @@ pub(super) fn render_picker_popup(
         let track_len = visible_rows;
         let thumb_size = ((visible_rows * visible_rows) / total_items).max(1);
         let max_scroll = total_items.saturating_sub(visible_rows);
-        let thumb_offset = if max_scroll > 0 {
-            (picker.scroll_top * (track_len.saturating_sub(thumb_size))) / max_scroll
-        } else {
-            0
-        };
+        let thumb_offset = (picker.scroll_top * (track_len.saturating_sub(thumb_size)))
+            .checked_div(max_scroll)
+            .unwrap_or(0);
         for row_off in 0..track_len {
             let ry = results_start + row_off as u16;
             if ry >= y + height - 1 || ry >= term_area.height {
@@ -2787,7 +2799,7 @@ pub(super) fn render_window(
                     frame.buffer_mut(),
                     area.x,
                     screen_y,
-                    '\u{f0eb}', // nf-fa-lightbulb_o
+                    crate::icons::LIGHTBULB.c(),
                     rc(theme.lightbulb),
                     line_bg,
                 );
@@ -2834,6 +2846,25 @@ pub(super) fn render_window(
                         cell.set_char('│');
                         cell.set_fg(fg);
                     }
+                }
+            }
+        }
+
+        // Color columns: tint background at specified column positions
+        if !line.colorcolumns.is_empty() {
+            let cc_bg = rc(theme.colorcolumn_bg);
+            for &cc_col in &line.colorcolumns {
+                if cc_col < window.scroll_left {
+                    continue;
+                }
+                let vis_col = (cc_col - window.scroll_left) as u16;
+                if vis_col >= text_width {
+                    break;
+                }
+                let cx = text_area_x + vis_col;
+                if cx < area.x + area.width && screen_y < area.y + area.height {
+                    let cell = &mut frame.buffer_mut()[(cx, screen_y)];
+                    cell.set_bg(cc_bg);
                 }
             }
         }
@@ -3982,5 +4013,541 @@ pub(super) fn render_debug_toolbar(
             set_cell(buf, col, y, ' ', bar_fg, bar_bg);
             col += 1;
         }
+    }
+}
+
+// ─── Find/replace overlay ────────────────────────────────────────────────────
+
+pub(super) fn render_find_replace_popup(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    panel: &render::FindReplacePanel,
+    theme: &Theme,
+    editor_left: u16,
+) {
+    use super::set_cell;
+
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let accent_bg = rc(theme.tab_active_accent);
+
+    // Dimensions
+    let panel_w: u16 = 50.min(area.width.saturating_sub(2));
+    let row_count: u16 = if panel.show_replace { 2 } else { 1 };
+    let panel_h: u16 = row_count + 2; // +2 for top/bottom borders
+
+    // Position: top-right of active editor group.
+    // group_bounds is in row/col units (content-relative), offset by editor_left.
+    let gb = &panel.group_bounds;
+    let gb_right = editor_left + gb.x as u16 + gb.width as u16;
+    let x = gb_right.saturating_sub(panel_w + 1).max(editor_left);
+    let y = (gb.y as u16).max(1);
+
+    // Clear background
+    for row in y..y + panel_h {
+        for col in x..x + panel_w {
+            if col < area.width && row < area.height {
+                set_cell(buf, col, row, ' ', fg, bg);
+            }
+        }
+    }
+
+    // Top border
+    for col in x..x + panel_w {
+        set_cell(buf, col, y, '─', border_fg, bg);
+    }
+    set_cell(buf, x, y, '┌', border_fg, bg);
+    if x + panel_w > 0 {
+        set_cell(buf, x + panel_w - 1, y, '┐', border_fg, bg);
+    }
+
+    // Bottom border
+    let bot = y + panel_h - 1;
+    for col in x..x + panel_w {
+        set_cell(buf, col, bot, '─', border_fg, bg);
+    }
+    set_cell(buf, x, bot, '└', border_fg, bg);
+    if x + panel_w > 0 {
+        set_cell(buf, x + panel_w - 1, bot, '┘', border_fg, bg);
+    }
+
+    // Side borders
+    for row in y + 1..bot {
+        set_cell(buf, x, row, '│', border_fg, bg);
+        if x + panel_w > 0 {
+            set_cell(buf, x + panel_w - 1, row, '│', border_fg, bg);
+        }
+    }
+
+    // --- Find row: [▶] [query...] [Aa][ab][.*] [N of M] [↑][↓][≡][×] ---
+    let find_y = y + 1;
+    let content_x = x + 1;
+    let right_edge = x + panel_w - 1;
+
+    // Chevron
+    let chevron = if panel.show_replace { '▼' } else { '▶' };
+    set_cell(buf, content_x, find_y, chevron, fg, bg);
+
+    // Find input (after chevron)
+    let input_start = content_x + 2;
+    // Reserve space for right-side buttons: toggles(9) + count(dynamic) + gap + nav(8)
+    let info_len = (panel.match_info.len() as u16).max(5);
+    let right_side_w: u16 = 9 + info_len + 1 + 8;
+    let input_w = panel_w.saturating_sub(2 + 2 + right_side_w);
+    for (i, ch) in panel.query.chars().enumerate() {
+        let cx = input_start + i as u16;
+        if cx < input_start + input_w && cx < right_edge {
+            set_cell(buf, cx, find_y, ch, fg, bg);
+        }
+    }
+    if panel.focus == 0 {
+        // Selection highlight
+        if let Some(anchor) = panel.sel_anchor {
+            let s = anchor.min(panel.cursor) as u16;
+            let e = anchor.max(panel.cursor) as u16;
+            let sel_bg = rc(theme.selection);
+            for i in s..e {
+                let cx = input_start + i;
+                if cx < input_start + input_w && cx < right_edge {
+                    let ch = panel.query.chars().nth(i as usize).unwrap_or(' ');
+                    set_cell(buf, cx, find_y, ch, fg, sel_bg);
+                }
+            }
+        }
+        // Cursor
+        let cursor_col = input_start + panel.cursor as u16;
+        if cursor_col < input_start + input_w && cursor_col < right_edge {
+            let ch = panel.query.chars().nth(panel.cursor).unwrap_or(' ');
+            set_cell(buf, cursor_col, find_y, ch, bg, fg);
+        }
+    }
+
+    // Toggle buttons: [Aa] [ab] [.*]
+    let mut tx = input_start + input_w + 1;
+    for (label, active) in [
+        ("Aa", panel.case_sensitive),
+        ("ab", panel.whole_word),
+        (".*", panel.use_regex),
+    ] {
+        let (t_fg, t_bg) = if active { (bg, accent_bg) } else { (fg, bg) };
+        for ch in label.chars() {
+            if tx < right_edge {
+                set_cell(buf, tx, find_y, ch, t_fg, t_bg);
+                tx += 1;
+            }
+        }
+        tx += 1;
+    }
+
+    // Match count
+    let info = &panel.match_info;
+    for (i, ch) in info.chars().enumerate() {
+        let cx = tx + i as u16;
+        if cx < right_edge {
+            set_cell(buf, cx, find_y, ch, fg, bg);
+        }
+    }
+    tx += (info.len() as u16).max(5) + 1;
+
+    // Nav buttons: ↑ ↓ ≡ ×
+    let nav_items = [
+        ('↑', false),
+        ('↓', false),
+        ('≡', panel.in_selection),
+        ('×', false),
+    ];
+    for (ch, active) in nav_items {
+        if tx < right_edge {
+            let (n_fg, n_bg) = if active { (bg, accent_bg) } else { (fg, bg) };
+            set_cell(buf, tx, find_y, ch, n_fg, n_bg);
+            tx += 2;
+        }
+    }
+
+    // --- Replace row: [  ] [replacement...] [AB] [⇄] [⇉] ---
+    if panel.show_replace && row_count >= 2 {
+        let rep_y = find_y + 1;
+
+        // Replacement text (aligned with find input)
+        for (i, ch) in panel.replacement.chars().enumerate() {
+            let cx = input_start + i as u16;
+            if cx < input_start + input_w && cx < right_edge {
+                set_cell(buf, cx, rep_y, ch, fg, bg);
+            }
+        }
+        if panel.focus == 1 {
+            // Selection highlight
+            if let Some(anchor) = panel.sel_anchor {
+                let s = anchor.min(panel.cursor) as u16;
+                let e = anchor.max(panel.cursor) as u16;
+                let sel_bg = rc(theme.selection);
+                for i in s..e {
+                    let cx = input_start + i;
+                    if cx < input_start + input_w && cx < right_edge {
+                        let ch = panel.replacement.chars().nth(i as usize).unwrap_or(' ');
+                        set_cell(buf, cx, rep_y, ch, fg, sel_bg);
+                    }
+                }
+            }
+            // Cursor
+            let cursor_col = input_start + panel.cursor as u16;
+            if cursor_col < input_start + input_w && cursor_col < right_edge {
+                let ch = panel.replacement.chars().nth(panel.cursor).unwrap_or(' ');
+                set_cell(buf, cursor_col, rep_y, ch, bg, fg);
+            }
+        }
+
+        // AB (preserve case toggle)
+        let mut bx = input_start + input_w + 1;
+        let (ab_fg, ab_bg) = if panel.preserve_case {
+            (bg, accent_bg)
+        } else {
+            (fg, bg)
+        };
+        for ch in "AB".chars() {
+            if bx < right_edge {
+                set_cell(buf, bx, rep_y, ch, ab_fg, ab_bg);
+                bx += 1;
+            }
+        }
+        bx += 1;
+
+        // Replace current / Replace all (icon or fallback)
+        let sel_bg = rc(theme.fuzzy_selected_bg);
+        for label in [
+            crate::icons::FIND_REPLACE.s(),
+            crate::icons::FIND_REPLACE_ALL.s(),
+        ] {
+            for ch in label.chars() {
+                if bx < right_edge {
+                    set_cell(buf, bx, rep_y, ch, fg, sel_bg);
+                    bx += 1;
+                }
+            }
+            bx += 1;
+        }
+    }
+}
+
+// ─── TUI rendering regression tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::window::GroupId;
+    use ratatui::backend::TestBackend;
+
+    /// Create a hermetic engine for rendering tests.
+    fn test_engine(text: &str) -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.extension_state = crate::core::session::ExtensionState::default();
+        e.ext_registry = None;
+        e.mode = crate::core::Mode::Normal;
+        e.rebuild_user_keymaps();
+        if !text.is_empty() {
+            e.buffer_mut().insert(0, text);
+        }
+        e
+    }
+
+    /// Render the TUI and return the character buffer as a Vec of lines.
+    fn render_tui(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut sidebar = TuiSidebar {
+            visible: false,
+            has_focus: false,
+            active_panel: TuiPanel::Explorer,
+            selected: 0,
+            scroll_top: 0,
+            rows: Vec::new(),
+            root: std::path::PathBuf::from("/tmp"),
+            expanded: std::collections::HashSet::new(),
+            search_input_mode: false,
+            replace_input_focused: false,
+            search_scroll_top: 0,
+            show_hidden_files: false,
+            sort_case_insensitive: false,
+            toolbar_focused: false,
+            toolbar_selected: 0,
+            pending_ctrl_w: false,
+            ext_panel_name: None,
+        };
+        let sidebar_width = 0u16;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
+
+        let mut hover_link_rects = Vec::new();
+        let mut hover_popup_rect = None;
+        let mut editor_hover_popup_rect = None;
+        let mut editor_hover_link_rects = Vec::new();
+        let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
+
+        terminal
+            .draw(|frame| {
+                draw_frame(
+                    frame,
+                    &screen,
+                    &theme,
+                    &mut sidebar,
+                    engine,
+                    sidebar_width,
+                    0,    // quickfix_scroll_top
+                    0,    // debug_output_scroll
+                    None, // folder_picker
+                    false,
+                    false,
+                    None, // cmd_sel
+                    None, // explorer_drop_target
+                    &mut hover_link_rects,
+                    &mut hover_popup_rect,
+                    &mut editor_hover_popup_rect,
+                    &mut editor_hover_link_rects,
+                    &mut tab_visible_counts,
+                );
+            })
+            .unwrap();
+
+        // Extract the rendered buffer as lines of text
+        let buf = terminal.backend().buffer();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                let cell = &buf[(x, y)];
+                line.push_str(cell.symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines
+    }
+
+    /// Assert that a specific row in the rendered output contains a substring.
+    fn assert_row_contains(lines: &[String], row: usize, substr: &str) {
+        assert!(
+            row < lines.len(),
+            "row {row} out of bounds (have {} lines)",
+            lines.len()
+        );
+        assert!(
+            lines[row].contains(substr),
+            "row {row}: expected {substr:?} in {:?}",
+            lines[row]
+        );
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tui_renders_file_content() {
+        let e = test_engine("Hello, world!\nSecond line\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Content should appear somewhere in the rendered output
+        let has_hello = lines.iter().any(|l| l.contains("Hello, world!"));
+        assert!(has_hello, "rendered output should contain file content");
+
+        let has_second = lines.iter().any(|l| l.contains("Second line"));
+        assert!(has_second, "rendered output should contain second line");
+    }
+
+    #[test]
+    fn test_tui_renders_tab_bar() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Tab bar is the first line; should show "[No Name]" for unsaved buffer
+        assert_row_contains(&lines, 0, "No Name");
+    }
+
+    #[test]
+    fn test_tui_renders_command_line() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Last line is the command line — should not contain normal text content.
+        // Activity bar icons (nerd font glyphs) may appear in the leftmost columns.
+        let last = &lines[23];
+        assert!(
+            !last.contains("content") && !last.contains("NORMAL"),
+            "command line should not contain editor content or status, got: {last:?}"
+        );
+    }
+
+    #[test]
+    fn test_tui_renders_status_bar() {
+        let e = test_engine("content\n");
+        let lines = render_tui(&e, 80, 24);
+
+        // Per-window status bar should show NORMAL mode
+        let has_normal = lines
+            .iter()
+            .any(|l| l.contains("NORMAL") || l.contains("NOR"));
+        assert!(has_normal, "status bar should show normal mode");
+    }
+
+    #[test]
+    fn test_tui_split_renders_two_panes() {
+        let mut e = test_engine("left pane\n");
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let lines = render_tui(&e, 80, 24);
+
+        // Both panes should have a tab bar with "[No Name]"
+        // Count occurrences of "No Name" across all lines
+        let tab_count: usize = lines.iter().filter(|l| l.contains("No Name")).count();
+        assert!(
+            tab_count >= 2,
+            "split should produce two tab bars, found {tab_count} 'No Name' occurrences"
+        );
+    }
+
+    #[test]
+    fn test_tui_dirty_indicator() {
+        let mut e = test_engine("clean\n");
+        e.handle_key("i", Some('i'), false);
+        e.handle_key("x", Some('x'), false);
+        e.handle_key("Escape", None, false);
+        let lines = render_tui(&e, 80, 24);
+
+        // Dirty buffer shows a dot indicator in the tab bar
+        let has_dot = lines[0].contains('●') || lines[0].contains('•') || lines[0].contains('+');
+        assert!(
+            has_dot,
+            "dirty buffer should show indicator in tab bar: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_tui_insert_mode_status() {
+        let mut e = test_engine("hello\n");
+        e.handle_key("i", Some('i'), false);
+        let lines = render_tui(&e, 80, 24);
+
+        let has_insert = lines
+            .iter()
+            .any(|l| l.contains("INSERT") || l.contains("INS"));
+        assert!(has_insert, "insert mode should show in status bar");
+    }
+
+    #[test]
+    fn test_tui_visual_mode_status() {
+        let mut e = test_engine("hello\n");
+        e.handle_key("v", Some('v'), false);
+        let lines = render_tui(&e, 80, 24);
+
+        let has_visual = lines
+            .iter()
+            .any(|l| l.contains("VISUAL") || l.contains("VIS"));
+        assert!(has_visual, "visual mode should show in status bar");
+    }
+
+    #[test]
+    fn test_tui_dimensions_respected() {
+        let e = test_engine("content\n");
+        // Small terminal
+        let lines = render_tui(&e, 40, 10);
+        assert_eq!(lines.len(), 10, "should render exactly 10 rows");
+
+        // All lines should fit in 40 display columns.
+        // Note: multi-byte nerd font glyphs may make .len() > 40 but the
+        // ratatui buffer guarantees 40 cell columns. Check cell count instead.
+        // (The render_tui helper already indexes by cell coordinates.)
+    }
+
+    #[test]
+    fn test_tui_long_file_scroll() {
+        // Create a file longer than the viewport
+        let content: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        let e = test_engine(&content);
+        let lines = render_tui(&e, 80, 15);
+
+        // Should show "line 1" at the top (we're at scroll position 0)
+        let has_line1 = lines.iter().any(|l| l.contains("line 1"));
+        assert!(has_line1, "scrolled-to-top should show line 1");
+
+        // Should NOT show "line 50" (too far down)
+        let has_line50 = lines.iter().any(|l| l.contains("line 50"));
+        assert!(!has_line50, "should not show line 50 in 15-row viewport");
+    }
+
+    // ── Snapshot tests (golden reference) ────────────────────────────────
+    //
+    // These capture the full rendered grid. Any visual change causes a
+    // test failure until the snapshot is reviewed and accepted with:
+    //   cargo insta review
+    //
+    // First run creates the snapshot files automatically.
+    //
+    // The `prepend_module_path(false)` setting ensures both the `vimcode`
+    // and `vcd` binaries share the same snapshot files.
+
+    fn snap_settings() -> insta::Settings {
+        let mut s = insta::Settings::clone_current();
+        s.set_prepend_module_to_snapshot(false);
+        s.set_snapshot_path("snapshots");
+        s
+    }
+
+    #[test]
+    fn snapshot_normal_mode() {
+        let e = test_engine("fn main() {\n    println!(\"hello\");\n}\n");
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("normal_mode", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_insert_mode() {
+        let mut e = test_engine("hello world\n");
+        e.handle_key("i", Some('i'), false);
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("insert_mode", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_visual_selection() {
+        let mut e = test_engine("select this text\nand this too\n");
+        e.handle_key("v", Some('v'), false);
+        for _ in 0..10 {
+            e.handle_key("l", Some('l'), false);
+        }
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("visual_selection", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_command_line() {
+        let mut e = test_engine("buffer content\n");
+        e.handle_key(":", Some(':'), false);
+        e.handle_key("s", Some('s'), false);
+        e.handle_key("e", Some('e'), false);
+        e.handle_key("t", Some('t'), false);
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("command_line", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_split_panes() {
+        let mut e = test_engine("left pane content\n");
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let lines = render_tui(&e, 80, 16);
+        snap_settings().bind(|| insta::assert_snapshot!("split_panes", lines.join("\n")));
+    }
+
+    #[test]
+    fn snapshot_line_numbers() {
+        let mut e = test_engine("alpha\nbeta\ngamma\ndelta\nepsilon\n");
+        e.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+        let lines = render_tui(&e, 60, 12);
+        snap_settings().bind(|| insta::assert_snapshot!("line_numbers", lines.join("\n")));
     }
 }

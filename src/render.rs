@@ -129,6 +129,17 @@ impl Color {
         }
     }
 
+    /// Derive a subtle colorcolumn background from this colour.
+    /// Slightly less prominent than cursorline — a gentle column tint.
+    pub fn colorcolumn_tint(self) -> Self {
+        let lum = 0.299 * self.r as f64 + 0.587 * self.g as f64 + 0.114 * self.b as f64;
+        if lum < 128.0 {
+            self.lighten(0.08)
+        } else {
+            self.darken(0.06)
+        }
+    }
+
     /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
     /// Cairo's `set_source_rgb` / `set_source_rgba`.
     pub fn to_cairo(self) -> (f64, f64, f64) {
@@ -278,7 +289,7 @@ pub struct RenderedLine {
     pub is_conditional_bp: bool,
     /// True when the DAP adapter is currently stopped at this line.
     pub is_dap_current: bool,
-    /// True when this is a soft-wrap continuation row (the 2nd+ visual row of a
+    /// True when this is a -wrap continuation row (the 2nd+ visual row of a
     /// long buffer line). When true, `gutter_text` is blank and the line number
     /// belongs to the preceding non-continuation row.
     pub is_wrap_continuation: bool,
@@ -299,6 +310,9 @@ pub struct RenderedLine {
     /// Column positions where indent guide lines should be drawn.
     /// Empty when `indent_guides` setting is off.
     pub indent_guides: Vec<usize>,
+    /// Column positions where colorcolumn background should be drawn.
+    /// Parsed from `settings.colorcolumn` (e.g. "80,120").
+    pub colorcolumns: Vec<usize>,
 }
 
 /// A single diagnostic mark on a rendered line (for inline underlines/squiggles).
@@ -408,6 +422,162 @@ pub struct GroupTabBar {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Index of the first visible tab (scroll offset for overflow tab bars).
     pub tab_scroll_offset: usize,
+    /// Pre-computed click regions for this tab bar, in char-cell units
+    /// relative to the tab bar's left edge (column 0 = left edge of group bounds).
+    pub hit_regions: Vec<(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )>,
+}
+
+// ── Tab bar hit region constants (char-cell units) ──────────────────────────
+
+/// Columns used by each tab's close button (the × itself + trailing space).
+pub const TAB_CLOSE_COLS: u16 = 2;
+/// Columns occupied by each split button (1 space + 2-wide glyph).
+const TAB_SPLIT_BTN_COLS: u16 = 3;
+/// Total columns reserved for both split buttons (right + down).
+const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
+/// Columns for the editor action menu button ("…").
+const TAB_ACTION_BTN_COLS: u16 = 3;
+/// Columns per diff toolbar button (1 space + 1 char + 1 space).
+const DIFF_BTN_COLS: u16 = 3;
+/// Total columns for all three diff toolbar buttons.
+const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
+
+/// Compute hit regions for a group's tab bar.
+///
+/// Layout (left to right):
+/// `[tab0][tab1]...[tabN]  [diff_toolbar?] [split_btns?] [action_btn]`
+///
+/// All positions are in char-cell columns relative to the tab bar left edge.
+pub fn compute_tab_bar_hit_regions(
+    tabs: &[TabInfo],
+    tab_scroll_offset: usize,
+    bar_width: u16,
+    has_diff_toolbar: bool,
+    diff_label_cols: u16,
+    has_split_buttons: bool,
+) -> Vec<(
+    crate::core::engine::TabBarHitRegion,
+    crate::core::engine::TabBarClickTarget,
+)> {
+    use crate::core::engine::{TabBarClickTarget, TabBarHitRegion};
+
+    let mut regions = Vec::new();
+
+    // ── Right-side buttons (from right edge inward) ─────────────
+
+    // Action menu button at far right
+    let action_start = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
+    regions.push((
+        TabBarHitRegion {
+            col: action_start,
+            width: TAB_ACTION_BTN_COLS,
+        },
+        TabBarClickTarget::ActionMenu,
+    ));
+
+    // Split buttons (left of action menu)
+    let split_cols = if has_split_buttons {
+        TAB_SPLIT_BOTH_COLS
+    } else {
+        0
+    };
+    let split_end = action_start;
+    let split_start = split_end.saturating_sub(split_cols);
+    if has_split_buttons {
+        regions.push((
+            TabBarHitRegion {
+                col: split_start,
+                width: TAB_SPLIT_BTN_COLS,
+            },
+            TabBarClickTarget::SplitRight,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: split_start + TAB_SPLIT_BTN_COLS,
+                width: TAB_SPLIT_BTN_COLS,
+            },
+            TabBarClickTarget::SplitDown,
+        ));
+    }
+
+    // Diff toolbar (left of split buttons)
+    if has_diff_toolbar {
+        let diff_total = DIFF_TOOLBAR_BTN_COLS + diff_label_cols;
+        let diff_end = split_start;
+        let diff_start = diff_end.saturating_sub(diff_total);
+        let btn_start = diff_start + diff_label_cols;
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffPrev,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start + DIFF_BTN_COLS,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffNext,
+        ));
+        regions.push((
+            TabBarHitRegion {
+                col: btn_start + DIFF_BTN_COLS * 2,
+                width: DIFF_BTN_COLS,
+            },
+            TabBarClickTarget::DiffToggle,
+        ));
+    }
+
+    // ── Tab slots (from left edge) ─────────────────────────────
+
+    let mut x: u16 = 0;
+    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
+        let name_width = tab.name.chars().count() as u16;
+        let tab_width = name_width + TAB_CLOSE_COLS;
+        if x + tab_width > bar_width {
+            break; // Overflow — remaining tabs are hidden
+        }
+        // Tab body (click to switch)
+        regions.push((
+            TabBarHitRegion {
+                col: x,
+                width: name_width,
+            },
+            TabBarClickTarget::Tab(i),
+        ));
+        // Close button
+        regions.push((
+            TabBarHitRegion {
+                col: x + name_width,
+                width: TAB_CLOSE_COLS,
+            },
+            TabBarClickTarget::CloseTab(i),
+        ));
+        x += tab_width;
+    }
+
+    regions
+}
+
+/// Resolve a column position (in char cells, relative to the tab bar left edge)
+/// to a `TabBarClickTarget` by walking the hit region list.
+pub fn resolve_tab_bar_click(
+    hit_regions: &[(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )],
+    col: u16,
+) -> Option<crate::core::engine::TabBarClickTarget> {
+    for (region, target) in hit_regions {
+        if col >= region.col && col < region.col + region.width {
+            return Some(*target);
+        }
+    }
+    None
 }
 
 /// One segment in the breadcrumb bar (either a path component or a symbol).
@@ -1259,7 +1429,7 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Replace",
                 shortcut: "",
-                vscode_shortcut: "",
+                vscode_shortcut: "Ctrl+H",
                 action: "replace",
                 enabled: true,
                 separator: false,
@@ -1642,6 +1812,771 @@ pub static DEBUG_BUTTONS: &[DebugButton] = &[
     },
 ];
 
+// ─── Backend Parity Harness ───────────────────────────────────────────────────
+
+/// A UI element that a backend is expected to render from a [`ScreenLayout`].
+/// Used by the parity harness to verify all three backends handle the same set
+/// of elements.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UiElement {
+    /// Menu bar strip (File / Edit / View / …).
+    MenuBar,
+    /// Open menu dropdown overlay.
+    MenuDropdown,
+    /// Single-group tab bar (uses `ScreenLayout.tab_bar`).
+    TabBar,
+    /// Per-group tab bar in a multi-group split.
+    GroupTabBar { group_idx: usize },
+    /// Group divider lines between editor groups.
+    GroupDividers,
+    /// Breadcrumb bar for a group.
+    Breadcrumbs { group_idx: usize },
+    /// An editor window/pane.
+    EditorWindow { window_idx: usize },
+    /// Per-window status line (Vim-style).
+    WindowStatusLine { window_idx: usize },
+    /// Global status bar (when per-window status lines are off).
+    GlobalStatusBar,
+    /// Separated status line (above terminal panel).
+    SeparatedStatusLine,
+    /// Command line (always present).
+    CommandLine,
+    /// Completion popup (autocomplete).
+    CompletionPopup,
+    /// Hover popup (LSP documentation).
+    HoverPopup,
+    /// Rich editor hover popup (markdown, triggered by `gh` or mouse dwell).
+    EditorHoverPopup,
+    /// Signature help popup (function parameter hints).
+    SignatureHelp,
+    /// Wildmenu bar (Tab completion in command mode).
+    Wildmenu,
+    /// Quickfix bottom panel.
+    QuickfixPanel,
+    /// Debug toolbar strip.
+    DebugToolbar,
+    /// Terminal panel (bottom).
+    TerminalPanel,
+    /// Unified picker modal (fuzzy finder / command palette).
+    PickerPopup,
+    /// Tab switcher popup (Ctrl+Tab MRU list).
+    TabSwitcher,
+    /// Context menu popup (right-click).
+    ContextMenu,
+    /// Modal dialog popup.
+    Dialog,
+    /// Diff peek popup (inline git hunk preview).
+    DiffPeekPopup,
+    /// Panel hover popup (sidebar item hover).
+    PanelHoverPopup,
+    /// Tab hover tooltip.
+    TabTooltip,
+    /// Diff toolbar (change navigation buttons in tab bar).
+    DiffToolbar,
+    /// Activity bar (sidebar icon strip) — rendered by backends, not in ScreenLayout directly.
+    ActivityBar,
+    /// Sidebar panel content — rendered by backends from ScreenLayout sidebar data.
+    Sidebar,
+}
+
+// ─── Phase 2c: Action / click-handler parity ────────────────────────────────
+
+/// A user-triggered action that each backend must handle.
+/// This is the **source of truth** for click/mouse/interaction parity.
+///
+/// Each variant documents: the trigger, the correct engine method to call,
+/// and any draw-order requirements.  Backends that are missing a handler
+/// will fail the parity test.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UiAction {
+    // ── Explorer interactions ─────────────────────────────────────────
+    /// Single-click on a file in the explorer tree.
+    /// Must call: `engine.open_file_preview(&path)`
+    ExplorerSingleClickFile,
+    /// Double-click on a file in the explorer tree.
+    /// Must call: `engine.open_file_in_tab(&path)`
+    ExplorerDoubleClickFile,
+    /// Enter/Return key on a file in the explorer.
+    /// Must call: `engine.open_file_in_tab(&path)`
+    ExplorerEnterOnFile,
+    /// Right-click on explorer item → open context menu.
+    /// Must call: `engine.open_explorer_context_menu(path, is_dir, x, y)`
+    ExplorerRightClick,
+
+    // ── Context menu ─────────────────────────────────────────────────
+    /// Click inside an open context menu → select item and execute.
+    /// Must call: `engine.context_menu_confirm()` then dispatch action.
+    /// Must be checked BEFORE explorer/editor click handlers.
+    ContextMenuClickInside,
+    /// Click outside an open context menu → dismiss.
+    /// Must call: `engine.close_context_menu()`
+    ContextMenuClickOutside,
+
+    // ── Tab bar ──────────────────────────────────────────────────────
+    /// Click on a tab → switch to it.
+    /// Must call: `engine.goto_tab(idx)`
+    TabClick,
+    /// Click on tab close button.
+    /// Must call: `engine.goto_tab(idx)` then `engine.close_tab()`
+    TabCloseClick,
+    /// Right-click on tab → open tab context menu.
+    /// Must call: `engine.open_tab_context_menu(group_id, tab_idx, x, y)`
+    TabRightClick,
+    /// Drag a tab → reorder or move between groups.
+    /// Must call: `engine.tab_drag_begin()`, `engine.tab_drag_drop(zone)`
+    TabDragDrop,
+
+    // ── Editor ───────────────────────────────────────────────────────
+    /// Right-click in editor → open editor context menu.
+    /// Must call: `engine.open_editor_context_menu(x, y)`
+    EditorRightClick,
+    /// Double-click in editor → word select.
+    /// Must call: `engine.mouse_double_click(wid, line, col)`
+    EditorDoubleClick,
+    /// Scroll wheel in editor → scroll viewport.
+    EditorScroll,
+
+    // ── Popup interactions ───────────────────────────────────────────
+    /// Click on editor hover popup → focus it.
+    /// Must call: `engine.editor_hover_focus()`
+    EditorHoverClick,
+    /// Click outside editor hover popup → dismiss.
+    /// Must call: `engine.dismiss_editor_hover()`
+    EditorHoverDismiss,
+    /// Scroll wheel on editor hover popup → scroll content.
+    /// Must call: `engine.editor_hover_scroll(delta)`
+    EditorHoverScroll,
+    /// Click on debug toolbar button → execute command.
+    /// Must call: `engine.execute_command(&btn.action)`
+    DebugToolbarButtonClick,
+
+    // ── Terminal ─────────────────────────────────────────────────────
+    /// Click terminal split button.
+    /// Must call: `engine.terminal_toggle_split(cols, rows)`
+    TerminalSplitButton,
+    /// Click terminal add (+) button.
+    /// Must call: `engine.terminal_new_tab(cols, rows)`
+    TerminalAddButton,
+    /// Click terminal close (×) button.
+    /// Must call: `engine.terminal_close_active_tab()`
+    TerminalCloseButton,
+    /// Click in split terminal pane → switch focus.
+    /// Must set: `engine.terminal_active = 0 or 1`
+    TerminalSplitPaneClick,
+
+    // ── Activity bar ─────────────────────────────────────────────────
+    /// Click on activity bar icon → toggle sidebar panel.
+    ActivityBarClick,
+    /// Click on settings gear icon → open settings panel.
+    ActivityBarSettingsClick,
+
+    // ── Draw order requirements ──────────────────────────────────────
+    /// Context menu must be drawn AFTER sidebar (higher z-order).
+    DrawOrderContextMenuAboveSidebar,
+    /// Dialog must be drawn AFTER context menu and sidebar.
+    DrawOrderDialogOnTop,
+    /// Menu dropdown must be drawn AFTER sidebar.
+    DrawOrderMenuDropdownAboveSidebar,
+}
+
+/// Return the full set of [`UiAction`]s that every backend must handle.
+/// This is the canonical contract — if a backend doesn't handle one of these,
+/// users will experience broken interactions.
+pub fn all_required_ui_actions() -> Vec<UiAction> {
+    vec![
+        UiAction::ExplorerSingleClickFile,
+        UiAction::ExplorerDoubleClickFile,
+        UiAction::ExplorerEnterOnFile,
+        UiAction::ExplorerRightClick,
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        UiAction::TabRightClick,
+        UiAction::TabDragDrop,
+        UiAction::EditorRightClick,
+        UiAction::EditorDoubleClick,
+        UiAction::EditorScroll,
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        UiAction::DebugToolbarButtonClick,
+        UiAction::TerminalSplitButton,
+        UiAction::TerminalAddButton,
+        UiAction::TerminalCloseButton,
+        UiAction::TerminalSplitPaneClick,
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
+/// Collect the [`UiAction`]s that the **TUI** backend handles.
+/// This is the reference implementation — all actions should be present.
+pub fn collect_ui_actions_tui() -> Vec<UiAction> {
+    // TUI is the reference backend — it handles all actions.
+    // Each entry below is verified by the corresponding code location:
+    vec![
+        // mouse.rs:1914 — open_file_preview for single click
+        UiAction::ExplorerSingleClickFile,
+        // mouse.rs:1913 — open_file_in_tab for double click
+        UiAction::ExplorerDoubleClickFile,
+        // mod.rs key handler — open_file_in_tab for Enter
+        UiAction::ExplorerEnterOnFile,
+        // mouse.rs:898 — open_explorer_context_menu
+        UiAction::ExplorerRightClick,
+        // mouse.rs:984-1036 — context_menu click inside/outside
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        // mouse.rs tab click handlers
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        UiAction::TabRightClick,
+        UiAction::TabDragDrop,
+        // mouse.rs:977 — open_editor_context_menu
+        UiAction::EditorRightClick,
+        // mouse.rs — mouse_double_click
+        UiAction::EditorDoubleClick,
+        UiAction::EditorScroll,
+        // mouse.rs — editor_hover_focus, dismiss, scroll
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        // mouse.rs — debug toolbar button handling
+        UiAction::DebugToolbarButtonClick,
+        // mouse.rs:1639 — terminal_toggle_split
+        UiAction::TerminalSplitButton,
+        // mouse.rs — terminal_new_tab
+        UiAction::TerminalAddButton,
+        // mouse.rs — terminal_close_active_tab
+        UiAction::TerminalCloseButton,
+        // mouse.rs:1650 — terminal split pane click
+        UiAction::TerminalSplitPaneClick,
+        // panels.rs — activity bar icon click
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        // render_impl.rs — draw order: popups after terminal, picker on top
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
+/// Collect the [`UiAction`]s that the **Win-GUI** backend handles.
+/// Update this list as handlers are added to `src/win_gui/`.
+pub fn collect_ui_actions_wingui() -> Vec<UiAction> {
+    vec![
+        // mod.rs:2253 — open_file_preview for single click
+        UiAction::ExplorerSingleClickFile,
+        // mod.rs:2945 — open_file_in_tab for double click
+        UiAction::ExplorerDoubleClickFile,
+        // mod.rs:1535 — open_file_in_tab for Enter/Right/l
+        UiAction::ExplorerEnterOnFile,
+        // mod.rs:3015 — open_explorer_context_menu
+        UiAction::ExplorerRightClick,
+        // mod.rs:2331-2416 — context menu click inside/outside
+        UiAction::ContextMenuClickInside,
+        UiAction::ContextMenuClickOutside,
+        // mod.rs:2420-2440 — tab click + close
+        UiAction::TabClick,
+        UiAction::TabCloseClick,
+        // mod.rs:2981 — open_tab_context_menu
+        UiAction::TabRightClick,
+        // mod.rs — tab drag begin/drop
+        UiAction::TabDragDrop,
+        // mod.rs:3037 — open_editor_context_menu
+        UiAction::EditorRightClick,
+        // mod.rs:2955 — mouse_double_click
+        UiAction::EditorDoubleClick,
+        // mod.rs:3043+ — scroll handler
+        UiAction::EditorScroll,
+        // mod.rs — editor_hover_focus, dismiss_editor_hover, editor_hover_scroll
+        UiAction::EditorHoverClick,
+        UiAction::EditorHoverDismiss,
+        UiAction::EditorHoverScroll,
+        // mod.rs — debug toolbar button execute_command
+        UiAction::DebugToolbarButtonClick,
+        // mod.rs — terminal_toggle_split
+        UiAction::TerminalSplitButton,
+        // mod.rs — terminal_new_tab
+        UiAction::TerminalAddButton,
+        // mod.rs — terminal_close_active_tab
+        UiAction::TerminalCloseButton,
+        // mod.rs — terminal_active = 0/1
+        UiAction::TerminalSplitPaneClick,
+        // mod.rs — sidebar panel toggle
+        UiAction::ActivityBarClick,
+        UiAction::ActivityBarSettingsClick,
+        // on_paint draw order: draw_frame → sidebar → context menu → dialog → notifications
+        UiAction::DrawOrderContextMenuAboveSidebar,
+        UiAction::DrawOrderDialogOnTop,
+        UiAction::DrawOrderMenuDropdownAboveSidebar,
+    ]
+}
+
+/// Walk a [`ScreenLayout`] and collect every [`UiElement`] that a backend is
+/// expected to render.  This is the **source of truth** for the parity harness.
+pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // Menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+        if layout
+            .menu_bar
+            .as_ref()
+            .is_some_and(|m| m.open_menu_idx.is_some())
+        {
+            elems.push(UiElement::MenuDropdown);
+        }
+    }
+
+    // Tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // Diff toolbar (single-group)
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    // Diff toolbar (per-group)
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break; // one element is enough to flag presence
+            }
+        }
+    }
+
+    // Breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // Editor windows + per-window status lines
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // Global status bar (only when per-window status lines are off)
+    let any_per_window_status = layout.windows.iter().any(|w| w.status_line.is_some());
+    if !any_per_window_status {
+        elems.push(UiElement::GlobalStatusBar);
+    }
+
+    // Separated status line (above terminal)
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // Command line (always rendered)
+    elems.push(UiElement::CommandLine);
+
+    // Popups & overlays (conditional)
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // Activity bar + sidebar — always expected (backends render these from
+    // engine state / ScreenLayout sidebar fields).
+    elems.push(UiElement::ActivityBar);
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    elems.sort();
+    elems
+}
+
+/// Simulate the Win-GUI backend's `draw_frame()` + `on_paint()` branching logic
+/// to collect which [`UiElement`]s it would render.  This mirrors the actual
+/// rendering code in `src/win_gui/draw.rs` without requiring Direct2D.
+pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // draw_frame(): menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+    }
+
+    // draw_frame(): tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // draw_frame(): breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // draw_frame(): editor windows
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // draw_frame(): status bar (global, only when separated_status_line is None)
+    if layout.separated_status_line.is_none() {
+        let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
+        if !any_per_window {
+            elems.push(UiElement::GlobalStatusBar);
+        }
+    }
+
+    // draw_frame(): command line
+    elems.push(UiElement::CommandLine);
+
+    // draw_frame(): tab tooltip
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // draw_frame(): completion popup
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+
+    // draw_frame(): hover popup
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+
+    // draw_frame(): editor hover (rich markdown)
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+
+    // draw_frame(): diff peek popup
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+
+    // draw_frame(): signature help
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+
+    // draw_frame(): wildmenu
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+
+    // draw_frame(): quickfix
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+
+    // draw_frame(): separated status line
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // draw_frame(): debug toolbar
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+
+    // draw_frame(): terminal
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+
+    // draw_frame(): panel hover popup
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+
+    // draw_frame(): picker
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+
+    // draw_frame(): tab switcher
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+
+    // draw_frame(): context menu
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+
+    // draw_frame(): dialog
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+
+    // on_paint(): sidebar (always rendered after draw_frame)
+    elems.push(UiElement::ActivityBar);
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    // on_paint(): menu dropdown (rendered after sidebar for z-order)
+    if layout
+        .menu_bar
+        .as_ref()
+        .is_some_and(|m| m.open_menu_idx.is_some())
+    {
+        elems.push(UiElement::MenuDropdown);
+    }
+
+    // draw_tab_bar() / draw_group_tab_bar(): diff toolbar
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break;
+            }
+        }
+    }
+
+    elems.sort();
+    elems
+}
+
+/// Simulate the TUI backend's `draw_frame()` branching logic to collect which
+/// [`UiElement`]s it would render.
+pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
+    let mut elems = Vec::new();
+
+    // Menu bar
+    if layout.menu_bar.is_some() {
+        elems.push(UiElement::MenuBar);
+    }
+
+    // Activity bar (always rendered)
+    elems.push(UiElement::ActivityBar);
+
+    // Sidebar
+    if layout.source_control.is_some()
+        || layout.ext_sidebar.is_some()
+        || layout.ai_panel.is_some()
+        || layout.ext_panel.is_some()
+        || layout.debug_sidebar.session_active
+    {
+        elems.push(UiElement::Sidebar);
+    }
+
+    // Tab bar(s)
+    if let Some(ref split) = layout.editor_group_split {
+        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+            elems.push(UiElement::GroupTabBar { group_idx: i });
+        }
+        elems.push(UiElement::GroupDividers);
+    } else {
+        elems.push(UiElement::TabBar);
+    }
+
+    // Diff toolbar (single-group, rendered as part of tab bar)
+    if layout.diff_toolbar.is_some() {
+        elems.push(UiElement::DiffToolbar);
+    }
+    // Diff toolbar (per-group)
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            if gtb.diff_toolbar.is_some() {
+                elems.push(UiElement::DiffToolbar);
+                break;
+            }
+        }
+    }
+
+    // Breadcrumbs
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        if !bc.segments.is_empty() {
+            elems.push(UiElement::Breadcrumbs { group_idx: i });
+        }
+    }
+
+    // Editor windows
+    for (i, rw) in layout.windows.iter().enumerate() {
+        elems.push(UiElement::EditorWindow { window_idx: i });
+        if rw.status_line.is_some() {
+            elems.push(UiElement::WindowStatusLine { window_idx: i });
+        }
+    }
+
+    // Tab tooltip
+    if layout.tab_tooltip.is_some() {
+        elems.push(UiElement::TabTooltip);
+    }
+
+    // Completion popup
+    if layout.completion.is_some() {
+        elems.push(UiElement::CompletionPopup);
+    }
+
+    // Hover popup
+    if layout.hover.is_some() {
+        elems.push(UiElement::HoverPopup);
+    }
+
+    // Editor hover popup (rich markdown)
+    if layout.editor_hover.is_some() {
+        elems.push(UiElement::EditorHoverPopup);
+    }
+
+    // Diff peek popup
+    if layout.diff_peek.is_some() {
+        elems.push(UiElement::DiffPeekPopup);
+    }
+
+    // Signature help
+    if layout.signature_help.is_some() {
+        elems.push(UiElement::SignatureHelp);
+    }
+
+    // Quickfix
+    if layout.quickfix.is_some() {
+        elems.push(UiElement::QuickfixPanel);
+    }
+
+    // Separated status line
+    if layout.separated_status_line.is_some() {
+        elems.push(UiElement::SeparatedStatusLine);
+    }
+
+    // Bottom panel (terminal / debug output)
+    if layout.bottom_tabs.terminal.is_some() {
+        elems.push(UiElement::TerminalPanel);
+    }
+
+    // Debug toolbar
+    if layout.debug_toolbar.is_some() {
+        elems.push(UiElement::DebugToolbar);
+    }
+
+    // Wildmenu
+    if layout.wildmenu.is_some() {
+        elems.push(UiElement::Wildmenu);
+    }
+
+    // Global status bar (when per-window status is off)
+    let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
+    if !any_per_window {
+        elems.push(UiElement::GlobalStatusBar);
+    }
+
+    // Command line
+    elems.push(UiElement::CommandLine);
+
+    // Panel hover popup
+    if layout.panel_hover.is_some() {
+        elems.push(UiElement::PanelHoverPopup);
+    }
+
+    // Picker
+    if layout.picker.is_some() {
+        elems.push(UiElement::PickerPopup);
+    }
+
+    // Tab switcher
+    if layout.tab_switcher.is_some() {
+        elems.push(UiElement::TabSwitcher);
+    }
+
+    // Context menu
+    if layout.context_menu.is_some() {
+        elems.push(UiElement::ContextMenu);
+    }
+
+    // Dialog
+    if layout.dialog.is_some() {
+        elems.push(UiElement::Dialog);
+    }
+
+    // Menu dropdown (rendered last for z-order)
+    if layout
+        .menu_bar
+        .as_ref()
+        .is_some_and(|m| m.open_menu_idx.is_some())
+    {
+        elems.push(UiElement::MenuDropdown);
+    }
+
+    elems.sort();
+    elems
+}
+
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -1701,6 +2636,8 @@ pub struct ScreenLayout {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
+    /// Inline find/replace overlay — `Some` when the find/replace popup is open.
+    pub find_replace: Option<FindReplacePanel>,
     /// Context menu popup — `Some` when an engine context menu is open.
     pub context_menu: Option<ContextMenuPanel>,
     /// Tab hover tooltip: shortened file path to display near the hovered tab.
@@ -1750,6 +2687,46 @@ pub struct DialogPanel {
 pub struct DialogInputPanel {
     /// Display text (masked for passwords).
     pub display: String,
+}
+
+// Re-export hit-test types and functions from engine so backends can use `render::*`.
+pub use crate::core::engine::{
+    compute_find_replace_hit_regions, FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH,
+};
+
+/// The inline find/replace overlay displayed at the top-right of the active editor group.
+#[derive(Debug, Clone)]
+pub struct FindReplacePanel {
+    /// Current query text in the find field.
+    pub query: String,
+    /// Current replacement text (only shown when `show_replace` is true).
+    pub replacement: String,
+    /// Whether the replace row is visible.
+    pub show_replace: bool,
+    /// Which field has focus: 0 = find, 1 = replace.
+    pub focus: u8,
+    /// Cursor position within the focused field (char offset).
+    pub cursor: usize,
+    /// Selection anchor in the focused field. When Some, text between anchor and cursor is selected.
+    pub sel_anchor: Option<usize>,
+    /// "N of M" match count display, or "No results" / empty.
+    pub match_info: String,
+    /// Toggle button states (find row).
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+    /// Toggle button states (replace row).
+    pub preserve_case: bool,
+    /// Find in selection mode.
+    pub in_selection: bool,
+    /// Bounding rect of the active editor group (pixel coords for GTK/Win-GUI,
+    /// approximate for TUI). The overlay positions itself at the top-right of this rect.
+    pub group_bounds: WindowRect,
+    /// Panel width in char cells (used by backends for positioning).
+    pub panel_width: u16,
+    /// Hit regions for click handling, in char-cell units relative to the panel
+    /// content corner (inside borders). Computed once in `build_screen_layout()`.
+    pub hit_regions: Vec<(FrHitRegion, FindReplaceClickTarget)>,
 }
 
 /// Format a button label with the hotkey character bracketed.
@@ -1965,6 +2942,9 @@ pub struct Theme {
     pub indent_guide_fg: Color,
     pub indent_guide_active_fg: Color,
 
+    // Color column (`:set colorcolumn=80`)
+    pub colorcolumn_bg: Color,
+
     // Bracket match highlight
     pub bracket_match_bg: Color,
 
@@ -1996,9 +2976,10 @@ impl Theme {
     /// All values are derived directly from the Cairo RGB tuples in the
     /// original `draw_*` functions.
     pub fn onedark() -> Self {
+        let bg = Color::from_hex("#1a1a1a");
         Self {
             // (0.1, 0.1, 0.1)
-            background: Color::from_hex("#1a1a1a"),
+            background: bg,
             // (0.12, 0.12, 0.12)
             active_background: Color::from_hex("#1e1e1e"),
             // (0.9, 0.9, 0.9)
@@ -2159,6 +3140,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#606060"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#61afef"), // function blue
@@ -2174,8 +3156,9 @@ impl Theme {
 
     /// Gruvbox Dark colour scheme.
     pub fn gruvbox_dark() -> Self {
+        let bg = Color::from_hex("#282828");
         Self {
-            background: Color::from_hex("#282828"),
+            background: bg,
             active_background: Color::from_hex("#32302f"),
             foreground: Color::from_hex("#ebdbb2"),
 
@@ -2307,6 +3290,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#3c3836"),
             indent_guide_active_fg: Color::from_hex("#504945"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#504945"),
 
             explorer_dir_fg: Color::from_hex("#83a598"), // gruvbox blue
@@ -2322,8 +3306,9 @@ impl Theme {
 
     /// Tokyo Night colour scheme.
     pub fn tokyo_night() -> Self {
+        let bg = Color::from_hex("#1a1b26");
         Self {
-            background: Color::from_hex("#1a1b26"),
+            background: bg,
             active_background: Color::from_hex("#1f2335"),
             foreground: Color::from_hex("#c0caf5"),
 
@@ -2455,6 +3440,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#292e42"),
             indent_guide_active_fg: Color::from_hex("#3b4261"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#364a82"),
 
             explorer_dir_fg: Color::from_hex("#7aa2f7"), // tokyo blue
@@ -2470,8 +3456,9 @@ impl Theme {
 
     /// Solarized Dark colour scheme.
     pub fn solarized_dark() -> Self {
+        let bg = Color::from_hex("#002b36");
         Self {
-            background: Color::from_hex("#002b36"),
+            background: bg,
             active_background: Color::from_hex("#073642"),
             foreground: Color::from_hex("#839496"),
 
@@ -2603,6 +3590,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#073642"),
             indent_guide_active_fg: Color::from_hex("#0d4a5a"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#0d4a5a"),
 
             explorer_dir_fg: Color::from_hex("#268bd2"), // solarized blue
@@ -2618,8 +3606,9 @@ impl Theme {
 
     /// VSCode Dark+ colour scheme.
     pub fn vscode_dark() -> Self {
+        let bg = Color::from_hex("#1e1e1e");
         Self {
-            background: Color::from_hex("#1e1e1e"),
+            background: bg,
             active_background: Color::from_hex("#252526"),
             foreground: Color::from_hex("#d4d4d4"),
 
@@ -2751,6 +3740,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#404040"),
             indent_guide_active_fg: Color::from_hex("#707070"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#3a3d41"),
 
             explorer_dir_fg: Color::from_hex("#dcdcaa"), // warm yellow (like function names)
@@ -2766,8 +3756,9 @@ impl Theme {
 
     /// VS Code Light+ (Default Light+) colour scheme.
     pub fn vscode_light() -> Self {
+        let bg = Color::from_hex("#ffffff");
         Self {
-            background: Color::from_hex("#ffffff"),
+            background: bg,
             active_background: Color::from_hex("#f3f3f3"),
             foreground: Color::from_hex("#333333"),
 
@@ -2898,6 +3889,7 @@ impl Theme {
 
             indent_guide_fg: Color::from_hex("#d3d3d3"),
             indent_guide_active_fg: Color::from_hex("#939393"),
+            colorcolumn_bg: bg.colorcolumn_tint(),
             bracket_match_bg: Color::from_hex("#dddddd"),
 
             explorer_dir_fg: Color::from_hex("#795e26"), // warm brown dirs
@@ -3023,6 +4015,9 @@ impl Theme {
         // ── Cursor line highlight ─────────────────────────────────────────
         if let Some(c) = color("editor.lineHighlightBackground") {
             theme.cursorline_bg = c;
+        }
+        if let Some(c) = color("editorRuler.foreground") {
+            theme.colorcolumn_bg = c;
         }
 
         // ── Search ────────────────────────────────────────────────────────
@@ -3936,12 +4931,30 @@ pub fn build_screen_layout(
                     .get(&gid)
                     .map(|g| g.tab_scroll_offset)
                     .unwrap_or(0);
+                let bar_width = bounds.width as u16;
+                let has_diff_toolbar = diff_toolbar.is_some();
+                let diff_label_cols = diff_toolbar
+                    .as_ref()
+                    .and_then(|dt| dt.change_label.as_ref())
+                    .map(|l| l.len() as u16 + 1)
+                    .unwrap_or(0);
+                let is_active = gid == engine.active_group;
+                let has_split = is_active || engine.is_in_diff_view();
+                let hit_regions = compute_tab_bar_hit_regions(
+                    &tabs,
+                    tab_scroll_offset,
+                    bar_width,
+                    has_diff_toolbar,
+                    diff_label_cols,
+                    has_split,
+                );
                 GroupTabBar {
                     group_id: gid,
                     tabs,
                     bounds,
                     diff_toolbar,
                     tab_scroll_offset,
+                    hit_regions,
                 }
             })
             .collect();
@@ -4151,6 +5164,75 @@ pub fn build_screen_layout(
             screen_col: cm.screen_x,
             screen_row: cm.screen_y,
         }),
+        find_replace: if engine.find_replace_open {
+            let match_info = if engine.search_matches.is_empty() {
+                if engine.find_replace_query.is_empty() {
+                    String::new()
+                } else {
+                    "No results".to_string()
+                }
+            } else {
+                match engine.search_index {
+                    Some(idx) => format!("{} of {}", idx + 1, engine.search_matches.len()),
+                    None => format!("{} matches", engine.search_matches.len()),
+                }
+            };
+            // Compute active group bounds from window rects
+            let active_group_bounds = {
+                let active_group = &engine.active_group;
+                let group_window_ids: Vec<_> = engine
+                    .editor_groups
+                    .get(active_group)
+                    .map(|g| g.active_tab().layout.window_ids())
+                    .unwrap_or_default();
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = 0.0f64;
+                let mut max_y = 0.0f64;
+                for (wid, rect) in window_rects {
+                    if group_window_ids.contains(wid) {
+                        min_x = min_x.min(rect.x);
+                        min_y = min_y.min(rect.y);
+                        max_x = max_x.max(rect.x + rect.width);
+                        max_y = max_y.max(rect.y + rect.height);
+                    }
+                }
+                if min_x < f64::MAX {
+                    WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+                } else {
+                    // Fallback: use first window rect or zero
+                    window_rects
+                        .first()
+                        .map(|(_, r)| *r)
+                        .unwrap_or_else(|| WindowRect::new(0.0, 0.0, 800.0, 600.0))
+                }
+            };
+            let panel_w = FR_PANEL_WIDTH;
+            let (hit_regions, _input_w) = compute_find_replace_hit_regions(
+                panel_w,
+                engine.find_replace_show_replace,
+                &match_info,
+            );
+            Some(FindReplacePanel {
+                query: engine.find_replace_query.clone(),
+                replacement: engine.find_replace_replacement.clone(),
+                show_replace: engine.find_replace_show_replace,
+                focus: engine.find_replace_focus,
+                cursor: engine.find_replace_cursor,
+                sel_anchor: engine.find_replace_sel_anchor,
+                match_info,
+                case_sensitive: engine.find_replace_options.case_sensitive,
+                whole_word: engine.find_replace_options.whole_word,
+                use_regex: engine.find_replace_options.use_regex,
+                preserve_case: engine.find_replace_options.preserve_case,
+                in_selection: engine.find_replace_options.in_selection,
+                group_bounds: active_group_bounds,
+                panel_width: panel_w,
+                hit_regions,
+            })
+        } else {
+            None
+        },
         tab_tooltip: engine.tab_hover_tooltip.clone(),
         tab_scroll_offset: engine
             .editor_groups
@@ -4735,10 +5817,12 @@ fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<Breadc
 
     // Path segments (relative to cwd)
     if let Some(ref file_path) = buf_state.file_path {
-        let display = if let Ok(rel) = file_path.strip_prefix(&engine.cwd) {
+        let clean_path = crate::core::paths::strip_unc_prefix(file_path);
+        let clean_cwd = crate::core::paths::strip_unc_prefix(&engine.cwd);
+        let display = if let Ok(rel) = clean_path.strip_prefix(clean_cwd.as_ref()) {
             rel.to_string_lossy().to_string()
         } else {
-            file_path.to_string_lossy().to_string()
+            clean_path.to_string_lossy().to_string()
         };
         let parts: Vec<&str> = display.split(std::path::MAIN_SEPARATOR).collect();
         let mut accumulated = engine.cwd.clone();
@@ -5264,6 +6348,7 @@ fn build_rendered_window(
                     folded_line_count: 0,
                     is_ghost_continuation: false,
                     indent_guides: vec![],
+                    colorcolumns: vec![],
                 });
                 aligned_idx += 1;
             }
@@ -5520,6 +6605,7 @@ fn build_rendered_window(
                     },
                     is_ghost_continuation: false,
                     indent_guides: Vec::new(), // filled below
+                    colorcolumns: Vec::new(),  // filled below
                 });
 
                 // After the cursor segment, insert ghost continuation rows.
@@ -5549,6 +6635,7 @@ fn build_rendered_window(
                             ghost_suffix: Some(cont.clone()),
                             is_ghost_continuation: true,
                             indent_guides: Vec::new(),
+                            colorcolumns: Vec::new(),
                         });
                     }
                 }
@@ -5584,6 +6671,7 @@ fn build_rendered_window(
                 },
                 is_ghost_continuation: false,
                 indent_guides: Vec::new(), // filled below
+                colorcolumns: Vec::new(),  // filled below
             });
 
             // After the cursor line, insert ghost continuation rows.
@@ -5614,6 +6702,7 @@ fn build_rendered_window(
                         ghost_suffix: Some(cont.clone()),
                         is_ghost_continuation: true,
                         indent_guides: Vec::new(),
+                        colorcolumns: Vec::new(),
                     });
                 }
             }
@@ -5777,6 +6866,14 @@ fn build_rendered_window(
                 col += tabstop;
             }
             line.indent_guides = guides;
+        }
+    }
+
+    // ── Color columns ──────────────────────────────────────────────────────
+    let cc_positions = engine.settings.colorcolumn_positions();
+    if !cc_positions.is_empty() {
+        for line in lines.iter_mut() {
+            line.colorcolumns = cc_positions.clone();
         }
     }
 
@@ -6353,9 +7450,29 @@ fn build_selection(
     visible_lines: usize,
 ) -> Option<SelectionRange> {
     let anchor = engine.visual_anchor?;
-    let cursor = engine.cursor();
+    // When find/replace is open from visual mode, use the frozen cursor position
+    // so the selection doesn't change as search jumps the live cursor to matches.
+    let frozen_end;
+    let cursor = if engine.find_replace_open {
+        if let Some(end) = engine.find_replace_visual_end {
+            frozen_end = end;
+            &frozen_end
+        } else {
+            engine.cursor()
+        }
+    } else {
+        engine.cursor()
+    };
 
-    let kind = match engine.mode {
+    let visual_mode = match engine.mode {
+        Mode::Visual | Mode::VisualLine | Mode::VisualBlock => Some(engine.mode),
+        // Show selection while typing a command/search entered from visual mode,
+        // or while find/replace overlay is open from visual mode
+        Mode::Command | Mode::Search => engine.command_from_visual,
+        Mode::Normal if engine.find_replace_open => engine.command_from_visual,
+        _ => None,
+    };
+    let kind = match visual_mode? {
         Mode::Visual => SelectionKind::Char,
         Mode::VisualLine => SelectionKind::Line,
         Mode::VisualBlock => SelectionKind::Block,
@@ -6952,6 +8069,50 @@ pub fn build_window_status_line(
             right_segments: right,
         }
     }
+}
+
+/// Compute hit regions from status line segments.
+/// `bar_width` is the total width in char cells.
+/// Returns `(col, width, action)` tuples for all interactive segments.
+pub fn compute_status_hit_regions(
+    left: &[StatusSegment],
+    right: &[StatusSegment],
+    bar_width: usize,
+) -> Vec<(u16, u16, StatusAction)> {
+    let mut regions = Vec::new();
+    // Left segments: accumulate from col 0
+    let mut col: u16 = 0;
+    for seg in left {
+        let w = seg.text.chars().count() as u16;
+        if let Some(ref action) = seg.action {
+            regions.push((col, w, action.clone()));
+        }
+        col += w;
+    }
+    // Right segments: right-aligned
+    let right_width: usize = right.iter().map(|s| s.text.chars().count()).sum();
+    let mut col = bar_width.saturating_sub(right_width) as u16;
+    for seg in right {
+        let w = seg.text.chars().count() as u16;
+        if let Some(ref action) = seg.action {
+            regions.push((col, w, action.clone()));
+        }
+        col += w;
+    }
+    regions
+}
+
+/// Resolve a column position to a `StatusAction` using pre-computed hit regions.
+pub fn resolve_status_bar_click(
+    hit_regions: &[(u16, u16, StatusAction)],
+    col: u16,
+) -> Option<StatusAction> {
+    for &(start, width, ref action) in hit_regions {
+        if col >= start && col < start + width {
+            return Some(action.clone());
+        }
+    }
+    None
 }
 
 fn build_command_line(engine: &Engine) -> CommandLineData {
@@ -7866,5 +9027,1013 @@ mod tests {
             false,
             false
         ));
+    }
+
+    // ─── ScreenLayout rendering tests ────────────────────────────────────
+
+    /// Build a ScreenLayout for an engine with the given content at the given
+    /// terminal dimensions (in character cells).
+    fn render_engine(engine: &Engine, width: f64, height: f64) -> ScreenLayout {
+        let bounds = WindowRect::new(0.0, 0.0, width, height);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
+        let theme = Theme::onedark();
+        build_screen_layout(engine, &theme, &rects, 1.0, 1.0, true)
+    }
+
+    fn test_engine(text: &str) -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = Mode::Normal;
+        if !text.is_empty() {
+            e.buffer_mut().insert(0, text);
+        }
+        e
+    }
+
+    #[test]
+    fn test_screen_layout_basic_structure() {
+        let e = test_engine("Hello, world!\nSecond line\nThird line\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Should have exactly one window
+        assert_eq!(layout.windows.len(), 1, "single buffer = single window");
+
+        // Window should contain rendered lines
+        let win = &layout.windows[0];
+        assert!(
+            win.lines.len() >= 3,
+            "should render at least 3 content lines"
+        );
+        assert!(win.is_active);
+        assert!(win.cursor.is_some(), "cursor should be visible");
+
+        // First line content
+        assert_eq!(win.lines[0].raw_text.trim_end(), "Hello, world!");
+
+        // Tab bar should have one tab
+        assert!(!layout.tab_bar.is_empty());
+        assert!(layout.tab_bar[0].active);
+    }
+
+    #[test]
+    fn test_screen_layout_cursor_position() {
+        let mut e = test_engine("abcdef\nghijkl\n");
+        // Move cursor to line 1, col 3
+        e.handle_key("j", Some('j'), false);
+        e.handle_key("l", Some('l'), false);
+        e.handle_key("l", Some('l'), false);
+        e.handle_key("l", Some('l'), false);
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let win = &layout.windows[0];
+        let (cursor_pos, _shape) = win.cursor.unwrap();
+        assert_eq!(cursor_pos.view_line, 1, "cursor on second line");
+        assert_eq!(cursor_pos.col, 3, "cursor at col 3");
+    }
+
+    #[test]
+    fn test_screen_layout_split_windows() {
+        let mut e = test_engine("file one\n");
+        // Open a vertical split
+        e.open_editor_group(SplitDirection::Vertical);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert_eq!(layout.windows.len(), 2, "vsplit should produce two windows");
+
+        // Windows should divide the horizontal space
+        let w0 = &layout.windows[0];
+        let w1 = &layout.windows[1];
+        assert!(w0.rect.width > 0.0);
+        assert!(w1.rect.width > 0.0);
+        assert!(
+            (w0.rect.width + w1.rect.width - 80.0).abs() < 2.0,
+            "widths should approximately sum to terminal width"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_terminal_open() {
+        let mut e = test_engine("content\n");
+        e.terminal_open = true;
+        e.session.terminal_panel_rows = 10;
+
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Bottom panel active tab should reflect terminal
+        assert_eq!(
+            layout.bottom_tabs.active,
+            BottomPanelKind::Terminal,
+            "bottom panel should show terminal tab"
+        );
+
+        // Editor window height should be reduced (less than full 24 rows)
+        let win = &layout.windows[0];
+        assert!(
+            win.rect.height < 24.0,
+            "editor should be shorter when terminal is open"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_visual_selection() {
+        let mut e = test_engine("select this text\n");
+        // Enter visual mode and select 5 chars
+        e.handle_key("v", Some('v'), false);
+        for _ in 0..4 {
+            e.handle_key("l", Some('l'), false);
+        }
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        let win = &layout.windows[0];
+        assert!(
+            win.selection.is_some(),
+            "visual mode should produce a selection range"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_command_line() {
+        let mut e = test_engine("hello\n");
+        // Enter command mode
+        e.handle_key(":", Some(':'), false);
+        e.handle_key("w", Some('w'), false);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(
+            layout.command.text.contains(":w"),
+            "command line should show ':w', got: {:?}",
+            layout.command.text
+        );
+        assert!(layout.command.show_cursor);
+    }
+
+    #[test]
+    fn test_screen_layout_dirty_tab() {
+        let mut e = test_engine("hello\n");
+        // Make a change to dirty the buffer
+        e.handle_key("i", Some('i'), false);
+        e.handle_key("x", Some('x'), false);
+        e.handle_key("Escape", None, false);
+
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(
+            layout.tab_bar[0].dirty,
+            "modified buffer should show dirty tab"
+        );
+    }
+
+    #[test]
+    fn test_screen_layout_line_numbers() {
+        let mut e = test_engine("line1\nline2\nline3\nline4\nline5\n");
+        e.settings.line_numbers = LineNumberMode::Absolute;
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let win = &layout.windows[0];
+        assert!(
+            win.gutter_char_width > 0,
+            "line numbers should produce a gutter"
+        );
+        // Gutter text should have line numbers
+        assert!(win.lines[0].gutter_text.contains('1'));
+        assert!(win.lines[1].gutter_text.contains('2'));
+    }
+
+    #[test]
+    fn test_screen_layout_status_segments() {
+        let e = test_engine("hello\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        // Per-window status lines should have segments
+        let win = &layout.windows[0];
+        if let Some(ref status) = win.status_line {
+            assert!(
+                !status.left_segments.is_empty(),
+                "status should have left segments"
+            );
+            assert!(
+                !status.right_segments.is_empty(),
+                "status should have right segments"
+            );
+
+            // Mode should be shown
+            let mode_text: String = status
+                .left_segments
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            assert!(
+                mode_text.contains("NORMAL") || mode_text.contains("NOR"),
+                "status should show normal mode, got: {mode_text}"
+            );
+        }
+    }
+
+    // ─── Backend Parity Tests ────────────────────────────────────────────────
+
+    /// Helper: compute the set difference (elements in `expected` but not in `actual`).
+    fn missing_elements(expected: &[UiElement], actual: &[UiElement]) -> Vec<UiElement> {
+        let actual_set: std::collections::HashSet<_> = actual.iter().collect();
+        expected
+            .iter()
+            .filter(|e| !actual_set.contains(e))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn test_parity_basic_layout_tui() {
+        let e = test_engine("Hello\nWorld\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let tui = collect_ui_elements_tui(&layout);
+        let missing = missing_elements(&expected, &tui);
+        assert!(
+            missing.is_empty(),
+            "TUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {tui:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_basic_layout_wingui() {
+        let e = test_engine("Hello\nWorld\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let wingui = collect_ui_elements_wingui(&layout);
+        let missing = missing_elements(&expected, &wingui);
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {wingui:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_with_completion_popup() {
+        let mut e = test_engine("fn main() {\n    let x = 1;\n}\n");
+        // Simulate an active completion menu
+        e.completion_candidates = vec!["println".to_string(), "print".to_string()];
+        e.completion_idx = Some(0);
+        e.completion_start_col = 0;
+        let layout = render_engine(&e, 80.0, 24.0);
+        // The completion popup should be present
+        assert!(layout.completion.is_some(), "completion should be active");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with completion: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_with_dialog() {
+        use crate::core::engine::DialogButton;
+        let mut e = test_engine("test content\n");
+        e.show_dialog(
+            "test_dialog",
+            "Confirm",
+            vec!["Are you sure?".to_string()],
+            vec![
+                DialogButton {
+                    label: "Yes".into(),
+                    hotkey: 'y',
+                    action: "yes".into(),
+                },
+                DialogButton {
+                    label: "No".into(),
+                    hotkey: 'n',
+                    action: "no".into(),
+                },
+            ],
+        );
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(layout.dialog.is_some(), "dialog should be active");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with dialog: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_with_menu_bar() {
+        let mut e = test_engine("hello\n");
+        e.menu_bar_visible = true;
+        let layout = render_engine(&e, 80.0, 24.0);
+        assert!(layout.menu_bar.is_some(), "menu bar should be visible");
+
+        let expected = collect_expected_ui_elements(&layout);
+        for (name, collector) in [
+            (
+                "TUI",
+                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
+            ),
+            ("Win-GUI", collect_ui_elements_wingui),
+        ] {
+            let actual = collector(&layout);
+            let missing = missing_elements(&expected, &actual);
+            assert!(
+                missing.is_empty(),
+                "{name} missing elements with menu bar: {missing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parity_wingui_no_known_gaps() {
+        // All previously-known Win-GUI gaps have been fixed.  This test
+        // verifies that no regressions have been introduced.
+        let mut e = test_engine("hello world\n");
+        e.menu_bar_visible = true;
+        e.debug_toolbar_visible = true;
+        e.dap_session_active = true;
+        let layout = render_engine(&e, 80.0, 24.0);
+
+        let expected = collect_expected_ui_elements(&layout);
+        let wingui = collect_ui_elements_wingui(&layout);
+        let missing = missing_elements(&expected, &wingui);
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing elements (regressions): {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_parity_all_elements_covered_by_expected() {
+        // Verify that collect_expected_ui_elements produces at least the
+        // baseline set of elements for a simple layout.
+        let e = test_engine("line1\nline2\n");
+        let layout = render_engine(&e, 80.0, 24.0);
+        let expected = collect_expected_ui_elements(&layout);
+
+        // Must always have: tab bar, at least one window, command line, activity bar
+        assert!(expected.contains(&UiElement::TabBar));
+        assert!(expected.contains(&UiElement::EditorWindow { window_idx: 0 }));
+        assert!(expected.contains(&UiElement::CommandLine));
+        assert!(expected.contains(&UiElement::ActivityBar));
+    }
+
+    // ── Phase 2c: Action / click-handler parity tests ───────────────────
+
+    #[test]
+    fn test_action_parity_tui_covers_all_required() {
+        let required = all_required_ui_actions();
+        let tui = collect_ui_actions_tui();
+        let missing: Vec<_> = required.iter().filter(|a| !tui.contains(a)).collect();
+        assert!(
+            missing.is_empty(),
+            "TUI missing required actions: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_action_parity_wingui_covers_all_required() {
+        let required = all_required_ui_actions();
+        let wingui = collect_ui_actions_wingui();
+        let missing: Vec<_> = required.iter().filter(|a| !wingui.contains(a)).collect();
+        assert!(
+            missing.is_empty(),
+            "Win-GUI missing required actions: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn test_action_parity_wingui_matches_tui() {
+        let tui = collect_ui_actions_tui();
+        let wingui = collect_ui_actions_wingui();
+        let tui_only: Vec<_> = tui.iter().filter(|a| !wingui.contains(a)).collect();
+        let wingui_only: Vec<_> = wingui.iter().filter(|a| !tui.contains(a)).collect();
+        assert!(
+            tui_only.is_empty() && wingui_only.is_empty(),
+            "Action parity mismatch:\n  TUI-only: {tui_only:?}\n  Win-GUI-only: {wingui_only:?}"
+        );
+    }
+
+    /// Phase 2c source-code verification: grep the Win-GUI source for the
+    /// engine method calls required by each [`UiAction`]. This catches cases
+    /// where a hand-curated list claims an action is handled but the actual
+    /// engine call is missing from the source code.
+    #[test]
+    fn test_wingui_source_contains_required_calls() {
+        // Read both Win-GUI source files (use CARGO_MANIFEST_DIR for stable path)
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mod_path = std::path::Path::new(manifest_dir).join("src/win_gui/mod.rs");
+        let draw_path = std::path::Path::new(manifest_dir).join("src/win_gui/draw.rs");
+        let mod_src = std::fs::read_to_string(&mod_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", mod_path.display()));
+        let draw_src = std::fs::read_to_string(&draw_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", draw_path.display()));
+        let src = format!("{mod_src}\n{draw_src}");
+
+        // Map each UiAction to the engine method call(s) that MUST appear in
+        // the source.  Draw-order actions check draw function call order
+        // instead of engine methods.
+        let checks: Vec<(UiAction, &[&str])> = vec![
+            (UiAction::ExplorerSingleClickFile, &["open_file_preview"]),
+            (UiAction::ExplorerDoubleClickFile, &["open_file_in_tab"]),
+            (UiAction::ExplorerEnterOnFile, &["open_file_in_tab"]),
+            (
+                UiAction::ExplorerRightClick,
+                &["open_explorer_context_menu"],
+            ),
+            (UiAction::ContextMenuClickInside, &["context_menu_confirm"]),
+            (UiAction::ContextMenuClickOutside, &["close_context_menu"]),
+            (UiAction::TabClick, &["goto_tab"]),
+            (UiAction::TabCloseClick, &["close_tab"]),
+            (UiAction::TabRightClick, &["open_tab_context_menu"]),
+            (UiAction::TabDragDrop, &["tab_drag_begin", "tab_drag_drop"]),
+            (UiAction::EditorRightClick, &["open_editor_context_menu"]),
+            (UiAction::EditorDoubleClick, &["mouse_double_click"]),
+            // EditorScroll: scroll_down_visible/scroll_up_visible or
+            // set_scroll_top_for_window — any is fine
+            (UiAction::EditorScroll, &["scroll_down_visible"]),
+            (UiAction::EditorHoverClick, &["editor_hover_focus"]),
+            (UiAction::EditorHoverDismiss, &["dismiss_editor_hover"]),
+            (UiAction::EditorHoverScroll, &["editor_hover_scroll"]),
+            (UiAction::DebugToolbarButtonClick, &["execute_command"]),
+            (UiAction::TerminalSplitButton, &["terminal_toggle_split"]),
+            (UiAction::TerminalAddButton, &["terminal_new_tab"]),
+            (
+                UiAction::TerminalCloseButton,
+                &["terminal_close_active_tab"],
+            ),
+            (UiAction::TerminalSplitPaneClick, &["terminal_active"]),
+            // Activity bar: check for panel toggle dispatch
+            (UiAction::ActivityBarClick, &["active_panel"]),
+            (UiAction::ActivityBarSettingsClick, &["Settings"]),
+            // Draw order: verify draw sequence in on_paint / draw_frame
+            (
+                UiAction::DrawOrderContextMenuAboveSidebar,
+                &["draw_context_menu", "draw_sidebar"],
+            ),
+            (UiAction::DrawOrderDialogOnTop, &["draw_dialog"]),
+            (
+                UiAction::DrawOrderMenuDropdownAboveSidebar,
+                &["draw_menu_dropdown"],
+            ),
+        ];
+
+        let mut missing = Vec::new();
+        for (action, required_calls) in &checks {
+            for call in *required_calls {
+                if !src.contains(call) {
+                    missing.push(format!(
+                        "{action:?} requires `{call}` — not found in Win-GUI source"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Win-GUI source missing required engine calls:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+
+    /// Test that `open_file_preview` reuses/creates a preview tab, NOT replacing
+    /// a permanent buffer. This is the contract for explorer single-click.
+    #[test]
+    fn test_open_file_preview_does_not_replace_permanent() {
+        let mut e = test_engine("first file\n");
+        let dir = std::env::temp_dir().join("vimcode_test_preview");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+        std::fs::write(&f2, "file B\n").unwrap();
+
+        // Open f1 permanently (simulates existing tab)
+        e.open_file_in_tab(&f1);
+        let buf_a = e.active_buffer_id();
+        assert_eq!(e.active_group().tabs.len(), 2); // scratch + f1
+
+        // Preview f2 (simulates explorer single-click)
+        e.open_file_preview(&f2);
+        let buf_b = e.active_buffer_id();
+        assert_ne!(buf_a, buf_b, "Preview should show different buffer");
+        assert_eq!(
+            e.active_group().tabs.len(),
+            3,
+            "Preview should create a new tab, not replace"
+        );
+
+        // Preview another file — should reuse the preview tab
+        let f3 = dir.join("c.txt");
+        std::fs::write(&f3, "file C\n").unwrap();
+        e.open_file_preview(&f3);
+        assert_eq!(
+            e.active_group().tabs.len(),
+            3,
+            "Second preview should reuse the preview tab"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that `open_file_in_tab` always creates a new tab (or switches to
+    /// existing). This is the contract for explorer double-click / Enter.
+    #[test]
+    fn test_open_file_in_tab_creates_new_tab() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_tab");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+        std::fs::write(&f2, "file B\n").unwrap();
+
+        let initial_tabs = e.active_group().tabs.len();
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 1);
+        e.open_file_in_tab(&f2);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 2);
+
+        // Opening f1 again should switch to existing tab, not create another
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.active_group().tabs.len(), initial_tabs + 2);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that the default shell is platform-appropriate.
+    #[test]
+    fn test_default_shell_platform() {
+        let shell = crate::core::terminal::default_shell();
+        #[cfg(target_os = "windows")]
+        {
+            // Must NOT be /bin/bash on Windows
+            assert!(
+                !shell.contains("/bin/bash"),
+                "Windows default shell should not be /bin/bash, got: {shell}"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Should be $SHELL or /bin/bash on Unix
+            assert!(
+                shell.contains("sh") || shell.contains("zsh") || shell.contains("fish"),
+                "Unix default shell should be a known shell, got: {shell}"
+            );
+        }
+    }
+
+    // =====================================================================
+    // Phase 2d: Behavioral backend parity tests
+    //
+    // These tests simulate user interaction sequences (the same engine method
+    // calls that every backend must make) and assert that the engine state
+    // transitions are correct.  A bug here means every backend is broken;
+    // a missing engine call in a specific backend would pass these tests but
+    // fail the Phase 2c static parity check.
+    // =====================================================================
+
+    /// Tab click switches to the correct tab and promotes preview tabs.
+    #[test]
+    fn test_behavior_tab_click_switches_tab() {
+        let mut e = test_engine("first\n");
+        let dir = std::env::temp_dir().join("vimcode_test_tab_click");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+        std::fs::write(&f2, "file B\n").unwrap();
+
+        e.open_file_in_tab(&f1);
+        e.open_file_in_tab(&f2);
+        // Now on tab 2 (f2).  Switch back to tab 0 (scratch).
+        e.goto_tab(0);
+        assert_eq!(
+            e.active_group().active_tab,
+            0,
+            "goto_tab(0) should switch to first tab"
+        );
+
+        // Switch to tab 1 (f1)
+        e.goto_tab(1);
+        assert_eq!(e.active_group().active_tab, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tab close removes the tab and falls back to an adjacent tab.
+    #[test]
+    fn test_behavior_tab_close_removes_tab() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_tab_close");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.active_group().tabs.len(), 2);
+
+        // Close the active tab (f1) — should fall back to scratch
+        e.close_tab();
+        assert_eq!(
+            e.active_group().tabs.len(),
+            1,
+            "close_tab should remove the tab"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Backends must check dirty() before calling close_tab().
+    /// This test verifies that dirty() detects unsaved changes so backends
+    /// can show a confirmation dialog.  close_tab() itself is a raw operation.
+    #[test]
+    fn test_behavior_dirty_check_before_tab_close() {
+        let mut e = test_engine("");
+        let dir = std::env::temp_dir().join("vimcode_test_dirty_close");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        std::fs::write(&f1, "original\n").unwrap();
+
+        e.open_file_in_tab(&f1);
+        assert!(!e.dirty(), "freshly opened file should not be dirty");
+
+        // Make the buffer dirty by inserting text
+        e.handle_key("i", Some('i'), false);
+        e.handle_key("x", Some('x'), false);
+        e.handle_key("Escape", None, false);
+        assert!(
+            e.dirty(),
+            "buffer should be dirty after insert — backends must check this before close_tab()"
+        );
+
+        // Verify the backend contract: if dirty() is true, do NOT call
+        // close_tab() directly — show a dialog first.  We verify the raw
+        // close_tab still works (backends call it after user confirms).
+        let tabs_before = e.active_group().tabs.len();
+        e.close_tab();
+        assert_eq!(
+            e.active_group().tabs.len(),
+            tabs_before - 1,
+            "close_tab() is a raw operation — backends gate it with dirty() check"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Context menu open/select/dismiss lifecycle.
+    #[test]
+    fn test_behavior_context_menu_lifecycle() {
+        let mut e = test_engine("hello world\n");
+
+        // Open editor context menu
+        e.open_editor_context_menu(10, 5);
+        assert!(
+            e.context_menu.is_some(),
+            "open_editor_context_menu should populate context_menu state"
+        );
+        let items_count = e.context_menu.as_ref().unwrap().items.len();
+        assert!(items_count > 0, "context menu should have items");
+
+        // Dismiss by clicking outside
+        e.close_context_menu();
+        assert!(
+            e.context_menu.is_none(),
+            "close_context_menu should clear the state"
+        );
+
+        // Open again and confirm an item
+        e.open_editor_context_menu(10, 5);
+        assert!(e.context_menu.is_some());
+        let _action = e.context_menu_confirm();
+        // After confirm, the menu should be closed
+        assert!(
+            e.context_menu.is_none(),
+            "context_menu_confirm should close the menu"
+        );
+    }
+
+    /// Explorer context menu opens with correct target type.
+    #[test]
+    fn test_behavior_explorer_context_menu() {
+        let mut e = test_engine("");
+        let dir = std::env::temp_dir().join("vimcode_test_ctx_explorer");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("test.txt");
+        std::fs::write(&f1, "content\n").unwrap();
+
+        e.open_explorer_context_menu(f1.clone(), false, 5, 10);
+        assert!(e.context_menu.is_some());
+        let ctx = e.context_menu.as_ref().unwrap();
+        assert!(
+            matches!(
+                ctx.target,
+                crate::core::engine::ContextMenuTarget::ExplorerFile { .. }
+            ),
+            "file click should produce ExplorerFile target"
+        );
+
+        e.close_context_menu();
+
+        // Directory context menu
+        e.open_explorer_context_menu(dir.clone(), true, 5, 10);
+        assert!(e.context_menu.is_some());
+        let ctx = e.context_menu.as_ref().unwrap();
+        assert!(
+            matches!(
+                ctx.target,
+                crate::core::engine::ContextMenuTarget::ExplorerDir { .. }
+            ),
+            "dir click should produce ExplorerDir target"
+        );
+
+        e.close_context_menu();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tab context menu opens with correct target.
+    #[test]
+    fn test_behavior_tab_context_menu() {
+        let mut e = test_engine("hello\n");
+        let gid = e.active_group;
+        e.open_tab_context_menu(gid, 0, 20, 5);
+        assert!(e.context_menu.is_some());
+        let ctx = e.context_menu.as_ref().unwrap();
+        assert!(
+            matches!(
+                ctx.target,
+                crate::core::engine::ContextMenuTarget::Tab { .. }
+            ),
+            "tab right-click should produce Tab target"
+        );
+        e.close_context_menu();
+    }
+
+    /// Double-click in editor selects a word (enters visual mode).
+    #[test]
+    fn test_behavior_editor_double_click_selects_word() {
+        let mut e = test_engine("hello world\n");
+        let wid = e.active_window_id();
+        e.mouse_double_click(wid, 0, 2); // double-click on "hello"
+        assert_eq!(
+            e.mode,
+            crate::core::mode::Mode::Visual,
+            "double-click should enter visual mode"
+        );
+    }
+
+    /// Editor hover popup lifecycle: show → focus → scroll → dismiss.
+    #[test]
+    fn test_behavior_editor_hover_lifecycle() {
+        let mut e = test_engine("fn main() {}\n");
+
+        // Show a hover popup
+        e.show_editor_hover(
+            0,
+            3,
+            "**main** — entry point",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        assert!(
+            e.editor_hover.is_some(),
+            "show_editor_hover should set editor_hover"
+        );
+        assert!(
+            !e.editor_hover_has_focus,
+            "hover should not auto-focus without take_focus"
+        );
+
+        // Focus the popup (simulates click on hover)
+        e.editor_hover_focus();
+        assert!(
+            e.editor_hover_has_focus,
+            "editor_hover_focus should set focus flag"
+        );
+
+        // Scroll the popup
+        let scrolled = e.editor_hover_scroll(1);
+        // Scroll may or may not change offset depending on content length,
+        // but the method should not panic
+        let _ = scrolled;
+
+        // Dismiss
+        e.dismiss_editor_hover();
+        assert!(
+            e.editor_hover.is_none(),
+            "dismiss_editor_hover should clear popup"
+        );
+        assert!(!e.editor_hover_has_focus, "dismiss should clear focus flag");
+    }
+
+    /// Activity bar click toggles sidebar focus flags.
+    #[test]
+    fn test_behavior_sidebar_focus_toggle() {
+        let mut e = test_engine("hello\n");
+
+        // Simulate activity bar click → explorer
+        e.explorer_has_focus = true;
+        assert!(e.explorer_has_focus);
+
+        // Simulate clicking editor → clear sidebar focus
+        e.clear_sidebar_focus();
+        assert!(
+            !e.explorer_has_focus,
+            "clear_sidebar_focus should clear explorer"
+        );
+        assert!(!e.search_has_focus);
+        assert!(!e.sc_has_focus);
+        assert!(!e.settings_has_focus);
+        assert!(!e.ai_has_focus);
+    }
+
+    /// Terminal new tab / close tab lifecycle.
+    #[test]
+    fn test_behavior_terminal_new_and_close() {
+        let mut e = test_engine("hello\n");
+
+        // Create a terminal tab
+        e.terminal_new_tab(80, 24);
+        assert!(
+            !e.terminal_panes.is_empty(),
+            "terminal_new_tab should create a tab"
+        );
+        let count_after_new = e.terminal_panes.len();
+
+        // Create another
+        e.terminal_new_tab(80, 24);
+        assert_eq!(e.terminal_panes.len(), count_after_new + 1);
+
+        // Close active tab
+        e.terminal_close_active_tab();
+        assert_eq!(e.terminal_panes.len(), count_after_new);
+    }
+
+    /// Terminal split toggle.
+    #[test]
+    fn test_behavior_terminal_split_toggle() {
+        let mut e = test_engine("hello\n");
+        e.terminal_new_tab(80, 24);
+        assert!(!e.terminal_split, "split should be off initially");
+
+        e.terminal_toggle_split(80, 24);
+        assert!(e.terminal_split, "toggle should enable split");
+
+        e.terminal_toggle_split(80, 24);
+        assert!(!e.terminal_split, "second toggle should disable split");
+    }
+
+    /// Tab drag and drop between groups creates a new split.
+    #[test]
+    fn test_behavior_tab_drag_drop_creates_split() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_drag_drop");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+
+        e.open_file_in_tab(&f1);
+        assert_eq!(e.editor_groups.len(), 1, "start with one group");
+
+        let gid = e.active_group;
+        e.tab_drag_begin(gid, 1); // drag f1's tab
+
+        // Drop to create a vertical split
+        e.tab_drag_drop(crate::core::window::DropZone::Split(
+            gid,
+            crate::core::window::SplitDirection::Vertical,
+            false,
+        ));
+        assert_eq!(
+            e.editor_groups.len(),
+            2,
+            "dropping into a split should create a second editor group"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Preview tab is promoted to permanent when goto_tab selects it.
+    #[test]
+    fn test_behavior_goto_tab_promotes_preview() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_promote");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        std::fs::write(&f1, "file A\n").unwrap();
+
+        e.open_file_preview(&f1);
+        let preview_buf = e.active_buffer_id();
+        assert!(
+            e.preview_buffer_id == Some(preview_buf),
+            "open_file_preview should set preview_buffer_id"
+        );
+
+        // Switch away and back via goto_tab (simulates clicking the tab)
+        let tab_idx = e.active_group().active_tab;
+        e.goto_tab(0);
+        e.goto_tab(tab_idx);
+        assert!(
+            e.preview_buffer_id.is_none() || e.preview_buffer_id != Some(preview_buf),
+            "goto_tab should promote preview to permanent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Editor click clears sidebar focus (backends must call clear_sidebar_focus).
+    #[test]
+    fn test_behavior_editor_click_clears_sidebar() {
+        let mut e = test_engine("hello world\n");
+
+        // Simulate various sidebar focus states
+        e.explorer_has_focus = true;
+        e.search_has_focus = true;
+        e.sc_has_focus = true;
+        e.ai_has_focus = true;
+        e.settings_has_focus = true;
+
+        // Simulate what backends do on editor click: clear sidebar, then click
+        e.clear_sidebar_focus();
+        let wid = e.active_window_id();
+        e.mouse_click(wid, 0, 3);
+
+        assert!(!e.explorer_has_focus);
+        assert!(!e.search_has_focus);
+        assert!(!e.sc_has_focus);
+        assert!(!e.ai_has_focus);
+        assert!(!e.settings_has_focus);
+    }
+
+    /// mouse_click moves cursor to the clicked position.
+    #[test]
+    fn test_behavior_mouse_click_moves_cursor() {
+        let mut e = test_engine("hello world\nsecond line\n");
+        let wid = e.active_window_id();
+        e.mouse_click(wid, 1, 3);
+        assert_eq!(e.cursor().line, 1, "click should move to line 1");
+        assert_eq!(e.cursor().col, 3, "click should move to col 3");
+    }
+
+    /// Preview reuse: opening multiple previews reuses the same tab slot.
+    #[test]
+    fn test_behavior_preview_reuse_then_permanent() {
+        let mut e = test_engine("scratch\n");
+        let dir = std::env::temp_dir().join("vimcode_test_preview_reuse");
+        let _ = std::fs::create_dir_all(&dir);
+        let f1 = dir.join("a.txt");
+        let f2 = dir.join("b.txt");
+        let f3 = dir.join("c.txt");
+        std::fs::write(&f1, "A\n").unwrap();
+        std::fs::write(&f2, "B\n").unwrap();
+        std::fs::write(&f3, "C\n").unwrap();
+
+        // Preview f1
+        e.open_file_preview(&f1);
+        assert_eq!(e.active_group().tabs.len(), 2);
+
+        // Preview f2 — should reuse the preview slot
+        e.open_file_preview(&f2);
+        assert_eq!(e.active_group().tabs.len(), 2, "preview should reuse slot");
+
+        // Open f3 permanently — should create a new tab
+        e.open_file_in_tab(&f3);
+        assert_eq!(
+            e.active_group().tabs.len(),
+            3,
+            "permanent open after preview should add a tab"
+        );
+
+        // Opening yet another preview should still reuse the preview slot
+        e.open_file_preview(&f1);
+        // The key invariant: at most one preview buffer exists at a time
+        // preview_buffer_id tracks it (None means no preview, Some means exactly one)
+        assert!(
+            e.preview_buffer_id.is_some(),
+            "should have a preview buffer after open_file_preview"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -578,6 +578,16 @@ pub(super) fn draw_editor(
     }
 
     // 8. Popups and modals — drawn last so they appear on top of everything.
+    draw_find_replace_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        line_height,
+    );
+
     draw_picker_popup(
         cr,
         &layout,
@@ -607,6 +617,18 @@ pub(super) fn draw_editor(
         line_height,
     );
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
+
+    draw_context_menu_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        width as f64,
+        height as f64,
+        char_width,
+        line_height,
+        mouse_pos,
+    );
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
@@ -1472,6 +1494,17 @@ pub(super) fn draw_window(
                 cr.move_to(gx, y);
                 cr.line_to(gx, y + line_height);
                 cr.stroke().ok();
+            }
+        }
+
+        // Color columns: tinted background rectangle at each column
+        if !rl.colorcolumns.is_empty() {
+            let (cr2, cg, cb) = theme.colorcolumn_bg.to_cairo();
+            cr.set_source_rgb(cr2, cg, cb);
+            for &cc_col in &rl.colorcolumns {
+                let cx = text_x_offset + cc_col as f64 * char_width;
+                cr.rectangle(cx, y, char_width, line_height);
+                cr.fill().ok();
             }
         }
 
@@ -2586,6 +2619,288 @@ pub(super) fn draw_signature_popup(
     layout.set_attributes(None);
 }
 
+/// Draw the inline find/replace overlay at the top-right of the editor.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_find_replace_popup(
+    cr: &Context,
+    layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    _editor_width: f64,
+    _editor_height: f64,
+    line_height: f64,
+) {
+    let Some(panel) = &screen.find_replace else {
+        return;
+    };
+
+    let pad = 6.0;
+    let input_w = 200.0;
+    let btn_s = line_height; // square button size
+
+    // Layout: [chevron] [input] [Aa][ab][.*] [count] [↑][↓][≡][×]
+    let chevron_w = 16.0;
+    let toggles_w = 3.0 * (btn_s + 4.0);
+    let info_w = 80.0; // "99 of 999"
+    let nav_w = 4.0 * (btn_s + 2.0);
+    let popup_w = chevron_w + input_w + pad + toggles_w + info_w + nav_w + pad;
+    let row_count = if panel.show_replace { 2.0 } else { 1.0 };
+    let popup_h = line_height * row_count + pad * (row_count + 1.0);
+
+    let gb = &panel.group_bounds;
+    let popup_x = (gb.x + gb.width - popup_w - 10.0).max(gb.x);
+    let popup_y = gb.y + 2.0;
+
+    // Background & border
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    let _ = cr.fill();
+    let (r, g, b) = theme.separator.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
+
+    // Helper to draw a toggle button
+    let draw_toggle =
+        |cr: &Context, layout: &pango::Layout, label: &str, bx: f64, by: f64, active: bool| {
+            layout.set_text(label);
+            let (tw, _) = layout.pixel_size();
+            let bw = tw as f64 + 8.0;
+            if active {
+                let (r, g, b) = theme.tab_active_accent.to_cairo();
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(bx, by, bw, line_height);
+                let _ = cr.fill();
+                let (r, g, b) = theme.background.to_cairo();
+                cr.set_source_rgb(r, g, b);
+            } else {
+                let (r, g, b) = theme.separator.to_cairo();
+                cr.set_source_rgb(r, g, b);
+                cr.rectangle(bx, by, bw, line_height);
+                cr.set_line_width(0.5);
+                let _ = cr.stroke();
+                let (r, g, b) = theme.foreground.to_cairo();
+                cr.set_source_rgb(r, g, b);
+            }
+            cr.move_to(bx + 4.0, by);
+            pangocairo::show_layout(cr, layout);
+            bw + 4.0
+        };
+
+    // Helper to draw a nav button
+    let draw_nav_btn = |cr: &Context, layout: &pango::Layout, label: &str, bx: f64, by: f64| {
+        let (r, g, b) = theme.separator.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(bx, by, btn_s, line_height);
+        cr.set_line_width(0.5);
+        let _ = cr.stroke();
+        let (r, g, b) = theme.foreground.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(label);
+        let (tw, _) = layout.pixel_size();
+        cr.move_to(bx + (btn_s - tw as f64) / 2.0, by);
+        pangocairo::show_layout(cr, layout);
+    };
+
+    // --- Find row ---
+    let row_y = popup_y + pad;
+
+    // Chevron
+    let chevron = if panel.show_replace { "▼" } else { "▶" };
+    let (r, g, b) = theme.foreground.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.move_to(popup_x + pad, row_y);
+    layout.set_text(chevron);
+    pangocairo::show_layout(cr, layout);
+    let input_x = popup_x + chevron_w;
+
+    // Find input
+    let (r, g, b) = theme.background.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(input_x, row_y, input_w, line_height);
+    let _ = cr.fill();
+    let (r, g, b) = theme.separator.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(input_x, row_y, input_w, line_height);
+    cr.set_line_width(0.5);
+    let _ = cr.stroke();
+
+    // Query text + cursor
+    cr.move_to(input_x + 4.0, row_y);
+    let (r, g, b) = theme.foreground.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&panel.query);
+    pangocairo::show_layout(cr, layout);
+    if panel.focus == 0 {
+        // Selection highlight
+        if let Some(anchor) = panel.sel_anchor {
+            let s = anchor.min(panel.cursor);
+            let e = anchor.max(panel.cursor);
+            if s != e {
+                let s_prefix = &panel.query[..panel
+                    .query
+                    .char_indices()
+                    .nth(s)
+                    .map(|(i, _)| i)
+                    .unwrap_or(panel.query.len())];
+                let e_prefix = &panel.query[..panel
+                    .query
+                    .char_indices()
+                    .nth(e)
+                    .map(|(i, _)| i)
+                    .unwrap_or(panel.query.len())];
+                layout.set_text(s_prefix);
+                let (sx, _) = layout.pixel_size();
+                layout.set_text(e_prefix);
+                let (ex, _) = layout.pixel_size();
+                let (sr, sg, sb) = theme.selection.to_cairo();
+                cr.set_source_rgba(sr, sg, sb, 0.5);
+                cr.rectangle(
+                    input_x + 4.0 + sx as f64,
+                    row_y,
+                    (ex - sx) as f64,
+                    line_height,
+                );
+                let _ = cr.fill();
+            }
+        }
+        // Cursor
+        let (r, g, b) = theme.foreground.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        let prefix = &panel.query[..panel
+            .query
+            .char_indices()
+            .nth(panel.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(panel.query.len())];
+        layout.set_text(prefix);
+        let (cpx, _) = layout.pixel_size();
+        cr.rectangle(
+            input_x + 4.0 + cpx as f64,
+            row_y + 2.0,
+            2.0,
+            line_height - 4.0,
+        );
+        let _ = cr.fill();
+    }
+
+    // Toggles: [Aa] [ab] [.*]
+    let mut bx = input_x + input_w + pad;
+    bx += draw_toggle(cr, layout, "Aa", bx, row_y, panel.case_sensitive);
+    bx += draw_toggle(cr, layout, "ab", bx, row_y, panel.whole_word);
+    bx += draw_toggle(cr, layout, ".*", bx, row_y, panel.use_regex);
+
+    // Match count (fixed-width slot)
+    bx += 4.0;
+    let (r, g, b) = theme.foreground.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    layout.set_text(&panel.match_info);
+    cr.move_to(bx, row_y);
+    pangocairo::show_layout(cr, layout);
+    bx += info_w;
+
+    // Nav: [↑] [↓] [≡] [×]
+    use crate::icons;
+    let nav_items: [(&str, bool); 4] = [
+        ("\u{2191}", false),
+        ("\u{2193}", false),
+        (icons::FIND_IN_SEL.s(), panel.in_selection),
+        (icons::FIND_CLOSE.s(), false),
+    ];
+    for (label, active) in &nav_items {
+        if *active {
+            draw_toggle(cr, layout, label, bx, row_y, true);
+        } else {
+            draw_nav_btn(cr, layout, label, bx, row_y);
+        }
+        bx += btn_s + 2.0;
+    }
+
+    // --- Replace row ---
+    if panel.show_replace {
+        let rep_y = row_y + line_height + pad;
+
+        // Replace input (aligned with find input)
+        let (r, g, b) = theme.background.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(input_x, rep_y, input_w, line_height);
+        let _ = cr.fill();
+        let (r, g, b) = theme.separator.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        cr.rectangle(input_x, rep_y, input_w, line_height);
+        cr.set_line_width(0.5);
+        let _ = cr.stroke();
+
+        // Replace text + cursor
+        cr.move_to(input_x + 4.0, rep_y);
+        let (r, g, b) = theme.foreground.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        layout.set_text(&panel.replacement);
+        pangocairo::show_layout(cr, layout);
+        if panel.focus == 1 {
+            // Selection highlight
+            if let Some(anchor) = panel.sel_anchor {
+                let s = anchor.min(panel.cursor);
+                let e = anchor.max(panel.cursor);
+                if s != e {
+                    let s_prefix = &panel.replacement[..panel
+                        .replacement
+                        .char_indices()
+                        .nth(s)
+                        .map(|(i, _)| i)
+                        .unwrap_or(panel.replacement.len())];
+                    let e_prefix = &panel.replacement[..panel
+                        .replacement
+                        .char_indices()
+                        .nth(e)
+                        .map(|(i, _)| i)
+                        .unwrap_or(panel.replacement.len())];
+                    layout.set_text(s_prefix);
+                    let (sx, _) = layout.pixel_size();
+                    layout.set_text(e_prefix);
+                    let (ex, _) = layout.pixel_size();
+                    let (sr, sg, sb) = theme.selection.to_cairo();
+                    cr.set_source_rgba(sr, sg, sb, 0.5);
+                    cr.rectangle(
+                        input_x + 4.0 + sx as f64,
+                        rep_y,
+                        (ex - sx) as f64,
+                        line_height,
+                    );
+                    let _ = cr.fill();
+                }
+            }
+            // Cursor
+            let (r, g, b) = theme.foreground.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            let prefix = &panel.replacement[..panel
+                .replacement
+                .char_indices()
+                .nth(panel.cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(panel.replacement.len())];
+            layout.set_text(prefix);
+            let (cpx, _) = layout.pixel_size();
+            cr.rectangle(
+                input_x + 4.0 + cpx as f64,
+                rep_y + 2.0,
+                2.0,
+                line_height - 4.0,
+            );
+            let _ = cr.fill();
+        }
+
+        // [AB] [replace] [replace_all]
+        let mut rbx = input_x + input_w + pad;
+        rbx += draw_toggle(cr, layout, "AB", rbx, rep_y, panel.preserve_case);
+        draw_nav_btn(cr, layout, icons::FIND_REPLACE.s(), rbx, rep_y);
+        rbx += btn_s + 2.0;
+        draw_nav_btn(cr, layout, icons::FIND_REPLACE_ALL.s(), rbx, rep_y);
+    }
+}
+
 /// Draw the unified picker modal (supports single-pane and two-pane with preview).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_picker_popup(
@@ -3125,6 +3440,147 @@ pub(super) fn draw_dialog_popup(
         }
     }
     rects
+}
+
+/// Draw an engine-driven context menu popup on the DrawingArea.
+/// Uses the same data as TUI/Win-GUI for visual consistency.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_context_menu_popup(
+    cr: &Context,
+    _layout: &pango::Layout,
+    screen: &render::ScreenLayout,
+    theme: &Theme,
+    editor_width: f64,
+    editor_height: f64,
+    char_width: f64,
+    line_height: f64,
+    mouse_pos: (f64, f64),
+) {
+    let Some(cm) = &screen.context_menu else {
+        return;
+    };
+    if cm.items.is_empty() {
+        return;
+    }
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
+
+    // Calculate popup dimensions.
+    let sep_count = cm.items.iter().filter(|i| i.separator_after).count();
+    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
+    let popup_w = content_cols as f64 * char_width;
+    let popup_h = (cm.items.len() + sep_count + 2) as f64 * line_height;
+
+    // Position: use char-cell coordinates from engine, scaled to pixels.
+    let raw_x = cm.screen_col as f64 * char_width;
+    let raw_y = cm.screen_row as f64 * line_height;
+    let px = raw_x.min(editor_width - popup_w);
+    let py = raw_y.min(editor_height - popup_h);
+
+    // Background.
+    let (r, g, b) = theme.fuzzy_bg.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(px, py, popup_w, popup_h);
+    cr.fill().ok();
+
+    // Border.
+    let (r, g, b) = theme.fuzzy_border.to_cairo();
+    cr.set_source_rgb(r, g, b);
+    cr.set_line_width(1.0);
+    cr.rectangle(px, py, popup_w, popup_h);
+    cr.stroke().ok();
+
+    // Compute hovered item from mouse position (avoids engine borrow in motion callback).
+    let hover_idx: Option<usize> = if mouse_pos.0 >= 0.0 {
+        let mcol = (mouse_pos.0 / char_width) as u16;
+        let mrow = (mouse_pos.1 / line_height) as u16;
+        let tw = (editor_width / char_width) as u16;
+        let th = (editor_height / line_height) as u16;
+        match crate::core::engine::resolve_context_menu_click(
+            &cm.items
+                .iter()
+                .map(|i| crate::core::engine::ContextMenuItem {
+                    label: i.label.clone(),
+                    action: String::new(),
+                    shortcut: i.shortcut.clone(),
+                    separator_after: i.separator_after,
+                    enabled: i.enabled,
+                })
+                .collect::<Vec<_>>(),
+            cm.screen_col,
+            cm.screen_row,
+            tw,
+            th,
+            mcol,
+            mrow,
+        ) {
+            crate::core::engine::ContextMenuClickResult::Item(idx) => Some(idx),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Use hover index if mouse is over an item; otherwise keep engine selection
+    // (preserves last-hovered or keyboard-navigated item when mouse leaves).
+    let selected = hover_idx.unwrap_or(cm.selected_idx);
+
+    // Items.
+    let mut visual_row: usize = 0;
+    let item_x = px + char_width;
+    for (i, item) in cm.items.iter().enumerate() {
+        let item_y = py + (visual_row + 1) as f64 * line_height;
+
+        // Selection highlight.
+        if i == selected && item.enabled {
+            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.rectangle(px + 1.0, item_y, popup_w - 2.0, line_height);
+            cr.fill().ok();
+        }
+
+        // Label — disabled items heavily darkened for obvious visual distinction.
+        let fg = if item.enabled {
+            theme.fuzzy_fg
+        } else {
+            theme.fuzzy_fg.darken(0.5)
+        };
+        let (r, g, b) = fg.to_cairo();
+        cr.set_source_rgb(r, g, b);
+        ui_layout.set_text(&item.label);
+        ui_layout.set_attributes(None);
+        cr.move_to(item_x, item_y);
+        pangocairo::show_layout(cr, &ui_layout);
+
+        // Shortcut (right-aligned).
+        if !item.shortcut.is_empty() {
+            ui_layout.set_text(&item.shortcut);
+            let (sw, _) = ui_layout.pixel_size();
+            let sc_x = px + popup_w - sw as f64 - char_width;
+            let (r, g, b) = theme.line_number_fg.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.move_to(sc_x, item_y);
+            pangocairo::show_layout(cr, &ui_layout);
+        }
+
+        visual_row += 1;
+
+        // Separator line.
+        if item.separator_after {
+            let sep_y = py + (visual_row + 1) as f64 * line_height + line_height / 2.0;
+            let (r, g, b) = theme.fuzzy_border.to_cairo();
+            cr.set_source_rgb(r, g, b);
+            cr.set_line_width(0.5);
+            cr.move_to(px + 4.0, sep_y);
+            cr.line_to(px + popup_w - 4.0, sep_y);
+            cr.stroke().ok();
+            visual_row += 1;
+        }
+    }
 }
 
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
@@ -5901,11 +6357,7 @@ pub(super) fn draw_ai_sidebar(
     cr.fill().ok();
 
     let cursor = ai.input_cursor.min(input_chars.len());
-    let cursor_line = if input_content_w > 0 {
-        cursor / input_content_w
-    } else {
-        0
-    };
+    let cursor_line = cursor.checked_div(input_content_w).unwrap_or(0);
     let cursor_col = if input_content_w > 0 {
         cursor % input_content_w
     } else {

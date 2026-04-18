@@ -1,0 +1,17 @@
+---
+source: src/tui_main/render_impl.rs
+assertion_line: 4537
+expression: "lines.join(\"\\n\")"
+---
+ 󰍜  1: [No Name] ×                                  󰤲   ⋯
+ 
+   buffer content
+ 
+ 
+ 
+ 
+
+
+
+    COMMAND  [No Name]Spaces: 4 utf-8 LF  Ln 1, Col 1  󰘖  󰆍
+  :set

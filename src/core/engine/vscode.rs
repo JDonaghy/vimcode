@@ -16,7 +16,8 @@ impl Engine {
             };
         }
         match self.mode {
-            Mode::Normal | Mode::Command | Mode::Search => "NORMAL",
+            Mode::Normal | Mode::Search => "NORMAL",
+            Mode::Command => "COMMAND",
             Mode::Insert => "INSERT",
             Mode::Replace => "REPLACE",
             Mode::Visual => "VISUAL",
@@ -1229,6 +1230,14 @@ impl Engine {
                 // Phase 3: Ctrl+Shift+P → command palette
                 "P" => {
                     self.open_picker(PickerSource::Commands);
+                }
+                // Find/Replace: Ctrl+F → find, Ctrl+H → find & replace
+                "f" => {
+                    self.open_find_replace();
+                }
+                "h" => {
+                    self.open_find_replace();
+                    self.find_replace_show_replace = true;
                 }
                 // Phase 3: Ctrl+B → toggle sidebar
                 "b" => {

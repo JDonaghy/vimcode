@@ -151,17 +151,11 @@ struct App {
     tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>>,
     /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
     h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
+    /// True while user is drag-selecting text inside a find/replace input field.
+    fr_input_dragging: bool,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
-    // Find/Replace dialog state
-    find_dialog_visible: bool,
-    find_text: String,
-    replace_text: String,
-    #[allow(dead_code)] // For future case-sensitive search feature
-    find_case_sensitive: bool,
-    #[allow(dead_code)] // For future whole word search feature
-    find_whole_word: bool,
     /// Status text shown below the project search input ("N matches in M files").
     project_search_status: String,
     /// Ref to the search results ListBox so we can rebuild it after each search.
@@ -387,22 +381,6 @@ enum Msg {
     OpenSettingsFile,
     /// Settings file changed on disk.
     SettingsFileChanged,
-    /// Toggle find dialog visibility.
-    ToggleFindDialog,
-    /// Find text input changed.
-    FindTextChanged(String),
-    /// Replace text input changed.
-    ReplaceTextChanged(String),
-    /// Find next match.
-    FindNext,
-    /// Find previous match.
-    FindPrevious,
-    /// Replace current match and find next.
-    ReplaceNext,
-    /// Replace all matches.
-    ReplaceAll,
-    /// Close find dialog.
-    CloseFindDialog,
     /// Window size changed.
     WindowResized {
         width: i32,
@@ -1247,18 +1225,8 @@ impl SimpleComponent for App {
                                                 || f.downcast_ref::<gtk4::Text>().is_some()
                                         });
                                     if entry_has_focus {
-                                        // Escape: close the find dialog and return focus to editor.
-                                        if key_name == "Escape" {
-                                            sender.input(Msg::CloseFindDialog);
-                                            sender.input(Msg::Resize);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Ctrl-F: toggle find dialog.
-                                        if ctrl && !shift && unicode == Some('f') {
-                                            sender.input(Msg::ToggleFindDialog);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Let all other keys reach the Entry widget.
+                                        // Let all other keys reach the Entry widget
+                                        // (e.g. search panel input, terminal find input).
                                         return gtk4::glib::Propagation::Proceed;
                                     }
 
@@ -1371,7 +1339,7 @@ impl SimpleComponent for App {
                                         }
                                     }
 
-                                    // Ctrl-F: terminal find when terminal focused, else editor find dialog
+                                    // Ctrl-F: terminal find when terminal focused, else engine find/replace
                                     if ctrl && !shift && unicode == Some('f') {
                                         if engine.borrow().terminal_has_focus {
                                             if engine.borrow().terminal_find_active {
@@ -1380,7 +1348,10 @@ impl SimpleComponent for App {
                                                 sender.input(Msg::TerminalFindOpen);
                                             }
                                         } else {
-                                            sender.input(Msg::ToggleFindDialog);
+                                            // Pass Ctrl+F to engine (opens find/replace overlay
+                                            // or does page-down based on ctrl_f_action setting)
+                                            engine.borrow_mut().handle_key("f", Some('f'), true);
+                                            sender.input(Msg::SearchPollTick);
                                         }
                                         return gtk4::glib::Propagation::Stop;
                                     }
@@ -1742,124 +1713,12 @@ impl SimpleComponent for App {
                             },
                         },
 
-                        // Find/Replace Dialog (overlay at top-right)
-                        add_overlay = &gtk4::Revealer {
-                            set_transition_type: gtk4::RevealerTransitionType::SlideDown,
-                            set_transition_duration: 200,
-                            set_halign: gtk4::Align::End,
-                            set_valign: gtk4::Align::Start,
-                            set_margin_top: 10,
-                            set_margin_end: 10,
-
-                            #[watch]
-                            set_reveal_child: model.find_dialog_visible,
-
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Vertical,
-                                set_spacing: 8,
-                                set_css_classes: &["find-dialog"],
-                                set_width_request: 400,
-
-                                // Find input row
-                                gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Horizontal,
-                                    set_spacing: 4,
-
-                                    gtk4::Label {
-                                        set_text: "Find:",
-                                        set_width_request: 60,
-                                    },
-
-                                    #[name = "find_entry"]
-                                    gtk4::Entry {
-                                        set_placeholder_text: Some("Find in buffer"),
-                                        set_hexpand: true,
-
-                                        connect_changed[sender] => move |entry| {
-                                            let text = entry.text().to_string();
-                                            sender.input(Msg::FindTextChanged(text));
-                                        },
-
-                                        connect_activate[sender] => move |_| {
-                                            sender.input(Msg::FindNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "↑",
-                                        set_tooltip_text: Some("Previous (Shift+Enter)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::FindPrevious);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "↓",
-                                        set_tooltip_text: Some("Next (Enter)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::FindNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "×",
-                                        set_tooltip_text: Some("Close (Escape)"),
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::CloseFindDialog);
-                                        },
-                                    },
-                                },
-
-                                // Replace input row
-                                gtk4::Box {
-                                    set_orientation: gtk4::Orientation::Horizontal,
-                                    set_spacing: 4,
-
-                                    gtk4::Label {
-                                        set_text: "Replace:",
-                                        set_width_request: 60,
-                                    },
-
-                                    #[name = "replace_entry"]
-                                    gtk4::Entry {
-                                        set_placeholder_text: Some("Replace with"),
-                                        set_hexpand: true,
-
-                                        connect_changed[sender] => move |entry| {
-                                            let text = entry.text().to_string();
-                                            sender.input(Msg::ReplaceTextChanged(text));
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "Replace",
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::ReplaceNext);
-                                        },
-                                    },
-
-                                    gtk4::Button {
-                                        set_label: "Replace All",
-                                        connect_clicked[sender] => move |_| {
-                                            sender.input(Msg::ReplaceAll);
-                                        },
-                                    },
-                                },
-
-                                // Match count label
-                                #[name = "match_count_label"]
-                                gtk4::Label {
-                                    set_text: "No matches",
-                                    set_halign: gtk4::Align::Start,
-                                    set_css_classes: &["find-match-count"],
-                                },
-                            }
-                        }
+                        // Find/Replace is now engine-level (drawn by Cairo in draw.rs)
                     }
                 }
                 }  // close main_hbox
             }  // close outer gtk4::Box
-            }  // close window_overlay
+            }  // close window_overlay (gtk4::Overlay)
         }
     }
 
@@ -2101,13 +1960,9 @@ impl SimpleComponent for App {
             h_sb_hovered_cell: h_sb_hovered_cell.clone(),
             tab_close_hover_cell: tab_close_hover_cell.clone(),
             h_sb_drag_cell: h_sb_drag_cell.clone(),
+            fr_input_dragging: false,
             settings_monitor,
             sender: sender.input_sender().clone(),
-            find_dialog_visible: false,
-            find_text: String::new(),
-            replace_text: String::new(),
-            find_case_sensitive: false,
-            find_whole_word: false,
             sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
             sidebar_revealer: sidebar_revealer_ref.clone(),
             explorer_panel_box: explorer_panel_box_ref.clone(),
@@ -4041,9 +3896,45 @@ impl SimpleComponent for App {
         {
             let pos_cell = mouse_pos_cell.clone();
             let pos_cell_leave = mouse_pos_cell.clone();
+            let engine_motion = engine.clone();
+            let lh_motion = line_height_cell.clone();
+            let cw_motion = char_width_cell.clone();
+            let da_motion = widgets.drawing_area.clone();
             let mc = gtk4::EventControllerMotion::new();
             mc.connect_motion(move |_, x, y| {
                 pos_cell.set((x, y));
+                // Update context menu hover: persist selected index so it
+                // sticks when the mouse leaves. try_borrow_mut fails during
+                // draw (engine immutably borrowed) — that's fine, the draw
+                // function computes hover from mouse_pos directly.
+                if let Ok(mut eng) = engine_motion.try_borrow_mut() {
+                    if eng.context_menu.is_some() {
+                        let lh = lh_motion.get();
+                        let cw = cw_motion.get();
+                        if lh >= 1.0 && cw >= 1.0 {
+                            let col = (x / cw) as u16;
+                            let row = (y / lh) as u16;
+                            let tw = (da_motion.width() as f64 / cw) as u16;
+                            let th = (da_motion.height() as f64 / lh) as u16;
+                            let cm = eng.context_menu.as_ref().unwrap();
+                            if let crate::core::engine::ContextMenuClickResult::Item(idx) =
+                                crate::core::engine::resolve_context_menu_click(
+                                    &cm.items,
+                                    cm.screen_x,
+                                    cm.screen_y,
+                                    tw,
+                                    th,
+                                    col,
+                                    row,
+                                )
+                            {
+                                eng.context_menu.as_mut().unwrap().selected = idx;
+                            }
+                        }
+                        drop(eng);
+                        da_motion.queue_draw();
+                    }
+                }
             });
             mc.connect_leave(move |_| {
                 pos_cell_leave.set((-1.0, -1.0));
@@ -4208,14 +4099,26 @@ impl SimpleComponent for App {
                 x,
                 y,
             } => {
-                self.handle_tab_right_click(group_id, tab_idx, x, y, &sender);
+                let cw = self.cached_char_width.max(1.0);
+                let lh = self.cached_line_height.max(1.0);
+                let cx = (x / cw) as u16;
+                let cy = (y / lh) as u16;
+                self.engine
+                    .borrow_mut()
+                    .open_tab_context_menu(group_id, tab_idx, cx, cy);
+                self.draw_needed.set(true);
             }
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
                 // Kept as a no-op for exhaustive match.
             }
             Msg::EditorRightClick { x, y } => {
-                self.handle_editor_right_click(x, y);
+                let cw = self.cached_char_width.max(1.0);
+                let lh = self.cached_line_height.max(1.0);
+                let cx = (x / cw) as u16;
+                let cy = (y / lh) as u16;
+                self.engine.borrow_mut().open_editor_context_menu(cx, cy);
+                self.draw_needed.set(true);
             }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
@@ -4546,16 +4449,7 @@ impl SimpleComponent for App {
                 drop(engine);
                 self.draw_needed.set(true);
             }
-            Msg::ToggleFindDialog
-            | Msg::FindTextChanged(_)
-            | Msg::ReplaceTextChanged(_)
-            | Msg::FindNext
-            | Msg::FindPrevious
-            | Msg::ReplaceNext
-            | Msg::ReplaceAll
-            | Msg::CloseFindDialog
-            | Msg::WindowResized { .. }
-            | Msg::SidebarResized => {
+            Msg::WindowResized { .. } | Msg::SidebarResized => {
                 self.handle_find_replace_msg(msg);
             }
             Msg::ProjectSearchQueryChanged(q) => {
@@ -5239,6 +5133,64 @@ impl App {
             return;
         }
 
+        // Dismiss context menu on any key press (Escape, or j/k for nav, Enter to confirm).
+        if self.engine.borrow().context_menu.is_some() {
+            let mut engine = self.engine.borrow_mut();
+            match key_name.as_str() {
+                "Escape" => {
+                    engine.close_context_menu();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "Return" => {
+                    let _act = engine.context_menu_confirm();
+                    let needs_refresh = engine.explorer_needs_refresh;
+                    if needs_refresh {
+                        engine.explorer_needs_refresh = false;
+                    }
+                    drop(engine);
+                    if needs_refresh {
+                        sender.input(Msg::RefreshFileTree);
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "j" | "Down" => {
+                    if let Some(ref mut cm) = engine.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = (cm.selected + 1) % len;
+                        }
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "k" | "Up" => {
+                    if let Some(ref mut cm) = engine.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = if cm.selected > 0 {
+                                cm.selected - 1
+                            } else {
+                                len - 1
+                            };
+                        }
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                _ => {
+                    engine.close_context_menu();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    // Fall through to normal key handling
+                }
+            }
+        }
+
         // Dismiss any panel hover popup on key press.
         self.engine.borrow_mut().dismiss_panel_hover_now();
         if let Some(ref da) = *self.panel_hover_da.borrow() {
@@ -5844,6 +5796,10 @@ impl App {
         }
         // Tick swap file writes (only does work when updatetime elapsed).
         self.engine.borrow_mut().tick_swap_files();
+        // Poll for external git branch changes (rate-limited to once per 2s inside).
+        if self.engine.borrow_mut().tick_git_branch() {
+            self.draw_needed.set(true);
+        }
         // Auto-dismiss completed notifications after timeout; force redraw for spinner animation.
         {
             let mut engine = self.engine.borrow_mut();
@@ -5900,6 +5856,159 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // ── Context menu click handling (engine-drawn) ──
+        if self.engine.borrow().context_menu.is_some() {
+            let cw = self.cached_char_width.max(1.0);
+            let lh = self.cached_line_height.max(1.0);
+            let click_col = (x / cw) as u16;
+            let click_row = (y / lh) as u16;
+            let term_w = (width / cw) as u16;
+            let term_h = (height / lh) as u16;
+
+            let result = {
+                let engine = self.engine.borrow();
+                let cm = engine.context_menu.as_ref().unwrap();
+                crate::core::engine::resolve_context_menu_click(
+                    &cm.items,
+                    cm.screen_x,
+                    cm.screen_y,
+                    term_w,
+                    term_h,
+                    click_col,
+                    click_row,
+                )
+            };
+
+            use crate::core::engine::ContextMenuClickResult;
+            match result {
+                ContextMenuClickResult::Item(idx) => {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.context_menu.as_mut().unwrap().selected = idx;
+                    // context_menu_confirm() handles the action internally and
+                    // consumes the menu.
+                    let _act = engine.context_menu_confirm();
+                    let needs_tree_refresh = engine.explorer_needs_refresh;
+                    if needs_tree_refresh {
+                        engine.explorer_needs_refresh = false;
+                    }
+                    drop(engine);
+                    if needs_tree_refresh {
+                        sender.input(Msg::RefreshFileTree);
+                    }
+                }
+                ContextMenuClickResult::InsidePopup => {
+                    // Click inside but not on an item — ignore
+                }
+                ContextMenuClickResult::Outside => {
+                    self.engine.borrow_mut().close_context_menu();
+                }
+            }
+            self.draw_needed.set(true);
+            return;
+        }
+
+        // ── Find/replace overlay click handling (using shared hit regions) ──
+        if self.engine.borrow().find_replace_open {
+            let cw = self.cached_char_width.max(1.0);
+            let lh = self.cached_line_height.max(1.0);
+
+            let (hit_regions, on_panel, rel_col, rel_row) = {
+                let engine = self.engine.borrow();
+
+                // Build match_info (same logic as build_screen_layout)
+                let match_info = if engine.search_matches.is_empty() {
+                    if engine.find_replace_query.is_empty() {
+                        String::new()
+                    } else {
+                        "No results".to_string()
+                    }
+                } else {
+                    match engine.search_index {
+                        Some(idx) => {
+                            format!("{} of {}", idx + 1, engine.search_matches.len())
+                        }
+                        None => format!("{} matches", engine.search_matches.len()),
+                    }
+                };
+
+                let panel_w = render::FR_PANEL_WIDTH;
+                let (hit_regions, _) = render::compute_find_replace_hit_regions(
+                    panel_w,
+                    engine.find_replace_show_replace,
+                    &match_info,
+                );
+
+                // Replicate draw.rs pixel layout for panel bounding box
+                let pad = 6.0;
+                let input_w_px = 200.0;
+                let btn_s = lh;
+                let chevron_w = 16.0;
+                let toggles_w = 3.0 * (btn_s + 4.0);
+                let info_w = 80.0;
+                let nav_w = 4.0 * (btn_s + 2.0);
+                let popup_w = chevron_w + input_w_px + pad + toggles_w + info_w + nav_w + pad;
+                let row_count_f = if engine.find_replace_show_replace {
+                    2.0
+                } else {
+                    1.0
+                };
+                let popup_h = lh * row_count_f + pad * (row_count_f + 1.0);
+                let popup_x = (width - popup_w - 10.0).max(0.0);
+                let popup_y = lh * 2.5 + 2.0; // approximate position
+
+                let on_panel =
+                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
+
+                // Translate pixel to panel-relative row + char column
+                let row_y = popup_y + pad;
+                let rel_row = if y >= row_y && y < row_y + lh {
+                    0u16
+                } else if y >= row_y + lh + pad && y < row_y + lh + pad + lh {
+                    1u16
+                } else {
+                    u16::MAX
+                };
+                let content_px = popup_x + chevron_w; // content starts after chevron
+                let rel_col = ((x - content_px) / cw).max(0.0) as u16;
+
+                (hit_regions, on_panel, rel_col, rel_row)
+            };
+
+            if on_panel {
+                let mut matched_target = None;
+                for (region, target) in &hit_regions {
+                    if region.row == rel_row
+                        && rel_col >= region.col
+                        && rel_col < region.col + region.width
+                    {
+                        matched_target = Some((*target, region.col));
+                        break;
+                    }
+                }
+
+                if let Some((target, region_col)) = matched_target {
+                    use core::engine::FindReplaceClickTarget::*;
+
+                    let target = match target {
+                        FindInput(_) => FindInput(rel_col.saturating_sub(region_col) as usize),
+                        ReplaceInput(_) => {
+                            ReplaceInput(rel_col.saturating_sub(region_col) as usize)
+                        }
+                        other => other,
+                    };
+
+                    if matches!(target, FindInput(_) | ReplaceInput(_)) {
+                        self.fr_input_dragging = true;
+                    }
+
+                    self.engine.borrow_mut().handle_find_replace_click(target);
+                }
+
+                self.draw_needed.set(true);
+                return;
+            }
+        }
+
         // Picker popup: intercept all clicks when picker is open
         {
             let engine = self.engine.borrow();
@@ -6075,10 +6184,16 @@ impl App {
             drop(engine);
 
             if let Some(idx) = clicked_btn {
-                let _action = self.engine.borrow_mut().dialog_click_button(idx);
+                let action = self.engine.borrow_mut().dialog_click_button(idx);
                 if self.engine.borrow().explorer_needs_refresh {
                     self.engine.borrow_mut().explorer_needs_refresh = false;
                     sender.input(Msg::RefreshFileTree);
+                }
+                match action {
+                    EngineAction::Quit | EngineAction::SaveQuit => {
+                        self.save_session_and_exit();
+                    }
+                    _ => {}
                 }
             } else if outside {
                 self.engine.borrow_mut().dialog = None;
@@ -6946,6 +7061,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_tab_right_click(
         &mut self,
         group_id: core::window::GroupId,
@@ -7170,6 +7286,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_editor_right_click(&mut self, x: f64, y: f64) {
         let da = match self.drawing_area.borrow().as_ref() {
             Some(da) => da.clone(),
@@ -7581,7 +7698,8 @@ impl App {
                         sender.input(Msg::OpenRecentDialog);
                     }
                     "find" => {
-                        sender.input(Msg::ToggleFindDialog);
+                        self.engine.borrow_mut().open_find_replace();
+                        self.draw_needed.set(true);
                     }
                     "quit_menu" => {
                         if self.engine.borrow().has_any_unsaved() {
@@ -9151,88 +9269,6 @@ impl App {
 
     fn handle_find_replace_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::ToggleFindDialog => {
-                self.find_dialog_visible = !self.find_dialog_visible;
-                self.draw_needed.set(true);
-            }
-            Msg::FindTextChanged(text) => {
-                self.find_text = text.clone();
-                let mut engine = self.engine.borrow_mut();
-                engine.search_query = text;
-                engine.run_search();
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceTextChanged(text) => {
-                self.replace_text = text;
-            }
-            Msg::FindNext => {
-                let mut engine = self.engine.borrow_mut();
-                engine.search_next();
-                self.draw_needed.set(true);
-            }
-            Msg::FindPrevious => {
-                let mut engine = self.engine.borrow_mut();
-                engine.search_prev();
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceNext => {
-                let mut engine = self.engine.borrow_mut();
-
-                // Replace current match and find next
-                if let Some(current_idx) = engine.search_index {
-                    if let Some(&(start, end)) = engine.search_matches.get(current_idx) {
-                        engine.start_undo_group();
-                        engine.delete_with_undo(start, end);
-                        engine.insert_with_undo(start, &self.replace_text);
-                        engine.finish_undo_group();
-
-                        // Re-run search and move to next
-                        engine.run_search();
-                        engine.search_next();
-                    }
-                }
-
-                self.draw_needed.set(true);
-            }
-            Msg::ReplaceAll => {
-                let mut engine = self.engine.borrow_mut();
-                let pattern = engine.search_query.clone();
-                let replacement = self.replace_text.clone();
-
-                // Replace in entire buffer
-                let last_line = engine.buffer().len_lines().saturating_sub(1);
-                match engine.replace_in_range(Some((0, last_line)), &pattern, &replacement, "g") {
-                    Ok(count) => {
-                        engine.message = format!(
-                            "Replaced {} occurrence{}",
-                            count,
-                            if count == 1 { "" } else { "s" }
-                        );
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
-                }
-
-                // Re-run search to update highlights
-                engine.run_search();
-                self.draw_needed.set(true);
-            }
-            Msg::CloseFindDialog => {
-                self.find_dialog_visible = false;
-
-                // Clear search highlights
-                let mut engine = self.engine.borrow_mut();
-                engine.search_matches.clear();
-                engine.search_index = None;
-
-                // Return focus to editor
-                if let Some(ref drawing_area) = *self.drawing_area.borrow() {
-                    drawing_area.grab_focus();
-                }
-
-                self.draw_needed.set(true);
-            }
             Msg::WindowResized { width, height } => {
                 // Update session state with new window geometry (debounced save)
                 let mut engine = self.engine.borrow_mut();
@@ -9483,44 +9519,35 @@ impl App {
 
             Msg::ShowQuitConfirm => {
                 if !self.engine.borrow().has_any_unsaved() {
-                    // No unsaved changes — save session and exit immediately.
                     self.save_session_and_exit();
                 }
-                // Show a confirmation dialog listing the choice.
-                let dialog = gtk4::Dialog::with_buttons(
-                    Some("Unsaved Changes"),
-                    Some(&self.window),
-                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                    &[
-                        ("Save All & Quit", gtk4::ResponseType::Accept),
-                        ("Quit Without Saving", gtk4::ResponseType::Reject),
-                        ("Cancel", gtk4::ResponseType::Cancel),
+                use crate::core::engine::DialogButton;
+                self.engine.borrow_mut().show_dialog(
+                    "quit_unsaved",
+                    "Unsaved Changes",
+                    vec![
+                        "You have unsaved changes.".to_string(),
+                        "Do you want to save before quitting?".to_string(),
+                    ],
+                    vec![
+                        DialogButton {
+                            label: "Save All & Quit".into(),
+                            hotkey: 's',
+                            action: "save_quit".into(),
+                        },
+                        DialogButton {
+                            label: "Quit Without Saving".into(),
+                            hotkey: 'q',
+                            action: "discard_quit".into(),
+                        },
+                        DialogButton {
+                            label: "Cancel".into(),
+                            hotkey: '\0',
+                            action: "cancel".into(),
+                        },
                     ],
                 );
-                let label = gtk4::Label::new(Some(
-                    "You have unsaved changes.\nDo you want to save before quitting?",
-                ));
-                label.set_margin_top(12);
-                label.set_margin_bottom(12);
-                label.set_margin_start(12);
-                label.set_margin_end(12);
-                dialog.content_area().append(&label);
-                let engine_clone = self.engine.clone();
-                let s = sender.input_sender().clone();
-                dialog.connect_response(move |dlg, resp| {
-                    dlg.close();
-                    match resp {
-                        gtk4::ResponseType::Accept => {
-                            engine_clone.borrow_mut().save_all_dirty();
-                            s.send(Msg::QuitConfirmed).ok();
-                        }
-                        gtk4::ResponseType::Reject => {
-                            s.send(Msg::QuitConfirmed).ok();
-                        }
-                        _ => {} // Cancel — do nothing
-                    }
-                });
-                dialog.present();
+                self.draw_needed.set(true);
             }
 
             Msg::QuitConfirmed => {
@@ -9529,38 +9556,29 @@ impl App {
             }
 
             Msg::ShowCloseTabConfirm => {
-                let dialog = gtk4::Dialog::with_buttons(
-                    Some("Unsaved Changes"),
-                    Some(&self.window),
-                    gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                    &[
-                        ("Save & Close Tab", gtk4::ResponseType::Accept),
-                        ("Discard & Close Tab", gtk4::ResponseType::Reject),
-                        ("Cancel", gtk4::ResponseType::Cancel),
+                use crate::core::engine::DialogButton;
+                self.engine.borrow_mut().show_dialog(
+                    "close_tab_confirm",
+                    "Unsaved Changes",
+                    vec!["This file has unsaved changes.".to_string()],
+                    vec![
+                        DialogButton {
+                            label: "Save & Close".into(),
+                            hotkey: 's',
+                            action: "save_close".into(),
+                        },
+                        DialogButton {
+                            label: "Discard & Close".into(),
+                            hotkey: 'd',
+                            action: "discard".into(),
+                        },
+                        DialogButton {
+                            label: "Cancel".into(),
+                            hotkey: '\0',
+                            action: "cancel".into(),
+                        },
                     ],
                 );
-                let label = gtk4::Label::new(Some(
-                    "This file has unsaved changes.\nDo you want to save before closing the tab?",
-                ));
-                label.set_margin_top(12);
-                label.set_margin_bottom(12);
-                label.set_margin_start(12);
-                label.set_margin_end(12);
-                dialog.content_area().append(&label);
-                let s = sender.input_sender().clone();
-                dialog.connect_response(move |dlg, resp| {
-                    dlg.close();
-                    match resp {
-                        gtk4::ResponseType::Accept => {
-                            s.send(Msg::CloseTabConfirmed { save: true }).ok();
-                        }
-                        gtk4::ResponseType::Reject => {
-                            s.send(Msg::CloseTabConfirmed { save: false }).ok();
-                        }
-                        _ => {} // Cancel — do nothing
-                    }
-                });
-                dialog.present();
                 self.draw_needed.set(true);
             }
 

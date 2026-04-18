@@ -3,7 +3,7 @@
 //! All modules that need `~/.config/vimcode/` (or the platform equivalent)
 //! should call [`vimcode_config_dir()`] instead of hardcoding paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Return the platform-appropriate VimCode configuration directory.
 ///
@@ -41,6 +41,19 @@ pub fn home_dir() -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
+}
+
+/// Strip the `\\?\` extended-length path prefix that Windows adds when
+/// a path is canonicalized. Returns the path unchanged on non-Windows.
+pub fn strip_unc_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::borrow::Cow::Owned(PathBuf::from(stripped));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 #[cfg(test)]

@@ -111,8 +111,8 @@ jobs:
     - name: Build TUI binary (no GTK)
       run: cargo build --bin vcd --no-default-features
 
-    - name: Run tests (library only, no GTK)
-      run: cargo test --lib --no-default-features
+    - name: Run tests (no GTK)
+      run: cargo test --no-default-features
 
   coverage:
     name: Code Coverage

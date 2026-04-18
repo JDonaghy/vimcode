@@ -1,13 +1,35 @@
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Check `.opencode/specs/` for detailed feature specs before starting
-3. Prompt user to update `PROJECT_STATE.md` after significant tasks
+3. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
+4. Prompt user to update `PROJECT_STATE.md` after significant tasks
+
+## Issue-Driven Workflow
+All non-trivial work should be tracked via GitHub Issues. Issues are the source of truth for what needs doing, why, and what the design is.
+
+**Starting work on an issue:**
+1. Create a feature branch from `develop`: `git checkout -b issue-{number}-{short-description} develop`
+2. Do the work on that branch, committing as you go
+3. **Do NOT push or create a PR until the user has run smoke tests and confirmed the changes work.** Commit locally, offer smoke tests, wait for approval before pushing.
+4. When the user approves, push and create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
+5. The user reviews and merges the PR. When the user confirms the merge, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close
+
+**Creating issues:**
+- At session end, create issues for any planned but unstarted work discussed during the session
+- Include full design context in the issue body — file paths, API details, expected behavior, Neovim reference values
+- Use milestones to group related work (e.g., "Vim Conformance")
+- Use labels for categorization (`conformance`, `testing`, `bug:vim-deviation`, `lua-api`, etc.)
+- Issues should be self-contained — a new session should be able to pick one up and implement it from the issue body alone
+
+**Bug fixes found during other work:**
+- If a bug is found while working on something else, create a separate issue for it
+- Fix it on the current branch if it's small and directly related, or leave it for a separate branch if it's independent
 
 ## Documentation Maintenance (MANDATORY)
 After completing any feature or significant change, update ALL of these files:
 - **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
 - **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
-- **`PLAN.md`** — update recently completed section at top; tick off roadmap items
+- **GitHub Issues** — close completed issues, create new ones for planned work; update milestones as needed (PLAN.md archived — issues are the source of truth)
 - **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
 - **`SUMMARIES/`** — update any summary file whose source file was modified (new methods, changed types, significant line count changes); see below
 
@@ -43,7 +65,7 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 
-**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there.
+**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there. When building a new native GUI backend (e.g. macOS), read **`docs/NATIVE_GUI_LESSONS.md`** first — it documents pitfalls from Win-GUI (breadcrumb offset bugs, multi-group layout issues, click/draw parity, backend checklist).
 
 ### GTK directory (`src/gtk/`)
 
@@ -155,7 +177,30 @@ This prevents CI failures and maintains code quality.
 - Core: Return `Result<T, E>` for I/O, silent no-ops for bounds
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
+## Theme Colors (CRITICAL)
+**NEVER introduce new hex color literals for derived theme fields.** Every new color added to the `Theme` struct must be derived from an existing foundational theme field (`background`, `foreground`, etc.) using `lighten()`/`darken()`/`cursorline_tint()`/`colorcolumn_tint()` or similar. Use a local variable to avoid repeating hex strings:
+```rust
+pub fn onedark() -> Self {
+    let bg = Color::from_hex("#1a1a1a");
+    Self {
+        background: bg,
+        new_derived_color: bg.some_tint(),  // GOOD: derived from variable
+        // bad_color: Color::from_hex("#2c313a"),  // BAD: hardcoded hex
+    }
+}
+```
+**Why:** Hardcoded hex values don't adapt to custom themes or VSCode theme imports. Only foundational colors (background, foreground, keyword, string, etc.) should have hex literals. VSCode theme imports (`from_vscode_json`) can override derived values with user-specified exact colors.
+
+## Testing (CRITICAL)
+**NEVER run `cargo test` with the `win-gui` feature enabled.** This spawns hundreds of real Win32 windows and locks up the machine. Use these commands instead:
+- **Run tests:** `cargo test --no-default-features --lib` (no GTK, no win-gui)
+- **Build win-gui:** `cargo build --bin vimcode-win --features win-gui --no-default-features`
+- **Clippy win-gui:** `cargo clippy --features win-gui --no-default-features`
+- NEVER combine `cargo test` with `--features win-gui`
+
 ## Common Patterns
+
+**Hit regions for clickable UI elements:** When adding clickable elements to the find/replace overlay (or future UI panels), define hit regions in `engine/mod.rs` using `FrHitRegion` + `FindReplaceClickTarget` types. Compute regions once in `build_screen_layout()`, then backends walk the region list to resolve clicks. Dispatch through a shared `Engine::handle_*_click()` method. This avoids per-backend geometry duplication and is the established pattern for crate extraction. See `compute_find_replace_hit_regions()` as the reference implementation.
 
 **Add Normal Mode Key:** `engine/keys.rs` → `handle_normal_key()` → add match arm → test
 

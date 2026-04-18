@@ -133,7 +133,20 @@ pub struct LspConfig {
 impl LspConfig {
     /// Return the install command for the current platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
+    /// Applies known fixups (e.g. rust-analyzer on Windows uses `rustup component add`).
     pub fn install_cmd_for_platform(&self) -> &str {
+        // On Windows, rust-analyzer should be installed via rustup, not cargo.
+        // The generic `install` field says `cargo install rust-analyzer` which
+        // compiles from source and is slow.  The rustup component is instant
+        // and is the standard approach.
+        #[cfg(target_os = "windows")]
+        if self.binary == "rust-analyzer"
+            && self.install_windows.is_empty()
+            && self.install.starts_with("cargo install")
+        {
+            return "rustup component add rust-analyzer";
+        }
+
         let platform = platform_install_field(
             &self.install_linux,
             &self.install_macos,

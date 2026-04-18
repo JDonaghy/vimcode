@@ -321,10 +321,13 @@ impl Engine {
 
         // If there are install commands, combine them and store for the UI to run
         // in a visible terminal pane.
-        if !install_commands.is_empty() {
-            let combined = install_commands.join(" && ");
+        let has_install = !install_commands.is_empty();
+        if has_install {
+            // Use `;` as separator — `&&` is not valid in PowerShell 5.x
+            // (Windows default).  `;` works in both PowerShell and bash.
+            let combined = install_commands.join(" ; ");
             let header = format!("echo '── Installing {ext_name} ──'");
-            self.pending_terminal_command = Some(format!("{header} && {combined}"));
+            self.pending_terminal_command = Some(format!("{header} ; {combined}"));
         }
 
         // Mark installed with version and persist
@@ -338,19 +341,23 @@ impl Engine {
 
         // Kick-start LSP for the current buffer if it matches this extension's languages.
         // Without this, the user would have to re-open the file to get LSP support.
-        let active_bid = self.active_buffer_id();
-        if let Some(state) = self.buffer_manager.get(active_bid) {
-            let buf_lang = state.lsp_language_id.clone().or_else(|| {
-                state
-                    .file_path
+        // Skip if an install is pending — the binary isn't available yet; LSP will be
+        // started when the install terminal completes.
+        if !has_install {
+            let active_bid = self.active_buffer_id();
+            if let Some(state) = self.buffer_manager.get(active_bid) {
+                let buf_lang = state.lsp_language_id.clone().or_else(|| {
+                    state
+                        .file_path
+                        .as_ref()
+                        .and_then(|p| lsp::language_id_from_path(p))
+                });
+                let matches = buf_lang
                     .as_ref()
-                    .and_then(|p| lsp::language_id_from_path(p))
-            });
-            let matches = buf_lang
-                .as_ref()
-                .is_some_and(|lang| manifest.language_ids.iter().any(|l| l == lang));
-            if matches {
-                self.lsp_did_open(active_bid);
+                    .is_some_and(|lang| manifest.language_ids.iter().any(|l| l == lang));
+                if matches {
+                    self.lsp_did_open(active_bid);
+                }
             }
         }
 
@@ -631,9 +638,9 @@ impl Engine {
         }
 
         if !install_commands.is_empty() {
-            let combined = install_commands.join(" && ");
+            let combined = install_commands.join(" ; ");
             let header = format!("echo '── Updating {ext_name} ──'");
-            self.pending_terminal_command = Some(format!("{header} && {combined}"));
+            self.pending_terminal_command = Some(format!("{header} ; {combined}"));
         }
 
         // Update version

@@ -130,11 +130,12 @@ fn test_gJ_join_no_space() {
 }
 
 #[test]
-fn test_gJ_join_strips_leading_whitespace() {
+fn test_gJ_join_preserves_leading_whitespace() {
+    // gJ joins without inserting space AND without stripping whitespace (Neovim-verified)
     let mut e = engine_with("hello\n   world\n");
     press(&mut e, 'g');
     press(&mut e, 'J');
-    assert_buf(&e, "helloworld\n");
+    assert_buf(&e, "hello   world\n");
 }
 
 // ── gf open file ─────────────────────────────────────────────────────────────

@@ -578,8 +578,11 @@ impl Engine {
 
     /// Return the path relative to cwd.
     pub fn copy_relative_path(&self, path: &Path) -> String {
-        path.strip_prefix(&self.cwd)
-            .unwrap_or(path)
+        let clean_path = crate::core::paths::strip_unc_prefix(path);
+        let clean_cwd = crate::core::paths::strip_unc_prefix(&self.cwd);
+        clean_path
+            .strip_prefix(clean_cwd.as_ref())
+            .unwrap_or(&clean_path)
             .to_string_lossy()
             .into_owned()
     }
@@ -1526,6 +1529,38 @@ impl Engine {
         }
     }
 
+    /// Jump to the last-accessed tab (g<Tab> / :tablast-accessed).
+    /// Uses the MRU list: index 0 is current, index 1 is previous.
+    /// Calling again toggles back (Vim behaviour).
+    pub fn goto_last_accessed_tab(&mut self) {
+        // Prune stale entries
+        self.tab_mru.retain(|&(g, idx)| {
+            self.editor_groups
+                .get(&g)
+                .is_some_and(|grp| idx < grp.tabs.len())
+        });
+        // Ensure current is at index 0
+        let current = (self.active_group, self.active_group().active_tab);
+        if self.tab_mru.first() != Some(&current) {
+            self.tab_mru.retain(|e| *e != current);
+            self.tab_mru.insert(0, current);
+        }
+        if self.tab_mru.len() < 2 {
+            return; // No previous tab to jump to
+        }
+        let (group_id, tab_idx) = self.tab_mru[1];
+        if self.editor_groups.contains_key(&group_id) {
+            self.active_group = group_id;
+            self.active_group_mut().active_tab = tab_idx;
+            self.line_annotations.clear();
+            self.blame_annotations_active = false;
+            self.tab_mru_touch();
+            self.tab_nav_push();
+            self.lsp_ensure_active_buffer();
+            self.ensure_active_tab_visible();
+        }
+    }
+
     /// Open the tab switcher popup, pre-selecting the second MRU entry.
     pub fn open_tab_switcher(&mut self) {
         // Build a clean MRU list: only include entries that still exist
@@ -1575,6 +1610,52 @@ impl Engine {
             }
         }
         self.tab_switcher_open = false;
+    }
+
+    /// Handle a click on a tab bar hit region.
+    /// `group_id` identifies which group's tab bar was clicked.
+    /// Returns `true` if a close-dirty-tab confirmation is needed.
+    pub fn handle_tab_bar_click(&mut self, group_id: GroupId, target: TabBarClickTarget) -> bool {
+        self.active_group = group_id;
+        match target {
+            TabBarClickTarget::Tab(idx) => {
+                self.goto_tab(idx);
+                self.lsp_ensure_active_buffer();
+            }
+            TabBarClickTarget::CloseTab(idx) => {
+                if let Some(g) = self.editor_groups.get_mut(&group_id) {
+                    g.active_tab = idx;
+                }
+                self.line_annotations.clear();
+                if self.dirty() {
+                    return true; // Caller should show confirmation
+                }
+                self.close_tab();
+            }
+            TabBarClickTarget::SplitRight => {
+                self.open_editor_group(SplitDirection::Vertical);
+            }
+            TabBarClickTarget::SplitDown => {
+                self.open_editor_group(SplitDirection::Horizontal);
+            }
+            TabBarClickTarget::ActionMenu => {
+                // Caller handles this — needs screen coordinates
+            }
+            TabBarClickTarget::DiffPrev => {
+                if self.windows.contains_key(&self.active_window_id()) {
+                    self.jump_prev_hunk();
+                }
+            }
+            TabBarClickTarget::DiffNext => {
+                if self.windows.contains_key(&self.active_window_id()) {
+                    self.jump_next_hunk();
+                }
+            }
+            TabBarClickTarget::DiffToggle => {
+                self.diff_toggle_hide_unchanged();
+            }
+        }
+        false
     }
 
     /// Get display info for each MRU entry: (filename, path, is_dirty).

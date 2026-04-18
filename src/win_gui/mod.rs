@@ -33,9 +33,12 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::core::engine::{open_url_in_browser, Engine, EngineAction, OpenMode};
-use crate::core::window::{GroupId, WindowId, WindowRect};
+use crate::core::window::{DropZone, GroupId, SplitDirection, WindowId, WindowRect};
 use crate::icons;
-use crate::render::{self, build_screen_layout, ScreenLayout, Theme, MENU_STRUCTURE};
+use crate::render::{
+    self, build_screen_layout, build_window_status_line, ScreenLayout, StatusAction, Theme,
+    MENU_STRUCTURE,
+};
 
 use self::draw::DrawContext;
 use self::input::{translate_char, translate_vk};
@@ -84,6 +87,7 @@ struct TabSlot {
 #[derive(Clone, Debug)]
 struct CachedWindowRect {
     window_id: WindowId,
+    group_id: GroupId,
     rect: WindowRect,
     gutter_chars: usize,
 }
@@ -128,6 +132,12 @@ struct WinSidebar {
     dirty: bool,
     /// Whether the sidebar has keyboard focus.
     has_focus: bool,
+    // Search panel state
+    search_input_mode: bool,
+    replace_input_focused: bool,
+    search_scroll_top: usize,
+    /// Currently active extension panel (overrides active_panel when Some).
+    ext_panel_name: Option<String>,
 }
 
 impl WinSidebar {
@@ -135,7 +145,7 @@ impl WinSidebar {
         Self {
             visible: false,
             active_panel: SidebarPanel::Explorer,
-            activity_bar_px: 36.0,
+            activity_bar_px: 48.0,
             panel_width: 220.0,
             rows: Vec::new(),
             expanded: HashSet::new(),
@@ -145,6 +155,10 @@ impl WinSidebar {
             sort_case_insensitive: true,
             dirty: true,
             has_focus: false,
+            search_input_mode: true,
+            replace_input_focused: false,
+            search_scroll_top: 0,
+            ext_panel_name: None,
         }
     }
 
@@ -257,6 +271,25 @@ fn collect_explorer_rows(
     }
 }
 
+/// Cached find/replace overlay geometry for click handling.
+#[derive(Clone)]
+struct FindReplaceRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    input_x: f32,
+    input_w: f32,
+    row_y: f32,
+    /// X positions of nav buttons [↑, ↓, ≡, ×] (4 entries), each btn_s wide.
+    nav_x: [f32; 4],
+    btn_s: f32,
+    /// Replace row Y (only valid when show_replace was true at draw time).
+    rep_y: f32,
+    /// X positions of replace buttons: [AB_x, AB_w, R1_x, R*_x].
+    rep_btns: [f32; 4],
+}
+
 struct AppState {
     engine: Engine,
     theme: Theme,
@@ -265,6 +298,10 @@ struct AppState {
     text_format: IDWriteTextFormat,
     /// Proportional UI font (Segoe UI) for menus and tab labels.
     ui_text_format: IDWriteTextFormat,
+    /// Icon font for activity bar and toolbar icons (larger, tries Symbols Nerd Font).
+    icon_text_format: IDWriteTextFormat,
+    /// True when icon_text_format uses "Symbols Nerd Font" (bundled) instead of Segoe MDL2.
+    nerd_icon_font: bool,
     render_target: Option<ID2D1HwndRenderTarget>,
     hwnd: HWND,
     char_width: f32,
@@ -274,6 +311,16 @@ struct AppState {
     // ── Cached layout from last draw pass ────────────────────────────────
     tab_slots: Vec<TabSlot>,
     cached_window_rects: Vec<CachedWindowRect>,
+    /// Cached breadcrumb bars from last draw pass (for click handling).
+    cached_breadcrumbs: Vec<render::BreadcrumbBar>,
+    /// Cached diff toolbar button positions: (group_id, prev_x, next_x, fold_x, btn_w, bar_y, bar_h).
+    cached_diff_toolbar_btns: Vec<(GroupId, f32, f32, f32, f32, f32, f32)>,
+    /// Cached group dividers from last draw pass (for drag handling).
+    cached_dividers: Vec<crate::core::window::GroupDivider>,
+    /// Cached find/replace overlay geometry from last draw pass.
+    cached_find_replace_rect: Option<FindReplaceRect>,
+    /// True when the user is dragging within a find/replace input field.
+    fr_input_dragging: bool,
 
     // ── Sidebar ───────────────────────────────────────────────────────────
     sidebar: WinSidebar,
@@ -286,11 +333,38 @@ struct AppState {
     mouse_text_drag: bool,
     sidebar_resize_drag: bool,
     scrollbar_drag: Option<WindowId>,
+    h_scrollbar_drag: Option<WindowId>,
+    terminal_resize_drag: bool,
+    /// Active group divider drag: split_index being dragged.
+    group_divider_drag: Option<usize>,
+    /// True when dragging to select text in the terminal panel.
+    terminal_text_drag: bool,
     last_click_time: Instant,
     last_click_pos: (i16, i16),
 
+    // ── Tab drag-and-drop ────────────────────────────────────────────────
+    /// Mousedown position on a tab, before threshold is reached.
+    tab_drag_start: Option<(f32, f32, GroupId, usize)>,
+    /// True when actively dragging a tab (threshold exceeded).
+    tab_dragging: bool,
+    /// True when dragging the terminal split divider.
+    terminal_split_drag: bool,
+
+    // ── Clipboard sync ────────────────────────────────────────────────────
+    /// Last known `"` register content, for detecting yank changes.
+    last_clipboard_register: Option<String>,
+
+    /// X position of the hovered tab for tooltip placement.
+    tab_tooltip_x: f32,
+
     // ── Periodic refresh ─────────────────────────────────────────────────
     last_sidebar_refresh: Instant,
+
+    // ── Layout cache ─────────────────────────────────────────────────────
+    /// Bottom chrome height in DIPs (status bar + cmd line + terminal + above-terminal status)
+    bottom_chrome_px: f32,
+    /// Cached popup bounding rectangles from the last draw pass, for mouse hit-testing.
+    popup_rects: CachedPopupRects,
 
     // ── Caption buttons (custom title bar) ──────────────────────────────
     /// Which caption button is hovered (0=min, 1=max, 2=close), or None.
@@ -299,6 +373,89 @@ struct AppState {
 
 thread_local! {
     static APP: RefCell<Option<AppState>> = const { RefCell::new(None) };
+}
+
+// ─── Bundled font installation ──────────────────────────────────────────────
+
+/// Install the bundled Nerd Font subset to the Windows per-user fonts directory
+/// so DirectWrite can find it by family name. Returns `true` if the font file is
+/// in place (already existed or was successfully written). Mirrors the GTK
+/// approach of installing to `~/.local/share/fonts/` on Linux.
+fn install_bundled_icon_font_windows() -> bool {
+    static FONT_BYTES: &[u8] = include_bytes!("../../data/fonts/vimcode-icons.ttf");
+
+    let local = match std::env::var("LOCALAPPDATA") {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => return false,
+    };
+    let fonts_dir = local.join("Microsoft\\Windows\\Fonts");
+    let _ = std::fs::create_dir_all(&fonts_dir);
+    let dest = fonts_dir.join("vimcode-icons.ttf");
+
+    // Skip write if the file already exists with the correct size.
+    if dest.exists() {
+        if let Ok(meta) = std::fs::metadata(&dest) {
+            if meta.len() == FONT_BYTES.len() as u64 {
+                // File already installed — ensure registry entry exists
+                register_user_font(&dest);
+                return true;
+            }
+        }
+    }
+
+    if std::fs::write(&dest, FONT_BYTES).is_ok() {
+        register_user_font(&dest);
+        // Broadcast font change so DirectWrite picks it up in this session
+        unsafe {
+            let _ = SendMessageW(
+                HWND_BROADCAST,
+                WM_FONTCHANGE,
+                Some(WPARAM(0)),
+                Some(LPARAM(0)),
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Register a per-user font in the registry so DirectWrite sees it.
+fn register_user_font(font_path: &std::path::Path) {
+    use windows::Win32::System::Registry::*;
+
+    let key_path = w!("Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts");
+    let mut hkey = HKEY::default();
+    let result = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_path,
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if result.is_err() {
+        return;
+    }
+
+    let value_name = w!("Symbols Nerd Font (TrueType)");
+    let path_str: Vec<u16> = font_path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let data_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(path_str.as_ptr() as *const u8, path_str.len() * 2) };
+
+    unsafe {
+        let _ = RegSetValueExW(hkey, value_name, Some(0), REG_SZ, Some(data_bytes));
+        let _ = RegCloseKey(hkey);
+    }
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -316,9 +473,24 @@ pub fn run(file_path: Option<PathBuf>) {
 
     let mut engine = Engine::new();
     engine.menu_bar_visible = true;
+
+    // Install the bundled Nerd Font subset so DirectWrite can find it.
+    let bundled_font_installed = install_bundled_icon_font_windows();
+
+    // Auto-detect Nerd Font availability on Windows (bundled font counts)
+    let nerd_available = bundled_font_installed || icons::detect_nerd_font_windows();
+    let nerd_font_missing = engine.settings.use_nerd_fonts && !nerd_available;
+    if nerd_font_missing {
+        engine.settings.use_nerd_fonts = false;
+    }
     icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
     engine.plugin_init();
     engine.ext_refresh();
+    if nerd_font_missing {
+        engine.message =
+            "No Nerd Font detected — using fallback icons. Install a Nerd Font and run :set nerdfonts to enable."
+                .to_string();
+    }
 
     if let Some(path) = file_path {
         if path.is_dir() {
@@ -409,6 +581,76 @@ pub fn run(file_path: Option<PathBuf>) {
     }
     .expect("CreateTextFormat for UI font");
 
+    // Icon text format for activity bar — try the bundled "Symbols Nerd Font"
+    // first (installed to per-user fonts above), then fall back to Windows icon
+    // fonts (Segoe Fluent Icons on Win11, Segoe MDL2 Assets on Win10+).
+    let icon_font_size = 20.0 * dpi_scale; // 20px — matches GTK's 24px visually
+    let nerd_icon_font = bundled_font_installed
+        && unsafe {
+            dwrite_factory
+                .CreateTextFormat(
+                    w!("Symbols Nerd Font"),
+                    None,
+                    DWRITE_FONT_WEIGHT_REGULAR,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    icon_font_size,
+                    w!("en-us"),
+                )
+                .is_ok()
+        };
+    let icon_text_format: IDWriteTextFormat = unsafe {
+        if nerd_icon_font {
+            dwrite_factory.CreateTextFormat(
+                w!("Symbols Nerd Font"),
+                None,
+                DWRITE_FONT_WEIGHT_REGULAR,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                icon_font_size,
+                w!("en-us"),
+            )
+        } else {
+            dwrite_factory
+                .CreateTextFormat(
+                    w!("Segoe Fluent Icons"),
+                    None,
+                    DWRITE_FONT_WEIGHT_REGULAR,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    icon_font_size,
+                    w!("en-us"),
+                )
+                .or_else(|_| {
+                    dwrite_factory.CreateTextFormat(
+                        w!("Segoe MDL2 Assets"),
+                        None,
+                        DWRITE_FONT_WEIGHT_REGULAR,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        icon_font_size,
+                        w!("en-us"),
+                    )
+                })
+                .or_else(|_| {
+                    dwrite_factory.CreateTextFormat(
+                        w!("Consolas"),
+                        None,
+                        DWRITE_FONT_WEIGHT_REGULAR,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        icon_font_size,
+                        w!("en-us"),
+                    )
+                })
+        }
+    }
+    .expect("CreateTextFormat for icon font");
+    unsafe {
+        let _ = icon_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        let _ = icon_text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
     // Measure monospace dimensions (already includes DPI scaling via font size)
     let char_width = draw::measure_char_width(&dwrite_factory, &text_format);
     let line_height = draw::measure_line_height(&dwrite_factory, &text_format);
@@ -422,6 +664,8 @@ pub fn run(file_path: Option<PathBuf>) {
             dwrite_factory,
             text_format,
             ui_text_format,
+            icon_text_format,
+            nerd_icon_font,
             render_target: None,
             hwnd,
             char_width,
@@ -429,15 +673,31 @@ pub fn run(file_path: Option<PathBuf>) {
             dpi_scale,
             tab_slots: Vec::new(),
             cached_window_rects: Vec::new(),
+            cached_breadcrumbs: Vec::new(),
+            cached_diff_toolbar_btns: Vec::new(),
+            cached_dividers: Vec::new(),
+            cached_find_replace_rect: None,
+            fr_input_dragging: false,
             sidebar: WinSidebar::new(),
             current_colorscheme: initial_colorscheme,
             current_font_size: initial_font_size,
             mouse_text_drag: false,
             sidebar_resize_drag: false,
             scrollbar_drag: None,
+            h_scrollbar_drag: None,
+            terminal_resize_drag: false,
+            group_divider_drag: None,
+            terminal_text_drag: false,
             last_click_time: Instant::now(),
             last_click_pos: (0, 0),
+            tab_drag_start: None,
+            tab_dragging: false,
+            terminal_split_drag: false,
+            last_clipboard_register: None,
+            tab_tooltip_x: 0.0,
             last_sidebar_refresh: Instant::now(),
+            bottom_chrome_px: 0.0,
+            popup_rects: CachedPopupRects::default(),
             caption_hover: None,
         });
     });
@@ -681,6 +941,52 @@ unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             on_dpi_changed(hwnd, wparam, lparam);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // Check for unsaved changes before closing
+            let has_unsaved = APP.with(|app| {
+                let app = app.borrow();
+                app.as_ref()
+                    .is_some_and(|state| state.engine.has_any_unsaved())
+            });
+            if has_unsaved {
+                APP.with(|app| {
+                    let mut app = app.borrow_mut();
+                    if let Some(state) = app.as_mut() {
+                        use crate::core::engine::DialogButton;
+                        state.engine.show_dialog(
+                            "quit_unsaved",
+                            "Unsaved Changes",
+                            vec![
+                                "You have unsaved changes. Do you want to save before quitting?"
+                                    .to_string(),
+                            ],
+                            vec![
+                                DialogButton {
+                                    label: "Save All & Quit".into(),
+                                    hotkey: 's',
+                                    action: "save_quit".into(),
+                                },
+                                DialogButton {
+                                    label: "Quit Without Saving".into(),
+                                    hotkey: 'd',
+                                    action: "discard_quit".into(),
+                                },
+                                DialogButton {
+                                    label: "Cancel".into(),
+                                    hotkey: '\0',
+                                    action: "cancel".into(),
+                                },
+                            ],
+                        );
+                    }
+                });
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0) // Don't close — let the dialog handle it
+            } else {
+                DestroyWindow(hwnd).ok();
+                LRESULT(0)
+            }
+        }
         WM_DESTROY => {
             on_destroy();
             PostQuitMessage(0);
@@ -735,16 +1041,37 @@ fn on_nchittest(hwnd: HWND, lparam: LPARAM) -> u32 {
     let px = pt.x as f32;
     let py = pt.y as f32;
 
-    // Top resize border (thin strip at very top for resizing)
-    if py < resize_border && !is_maximized(hwnd) {
-        // Top corners
+    let client_height = (rc.bottom - rc.top) as f32;
+
+    if !is_maximized(hwnd) {
+        // Top resize border
+        if py < resize_border {
+            if px < resize_border {
+                return HTTOPLEFT;
+            }
+            if px > client_width - resize_border {
+                return HTTOPRIGHT;
+            }
+            return HTTOP;
+        }
+        // Bottom resize border
+        if py > client_height - resize_border {
+            if px < resize_border {
+                return HTBOTTOMLEFT;
+            }
+            if px > client_width - resize_border {
+                return HTBOTTOMRIGHT;
+            }
+            return HTBOTTOM;
+        }
+        // Left resize border
         if px < resize_border {
-            return HTTOPLEFT;
+            return HTLEFT;
         }
+        // Right resize border
         if px > client_width - resize_border {
-            return HTTOPRIGHT;
+            return HTRIGHT;
         }
-        return HTTOP;
     }
 
     // Caption buttons area (right side of the title bar row)
@@ -777,18 +1104,14 @@ fn on_nchittest(hwnd: HWND, lparam: LPARAM) -> u32 {
                 .is_some_and(|s| s.engine.menu_bar_visible)
         });
         if menu_bar_visible {
-            let char_width = APP.with(|app| app.borrow().as_ref().map_or(8.0f32, |s| s.char_width));
-            // Menu labels start at 1*cw and extend across all menu items
-            let mut menu_end = char_width; // initial offset
-            for (name, _, _) in MENU_STRUCTURE.iter() {
-                menu_end += (name.len() as f32 + 2.0) * char_width;
-            }
-            if px < menu_end * dpi_scale {
-                return HTCLIENT;
-            }
+            // The entire title bar is HTCLIENT so that menu labels, nav arrows,
+            // and command center clicks reach our WM_LBUTTONDOWN handler.
+            // Window dragging is handled by on_mouse_down sending WM_NCLBUTTONDOWN
+            // when no interactive element was hit.
+            return HTCLIENT;
         }
 
-        // Rest of the title bar row = draggable caption
+        // No menu bar — rest of the title bar row = draggable caption
         return HTCAPTION;
     }
 
@@ -850,10 +1173,14 @@ fn on_paint(hwnd: HWND) {
         };
         let below_terminal_px = if status_above_terminal {
             0.0 // nothing below terminal
+        } else if state.engine.settings.window_status_line {
+            1.0 * lh // cmd line only (per-window status is inside editor windows)
         } else {
-            2.0 * lh // status + cmd (below terminal)
+            2.0 * lh // global status + cmd (below terminal)
         };
         let bottom_chrome = below_terminal_px + terminal_height + above_terminal_px;
+        // Store in same units as line_height (physical-px) — callers that need DIPs must divide by dpi_scale
+        state.bottom_chrome_px = bottom_chrome as f32;
         let editor_bottom = height - bottom_chrome;
 
         // Use engine's group-aware rect calculation (handles splits)
@@ -897,12 +1224,15 @@ fn on_paint(hwnd: HWND) {
             dwrite: &state.dwrite_factory,
             format: &state.text_format,
             ui_format: &state.ui_text_format,
+            icon_format: &state.icon_text_format,
             theme: &state.theme,
             char_width: state.char_width,
             line_height: state.line_height,
             editor_left: state.sidebar.total_width(),
+            tab_tooltip_x: state.tab_tooltip_x,
             caption_hover: state.caption_hover,
             is_maximized: is_maximized(state.hwnd),
+            nerd_icon_font: state.nerd_icon_font,
         };
 
         unsafe {
@@ -914,15 +1244,53 @@ fn on_paint(hwnd: HWND) {
             } else {
                 0.0
             };
-            ctx.draw_sidebar(&state.sidebar, &screen, menu_bar_y);
+            ctx.draw_sidebar(
+                &state.sidebar,
+                &screen,
+                menu_bar_y,
+                state.bottom_chrome_px,
+                &state.engine,
+            );
+            // Context menu on top of sidebar
+            if let Some(ref ctxm) = screen.context_menu {
+                ctx.draw_context_menu(ctxm);
+            }
+            // Tab drag overlay (drop zone highlight + ghost label)
+            ctx.draw_tab_drag_overlay(&screen, &state.engine);
             // Menu dropdown on top of sidebar
             if let Some(ref menu) = screen.menu_bar {
                 ctx.draw_menu_dropdown(menu);
+            }
+            // Find/replace overlay
+            if let Some(ref find_replace) = screen.find_replace {
+                let fr_rect = ctx.draw_find_replace(find_replace);
+                state.cached_find_replace_rect = Some(fr_rect);
+            } else {
+                state.cached_find_replace_rect = None;
+            }
+            // Dialog (on top of everything except notifications)
+            if let Some(ref dialog) = screen.dialog {
+                ctx.draw_dialog(dialog);
             }
             // Notification toasts
             ctx.draw_notifications(&state.engine.notifications);
             let _ = rt.EndDraw(None, None);
         }
+
+        // Report tab bar widths to engine so ensure_active_tab_visible() works.
+        // Convert pixel width to approximate character columns (matching
+        // tab_display_width's character-based calculation in the engine).
+        if let Some(ref split) = screen.editor_group_split {
+            let cw = state.char_width.max(1.0);
+            for gtb in &split.group_tab_bars {
+                let width_cols = (gtb.bounds.width as f32 / cw).floor() as usize;
+                state.engine.set_tab_visible_count(gtb.group_id, width_cols);
+            }
+            state.engine.ensure_all_groups_tabs_visible();
+        }
+
+        // Cache popup rects for mouse hit-testing
+        cache_popup_rects(state, &screen);
 
         // Validate the paint
         unsafe {
@@ -931,7 +1299,138 @@ fn on_paint(hwnd: HWND) {
     });
 }
 
+/// Recompute popup bounding rectangles from the screen layout (mirrors draw positioning).
+fn cache_popup_rects(state: &mut AppState, screen: &ScreenLayout) {
+    let cw = state.char_width;
+    let lh = state.line_height;
+    let rt_w = {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(state.hwnd, &mut rc);
+        }
+        (rc.right - rc.left) as f32 / state.dpi_scale
+    };
+    let rt_h = {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(state.hwnd, &mut rc);
+        }
+        (rc.bottom - rc.top) as f32 / state.dpi_scale
+    };
+
+    let mut rects = CachedPopupRects::default();
+
+    // Editor hover popup rect
+    if let Some(ref eh) = screen.editor_hover {
+        let lines = &eh.rendered.lines;
+        if !lines.is_empty() {
+            let max_height = 20;
+            let scroll = eh.scroll_top;
+            let visible_count = lines.len().saturating_sub(scroll).min(max_height);
+            if visible_count > 0 {
+                let num_lines = lines.len().min(max_height);
+                let content_w = (eh.popup_width as f32 + 2.0) * cw;
+                let popup_w = content_w.clamp(12.0 * cw, rt_w * 0.7);
+                let popup_h = num_lines as f32 * lh + 8.0;
+
+                let active = screen.windows.iter().find(|w| w.is_active);
+                let (x, y) = if let Some(rw) = active {
+                    let gutter_px = rw.gutter_char_width as f32 * cw;
+                    let view_line = eh.anchor_line.saturating_sub(eh.frozen_scroll_top);
+                    let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left);
+                    let cx = rw.rect.x as f32 + gutter_px + vis_col as f32 * cw;
+                    let cy = rw.rect.y as f32 + view_line as f32 * lh;
+                    let fy = if cy >= popup_h + 4.0 {
+                        cy - popup_h
+                    } else {
+                        cy + lh
+                    };
+                    (cx.min(rt_w - popup_w - 4.0).max(0.0), fy.max(0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                rects.editor_hover = Some(PopupRect {
+                    x,
+                    y,
+                    w: popup_w,
+                    h: popup_h,
+                });
+            }
+        }
+    }
+
+    // Panel hover popup rect (mirrors draw_panel_hover positioning)
+    if let Some(ref ph) = screen.panel_hover {
+        let lines = &ph.rendered.lines;
+        if !lines.is_empty() {
+            let max_height = 20;
+            let num_lines = lines.len().min(max_height);
+            let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+            let popup_w = ((max_len + 4) as f32 * cw).clamp(12.0 * cw, rt_w * 0.5);
+            let popup_h = num_lines as f32 * lh + 8.0;
+            let x = state.sidebar.total_width() + 2.0;
+            let y = (ph.item_index as f32 * lh + lh * 2.0)
+                .min(rt_h - popup_h)
+                .max(0.0);
+            rects.panel_hover = Some(PopupRect {
+                x,
+                y,
+                w: popup_w,
+                h: popup_h,
+            });
+        }
+    }
+
+    // Debug toolbar rect
+    if let Some(ref toolbar) = screen.debug_toolbar {
+        let btn_count = toolbar.buttons.len();
+        if btn_count > 0 {
+            let btn_w = cw * 4.0;
+            let total_w = btn_count as f32 * btn_w;
+            let x = (rt_w - total_w) / 2.0;
+            let y = rt_h - 3.0 * lh; // above status+cmd
+            rects.debug_toolbar = Some(PopupRect {
+                x,
+                y,
+                w: total_w,
+                h: lh,
+            });
+            for (i, btn) in toolbar.buttons.iter().enumerate() {
+                let bx = x + i as f32 * btn_w;
+                rects.debug_toolbar_buttons.push((
+                    PopupRect {
+                        x: bx,
+                        y,
+                        w: btn_w,
+                        h: lh,
+                    },
+                    btn.action.to_string(),
+                    btn.enabled,
+                ));
+            }
+        }
+    }
+
+    state.popup_rects = rects;
+}
+
 /// Cache tab slot positions and window rects after each draw for mouse hit-testing.
+/// Measure text width using the proportional UI font (same as draw_tabs).
+fn measure_ui_text_width(dwrite: &IDWriteFactory, format: &IDWriteTextFormat, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        let layout: IDWriteTextLayout = dwrite
+            .CreateTextLayout(&wide, format, 10000.0, 1000.0)
+            .expect("CreateTextLayout");
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        layout.GetMetrics(&mut metrics).expect("GetMetrics");
+        metrics.width
+    }
+}
+
 fn cache_layout(
     state: &mut AppState,
     screen: &ScreenLayout,
@@ -945,53 +1444,182 @@ fn cache_layout(
     if let Some(ref split) = screen.editor_group_split {
         // Multi-group: each group has its own tab bar
         for gtb in &split.group_tab_bars {
-            let tab_y = gtb.bounds.y as f32 - lh;
+            let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+            let has_bc = screen
+                .breadcrumbs
+                .iter()
+                .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+            let bc_offset = if has_bc { lh } else { 0.0 };
+            let tab_y = gtb.bounds.y as f32 - tab_h - bc_offset;
             let mut x = gtb.bounds.x as f32;
+            let group_right = gtb.bounds.x as f32 + gtb.bounds.width as f32;
+            let pad = 12.0_f32;
             for (idx, tab) in gtb.tabs.iter().enumerate() {
-                let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
-                let close_x = x + name_w - 2.0 * cw;
+                let text_w =
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, &tab.name);
+                let tab_w = pad + text_w + pad + cw + pad * 0.5;
+                // Skip tabs that start past the group's right edge
+                if x >= group_right {
+                    break;
+                }
+                let clamped_end = (x + tab_w).min(group_right);
+                let close_x = x + tab_w - cw - pad * 0.5;
                 state.tab_slots.push(TabSlot {
                     group_id: gtb.group_id,
                     tab_idx: idx,
                     x_start: x,
-                    x_end: x + name_w,
+                    x_end: clamped_end,
                     close_x_start: close_x,
                     y: tab_y,
-                    height: lh,
+                    height: tab_h,
                 });
-                x += name_w;
+                x += tab_w;
             }
         }
     } else {
         // Single-group: use the flat tab_bar
         let group_id = state.engine.active_group;
         let tab_y = if screen.menu_bar.is_some() {
-            lh
+            TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT
         } else {
             0.0f32
         };
+        let tab_h = lh * TAB_BAR_HEIGHT_MULT;
         let mut x = state.sidebar.total_width(); // start after sidebar
+        let pad = 12.0_f32;
         for (idx, tab) in screen.tab_bar.iter().enumerate() {
-            let name_w = (tab.name.chars().count() as f32 + 3.0) * cw;
-            let close_x = x + name_w - 2.0 * cw;
+            let text_w =
+                measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, &tab.name);
+            let tab_w = pad + text_w + pad + cw + pad * 0.5;
+            let close_x = x + tab_w - cw - pad * 0.5;
             state.tab_slots.push(TabSlot {
                 group_id,
                 tab_idx: idx,
                 x_start: x,
-                x_end: x + name_w,
+                x_end: x + tab_w,
                 close_x_start: close_x,
                 y: tab_y,
-                height: lh,
+                height: tab_h,
             });
-            x += name_w;
+            x += tab_w;
         }
     }
 
-    // Cache window rects with gutter widths
+    // Cache breadcrumb bars for click handling
+    state.cached_breadcrumbs = screen.breadcrumbs.clone();
+
+    // Cache group dividers for drag handling
+    state.cached_dividers = if let Some(ref split) = screen.editor_group_split {
+        split.dividers.clone()
+    } else {
+        Vec::new()
+    };
+
+    // Cache diff toolbar button positions
+    state.cached_diff_toolbar_btns.clear();
+    {
+        let cache_diff_toolbar = |dt: &render::DiffToolbarData,
+                                  bar_x: f32,
+                                  bar_y: f32,
+                                  bar_w: f32,
+                                  bar_h: f32,
+                                  group_id: GroupId|
+         -> (GroupId, f32, f32, f32, f32, f32, f32) {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(ref label) = dt.change_label {
+                parts.push(label.clone());
+            }
+            parts.push("\u{2191}".to_string());
+            parts.push("\u{2193}".to_string());
+            parts.push("\u{2261}".to_string());
+            let label = parts.join("  ");
+            let label_w = label.chars().count() as f32 * cw;
+            let rx = bar_x + bar_w - label_w - cw * 2.0;
+            // Skip past the change label and its trailing "  "
+            let btn_offset = if let Some(ref cl) = dt.change_label {
+                (cl.chars().count() + 2) as f32 * cw
+            } else {
+                0.0
+            };
+            let prev_x = rx + btn_offset;
+            let next_x = prev_x + 3.0 * cw; // "↑  " = 3 chars
+            let fold_x = next_x + 3.0 * cw; // "↓  " = 3 chars
+            let btn_w = cw;
+            (group_id, prev_x, next_x, fold_x, btn_w, bar_y, bar_h)
+        };
+        // Single-group diff toolbar
+        if let Some(ref dt) = screen.diff_toolbar {
+            let tab_y = if screen.menu_bar.is_some() {
+                TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0f32
+            };
+            let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+            let bar_x = state.sidebar.total_width();
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(state.hwnd, &mut rc);
+            }
+            let client_w = (rc.right - rc.left) as f32 / state.dpi_scale;
+            let bar_w = client_w - bar_x;
+            state.cached_diff_toolbar_btns.push(cache_diff_toolbar(
+                dt,
+                bar_x,
+                tab_y,
+                bar_w,
+                tab_h,
+                state.engine.active_group,
+            ));
+        }
+        // Multi-group diff toolbars
+        if let Some(ref split) = screen.editor_group_split {
+            for gtb in &split.group_tab_bars {
+                if let Some(ref dt) = gtb.diff_toolbar {
+                    let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+                    let has_bc = screen
+                        .breadcrumbs
+                        .iter()
+                        .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
+                    let bc_offset = if has_bc { lh } else { 0.0 };
+                    let tab_y = gtb.bounds.y as f32 - tab_h - bc_offset;
+                    let bar_x = gtb.bounds.x as f32;
+                    let bar_w = gtb.bounds.width as f32;
+                    state.cached_diff_toolbar_btns.push(cache_diff_toolbar(
+                        dt,
+                        bar_x,
+                        tab_y,
+                        bar_w,
+                        tab_h,
+                        gtb.group_id,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Cache window rects with gutter widths and group_id
     state.cached_window_rects.clear();
     for rw in &screen.windows {
+        // Determine group_id by checking which group's bounds contain this window
+        let gid = if let Some(ref split) = screen.editor_group_split {
+            split
+                .group_tab_bars
+                .iter()
+                .find(|gtb| {
+                    let b = &gtb.bounds;
+                    rw.rect.x >= b.x
+                        && rw.rect.y >= b.y
+                        && rw.rect.x < b.x + b.width
+                        && rw.rect.y < b.y + b.height
+                })
+                .map(|gtb| gtb.group_id)
+                .unwrap_or(state.engine.active_group)
+        } else {
+            state.engine.active_group
+        };
         state.cached_window_rects.push(CachedWindowRect {
             window_id: rw.window_id,
+            group_id: gid,
             rect: WindowRect::new(rw.rect.x, rw.rect.y, rw.rect.width, rw.rect.height),
             gutter_chars: rw.gutter_char_width,
         });
@@ -1161,6 +1789,65 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
                 return false;
             }
 
+            // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY
+            if ctrl && (key.key_name == "v" || key.key_name == "V") {
+                let paste_text = state
+                    .engine
+                    .clipboard_read
+                    .as_ref()
+                    .and_then(|cb| cb().ok())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        state
+                            .engine
+                            .registers
+                            .get(&'+')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    })
+                    .or_else(|| {
+                        state
+                            .engine
+                            .registers
+                            .get(&'"')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    });
+                if let Some(text) = paste_text {
+                    state.engine.terminal_write(b"\x1b[200~");
+                    state.engine.terminal_write(text.as_bytes());
+                    state.engine.terminal_write(b"\x1b[201~");
+                    state.engine.poll_terminal();
+                } else {
+                    state.engine.message = "Nothing to paste".to_string();
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
+            // Ctrl+Y / Ctrl+Shift+C: copy terminal selection to clipboard
+            if ctrl
+                && ((key.key_name == "y" || key.key_name == "Y")
+                    || (shift && (key.key_name == "c" || key.key_name == "C")))
+            {
+                let text = state
+                    .engine
+                    .active_terminal()
+                    .and_then(|t| t.selected_text());
+                if let Some(ref text) = text {
+                    if let Some(ref cb) = state.engine.clipboard_write {
+                        let _ = cb(text);
+                    }
+                    state.engine.message = "Copied".to_string();
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
             // Translate key to PTY escape sequence
             let data = translate_key_to_pty(&key.key_name, key.unicode, ctrl);
             if !data.is_empty() {
@@ -1192,8 +1879,497 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
-        // Sidebar keyboard navigation when focused
-        if state.sidebar.has_focus && state.sidebar.visible {
+        // ── Settings panel keyboard handling ─────────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Settings
+        {
+            // Ctrl+V paste into search input or inline edit
+            if ctrl && key.key_name == "v" {
+                if state.engine.settings_input_active || state.engine.settings_editing.is_some() {
+                    let text = match state.engine.clipboard_read {
+                        Some(ref cb) => cb().ok(),
+                        None => None,
+                    };
+                    if let Some(t) = text {
+                        state.engine.settings_paste(&t);
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Tab" => ("Tab", None),
+                "Return" => ("Return", None),
+                "space" | " " => ("Space", None),
+                "l" | "Right" => ("l", None),
+                "h" | "Left" => ("h", None),
+                "/" => ("/", None),
+                "q" | "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                _ => {
+                    if let Some(ch) = key.unicode {
+                        ("char", Some(ch))
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                state.engine.handle_settings_key(
+                    if key_name == "char" { "" } else { key_name },
+                    ctrl,
+                    ch,
+                );
+                if !state.engine.settings_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+                // Keep selected item visible after navigation
+                let content_h = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(state.hwnd, &mut rc);
+                    }
+                    let h = (rc.bottom - rc.top) as f32;
+                    ((h - state.bottom_chrome_px - state.line_height * 2.0) / state.line_height)
+                        .floor() as usize
+                };
+                if content_h > 0 {
+                    if state.engine.settings_selected
+                        >= state.engine.settings_scroll_top + content_h
+                    {
+                        state.engine.settings_scroll_top =
+                            state.engine.settings_selected - content_h + 1;
+                    } else if state.engine.settings_selected < state.engine.settings_scroll_top {
+                        state.engine.settings_scroll_top = state.engine.settings_selected;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── Extension panel (plugin-provided) keyboard handling ────────
+        if state.engine.ext_panel_has_focus
+            && state.sidebar.visible
+            && state.sidebar.ext_panel_name.is_some()
+        {
+            // When input field is active, pass characters as input
+            if state.engine.ext_panel_input_active {
+                let (ikey, ich): (&str, Option<char>) = match key.key_name.as_str() {
+                    "Escape" => ("Escape", None),
+                    "Return" => ("Return", None),
+                    "BackSpace" => ("BackSpace", None),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            if !ch.is_control() {
+                                ("char", Some(ch))
+                            } else {
+                                ("", None)
+                            }
+                        } else {
+                            ("", None)
+                        }
+                    }
+                };
+                if !ikey.is_empty() {
+                    let name = if ikey == "char" {
+                        ich.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        ikey.to_string()
+                    };
+                    state.engine.handle_ext_panel_input_key(&name, ctrl, ich);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            // Navigation keys
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Return" => ("Return", None),
+                "Tab" => ("Tab", None),
+                "Escape" => ("Escape", None),
+                _ => {
+                    if let Some(ch) = key.unicode {
+                        match ch {
+                            'g' => ("g", None),
+                            'G' => ("G", None),
+                            '/' => ("/", None),
+                            '?' => ("?", None),
+                            'q' => ("Escape", None),
+                            c if !c.is_control() => ("char", Some(c)),
+                            _ => ("", None),
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                let name = if key_name == "char" {
+                    ch.map(|c| c.to_string()).unwrap_or_default()
+                } else {
+                    key_name.to_string()
+                };
+                state.engine.handle_ext_panel_key(&name, ctrl, ch);
+                if !state.engine.ext_panel_has_focus {
+                    state.sidebar.has_focus = false;
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── Extensions panel keyboard handling ─────────────────────────
+        if state.engine.ext_sidebar_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+        {
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "j" | "Down" => ("j", None),
+                "k" | "Up" => ("k", None),
+                "Return" => ("Return", None),
+                "Tab" => ("Tab", None),
+                "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                _ => {
+                    // Map single letters to their key name (matching TUI behavior)
+                    if let Some(ch) = key.unicode {
+                        match ch {
+                            'i' => ("i", None),
+                            'd' => ("d", None),
+                            'u' => ("u", None),
+                            'r' => ("r", None),
+                            '/' => ("/", None),
+                            'q' => ("Escape", None),
+                            _ if !ch.is_control() => ("char", Some(ch)),
+                            _ => ("", None),
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let ch = if key_name == "char" { unicode } else { None };
+                state.engine.handle_ext_sidebar_key(
+                    if key_name == "char" { "" } else { key_name },
+                    ctrl,
+                    ch,
+                );
+                if !state.engine.ext_sidebar_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── Search panel keyboard handling ──────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Search
+        {
+            // Alt toggles for search options
+            if alt {
+                match key.key_name.as_str() {
+                    "c" | "C" => {
+                        state.engine.project_search_options.case_sensitive =
+                            !state.engine.project_search_options.case_sensitive;
+                    }
+                    "w" | "W" => {
+                        state.engine.project_search_options.whole_word =
+                            !state.engine.project_search_options.whole_word;
+                    }
+                    "r" | "R" => {
+                        state.engine.project_search_options.use_regex =
+                            !state.engine.project_search_options.use_regex;
+                    }
+                    "h" | "H" => {
+                        // Toggle replace input visibility
+                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
+                    }
+                    _ => {}
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            // Ctrl+V paste into search/replace input
+            if ctrl && key.key_name == "v" && state.sidebar.search_input_mode {
+                let text = match state.engine.clipboard_read {
+                    Some(ref cb) => cb().ok(),
+                    None => None,
+                };
+                if let Some(t) = text {
+                    let line = t.lines().next().unwrap_or("");
+                    for c in line.chars() {
+                        if !c.is_control() {
+                            if state.sidebar.replace_input_focused {
+                                state.engine.project_replace_text.push(c);
+                            } else {
+                                state.engine.project_search_query.push(c);
+                            }
+                        }
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            if state.sidebar.search_input_mode {
+                // Input mode: typing into search or replace box
+                match key.key_name.as_str() {
+                    "Tab" => {
+                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
+                    }
+                    "Return" => {
+                        if state.sidebar.replace_input_focused {
+                            let root = state.engine.workspace_root.clone().unwrap_or_default();
+                            state.engine.start_project_replace(root);
+                        } else {
+                            let root = state.engine.workspace_root.clone().unwrap_or_default();
+                            state.engine.start_project_search(root);
+                            state.sidebar.search_scroll_top = 0;
+                        }
+                    }
+                    "BackSpace" => {
+                        if state.sidebar.replace_input_focused {
+                            state.engine.project_replace_text.pop();
+                        } else {
+                            state.engine.project_search_query.pop();
+                        }
+                    }
+                    "Escape" => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    "Down" => {
+                        // Switch to results mode
+                        if !state.engine.project_search_results.is_empty() {
+                            state.sidebar.search_input_mode = false;
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Results navigation mode
+                match key.key_name.as_str() {
+                    "j" | "Down" => {
+                        state.engine.project_search_select_next();
+                    }
+                    "k" | "Up" => {
+                        state.engine.project_search_select_prev();
+                    }
+                    "Return" => {
+                        let idx = state.engine.project_search_selected;
+                        let result = state
+                            .engine
+                            .project_search_results
+                            .get(idx)
+                            .map(|m| (m.file.clone(), m.line));
+                        if let Some((file, line)) = result {
+                            state.engine.open_file_in_tab(&file);
+                            let win_id = state.engine.active_window_id();
+                            state.engine.set_cursor_for_window(win_id, line, 0);
+                            state.engine.ensure_cursor_visible();
+                            state.sidebar.has_focus = false;
+                            state.engine.search_has_focus = false;
+                        }
+                    }
+                    "Escape" => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    _ => {}
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── AI panel keyboard handling ───────────────────────────────
+        if state.engine.ai_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Ai
+        {
+            // Ctrl+V paste
+            if ctrl && key.key_name == "v" {
+                let text = match state.engine.clipboard_read {
+                    Some(ref cb) => cb().ok(),
+                    None => None,
+                };
+                if let Some(t) = text {
+                    state.engine.ai_insert_text(&t);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(state.hwnd), None, false);
+                }
+                return false;
+            }
+            let (key_name, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                "Down" if !state.engine.ai_input_active => ("j", None),
+                "Up" if !state.engine.ai_input_active => ("k", None),
+                "Return" => ("Return", None),
+                "Escape" => ("Escape", None),
+                "BackSpace" => ("BackSpace", None),
+                "Delete" => ("Delete", None),
+                "Left" => ("Left", None),
+                "Right" => ("Right", None),
+                "Home" => ("Home", None),
+                "End" => ("End", None),
+                other => {
+                    if ctrl {
+                        (other, None)
+                    } else if let Some(ch) = key.unicode {
+                        if !state.engine.ai_input_active {
+                            match ch {
+                                'j' => ("j", None),
+                                'k' => ("k", None),
+                                'G' => ("G", None),
+                                'g' => ("g", None),
+                                'i' | 'a' => ("i", None),
+                                'q' => ("Escape", None),
+                                _ => ("char", Some(ch)),
+                            }
+                        } else {
+                            ("char", Some(ch))
+                        }
+                    } else {
+                        ("", None)
+                    }
+                }
+            };
+            if !key_name.is_empty() {
+                let (mapped, uni) = if key_name == "char" {
+                    ("", unicode)
+                } else {
+                    (key_name, None)
+                };
+                state.engine.handle_ai_panel_key(mapped, ctrl, uni);
+                if !state.engine.ai_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // ── Git/Source Control panel keyboard handling ────────────────
+        if state.engine.sc_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+        {
+            if state.engine.sc_commit_input_active
+                || state.engine.sc_branch_picker_open
+                || state.engine.sc_branch_create_mode
+                || state.engine.sc_help_open
+            {
+                // Input/popup mode — route all keys through engine
+                let (key_str, unicode): (&str, Option<char>) = match key.key_name.as_str() {
+                    "Return" => ("Return", None),
+                    "Escape" => ("Escape", None),
+                    "BackSpace" => ("BackSpace", None),
+                    "Delete" => ("Delete", None),
+                    "Up" => ("Up", None),
+                    "Down" => ("Down", None),
+                    "Left" => ("Left", None),
+                    "Right" => ("Right", None),
+                    "Home" => ("Home", None),
+                    "End" => ("End", None),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            ("char", Some(ch))
+                        } else {
+                            ("", None)
+                        }
+                    }
+                };
+                if key_str == "char" {
+                    state.engine.handle_sc_key("", ctrl, unicode);
+                } else if !key_str.is_empty() {
+                    state.engine.handle_sc_key(key_str, ctrl, None);
+                }
+            } else {
+                // Navigation mode
+                let key_name: Option<&str> = match key.key_name.as_str() {
+                    "j" | "Down" => Some("j"),
+                    "k" | "Up" => Some("k"),
+                    "h" | "Left" => Some("h"),
+                    "l" | "Right" => Some("l"),
+                    "Tab" => Some("Tab"),
+                    "Escape" => Some("Escape"),
+                    _ => {
+                        if let Some(ch) = key.unicode {
+                            match ch {
+                                's' => Some("s"),
+                                'S' => Some("S"),
+                                'd' => Some("d"),
+                                'D' => Some("D"),
+                                'c' => Some("c"),
+                                'C' => Some("C"),
+                                'p' => Some("p"),
+                                'P' => Some("P"),
+                                'f' => Some("f"),
+                                'b' if !ctrl => Some("b"),
+                                'B' => Some("B"),
+                                '?' => Some("?"),
+                                'r' => Some("r"),
+                                'q' => Some("Escape"),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some("Return") = key_name {
+                    let done = state.engine.sc_open_selected_async();
+                    if done && !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
+                } else if let Some(name) = key_name {
+                    state.engine.handle_sc_key(name, ctrl, None);
+                    if !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Sidebar keyboard navigation when focused (Explorer)
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+        {
             let handled = match key.key_name.as_str() {
                 "Escape" => {
                     state.sidebar.has_focus = false;
@@ -1221,8 +2397,7 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
                                     state.sidebar.build_rows(root);
                                 }
                             } else {
-                                let _ =
-                                    state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                                state.engine.open_file_in_tab(&path);
                                 state.sidebar.has_focus = false;
                             }
                         }
@@ -1364,10 +2539,48 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             }
         }
 
+        // Intercept paste keys to load system clipboard into registers
+        if !key.ctrl && intercept_paste_key(state, &key.key_name, key.unicode) {
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
+        // Ctrl+V in Insert/Replace/Command mode: paste from system clipboard
+        if key.ctrl
+            && (key.key_name == "v" || key.key_name == "V")
+            && matches!(
+                state.engine.mode,
+                crate::core::Mode::Insert | crate::core::Mode::Replace
+            )
+        {
+            if let Some(ref cb_read) = state.engine.clipboard_read {
+                if let Ok(text) = cb_read() {
+                    if !text.is_empty() {
+                        for ch in text.chars() {
+                            if ch == '\n' || ch == '\r' {
+                                state.engine.handle_key("Return", None, false);
+                            } else if !ch.is_control() {
+                                state.engine.handle_key("", Some(ch), false);
+                            }
+                        }
+                    }
+                }
+            }
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
         let quit = handle_action_with_sidebar(state, action);
+        sync_clipboard(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -1414,8 +2627,286 @@ fn on_char(wparam: WPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        // Sidebar keyboard navigation for character keys (j/k/h/l)
-        if state.sidebar.has_focus && state.sidebar.visible {
+        // Settings panel character key handling
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Settings
+        {
+            let (key_name, unicode): (&str, Option<char>) = match ch {
+                'j' => ("j", None),
+                'k' => ("k", None),
+                'l' => ("l", None),
+                'h' => ("h", None),
+                '/' => ("/", None),
+                'q' => ("Escape", None),
+                ' ' => ("Space", None),
+                c if !c.is_control() => ("char", Some(c)),
+                _ => ("", None),
+            };
+            if !key_name.is_empty() {
+                let ch_arg = if key_name == "char" { unicode } else { None };
+                state.engine.handle_settings_key(
+                    if key_name == "char" { "" } else { key_name },
+                    false,
+                    ch_arg,
+                );
+                if !state.engine.settings_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+                // Keep selected item visible
+                let content_h = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(state.hwnd, &mut rc);
+                    }
+                    let h = (rc.bottom - rc.top) as f32;
+                    ((h - state.bottom_chrome_px - state.line_height * 2.0) / state.line_height)
+                        .floor() as usize
+                };
+                if content_h > 0 {
+                    if state.engine.settings_selected
+                        >= state.engine.settings_scroll_top + content_h
+                    {
+                        state.engine.settings_scroll_top =
+                            state.engine.settings_selected - content_h + 1;
+                    } else if state.engine.settings_selected < state.engine.settings_scroll_top {
+                        state.engine.settings_scroll_top = state.engine.settings_selected;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // Extension panel (plugin-provided) character key handling
+        if state.engine.ext_panel_has_focus
+            && state.sidebar.visible
+            && state.sidebar.ext_panel_name.is_some()
+        {
+            if state.engine.ext_panel_input_active {
+                // Input mode: all chars go to input
+                let (ikey, ich): (&str, Option<char>) = match ch {
+                    '\x1b' => ("Escape", None),
+                    '\r' => ("Return", None),
+                    '\x08' => ("BackSpace", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                };
+                if !ikey.is_empty() {
+                    let name = if ikey == "char" {
+                        ich.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        ikey.to_string()
+                    };
+                    state.engine.handle_ext_panel_input_key(&name, false, ich);
+                }
+            } else {
+                // Navigation mode
+                let (key_name, unicode): (&str, Option<char>) = match ch {
+                    'j' => ("j", None),
+                    'k' => ("k", None),
+                    'g' => ("g", None),
+                    'G' => ("G", None),
+                    '/' => ("/", None),
+                    '?' => ("?", None),
+                    'q' => ("Escape", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                };
+                if !key_name.is_empty() {
+                    let ch_arg = if key_name == "char" { unicode } else { None };
+                    let name = if key_name == "char" {
+                        ch_arg.map(|c| c.to_string()).unwrap_or_default()
+                    } else {
+                        key_name.to_string()
+                    };
+                    state.engine.handle_ext_panel_key(&name, false, ch_arg);
+                    if !state.engine.ext_panel_has_focus {
+                        state.sidebar.has_focus = false;
+                        state.sidebar.ext_panel_name = None;
+                        state.engine.ext_panel_active = None;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // Extensions panel character key handling
+        if state.engine.ext_sidebar_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+        {
+            let (key_name, unicode): (&str, Option<char>) = match ch {
+                'j' => ("j", None),
+                'k' => ("k", None),
+                'i' => ("i", None),
+                'd' => ("d", None),
+                'u' => ("u", None),
+                'r' => ("r", None),
+                '/' => ("/", None),
+                'q' => ("Escape", None),
+                c if !c.is_control() => ("char", Some(c)),
+                _ => ("", None),
+            };
+            if !key_name.is_empty() {
+                let ch_arg = if key_name == "char" { unicode } else { None };
+                state.engine.handle_ext_sidebar_key(
+                    if key_name == "char" { "" } else { key_name },
+                    false,
+                    ch_arg,
+                );
+                if !state.engine.ext_sidebar_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Search panel character keys ─────────────────────────────
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Search
+        {
+            if state.sidebar.search_input_mode {
+                // Printable chars go into search/replace query
+                if !ch.is_control() {
+                    if state.sidebar.replace_input_focused {
+                        state.engine.project_replace_text.push(ch);
+                    } else {
+                        state.engine.project_search_query.push(ch);
+                    }
+                }
+            } else {
+                // Results navigation mode — handle nav keys, rest switches to input
+                match ch {
+                    'j' => {
+                        state.engine.project_search_select_next();
+                    }
+                    'k' => {
+                        state.engine.project_search_select_prev();
+                    }
+                    'q' => {
+                        state.sidebar.has_focus = false;
+                        state.engine.search_has_focus = false;
+                    }
+                    c if !c.is_control() => {
+                        // Any other printable char switches to input mode
+                        state.sidebar.search_input_mode = true;
+                        state.sidebar.replace_input_focused = false;
+                        state.engine.project_search_query.push(c);
+                    }
+                    _ => {}
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── AI panel character keys ─────────────────────────────────
+        if state.engine.ai_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Ai
+        {
+            let (key_name, unicode): (&str, Option<char>) = if !state.engine.ai_input_active {
+                match ch {
+                    'j' => ("j", None),
+                    'k' => ("k", None),
+                    'G' => ("G", None),
+                    'g' => ("g", None),
+                    'i' | 'a' => ("i", None),
+                    'q' => ("Escape", None),
+                    c if !c.is_control() => ("char", Some(c)),
+                    _ => ("", None),
+                }
+            } else {
+                if !ch.is_control() {
+                    ("char", Some(ch))
+                } else {
+                    ("", None)
+                }
+            };
+            if !key_name.is_empty() {
+                let (mapped, uni) = if key_name == "char" {
+                    ("", unicode)
+                } else {
+                    (key_name, None)
+                };
+                state.engine.handle_ai_panel_key(mapped, false, uni);
+                if !state.engine.ai_has_focus {
+                    state.sidebar.has_focus = false;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Git panel character keys ────────────────────────────────
+        if state.engine.sc_has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+        {
+            if state.engine.sc_commit_input_active
+                || state.engine.sc_branch_picker_open
+                || state.engine.sc_branch_create_mode
+                || state.engine.sc_help_open
+            {
+                // Input mode: route printable chars through engine
+                if !ch.is_control() {
+                    state.engine.handle_sc_key("", false, Some(ch));
+                }
+            } else {
+                // Navigation mode
+                let key_name: Option<&str> = match ch {
+                    'j' => Some("j"),
+                    'k' => Some("k"),
+                    'h' => Some("h"),
+                    'l' => Some("l"),
+                    's' => Some("s"),
+                    'S' => Some("S"),
+                    'd' => Some("d"),
+                    'D' => Some("D"),
+                    'c' => Some("c"),
+                    'C' => Some("C"),
+                    'p' => Some("p"),
+                    'P' => Some("P"),
+                    'f' => Some("f"),
+                    'b' => Some("b"),
+                    'B' => Some("B"),
+                    '?' => Some("?"),
+                    'r' => Some("r"),
+                    'q' => Some("Escape"),
+                    _ => None,
+                };
+                if let Some(name) = key_name {
+                    state.engine.handle_sc_key(name, false, None);
+                    if !state.engine.sc_has_focus {
+                        state.sidebar.has_focus = false;
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
+        // Sidebar keyboard navigation for character keys (Explorer only)
+        if state.sidebar.has_focus
+            && state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+        {
             let handled = match ch {
                 'j' => {
                     if state.sidebar.selected + 1 < state.sidebar.rows.len() {
@@ -1441,8 +2932,7 @@ fn on_char(wparam: WPARAM) {
                                     }
                                 }
                             } else {
-                                let _ =
-                                    state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                                state.engine.open_file_in_tab(&path);
                                 state.sidebar.has_focus = false;
                             }
                         }
@@ -1474,10 +2964,20 @@ fn on_char(wparam: WPARAM) {
             }
         }
 
+        // Intercept paste keys to load system clipboard
+        if !key.ctrl && intercept_paste_key(state, &key.key_name, key.unicode) {
+            sync_clipboard(state);
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return;
+        }
+
         let action = state
             .engine
             .handle_key(&key.key_name, key.unicode, key.ctrl);
         let _ = handle_action_with_sidebar(state, action);
+        sync_clipboard(state);
         unsafe {
             let _ = InvalidateRect(Some(state.hwnd), None, false);
         }
@@ -1583,7 +3083,13 @@ fn pixel_to_editor_pos(state: &AppState, px: f32, py: f32) -> Option<(WindowId, 
         let rh = cwr.rect.height as f32;
 
         // Exclude scrollbar area (rightmost SCROLLBAR_WIDTH px)
-        if px >= rx && px < rx + rw - SCROLLBAR_WIDTH && py >= ry && py < ry + rh {
+        // Exclude per-window status bar (bottom line_height px)
+        let status_h = if state.engine.settings.window_status_line {
+            lh
+        } else {
+            0.0
+        };
+        if px >= rx && px < rx + rw - SCROLLBAR_WIDTH && py >= ry && py < ry + rh - status_h {
             let gutter_px = cwr.gutter_chars as f32 * cw;
             let view_row = ((py - ry) / lh).floor().max(0.0) as usize;
 
@@ -1646,6 +3152,75 @@ fn scrollbar_hit(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize)
     None
 }
 
+/// Check if (px, py) is inside a horizontal scrollbar track; if so, return the
+/// window ID and the new `scroll_left` for that click position.
+fn h_scrollbar_hit(state: &AppState, px: f32, py: f32) -> Option<(WindowId, usize)> {
+    let lh = state.line_height;
+    let cw = state.char_width;
+    for cwr in &state.cached_window_rects {
+        let rx = cwr.rect.x as f32;
+        let ry = cwr.rect.y as f32;
+        let rw_px = cwr.rect.width as f32;
+        let rh_px = cwr.rect.height as f32;
+        let gutter_px = cwr.gutter_chars as f32 * cw;
+
+        let w = state.engine.windows.get(&cwr.window_id);
+        let max_col = w.map_or(0, |w| {
+            let bid = w.buffer_id;
+            state.engine.buffer_manager.get(bid).map_or(0, |bs| {
+                let mut mc = 0usize;
+                for i in 0..bs.buffer.len_lines() {
+                    let line_len = bs.buffer.content.line(i).len_chars();
+                    if line_len > mc {
+                        mc = line_len;
+                    }
+                }
+                mc
+            })
+        });
+
+        let has_v_scrollbar = {
+            let total_lines = w.map_or(1, |w| {
+                let bid = w.buffer_id;
+                state
+                    .engine
+                    .buffer_manager
+                    .get(bid)
+                    .map_or(1, |bs| bs.buffer.len_lines())
+            });
+            let has_status = w.is_some_and(|_| state.engine.settings.window_status_line);
+            let editor_h = rh_px - if has_status { lh } else { 0.0 };
+            let viewport_lines = (editor_h / lh).floor() as usize;
+            total_lines > viewport_lines
+        };
+
+        let v_sb_w = if has_v_scrollbar {
+            SCROLLBAR_WIDTH
+        } else {
+            0.0
+        };
+        let track_x = rx + gutter_px;
+        let track_w = rw_px - gutter_px - v_sb_w;
+        let viewport_cols = (track_w / cw).floor() as usize;
+
+        if max_col <= viewport_cols || track_w <= 0.0 {
+            continue; // no horizontal scrollbar for this window
+        }
+
+        let has_status = w.is_some_and(|_| state.engine.settings.window_status_line);
+        let editor_h = rh_px - if has_status { lh } else { 0.0 };
+        let sb_y = ry + editor_h - SCROLLBAR_WIDTH;
+
+        if px >= track_x && px < track_x + track_w && py >= sb_y && py < sb_y + SCROLLBAR_WIDTH {
+            let max_scroll = max_col.saturating_sub(viewport_cols);
+            let ratio = ((px - track_x) / track_w).clamp(0.0, 1.0);
+            let new_left = ((ratio * max_scroll as f32) as usize).min(max_scroll);
+            return Some((cwr.window_id, new_left));
+        }
+    }
+    None
+}
+
 fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
     let (px, py) = lparam_xy(lparam);
     let ix = (lparam.0 & 0xFFFF) as i16;
@@ -1685,6 +3260,10 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        // Default: any non-terminal click clears terminal focus (matching TUI).
+        // Terminal click handlers below re-enable it for terminal area clicks.
+        state.engine.terminal_has_focus = false;
+
         // ── Sidebar resize drag start ────────────────────────────────────
         let edge = state.sidebar.total_width();
         if state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX {
@@ -1700,10 +3279,13 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             let cw = state.char_width;
             let lh = state.line_height;
             // Compute dropdown position (must match draw.rs logic)
-            let mut popup_x = cw;
+            let pad = 8.0_f32;
+            let mut popup_x = pad;
             for i in 0..midx {
                 if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                    popup_x += (name.len() as f32 + 2.0) * cw;
+                    popup_x +=
+                        measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                            + pad * 2.0;
                 }
             }
             let items = if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
@@ -1729,9 +3311,12 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
 
             // Check if click is on the menu bar labels (to switch menus)
             if py < lh {
-                let mut label_x = cw;
+                let pad = 8.0_f32;
+                let mut label_x = pad;
                 for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                    let label_w = (name.len() as f32 + 2.0) * cw;
+                    let label_w =
+                        measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                            + pad * 2.0;
                     if px >= label_x && px < label_x + label_w {
                         if state.engine.menu_open_idx == Some(idx) {
                             state.engine.close_menu();
@@ -1777,10 +3362,12 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Menu bar clicks (when no dropdown is open) ───────────────────
         let title_bar_h = TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT;
         if state.engine.menu_bar_visible && py < title_bar_h {
-            let cw = state.char_width;
-            let mut label_x = cw;
+            let pad = 8.0_f32;
+            let mut label_x = pad;
             for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                let label_w = (name.len() as f32 + 2.0) * cw;
+                let label_w =
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                        + pad * 2.0;
                 if px >= label_x && px < label_x + label_w {
                     state.engine.open_menu(idx);
                     unsafe {
@@ -1792,6 +3379,92 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             }
         }
 
+        // ── Nav arrow clicks (back/forward in title bar) ────────────────
+        if state.engine.menu_bar_visible && py < title_bar_h {
+            let cw = state.char_width;
+            let pad = 8.0_f32;
+            let mut menu_end = pad;
+            for (name, _, _) in MENU_STRUCTURE.iter() {
+                menu_end +=
+                    measure_ui_text_width(&state.dwrite_factory, &state.ui_text_format, name)
+                        + pad * 2.0;
+            }
+            let arrows_w = 4.0 * cw;
+            let caption_btns_w = CAPTION_BTN_COUNT * CAPTION_BTN_WIDTH;
+            let client_w = unsafe {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                (rc.right - rc.left) as f32 / state.dpi_scale
+            };
+            let available = client_w - menu_end - caption_btns_w;
+            // Compute command center title (same as render.rs MenuBarData)
+            let title = state
+                .engine
+                .cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "VimCode".to_string());
+            let title_display = format!("\u{1f50d} {}", title);
+            let text_len = title_display.chars().count() as f32;
+            let box_w = if !title_display.is_empty() {
+                (text_len + 4.0) * cw
+            } else {
+                0.0
+            };
+            let gap = if box_w > 0.0 { cw } else { 0.0 };
+            let total_unit = arrows_w + gap + box_w;
+            if available >= total_unit + 2.0 * cw {
+                let unit_start = menu_end + (available - total_unit) / 2.0;
+                // Back arrow: [unit_start, unit_start + 2*cw)
+                if px >= unit_start && px < unit_start + 2.0 * cw {
+                    state.engine.tab_nav_back();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+                // Forward arrow: [unit_start + 2*cw, unit_start + 4*cw)
+                if px >= unit_start + 2.0 * cw && px < unit_start + 4.0 * cw {
+                    state.engine.tab_nav_forward();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+                // Command center search box
+                if box_w > 0.0 {
+                    let bx = unit_start + arrows_w + gap;
+                    if px >= bx && px < bx + box_w {
+                        state.engine.open_command_center();
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // ── Title bar drag fallback ──────────────────────────────────────
+        // If click is in the title bar but no interactive element was hit above,
+        // initiate a window drag (replaces HTCAPTION behavior since we return
+        // HTCLIENT for the entire title bar when menu bar is visible).
+        if state.engine.menu_bar_visible && py < title_bar_h {
+            // Re-enable terminal focus if it was set before (blanket clear was premature
+            // for a drag operation, but this is harmless since dragging doesn't need it).
+            unsafe {
+                let _ = ReleaseCapture();
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_NCLBUTTONDOWN,
+                    Some(WPARAM(HTCAPTION as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            return;
+        }
+
         // ── Check activity bar clicks ────────────────────────────────────
         let ab_w = state.sidebar.activity_bar_px;
         let menu_y = if state.engine.menu_bar_visible {
@@ -1800,8 +3473,18 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             0.0
         };
         if px < ab_w && py >= menu_y {
-            let row = ((py - menu_y) / state.line_height).floor() as usize;
-            let panels = [
+            // Check if clicking the bottom-pinned Settings gear.
+            // The gear is drawn at sidebar_bottom - line_height where sidebar_bottom = rt_h - bottom_chrome.
+            // Use physical pixel coords (iy) directly for reliable hit-testing.
+            let client_h = unsafe {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                (rc.bottom - rc.top) as f32
+            };
+            let icon_row_h = ab_w; // square cells matching activity bar width
+            let settings_y = client_h / state.dpi_scale - state.bottom_chrome_px - icon_row_h;
+            let row = ((py - menu_y) / icon_row_h).floor() as usize;
+            let fixed_panels = [
                 SidebarPanel::Explorer,
                 SidebarPanel::Search,
                 SidebarPanel::Debug,
@@ -1809,24 +3492,93 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 SidebarPanel::Extensions,
                 SidebarPanel::Ai,
             ];
-            if row < panels.len() {
-                let clicked_panel = panels[row];
-                if state.sidebar.visible && state.sidebar.active_panel == clicked_panel {
+            // Determine what was clicked: Settings gear, fixed panel, or ext panel
+            let mut ext_names: Vec<_> = state.engine.ext_panels.keys().cloned().collect();
+            ext_names.sort();
+            if py >= settings_y {
+                // Settings gear clicked
+                let is_toggle = state.sidebar.visible
+                    && state.sidebar.ext_panel_name.is_none()
+                    && state.sidebar.active_panel == SidebarPanel::Settings;
+                if is_toggle {
                     state.sidebar.visible = false;
+                    state.sidebar.has_focus = false;
+                    state.engine.clear_sidebar_focus();
                 } else {
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
+                    state.sidebar.active_panel = SidebarPanel::Settings;
+                    state.sidebar.visible = true;
+                    state.sidebar.dirty = true;
+                    state.sidebar.has_focus = true;
+                    state.engine.clear_sidebar_focus();
+                    state.engine.settings_has_focus = true;
+                }
+            } else if row < fixed_panels.len() {
+                // Fixed panel clicked
+                let clicked_panel = fixed_panels[row];
+                let is_toggle = state.sidebar.visible
+                    && state.sidebar.ext_panel_name.is_none()
+                    && state.sidebar.active_panel == clicked_panel;
+                if is_toggle {
+                    state.sidebar.visible = false;
+                    state.sidebar.has_focus = false;
+                    state.engine.clear_sidebar_focus();
+                } else {
+                    state.sidebar.ext_panel_name = None;
+                    state.engine.ext_panel_active = None;
                     state.sidebar.active_panel = clicked_panel;
                     state.sidebar.visible = true;
                     state.sidebar.dirty = true;
-                    // Refresh git data when switching to Git panel
-                    if clicked_panel == SidebarPanel::Git {
-                        state.engine.sc_refresh();
+                    state.sidebar.has_focus = true;
+                    state.engine.clear_sidebar_focus();
+                    match clicked_panel {
+                        SidebarPanel::Settings => state.engine.settings_has_focus = true,
+                        SidebarPanel::Git => {
+                            state.engine.sc_has_focus = true;
+                            state.engine.sc_refresh();
+                        }
+                        SidebarPanel::Extensions => state.engine.ext_sidebar_has_focus = true,
+                        SidebarPanel::Ai => {
+                            state.engine.ai_has_focus = true;
+                            state.engine.ai_input_active = true;
+                        }
+                        SidebarPanel::Search => {
+                            state.engine.search_has_focus = true;
+                            state.sidebar.search_input_mode = true;
+                        }
+                        SidebarPanel::Debug => state.engine.dap_sidebar_has_focus = true,
+                        _ => {}
                     }
-                    // Auto-expand root
                     if clicked_panel == SidebarPanel::Explorer && state.sidebar.expanded.is_empty()
                     {
                         if let Some(ref root) = state.engine.workspace_root.clone() {
                             state.sidebar.expanded.insert(root.clone());
                         }
+                    }
+                }
+            } else {
+                // Extension panel icon row
+                let ext_idx = row - fixed_panels.len();
+                if let Some(ext_name) = ext_names.get(ext_idx).cloned() {
+                    let is_toggle = state.sidebar.visible
+                        && state.sidebar.ext_panel_name.as_deref() == Some(&ext_name);
+                    if is_toggle {
+                        state.sidebar.visible = false;
+                        state.sidebar.has_focus = false;
+                        state.sidebar.ext_panel_name = None;
+                        state.engine.clear_sidebar_focus();
+                        state.engine.ext_panel_active = None;
+                    } else {
+                        state.sidebar.ext_panel_name = Some(ext_name.clone());
+                        state.sidebar.visible = true;
+                        state.sidebar.dirty = true;
+                        state.sidebar.has_focus = true;
+                        state.engine.clear_sidebar_focus();
+                        state.engine.ext_panel_active = Some(ext_name.clone());
+                        state.engine.ext_panel_has_focus = true;
+                        // Fire panel_focus event
+                        state.engine.plugin_event("panel_focus", &ext_name);
                     }
                 }
             }
@@ -1839,6 +3591,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         // ── Check sidebar panel clicks ──────────────────────────────────
         if state.sidebar.visible && px < state.sidebar.total_width() && py >= menu_y {
             state.sidebar.has_focus = px >= ab_w; // focus panel area, not activity bar
+            state.engine.clear_sidebar_focus(); // clear stale focus from other panels
             let row = ((py - menu_y) / state.line_height).floor() as usize;
 
             if state.sidebar.active_panel == SidebarPanel::Explorer {
@@ -1858,20 +3611,74 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                 state.sidebar.build_rows(root);
                             }
                         } else {
-                            let _ = state.engine.open_file_with_mode(&path, OpenMode::Permanent);
+                            state.engine.open_file_preview(&path);
                         }
                     }
                 }
             } else if state.sidebar.active_panel == SidebarPanel::Git {
-                // Git panel: row 0 = header, row 1 = branch, row 2+ = content
-                // Route through engine's sc_ methods
-                if row >= 2 {
-                    // Map visual row to flat index for the source control panel
-                    let adjusted = row; // visual row in the panel
+                // Git panel layout (pixel-based, must match draw_git_panel):
+                //   row 0 (0..lh): header
+                //   row 1..1+commit_rows: commit input
+                //   0.3*lh gap, button row (1 lh), 0.3*lh gap
+                //   sections start after that
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+
+                let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+                let commit_rows = commit_lines as f32;
+
+                let header_end = lh;
+                let commit_end = header_end + commit_rows * lh;
+                let btn_start = commit_end + lh * 0.3;
+                let btn_end = btn_start + lh;
+                let sections_start = btn_end + lh * 0.3;
+
+                if click_y < header_end {
+                    // Header click — just set focus
+                } else if click_y < commit_end {
+                    // Commit input click — activate input mode
+                    state.engine.sc_commit_input_active = true;
+                } else if click_y >= btn_start && click_y < btn_end {
+                    // Button row click — determine which button
+                    let click_x = px - ab_w;
+                    let panel_w_val = state.sidebar.panel_width;
+                    let commit_w = panel_w_val * 0.5;
+                    let remain = panel_w_val - commit_w;
+                    let icon_w = remain / 3.0;
+                    let btn_idx = if click_x < commit_w {
+                        0 // Commit
+                    } else if click_x < commit_w + icon_w {
+                        1 // Push
+                    } else if click_x < commit_w + icon_w * 2.0 {
+                        2 // Pull
+                    } else {
+                        3 // Sync
+                    };
+                    match btn_idx {
+                        0 => {
+                            state.engine.handle_sc_key("C", false, None);
+                        }
+                        1 => {
+                            state.engine.handle_sc_key("P", false, None);
+                        }
+                        2 => {
+                            state.engine.handle_sc_key("p", false, None);
+                        }
+                        3 => {
+                            state.engine.handle_sc_key("f", false, None);
+                        }
+                        _ => {}
+                    }
+                } else if click_y >= sections_start {
+                    // Sections area — map to visual row for sc_visual_row_to_flat
+                    // sc_visual_row_to_flat expects row 3+ for sections
+                    let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                    let visual_row = section_row + 3; // offset: rows 0-2 are header/commit/buttons
                     if let Some((flat_idx, is_header)) =
-                        state.engine.sc_visual_row_to_flat(adjusted, true)
+                        state.engine.sc_visual_row_to_flat(visual_row, true)
                     {
                         if is_header {
+                            state.engine.sc_selected = flat_idx;
                             state.engine.handle_sc_key("Tab", false, None);
                         } else {
                             state.engine.sc_selected = flat_idx;
@@ -1879,29 +3686,47 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     }
                 }
                 state.engine.sc_has_focus = true;
+                state.engine.sc_refresh();
             } else if state.sidebar.active_panel == SidebarPanel::Extensions {
-                // Extensions panel: row 0 = header
+                // Extensions panel — Y layout must match draw_extensions_panel:
+                // row 0: "EXTENSIONS" header at top
+                // installed header at top + lh * 1.5
+                // items follow at lh each
+                // 0.3 * lh gap before available header
                 state.engine.ext_sidebar_has_focus = true;
-                if row >= 1 {
-                    // Approximate: compute flat index from row
-                    let installed_len = state.engine.ext_installed_items().len();
-                    let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
-                    let inst_header_row = 1;
-                    let inst_items_rows = if inst_expanded { installed_len } else { 0 };
-                    let avail_header_row = inst_header_row + 1 + inst_items_rows;
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+                let installed_len = state.engine.ext_installed_items().len();
+                let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
 
-                    if row == inst_header_row {
-                        state.engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
-                    } else if inst_expanded
-                        && row > inst_header_row
-                        && row <= inst_header_row + installed_len
-                    {
-                        state.engine.ext_sidebar_selected = row - inst_header_row - 1;
-                    } else if row == avail_header_row {
-                        state.engine.ext_sidebar_sections_expanded[1] =
-                            !state.engine.ext_sidebar_sections_expanded[1];
-                    } else if row > avail_header_row {
-                        let avail_idx = row - avail_header_row - 1;
+                let inst_header_y = lh * 1.5;
+                let inst_items_start_y = inst_header_y + lh;
+                let inst_items_end_y = inst_items_start_y
+                    + if inst_expanded {
+                        installed_len as f32 * lh
+                    } else {
+                        0.0
+                    };
+                let avail_header_y = inst_items_end_y + lh * 0.3;
+                let avail_items_start_y = avail_header_y + lh;
+
+                if click_y >= inst_header_y && click_y < inst_header_y + lh {
+                    state.engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
+                } else if inst_expanded
+                    && click_y >= inst_items_start_y
+                    && click_y < inst_items_end_y
+                {
+                    let idx = ((click_y - inst_items_start_y) / lh).floor() as usize;
+                    if idx < installed_len {
+                        state.engine.ext_sidebar_selected = idx;
+                    }
+                } else if click_y >= avail_header_y && click_y < avail_header_y + lh {
+                    state.engine.ext_sidebar_sections_expanded[1] =
+                        !state.engine.ext_sidebar_sections_expanded[1];
+                } else if click_y >= avail_items_start_y {
+                    let avail_idx = ((click_y - avail_items_start_y) / lh).floor() as usize;
+                    let avail_len = state.engine.ext_available_items().len();
+                    if avail_idx < avail_len {
                         state.engine.ext_sidebar_selected = installed_len + avail_idx;
                     }
                 }
@@ -1913,10 +3738,51 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                 }
             } else if state.sidebar.active_panel == SidebarPanel::Ai {
                 state.engine.ai_has_focus = true;
+                // Click on the input box area (bottom 2 rows) activates input mode
+                let client_h = unsafe {
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale
+                };
+                let input_y = client_h - state.line_height * 2.0;
+                if py >= input_y {
+                    state.engine.ai_input_active = true;
+                }
             } else if state.sidebar.active_panel == SidebarPanel::Search {
                 state.engine.search_has_focus = true;
             } else if state.sidebar.active_panel == SidebarPanel::Debug {
                 state.engine.dap_sidebar_has_focus = true;
+            }
+
+            // Extension panel content clicks (when ext_panel_name is set)
+            if state.sidebar.ext_panel_name.is_some() {
+                state.engine.ext_panel_has_focus = true;
+                let lh = state.line_height;
+                let click_y = py - menu_y;
+                // Row 0 is header, row 1 may be input field
+                let has_input = state.engine.ext_panel_input_active
+                    || state
+                        .engine
+                        .ext_panel_active
+                        .as_ref()
+                        .and_then(|n| state.engine.ext_panel_input_text.get(n))
+                        .is_some_and(|t| !t.is_empty());
+                let content_start = if has_input { 2.0 } else { 1.0 };
+                if click_y >= content_start * lh {
+                    let content_row = ((click_y - content_start * lh) / lh).floor() as usize;
+                    let flat_idx = state.engine.ext_panel_scroll_top + content_row;
+                    let flat_len = state.engine.ext_panel_flat_len();
+                    if flat_idx < flat_len {
+                        state.engine.ext_panel_selected = flat_idx;
+                        // Handle as "Return" (toggle expand / fire select event)
+                        state.engine.handle_ext_panel_key("Return", false, None);
+                    }
+                } else if click_y < lh {
+                    // Header click — ignore
+                } else if has_input {
+                    // Clicked input row — activate input
+                    state.engine.ext_panel_input_active = true;
+                }
             }
 
             unsafe {
@@ -1925,7 +3791,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
-        // ── Scrollbar click-to-jump ──────────────────────────────────────
+        // ── Scrollbar click-to-jump (vertical) ──────────────────────────
         if let Some((wid, new_top)) = scrollbar_hit(state, px, py) {
             state.scrollbar_drag = Some(wid);
             state.engine.set_scroll_top_for_window(wid, new_top);
@@ -1936,19 +3802,647 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
 
+        // ── Horizontal scrollbar click-to-jump ──────────────────────────
+        if let Some((wid, new_left)) = h_scrollbar_hit(state, px, py) {
+            state.h_scrollbar_drag = Some(wid);
+            state.engine.set_scroll_left_for_window(wid, new_left);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Find/replace overlay click handling (shared dispatch) ──────────
+        if state.engine.find_replace_open {
+            if let Some(fr) = state.cached_find_replace_rect.clone() {
+                use crate::core::engine::FindReplaceClickTarget;
+
+                let lh = state.line_height;
+                let cw = state.char_width;
+
+                let on_panel = px >= fr.x && px < fr.x + fr.w && py >= fr.y && py < fr.y + fr.h;
+
+                if on_panel {
+                    let mut target: Option<FindReplaceClickTarget> = None;
+
+                    // --- Find row ---
+                    if py >= fr.row_y && py < fr.row_y + lh {
+                        if px < fr.input_x {
+                            target = Some(FindReplaceClickTarget::Chevron);
+                        } else if px < fr.input_x + fr.input_w {
+                            let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                            target = Some(FindReplaceClickTarget::FindInput(click_col));
+                            state.fr_input_dragging = true;
+                        } else {
+                            // Toggle buttons (pixel hit-test from draw cache)
+                            let mut bx = fr.input_x + fr.input_w + 4.0;
+                            let toggle_targets = [
+                                FindReplaceClickTarget::ToggleCase,
+                                FindReplaceClickTarget::ToggleWholeWord,
+                                FindReplaceClickTarget::ToggleRegex,
+                            ];
+                            for (i, label) in ["Aa", "ab", ".*"].iter().enumerate() {
+                                let tw = label.chars().count() as f32 * cw + 4.0;
+                                if px >= bx && px < bx + tw {
+                                    target = Some(toggle_targets[i]);
+                                    break;
+                                }
+                                bx += tw + 2.0;
+                            }
+                            // Nav buttons (use exact cached positions)
+                            if target.is_none() {
+                                let nav_targets = [
+                                    FindReplaceClickTarget::PrevMatch,
+                                    FindReplaceClickTarget::NextMatch,
+                                    FindReplaceClickTarget::ToggleInSelection,
+                                    FindReplaceClickTarget::Close,
+                                ];
+                                for (&nx, nt) in fr.nav_x.iter().zip(nav_targets) {
+                                    if px >= nx && px < nx + fr.btn_s {
+                                        target = Some(nt);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Replace row ---
+                    if target.is_none()
+                        && state.engine.find_replace_show_replace
+                        && fr.rep_y > 0.0
+                        && py >= fr.rep_y
+                        && py < fr.rep_y + lh
+                    {
+                        if px >= fr.input_x && px < fr.input_x + fr.input_w {
+                            let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                            target = Some(FindReplaceClickTarget::ReplaceInput(click_col));
+                            state.fr_input_dragging = true;
+                        } else {
+                            let [ab_x, ab_w, r1_x, r_all_x] = fr.rep_btns;
+                            if px >= ab_x && px < ab_x + ab_w {
+                                target = Some(FindReplaceClickTarget::TogglePreserveCase);
+                            } else if px >= r1_x && px < r1_x + fr.btn_s {
+                                target = Some(FindReplaceClickTarget::ReplaceCurrent);
+                            } else if px >= r_all_x && px < r_all_x + fr.btn_s {
+                                target = Some(FindReplaceClickTarget::ReplaceAll);
+                            }
+                        }
+                    }
+
+                    if let Some(t) = target {
+                        state.engine.handle_find_replace_click(t);
+                    }
+
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+            // Click outside panel — let it fall through to editor
+        }
+
+        // ── Dialog button click handling (highest z-order) ────────────────
+        if state.engine.dialog.is_some() {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let (rt_w, rt_h) = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (
+                    (rc.right - rc.left) as f32 / state.dpi_scale,
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale,
+                )
+            };
+            // Match geometry from draw_dialog (auto-sized width)
+            let dialog = state.engine.dialog.as_ref().unwrap();
+            let btn_total_w: f32 = dialog
+                .buttons
+                .iter()
+                .map(|b| (b.label.chars().count() as f32 + 2.0) * cw + cw)
+                .sum::<f32>()
+                + cw * 2.0;
+            let body_max_w = dialog
+                .body
+                .iter()
+                .map(|line| line.chars().count() as f32 * cw + cw * 4.0)
+                .fold(0.0f32, f32::max);
+            let title_w = dialog.title.chars().count() as f32 * cw + cw * 4.0;
+            let content_w = btn_total_w.max(body_max_w).max(title_w);
+            let dialog_w = content_w.max(300.0).min(rt_w - 40.0);
+            let dialog_h = (dialog.body.len() as f32 + 3.0) * lh + 20.0;
+            let dx = (rt_w - dialog_w) / 2.0;
+            let dy = (rt_h - dialog_h) / 2.0;
+            let btn_y = dy + dialog_h - lh - 8.0;
+
+            // Hit-test buttons (laid out right-to-left, matching draw_dialog)
+            let mut bx = dx + dialog_w - cw;
+            let btn_count = dialog.buttons.len();
+            let mut clicked_btn: Option<usize> = None;
+            for (i, btn) in dialog.buttons.iter().enumerate().rev() {
+                let btn_w = (btn.label.chars().count() as f32 + 2.0) * cw;
+                bx -= btn_w;
+                if px >= bx && px < bx + btn_w && py >= btn_y && py < btn_y + lh {
+                    clicked_btn = Some(i);
+                    break;
+                }
+                bx -= cw;
+            }
+
+            let on_dialog = px >= dx && px < dx + dialog_w && py >= dy && py < dy + dialog_h;
+
+            if let Some(idx) = clicked_btn {
+                let action = state.engine.dialog_click_button(idx);
+                let quit = handle_action_with_sidebar(state, action);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                if quit {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+            } else if !on_dialog {
+                // Click outside dialog — dismiss
+                state.engine.dialog = None;
+                state.engine.pending_move = None;
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Picker click handling (intercept all clicks when picker is open) ──
+        if state.engine.picker_open {
+            let lh = state.line_height;
+            let (rt_w, rt_h) = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (
+                    (rc.right - rc.left) as f32 / state.dpi_scale,
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale,
+                )
+            };
+            // Match geometry from draw_picker
+            let max_visible = 12usize;
+            let has_preview = state.engine.picker_preview.is_some();
+            let list_w = if has_preview { rt_w * 0.4 } else { rt_w * 0.6 };
+            let total_w = if has_preview { rt_w * 0.8 } else { list_w };
+            let header_h = lh * 2.0; // title + input
+            let body_h = max_visible as f32 * lh;
+            let total_h = header_h + body_h;
+            let popup_x = (rt_w - total_w) / 2.0;
+            let popup_y = rt_h * 0.15;
+
+            let on_popup =
+                px >= popup_x && px < popup_x + total_w && py >= popup_y && py < popup_y + total_h;
+            let results_top = popup_y + header_h;
+            let results_bottom = popup_y + total_h;
+            let on_results =
+                on_popup && py >= results_top && py < results_bottom && px < popup_x + list_w;
+
+            if on_results {
+                let clicked_idx =
+                    state.engine.picker_scroll_top + ((py - results_top) / lh) as usize;
+                if clicked_idx < state.engine.picker_items.len() {
+                    state.engine.picker_selected = clicked_idx;
+                    state.engine.picker_load_preview();
+                }
+            } else if !on_popup {
+                state.engine.close_picker();
+            }
+            // Consume click — don't fall through to editor
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Context menu click handling (must be before any other click) ──────
+        if state.engine.context_menu.is_some() {
+            let handled = {
+                let cm = state.engine.context_menu.as_ref().unwrap();
+                let cw = state.char_width;
+                let lh = state.line_height;
+                let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+                let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+                let popup_w = (max_label + max_sc + 6).clamp(20, 50) as f32 * cw;
+                let popup_h = cm.items.len() as f32 * lh;
+                let menu_x = cm.screen_x as f32 * cw;
+                let menu_y = cm.screen_y as f32 * lh;
+                // Clamp to screen (same as draw_context_menu)
+                let rt_w = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.right - rc.left) as f32 / state.dpi_scale
+                };
+                let rt_h = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale
+                };
+                let menu_x = menu_x.min(rt_w - popup_w).max(0.0);
+                let menu_y = menu_y.min(rt_h - popup_h).max(0.0);
+
+                if px >= menu_x && px < menu_x + popup_w && py >= menu_y && py < menu_y + popup_h {
+                    // Click inside context menu — determine which item
+                    let item_idx = ((py - menu_y) / lh).floor() as usize;
+                    if item_idx < cm.items.len() && cm.items[item_idx].enabled {
+                        true // Will handle below after releasing borrow
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if handled {
+                let item_idx = {
+                    let cm = state.engine.context_menu.as_ref().unwrap();
+                    let lh = state.line_height;
+                    let cw = state.char_width;
+                    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+                    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+                    let popup_w = (max_label + max_sc + 6).clamp(20, 50) as f32 * cw;
+                    let popup_h = cm.items.len() as f32 * lh;
+                    let menu_x = cm.screen_x as f32 * cw;
+                    let menu_y = cm.screen_y as f32 * lh;
+                    let rt_h_val = {
+                        let mut rc = RECT::default();
+                        unsafe {
+                            let _ = GetClientRect(hwnd, &mut rc);
+                        }
+                        (rc.bottom - rc.top) as f32 / state.dpi_scale
+                    };
+                    let rt_w_val = {
+                        let mut rc = RECT::default();
+                        unsafe {
+                            let _ = GetClientRect(hwnd, &mut rc);
+                        }
+                        (rc.right - rc.left) as f32 / state.dpi_scale
+                    };
+                    let menu_y = menu_y.min(rt_h_val - popup_h).max(0.0);
+                    ((py - menu_y) / lh).floor() as usize
+                };
+                state.engine.context_menu.as_mut().unwrap().selected = item_idx;
+                let ctx = state.engine.context_menu_target_path();
+                if let Some(action) = state.engine.context_menu_confirm() {
+                    if let Some((ctx_path, ctx_is_dir)) = ctx {
+                        handle_context_action(state, hwnd, &action, ctx_path, ctx_is_dir);
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+            // Click outside — close menu
+            state.engine.close_context_menu();
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // ── Popup click handling (editor hover, panel hover, debug toolbar) ──
+        // Editor hover popup — click gives focus, click outside dismisses
+        if let Some(ref rect) = state.popup_rects.editor_hover {
+            if rect.contains(px, py) {
+                state.engine.editor_hover_focus();
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            } else {
+                // Click outside hover → dismiss
+                state.engine.dismiss_editor_hover();
+            }
+        }
+
+        // Panel hover popup — click outside dismisses
+        if let Some(ref rect) = state.popup_rects.panel_hover {
+            if rect.contains(px, py) {
+                // Click on panel hover — do nothing special (read-only)
+                return;
+            } else {
+                state.engine.dismiss_panel_hover_now();
+            }
+        }
+
+        // Debug toolbar buttons — dispatch via execute_command
+        if state.popup_rects.debug_toolbar.is_some() {
+            for (rect, action, enabled) in state.popup_rects.debug_toolbar_buttons.clone() {
+                if rect.contains(px, py) && enabled {
+                    let _ = state.engine.execute_command(&action);
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
         // ── Check tab bar hits first ─────────────────────────────────────
         for slot in &state.tab_slots {
             if px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height {
                 // Hit a tab — switch group and tab
                 state.engine.active_group = slot.group_id;
                 if px >= slot.close_x_start {
-                    // Close button hit
+                    // Close button hit — check for unsaved changes first
                     state.engine.goto_tab(slot.tab_idx);
-                    state.engine.close_tab();
+                    if state.engine.dirty() {
+                        use crate::core::engine::DialogButton;
+                        state.engine.show_dialog(
+                            "close_tab_confirm",
+                            "Unsaved Changes",
+                            vec!["This file has unsaved changes.".to_string()],
+                            vec![
+                                DialogButton {
+                                    label: "Save & Close".into(),
+                                    hotkey: 's',
+                                    action: "save_close".into(),
+                                },
+                                DialogButton {
+                                    label: "Discard".into(),
+                                    hotkey: 'd',
+                                    action: "discard".into(),
+                                },
+                                DialogButton {
+                                    label: "Cancel".into(),
+                                    hotkey: '\0',
+                                    action: "cancel".into(),
+                                },
+                            ],
+                        );
+                    } else {
+                        state.engine.close_tab();
+                    }
                 } else {
                     state.engine.goto_tab(slot.tab_idx);
+                    // Record for potential tab drag (threshold checked on mouse move)
+                    state.tab_drag_start = Some((px, py, slot.group_id, slot.tab_idx));
+                    unsafe {
+                        let _ = SetCapture(hwnd);
+                    }
                 }
                 unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // ── Diff toolbar button clicks ─────────────────────────────────
+        for &(_, prev_x, next_x, fold_x, btn_w, bar_y, bar_h) in
+            &state.cached_diff_toolbar_btns.clone()
+        {
+            if py >= bar_y && py < bar_y + bar_h {
+                if px >= prev_x && px < prev_x + btn_w {
+                    state.engine.jump_prev_hunk();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                } else if px >= next_x && px < next_x + btn_w {
+                    state.engine.jump_next_hunk();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                } else if px >= fold_x && px < fold_x + btn_w {
+                    state.engine.diff_toggle_hide_unchanged();
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── Breadcrumb clicks ────────────────────────────────────────────
+        if state.engine.settings.breadcrumbs {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            for bc in state.cached_breadcrumbs.clone() {
+                if bc.segments.is_empty() {
+                    continue;
+                }
+                let bx = bc.bounds.x as f32;
+                let by = bc.bounds.y as f32 - lh;
+                let bw = bc.bounds.width as f32;
+                if py >= by && py < by + lh && px >= bx && px < bx + bw {
+                    let local_x = px - bx;
+                    let sep_len = 3.0 * cw; // " › "
+                    let mut x = cw; // left padding
+                    state.engine.rebuild_breadcrumb_segments();
+                    for (i, seg) in bc.segments.iter().enumerate() {
+                        if i > 0 {
+                            x += sep_len;
+                        }
+                        let label_w = seg.label.chars().count() as f32 * cw;
+                        if local_x >= x && local_x < x + label_w {
+                            state.engine.breadcrumb_selected = i;
+                            state.engine.breadcrumb_open_scoped();
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                            return;
+                        }
+                        x += label_w;
+                    }
+                    // Click on breadcrumb row but not on a segment — consume the click
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ── Group divider click → start drag ─────────────────────────────
+        for div in &state.cached_dividers.clone() {
+            let hit = match div.direction {
+                SplitDirection::Vertical => {
+                    (px - div.position as f32).abs() < 6.0
+                        && py >= div.cross_start as f32
+                        && py < (div.cross_start + div.cross_size) as f32
+                }
+                SplitDirection::Horizontal => {
+                    (py - div.position as f32).abs() < 6.0
+                        && px >= div.cross_start as f32
+                        && px < (div.cross_start + div.cross_size) as f32
+                }
+            };
+            if hit {
+                state.group_divider_drag = Some(div.split_index);
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // ── Terminal panel header click → start resize drag ─────────────
+        if state.engine.terminal_open && !state.engine.terminal_panes.is_empty() {
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
+            // Compute panel_y using same logic as the paint pass
+            let status_above = state.engine.settings.window_status_line
+                && state.engine.settings.status_line_above_terminal
+                && state.engine.terminal_open;
+            let below_term = if status_above {
+                0.0
+            } else if state.engine.settings.window_status_line {
+                1.0
+            } else {
+                2.0
+            };
+            let above_term = if status_above { 2.0 } else { 0.0 };
+            let panel_y = rt_h - (total_rows + above_term + below_term) * lh;
+            let editor_left = state.sidebar.total_width();
+
+            // Click on the toolbar row
+            if py >= panel_y && px >= editor_left {
+                // Clear sidebar focus when clicking on terminal area
+                state.sidebar.has_focus = false;
+                state.engine.clear_sidebar_focus();
+            }
+            if py >= panel_y && py < panel_y + lh && px >= editor_left {
+                // Check toolbar buttons (right-aligned): × at width-2cw, split at width-4cw, + at width-6cw
+                let btn_close_x = rt_h.max(0.0); // rt_h unused — use width
+                let client_w = {
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.right - rc.left) as f32 / state.dpi_scale
+                };
+                if px >= client_w - cw * 2.0 {
+                    // Close button — close active terminal tab
+                    state.engine.terminal_close_active_tab();
+                    state.engine.terminal_has_focus = true;
+                } else if px >= client_w - cw * 4.0 {
+                    // Split button — toggle terminal split
+                    let full_cols = ((client_w - editor_left) / cw).floor() as u16;
+                    let rows = state.engine.session.terminal_panel_rows;
+                    state.engine.terminal_toggle_split(full_cols, rows);
+                    state.engine.terminal_has_focus = true;
+                } else if px >= client_w - cw * 6.0 {
+                    // Add button — new terminal tab
+                    let cols = ((client_w - editor_left) / cw).floor() as u16;
+                    let rows = state.engine.session.terminal_panel_rows;
+                    state.engine.terminal_new_tab(cols, rows);
+                    state.engine.terminal_has_focus = true;
+                } else {
+                    // Check terminal tab labels (left-aligned)
+                    let nf = crate::icons::nerd_fonts_enabled();
+                    let mut tx = editor_left + cw;
+                    let mut clicked_tab = None;
+                    for i in 0..state.engine.terminal_panes.len() {
+                        let label = if i == state.engine.terminal_active {
+                            format!(" {} Terminal {} ", if nf { "\u{f120}" } else { "$" }, i + 1)
+                        } else {
+                            format!(" {} ", i + 1)
+                        };
+                        let tab_w = label.chars().count() as f32 * cw;
+                        if px >= tx && px < tx + tab_w {
+                            clicked_tab = Some(i);
+                            break;
+                        }
+                        tx += tab_w;
+                    }
+                    if let Some(tab_idx) = clicked_tab {
+                        state.engine.terminal_active = tab_idx;
+                        state.engine.terminal_has_focus = true;
+                    } else {
+                        // Click on toolbar area (not a tab or button) — start resize drag
+                        state.terminal_resize_drag = true;
+                        state.engine.terminal_has_focus = true;
+                    }
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+
+            // Click in terminal content area
+            let content_y = panel_y + lh;
+            if py >= content_y && px >= editor_left {
+                // Handle split divider drag and pane switching
+                if state.engine.terminal_split && state.engine.terminal_panes.len() >= 2 {
+                    let split_cols = if state.engine.terminal_split_left_cols > 0 {
+                        state.engine.terminal_split_left_cols
+                    } else {
+                        state.engine.terminal_panes[0].cols
+                    };
+                    let div_x = editor_left + split_cols as f32 * cw;
+                    // Near divider (±5px) — start drag
+                    if (px - div_x).abs() < 5.0 {
+                        state.terminal_split_drag = true;
+                        state.engine.terminal_has_focus = true;
+                        unsafe {
+                            let _ = SetCapture(hwnd);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return;
+                    }
+                    // Switch focus to clicked pane
+                    if px < div_x {
+                        state.engine.terminal_active = 0;
+                    } else {
+                        state.engine.terminal_active = 1;
+                    }
+                }
+                // Start terminal text selection
+                let term_col = ((px - editor_left) / cw).floor() as u16;
+                let term_row = ((py - content_y) / lh).floor() as u16;
+                // Adjust for split pane — if clicking in the right pane, offset column
+                let adj_col = if state.engine.terminal_split
+                    && state.engine.terminal_panes.len() >= 2
+                    && state.engine.terminal_active == 1
+                {
+                    let left_cols = if state.engine.terminal_split_left_cols > 0 {
+                        state.engine.terminal_split_left_cols
+                    } else {
+                        state.engine.terminal_panes[0].cols
+                    };
+                    term_col.saturating_sub(left_cols + 1) // +1 for divider
+                } else {
+                    term_col
+                };
+                state.engine.terminal_scroll_reset();
+                if let Some(term) = state.engine.active_terminal_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: term_row,
+                        start_col: adj_col,
+                        end_row: term_row,
+                        end_col: adj_col,
+                    });
+                }
+                state.terminal_text_drag = true;
+                state.engine.terminal_has_focus = true;
+                unsafe {
+                    let _ = SetCapture(hwnd);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 return;
@@ -1963,9 +4457,68 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
         state.last_click_time = now;
         state.last_click_pos = (ix, iy);
 
+        // ── Per-window status bar click ─────────────────────────────────
+        if state.engine.settings.window_status_line {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let mut status_clicked = false;
+            for cwr in &state.cached_window_rects {
+                let rx = cwr.rect.x as f32;
+                let ry = cwr.rect.y as f32;
+                let rw_px = cwr.rect.width as f32;
+                let rh_px = cwr.rect.height as f32;
+                let status_y = ry + rh_px - lh;
+                if px >= rx && px < rx + rw_px && py >= status_y && py < status_y + lh {
+                    // Click is on this window's status bar
+                    let is_active = cwr.window_id == state.engine.active_window_id();
+                    let status = build_window_status_line(
+                        &state.engine,
+                        &state.theme,
+                        cwr.window_id,
+                        is_active,
+                    );
+                    let click_col = ((px - rx) / cw).floor() as usize;
+                    let bar_width = (rw_px / cw).floor() as usize;
+                    if let Some(action) = win_status_segment_hit_test(&status, bar_width, click_col)
+                    {
+                        if let Some(ea) = state.engine.handle_status_action(&action) {
+                            use crate::core::engine::EngineAction;
+                            match ea {
+                                EngineAction::ToggleSidebar => {
+                                    state.sidebar.visible = !state.sidebar.visible;
+                                }
+                                EngineAction::OpenTerminal => {
+                                    let cols = (rw_px / cw).floor() as u16;
+                                    state.engine.terminal_new_tab(
+                                        cols,
+                                        state.engine.session.terminal_panel_rows,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    status_clicked = true;
+                    break;
+                }
+            }
+            if status_clicked {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
         // ── Editor area click ────────────────────────────────────────────
         state.sidebar.has_focus = false;
+        state.engine.terminal_has_focus = false;
+        state.engine.clear_sidebar_focus();
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+            // Clear VSCode selection on click (matching GTK behavior)
+            if state.engine.is_vscode_mode() {
+                state.engine.vscode_clear_selection();
+            }
             if is_double {
                 state.engine.mouse_double_click(wid, line, col);
             } else {
@@ -1988,9 +4541,50 @@ fn on_mouse_up(hwnd: HWND) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
+        // Tab drag drop
+        if state.tab_dragging {
+            let zone = state.engine.tab_drop_zone;
+            state.engine.tab_drag_drop(zone);
+            state.tab_dragging = false;
+            state.tab_drag_start = None;
+        } else {
+            state.tab_drag_start = None;
+        }
+
         state.mouse_text_drag = false;
+        state.fr_input_dragging = false;
         state.sidebar_resize_drag = false;
         state.scrollbar_drag = None;
+        state.h_scrollbar_drag = None;
+        state.terminal_split_drag = false;
+        state.group_divider_drag = None;
+        // Auto-copy terminal selection on mouse release
+        if state.terminal_text_drag {
+            state.terminal_text_drag = false;
+            let text = state
+                .engine
+                .active_terminal()
+                .and_then(|t| t.selected_text());
+            if let Some(ref text) = text {
+                if let Some(ref cb) = state.engine.clipboard_write {
+                    let _ = cb(text);
+                }
+            }
+        }
+        if state.terminal_resize_drag {
+            state.terminal_resize_drag = false;
+            let rows = state.engine.session.terminal_panel_rows;
+            let cw = state.char_width;
+            let cols = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                ((rc.right - rc.left) as f32 / state.dpi_scale / cw).floor() as u16
+            };
+            state.engine.terminal_resize(cols, rows);
+            let _ = state.engine.session.save();
+        }
         state.engine.mouse_drag_active = false;
         state.engine.mouse_drag_origin_window = None;
         state.engine.mouse_drag_word_mode = false;
@@ -2036,6 +4630,157 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Find/replace input text selection drag
+        if state.fr_input_dragging && lbutton {
+            if let Some(ref fr) = state.cached_find_replace_rect {
+                let cw = state.char_width;
+                let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                let len = if state.engine.find_replace_focus == 0 {
+                    state.engine.find_replace_query.chars().count()
+                } else {
+                    state.engine.find_replace_replacement.chars().count()
+                };
+                state.engine.find_replace_cursor = click_col.min(len);
+                // anchor stays at the original click position → creates selection
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+        if state.fr_input_dragging && !lbutton {
+            state.fr_input_dragging = false;
+        }
+
+        // Terminal text selection drag in progress
+        if state.terminal_text_drag && lbutton {
+            let lh = state.line_height;
+            let cw = state.char_width;
+            let editor_left = state.sidebar.total_width();
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(state.hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let total_rows = state.engine.session.terminal_panel_rows as f32 + 1.0;
+            let status_above = state.engine.settings.window_status_line
+                && state.engine.settings.status_line_above_terminal
+                && state.engine.terminal_open;
+            let below_term = if status_above {
+                0.0
+            } else if state.engine.settings.window_status_line {
+                1.0
+            } else {
+                2.0
+            };
+            let above_term = if status_above { 2.0 } else { 0.0 };
+            let panel_y = rt_h - (total_rows + above_term + below_term) * lh;
+            let content_y = panel_y + lh;
+            let term_col = ((px - editor_left) / cw).floor().max(0.0) as u16;
+            let term_row = ((py - content_y) / lh).floor().max(0.0) as u16;
+            let adj_col = if state.engine.terminal_split
+                && state.engine.terminal_panes.len() >= 2
+                && state.engine.terminal_active == 1
+            {
+                let left_cols = if state.engine.terminal_split_left_cols > 0 {
+                    state.engine.terminal_split_left_cols
+                } else {
+                    state.engine.terminal_panes[0].cols
+                };
+                term_col.saturating_sub(left_cols + 1)
+            } else {
+                term_col
+            };
+            if let Some(term) = state.engine.active_terminal_mut() {
+                if let Some(ref mut sel) = term.selection {
+                    sel.end_row = term_row;
+                    sel.end_col = adj_col;
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        } else if state.terminal_text_drag && !lbutton {
+            state.terminal_text_drag = false;
+            // Auto-copy selection to clipboard on mouse release
+            let text = state
+                .engine
+                .active_terminal()
+                .and_then(|t| t.selected_text());
+            if let Some(ref text) = text {
+                if let Some(ref cb) = state.engine.clipboard_write {
+                    let _ = cb(text);
+                }
+            }
+        }
+
+        // Terminal split divider drag in progress
+        if state.terminal_split_drag && lbutton {
+            let editor_left = state.sidebar.total_width();
+            let cw = state.char_width;
+            let left_cols = ((px - editor_left) / cw).floor() as u16;
+            let left_cols = left_cols.clamp(5, 200);
+            state.engine.terminal_split_set_drag_cols(left_cols);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        } else if state.terminal_split_drag && !lbutton {
+            state.terminal_split_drag = false;
+            let editor_left = state.sidebar.total_width();
+            let cw = state.char_width;
+            let rt_w = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.right - rc.left) as f32 / state.dpi_scale
+            };
+            let full_cols = ((rt_w - editor_left) / cw).floor() as u16;
+            let left_cols = state.engine.terminal_split_left_cols;
+            let right_cols = full_cols.saturating_sub(left_cols + 1); // +1 for divider
+            let rows = state.engine.session.terminal_panel_rows;
+            state
+                .engine
+                .terminal_split_finalize_drag(left_cols, right_cols, rows);
+        }
+
+        // Terminal panel resize drag in progress
+        if state.terminal_resize_drag && lbutton {
+            let rt_h = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                (rc.bottom - rc.top) as f32 / state.dpi_scale
+            };
+            let lh = state.line_height;
+            // Available rows between drag position and bottom chrome (status + cmd = 2 rows)
+            let available = ((rt_h - py) / lh).floor() as u16;
+            let new_rows = available.saturating_sub(3).clamp(5, 50); // -3 for toolbar + status + cmd
+            state.engine.session.terminal_panel_rows = new_rows;
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        } else if state.terminal_resize_drag && !lbutton {
+            state.terminal_resize_drag = false;
+            let rows = state.engine.session.terminal_panel_rows;
+            let cw = state.char_width;
+            let cols = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                ((rc.right - rc.left) as f32 / state.dpi_scale / cw).floor() as u16
+            };
+            state.engine.terminal_resize(cols, rows);
+            let _ = state.engine.session.save();
+        }
+
         // Sidebar resize drag in progress
         if state.sidebar_resize_drag && lbutton {
             let ab_w = state.sidebar.activity_bar_px;
@@ -2045,6 +4790,36 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             return;
+        }
+
+        // Group divider drag in progress
+        if let Some(split_index) = state.group_divider_drag {
+            if lbutton {
+                if let Some(div) = state
+                    .cached_dividers
+                    .iter()
+                    .find(|d| d.split_index == split_index)
+                {
+                    let mouse_pos = match div.direction {
+                        SplitDirection::Vertical => px as f64,
+                        SplitDirection::Horizontal => py as f64,
+                    };
+                    let new_ratio = ((mouse_pos - div.axis_start) / div.axis_size).clamp(0.1, 0.9);
+                    state
+                        .engine
+                        .group_layout
+                        .set_ratio_at_index(split_index, new_ratio);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            } else {
+                state.group_divider_drag = None;
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
         }
 
         // Scrollbar drag in progress
@@ -2087,6 +4862,95 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Horizontal scrollbar drag in progress
+        if let Some(wid) = state.h_scrollbar_drag {
+            if lbutton {
+                if let Some(cwr) = state
+                    .cached_window_rects
+                    .iter()
+                    .find(|c| c.window_id == wid)
+                {
+                    let cw = state.char_width;
+                    let gutter_px = cwr.gutter_chars as f32 * cw;
+                    let rw_px = cwr.rect.width as f32;
+                    let rh_px = cwr.rect.height as f32;
+                    let lh = state.line_height;
+
+                    let w = state.engine.windows.get(&wid);
+                    let total_lines = w.map_or(1, |w| {
+                        let bid = w.buffer_id;
+                        state
+                            .engine
+                            .buffer_manager
+                            .get(bid)
+                            .map_or(1, |bs| bs.buffer.len_lines())
+                    });
+                    let has_status = state.engine.settings.window_status_line;
+                    let editor_h = rh_px - if has_status { lh } else { 0.0 };
+                    let viewport_lines = (editor_h / lh).floor() as usize;
+                    let has_v_scrollbar = total_lines > viewport_lines;
+                    let v_sb_w = if has_v_scrollbar {
+                        SCROLLBAR_WIDTH
+                    } else {
+                        0.0
+                    };
+
+                    let track_x = cwr.rect.x as f32 + gutter_px;
+                    let track_w = rw_px - gutter_px - v_sb_w;
+                    let viewport_cols = (track_w / cw).floor() as usize;
+
+                    let max_col = w.map_or(0, |w| {
+                        let bid = w.buffer_id;
+                        state.engine.buffer_manager.get(bid).map_or(0, |bs| {
+                            let mut mc = 0usize;
+                            for i in 0..bs.buffer.len_lines() {
+                                let line_len = bs.buffer.content.line(i).len_chars();
+                                if line_len > mc {
+                                    mc = line_len;
+                                }
+                            }
+                            mc
+                        })
+                    });
+                    let max_scroll = max_col.saturating_sub(viewport_cols);
+                    let rel_x = (px - track_x).clamp(0.0, track_w);
+                    let ratio = if track_w > 0.0 { rel_x / track_w } else { 0.0 };
+                    let new_left = ((ratio * max_scroll as f32) as usize).min(max_scroll);
+                    state.engine.set_scroll_left_for_window(wid, new_left);
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+                return;
+            } else {
+                state.h_scrollbar_drag = None;
+            }
+        }
+
+        // Tab drag: threshold check and drag tracking
+        if lbutton {
+            if let Some((sx, sy, gid, tidx)) = state.tab_drag_start {
+                let dx = (px - sx).abs();
+                let dy = (py - sy).abs();
+                // Start drag once we exceed a small threshold (5 DIPs)
+                if dx + dy >= 5.0 && !state.tab_dragging {
+                    state.tab_dragging = true;
+                    state.tab_drag_start = None;
+                    state.engine.tab_drag_begin(gid, tidx);
+                }
+            }
+            if state.tab_dragging {
+                state.engine.tab_drag_mouse = Some((px as f64, py as f64));
+                // Compute drop zone based on cursor position
+                let zone = compute_win_tab_drop_zone(state, px, py);
+                state.engine.tab_drop_zone = zone;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
         // Menu hover: switch menus and highlight dropdown items
         if let Some(midx) = state.engine.menu_open_idx {
             if state.engine.menu_bar_visible {
@@ -2096,9 +4960,14 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                 // Hover over menu bar labels — switch to that menu
                 let title_h = TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT;
                 if py < title_h {
-                    let mut label_x = cw;
+                    let pad = 8.0_f32;
+                    let mut label_x = pad;
                     for (idx, (name, _, _)) in MENU_STRUCTURE.iter().enumerate() {
-                        let label_w = (name.len() as f32 + 2.0) * cw;
+                        let label_w = measure_ui_text_width(
+                            &state.dwrite_factory,
+                            &state.ui_text_format,
+                            name,
+                        ) + pad * 2.0;
                         if px >= label_x && px < label_x + label_w && idx != midx {
                             state.engine.open_menu(idx);
                             unsafe {
@@ -2110,10 +4979,15 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
                     }
                 } else {
                     // Hover over dropdown items — highlight
-                    let mut popup_x = cw;
+                    let pad = 8.0_f32;
+                    let mut popup_x = pad;
                     for i in 0..midx {
                         if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                            popup_x += (name.len() as f32 + 2.0) * cw;
+                            popup_x += measure_ui_text_width(
+                                &state.dwrite_factory,
+                                &state.ui_text_format,
+                                name,
+                            ) + pad * 2.0;
                         }
                     }
                     let items = MENU_STRUCTURE
@@ -2157,6 +5031,178 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             }
         }
 
+        // Context menu hover tracking — highlight items on mouse move
+        if let Some(ref cm) = state.engine.context_menu {
+            let cw = state.char_width;
+            let lh = state.line_height;
+            let max_label = cm
+                .items
+                .iter()
+                .map(|i| i.label.chars().count() + i.shortcut.chars().count() + 4)
+                .max()
+                .unwrap_or(20);
+            let popup_w = max_label as f32 * cw;
+            let popup_h = cm.items.len() as f32 * lh;
+            let menu_x = (cm.screen_x as f32 * cw)
+                .min({
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.right - rc.left) as f32 / state.dpi_scale - popup_w
+                })
+                .max(0.0);
+            let menu_y = (cm.screen_y as f32 * lh)
+                .min({
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    (rc.bottom - rc.top) as f32 / state.dpi_scale - popup_h
+                })
+                .max(0.0);
+
+            if px >= menu_x && px < menu_x + popup_w && py >= menu_y && py < menu_y + popup_h {
+                let item_idx = ((py - menu_y) / lh).floor() as usize;
+                if item_idx < cm.items.len()
+                    && cm.items[item_idx].enabled
+                    && cm.selected != item_idx
+                {
+                    state.engine.context_menu.as_mut().unwrap().selected = item_idx;
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                }
+            }
+        }
+
+        // Git panel button hover tracking
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+            && px < state.sidebar.total_width()
+        {
+            let ab_w = state.sidebar.activity_bar_px;
+            let menu_y_off = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0
+            };
+            let lh = state.line_height;
+            let click_y = py - menu_y_off;
+            let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+            let commit_end = lh + commit_lines as f32 * lh;
+            let btn_start = commit_end + lh * 0.3;
+            let btn_end = btn_start + lh;
+            let old = state.engine.sc_button_hovered;
+            if click_y >= btn_start && click_y < btn_end && px >= ab_w {
+                let click_x = px - ab_w;
+                let panel_w_val = state.sidebar.panel_width;
+                let commit_w = panel_w_val * 0.5;
+                let remain = panel_w_val - commit_w;
+                let icon_w = remain / 3.0;
+                state.engine.sc_button_hovered = Some(if click_x < commit_w {
+                    0
+                } else if click_x < commit_w + icon_w {
+                    1
+                } else if click_x < commit_w + icon_w * 2.0 {
+                    2
+                } else {
+                    3
+                });
+            } else {
+                state.engine.sc_button_hovered = None;
+                // SC item hover dwell tracking (sections area)
+                let sections_start = btn_end + lh * 0.3;
+                if click_y >= sections_start && px >= ab_w {
+                    let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                    let visual_row = section_row + 3;
+                    if let Some((flat_idx, _is_header)) =
+                        state.engine.sc_visual_row_to_flat(visual_row, true)
+                    {
+                        if state
+                            .engine
+                            .panel_hover_mouse_move("source_control", "", flat_idx)
+                        {
+                            unsafe {
+                                let _ = InvalidateRect(Some(hwnd), None, false);
+                            }
+                        }
+                    } else {
+                        state.engine.dismiss_panel_hover();
+                    }
+                } else {
+                    state.engine.dismiss_panel_hover();
+                }
+            }
+            if state.engine.sc_button_hovered != old {
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        } else {
+            if state.engine.sc_button_hovered.is_some() {
+                state.engine.sc_button_hovered = None;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            // Mouse left git panel — dismiss hover unless over popup
+            if state.sidebar.active_panel == SidebarPanel::Git
+                && state.engine.panel_hover.is_some()
+                && state
+                    .popup_rects
+                    .panel_hover
+                    .as_ref()
+                    .is_none_or(|r| !r.contains(px, py))
+            {
+                state.engine.dismiss_panel_hover();
+            }
+        }
+
+        // Popup hover tracking: dismiss/cancel-dismiss for editor hover and panel hover
+        if let Some(ref rect) = state.popup_rects.editor_hover {
+            if rect.contains(px, py) {
+                state.engine.cancel_editor_hover_dismiss();
+            } else {
+                state.engine.dismiss_editor_hover_delayed();
+            }
+        }
+        if let Some(ref rect) = state.popup_rects.panel_hover {
+            if rect.contains(px, py) {
+                state.engine.cancel_panel_hover_dismiss();
+            } else {
+                // Only dismiss if also not over the sidebar
+                if px >= state.sidebar.total_width() {
+                    state.engine.dismiss_panel_hover();
+                }
+            }
+        }
+
+        // Tab tooltip: show on hover, dismiss on mouseout
+        {
+            let found_slot = state.tab_slots.iter().find(|slot| {
+                px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height
+            });
+            let tooltip = found_slot.and_then(|slot| {
+                let group = state.engine.editor_groups.get(&slot.group_id)?;
+                let tab = group.tabs.get(slot.tab_idx)?;
+                let win = state.engine.windows.get(&tab.active_window)?;
+                let bs = state.engine.buffer_manager.get(win.buffer_id)?;
+                let raw_path = bs.file_path.as_ref()?;
+                let path = crate::core::paths::strip_unc_prefix(raw_path);
+                Some(path.display().to_string())
+            });
+            if let Some(slot) = found_slot {
+                state.tab_tooltip_x = slot.x_start;
+            }
+            if tooltip != state.engine.tab_hover_tooltip {
+                state.engine.tab_hover_tooltip = tooltip;
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+
         // Text drag (inline instead of calling on_mouse_drag to avoid double borrow)
         if !state.sidebar_resize_drag && lbutton && state.mouse_text_drag {
             if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
@@ -2168,15 +5214,84 @@ fn on_mouse_move(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             return;
         }
 
-        // Cursor shape: resize arrow near sidebar edge
+        // Editor hover dwell: track mouse position over editor text for LSP hover popups.
+        // Only when not dragging anything and not over a popup.
+        if !lbutton
+            && !state.tab_dragging
+            && state.engine.context_menu.is_none()
+            && state.engine.menu_open_idx.is_none()
+        {
+            let mouse_on_popup = state
+                .popup_rects
+                .editor_hover
+                .as_ref()
+                .is_some_and(|r| r.contains(px, py));
+            if !mouse_on_popup {
+                if let Some((_wid, line, col)) = pixel_to_editor_pos(state, px, py) {
+                    state.engine.editor_hover_mouse_move(line, col, false);
+                } else if state.engine.editor_hover.is_some()
+                    && !state.engine.editor_hover_has_focus
+                {
+                    state.engine.dismiss_editor_hover();
+                }
+            }
+        }
+
+        // Cursor shape: resize arrow near sidebar edge or group divider
         let edge = state.sidebar.total_width();
-        let near_edge = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
-        unsafe {
-            let cursor = if near_edge {
-                LoadCursorW(None, IDC_SIZEWE).unwrap_or_default()
+        let near_sidebar = state.sidebar.visible && (px - edge).abs() < SIDEBAR_RESIZE_HIT_PX;
+        let hit_divider = state
+            .cached_dividers
+            .iter()
+            .find(|div| match div.direction {
+                SplitDirection::Vertical => {
+                    (px - div.position as f32).abs() < 6.0
+                        && py >= div.cross_start as f32
+                        && py < (div.cross_start + div.cross_size) as f32
+                }
+                SplitDirection::Horizontal => {
+                    (py - div.position as f32).abs() < 6.0
+                        && px >= div.cross_start as f32
+                        && px < (div.cross_start + div.cross_size) as f32
+                }
+            });
+        // Determine if cursor is over an editor text area (I-beam) or UI chrome (arrow)
+        let over_editor = {
+            let editor_left = state.sidebar.total_width();
+            let menu_h = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
             } else {
-                LoadCursorW(None, IDC_IBEAM).unwrap_or_default()
+                0.0
             };
+            let tab_h = state.line_height * TAB_BAR_HEIGHT_MULT;
+            let bc_h = if state.engine.settings.breadcrumbs {
+                state.line_height
+            } else {
+                0.0
+            };
+            let chrome_top = menu_h + tab_h + bc_h;
+            px >= editor_left
+                && py >= chrome_top
+                && state.engine.context_menu.is_none()
+                && !state
+                    .tab_slots
+                    .iter()
+                    .any(|s| px >= s.x_start && px < s.x_end && py >= s.y && py < s.y + s.height)
+        };
+        unsafe {
+            let cursor_id = if near_sidebar {
+                IDC_SIZEWE
+            } else if let Some(div) = hit_divider {
+                match div.direction {
+                    SplitDirection::Vertical => IDC_SIZEWE,
+                    SplitDirection::Horizontal => IDC_SIZENS,
+                }
+            } else if over_editor {
+                IDC_IBEAM
+            } else {
+                IDC_ARROW
+            };
+            let cursor = LoadCursorW(None, cursor_id).unwrap_or_default();
             SetCursor(Some(cursor));
         }
     });
@@ -2213,6 +5328,162 @@ fn on_mouse_dblclick(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
+        state.engine.terminal_has_focus = false;
+
+        // If find/replace overlay is open and double-click is on an input, select word
+        if state.engine.find_replace_open {
+            if let Some(ref fr) = state.cached_find_replace_rect {
+                if px >= fr.x && px < fr.x + fr.w && py >= fr.y && py < fr.y + fr.h {
+                    let lh = state.line_height;
+                    let cw = state.char_width;
+                    // Check if double-click is on find or replace input
+                    let on_find_input = py >= fr.row_y
+                        && py < fr.row_y + lh
+                        && px >= fr.input_x
+                        && px < fr.input_x + fr.input_w;
+                    let on_repl_input = fr.rep_y > 0.0
+                        && py >= fr.rep_y
+                        && py < fr.rep_y + lh
+                        && px >= fr.input_x
+                        && px < fr.input_x + fr.input_w;
+
+                    if on_find_input || on_repl_input {
+                        let focus = if on_find_input { 0u8 } else { 1 };
+                        state.engine.find_replace_focus = focus;
+                        let field: Vec<char> = if focus == 0 {
+                            state.engine.find_replace_query.chars().collect()
+                        } else {
+                            state.engine.find_replace_replacement.chars().collect()
+                        };
+                        let click_col = ((px - fr.input_x - 2.0) / cw).max(0.0) as usize;
+                        let pos = click_col.min(field.len());
+                        // Find word boundaries around pos
+                        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                        let start = (0..=pos)
+                            .rev()
+                            .take_while(|&i| i < field.len() && is_word(field[i]))
+                            .last()
+                            .unwrap_or(pos);
+                        let end = (pos..field.len())
+                            .take_while(|&i| is_word(field[i]))
+                            .last()
+                            .map(|i| i + 1)
+                            .unwrap_or(pos);
+                        state.engine.find_replace_sel_anchor = Some(start);
+                        state.engine.find_replace_cursor = end;
+                    }
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Double-click on explorer file → open as Permanent (promotes preview tab)
+        let ab_w = state.sidebar.activity_bar_px;
+        let menu_y = if state.engine.menu_bar_visible {
+            TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+        } else {
+            0.0
+        };
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let row = ((py - menu_y) / state.line_height).floor() as usize;
+            if row >= 1 {
+                let vis_idx = state.sidebar.scroll_top + (row - 1);
+                if vis_idx < state.sidebar.rows.len() && !state.sidebar.rows[vis_idx].is_dir {
+                    let path = state.sidebar.rows[vis_idx].path.clone();
+                    state.engine.open_file_in_tab(&path);
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on git panel file → open diff / file
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Git
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let lh = state.line_height;
+            let click_y = py - menu_y;
+            let commit_lines = state.engine.sc_commit_message.split('\n').count().max(1);
+            let commit_end = lh + commit_lines as f32 * lh;
+            let btn_end = commit_end + lh * 0.3 + lh;
+            let sections_start = btn_end + lh * 0.3;
+
+            if click_y >= sections_start {
+                let section_row = ((click_y - sections_start) / lh).floor() as usize;
+                let visual_row = section_row + 3;
+                if let Some((flat_idx, is_header)) =
+                    state.engine.sc_visual_row_to_flat(visual_row, true)
+                {
+                    if !is_header {
+                        state.engine.sc_selected = flat_idx;
+                        state.engine.handle_sc_key("Return", false, None);
+                    }
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on extension panel → open extension README
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Extensions
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+            && py >= menu_y
+        {
+            let lh = state.line_height;
+            let click_y = py - menu_y;
+            let installed_len = state.engine.ext_installed_items().len();
+            let inst_expanded = state.engine.ext_sidebar_sections_expanded[0];
+
+            let inst_header_y = lh * 1.5;
+            let inst_items_start_y = inst_header_y + lh;
+            let inst_items_end_y = inst_items_start_y
+                + if inst_expanded {
+                    installed_len as f32 * lh
+                } else {
+                    0.0
+                };
+            let avail_header_y = inst_items_end_y + lh * 0.3;
+            let avail_items_start_y = avail_header_y + lh;
+
+            // Only open readme on item rows, not section headers
+            if inst_expanded && click_y >= inst_items_start_y && click_y < inst_items_end_y {
+                let idx = ((click_y - inst_items_start_y) / lh).floor() as usize;
+                if idx < installed_len {
+                    state.engine.ext_sidebar_selected = idx;
+                    state.engine.ext_open_selected_readme();
+                }
+            } else if click_y >= avail_items_start_y {
+                let avail_idx = ((click_y - avail_items_start_y) / lh).floor() as usize;
+                let avail_len = state.engine.ext_available_items().len();
+                if avail_idx < avail_len {
+                    state.engine.ext_sidebar_selected = installed_len + avail_idx;
+                    state.engine.ext_open_selected_readme();
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Double-click on editor → word-select
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             state.engine.mouse_double_click(wid, line, col);
             state.mouse_text_drag = true;
@@ -2231,15 +5502,72 @@ fn on_right_click(hwnd: HWND, lparam: LPARAM) {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        // Only handle right-click in editor area
+        state.engine.terminal_has_focus = false;
+
+        let lh = state.line_height;
+        let cw = state.char_width;
+        let screen_col = (px / cw).floor() as u16;
+        let screen_row = (py / lh).floor() as u16;
+
+        // Check tab bar right-click
+        for slot in &state.tab_slots {
+            if px >= slot.x_start && px < slot.x_end && py >= slot.y && py < slot.y + slot.height {
+                state.engine.active_group = slot.group_id;
+                state.engine.goto_tab(slot.tab_idx);
+                state.engine.open_tab_context_menu(
+                    slot.group_id,
+                    slot.tab_idx,
+                    screen_col,
+                    screen_row,
+                );
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // Check explorer sidebar right-click
+        let ab_w = state.sidebar.activity_bar_px;
+        if state.sidebar.visible
+            && state.sidebar.active_panel == SidebarPanel::Explorer
+            && px >= ab_w
+            && px < state.sidebar.total_width()
+        {
+            let menu_y = if state.engine.menu_bar_visible {
+                TITLE_BAR_TOP_INSET + state.line_height * TITLE_BAR_HEIGHT_MULT
+            } else {
+                0.0
+            };
+            let row = ((py - menu_y) / state.line_height).floor() as usize;
+            // Row 0 is header, tree starts at row 1
+            if row >= 1 {
+                let vis_idx = state.sidebar.scroll_top + (row - 1);
+                if vis_idx < state.sidebar.rows.len() {
+                    let path = state.sidebar.rows[vis_idx].path.clone();
+                    let is_dir = state.sidebar.rows[vis_idx].is_dir;
+                    state
+                        .engine
+                        .open_explorer_context_menu(path, is_dir, screen_col, screen_row);
+                } else if let Some(ref root) = state.engine.workspace_root.clone() {
+                    state.engine.open_explorer_context_menu(
+                        root.clone(),
+                        true,
+                        screen_col,
+                        screen_row,
+                    );
+                }
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Editor area right-click
         if let Some((wid, line, col)) = pixel_to_editor_pos(state, px, py) {
             // Position cursor at click location first
             state.engine.mouse_click(wid, line, col);
-            // Convert pixel to screen row/col for context menu positioning
-            let lh = state.line_height;
-            let cw = state.char_width;
-            let screen_col = (px / cw).floor() as u16;
-            let screen_row = (py / lh).floor() as u16;
             state
                 .engine
                 .open_editor_context_menu(screen_col, screen_row);
@@ -2267,34 +5595,142 @@ fn on_mouse_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     }
     let scale = APP.with(|app| app.borrow().as_ref().map_or(1.0, |state| state.dpi_scale));
     let px = pt.x as f32 / scale;
+    let py = pt.y as f32 / scale;
 
     APP.with(|app| {
         let mut app = app.borrow_mut();
         let state = app.as_mut().expect("AppState");
 
-        // Sidebar scroll
-        if state.sidebar.visible && px < state.sidebar.total_width() {
-            let max = state.sidebar.rows.len().saturating_sub(1);
+        // Picker scroll — intercept scroll when picker is open
+        if state.engine.picker_open {
+            let max = state.engine.picker_items.len().saturating_sub(1);
             if lines > 0 {
-                state.sidebar.scroll_top = state
-                    .sidebar
-                    .scroll_top
-                    .saturating_add(lines as usize)
-                    .min(max);
+                state.engine.picker_selected =
+                    (state.engine.picker_selected + lines as usize).min(max);
             } else {
-                state.sidebar.scroll_top =
-                    state.sidebar.scroll_top.saturating_sub((-lines) as usize);
+                state.engine.picker_selected = state
+                    .engine
+                    .picker_selected
+                    .saturating_sub((-lines) as usize);
+            }
+            state.engine.picker_load_preview();
+            // Update scroll to keep selected item visible (12 visible items)
+            let visible = 12;
+            if state.engine.picker_selected < state.engine.picker_scroll_top {
+                state.engine.picker_scroll_top = state.engine.picker_selected;
+            } else if state.engine.picker_selected >= state.engine.picker_scroll_top + visible {
+                state.engine.picker_scroll_top = state.engine.picker_selected + 1 - visible;
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return;
+        }
+
+        // Editor hover popup scroll
+        if let Some(ref rect) = state.popup_rects.editor_hover {
+            if rect.contains(px, py) {
+                state.engine.editor_hover_scroll(lines);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+        }
+
+        // Sidebar scroll — dispatch by active panel (ext panel overrides)
+        if state.sidebar.visible && px < state.sidebar.total_width() {
+            if state.sidebar.ext_panel_name.is_some() {
+                let flat_len = state.engine.ext_panel_flat_len();
+                if lines > 0 {
+                    state.engine.ext_panel_scroll_top = state
+                        .engine
+                        .ext_panel_scroll_top
+                        .saturating_add(lines as usize)
+                        .min(flat_len.saturating_sub(1));
+                } else {
+                    state.engine.ext_panel_scroll_top = state
+                        .engine
+                        .ext_panel_scroll_top
+                        .saturating_sub((-lines) as usize);
+                }
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                return;
+            }
+            match state.sidebar.active_panel {
+                SidebarPanel::Settings => {
+                    if lines > 0 {
+                        state.engine.settings_scroll_top = state
+                            .engine
+                            .settings_scroll_top
+                            .saturating_add(lines as usize);
+                    } else {
+                        state.engine.settings_scroll_top = state
+                            .engine
+                            .settings_scroll_top
+                            .saturating_sub((-lines) as usize);
+                    }
+                }
+                SidebarPanel::Ai => {
+                    if lines > 0 {
+                        state.engine.ai_scroll_top =
+                            state.engine.ai_scroll_top.saturating_add(lines as usize);
+                    } else {
+                        state.engine.ai_scroll_top =
+                            state.engine.ai_scroll_top.saturating_sub((-lines) as usize);
+                    }
+                }
+                SidebarPanel::Search => {
+                    if lines > 0 {
+                        state.sidebar.search_scroll_top = state
+                            .sidebar
+                            .search_scroll_top
+                            .saturating_add(lines as usize);
+                    } else {
+                        state.sidebar.search_scroll_top = state
+                            .sidebar
+                            .search_scroll_top
+                            .saturating_sub((-lines) as usize);
+                    }
+                }
+                _ => {
+                    let max = state.sidebar.rows.len().saturating_sub(1);
+                    if lines > 0 {
+                        state.sidebar.scroll_top = state
+                            .sidebar
+                            .scroll_top
+                            .saturating_add(lines as usize)
+                            .min(max);
+                    } else {
+                        state.sidebar.scroll_top =
+                            state.sidebar.scroll_top.saturating_sub((-lines) as usize);
+                    }
+                }
             }
         } else {
-            // Editor scroll
-            let scroll_top = state.engine.view().scroll_top;
-            let new_top = if lines > 0 {
-                scroll_top.saturating_add(lines as usize)
+            // Editor scroll — use fold-aware scrolling
+            let max_line = state.engine.buffer().len_lines().saturating_sub(1);
+            if lines > 0 {
+                state.engine.scroll_down_visible(lines as usize);
             } else {
-                scroll_top.saturating_sub((-lines) as usize)
-            };
-            let max = state.engine.buffer().len_lines().saturating_sub(1);
-            state.engine.view_mut().scroll_top = new_top.min(max);
+                state.engine.scroll_up_visible((-lines) as usize);
+            }
+            // Keep cursor within the viewport (matching GTK behavior)
+            let scrolloff = state.engine.settings.scrolloff;
+            let vp = state.engine.view().viewport_lines.max(1);
+            let cur = state.engine.view().cursor.line;
+            let new_top = state.engine.view().scroll_top;
+            if cur < new_top + scrolloff {
+                state.engine.view_mut().cursor.line = (new_top + scrolloff).min(max_line);
+                state.engine.clamp_cursor_col();
+            } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+                state.engine.view_mut().cursor.line =
+                    (new_top + vp.saturating_sub(scrolloff + 1)).min(max_line);
+                state.engine.clamp_cursor_col();
+            }
+            state.engine.sync_scroll_binds();
         }
 
         unsafe {
@@ -2320,8 +5756,21 @@ fn on_tick(hwnd: HWND) {
             needs_redraw = true;
         }
 
+        // Poll editor hover dwell timer (fires LSP hover request after delay)
+        if state.engine.poll_editor_hover() {
+            needs_redraw = true;
+        }
+
         // Poll terminals
         if state.engine.poll_terminal() {
+            needs_redraw = true;
+        }
+
+        // Run pending terminal commands (e.g. extension LSP/DAP installs).
+        if let Some(cmd) = state.engine.pending_terminal_command.take() {
+            let cols = 80; // updated by layout calculation on next frame
+            let rows = state.engine.session.terminal_panel_rows;
+            state.engine.terminal_run_command(&cmd, cols, rows);
             needs_redraw = true;
         }
 
@@ -2333,6 +5782,24 @@ fn on_tick(hwnd: HWND) {
         // Swap file periodic writes
         state.engine.tick_swap_files();
 
+        // Poll for completed async shell tasks (plugin background commands)
+        if state.engine.poll_async_shells() {
+            needs_redraw = true;
+        }
+
+        // Check for panel reveal request from plugins
+        if let Some(panel_name) = state.engine.ext_panel_focus_pending.take() {
+            state.sidebar.ext_panel_name = Some(panel_name);
+            state.sidebar.visible = true;
+            state.sidebar.has_focus = true;
+            needs_redraw = true;
+        }
+
+        // Poll panel hover dwell timer
+        if state.engine.poll_panel_hover() {
+            needs_redraw = true;
+        }
+
         // Periodic sidebar refresh (git status, explorer indicators) — every 2s
         if state.last_sidebar_refresh.elapsed().as_secs() >= 2 {
             state.engine.sc_refresh();
@@ -2343,6 +5810,11 @@ fn on_tick(hwnd: HWND) {
 
         // File watcher (external modification detection)
         state.engine.tick_file_watcher();
+
+        // Poll for external git branch changes (rate-limited to once per 2s inside).
+        if state.engine.tick_git_branch() {
+            needs_redraw = true;
+        }
 
         // Notification ticker
         state.engine.tick_notifications();
@@ -2442,9 +5914,7 @@ fn activate_menu_item(state: &mut AppState, menu_idx: usize, item_idx: usize, ac
         "open_file_dialog" => {
             state.engine.close_menu();
             if let Some(path) = show_open_file_dialog(state.hwnd) {
-                if let Err(e) = state.engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                    state.engine.message = e;
-                }
+                state.engine.open_file_in_tab(&path);
                 state.sidebar.dirty = true;
             }
         }
@@ -2575,9 +6045,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             true
         }
         EngineAction::OpenFile(path) => {
-            if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                engine.message = e;
-            }
+            engine.open_file_in_tab(&path);
             false
         }
         EngineAction::QuitWithError => {
@@ -2606,7 +6074,32 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::OpenWorkspaceDialog
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false,
-        EngineAction::QuitWithUnsaved => false,
+        EngineAction::QuitWithUnsaved => {
+            use crate::core::engine::DialogButton;
+            engine.show_dialog(
+                "quit_unsaved",
+                "Unsaved Changes",
+                vec!["You have unsaved changes. Do you want to save before quitting?".to_string()],
+                vec![
+                    DialogButton {
+                        label: "Save All & Quit".into(),
+                        hotkey: 's',
+                        action: "save_quit".into(),
+                    },
+                    DialogButton {
+                        label: "Quit Without Saving".into(),
+                        hotkey: 'd',
+                        action: "discard_quit".into(),
+                    },
+                    DialogButton {
+                        label: "Cancel".into(),
+                        hotkey: '\0',
+                        action: "cancel".into(),
+                    },
+                ],
+            );
+            false
+        }
         EngineAction::ToggleSidebar => {
             // Handled at the caller side (needs AppState access)
             false
@@ -2638,7 +6131,221 @@ fn save_session(engine: &mut Engine) {
     let _ = engine.session.save();
 }
 
+// ─── Cached popup rectangles ────────────────────────────────────────────────
+
+/// Bounding rectangle in DIPs for a popup/toolbar drawn in the last frame.
+#[derive(Clone, Debug, Default)]
+struct PopupRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl PopupRect {
+    fn contains(&self, px: f32, py: f32) -> bool {
+        self.w > 0.0 && px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+}
+
+/// Cached bounding rectangles for popups and toolbars, populated each paint.
+#[derive(Clone, Debug, Default)]
+struct CachedPopupRects {
+    editor_hover: Option<PopupRect>,
+    diff_peek: Option<PopupRect>,
+    panel_hover: Option<PopupRect>,
+    tab_tooltip: Option<PopupRect>,
+    debug_toolbar: Option<PopupRect>,
+    /// Per-button rects for debug toolbar actions (rect, action command, enabled).
+    debug_toolbar_buttons: Vec<(PopupRect, String, bool)>,
+}
+
+// ─── Tab drag-and-drop drop zone computation ────────────────────────────────
+
+/// Compute the drop zone for a tab drag at pixel position `(px, py)`.
+/// Returns the appropriate `DropZone` based on which group/tab/edge the cursor is over.
+/// Handle a context menu action after the user clicks an item.
+fn handle_context_action(
+    state: &mut AppState,
+    hwnd: HWND,
+    action: &str,
+    ctx_path: PathBuf,
+    ctx_is_dir: bool,
+) {
+    match action {
+        "new_file" | "new_folder" => {
+            let target = if ctx_is_dir {
+                ctx_path.clone()
+            } else {
+                ctx_path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            if action == "new_file" {
+                state.engine.start_explorer_new_file(target);
+            } else {
+                state.engine.start_explorer_new_folder(target);
+            }
+        }
+        "rename" => {
+            state.engine.start_explorer_rename(ctx_path);
+        }
+        "delete" => {
+            state.engine.confirm_delete_file(&ctx_path);
+        }
+        "open_terminal" => {
+            let dir = if ctx_is_dir {
+                ctx_path.clone()
+            } else {
+                ctx_path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            let cw = state.char_width;
+            let cols = {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                ((rc.right - rc.left) as f32 / state.dpi_scale / cw).floor() as u16
+            };
+            let rows = state.engine.session.terminal_panel_rows;
+            state.engine.terminal_new_tab_at(cols, rows, Some(&dir));
+        }
+        "find_in_folder" => {
+            state
+                .engine
+                .open_picker(crate::core::engine::PickerSource::Grep);
+        }
+        // copy_path, copy_relative_path, reveal, open_side, select_for_diff, diff_with_selected
+        // are handled by the engine's context_menu_confirm() directly
+        _ => {}
+    }
+    state.sidebar.dirty = true;
+}
+
+fn compute_win_tab_drop_zone(state: &AppState, px: f32, py: f32) -> DropZone {
+    let source = match &state.engine.tab_drag {
+        Some(td) => (td.source_group, td.source_tab_index),
+        None => return DropZone::None,
+    };
+
+    let lh = state.line_height;
+    let tab_h = lh * TAB_BAR_HEIGHT_MULT;
+
+    // Check if cursor is over a tab bar → TabReorder
+    for slot in &state.tab_slots {
+        if py >= slot.y && py < slot.y + slot.height {
+            if px >= slot.x_start && px < slot.x_end {
+                // Over this tab — insert before or after based on midpoint
+                let mid = (slot.x_start + slot.x_end) / 2.0;
+                let idx = if px < mid {
+                    slot.tab_idx
+                } else {
+                    slot.tab_idx + 1
+                };
+                return DropZone::TabReorder(slot.group_id, idx);
+            }
+            // Over this group's tab bar but past the last tab — append
+            // Use the number of tabs in this group (if available) as the insertion index.
+            let tab_count = state
+                .engine
+                .editor_groups
+                .get(&slot.group_id)
+                .map_or(0, |g| g.tabs.len());
+            return DropZone::TabReorder(slot.group_id, tab_count);
+        }
+    }
+
+    // Check if cursor is over an editor area → Center or Split
+    let multi_group = state.engine.editor_groups.len() > 1;
+
+    for cwr in &state.cached_window_rects {
+        let rx = cwr.rect.x as f32;
+        let ry = cwr.rect.y as f32;
+        let rw = cwr.rect.width as f32;
+        let rh = cwr.rect.height as f32;
+
+        if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
+            let gid = cwr.group_id;
+
+            // Edge zone = 20% of dimension, min 30px
+            let edge_x = (rw * 0.2).max(30.0);
+            let edge_y = (rh * 0.2).max(30.0);
+
+            let rel_x = px - rx;
+            let rel_y = py - ry;
+
+            if rel_x < edge_x {
+                return DropZone::Split(gid, SplitDirection::Vertical, true);
+            }
+            if rel_x > rw - edge_x {
+                return DropZone::Split(gid, SplitDirection::Vertical, false);
+            }
+            if rel_y < edge_y {
+                return DropZone::Split(gid, SplitDirection::Horizontal, true);
+            }
+            if rel_y > rh - edge_y {
+                return DropZone::Split(gid, SplitDirection::Horizontal, false);
+            }
+
+            // Center — merge into group (only if multi-group or different group)
+            if multi_group || gid != source.0 {
+                return DropZone::Center(gid);
+            }
+        }
+    }
+
+    DropZone::None
+}
+
 // ─── Clipboard ───────────────────────────────────────────────────────────────
+
+/// Sync the unnamed register to the system clipboard after yank/delete operations.
+fn sync_clipboard(state: &mut AppState) {
+    let current = state
+        .engine
+        .registers
+        .get(&'"')
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, _)| s.clone());
+    if current != state.last_clipboard_register {
+        if let (Some(ref text), Some(ref cb_write)) = (&current, &state.engine.clipboard_write) {
+            let _ = cb_write(text.as_str());
+        }
+        state.last_clipboard_register = current;
+    }
+}
+
+/// Load system clipboard into registers before a paste key (p/P) so that
+/// externally copied text can be pasted in the editor (clipboard=unnamedplus).
+fn intercept_paste_key(state: &mut AppState, key_name: &str, unicode: Option<char>) -> bool {
+    use crate::core::Mode;
+    // Only intercept p/P in Normal/Visual modes with default register
+    let is_paste = matches!(
+        (&state.engine.mode, unicode),
+        (
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock,
+            Some('p' | 'P')
+        )
+    );
+    if !is_paste {
+        return false;
+    }
+    if !matches!(
+        state.engine.selected_register,
+        None | Some('"') | Some('+') | Some('*')
+    ) {
+        return false;
+    }
+    // Read system clipboard and load into registers
+    if let Some(ref cb_read) = state.engine.clipboard_read {
+        if let Ok(text) = cb_read() {
+            if !text.is_empty() {
+                state.engine.load_clipboard_for_paste(text);
+            }
+        }
+    }
+    // Let engine execute the paste
+    state.engine.handle_key(key_name, unicode, false);
+    true
+}
 
 fn setup_win_clipboard(engine: &mut Engine) {
     engine.clipboard_read = Some(Box::new(|| {
@@ -2652,17 +6359,22 @@ fn setup_win_clipboard(engine: &mut Engine) {
             .map(|s| s.trim_end_matches("\r\n").to_string())
     }));
     engine.clipboard_write = Some(Box::new(|text: &str| {
+        use std::io::Write;
         use std::os::windows::process::CommandExt;
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Set-Clipboard", "-Value", text])
+        // Pipe text via stdin — passing multi-line text as a -Value argument
+        // breaks on newlines (PowerShell treats them as argument separators).
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "$input | Set-Clipboard"])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| e.to_string())
-            .and_then(|mut c| c.wait().map_err(|e| e.to_string()))
-            .map(|_| ())
+            .map_err(|e| e.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait().map_err(|e| e.to_string()).map(|_| ())
     }));
 }
 
@@ -2720,4 +6432,38 @@ fn translate_key_to_pty(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
             }
         }
     }
+}
+
+/// Hit-test a per-window status bar click, returning the action if any segment matches.
+fn win_status_segment_hit_test(
+    status: &crate::render::WindowStatusLine,
+    width: usize,
+    click_col: usize,
+) -> Option<StatusAction> {
+    let right_width: usize = status
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count())
+        .sum();
+    let right_start = width.saturating_sub(right_width);
+
+    let mut col = 0;
+    for seg in &status.left_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    let mut col = right_start;
+    for seg in &status.right_segments {
+        let seg_len = seg.text.chars().count();
+        if click_col >= col && click_col < col + seg_len {
+            return seg.action.clone();
+        }
+        col += seg_len;
+    }
+
+    None
 }

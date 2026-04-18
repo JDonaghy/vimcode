@@ -242,6 +242,11 @@ pub struct PluginCallContext {
     pub commit_file_diff: Option<(String, String)>,
     /// URLs to open in the default browser.
     pub open_urls: Vec<String>,
+    /// Key sequences to feed into the engine (parsed like `send_keys`).
+    pub feedkeys_sequences: Vec<String>,
+    /// Range-based line replacements: `(start_0idx, end_0idx, replacement_lines)`.
+    /// Replaces lines `[start, end)` with the given lines (Neovim-compatible).
+    pub set_lines_range: Vec<(usize, usize, Vec<String>)>,
 }
 
 // ─── Internal registration accumulator ───────────────────────────────────────
@@ -416,6 +421,39 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
+    /// Check if an operatorfunc has been registered via `vimcode.set_operatorfunc()`.
+    #[allow(dead_code)]
+    pub fn has_operatorfunc(&self) -> bool {
+        self.lua
+            .named_registry_value::<LuaRegistryKey>("__operatorfunc")
+            .is_ok()
+    }
+
+    /// Call the registered operatorfunc with the given motion type ("line", "char", "block").
+    /// Returns the updated context with any modifications made by the callback.
+    pub fn call_operatorfunc(
+        &self,
+        motion_type: &str,
+        ctx: PluginCallContext,
+    ) -> (bool, PluginCallContext) {
+        let key = match self
+            .lua
+            .named_registry_value::<LuaRegistryKey>("__operatorfunc")
+        {
+            Ok(k) => k,
+            Err(_) => return (false, ctx),
+        };
+        self.lua.set_app_data(ctx);
+        if let Ok(f) = self.lua.registry_value::<LuaFunction>(&key) {
+            let _ = f.call::<String, ()>(motion_type.to_string());
+        }
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (true, ctx)
+    }
+
     /// Check if any registered keymap for `mode` starts with `prefix`.
     pub fn has_keymap_prefix(&self, mode: &str, prefix: &str) -> bool {
         self.keymaps
@@ -494,6 +532,17 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.set_operatorfunc(fn) — register a function for g@{motion}
+        vimcode.set(
+            "set_operatorfunc",
+            lua.create_function(|lua, f: LuaFunction| {
+                let key = lua.create_registry_value(f)?;
+                // Store in named registry slot for retrieval by call_operatorfunc
+                lua.set_named_registry_value("__operatorfunc", key)?;
+                Ok(())
+            })?,
+        )?;
+
         // ── Runtime callbacks ───────────────────────────────────────────────
 
         // vimcode.message(text)
@@ -526,6 +575,58 @@ impl PluginManager {
                     ctx.run_commands.push(cmd);
                 }
                 Ok(())
+            })?,
+        )?;
+
+        // vimcode.feedkeys(keys) — inject keystrokes into the engine.
+        // Uses the same notation as Neovim: "dw", "<Esc>", "<C-a>", "<CR>".
+        vimcode.set(
+            "feedkeys",
+            lua.create_function(|lua, keys: String| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    ctx.feedkeys_sequences.push(keys);
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.eval(expr) — evaluate simple Vim-like expressions.
+        // Supports: @a (register), &option (setting), line('.'), col('.').
+        vimcode.set(
+            "eval",
+            lua.create_function(|lua, expr: String| -> LuaResult<LuaValue> {
+                let ctx = lua.app_data_ref::<PluginCallContext>();
+                let ctx = match ctx {
+                    Some(c) => c,
+                    None => return Ok(LuaValue::Nil),
+                };
+                let expr = expr.trim();
+                if let Some(reg_char) = expr.strip_prefix('@') {
+                    // Register contents: @a, @", @+, etc.
+                    let ch = reg_char.chars().next().unwrap_or('"');
+                    Ok(ctx
+                        .registers_snapshot
+                        .get(&ch)
+                        .map(|(content, _)| LuaValue::String(lua.create_string(content).unwrap()))
+                        .unwrap_or(LuaValue::Nil))
+                } else if let Some(opt_name) = expr.strip_prefix('&') {
+                    // Option value: &tabstop, &shiftwidth, etc.
+                    Ok(ctx
+                        .settings_snapshot
+                        .get(opt_name)
+                        .map(|v| LuaValue::String(lua.create_string(v).unwrap()))
+                        .unwrap_or(LuaValue::Nil))
+                } else if expr == "line('.')" {
+                    Ok(LuaValue::Integer(ctx.cursor_line as i64))
+                } else if expr == "col('.')" {
+                    Ok(LuaValue::Integer(ctx.cursor_col as i64))
+                } else if expr == "line('$')" {
+                    Ok(LuaValue::Integer(ctx.buf_lines.len() as i64))
+                } else if expr == "mode()" {
+                    Ok(LuaValue::String(lua.create_string(&ctx.mode_name).unwrap()))
+                } else {
+                    Ok(LuaValue::Nil)
+                }
             })?,
         )?;
 
@@ -621,6 +722,63 @@ impl PluginManager {
                     if n > 0 {
                         ctx.set_lines.push((n - 1, text));
                     }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.buf.get_lines(start, end) → table of strings (0-indexed, exclusive end)
+        // Neovim-compatible: nvim_buf_get_lines(0, start, end, false)
+        buf.set(
+            "get_lines",
+            lua.create_function(|lua, (start, end): (i64, i64)| {
+                let ctx = lua.app_data_ref::<PluginCallContext>();
+                let t = lua.create_table()?;
+                if let Some(ctx) = ctx {
+                    let len = ctx.buf_lines.len() as i64;
+                    // Negative indices count from end (Neovim convention)
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        (start as usize).min(len as usize)
+                    };
+                    let e = if end < 0 {
+                        (len + end).max(0) as usize
+                    } else {
+                        (end as usize).min(len as usize)
+                    };
+                    for (i, line) in ctx.buf_lines[s..e].iter().enumerate() {
+                        t.set(i + 1, line.as_str())?;
+                    }
+                }
+                Ok(t)
+            })?,
+        )?;
+
+        // vimcode.buf.set_lines(start, end, lines) (0-indexed, exclusive end)
+        // Neovim-compatible: nvim_buf_set_lines(0, start, end, false, lines)
+        buf.set(
+            "set_lines",
+            lua.create_function(|lua, (start, end, lines): (i64, i64, LuaTable)| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    let len = ctx.buf_lines.len() as i64;
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start as usize
+                    };
+                    let e = if end < 0 {
+                        (len + end).max(0) as usize
+                    } else {
+                        end as usize
+                    };
+                    let mut new_lines = Vec::new();
+                    for i in 1..=lines.len().unwrap_or(0) {
+                        if let Ok(line) = lines.get::<_, String>(i) {
+                            new_lines.push(line);
+                        }
+                    }
+                    ctx.set_lines_range.push((s, e, new_lines));
                 }
                 Ok(())
             })?,

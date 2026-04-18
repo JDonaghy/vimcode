@@ -1,6 +1,6 @@
 // Relm4 view! macro generates #[name = "..."] bindings that trigger this lint.
 // TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional.
-#![allow(unused_assignments, deprecated)]
+#![allow(unused_assignments, deprecated, clippy::collapsible_match)]
 
 mod core;
 mod gtk;

@@ -1,9 +1,123 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 263 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 280 archived here. Recent work summary in PROJECT_STATE.md.
+
+**Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
+Fix #31 (2d2w count multiplication), #32 (<G send_keys parser), #30 (di</da< angle brackets), #29 (da"/da' trailing whitespace), #28 (d}/d{ paragraph boundary), #33 (c+Esc cursor). Neovim conformance test harness: 31 automated tests comparing VimCode vs Neovim headless.
+
+**Session 279 — Vim conformance matrix tests, `:set` option audit:**
+Operator × motion matrix tests (Phase 1): 29 new parametric tests with 93 total test cases covering d/c/y/>>/<</ gU/gu/g~ × motions + text objects, count variations, dot-repeat. Test infrastructure: `send_keys(engine, "d2w")` helper. Bug fixes: ge/gE motion (rewrote backward word-end), leader key intercepting df<space>, dw/de/db dot-repeat, send_keys `<<` parsing. `:set` option audit (Phase 2): 18 tests for round-trip, behavior, and ex-command handling. 6 Vim deviations documented as GitHub issues (#28-#33). 47 new tests (total: 1463).
+
+**Session 278 — Find/replace hit regions, colorcolumn, `x`+`.` fix, CLAUDE.md rules:**
+Centralized find/replace hit-test geometry — `FindReplaceClickTarget` enum (13 variants), `FrHitRegion` struct, `compute_find_replace_hit_regions()` in `engine/mod.rs`. All 3 backends use shared hit regions. Shared click dispatch via `Engine::handle_find_replace_click()`. TUI mouse rewrite with hit-region-based dispatch, drag-to-select, double-click word select. GTK click handler fixed (3 geometry mismatches). Win-GUI migrated to shared dispatch. Visual selection preserved during Ctrl+F. Dynamic panel width. `:set colorcolumn` implemented with parsing, derived theme color, 3-backend rendering. `x` count+`.` repeat fixed. CLAUDE.md rules elevated. Crate extraction + Vim conformance roadmap items. 27 new tests.
+
+**Session 277 — Visual-mode `:` with `'<,'>` range prefix:**
+Pressing `:` in Visual, VisualLine, or VisualBlock mode enters Command mode with `'<,'>` pre-populated in the command buffer. `command_from_visual: Option<Mode>` on Engine tracks originating visual mode; `build_selection()` renders highlight during command input; selection cleared on Escape/Enter. Status line shows COMMAND. 6 new tests.
+
+**Session 276 — Unified find/replace overlay (Ctrl+F):**
+Engine-level `FindReplacePanel` in `ScreenLayout`, rendered identically by all 3 backends (GTK Cairo, TUI ratatui, Win-GUI Direct2D). Replaces GTK-only Revealer find dialog. VSCode-style layout: find row with toggles (Aa/ab/.*), match count, nav buttons, close button; replace row with replace/replace-all buttons. Features: incremental search, case/whole-word/regex/preserve-case/in-selection toggles, chevron expand/collapse, `ctrl_f_action` setting, Ctrl+Z undo passthrough, Ctrl+A select-all in inputs, visual selection pre-fill, regex multiline mode, Edit menu integration. Win-GUI mouse interactions (drag-select, double-click word, cached `FindReplaceRect`). Nerd Font icons with ASCII fallbacks. 13 new tests.
+
+**Session 275 — Win-GUI horizontal scrollbar, bundled Nerd Font, Phase 2c verification:**
+Win-GUI horizontal scrollbar drag (draw + click + drag + `scroll_left` text offset + text-area clip rect). Bundled Nerd Font via DirectWrite (per-user font install + registry + `icon_text_format`). Phase 2c source-code verification test (grep Win-GUI source for 26 required engine method calls). 1 new test.
+
+**Session 274 — Phase 2d behavioral parity tests, clippy CI fix:**
+Phase 2d behavioral backend parity tests — 16 new end-to-end tests in `render.rs` simulating user interaction sequences (tab click/close, context menus, double-click, hover lifecycle, sidebar focus, terminal ops, tab drag-drop, preview promotion). Clippy CI fix (`needless_return` in `lsp_manager.rs`). Updated `/complete-push` command to require clippy on all feature configs.
+
+**Session 273 — Windows LSP fix, extension install fixes, Win-GUI hover:**
+Critical LSP fix: `path_to_uri` produced backslash URIs (`file://C:\path`) instead of RFC 3986 (`file:///C:/path`), breaking all LSP on Windows. Win-GUI hover: added `editor_hover_mouse_move()` + `poll_editor_hover()`. Extension install fixes: Win-GUI `pending_terminal_command`, PowerShell terminal wrapper, `&&`→`;`, rustup proxy detection (`cargo_bin_probe_ok`), rust-analyzer install via `rustup component add`, install spinner clear, `lsp_did_open` skip when install pending.
+
+## Session 272 — Win-GUI git panel rendering parity + tab scroll-into-view
+Win-GUI git panel full renderer rewrite (~300 lines): themed header, commit input box, button row (Commit/Push/Pull/Sync with hover), 4 collapsible sections, selection highlight, file status coloring, scrollbar, branch picker popup, help dialog. Click interactivity: section items, commit input, buttons, double-click-to-open-diff. Button hover tracking. Panel hover dwell for commit log popups. Tab bar scroll-into-view fix (`set_tab_visible_count` reporting).
+
+## Session 271 — Win-GUI extension panels + Nerd Font auto-detect + breadcrumb/tooltip fixes
+Win-GUI extension panel support: full `draw_ext_panel()` renderer (header, search input, flat rows with sections/items/badges/actions, scrollbar, help popup), activity bar ext panel icons (Segoe MDL2 mappings), click/keyboard/scroll handlers, `ext_panel_focus_pending` polling.
+Rendering fixes: breadcrumb UNC prefix (`?C:`), tab tooltip UNC prefix, empty breadcrumb covering tab bar, diff toolbar tab overlap.
+Nerd Font auto-detect: `detect_nerd_font_windows()`, default `use_nerd_fonts=false` on Windows, TUI activity bar `icons::` fallback-aware calls, startup warning message.
+
+## Session 270 — Win-GUI bug blitz (9 fixes — panel routing, resize, subprocess, nav)
+1. `hidden_command()` helper — CREATE_NO_WINDOW for curl calls (6 sites in registry.rs + ai.rs)
+2. Full NCHITTEST for all 8 resize zones
+3. Search panel keyboard routing (on_key_down + on_char)
+4. AI panel keyboard routing via handle_ai_panel_key()
+5. Git panel keyboard routing via handle_sc_key()
+6. Nav arrow clicks (tab_nav_back/forward) + command center click
+7. Panel-specific scroll wheel routing
+8. Search/Debug focus on activity bar click
+9. Search panel draw stub replaced with full renderer
+
+## Session 269 — Win-GUI interaction parity (19 fixes)
+New features: terminal regains focus, breadcrumb clicks, group divider drag, diff toolbar buttons, tab tooltip, terminal selection/paste/copy, extension panel keyboard + double-click.
+Bugs: UNC path prefix, clipboard sync, tab close/click geometry, context menu hover, tab slot bounds overflow, menu bar hit-test, insert mode paste, generic sidebar key swallowing. Systematic audit found 4 additional bug classes. Updated NATIVE_GUI_LESSONS.md.
+
+## Session 268 — Win-GUI bug fixes (16 items — systematic audit + user-reported bugs)
+1. Tab close dirty check — shows engine dialog for unsaved buffers
+2. Picker mouse interaction — click result to select, click outside to dismiss, scroll wheel navigates
+3. Dialog button clicks — full button rect hit-testing, outside-click dismisses
+4. QuitWithUnsaved handling — shows confirmation dialog, WM_CLOSE checks for unsaved changes
+5. Fold-aware scrolling — uses scroll_down_visible()/scroll_up_visible()
+6. Picker scroll interception — scroll wheel checks picker_open first
+7. VSCode selection clear on click — calls vscode_clear_selection() before mouse_click
+8. Cursor kept in viewport after scroll — clamped with scrolloff, calls sync_scroll_binds()
+9. Terminal tab switching by mouse — matches tab label geometry from draw code
+10. Tabs disappear with second editor group — breadcrumb offset in draw + click + drag overlay
+11. Terminal steals keyboard focus — terminal_has_focus cleared on editor click
+12. Tab accent only on active group — show_accent parameter, is_active_group check
+13. Explorer preview investigated — working correctly (expected VSCode behavior)
+14. Sidebar focus persists after editor click — clear_sidebar_focus() added
+15. Sidebar focus persists after terminal click — clear_sidebar_focus() + sidebar.has_focus = false
+16. Dialog text/buttons overflow — auto-sized width from content
+- Created docs/NATIVE_GUI_LESSONS.md with 9 sections of lessons for future backends
 
 ---
+
+**Session 267 — Win-GUI bug blitz + parity tests (9 fixes, 6 new tests, 12 bugs found):**
+
+1. **Activity bar icons** — Replaced broken Nerd Font approach with Segoe MDL2 Assets / Segoe Fluent Icons (native Windows icon fonts). 48×48 centered icon cells with dedicated DirectWrite format.
+2. **Tab drag-and-drop** — Full implementation: threshold-based drag start, `compute_win_tab_drop_zone()` for reorder/split/merge, visual overlay (blue zone highlight + insertion bar + ghost label), calls engine's `tab_drag_begin()`/`tab_drag_drop()`.
+3. **Terminal split** — Split button + add/close buttons in toolbar, split pane rendering with divider, pane focus switching, divider drag resize.
+4. **Popup mouse handlers** — `CachedPopupRects` infrastructure. Editor hover (click/dismiss/scroll), panel hover (dismiss), debug toolbar (button clicks via `execute_command`).
+5. **Scrollbar theme colors** — Fixed editor scrollbar to use `theme.scrollbar_thumb`/`scrollbar_track` instead of hardcoded alpha values.
+6. **Explorer file open** — Single-click now uses `open_file_preview()` (preview tab). Double-click/Enter uses `open_file_in_tab()` (new permanent tab). Was using `switch_window_buffer` which replaced the current buffer.
+7. **Context menu z-order + clicks** — Context menu, dialog, notifications now draw after sidebar in `on_paint`. Full click handler: item selection, action dispatch via `handle_context_action()`, outside-click dismiss.
+8. **Default shell** — `default_shell()` returns `powershell.exe` on Windows instead of `/bin/bash`.
+9. **Phase 2c action parity harness** — `UiAction` enum (26 variants), `all_required_ui_actions()` source of truth, per-backend collectors. 3 parity tests + 3 behavioral contract tests. Systematic GTK↔Win-GUI comparison found 12 additional bugs (4 critical, 5 medium, 3 low — see BUGS.md).
+
+---
+
+**Session 266 — Win-GUI parity fixes (10 fixes, 5471 tests):**
+
+1. **Text rendering truncation** — `draw_styled_line` gap-filling for text between syntax spans
+2. **Settings icon clipped/not clickable** — repositioned above bottom chrome, click handler fixed
+3. **Settings panel interactive** — full form rendering + keyboard handling (j/k/Enter/Tab/q, editing, paste)
+4. **Global status bar over per-window status** — skip when empty; reserve 1 row not 2 for bottom chrome
+5. **Per-window status bar segments** — per-segment background colors matching TUI
+6. **Editor window clipping** — `PushAxisAlignedClip` prevents text bleeding
+7. **Sidebar panel clipping** — clip rect and panel_h use `sidebar_bottom`
+8. **Command line descenders clipped** — bottom margin for below-baseline characters
+9. **Sidebar/command line background gaps** — panel bg full height; cmd line starts at `editor_left`
+10. **Clippy fix** — identical if/else branches in diff toolbar
+
+---
+
+**Session 265 — Backend parity harness + Win-GUI rendering fixes (5471 tests):**
+
+1. **Backend parity harness** — `UiElement` enum (27 variants) + `collect_expected_ui_elements()` source of truth + per-backend collectors (`collect_ui_elements_tui`, `collect_ui_elements_wingui`). 7 parity tests assert every `ScreenLayout` field has a corresponding draw call in each backend.
+2. **6 Win-GUI rendering fixes** — Added `draw_editor_hover`, `draw_diff_peek`, `draw_debug_toolbar`, `draw_diff_toolbar_in_tab_bar`, `draw_tab_tooltip`, `draw_panel_hover` to Win-GUI backend. Zero known rendering gaps remaining.
+3. **Win-GUI smoke test checklist** — Documented visual verification steps for Session 265 changes.
+
+---
+
+**Session 264 — Context-aware dedent + terminal bug fixes (5440 tests):**
+
+1. **Context-aware dedent** — `dedent_lines()` in `motions.rs` rewritten with two-pass approach: first pass finds minimum indent across all non-blank lines in the selection; second pass removes `min(shift_width, min_indent)` columns from every line uniformly. Preserves relative nesting structure. Blank lines skipped for min calculation. 6 new tests.
+2. **Terminal panel resize fix** — Two bugs: (a) mouse drag events didn't set `needs_redraw=true` in `tui_main/mod.rs`, so drag had no visual effect; (b) available-space formula in `mouse.rs` used hardcoded `2` instead of computed `bottom_chrome`. Also raised max terminal height from fixed `30` to dynamic (leaves 4 editor lines visible). Both TUI and GTK backends updated.
+3. **GTK terminal toggle fix** — `[P]` status bar button required two clicks on first use because it sent an async `Msg::ToggleTerminal` via Relm4 message queue. Fixed by calling `terminal_new_tab()` synchronously in the click handler (matching TUI which already did this).
+4. **CLAUDE.md updates** — Added Win-GUI directory section, multi-backend rule ("check all THREE backends when touching mouse/layout/rendering code").
+5. **Release v0.9.0** — Version bumped, PR #21 created and merged.
+6. **Rendering test infrastructure** — 9 ScreenLayout tests in `render.rs` (tests shared rendering data all backends consume); 10 TUI assertion tests + 6 insta golden-file snapshot tests in `tui_main/render_impl.rs` using ratatui `TestBackend`; `insta` added as dev-dependency.
+7. **Win-GUI bug audit** — Systematic comparison of Win-GUI vs TUI across 10 areas (tab clicks, file open, scrollbar, preview tabs, terminal, status bar, explorer, keys, mouse drag, context menus). Identified 9 gaps, corrected stale bugs.
+8. **Win-GUI fixes (7 total)**: (a) Explorer single-click → `OpenMode::Preview`, double-click → `Permanent`; (b) preview tab dimmer color in draw.rs; (c) Settings gear icon pinned to activity bar bottom + click handler; (d) explorer + tab bar right-click context menus; (e) status bar clickable via `win_status_segment_hit_test()` + `build_window_status_line()` on demand + `pixel_to_editor_pos()` now excludes status bar area; (f) tab bar clicks — fixed Y coordinate (`TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT`) and height (`lh * TAB_BAR_HEIGHT_MULT`) in both single-group and multi-group cache; (g) terminal resize drag — `terminal_resize_drag` field + header click + WM_MOUSEMOVE handler + mouse-up PTY resize.
 
 **Session 263 — Status line positioning + Windows alpha note (5422 tests):**
 
@@ -64,7 +178,7 @@ Files changed: `src/core/engine/keys.rs`, `src/core/engine/windows.rs`, `src/cor
 
 **Session 259 — README revamp (5391 tests):**
 
-Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha software" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
+Full review and rewrite of README.md for multi-platform maturity. Replaced "alpha ware" / "vibe-coded" status with "Beta" label and backup disclaimer. Added Platforms table (Linux GTK4, macOS GTK4 via Homebrew, Windows native Win32+Direct2D+DirectWrite, TUI everywhere). Added Windows native GUI and TUI download instructions. Added Windows build commands (`--features win-gui --bin vimcode-win`). Updated Architecture tree with `win_gui/` directory (~5,322 lines) and all current line counts (~128K total, core/ ~81,824, engine/ ~59,947, render.rs ~7,815). Updated Tech Stack with windows-rs/Direct2D/DirectWrite and notify crate. Added LaTeX to syntax highlighting list, mentioned semantic token overlay. Updated test count to 5,391. Removed 7 duplicate command table entries. Referenced vimcode.org for screenshots. Clarified `vcd` as recommended TUI binary. Mentioned Extensions panel for discovering extensions. Documented keymaps editor access in VSCode mode (F1 → Keymaps). Noted F1 command palette works in both Vim and VSCode modes. Updated Acknowledgements. Files changed: `README.md`, `PROJECT_STATE.md`, `PLAN.md`.
 
 ---
 
@@ -771,7 +885,7 @@ GTK: `set_decorated(false)` + `WindowHandle` drag + window-control buttons [─]
 **Session 88 — VSCode-like debugger UI (12 new tests, 743 total):**
 `LaunchConfig` struct + `parse_launch_json/type_to_adapter/generate_launch_json` in `dap_manager.rs`. Engine: `DebugSidebarSection`/`BottomPanelKind` enums; 8 new fields; `dap_add/remove_watch()`; `handle_debug_sidebar_key()`; `debug_toolbar_visible` default false. GTK: `SidebarPanel::Debug`, `draw_debug_sidebar()`. TUI: `TuiPanel::Debug`, `render_debug_sidebar()`. 12 new tests.
 
-**Session 87 — :set wrap / soft line-wrap rendering (7 new tests, 731 total):**
+**Session 87 — :set wrap /  line-wrap rendering (7 new tests, 731 total):**
 `Settings.wrap: bool` (default false). `render.rs`: `RenderedLine.is_wrap_continuation` + `segment_col_offset`; `build_rendered_window` splits lines at `viewport_cols`; `max_col=0` disables h-scroll. Engine: `ensure_cursor_visible_wrap`; `move_visual_down/up` helpers; `gj`/`gk` bindings. 7 new tests.
 
 **Session 86 — DAP panel interactivity + expression evaluation (4 new tests, 724 total):**

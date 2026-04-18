@@ -849,7 +849,7 @@ impl DapManager {
 
             // Verify debugpy is importable before spawning.
             if adapter_name == "debugpy" {
-                let ok = std::process::Command::new(&binary)
+                let ok = crate::core::git::hidden_command(&binary)
                     .args(["-c", "import debugpy"])
                     .output()
                     .map(|o| o.status.success())
@@ -896,7 +896,7 @@ impl DapManager {
 
         // Verify debugpy is importable before spawning.
         if info.name == "debugpy" {
-            let ok = std::process::Command::new(&binary)
+            let ok = crate::core::git::hidden_command(&binary)
                 .args(["-c", "import debugpy"])
                 .output()
                 .map(|o| o.status.success())

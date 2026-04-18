@@ -7,7 +7,11 @@
 //!
 //! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
 //! All rendering data comes from `render`.
-#![allow(unused_assignments)]
+#![allow(
+    unused_assignments,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop
+)]
 
 use std::collections::HashSet;
 use std::fs;
@@ -573,7 +577,7 @@ fn filter_dir_entries(all: &[PathBuf], query: &str) -> Vec<PathBuf> {
             dir_fuzzy_score(&display, &q).map(|s| (s, p))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
     scored
         .into_iter()
         .take(CAP)
@@ -839,10 +843,17 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 
     let mut engine = Engine::new();
+    // Auto-detect Nerd Font availability. On Windows, terminal fonts typically
+    // don't include Nerd Font glyphs. If none found, disable and show message.
+    let nerd_font_missing = engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
+    if nerd_font_missing {
+        engine.settings.use_nerd_fonts = false;
+    }
     icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
     engine.plugin_init();
     // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
     engine.ext_refresh();
+    // Nerd font message is set right before event_loop to survive async overwrites.
     if let Some(path) = file_path {
         // CLI argument: open only the specified file/directory, skip session restore
         if path.is_dir() {
@@ -915,8 +926,14 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     let mut terminal = Terminal::new(backend).expect("create terminal");
     terminal.clear().expect("clear terminal");
 
+    let startup_msg = if nerd_font_missing {
+        Some("No Nerd Font detected — using fallback icons. Install a Nerd Font and run :set nerdfonts to enable.".to_string())
+    } else {
+        None
+    };
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        event_loop(&mut terminal, &mut engine, keyboard_enhanced);
+        event_loop(&mut terminal, &mut engine, keyboard_enhanced, startup_msg);
     }));
 
     restore_terminal(&mut terminal, keyboard_enhanced);
@@ -964,8 +981,10 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     engine: &mut Engine,
     keyboard_enhanced: bool,
+    startup_message: Option<String>,
 ) {
     let mut theme = Theme::from_name(&engine.settings.colorscheme);
+    let mut pending_startup_msg = startup_message;
 
     // TUI menu bar can be fully hidden (unlike GTK where it's the title bar).
     engine.menu_bar_toggleable = true;
@@ -1019,6 +1038,8 @@ fn event_loop(
     let mut dragging_group_divider: Option<usize> = None;
     // True while user is drag-selecting text inside the editor hover popup.
     let mut hover_selecting: bool = false;
+    // True while user is drag-selecting text inside a find/replace input field.
+    let mut fr_input_dragging: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
     // Double-click detection state
@@ -1441,6 +1462,12 @@ fn event_loop(
             if engine.poll_async_shells() {
                 needs_redraw = true;
             }
+            // Show startup message after async init completes (overrides
+            // "Extension registry updated" etc.)
+            if let Some(msg) = pending_startup_msg.take() {
+                engine.message = msg;
+                needs_redraw = true;
+            }
             // Check for panel reveal request from plugins.
             if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
                 sidebar.ext_panel_name = Some(panel_name);
@@ -1474,6 +1501,10 @@ fn event_loop(
             engine.tick_swap_files();
             // Check for externally modified files.
             engine.tick_file_watcher();
+            // Poll for external git branch changes (rate-limited to once per 2s).
+            if engine.tick_git_branch() {
+                needs_redraw = true;
+            }
             // Auto-dismiss completed notifications after timeout.
             // Force redraw every idle tick when notifications are visible (spinner animation).
             if !engine.notifications.is_empty() {
@@ -3618,6 +3649,7 @@ fn event_loop(
                                 editor_hover_popup_rect,
                                 &editor_hover_link_rects,
                                 &mut hover_selecting,
+                                &mut fr_input_dragging,
                             );
                             sync_sidebar_focus(&sidebar, engine);
                             if mouse_should_quit {
@@ -3668,6 +3700,7 @@ fn event_loop(
                     editor_hover_popup_rect,
                     &editor_hover_link_rects,
                     &mut hover_selecting,
+                    &mut fr_input_dragging,
                 );
                 sync_sidebar_focus(&sidebar, engine);
                 if mouse_should_quit {

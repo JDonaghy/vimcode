@@ -162,7 +162,8 @@ fn test_backtick_around_text_object() {
     e.view_mut().cursor.col = 10;
     type_chars(&mut e, "da`");
     let content = buf(&e);
-    assert!(content.starts_with("let x = ;"), "got: {}", content);
+    // da` deletes backticks + content + trailing space (Neovim-verified)
+    assert!(content.starts_with("let x =;"), "got: {}", content);
 }
 
 // ── Insert CTRL-E (char below) ──────────────────────────────────────────

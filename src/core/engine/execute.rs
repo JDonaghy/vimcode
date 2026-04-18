@@ -17,6 +17,52 @@ impl Engine {
         let normalized = normalize_ex_command(cmd);
         let cmd: &str = &normalized;
 
+        // Handle :{range}{cmd} — commands with line number prefixes (e.g. :2d, :3,5d)
+        if cmd.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            if let Some(action) = self.try_execute_ranged_command(cmd) {
+                return action;
+            }
+        }
+
+        // Handle :%{cmd} — whole-buffer range prefix (e.g. :%join, :%d)
+        if let Some(rest) = cmd.strip_prefix('%') {
+            let rest = rest.trim();
+            let rest_normalized = normalize_ex_command(rest);
+            match rest_normalized.as_ref() {
+                "join" => {
+                    let total_lines = self.buffer().len_lines();
+                    if total_lines > 1 {
+                        self.view_mut().cursor.line = 0;
+                        self.view_mut().cursor.col = 0;
+                        let mut changed = false;
+                        self.join_lines(total_lines, &mut changed);
+                    }
+                    return EngineAction::None;
+                }
+                "delete" | "d" => {
+                    let total_lines = self.buffer().len_lines();
+                    self.view_mut().cursor.line = 0;
+                    self.view_mut().cursor.col = 0;
+                    let mut changed = false;
+                    self.start_undo_group();
+                    self.delete_lines(total_lines, &mut changed);
+                    self.finish_undo_group();
+                    return EngineAction::None;
+                }
+                "yank" | "y" => {
+                    let total_lines = self.buffer().len_lines();
+                    let saved = self.view().cursor;
+                    self.view_mut().cursor.line = 0;
+                    self.yank_lines(total_lines);
+                    self.view_mut().cursor = saved;
+                    return EngineAction::None;
+                }
+                _ => {
+                    // Fall through for commands that handle % themselves (s/, norm, etc.)
+                }
+            }
+        }
+
         // Handle :term / :terminal — open integrated terminal
         if cmd == "terminal" {
             return EngineAction::OpenTerminal;
@@ -1269,20 +1315,36 @@ impl Engine {
             return self.execute_global_command(rest, true);
         }
 
-        // :sort [flags] — sort lines in buffer
-        if cmd == "sort" || cmd.starts_with("sort ") {
-            let flags = cmd.strip_prefix("sort").unwrap_or("").trim();
-            return self.execute_sort_command(flags);
+        // :sort [flags] — sort lines in buffer.
+        // Accept both ":sort" with space-separated flags and the Vim ":sort!" bang
+        // (synonym for the 'r' reverse flag).
+        if cmd == "sort" || cmd == "sort!" || cmd.starts_with("sort ") || cmd.starts_with("sort!") {
+            // Normalize: strip "sort" and an optional '!', then treat the '!' as
+            // a reverse flag appended to whatever flags remain.
+            let after = cmd.strip_prefix("sort").unwrap_or("");
+            let (bang, after) = if let Some(rest) = after.strip_prefix('!') {
+                (true, rest)
+            } else {
+                (false, after)
+            };
+            let mut flags = after.trim().to_string();
+            if bang && !flags.contains('r') {
+                flags.push('r');
+            }
+            return self.execute_sort_command(&flags);
         }
 
-        // :m[ove] {dest} — move current line to after dest
-        if let Some(dest) = cmd.strip_prefix("move ") {
-            return self.execute_move_command(dest.trim());
+        // :m[ove] {dest} / :t {dest} / :co[py] {dest} — operate on current line.
+        // Accept both the space-separated form (":move 3") and the concatenated
+        // digit-suffix form (":m3", ":t3", ":co3") that Vim supports.
+        if let Some(dest) = split_cmd_and_arg(cmd, "move").or_else(|| split_cmd_and_arg(cmd, "m")) {
+            return self.execute_move_command(dest);
         }
-
-        // :t {dest} / :co[py] {dest} — copy current line to after dest
-        if let Some(dest) = cmd.strip_prefix("copy ").or_else(|| cmd.strip_prefix("t ")) {
-            return self.execute_copy_command(dest.trim());
+        if let Some(dest) = split_cmd_and_arg(cmd, "copy")
+            .or_else(|| split_cmd_and_arg(cmd, "co"))
+            .or_else(|| split_cmd_and_arg(cmd, "t"))
+        {
+            return self.execute_copy_command(dest);
         }
 
         // Handle range filter: N,M!cmd — pipe lines through external command
@@ -1896,21 +1958,14 @@ impl Engine {
                 EngineAction::None
             }
             "find" => {
-                // Open incremental forward search (same as pressing /)
-                self.mode = Mode::Search;
-                self.command_buffer.clear();
-                self.search_direction = SearchDirection::Forward;
-                self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false;
-                self.count = None;
+                // Open the unified find/replace overlay
+                self.open_find_replace();
                 EngineAction::None
             }
             "replace" => {
-                // Open ex command mode pre-filled with %s/ for find & replace
-                self.mode = Mode::Command;
-                self.command_buffer = "%s/".to_string();
-                self.command_cursor = self.command_buffer.chars().count();
-                self.count = None;
+                // Open the unified find/replace overlay with replace row visible
+                self.open_find_replace();
+                self.find_replace_show_replace = true;
                 EngineAction::None
             }
             "sidebar" => EngineAction::ToggleSidebar,
@@ -2098,11 +2153,7 @@ impl Engine {
                 let modified = if self.dirty() { " [Modified]" } else { "" };
                 let total = self.buffer().len_lines();
                 let cur_line = self.view().cursor.line + 1;
-                let pct = if total == 0 {
-                    0
-                } else {
-                    (cur_line * 100) / total
-                };
+                let pct = (cur_line * 100).checked_div(total).unwrap_or(0);
                 self.message = format!("\"{name}\"{modified} {total} lines --{pct}%--");
                 EngineAction::None
             }
@@ -2581,6 +2632,134 @@ impl Engine {
         EngineAction::None
     }
 
+    /// :[start,end]m {dest} — move a range of lines to after line {dest}.
+    /// Lines are 0-indexed inclusive. `dest` is an address string.
+    pub(crate) fn execute_move_range(
+        &mut self,
+        src_start: usize,
+        src_end: usize,
+        dest: &str,
+    ) -> EngineAction {
+        let num_lines = self.buffer().len_lines();
+        if src_start > src_end {
+            self.message = "Invalid range".to_string();
+            return EngineAction::Error;
+        }
+        let current = self.view().cursor.line;
+        let dest_line = self.parse_line_address(dest, current, num_lines);
+        // Dest inside source range is a no-op (Vim disallows it; we silently skip).
+        if dest_line >= src_start && dest_line <= src_end {
+            return EngineAction::None;
+        }
+        let line_count = src_end - src_start + 1;
+
+        let block_start = self.buffer().line_to_char(src_start);
+        let block_end = if src_end + 1 < num_lines {
+            self.buffer().line_to_char(src_end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let block_text: String = self
+            .buffer()
+            .content
+            .slice(block_start..block_end)
+            .chars()
+            .collect();
+        let block_text = if block_text.ends_with('\n') {
+            block_text
+        } else {
+            format!("{}\n", block_text)
+        };
+
+        self.start_undo_group();
+        // Delete source first, then compute adjusted dest in the post-deletion buffer.
+        self.delete_with_undo(block_start, block_end);
+        let post_num_lines = self.buffer().len_lines();
+        let dest_is_zero = dest.trim() == "0";
+        let adjusted_dest = if dest_line > src_end {
+            dest_line - line_count
+        } else {
+            dest_line
+        };
+        let insert_pos = if dest_is_zero {
+            0
+        } else if adjusted_dest + 1 >= post_num_lines {
+            self.buffer().len_chars()
+        } else {
+            self.buffer().line_to_char(adjusted_dest + 1)
+        };
+        self.insert_with_undo(insert_pos, &block_text);
+        self.finish_undo_group();
+
+        let new_cursor_line = if dest_is_zero {
+            line_count - 1
+        } else {
+            adjusted_dest + line_count
+        };
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = new_cursor_line.min(max_line);
+        self.view_mut().cursor.col = 0;
+        EngineAction::None
+    }
+
+    /// :[start,end]co {dest} / :t {dest} — copy a range of lines to after line {dest}.
+    pub(crate) fn execute_copy_range(
+        &mut self,
+        src_start: usize,
+        src_end: usize,
+        dest: &str,
+    ) -> EngineAction {
+        let num_lines = self.buffer().len_lines();
+        if src_start > src_end {
+            self.message = "Invalid range".to_string();
+            return EngineAction::Error;
+        }
+        let current = self.view().cursor.line;
+        let dest_line = self.parse_line_address(dest, current, num_lines);
+        let line_count = src_end - src_start + 1;
+
+        let block_start = self.buffer().line_to_char(src_start);
+        let block_end = if src_end + 1 < num_lines {
+            self.buffer().line_to_char(src_end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
+        let block_text: String = self
+            .buffer()
+            .content
+            .slice(block_start..block_end)
+            .chars()
+            .collect();
+        let block_text = if block_text.ends_with('\n') {
+            block_text
+        } else {
+            format!("{}\n", block_text)
+        };
+
+        let dest_is_zero = dest.trim() == "0";
+        let insert_pos = if dest_is_zero {
+            0
+        } else if dest_line + 1 >= num_lines {
+            self.buffer().len_chars()
+        } else {
+            self.buffer().line_to_char(dest_line + 1)
+        };
+
+        self.start_undo_group();
+        self.insert_with_undo(insert_pos, &block_text);
+        self.finish_undo_group();
+
+        let new_cursor_line = if dest_is_zero {
+            line_count - 1
+        } else {
+            dest_line + line_count
+        };
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = new_cursor_line.min(max_line);
+        self.view_mut().cursor.col = 0;
+        EngineAction::None
+    }
+
     /// :t {dest} / :co[py] {dest} — copy current line to after line {dest}.
     pub(crate) fn execute_copy_command(&mut self, dest: &str) -> EngineAction {
         let current_line = self.view().cursor.line;
@@ -2606,8 +2785,12 @@ impl Engine {
             format!("{}\n", line_text)
         };
 
-        // Insert copy after dest_line (after the line at dest_line index)
-        let insert_pos = if dest_line >= num_lines {
+        // Insert copy after dest_line. The special address "0" means "insert
+        // before line 1" — at char 0 — and is NOT a normal "after line N" op.
+        let dest_is_zero = dest.trim() == "0";
+        let insert_pos = if dest_is_zero {
+            0
+        } else if dest_line >= num_lines {
             self.buffer().len_chars()
         } else {
             let after = dest_line.min(num_lines - 1);
@@ -2622,7 +2805,9 @@ impl Engine {
         self.insert_with_undo(insert_pos, &line_text);
         self.finish_undo_group();
 
-        let new_line = if dest_line < current_line {
+        let new_line = if dest_is_zero {
+            0
+        } else if dest_line < current_line {
             current_line + 1
         } else {
             dest_line + 1
@@ -2634,7 +2819,15 @@ impl Engine {
     }
 
     /// Parse a line address string to a 0-based line index.
-    /// Supports: "0", "1"-"N" (1-based absolute), ".", "$", "+N", "-N".
+    ///
+    /// Bare numeric addresses are **1-based** (matches Vim's convention): `"1"`
+    /// → index 0, `"3"` → index 2. The special address `"0"` means "before line 1"
+    /// — callers that use the result as an insert point should treat 0 as "insert
+    /// at the very top". For callers that use the result as a cursor line,
+    /// clamping to 0 is already safe.
+    ///
+    /// Supports: `"0"` (before first line), `"1"`-`"N"` (1-based absolute),
+    /// `"."` (current), `"$"` (last), `"+N"`/`"-N"` (relative to current).
     pub(crate) fn parse_line_address(&self, addr: &str, current: usize, total: usize) -> usize {
         let addr = addr.trim();
         if addr == "." {
@@ -2652,8 +2845,12 @@ impl Engine {
             return current.saturating_sub(n);
         }
         if let Ok(n) = addr.parse::<usize>() {
-            // 0-based absolute line index
-            return n.min(total.saturating_sub(1));
+            // 1-based absolute line index. "0" maps to index 0 and is treated
+            // specially by copy/move callers as "before line 1".
+            if n == 0 {
+                return 0;
+            }
+            return (n - 1).min(total.saturating_sub(1));
         }
         current
     }
@@ -3082,6 +3279,138 @@ impl Engine {
                 self.dismiss_done_notifications();
             }
         }
+        None
+    }
+
+    /// Try to parse and execute a ranged ex command like `:2d`, `:3,5d`, `:10y`.
+    /// Returns `Some(action)` if it handled the command, `None` otherwise.
+    fn try_execute_ranged_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        // Parse leading range: N or N,M
+        let bytes = cmd.as_bytes();
+        let mut i = 0;
+
+        // Parse first number
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 {
+            return None;
+        }
+        let first_num: usize = cmd[..i].parse().ok()?;
+
+        let (start_line, end_line, rest) = if i < bytes.len() && bytes[i] == b',' {
+            // Range: N,M
+            let comma = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let second_num: usize = cmd[comma + 1..i].parse().ok()?;
+            (first_num, second_num, &cmd[i..])
+        } else {
+            // Single line: N
+            (first_num, first_num, &cmd[i..])
+        };
+
+        let rest = rest.trim();
+        let max_line = self.buffer().len_lines();
+        let start = start_line.min(max_line);
+        let end = end_line.min(max_line);
+
+        match rest {
+            "d" | "delete" => {
+                // :Nd or :N,Md — delete lines (1-indexed)
+                if start == 0 || end == 0 || start > end {
+                    self.message = "Invalid range".to_string();
+                    return Some(EngineAction::None);
+                }
+                let start_0 = start - 1;
+                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
+                let count = end_0 - start_0 + 1;
+                self.view_mut().cursor.line = start_0;
+                self.view_mut().cursor.col = 0;
+                let mut changed = false;
+                self.start_undo_group();
+                self.delete_lines(count, &mut changed);
+                self.finish_undo_group();
+                Some(EngineAction::None)
+            }
+            "y" | "yank" => {
+                // :Ny or :N,My — yank lines (1-indexed)
+                if start == 0 || end == 0 || start > end {
+                    self.message = "Invalid range".to_string();
+                    return Some(EngineAction::None);
+                }
+                let start_0 = start - 1;
+                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
+                let saved = self.view().cursor;
+                self.view_mut().cursor.line = start_0;
+                let count = end_0 - start_0 + 1;
+                self.yank_lines(count);
+                self.view_mut().cursor = saved;
+                Some(EngineAction::None)
+            }
+            _ if rest.is_empty() && first_num > 0 => {
+                // :N alone — go to line N (1-indexed)
+                let target = (first_num - 1).min(self.buffer().len_lines().saturating_sub(1));
+                self.view_mut().cursor.line = target;
+                self.view_mut().cursor.col = 0;
+                self.clamp_cursor_col();
+                Some(EngineAction::None)
+            }
+            _ => {
+                // Try :[range]m[ove]{dest} / :[range]co[py]{dest} / :[range]t{dest}.
+                // After range parse, `rest` looks like "m3", "move 3", "co3", "copy 3", "t3".
+                let move_dest =
+                    split_cmd_and_arg(rest, "move").or_else(|| split_cmd_and_arg(rest, "m"));
+                let copy_dest = split_cmd_and_arg(rest, "copy")
+                    .or_else(|| split_cmd_and_arg(rest, "co"))
+                    .or_else(|| split_cmd_and_arg(rest, "t"));
+                if move_dest.is_none() && copy_dest.is_none() {
+                    // Unknown ranged command — fall through to other dispatchers.
+                    return None;
+                }
+                if start == 0 || end == 0 || start > end {
+                    self.message = "Invalid range".to_string();
+                    return Some(EngineAction::None);
+                }
+                let src_start = start - 1;
+                let src_end = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
+                if let Some(dest) = move_dest {
+                    return Some(self.execute_move_range(src_start, src_end, dest));
+                }
+                if let Some(dest) = copy_dest {
+                    return Some(self.execute_copy_range(src_start, src_end, dest));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Matches `rest` against command name `name` followed by a valid argument
+/// separator (space, digit, `+`, `-`, `.`, `$`). Returns the trimmed argument
+/// if matched, else None.
+///
+/// Examples:
+/// - split_cmd_and_arg("t3", "t") → Some("3")
+/// - split_cmd_and_arg("move 5", "move") → Some("5")
+/// - split_cmd_and_arg("term", "t") → None (char 'e' is not a valid separator)
+fn split_cmd_and_arg<'a>(rest: &'a str, name: &str) -> Option<&'a str> {
+    let rest = rest.strip_prefix(name)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest.chars().next()?;
+    if first == ' '
+        || first.is_ascii_digit()
+        || first == '+'
+        || first == '-'
+        || first == '.'
+        || first == '$'
+    {
+        Some(rest.trim())
+    } else {
         None
     }
 }

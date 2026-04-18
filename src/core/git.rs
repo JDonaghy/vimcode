@@ -77,6 +77,19 @@ pub struct DiffHunkInfo {
     pub new_count: usize,
 }
 
+/// Create a Command with `CREATE_NO_WINDOW` on Windows to prevent
+/// console window flashes in GUI mode.
+pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Create a `git` Command with `CREATE_NO_WINDOW` on Windows to prevent
 /// console window flashes in GUI mode.
 fn git_command() -> Command {

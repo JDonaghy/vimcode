@@ -1,4 +1,4 @@
-# src/core/engine/execute.rs — 3,008 lines
+# src/core/engine/execute.rs — 3,398 lines
 
 Ex-command dispatcher. Parses and executes all `:` commands entered in command mode.
 

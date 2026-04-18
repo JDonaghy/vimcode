@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -103,7 +103,12 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_Security",
 ], optional = true }
+
+[dev-dependencies]
+insta = "1.39"
 
 [build-dependencies]
 cc = "1.0"

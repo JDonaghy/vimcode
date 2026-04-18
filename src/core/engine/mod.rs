@@ -924,6 +924,379 @@ pub enum SearchDirection {
     Backward, // Last search was '?'
 }
 
+/// Toggle options for the inline find/replace overlay (Ctrl+F).
+#[derive(Debug, Clone, Default)]
+pub struct FindReplaceOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+    /// Replace preserving the case pattern of the match (e.g. "Foo"→"Bar", "FOO"→"BAR").
+    pub preserve_case: bool,
+    /// Only search within the current visual selection range.
+    pub in_selection: bool,
+}
+
+/// Click target within the find/replace overlay.
+/// Backends resolve native coordinates → `FindReplaceClickTarget`, then call
+/// `Engine::handle_find_replace_click()` for shared dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindReplaceClickTarget {
+    /// Toggle replace row visibility (the ▶/▼ chevron).
+    Chevron,
+    /// Click in the find input field at the given char offset.
+    FindInput(usize),
+    /// Click in the replace input field at the given char offset.
+    ReplaceInput(usize),
+    ToggleCase,
+    ToggleWholeWord,
+    ToggleRegex,
+    PrevMatch,
+    NextMatch,
+    ToggleInSelection,
+    Close,
+    TogglePreserveCase,
+    ReplaceCurrent,
+    ReplaceAll,
+}
+
+/// A hit region within the find/replace panel, expressed in character-cell units
+/// relative to the panel's top-left **content** corner (inside borders).
+#[derive(Debug, Clone)]
+pub struct FrHitRegion {
+    /// Column offset from panel content-left edge.
+    pub col: u16,
+    /// Row: 0 = find row, 1 = replace row.
+    pub row: u16,
+    /// Width of this region in char cells.
+    pub width: u16,
+}
+
+/// Default panel width for the find/replace overlay (in char cells, including borders).
+pub const FR_PANEL_WIDTH: u16 = 50;
+
+/// Compute hit regions for the find/replace overlay.
+/// Layout: `[chevron(2)] [input(variable)] [Aa(2+1)][ab(2+1)][.*(2+1)] [count(max(len,5)+1)] [↑(2)][↓(2)][≡(2)][×(2)]`
+/// All positions are in char-cell units relative to the panel content corner (inside borders).
+pub fn compute_find_replace_hit_regions(
+    panel_w: u16,
+    show_replace: bool,
+    match_info: &str,
+) -> (Vec<(FrHitRegion, FindReplaceClickTarget)>, u16) {
+    use FindReplaceClickTarget::*;
+
+    let mut regions = Vec::with_capacity(16);
+    let content_w = panel_w.saturating_sub(2);
+
+    // Chevron: cols 0..2
+    regions.push((
+        FrHitRegion {
+            col: 0,
+            row: 0,
+            width: 2,
+        },
+        Chevron,
+    ));
+
+    // Find input: starts at col 2, right side uses remaining space for buttons.
+    // Right side: toggles(3×3=9) + gap(1) + match_info(max(len,5)) + gap(1) + nav(4×2=8) = dynamic
+    let info_len = (match_info.len() as u16).max(5);
+    let right_side_w: u16 = 9 + info_len + 1 + 8; // toggles + count + gap + nav
+    let input_start: u16 = 2;
+    let input_w = content_w.saturating_sub(2 + right_side_w);
+    regions.push((
+        FrHitRegion {
+            col: input_start,
+            row: 0,
+            width: input_w,
+        },
+        FindInput(0),
+    ));
+
+    // Toggle buttons: [Aa(2)gap(1)] [ab(2)gap(1)] [.*(2)gap(1)]
+    let mut tx = input_start + input_w + 1;
+    for target in [ToggleCase, ToggleWholeWord, ToggleRegex] {
+        regions.push((
+            FrHitRegion {
+                col: tx,
+                row: 0,
+                width: 2,
+            },
+            target,
+        ));
+        tx += 3;
+    }
+
+    // Match count (not clickable)
+    tx += info_len + 1;
+
+    // Nav buttons: [↑(2)][↓(2)][≡(2)][×(2)]
+    for target in [PrevMatch, NextMatch, ToggleInSelection, Close] {
+        regions.push((
+            FrHitRegion {
+                col: tx,
+                row: 0,
+                width: 2,
+            },
+            target,
+        ));
+        tx += 2;
+    }
+
+    // Replace row (row 1)
+    if show_replace {
+        regions.push((
+            FrHitRegion {
+                col: input_start,
+                row: 1,
+                width: input_w,
+            },
+            ReplaceInput(0),
+        ));
+
+        let mut bx = input_start + input_w + 1;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: 2,
+            },
+            TogglePreserveCase,
+        ));
+        bx += 3;
+
+        let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: r1_w,
+            },
+            ReplaceCurrent,
+        ));
+        bx += r1_w + 1;
+
+        let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
+        regions.push((
+            FrHitRegion {
+                col: bx,
+                row: 1,
+                width: ra_w,
+            },
+            ReplaceAll,
+        ));
+    }
+
+    (regions, input_w)
+}
+
+// ── Activity bar hit regions ────────────────────────────────────────────────
+
+/// Click target within the activity bar icon column.
+/// Backends resolve row position → `ActivityBarTarget`, then apply
+/// panel-switching logic locally (since sidebar visibility is backend state).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivityBarTarget {
+    /// Hamburger menu (row 0) — toggles menu bar.
+    MenuToggle,
+    /// Built-in panel by name.
+    Panel(SidebarPanel),
+    /// Extension panel by registered name.
+    ExtensionPanel(String),
+    /// Settings (bottom row).
+    Settings,
+}
+
+/// Built-in sidebar panels (shared across backends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarPanel {
+    Explorer,
+    Search,
+    Debug,
+    Git,
+    Extensions,
+    Ai,
+}
+
+/// Resolve an activity bar row (0-indexed from the top of the activity bar)
+/// to a click target. `bar_height` is the total activity bar height in rows.
+/// `ext_panel_names` is the sorted list of registered extension panel names.
+pub fn resolve_activity_bar_click(
+    row: u16,
+    bar_height: u16,
+    ext_panel_names: &[String],
+) -> Option<ActivityBarTarget> {
+    let settings_row = bar_height.saturating_sub(1);
+    match row {
+        0 => Some(ActivityBarTarget::MenuToggle),
+        1 => Some(ActivityBarTarget::Panel(SidebarPanel::Explorer)),
+        2 => Some(ActivityBarTarget::Panel(SidebarPanel::Search)),
+        3 => Some(ActivityBarTarget::Panel(SidebarPanel::Debug)),
+        4 => Some(ActivityBarTarget::Panel(SidebarPanel::Git)),
+        5 => Some(ActivityBarTarget::Panel(SidebarPanel::Extensions)),
+        6 => Some(ActivityBarTarget::Panel(SidebarPanel::Ai)),
+        r if r == settings_row && settings_row >= 7 => Some(ActivityBarTarget::Settings),
+        r if r >= 7 => {
+            let ext_idx = (r - 7) as usize;
+            ext_panel_names
+                .get(ext_idx)
+                .map(|name| ActivityBarTarget::ExtensionPanel(name.clone()))
+        }
+        _ => None,
+    }
+}
+
+// ── Tab bar hit regions ─────────────────────────────────────────────────────
+
+/// Click target within a group's tab bar.
+/// Backends resolve native coordinates → `TabBarClickTarget`, then call
+/// `Engine::handle_tab_bar_click()` for shared dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabBarClickTarget {
+    /// Click on a tab (switch to it). Index into the group's tab list.
+    Tab(usize),
+    /// Click on a tab's close button. Index into the group's tab list.
+    CloseTab(usize),
+    /// Split editor right button.
+    SplitRight,
+    /// Split editor down button.
+    SplitDown,
+    /// Action menu button (the "…" overflow menu).
+    ActionMenu,
+    /// Diff toolbar: previous change.
+    DiffPrev,
+    /// Diff toolbar: next change.
+    DiffNext,
+    /// Diff toolbar: toggle inline/side-by-side.
+    DiffToggle,
+}
+
+/// A hit region within a group's tab bar, expressed in character-cell units
+/// relative to the tab bar's left edge.
+#[derive(Debug, Clone)]
+pub struct TabBarHitRegion {
+    /// Column offset from the tab bar left edge.
+    pub col: u16,
+    /// Width of this region in char cells.
+    pub width: u16,
+}
+
+// ── Context menu hit regions ────────────────────────────────────────────────
+
+/// Result of resolving a click against a context menu popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextMenuClickResult {
+    /// Click on a menu item at this index.
+    Item(usize),
+    /// Click inside the popup but not on any item (e.g. separator, border).
+    InsidePopup,
+    /// Click outside the popup — should dismiss the menu.
+    Outside,
+}
+
+/// Compute the context menu popup bounds and resolve a click position.
+///
+/// `items` — the menu items (separator_after items add an extra visual row).
+/// `screen_x`, `screen_y` — popup origin (top-left, clamped to screen).
+/// `term_w`, `term_h` — terminal dimensions.
+/// `click_col`, `click_row` — absolute click position.
+///
+/// Returns the click result.
+pub fn resolve_context_menu_click(
+    items: &[ContextMenuItem],
+    screen_x: u16,
+    screen_y: u16,
+    term_w: u16,
+    term_h: u16,
+    click_col: u16,
+    click_row: u16,
+) -> ContextMenuClickResult {
+    if items.is_empty() {
+        return ContextMenuClickResult::Outside;
+    }
+    let sep_count = items.iter().filter(|i| i.separator_after).count() as u16;
+    let popup_h = items.len() as u16 + sep_count + 2; // items + separators + top/bottom border
+    let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
+    let px = screen_x.min(term_w.saturating_sub(popup_w));
+    let py = screen_y.min(term_h.saturating_sub(popup_h));
+
+    // Outside popup?
+    if click_col < px || click_col >= px + popup_w || click_row < py || click_row >= py + popup_h {
+        return ContextMenuClickResult::Outside;
+    }
+
+    // Inside popup — find which item
+    let inner_row = click_row.saturating_sub(py).saturating_sub(1); // -1 for top border
+    let mut visual_row: u16 = 0;
+    for (i, item) in items.iter().enumerate() {
+        if visual_row == inner_row && item.enabled {
+            return ContextMenuClickResult::Item(i);
+        }
+        visual_row += 1;
+        if item.separator_after {
+            visual_row += 1;
+        }
+    }
+    ContextMenuClickResult::InsidePopup
+}
+
+// ── Dialog hit regions ──────────────────────────────────────────────────────
+
+/// Result of resolving a click against a modal dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogClickResult {
+    /// Click on a button at this index.
+    Button(usize),
+    /// Click inside the dialog but not on a button.
+    InsideDialog,
+    /// Click outside the dialog — should dismiss.
+    Outside,
+}
+
+/// Pre-computed dialog layout bounds (in char-cell units, absolute screen position).
+pub struct DialogLayout {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Row containing the buttons (absolute screen row).
+    pub btn_y: u16,
+}
+
+/// Resolve a click position against a dialog popup.
+pub fn resolve_dialog_click(
+    buttons: &[DialogButton],
+    layout: &DialogLayout,
+    click_col: u16,
+    click_row: u16,
+    format_label: &dyn Fn(&str, char) -> String,
+) -> DialogClickResult {
+    // Outside dialog?
+    if click_col < layout.x
+        || click_col >= layout.x + layout.width
+        || click_row < layout.y
+        || click_row >= layout.y + layout.height
+    {
+        return DialogClickResult::Outside;
+    }
+
+    // Check button row
+    if click_row == layout.btn_y {
+        let mut col_offset = layout.x + 2; // left padding
+        for (i, btn) in buttons.iter().enumerate() {
+            let label = format_label(&btn.label, btn.hotkey);
+            let btn_w = label.len() as u16 + 4;
+            if click_col >= col_offset && click_col < col_offset + btn_w {
+                return DialogClickResult::Button(i);
+            }
+            col_offset += btn_w;
+        }
+    }
+
+    DialogClickResult::InsideDialog
+}
+
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
@@ -1920,10 +2293,21 @@ pub struct Engine {
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
     pub visual_anchor: Option<Cursor>,
+    /// Set when `$` is used in visual mode — the selection extends through the
+    /// end of the line (including newline), matching Vim's curswant=MAXCOL.
+    /// Cleared when any other motion is used or visual mode exits.
+    pub visual_dollar: bool,
+    /// When Command mode is entered from Visual mode, stores the original
+    /// visual mode variant so the selection remains visible and `'<,'>` range
+    /// resolves correctly.  Cleared on command execution or Escape.
+    pub command_from_visual: Option<Mode>,
 
     // --- Count state ---
     /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
     pub count: Option<usize>,
+    /// Count prefix before operator (e.g., `2` in `2d3w`). Saved when operator is set,
+    /// then multiplied with motion count in `take_count()`.
+    pub operator_count: Option<usize>,
 
     // --- Character find state ---
     /// Last character find motion: (motion_type, target_char)
@@ -2001,6 +2385,8 @@ pub struct Engine {
     // --- Git integration ---
     /// Current git branch name (None if not in a git repo or git not available).
     pub git_branch: Option<String>,
+    /// When we last polled for an external branch change (for tick_git_branch rate limit).
+    pub last_git_branch_check: Option<std::time::Instant>,
 
     // --- Scroll binding ---
     /// Pairs of windows whose scroll_top should stay in sync (e.g. :Gblame).
@@ -2247,6 +2633,31 @@ pub struct Engine {
     /// Saves the user's in-progress query when they start browsing history.
     pub picker_history_typing_buffer: String,
 
+    // --- Find/Replace overlay (Ctrl+F) ---
+    /// Whether the find/replace overlay is open.
+    pub find_replace_open: bool,
+    /// Current text in the find input field.
+    pub find_replace_query: String,
+    /// Current text in the replace input field.
+    pub find_replace_replacement: String,
+    /// Whether the replace row is visible.
+    pub find_replace_show_replace: bool,
+    /// Which input field has focus: 0 = find, 1 = replace.
+    pub find_replace_focus: u8,
+    /// Cursor position within the focused input field (char offset).
+    pub find_replace_cursor: usize,
+    /// Selection anchor in the focused input field (char offset). When Some and != cursor,
+    /// the text between anchor and cursor is selected. Typing replaces it.
+    pub find_replace_sel_anchor: Option<usize>,
+    /// Search options for the find/replace overlay.
+    pub find_replace_options: FindReplaceOptions,
+    /// Char range for "find in selection" mode: (start_char, end_char).
+    pub find_replace_selection_range: Option<(usize, usize)>,
+    /// Frozen cursor position from when find/replace was opened in visual mode.
+    /// Used by `build_selection()` to render the original selection without it
+    /// changing as the cursor jumps to search matches.
+    pub find_replace_visual_end: Option<crate::core::cursor::Cursor>,
+
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
     pub breadcrumb_focus: bool,
@@ -2490,11 +2901,19 @@ pub struct Engine {
     pub insert_ctrl_g_pending: bool,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
+    /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
+    pub insert_enter_col: usize,
     /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
     pub insert_ctrl_v_pending: bool,
     /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
-    pub visual_block_insert_info: Option<(usize, usize, usize, bool)>,
+    /// (start_line, end_line, col, is_append, virtual_end).
+    /// `virtual_end` = true when the block was started with `$`: the insert column
+    /// for each line is that line's own end, not the captured `col`.
+    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool)>,
+    /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
+    /// on additional new lines (Vim behavior for 3oXX<Esc>).
+    pub insert_open_count: usize,
     /// Force motion mode: 'v' = charwise, 'V' = linewise.
     /// Set by pressing v/V/CTRL-V while an operator is pending (e.g., dVj).
     pub force_motion_mode: Option<char>,
@@ -2796,7 +3215,10 @@ impl Engine {
             selected_register: None,
             marks: HashMap::new(),
             visual_anchor: None,
+            visual_dollar: false,
+            command_from_visual: None,
             count: None,
+            operator_count: None,
             last_find: None,
             pending_operator: None,
             pending_find_operator: None,
@@ -2828,6 +3250,7 @@ impl Engine {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 git::current_branch(&cwd)
             },
+            last_git_branch_check: None,
             scroll_bind_pairs: Vec::new(),
             completion_candidates: Vec::new(),
             completion_idx: None,
@@ -2876,6 +3299,16 @@ impl Engine {
             jump_list: Vec::new(),
             jump_list_pos: 0,
             search_word_bounded: false,
+            find_replace_open: false,
+            find_replace_query: String::new(),
+            find_replace_replacement: String::new(),
+            find_replace_show_replace: false,
+            find_replace_focus: 0,
+            find_replace_cursor: 0,
+            find_replace_sel_anchor: None,
+            find_replace_options: FindReplaceOptions::default(),
+            find_replace_selection_range: None,
+            find_replace_visual_end: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,
@@ -3016,8 +3449,10 @@ impl Engine {
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
+            insert_enter_col: 0,
             insert_ctrl_v_pending: false,
             visual_block_insert_info: None,
+            insert_open_count: 0,
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
@@ -3284,6 +3719,9 @@ fn binary_on_path(binary: &str) -> bool {
     for dir in std::env::split_paths(&path_var) {
         let full = dir.join(binary);
         if full.exists() {
+            if !super::lsp_manager::cargo_bin_probe_ok(&full, binary) {
+                continue;
+            }
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
                 full.display()
@@ -3295,6 +3733,9 @@ fn binary_on_path(binary: &str) -> bool {
         if !binary.ends_with(".exe") {
             let exe = dir.join(format!("{binary}.exe"));
             if exe.exists() {
+                if !super::lsp_manager::cargo_bin_probe_ok(&exe, binary) {
+                    continue;
+                }
                 super::lsp_manager::install_log(&format!(
                     "[ext-check] FOUND {binary}.exe at {}",
                     exe.display()
@@ -3704,6 +4145,7 @@ mod panels;
 mod picker;
 mod plugins;
 mod search;
+pub use search::find_word_boundaries;
 mod source_control;
 mod spell_ops;
 mod terminal_ops;

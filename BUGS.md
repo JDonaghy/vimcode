@@ -1,20 +1,138 @@
 # Known Bugs
 
-- **(Intermittent) TUI rendering artifacts** — Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
+> **Bug tracking has moved to GitHub Issues.** Run `gh issue list --label bug --state open` to see all open bugs.
+> Vim conformance deviations: `gh issue list --label bug:vim-deviation --state open`
+> This file is kept for historical reference only — new bugs should be filed as GitHub issues.
+
+- **(Intermittent) TUI rendering artifacts** — See [#58](https://github.com/JDonaghy/vimcode/issues/58). Stale characters from a previous view sometimes linger on screen. Mitigated in Session 244: `terminal.clear()` on resize events and on popup dismiss (picker/folder picker transition to hidden). Root cause: ratatui's incremental diff can miss cells when the physical terminal state diverges from its buffer tracking. Workaround for any remaining cases: Ctrl+L forces a full screen redraw.
+
+- ~~**`x` with count + `.` repeat deletes too many characters**~~ — Fixed: `repeat_last_change()` was looping `final_count` times AND using `change.count` inside each iteration, causing `4x` then `.` to delete 4×4=16 chars. Fixed by removing the loop and using `final_count` directly for both `Motion::Right` (x) and `Motion::DeleteLine` (dd). 3 new tests.
+
+- **Git panel operations have no progress indicator** — Commit, push, and pull operations in the git panel give no visual feedback that an operation is in progress. VSCode shows a spinner for a few seconds to confirm the action was triggered. VimCode should show a spinner (using the existing notification/progress system) while git operations are running.
+
+- **Git branch in status bar not updated on external change** — When the git branch is changed outside of VimCode (e.g. via CLI `git checkout`), the branch name in the status bar is not updated. Needs file watching on `.git/HEAD` or periodic polling to detect external branch switches.
+
+- ~~**`:set colorcolumn` has no visual effect**~~ — Fixed: `colorcolumn_positions()` parses the setting string (supports absolute columns, `+N`/`-N` relative to textwidth). `colorcolumn_bg` theme color added to all 6 themes + VSCode import (`editorRuler.foreground`). `colorcolumns` field on `RenderedLine` populated in `build_screen_layout()`. Rendered in all 3 backends (TUI: cell background tint, GTK: filled rectangle, Win-GUI: filled rectangle). 10 new tests.
+
+- **Win-GUI: closing maximized window passes click through to window behind** — When vimcode-win is maximized and the user clicks the X (close) button, the window closes but the click also reaches the window underneath (e.g. another editor or browser), which may also close or activate. The close button handler likely doesn't consume the mouse event properly. Needs investigation of `WM_CLOSE`/`DestroyWindow` interaction with `ReleaseCapture` and whether the click propagates to the next window in the Z-order.
+
+- ~~**TUI (vcd) find/replace dialog — multiple issues:**~~ — **Mostly fixed (Session 278):** Centralized hit-test geometry via `FindReplaceClickTarget` enum + `FrHitRegion` + `compute_find_replace_hit_regions()`. TUI/GTK click handlers rewritten with shared hit regions — fixes ≡ button closing dialog (#2), × button not clickable (#3), and GTK geometry mismatches (#5). Added drag-to-select and double-click word select for TUI (#4 partial — Ctrl+A already worked via engine keyboard handler). Visual selection pre-fill (#1) verified working — engine captures selection before clearing visual mode, selection stays visible via frozen `find_replace_visual_end`. Dynamic panel width prevents × button overflow with long match counts. **Remaining:** GTK drag-to-select and double-click in motion/double-click handlers (needs GTK build to test).
 
 
-- **Win-GUI: scrollbar not visible** — Scrollbar hit-testing and drag handling exist (`scrollbar_hit()`, `scrollbar_drag` state) and `SCROLLBAR_WIDTH` reserves space, but there is no drawing code to paint the scrollbar thumb/track. Clicks on the scrollbar area do work invisibly.
+### Win-GUI gaps (vs GTK reference) — found by systematic GTK↔Win-GUI comparison
 
-- **Win-GUI: tab bar clicks not working** — Tab click handling code and `tab_slots` hit-test cache exist, but clicks on the tab bar don't register. Likely a hit-testing coordinate or ordering issue in the mouse handler.
+**Critical (data loss / broken core features):**
+- ~~**Win-GUI: tab close skips dirty check**~~ — Fixed: checks `engine.dirty()` before closing; shows engine dialog with Save/Discard/Cancel.
+- ~~**Win-GUI: picker (fuzzy finder) not mouse-interactive**~~ — Fixed: click result to select, click outside to dismiss; scroll wheel navigates picker items.
+- ~~**Win-GUI: dialog buttons not clickable**~~ — Fixed: button rect hit-testing in `on_mouse_down`, dispatches `dialog_click_button(idx)`, outside-click dismisses.
+- ~~**Win-GUI: QuitWithUnsaved action silently ignored**~~ — Fixed: shows engine dialog with Save All & Quit / Quit Without Saving / Cancel. WM_CLOSE also checks for unsaved changes.
 
-- **Win-GUI: opening a file replaces current buffer** — Selecting a file from the explorer replaces the current tab's contents instead of opening in a new tab. All file opens use `OpenMode::Permanent` but may be reusing the existing window rather than creating a new tab.
+**Medium (incorrect behavior):**
+- ~~**Win-GUI: scroll doesn't skip folded lines**~~ — Fixed: uses `scroll_down_visible()`/`scroll_up_visible()` instead of raw arithmetic.
+- ~~**Win-GUI: picker scroll not intercepted**~~ — Fixed: scroll wheel checks `picker_open` first and navigates picker results.
+- ~~**Win-GUI: VSCode selection not cleared on click**~~ — Fixed: calls `vscode_clear_selection()` before `mouse_click` when in VSCode mode.
+- ~~**Win-GUI: cursor not kept in viewport after scroll**~~ — Fixed: cursor now clamped into viewport (with scrolloff) after scroll, matching GTK. Also calls `sync_scroll_binds()`.
+- ~~**Win-GUI: terminal tab switching by mouse missing**~~ — Fixed: click on numbered tab labels in terminal toolbar switches `terminal_active`. Matches tab label geometry from draw code.
 
-- **Win-GUI: no preview mode** — Preview/transient tab mode (italic filename, replaced on next file open) is not implemented. All opens are permanent.
+**Medium (incorrect behavior — new):**
+- ~~**Win-GUI: tabs disappear when second editor group is created**~~ — Fixed: `draw_group_tab_bar` only subtracted the tab bar height from `bounds.y`, but the reserved space also includes the breadcrumb row. Tab bars were drawn at the breadcrumb position (hidden behind breadcrumbs/editor content). Fixed by accounting for breadcrumb offset in both drawing and click slot caching.
+
+**Medium (incorrect behavior — new):**
+- ~~**Win-GUI: explorer single-click opens permanent tab instead of preview**~~ — Investigated: preview system works correctly. `open_file_preview()` is called and reuses the preview tab. Multiple tabs appear only when the preview is promoted (by clicking the tab, editing, or saving) — this is expected VSCode behavior.
+- ~~**Win-GUI: terminal steals keyboard focus from editor**~~ — Fixed: added `terminal_has_focus = false` in the editor area click handler, matching GTK/TUI behavior.
+- ~~**Win-GUI: no active tab accent line across editor groups**~~ — Fixed: `draw_tabs` now takes `show_accent` parameter; `draw_group_tab_bar` passes `is_active_group` so the 2px accent line only appears on tabs in the focused group.
+
+**Medium (found by systematic focus/draw audit):**
+- ~~**Win-GUI: sidebar focus persists after editor click**~~ — Fixed: added `clear_sidebar_focus()` on editor click. Settings/AI/Search/Debug focus flags were never cleared when clicking the editor, causing keyboard events to route to sidebar panels.
+- ~~**Win-GUI: sidebar focus persists after terminal click**~~ — Fixed: added `clear_sidebar_focus()` and `sidebar.has_focus = false` when clicking in the terminal panel area.
+- ~~**Win-GUI: dialog text and buttons overflow the dialog box**~~ — Fixed: dialog width now auto-sized from content (buttons + body + title) instead of hardcoded 400px. Both draw and click handler use the same calculation.
+
+**Medium (deferred):**
+- ~~**Win-GUI: terminal can't regain focus after editor click**~~ — Fixed: terminal content clicks now always set `terminal_has_focus` (was only for split-pane case).
+
+**Medium (new — Win-GUI interaction gaps):**
+- ~~**Win-GUI: extension install flashes many windows**~~ — Fixed: added `hidden_command()` helper in `git.rs`; replaced all 6 `Command::new("curl")` in `registry.rs` and `ai.rs` with `hidden_command("curl")` which sets `CREATE_NO_WINDOW` on Windows.
+- ~~**Win-GUI: extension panel not appearing after install**~~ — Fixed: full `draw_ext_panel()` renderer with sections, tree items, badges, actions, scrollbar, help popup. Activity bar shows dynamic ext panel icons (Nerd Font glyphs mapped to Segoe MDL2 equivalents). Click/keyboard/scroll handlers, `ext_panel_focus_pending` polling. `WinSidebar.ext_panel_name` field (matching TUI pattern) overrides `active_panel` when set.
+- ~~**Win-GUI: activity bar icons non-functional**~~ — Investigated: activity bar clicks were already working (panel switching, focus flags, sc_refresh). The reported issue was likely that the panels themselves didn't respond after switching (see search/AI/git fixes below).
+- ~~**Win-GUI: back/forward navigation arrows non-functional**~~ — Fixed: added hit-test code for ◀/▶ arrows in the title bar click handler, calling `tab_nav_back()`/`tab_nav_forward()`. Also added command center search box click → `open_command_center()`.
+- ~~**Win-GUI: window resize only works from top/top corners**~~ — Fixed: `on_nchittest()` now handles all 8 resize zones (top/bottom/left/right + 4 corners) instead of only the top edge.
+- ~~**Win-GUI: search/replace panel non-functional**~~ — Fixed: added full keyboard routing in `on_key_down()` and `on_char()` — input mode (typing, Tab to toggle search/replace, Enter to execute, Backspace, Ctrl+V paste), results navigation (j/k, Enter to open file), Alt+C/W/R/H toggles for search options. Also set `search_has_focus` on activity bar click.
+- ~~**Win-GUI: git panel entries not clickable or navigable**~~ — Fixed: added full keyboard routing for git panel — navigation mode (j/k/s/S/d/D/c/p/P/f/b/B/?/Tab/Enter/Escape/r), commit input mode (text entry, cursor movement, Ctrl+Enter to commit), branch picker, help dialog. All routed through `engine.handle_sc_key()`.
+- ~~**Win-GUI: AI panel non-functional**~~ — Fixed: added full keyboard routing — navigation mode (j/k/G/g/i/q), input mode (text entry, Enter to submit, cursor movement, Ctrl+V paste). All routed through `engine.handle_ai_panel_key()`.
+- ~~**Win-GUI: settings panel scroll wheel broken**~~ — Fixed: sidebar scroll handler now dispatches by active panel — Settings scrolls `settings_scroll_top`, AI scrolls `ai_scroll_top`, Search scrolls `search_scroll_top`, Explorer scrolls `sidebar.scroll_top`.
+- ~~**Win-GUI: settings panel search non-functional**~~ — Settings search was already handled by the existing `handle_settings_key()` routing (the `/` key enters search mode). The scroll fix above makes it usable by allowing scrolling through results.
+
+**Low (missing features):**
+- ~~**Win-GUI: breadcrumb clicks not handled**~~ — Fixed: clicking breadcrumb segments opens scoped picker (directory→file picker, symbol→@picker).
+- ~~**Win-GUI: group divider drag not implemented**~~ — Fixed: cached dividers from ScreenLayout; full drag-to-resize with cursor change.
+- ~~**Win-GUI: horizontal scrollbar drag not implemented**~~ — Fixed: full h-scrollbar interaction (draw, hit-test, click-to-jump, drag). Text rendering applies `scroll_left` offset with text-area clip rect. Cursor also offset.
+- ~~**Win-GUI: diff toolbar buttons not clickable**~~ — Fixed: ↑/↓/≡ button click handlers dispatch to `jump_prev_hunk()`/`jump_next_hunk()`/`diff_toggle_hide_unchanged()`.
+- ~~**Win-GUI: diff peek key routing missing**~~ — Already working: keys route through `handle_key()` → `handle_diff_peek_key()`.
+- ~~**Win-GUI: tab tooltip dismiss-on-mouseout missing**~~ — Fixed: mouse hover shows file path, mouseout clears tooltip.
+
+**Systemic fixes found by pattern analysis (Session 270):**
+- ~~**Win-GUI: terminal steals keyboard from all non-terminal UI**~~ — Fixed: added blanket `terminal_has_focus = false` at the start of `on_mouse_down()`, `on_mouse_dblclick()`, and `on_right_click()`. Terminal click handlers re-enable it. Previously only sidebar and editor clicks cleared it; tab bar, menu, breadcrumbs, dialogs, scrollbars, and 12+ other click areas were affected.
+- ~~**Win-GUI: search panel was a draw stub**~~ — Fixed: `draw_search_panel()` now renders query text, replace text, toggle indicators (Aa/Ab|/.*), status line, and search results with file headers and selection highlight. Was previously just a placeholder with "Search (use :grep)".
+- ~~**Win-GUI: terminal panel overlap with status bar**~~ — Fixed: `draw_terminal()` used hardcoded `2.0 * lh` for bottom chrome. Now computes dynamically based on `separated_status_line` and per-window status settings. Also fixed 3 terminal row boundary checks and 2 terminal click handler Y calculations.
+- ~~**Win-GUI: DAP debugpy check flashes console**~~ — Fixed: 2 `Command::new(&binary)` calls in `dap_manager.rs` now use `hidden_command()`.
+- ~~**Win-GUI: `Event::SoftBreak` renamed to `Event::Break`**~~ — Fixed: stale edit in `markdown.rs` broke all builds. Restored to `Event::SoftBreak`.
+
+**Fixed in Session 272 (git panel rendering + tab scroll):**
+- ~~**Win-GUI: git panel is a rendering stub with no interactivity**~~ — Fixed: full `draw_git_panel()` rewrite with commit input box, button row, 4 collapsible sections, selection highlight, scrollbar, branch picker popup, help dialog. Click handling for all zones (items, buttons, commit input, double-click-to-open-diff). Hover dwell for commit log popups. Button hover tracking.
+- ~~**Win-GUI: new tabs not visible in tab bar (no scroll-into-view)**~~ — Fixed: Win-GUI now reports available tab bar width via `set_tab_visible_count()` after each paint frame and calls `ensure_all_groups_tabs_visible()`. Previously `tab_bar_width` defaulted to `usize::MAX`, making `ensure_active_tab_visible()` a no-op.
+
+**Fixed in Session 271 (ext panels + Nerd Font + breadcrumb):**
+- ~~**Win-GUI: extension panel not appearing after install**~~ — Fixed: full ext panel rendering, activity bar icons, click/keyboard/scroll handlers.
+- ~~**Win-GUI/TUI: breadcrumb path starts with `?C:`**~~ — Fixed: `build_breadcrumbs_for_group()` strips UNC prefix from file path and cwd.
+- ~~**TUI: tab tooltip path starts with `~/` on Windows**~~ — Fixed: uses `MAIN_SEPARATOR` (`~\` on Windows, `~/` on Linux).
+- ~~**TUI: tab tooltip shows UNC prefix**~~ — Fixed: `strip_unc_prefix()` applied in `tab_tooltip_at_col()`.
+- ~~**Win-GUI: empty breadcrumb covers tab bar for diff views**~~ — Fixed: `draw_breadcrumb_bar()` returns early when segments are empty.
+- ~~**Win-GUI: diff toolbar overlaps last tab text**~~ — Fixed: `draw_tabs()` respects `max_width`, stops rendering tabs before the diff toolbar area.
+- ~~**TUI: activity bar shows diamond glyphs on Windows**~~ — Fixed: 9 hardcoded Nerd Font codepoints replaced with `icons::ICON.c()` calls. Auto-detection disables nerd fonts when no Nerd Font is installed. Startup message warns user.
+
+**Fixed in Session 269 (interaction parity audit):**
+- ~~**Win-GUI: tab tooltip shows UNC prefix (`\\?\`)**~~ — Fixed: `strip_unc_prefix()` in `paths.rs`, also applied to `copy_relative_path()`.
+- ~~**Win-GUI: extension panel clicks/keyboard not working**~~ — Fixed: click geometry matched to draw's fractional Y layout; keyboard routing for `i`/`d`/`u`/`r`/`/`/`j`/`k`/`Return`/`q`; double-click opens README; selection highlight.
+- ~~**Win-GUI: clipboard sync missing (yank/paste broken)**~~ — Fixed: register→clipboard sync after yank, clipboard→register load before paste. Bidirectional clipboard=unnamedplus.
+- ~~**Win-GUI: context menu items not hoverable**~~ — Fixed: mouse-move tracking highlights items on hover.
+- ~~**Win-GUI: tab close button not clickable**~~ — Fixed: tab slot width uses `measure_ui_text_width()` (proportional UI font) matching `draw_tabs()`.
+- ~~**Win-GUI: first tab of second group not clickable**~~ — Fixed: tab slots clipped to group bounds.
+- ~~**Win-GUI: menu bar click/hover misaligned**~~ — Fixed: all 4 menu bar handlers use proportional font measurement matching draw code.
+- ~~**Win-GUI: Ctrl+V doesn't paste in insert mode**~~ — Fixed: intercepts Ctrl+V in Insert/Replace mode, pastes system clipboard.
+- ~~**Win-GUI: clipboard_paste() broken on Windows**~~ — Fixed: added `#[cfg(target_os = "windows")]` PowerShell branch. Fixes Ctrl+V in command mode, search mode, picker.
+- ~~**Win-GUI: mouse cursor always I-beam**~~ — Fixed: arrow over tabs/sidebar/menus, resize near dividers, I-beam over editor text only.
+- ~~**Win-GUI: generic sidebar handler swallows keys for Git/AI panels**~~ — Fixed: guarded with `active_panel == Explorer`.
+
+**Verified fixed this session:**
+- ~~Win-GUI: activity bar icon size mismatch~~ — Now uses Segoe MDL2 Assets / Segoe Fluent Icons at 20px in 48×48 cells.
+- ~~Win-GUI: no tab drag-and-drop~~ — Full drag with threshold, drop zone computation, visual overlay, ghost label.
+- ~~Win-GUI: no terminal split~~ — Split button, pane rendering, focus switching, divider drag.
+- ~~Win-GUI: no click/mouse handling for new popups~~ — Editor hover (click/dismiss/scroll), panel hover (dismiss), debug toolbar (button clicks), context menu (full click handling).
+- ~~Win-GUI: scrollbar rendering~~ — Fixed to use `theme.scrollbar_thumb`/`scrollbar_track` instead of hardcoded alpha.
+- ~~Win-GUI: explorer double-click replaces buffer~~ — Now uses `open_file_preview` (single-click) and `open_file_in_tab` (double-click/Enter).
+- ~~Win-GUI: context menu draws under explorer~~ — Context menu, dialog, notifications now draw after sidebar in on_paint.
+- ~~Win-GUI: context menu clicks pass through~~ — Full click handler with item selection, action dispatch, outside-click dismiss.
+- ~~Win-GUI: :term opens /bin/bash on Windows~~ — `default_shell()` returns `powershell.exe` on Windows.
 
 
 
 ## Resolved
 
+- **Win-GUI: text rendering truncation** — `draw_styled_line` only rendered syntax spans, leaving gaps invisible (`crate` in `pub(crate)`, variable names). Fixed by drawing text between and after spans in default foreground color.
+- **Win-GUI: settings icon clipped and not clickable** — Gear icon positioned at `rt_h - lh` (below status bar). Repositioned to `sidebar_bottom - lh` (above bottom chrome). Click handler updated with matching geometry.
+- **Win-GUI: settings panel stub** — Settings panel was a two-line stub. Replaced with full interactive form: categories (expandable), bools, integers, strings, enums, extension settings, search input. Keyboard handling via `handle_settings_key()` in both `on_key_down` and `on_char`.
+- **Win-GUI: global status bar drawn over per-window status** — `draw_status_bar` painted full-width blue bar even when per-window status was active (empty `status_left`/`status_right`). Fixed by early return when both are empty. Also fixed `below_terminal_px` to reserve 1 row (not 2) when per-window status is active.
+- **Win-GUI: per-window status bar all one color** — Status bar painted entire background with `status_bg`. Now renders per-segment backgrounds (mode name gets its own colored bg, matching TUI).
+- **Win-GUI: editor text bleeding past window bounds** — Added `PushAxisAlignedClip` around each editor window draw. Sidebar panel clip rect tightened to `sidebar_bottom`.
+- **Win-GUI: command line descenders clipped** — Added bottom margin so characters with descenders (`g`, `y`, `p`, `:`) aren't cut off at the window edge.
+- **Win-GUI: sidebar panel/command line background gaps** — Panel background now extends full height; command line background starts at `editor_left`; `panel_h` uses `sidebar_bottom` instead of `rt_h`.
+- **Win-GUI: opening a file replaces current buffer** — Explorer single-click now uses `OpenMode::Preview` (transient tab); double-click uses `OpenMode::Permanent`. Previously all opens hardcoded `Permanent`.
+- **Win-GUI: no preview tab mode** — Preview tabs now render with dimmer text color in draw.rs. Engine's preview logic now works because explorer single-click creates preview tabs.
+- **Win-GUI: missing explorer/tab context menus** — Right-click on explorer items now calls `open_explorer_context_menu(path, is_dir, ...)`. Right-click on tab bar now calls `open_tab_context_menu(group_id, tab_idx, ...)`. Previously only editor right-click worked.
+- **Win-GUI: no settings button** — Activity bar now renders a gear icon pinned to the bottom row (matching TUI/VSCode). Click handler routes to `SidebarPanel::Settings`.
+- **Win-GUI: status bar not clickable** — Added `win_status_segment_hit_test()` + click handler before editor click. Calls `build_window_status_line()` to get segments, maps click to `StatusAction`, dispatches via `handle_status_action()`. Also fixed `pixel_to_editor_pos()` to exclude per-window status bar area.
+- **Win-GUI: tab bar clicks not working** — Tab slot Y coordinates used `lh` (line height) instead of `TITLE_BAR_TOP_INSET + lh * TITLE_BAR_HEIGHT_MULT` (actual title bar height), and slot height was `lh` instead of `lh * TAB_BAR_HEIGHT_MULT`. Clicks at the real tab bar position missed the cached slots. Fixed both single-group and multi-group tab slot calculations.
+- **Win-GUI: no terminal resize drag** — Added `terminal_resize_drag` field + header click detection + WM_MOUSEMOVE drag handler + mouse-up finalization with PTY resize and session save.
 - **GTK terminal panel toggle requires two clicks** — On first use, the `[P]` status bar button sent an async `Msg::ToggleTerminal` via Relm4's message queue instead of creating the terminal tab synchronously. The async path caused a one-frame delay where the terminal state wasn't set, requiring a second click. Fixed by calling `terminal_new_tab()` immediately in the click handler (matching TUI behavior which already handled `OpenTerminal` synchronously).
 
 - **Terminal panel resize not working via mouse** — Two bugs: (1) mouse events didn't trigger a redraw (`needs_redraw` was not set after `handle_mouse`), so the drag visually did nothing; (2) the available-space formula used hardcoded `2` instead of the computed `bottom_chrome` value, giving wrong row counts with default settings (`window_status_line=true` → `bottom_chrome=1`). Fixed by unconditionally setting `needs_redraw=true` after all mouse events, and using `bottom_chrome` in the formula.

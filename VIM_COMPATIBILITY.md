@@ -225,7 +225,7 @@ See [README.md](README.md) for full feature documentation.
 | `gI` | Insert at column 1 | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
 | `CTRL-^` | Edit alternate file | ✅ | |
-| `CTRL-]` | Tag jump | ⚠️ | `gd` (LSP) provides equivalent |
+| `CTRL-]` | Tag jump / go to definition | ✅ | Delegates to LSP `gd` |
 | `CTRL-G` | Show file info | ✅ | Shows filename, line, col, percentage |
 | `CTRL-L` | Redraw screen | ✅ | Clears message |
 | `do` | Diff obtain | ✅ | Pull line from other diff window |
@@ -234,7 +234,7 @@ See [README.md](README.md) for full feature documentation.
 | `q/` / `q?` | Search history window | ✅ | Opens search history, Enter searches |
 | `cgn` | Change next match | ✅ | Repeat with `.` |
 
-**Other: 32/33 (97%)**
+**Other: 33/33 (100%)**
 
 ---
 
@@ -269,7 +269,9 @@ See [README.md](README.md) for full feature documentation.
 |---------|-------------|--------|-------|
 | `gg` | Go to first line / line N | ✅ | |
 | `g_` | Last non-blank char | ✅ | |
-| `g0` | Start of screen line | ✅ | |
+| `g0` / `g<Home>` | Start of screen line | ✅ | Wrap-aware |
+| `g^` | First non-blank on screen line | ✅ | Wrap-aware |
+| `g$` / `g<End>` | End of screen line | ✅ | Wrap-aware |
 | `gj` / `gk` | Visual line up/down | ✅ | Wrap mode |
 | `gE` | End of previous WORD | ✅ | |
 | `ge` | End of previous word | ✅ | |
@@ -280,6 +282,7 @@ See [README.md](README.md) for full feature documentation.
 | `gf` | Go to file under cursor | ✅ | |
 | `gF` | Go to file at line | ✅ | |
 | `gt` / `gT` | Next/prev tab | ✅ | |
+| `g<Tab>` | Last-accessed tab | ✅ | Toggle between two most recent tabs |
 | `g~{motion}` | Toggle case | ✅ | |
 | `gu{motion}` | Lowercase | ✅ | |
 | `gU{motion}` | Uppercase | ✅ | |
@@ -297,6 +300,7 @@ See [README.md](README.md) for full feature documentation.
 | `gI` | Insert at column 1 | ✅ | |
 | `gm` / `gM` | Middle of screen/text line | ✅ | |
 | `g?{motion}` | ROT13 encode | ✅ | Supports text objects, all motions |
+| `g@{motion}` | Call operatorfunc | ✅ | Lua plugin API: `vimcode.set_operatorfunc(fn)` |
 | `g+` / `g-` | Undo tree newer/older | ✅ | Chronological timeline navigation |
 | `gR` | Virtual replace mode | ✅ | Tab-aware overwrite; `gr` is LSP references |
 | `g'` / `` g` `` | Mark without jumplist | ✅ | |
@@ -304,7 +308,7 @@ See [README.md](README.md) for full feature documentation.
 | `gh` | Editor hover popup (diagnostics, annotations, LSP hover) | ✅ | VimCode-specific (Vim: Select mode) |
 | `gH` / `gV` | Select mode | N/A | No Select mode |
 
-**g-commands: 35/35 (100%)**
+**g-commands: 41/41 (100%)**
 
 ---
 
@@ -609,19 +613,19 @@ These are not in Vim but are part of VimCode:
 | Movement | 48 | 48 | 100% |
 | Editing | 51 | 51 | 100% |
 | Search & Marks | 26 | 26 | 100% |
-| Normal — Other | 32 | 33 | 97% |
+| Normal — Other | 33 | 33 | 100% |
 | Text Objects | 16 | 16 | 100% |
-| g-Commands | 35 | 35 | 100% |
+| g-Commands | 41 | 41 | 100% |
 | z-Commands | 23 | 23 | 100% |
 | Window (CTRL-W) | 33 | 33 | 100% |
 | Bracket ([ / ]) | 13 | 13 | 100% |
 | Operator-Pending | 21 | 21 | 100% |
 | Visual Mode | 26 | 26 | 100% |
 | Ex Commands | 70 | 70 | 100% |
-| **Total** | **415** | **418** | **99%** |
+| **Total** | **422** | **424** | **100%** |
 
 N/A commands (VimScript, digraphs, spelling, etc.) are excluded from totals.
 
 ### Remaining Missing Commands
 
-- `CTRL-]` (tag jump — ⚠️ partial via `gd`)
+None — all in-scope Vim commands are implemented.

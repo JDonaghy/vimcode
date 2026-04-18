@@ -1,5 +1,33 @@
 use super::*;
 
+/// Find word boundaries around char position `pos` in `text`.
+/// Returns `(start, end)` where `start..end` is the word range.
+/// A "word" character is alphanumeric or underscore.
+/// If `pos` is not on a word character, returns `(pos, pos)`.
+/// Used by TUI/GTK/Win-GUI backends for double-click word select in find/replace.
+#[allow(dead_code)]
+pub fn find_word_boundaries(text: &str, pos: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if pos >= chars.len() {
+        return (chars.len(), chars.len());
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    if !is_word(chars[pos]) {
+        return (pos, pos);
+    }
+    let start = (0..=pos)
+        .rev()
+        .take_while(|&i| is_word(chars[i]))
+        .last()
+        .unwrap_or(pos);
+    let end = (pos..chars.len())
+        .take_while(|&i| is_word(chars[i]))
+        .last()
+        .map(|i| i + 1)
+        .unwrap_or(pos);
+    (start, end)
+}
+
 impl Engine {
     // =======================================================================
     // Cursor helpers (delegating to buffer/view)
@@ -174,6 +202,70 @@ impl Engine {
             let target_col = (last_seg_start + visual_col).min(prev_len.saturating_sub(1));
             self.view_mut().cursor.line = cursor_line - 1;
             self.view_mut().cursor.col = target_col;
+        }
+        self.clamp_cursor_col();
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to the start of the current screen line (`g0` / `g<Home>`).
+    /// When wrap is off, equivalent to `0`.
+    pub(crate) fn move_screen_line_start(&mut self) {
+        if !self.settings.wrap {
+            self.view_mut().cursor.col = 0;
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            self.view_mut().cursor.col = (col / vp) * vp;
+        }
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to the first non-blank character on the current screen line (`g^`).
+    /// When wrap is off, equivalent to `^`.
+    pub(crate) fn move_screen_line_first_non_blank(&mut self) {
+        if !self.settings.wrap {
+            let line = self.view().cursor.line;
+            let fnb = self.first_non_blank_col(line);
+            self.view_mut().cursor.col = fnb;
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            let seg_start = (col / vp) * vp;
+            let line = self.view().cursor.line;
+            let line_start = self.buffer().line_to_char(line);
+            let line_len = self.buffer().line_len_chars(line);
+            let seg_end = (seg_start + vp).min(line_len);
+            let mut target = seg_start;
+            for i in seg_start..seg_end {
+                let ch = self.buffer().content.char(line_start + i);
+                if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' {
+                    target = i;
+                    break;
+                }
+            }
+            self.view_mut().cursor.col = target;
+        }
+        self.ensure_cursor_visible();
+    }
+
+    /// Move cursor to the end of the current screen line (`g$` / `g<End>`).
+    /// When wrap is off, equivalent to `$`.
+    pub(crate) fn move_screen_line_end(&mut self) {
+        let line = self.view().cursor.line;
+        let line_len = self
+            .buffer()
+            .content
+            .line(line)
+            .len_chars()
+            .saturating_sub(1); // exclude newline
+        if !self.settings.wrap {
+            self.view_mut().cursor.col = line_len.saturating_sub(1);
+        } else {
+            let vp = self.view().viewport_cols.max(1);
+            let col = self.view().cursor.col;
+            let seg_start = (col / vp) * vp;
+            let seg_end = (seg_start + vp).min(line_len);
+            self.view_mut().cursor.col = seg_end.saturating_sub(1);
         }
         self.clamp_cursor_col();
         self.ensure_cursor_visible();
@@ -647,6 +739,603 @@ impl Engine {
             }
 
             byte_pos = start_byte + 1;
+        }
+    }
+
+    // ===================================================================
+    // Find/Replace overlay (Ctrl+F)
+    // ===================================================================
+
+    /// Open the find/replace overlay.
+    pub fn open_find_replace(&mut self) {
+        let had_selection = self.visual_anchor.is_some()
+            && matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            );
+
+        // Capture selection BEFORE clearing visual mode
+        let sel_text = if had_selection {
+            self.get_visual_selection_text().map(|(t, _)| t)
+        } else {
+            None
+        };
+        let sel_range = if had_selection {
+            self.get_visual_selection_range().map(|(start, end)| {
+                let start_char = self.buffer().line_to_char(start.line) + start.col;
+                let end_line_start = self.buffer().line_to_char(end.line);
+                let end_char = end_line_start + end.col + 1;
+                (start.line, end.line, start_char, end_char)
+            })
+        } else {
+            None
+        };
+
+        // Keep visual selection visible while find/replace is open (like `:` in visual mode).
+        // Don't clear visual_anchor — build_selection() will render the highlight.
+        // Freeze the cursor position so the selection doesn't change as search moves the cursor.
+        if had_selection {
+            self.find_replace_visual_end = Some(*self.cursor());
+            self.command_from_visual = Some(self.mode);
+            self.mode = Mode::Normal;
+        }
+
+        // If already open and no new selection, just refocus
+        if self.find_replace_open && !had_selection {
+            self.find_replace_focus = 0;
+            self.find_replace_cursor = self.find_replace_query.chars().count();
+            return;
+        }
+
+        self.find_replace_open = true;
+        self.find_replace_focus = 0;
+
+        if let Some((start_line, end_line, start_char, end_char)) = sel_range {
+            // Save selection range for "find in selection"
+            self.find_replace_selection_range = Some((start_char, end_char));
+
+            if start_line == end_line {
+                // Single-line: populate the find box with the selected text
+                if let Some(text) = &sel_text {
+                    let trimmed = text.trim_end_matches('\n').to_string();
+                    if !trimmed.is_empty() {
+                        self.find_replace_query = trimmed;
+                    }
+                }
+            } else {
+                // Multi-line: auto-enable "find in selection", don't populate query
+                self.find_replace_options.in_selection = true;
+            }
+        } else if !self.find_replace_open || self.find_replace_query.is_empty() {
+            // No selection — pre-fill from last search query (only on first open)
+            if !self.search_query.is_empty() {
+                self.find_replace_query = self.search_query.clone();
+            }
+            self.find_replace_selection_range = None;
+            self.find_replace_options.in_selection = false;
+        }
+
+        self.find_replace_cursor = self.find_replace_query.chars().count();
+        self.find_replace_sel_anchor = None;
+        self.run_find_replace_search();
+    }
+
+    /// Close the find/replace overlay, preserving search state for n/N.
+    pub fn close_find_replace(&mut self) {
+        self.find_replace_open = false;
+        self.find_replace_options.in_selection = false;
+        self.find_replace_selection_range = None;
+        // Clear visual selection that was preserved while overlay was open
+        if self.command_from_visual.is_some() {
+            self.visual_anchor = None;
+            self.command_from_visual = None;
+            self.find_replace_visual_end = None;
+        }
+    }
+
+    /// Run a search using the find/replace overlay's query and options.
+    /// This populates `search_query`, `search_matches`, and `search_index`
+    /// so that existing highlighting and n/N navigation work.
+    pub fn run_find_replace_search(&mut self) {
+        self.search_query = self.find_replace_query.clone();
+        self.search_direction = SearchDirection::Forward;
+        self.search_word_bounded = false;
+        self.search_matches.clear();
+        self.search_index = None;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let text = self.buffer().to_string();
+        let query = self.search_query.clone();
+        let opts = &self.find_replace_options;
+
+        if opts.use_regex {
+            // Use regex crate for regex search (multiline so ^ and $ match line boundaries)
+            let mut flags = String::from("(?m");
+            if !opts.case_sensitive {
+                flags.push('i');
+            }
+            flags.push(')');
+            let pattern = format!("{}{}", flags, query);
+            if let Ok(re) = regex::Regex::new(&pattern) {
+                for m in re.find_iter(&text) {
+                    let start_char = self.buffer().content.byte_to_char(m.start());
+                    let end_char = self.buffer().content.byte_to_char(m.end());
+                    self.search_matches.push((start_char, end_char));
+                }
+            }
+        } else {
+            // Plain text search
+            let case_insensitive = !opts.case_sensitive;
+            let (search_text, search_query) = if case_insensitive {
+                (text.to_lowercase(), query.to_lowercase())
+            } else {
+                (text.clone(), query.clone())
+            };
+
+            let mut byte_pos = 0;
+            while let Some(found) = search_text[byte_pos..].find(&search_query) {
+                let start_byte = byte_pos + found;
+                let end_byte = start_byte + search_query.len();
+
+                // Whole word check
+                if opts.whole_word {
+                    let before_ok = start_byte == 0 || {
+                        let c = text[..start_byte].chars().last().unwrap_or(' ');
+                        !Self::is_word_char(c)
+                    };
+                    let after_ok = end_byte >= text.len() || {
+                        let c = text[end_byte..].chars().next().unwrap_or(' ');
+                        !Self::is_word_char(c)
+                    };
+                    if !before_ok || !after_ok {
+                        byte_pos = start_byte + 1;
+                        continue;
+                    }
+                }
+
+                let start_char = self.buffer().content.byte_to_char(start_byte);
+                let end_char = self.buffer().content.byte_to_char(end_byte);
+                self.search_matches.push((start_char, end_char));
+                byte_pos = start_byte + 1;
+            }
+        }
+
+        // Filter to selection range if "find in selection" is active
+        if self.find_replace_options.in_selection {
+            if let Some((sel_start, sel_end)) = self.find_replace_selection_range {
+                self.search_matches
+                    .retain(|(s, e)| *s >= sel_start && *e <= sel_end);
+            }
+        }
+
+        // Set search_index to nearest match from cursor
+        if !self.search_matches.is_empty() {
+            let cursor_char = {
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                self.buffer().line_to_char(line) + col
+            };
+            let idx = self
+                .search_matches
+                .iter()
+                .position(|(start, _)| *start >= cursor_char)
+                .unwrap_or(0);
+            self.search_index = Some(idx);
+        }
+    }
+
+    /// Navigate to the next match in the find/replace overlay.
+    pub fn find_replace_next(&mut self) {
+        self.search_next();
+    }
+
+    /// Navigate to the previous match in the find/replace overlay.
+    pub fn find_replace_prev(&mut self) {
+        self.search_prev();
+    }
+
+    /// Replace the current match and advance to the next.
+    pub fn find_replace_replace_current(&mut self) {
+        let idx = match self.search_index {
+            Some(i) => i,
+            None => return,
+        };
+        let (start_char, end_char) = match self.search_matches.get(idx) {
+            Some(&pair) => pair,
+            None => return,
+        };
+
+        let replacement = self.find_replace_replacement.clone();
+        let repl_len = replacement.chars().count();
+        self.start_undo_group();
+        self.delete_with_undo(start_char, end_char);
+        self.insert_with_undo(start_char, &replacement);
+        self.finish_undo_group();
+
+        // Move cursor past the replacement so next search finds the next match
+        let new_pos = start_char + repl_len;
+        let total_chars = self.buffer().len_chars();
+        let clamped = new_pos.min(total_chars.saturating_sub(1));
+        let line = self.buffer().content.char_to_line(clamped);
+        let line_start = self.buffer().line_to_char(line);
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = clamped - line_start;
+
+        // Re-run search and advance to next match
+        self.run_find_replace_search();
+    }
+
+    /// Replace all matches in the buffer (respects "find in selection" range).
+    pub fn find_replace_replace_all(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+
+        let replacement = self.find_replace_replacement.clone();
+        let query = self.find_replace_query.clone();
+
+        let flags = if self.find_replace_options.case_sensitive {
+            "g"
+        } else {
+            "gi"
+        };
+
+        // Determine line range: selection range or entire buffer
+        let (start_line, end_line) = if self.find_replace_options.in_selection {
+            if let Some((sel_start, sel_end)) = self.find_replace_selection_range {
+                let sl = self.buffer().content.char_to_line(sel_start);
+                let el = self
+                    .buffer()
+                    .content
+                    .char_to_line(sel_end.min(self.buffer().len_chars().saturating_sub(1)));
+                (sl, el)
+            } else {
+                (0, self.buffer().len_lines().saturating_sub(1))
+            }
+        } else {
+            (0, self.buffer().len_lines().saturating_sub(1))
+        };
+
+        match self.replace_in_range(Some((start_line, end_line)), &query, &replacement, flags) {
+            Ok(count) => {
+                self.message = format!("{} replacement(s) made", count);
+            }
+            Err(e) => {
+                self.message = format!("Replace error: {}", e);
+            }
+        }
+
+        // Re-run search to update highlights
+        self.run_find_replace_search();
+    }
+
+    /// Toggle case-sensitive search and re-run.
+    pub fn toggle_find_replace_case(&mut self) {
+        self.find_replace_options.case_sensitive = !self.find_replace_options.case_sensitive;
+        self.run_find_replace_search();
+    }
+
+    /// Toggle whole-word search and re-run.
+    pub fn toggle_find_replace_whole_word(&mut self) {
+        self.find_replace_options.whole_word = !self.find_replace_options.whole_word;
+        self.run_find_replace_search();
+    }
+
+    /// Toggle regex search and re-run.
+    pub fn toggle_find_replace_regex(&mut self) {
+        self.find_replace_options.use_regex = !self.find_replace_options.use_regex;
+        self.run_find_replace_search();
+    }
+
+    /// Toggle preserve-case replacement.
+    pub fn toggle_find_replace_preserve_case(&mut self) {
+        self.find_replace_options.preserve_case = !self.find_replace_options.preserve_case;
+    }
+
+    /// Toggle find-in-selection mode and re-run.
+    pub fn toggle_find_replace_in_selection(&mut self) {
+        self.find_replace_options.in_selection = !self.find_replace_options.in_selection;
+        self.run_find_replace_search();
+    }
+
+    /// Dispatch a find/replace click target to the appropriate engine method.
+    /// Backends resolve native coordinates → `FindReplaceClickTarget`, then call this.
+    pub fn handle_find_replace_click(&mut self, target: FindReplaceClickTarget) {
+        use FindReplaceClickTarget::*;
+        match target {
+            Chevron => {
+                self.find_replace_show_replace = !self.find_replace_show_replace;
+            }
+            FindInput(pos) => {
+                self.find_replace_focus = 0;
+                self.find_replace_cursor = pos.min(self.find_replace_query.chars().count());
+                self.find_replace_sel_anchor = Some(self.find_replace_cursor);
+            }
+            ReplaceInput(pos) => {
+                self.find_replace_focus = 1;
+                self.find_replace_cursor = pos.min(self.find_replace_replacement.chars().count());
+                self.find_replace_sel_anchor = Some(self.find_replace_cursor);
+            }
+            ToggleCase => self.toggle_find_replace_case(),
+            ToggleWholeWord => self.toggle_find_replace_whole_word(),
+            ToggleRegex => self.toggle_find_replace_regex(),
+            PrevMatch => self.find_replace_prev(),
+            NextMatch => self.find_replace_next(),
+            ToggleInSelection => self.toggle_find_replace_in_selection(),
+            Close => self.close_find_replace(),
+            TogglePreserveCase => self.toggle_find_replace_preserve_case(),
+            ReplaceCurrent => self.find_replace_replace_current(),
+            ReplaceAll => self.find_replace_replace_all(),
+        }
+    }
+
+    /// Get the selected range in the focused input field, if any.
+    /// Returns (start, end) as char offsets where start < end.
+    fn fr_input_selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.find_replace_sel_anchor?;
+        let cursor = self.find_replace_cursor;
+        if anchor == cursor {
+            return None;
+        }
+        Some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    /// Delete the selected text in the focused input field.
+    /// Returns true if something was deleted.
+    fn fr_delete_selection(&mut self) -> bool {
+        let (start, end) = match self.fr_input_selection() {
+            Some(r) => r,
+            None => return false,
+        };
+        let field = if self.find_replace_focus == 0 {
+            &mut self.find_replace_query
+        } else {
+            &mut self.find_replace_replacement
+        };
+        let start_byte = field
+            .char_indices()
+            .nth(start)
+            .map(|(i, _)| i)
+            .unwrap_or(field.len());
+        let end_byte = field
+            .char_indices()
+            .nth(end)
+            .map(|(i, _)| i)
+            .unwrap_or(field.len());
+        field.replace_range(start_byte..end_byte, "");
+        self.find_replace_cursor = start;
+        self.find_replace_sel_anchor = None;
+        true
+    }
+
+    /// Handle a key press in the find/replace overlay.
+    pub(crate) fn handle_find_replace_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        shift: bool,
+    ) {
+        match key_name {
+            "Escape" => {
+                self.close_find_replace();
+            }
+            "Return" => {
+                if ctrl && self.find_replace_focus == 1 {
+                    // Ctrl+Enter in replace field → replace all
+                    self.find_replace_replace_all();
+                } else {
+                    self.find_replace_next();
+                }
+            }
+            "Up" => {
+                self.find_replace_prev();
+            }
+            "Down" => {
+                self.find_replace_next();
+            }
+            "Tab" | "ISO_Left_Tab" => {
+                if !self.find_replace_show_replace {
+                    self.find_replace_show_replace = true;
+                }
+                self.find_replace_focus = if self.find_replace_focus == 0 { 1 } else { 0 };
+                // Update cursor to the focused field's length
+                let len = if self.find_replace_focus == 0 {
+                    self.find_replace_query.len()
+                } else {
+                    self.find_replace_replacement.len()
+                };
+                self.find_replace_cursor = len;
+            }
+            "BackSpace" => {
+                let is_find = self.find_replace_focus == 0;
+                if self.fr_delete_selection() {
+                    // Deleted selected text
+                } else if self.find_replace_cursor > 0 {
+                    let field = if is_find {
+                        &mut self.find_replace_query
+                    } else {
+                        &mut self.find_replace_replacement
+                    };
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(self.find_replace_cursor - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let next_byte = field
+                        .char_indices()
+                        .nth(self.find_replace_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(field.len());
+                    field.replace_range(byte_idx..next_byte, "");
+                    self.find_replace_cursor -= 1;
+                }
+                if is_find {
+                    self.run_find_replace_search();
+                }
+            }
+            "Delete" => {
+                let (field, is_find) = if self.find_replace_focus == 0 {
+                    (&mut self.find_replace_query, true)
+                } else {
+                    (&mut self.find_replace_replacement, false)
+                };
+                let char_len = field.chars().count();
+                if self.find_replace_cursor < char_len {
+                    let byte_idx = field
+                        .char_indices()
+                        .nth(self.find_replace_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(field.len());
+                    let next_byte = field
+                        .char_indices()
+                        .nth(self.find_replace_cursor + 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(field.len());
+                    field.replace_range(byte_idx..next_byte, "");
+                    if is_find {
+                        self.run_find_replace_search();
+                    }
+                }
+            }
+            "Left" => {
+                self.find_replace_sel_anchor = None;
+                if self.find_replace_cursor > 0 {
+                    self.find_replace_cursor -= 1;
+                }
+            }
+            "Right" => {
+                self.find_replace_sel_anchor = None;
+                let len = if self.find_replace_focus == 0 {
+                    self.find_replace_query.chars().count()
+                } else {
+                    self.find_replace_replacement.chars().count()
+                };
+                if self.find_replace_cursor < len {
+                    self.find_replace_cursor += 1;
+                }
+            }
+            "Home" => {
+                self.find_replace_sel_anchor = None;
+                self.find_replace_cursor = 0;
+            }
+            "End" => {
+                self.find_replace_sel_anchor = None;
+                self.find_replace_cursor = if self.find_replace_focus == 0 {
+                    self.find_replace_query.chars().count()
+                } else {
+                    self.find_replace_replacement.chars().count()
+                };
+            }
+            _ => {
+                // Alt+key toggles
+                if key_name == "c" && !ctrl && unicode == Some('c') {
+                    // check for alt below
+                }
+                // Handle Alt+C/W/R toggles
+                if !ctrl {
+                    match key_name {
+                        "c" if unicode.is_none() || shift => {
+                            // Alt+C — toggle case
+                            self.toggle_find_replace_case();
+                            return;
+                        }
+                        "w" if unicode.is_none() || shift => {
+                            self.toggle_find_replace_whole_word();
+                            return;
+                        }
+                        "r" if unicode.is_none() || shift => {
+                            self.toggle_find_replace_regex();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Ctrl+Z: pass through to engine undo
+                if ctrl && key_name == "z" {
+                    self.undo();
+                    self.run_find_replace_search();
+                    return;
+                }
+
+                // Ctrl+A: select all text in the focused field
+                if ctrl && key_name == "a" {
+                    let len = if self.find_replace_focus == 0 {
+                        self.find_replace_query.chars().count()
+                    } else {
+                        self.find_replace_replacement.chars().count()
+                    };
+                    self.find_replace_sel_anchor = Some(0);
+                    self.find_replace_cursor = len;
+                    return;
+                }
+
+                // Ctrl+V paste (replaces selection if any)
+                if ctrl && key_name == "v" {
+                    if let Some(clip) = Self::clipboard_paste() {
+                        let paste = clip.lines().next().unwrap_or("").to_string();
+                        self.fr_delete_selection(); // remove selected text first
+                        let (field, is_find) = if self.find_replace_focus == 0 {
+                            (&mut self.find_replace_query, true)
+                        } else {
+                            (&mut self.find_replace_replacement, false)
+                        };
+                        let byte_idx = field
+                            .char_indices()
+                            .nth(self.find_replace_cursor)
+                            .map(|(i, _)| i)
+                            .unwrap_or(field.len());
+                        field.insert_str(byte_idx, &paste);
+                        self.find_replace_cursor += paste.chars().count();
+                        if is_find {
+                            self.run_find_replace_search();
+                        }
+                    }
+                    return;
+                }
+
+                // Ctrl+Shift+H — replace current match
+                if ctrl && shift && key_name == "h" {
+                    self.find_replace_replace_current();
+                    return;
+                }
+
+                // Ctrl+H — toggle replace row visibility
+                if ctrl && !shift && key_name == "h" {
+                    self.find_replace_show_replace = !self.find_replace_show_replace;
+                    if self.find_replace_show_replace && self.find_replace_focus == 0 {
+                        // Optionally switch focus to replace
+                    }
+                    return;
+                }
+
+                // Printable character insertion (replaces selection if any)
+                if let Some(ch) = unicode {
+                    if !ctrl && !ch.is_control() {
+                        self.fr_delete_selection(); // remove selected text first
+                        let (field, is_find) = if self.find_replace_focus == 0 {
+                            (&mut self.find_replace_query, true)
+                        } else {
+                            (&mut self.find_replace_replacement, false)
+                        };
+                        let byte_idx = field
+                            .char_indices()
+                            .nth(self.find_replace_cursor)
+                            .map(|(i, _)| i)
+                            .unwrap_or(field.len());
+                        field.insert(byte_idx, ch);
+                        self.find_replace_cursor += 1;
+                        self.find_replace_sel_anchor = None;
+                        if is_find {
+                            self.run_find_replace_search();
+                        }
+                    }
+                }
+            }
         }
     }
 }

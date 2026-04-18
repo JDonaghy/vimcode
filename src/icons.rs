@@ -125,6 +125,13 @@ pub const GIT_STAGED: Icon = Icon::new("\u{f055}", "+");
 pub const LIGHTBULB: Icon = Icon::new("\u{f0eb}", "*");
 pub const PLUGIN_FALLBACK: Icon = Icon::new("\u{f03a}", "?");
 
+// ─── Find/Replace ───────────────────────────────────────────────────────────
+
+pub const FIND_REPLACE: Icon = Icon::new("\u{eb3c}", "R1"); // nf-cod-replace
+pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replace_all
+pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
+pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
+
 // ─── Tab Bar / Split Buttons (wide glyphs, TUI) ─────────────────────────────
 
 pub const DIFF_PREV: Icon = Icon::new("\u{F0143}", "<");
@@ -157,4 +164,43 @@ pub fn file_icon(ext: &str) -> &'static str {
         "txt" => FILE_TEXT.s(),
         _ => FILE_GENERIC.s(),
     }
+}
+
+/// Check whether a Nerd Font is installed on Windows by scanning the user and
+/// system font directories for font files with "Nerd" in the name.
+/// Returns `false` on non-Windows platforms.
+#[cfg(target_os = "windows")]
+pub fn detect_nerd_font_windows() -> bool {
+    use std::fs;
+    use std::path::PathBuf;
+    // User fonts (Windows 10 1803+, no admin required)
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let user_fonts = PathBuf::from(&local).join("Microsoft\\Windows\\Fonts");
+        if let Ok(entries) = fs::read_dir(&user_fonts) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.to_lowercase().contains("nerd") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // System fonts
+    let sys_fonts = PathBuf::from("C:\\Windows\\Fonts");
+    if let Ok(entries) = fs::read_dir(&sys_fonts) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.to_lowercase().contains("nerd") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect_nerd_font_windows() -> bool {
+    true // On non-Windows, assume available (GTK bundles, Linux has fontconfig)
 }

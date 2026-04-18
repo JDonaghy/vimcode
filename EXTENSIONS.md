@@ -255,6 +255,7 @@ end)
 vimcode.message(text)           -- Display a status bar message
 vimcode.cwd()                   -- Get current working directory (string)
 vimcode.command_run(cmd)        -- Execute a VimCode command (e.g., "w", "q", "split")
+vimcode.set_operatorfunc(fn)    -- Register a function for g@{motion} (receives "line"/"char")
 ```
 
 ### Buffer Functions (`vimcode.buf.*`)
@@ -512,6 +513,7 @@ vimcode.set_comment_style("haskell", {
 | `panel_collapse` | `"panel\|section\|id\|\|index"` | Tree node collapsed via Tab |
 | `panel_double_click` | `"panel\|section\|id\|\|index"` | Double-click on panel item |
 | `panel_context_menu` | `"panel\|section\|id\|\|index"` | Right-click on panel item |
+| `git_branch_changed` | new branch name (or `""`) | External git branch change detected (rate-limited to once per 2s) |
 | `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
 | Custom | shell output | `async_shell()` callback event |
 

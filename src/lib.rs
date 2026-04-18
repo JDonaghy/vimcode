@@ -1,4 +1,5 @@
 // Library shim for integration tests. No UI deps (GTK/Relm4/Cairo) allowed here.
+#![allow(clippy::collapsible_match)]
 pub mod core;
 pub mod icons;
 

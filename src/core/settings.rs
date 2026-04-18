@@ -294,6 +294,15 @@ pub struct Settings {
     /// Disable if your terminal/font lacks Nerd Font glyphs to get ASCII fallbacks.
     #[serde(default = "default_use_nerd_fonts")]
     pub use_nerd_fonts: bool,
+
+    /// What Ctrl+F does: "find" opens the find/replace overlay (default),
+    /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
+    #[serde(default = "default_ctrl_f_action")]
+    pub ctrl_f_action: String,
+}
+
+fn default_ctrl_f_action() -> String {
+    "find".to_string()
 }
 
 fn default_indent_guides() -> bool {
@@ -313,7 +322,12 @@ fn default_hover_delay() -> u32 {
 }
 
 fn default_use_nerd_fonts() -> bool {
-    true
+    // On Windows, terminal fonts (Consolas, Cascadia Mono) don't include Nerd
+    // Font glyphs by default. Use ASCII fallback icons instead.  Users who
+    // install a Nerd Font can enable via `:set nerdfonts`.  On Linux/macOS,
+    // the GTK backend bundles a Nerd Font subset and TUI terminals commonly
+    // have Nerd Font support.
+    !cfg!(target_os = "windows")
 }
 
 fn default_swap_file() -> bool {
@@ -730,6 +744,7 @@ impl Default for Settings {
             auto_pairs: default_auto_pairs(),
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
+            ctrl_f_action: default_ctrl_f_action(),
         }
     }
 }
@@ -851,6 +866,41 @@ impl Settings {
         // Enable a boolean option.
         self.set_bool_option(arg, true)?;
         Ok(arg.to_string())
+    }
+
+    /// Parse the `colorcolumn` string into a sorted, deduplicated list of column numbers.
+    /// Supports: `"80"`, `"80,120"`, `"+1"` (textwidth + 1), `"-2"` (textwidth - 2).
+    pub fn colorcolumn_positions(&self) -> Vec<usize> {
+        if self.colorcolumn.is_empty() {
+            return Vec::new();
+        }
+        let mut cols: Vec<usize> = Vec::new();
+        for part in self.colorcolumn.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(offset_str) = part.strip_prefix('+') {
+                if let Ok(offset) = offset_str.parse::<usize>() {
+                    if self.textwidth > 0 {
+                        cols.push(self.textwidth + offset);
+                    }
+                }
+            } else if let Some(offset_str) = part.strip_prefix('-') {
+                if let Ok(offset) = offset_str.parse::<usize>() {
+                    if self.textwidth > offset {
+                        cols.push(self.textwidth - offset);
+                    }
+                }
+            } else if let Ok(col) = part.parse::<usize>() {
+                if col > 0 {
+                    cols.push(col);
+                }
+            }
+        }
+        cols.sort_unstable();
+        cols.dedup();
+        cols
     }
 
     /// Return a compact one-line summary of all current settings.
@@ -1328,6 +1378,7 @@ impl Settings {
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
             "hover_delay" => self.hover_delay.to_string(),
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
+            "ctrl_f_action" => self.ctrl_f_action.clone(),
             "extension_registries" => self.extension_registries.join(", "),
             _ => String::new(),
         }
@@ -1441,6 +1492,14 @@ impl Settings {
                 self.use_nerd_fonts = value == "true";
                 crate::icons::set_nerd_fonts(self.use_nerd_fonts);
             }
+            "ctrl_f_action" => match value {
+                "find" | "page_down" => self.ctrl_f_action = value.to_string(),
+                _ => {
+                    return Err(format!(
+                        "Invalid ctrl_f_action: {value} (expected 'find' or 'page_down')"
+                    ))
+                }
+            },
             "extension_registries" => {
                 self.extension_registries = value
                     .split(',')
@@ -1877,6 +1936,14 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Press Enter to edit registry URLs (one per line, # comments)",
         category: "Extensions",
         setting_type: SettingType::BufferEditor,
+    },
+    // ── Keybindings ────────────────────────────────────────────────────────
+    SettingDef {
+        key: "ctrl_f_action",
+        label: "Ctrl+F Action",
+        description: "What Ctrl+F does: 'find' (find/replace overlay) or 'page_down' (Vim default)",
+        category: "Editor",
+        setting_type: SettingType::Enum(&["find", "page_down"]),
     },
     // ── TUI ─────────────────────────────────────────────────────────────────
     SettingDef {

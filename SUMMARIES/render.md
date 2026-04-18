@@ -1,4 +1,4 @@
-# src/render.rs — 7,815 lines
+# src/render.rs — ~9,762 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -38,12 +38,25 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `MenuBarData` / `MenuItemData` — menu bar + dropdown
 - `DebugToolbarData` / `DebugButton` — debug control buttons
 - `DialogPanel` / `ContextMenuPanel` — dialogs and context menus
+- `FindReplacePanel` — Ctrl+F find/replace overlay (query, replacement, toggles, match_info, sel_anchor, group_bounds, panel_width, hit_regions)
+- `FindReplaceClickTarget` — re-exported from engine; click target enum for shared dispatch (13 variants)
+- `FrHitRegion` — re-exported from engine; hit region in char-cell units
+- `FR_PANEL_WIDTH` — re-exported from engine; default panel width constant
+- `compute_find_replace_hit_regions()` — re-exported from engine; computes hit regions for find/replace overlay
 - `CommandLineData` / `WildmenuData` — command line + completion
 - `DiffPeekPopup` — inline diff hunk popup
 - `DiffToolbarData` — diff view toolbar
 
 ## Key Types — Shared Hit-Testing & Geometry
 - `ClickTarget` — semantic editor click target enum (TabBar, Gutter, BufferPos, SplitButton, CloseTab, StatusBarAction, etc.) — moved from gtk/click.rs for multi-backend sharing
+
+## Key Types — Backend Parity
+- `UiElement` (27 variants) — every renderable element a backend must draw; source of truth for rendering parity
+- `UiAction` (26 variants) — every user interaction a backend must handle; source of truth for click/mouse parity
+- `collect_expected_ui_elements(layout)` — walks ScreenLayout to list expected rendered elements
+- `all_required_ui_actions()` — canonical list of all required interaction handlers
+- `collect_ui_actions_tui()` / `collect_ui_actions_wingui()` — per-backend action lists for parity testing
+- `collect_ui_elements_tui(layout)` / `collect_ui_elements_wingui(layout)` — per-backend element lists
 
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)

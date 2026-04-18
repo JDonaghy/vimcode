@@ -147,20 +147,30 @@ impl Engine {
             return;
         }
 
-        // Move back one character first
-        pos -= 1;
+        let ch = self.buffer().content.char(pos);
 
-        // Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
+        // Step 1: If on a non-whitespace char, go to the start of the current word.
+        // If on whitespace, just move back one to begin searching.
+        if !ch.is_whitespace() {
+            if is_word_char(ch) {
+                while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
+                    pos -= 1;
+                }
+            } else {
+                while pos > 0 {
+                    let prev = self.buffer().content.char(pos - 1);
+                    if is_word_char(prev) || prev.is_whitespace() {
+                        break;
+                    }
+                    pos -= 1;
+                }
+            }
         }
 
-        // If we're at position 0 and it's whitespace, stop
         if pos == 0 {
-            if self.buffer().content.char(pos).is_whitespace() {
-                return;
-            }
-            // At position 0 and it's not whitespace, this is the end of the first word
+            // Already at start of first word — nowhere to go further back.
+            // But Vim's `ge` from start of first word goes to col 0 (no-op if
+            // already there). We're already there.
             let new_line = self.buffer().content.char_to_line(pos);
             let line_start = self.buffer().line_to_char(new_line);
             self.view_mut().cursor.line = new_line;
@@ -168,38 +178,20 @@ impl Engine {
             return;
         }
 
-        // Now we're on a non-whitespace char - find the start of this word
-        let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
-            // Move to start of word
-            while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
-                pos -= 1;
-            }
-        } else {
-            // Non-word punctuation
-            while pos > 0 {
-                let prev = self.buffer().content.char(pos - 1);
-                if is_word_char(prev) || prev.is_whitespace() {
-                    break;
-                }
-                pos -= 1;
-            }
-        }
-
-        // Now pos is at the start of a word, go back to find the end of the previous word
-        if pos == 0 {
-            // Already at start of buffer
-            return;
-        }
-
+        // Step 2: Move back one char (from start of current word or from whitespace)
         pos -= 1;
 
-        // Skip whitespace backward
+        // Step 3: Skip whitespace backward
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
             pos -= 1;
         }
 
-        // Now we're at the end of the previous word
+        // If at pos 0 and it's whitespace, no previous word exists
+        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
+            return;
+        }
+
+        // pos is now at the last char of the previous word (the target)
         let new_line = self.buffer().content.char_to_line(pos);
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
@@ -305,11 +297,14 @@ impl Engine {
         if pos == 0 {
             return;
         }
-        pos -= 1;
 
-        // Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
+        let ch = self.buffer().content.char(pos);
+
+        // Step 1: If on a non-whitespace char, go to the start of the current WORD.
+        if !ch.is_whitespace() {
+            while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
+                pos -= 1;
+            }
         }
 
         if pos == 0 {
@@ -320,22 +315,19 @@ impl Engine {
             return;
         }
 
-        // Skip non-whitespace backward to start of WORD
-        while pos > 0 && !self.buffer().content.char(pos - 1).is_whitespace() {
-            pos -= 1;
-        }
-
-        // We now point to start of a WORD; go back one more
-        if pos == 0 {
-            return;
-        }
+        // Step 2: Move back one char
         pos -= 1;
 
-        // Skip whitespace backward
+        // Step 3: Skip whitespace backward
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
             pos -= 1;
         }
 
+        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
+            return;
+        }
+
+        // pos is now at the last char of the previous WORD
         let new_line = self.buffer().content.char_to_line(pos);
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
@@ -533,6 +525,32 @@ impl Engine {
                 return;
             }
         };
+
+        // Hex prefix detection: if start is on '0' (or '-0') with 'x'/'X' following,
+        // extend num_end forward to cover all hex digits so parsing sees "0xXX".
+        // Without this, cursor landing on the leading '0' of "0x09" would only see
+        // the digit "0" and increment it as decimal to "1x09" (Vim deviation #109).
+        let hex_prefix_at = if start_col + 1 < chars.len()
+            && chars[start_col] == '0'
+            && (chars[start_col + 1] == 'x' || chars[start_col + 1] == 'X')
+        {
+            Some(start_col)
+        } else if start_col + 2 < chars.len()
+            && chars[start_col] == '-'
+            && chars[start_col + 1] == '0'
+            && (chars[start_col + 2] == 'x' || chars[start_col + 2] == 'X')
+        {
+            Some(start_col + 1)
+        } else {
+            None
+        };
+        if let Some(p) = hex_prefix_at {
+            let mut end = p + 2;
+            while end < chars.len() && chars[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            num_end = end;
+        }
 
         let num_str: String = chars[start_col..num_end].iter().collect();
         let trimmed = num_str.trim_start_matches('-');
@@ -953,12 +971,14 @@ impl Engine {
     pub(crate) fn join_lines_no_space(&mut self, count: usize, changed: &mut bool) {
         let total_lines = self.buffer().len_lines();
         let start_line = self.view().cursor.line;
-        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        let joins = if count <= 1 { 1 } else { count - 1 };
+        let joins = joins.min(total_lines.saturating_sub(start_line + 1));
         if joins == 0 {
             return;
         }
 
         self.start_undo_group();
+        let mut join_col = 0usize;
         for _ in 0..joins {
             let cur_line = self.view().cursor.line;
             let next_line = cur_line + 1;
@@ -969,21 +989,14 @@ impl Engine {
             let cur_line_len = self.buffer().line_len_chars(cur_line);
             let cur_line_start = self.buffer().line_to_char(cur_line);
             let newline_pos = cur_line_start + cur_line_len - 1;
+            join_col = newline_pos - cur_line_start;
 
-            // Count leading whitespace on next line
-            let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
-            let leading_ws = next_line_content
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
-                .count();
-
-            // Delete newline + all leading whitespace of next line (no space inserted)
-            let next_line_start = self.buffer().line_to_char(next_line);
-            let del_end = next_line_start + leading_ws;
-            self.delete_with_undo(newline_pos, del_end);
+            // gJ does NOT strip leading whitespace — just remove the newline
+            self.delete_with_undo(newline_pos, newline_pos + 1);
         }
         self.finish_undo_group();
 
+        self.view_mut().cursor.col = join_col;
         self.clamp_cursor_col();
         *changed = true;
     }
@@ -1057,6 +1070,107 @@ impl Engine {
         }
 
         None
+    }
+
+    /// Like `file_path_under_cursor`, but also parses a trailing `:<line>`
+    /// suffix (e.g. `src/main.rs:42`, `foo.txt:10:3`). Returns the resolved
+    /// path and an optional 1-based line number.
+    pub(crate) fn file_path_and_line_under_cursor(
+        &self,
+    ) -> Option<(std::path::PathBuf, Option<usize>)> {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.chars().collect();
+
+        // Path chars: same as file_path_under_cursor but ALLOW ':' so we capture the suffix
+        let is_path_or_colon =
+            |c: char| !c.is_whitespace() && c != '"' && c != '\'' && c != ',' && c != ';';
+
+        let mut start = col;
+        let mut end = col;
+
+        while start > 0 && is_path_or_colon(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_path_or_colon(chars[end]) {
+            end += 1;
+        }
+        while end > start && (chars[end - 1] == '\n' || chars[end - 1] == '\r') {
+            end -= 1;
+        }
+        // Strip trailing colon (e.g. "foo.rs:" at end of sentence)
+        while end > start && chars[end - 1] == ':' {
+            end -= 1;
+        }
+
+        if start >= end {
+            return None;
+        }
+
+        let token: String = chars[start..end].iter().collect();
+        if token.is_empty() {
+            return None;
+        }
+
+        // Split off `:line` or `:line:col` suffix — try progressively stripping
+        // colon-delimited numeric suffixes to find a valid file path.
+        let mut path_part = token.as_str();
+        let mut line_num: Option<usize> = None;
+
+        // Try stripping `:col` then `:line` (handles `path:line:col`)
+        for _ in 0..2 {
+            if let Some(colon_pos) = path_part.rfind(':') {
+                let suffix = &path_part[colon_pos + 1..];
+                if let Ok(n) = suffix.parse::<usize>() {
+                    // Remember the first (outermost) number stripped as line, but
+                    // on the second pass it becomes the actual line number.
+                    line_num = Some(n);
+                    path_part = &path_part[..colon_pos];
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if path_part.is_empty() {
+            return None;
+        }
+
+        let path = std::path::PathBuf::from(path_part);
+
+        // Resolve path: workspace root, then current file's dir
+        let resolved = if path.is_absolute() {
+            if path.exists() {
+                Some(path)
+            } else {
+                None
+            }
+        } else {
+            let mut found = None;
+            if let Some(ref root) = self.workspace_root {
+                let abs = root.join(&path);
+                if abs.exists() {
+                    found = Some(abs);
+                }
+            }
+            if found.is_none() {
+                if let Some(file_path) = self.active_buffer_state().file_path.as_ref() {
+                    if let Some(dir) = file_path.parent() {
+                        let abs = dir.join(&path);
+                        if abs.exists() {
+                            found = Some(abs);
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        resolved.map(|p| (p, line_num))
     }
 
     // --- g* / g#: partial word search ---
@@ -1213,6 +1327,10 @@ impl Engine {
             "Escape" => {
                 self.virtual_replace = false;
                 self.mode = Mode::Normal;
+                // Vim steps cursor one left when leaving Replace mode (unless at col 0)
+                if self.view().cursor.col > 0 {
+                    self.view_mut().cursor.col -= 1;
+                }
                 self.clamp_cursor_col();
             }
             "BackSpace" => {
@@ -1388,7 +1506,7 @@ impl Engine {
     /// Find a character on the current line.
     /// motion_type: 'f' (forward inclusive), 'F' (backward inclusive),
     ///              't' (forward till/exclusive), 'T' (backward till/exclusive)
-    pub(crate) fn find_char(&mut self, motion_type: char, target: char) {
+    pub(crate) fn find_char(&mut self, motion_type: char, target: char) -> bool {
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
         let line_start = self.buffer().line_to_char(line);
@@ -1401,7 +1519,7 @@ impl Engine {
                     let ch = self.buffer().content.char(line_start + i);
                     if ch == target && ch != '\n' {
                         self.view_mut().cursor.col = i;
-                        return;
+                        return true;
                     }
                 }
             }
@@ -1412,7 +1530,7 @@ impl Engine {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
                             self.view_mut().cursor.col = i;
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -1425,7 +1543,7 @@ impl Engine {
                         if i > 0 {
                             self.view_mut().cursor.col = i - 1;
                         }
-                        return;
+                        return true;
                     }
                 }
             }
@@ -1436,7 +1554,7 @@ impl Engine {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
                             self.view_mut().cursor.col = i + 1;
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -1444,6 +1562,7 @@ impl Engine {
             _ => {}
         }
         // Character not found - cursor doesn't move (Vim behavior)
+        false
     }
 
     /// Repeat the last character find motion.
@@ -1634,9 +1753,10 @@ impl Engine {
             'W' => self.find_bigword_object(modifier, cursor_pos),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
-            '(' | ')' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
-            '{' | '}' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
+            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
+            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
             '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
+            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos),
             'p' => self.find_paragraph_object(modifier, cursor_pos),
             's' => self.find_sentence_object(modifier, cursor_pos),
             't' => self.find_tag_text_object(modifier, cursor_pos),
@@ -1688,14 +1808,25 @@ impl Engine {
             end += 1;
         }
 
-        // For 'aw', include trailing whitespace
+        // For 'aw', include trailing whitespace; if none, include leading whitespace
         if modifier == 'a' {
+            let end_before = end;
             while end < total_chars {
                 let ch = self.buffer().content.char(end);
                 if !ch.is_whitespace() || ch == '\n' {
                     break;
                 }
                 end += 1;
+            }
+            // No trailing whitespace consumed — try leading instead
+            if end == end_before {
+                while start > 0 {
+                    let ch = self.buffer().content.char(start - 1);
+                    if !ch.is_whitespace() || ch == '\n' {
+                        break;
+                    }
+                    start -= 1;
+                }
             }
         }
 
@@ -1770,8 +1901,35 @@ impl Engine {
                 None
             }
         } else {
-            // Around: include quotes
-            Some((open_pos, close_pos + 1))
+            // Around: include quotes + trailing whitespace (or leading if no trailing)
+            let mut end = close_pos + 1;
+            let mut start = open_pos;
+            // Try trailing whitespace first
+            let mut trail = end;
+            while trail < line_end {
+                let ch = self.buffer().content.char(trail);
+                if ch == ' ' || ch == '\t' {
+                    trail += 1;
+                } else {
+                    break;
+                }
+            }
+            if trail > end {
+                end = trail;
+            } else {
+                // No trailing whitespace — try leading whitespace
+                let mut lead = start;
+                while lead > line_start {
+                    let ch = self.buffer().content.char(lead - 1);
+                    if ch == ' ' || ch == '\t' {
+                        lead -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                start = lead;
+            }
+            Some((start, end))
         }
     }
 
@@ -1821,7 +1979,23 @@ impl Engine {
         if modifier == 'i' {
             // Inner: exclude brackets
             if open_pos < close_pos {
-                Some((open_pos + 1, close_pos))
+                let open_line = self.buffer().content.char_to_line(open_pos);
+                let close_line = self.buffer().content.char_to_line(close_pos);
+                if open_line != close_line {
+                    // Multiline: Vim makes inner bracket objects linewise —
+                    // delete from start of line after open bracket to start of
+                    // line with close bracket.
+                    let start = self.buffer().line_to_char(open_line + 1);
+                    let end = self.buffer().line_to_char(close_line);
+                    if start <= end {
+                        Some((start, end))
+                    } else {
+                        // Empty interior (brackets on adjacent lines)
+                        Some((start, start))
+                    }
+                } else {
+                    Some((open_pos + 1, close_pos))
+                }
             } else {
                 None
             }
@@ -2503,6 +2677,18 @@ impl Engine {
 
         let (start_pos, end_pos) = range;
         if start_pos >= end_pos {
+            // Empty inner range (e.g. ci( on "()"). For 'c' operator,
+            // still enter insert mode at the position between the delimiters.
+            if operator == 'c' {
+                let line = self.buffer().content.char_to_line(start_pos);
+                let line_start = self.buffer().line_to_char(line);
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = start_pos - line_start;
+                self.mode = Mode::Insert;
+                self.start_undo_group();
+                self.insert_text_buffer.clear();
+                *changed = true;
+            }
             return;
         }
 
@@ -2657,13 +2843,10 @@ impl Engine {
             // Delete lines including their newlines
             (line_start, line_end)
         } else {
-            // Deleting to end of buffer
-            if start_line > 0 {
-                // Delete the newline before the first line being deleted
-                (line_start - 1, line_end)
-            } else {
-                (line_start, line_end)
-            }
+            // Deleting to end of buffer: just delete from start of first
+            // deleted line to EOF. This preserves the previous line's
+            // trailing newline (if any).
+            (line_start, line_end)
         };
 
         self.delete_with_undo(delete_start, delete_end);
@@ -3497,6 +3680,24 @@ impl Engine {
     /// Sets a register's content. `is_linewise` affects paste behavior.
     /// For `+` and `*` registers, also writes to the system clipboard.
     pub(crate) fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        // Uppercase register (A-Z): append to lowercase register
+        if reg.is_ascii_uppercase() {
+            let lower = reg.to_ascii_lowercase();
+            let (existing, existing_lw) = self.registers.get(&lower).cloned().unwrap_or_default();
+            let combined_lw = existing_lw || is_linewise;
+            let combined = if existing.is_empty() {
+                content.clone()
+            } else if existing_lw {
+                // Linewise: just concatenate (existing already ends with \n)
+                format!("{}{}", existing, content)
+            } else {
+                format!("{}\n{}", existing, content)
+            };
+            self.registers
+                .insert(lower, (combined.clone(), combined_lw));
+            self.registers.insert('"', (combined, combined_lw));
+            return;
+        }
         self.registers.insert(reg, (content.clone(), is_linewise));
         // Also copy to unnamed register if using a named register
         if reg != '"' {
@@ -3517,11 +3718,16 @@ impl Engine {
         self.registers.get(&reg)
     }
 
-    /// Sets a yank register. Like set_register, but ALSO always updates "0.
+    /// Sets a yank register. Like set_register, but ALSO updates "0 when the
+    /// target is the unnamed register. Yanks to a named register (e.g. "ayy)
+    /// leave "0 untouched, matching Vim's :help registers semantics.
     pub(crate) fn set_yank_register(&mut self, reg: char, content: String, is_linewise: bool) {
         self.set_register(reg, content.clone(), is_linewise);
-        // "0 is the yank-only register — set on every yank, never on deletes.
-        self.registers.insert('0', (content, is_linewise));
+        if reg == '"' {
+            // "0 is the yank-only register — set on every unnamed yank, never on
+            // deletes or on yanks to an explicit named register.
+            self.registers.insert('0', (content, is_linewise));
+        }
     }
 
     /// Sets a delete register. Like set_register, but:
@@ -3716,7 +3922,9 @@ impl Engine {
     /// This clears the count field.
     #[allow(dead_code)] // Will be used in Step 2 for motion commands
     pub fn take_count(&mut self) -> usize {
-        self.count.take().unwrap_or(1)
+        let op_count = self.operator_count.take().unwrap_or(1);
+        let motion_count = self.count.take().unwrap_or(1);
+        op_count * motion_count
     }
 
     /// Peeks at the current count without consuming it. Used for UI display.
@@ -3778,8 +3986,8 @@ impl Engine {
             self.delete_with_undo(char_idx, char_idx + to_replace);
             self.insert_with_undo(char_idx, &replacement_str);
 
-            // Keep cursor at the start position (Vim behavior)
-            self.view_mut().cursor.col = col;
+            // Cursor on last replaced char (Neovim behavior)
+            self.view_mut().cursor.col = col + to_replace - 1;
             self.clamp_cursor_col();
             *changed = true;
         }
@@ -4499,13 +4707,15 @@ impl Engine {
         let total_lines = self.buffer().len_lines();
         let start_line = self.view().cursor.line;
 
-        // We join (count) times; each join merges current line with next
-        let joins = count.min(total_lines.saturating_sub(start_line + 1));
+        // Vim: J joins 2 lines (1 join), 3J joins 3 lines (2 joins).
+        let joins = if count <= 1 { 1 } else { count - 1 };
+        let joins = joins.min(total_lines.saturating_sub(start_line + 1));
         if joins == 0 {
             return;
         }
 
         self.start_undo_group();
+        let mut join_col = 0usize; // track the join point for cursor placement
         for _ in 0..joins {
             let cur_line = self.view().cursor.line;
             let next_line = cur_line + 1;
@@ -4534,22 +4744,25 @@ impl Engine {
             let del_end = next_line_start + leading_ws;
             self.delete_with_undo(newline_pos, del_end);
 
-            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws
-            // Also don't add space if the current line ends with a space
+            // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
+            // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
-            // Check if current line ends with space (after the newline was removed)
-            let cur_end_char =
-                self.buffer().line_to_char(cur_line) + self.buffer().line_len_chars(cur_line);
-            let ends_with_space = cur_end_char > self.buffer().line_to_char(cur_line)
-                && self.buffer().content.char(cur_end_char - 1) == ' ';
+            let ends_with_ws = newline_pos > cur_line_start
+                && self.buffer().content.char(newline_pos - 1).is_whitespace();
 
-            if should_add_space && !ends_with_space {
+            if should_add_space && !ends_with_ws {
                 self.insert_with_undo(newline_pos, " ");
+                // Cursor at the inserted space
+                join_col = newline_pos - cur_line_start;
+            } else {
+                // No space inserted — cursor at last char before where next line starts
+                join_col = (newline_pos - cur_line_start).saturating_sub(1);
             }
         }
         self.finish_undo_group();
 
-        // Cursor stays at start of original line
+        // Cursor at the join point (where the space was inserted)
+        self.view_mut().cursor.col = join_col;
         self.clamp_cursor_col();
         *changed = true;
     }

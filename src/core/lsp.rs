@@ -494,12 +494,39 @@ pub fn parse_content_length(line: &str) -> Option<usize> {
 pub fn path_to_uri(path: &Path) -> String {
     // Canonicalize to get absolute path, fall back to as-is
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    format!("file://{}", abs.display())
+    let mut s = abs.to_string_lossy().into_owned();
+    // Strip Windows UNC prefix (\\?\)
+    if s.starts_with("\\\\?\\") {
+        s = s[4..].to_string();
+    }
+    // Convert backslashes to forward slashes for URI
+    s = s.replace('\\', "/");
+    // On Windows, paths start with a drive letter (C:/...) — URI needs a leading slash
+    if s.chars().nth(1) == Some(':') {
+        format!("file:///{s}")
+    } else {
+        format!("file://{s}")
+    }
 }
 
 /// Convert a file:// URI back to a PathBuf.
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    uri.strip_prefix("file://").map(PathBuf::from)
+    // Handle both file:///C:/... (standard) and file://C:/... (legacy)
+    let path_str = if let Some(s) = uri.strip_prefix("file:///") {
+        s
+    } else {
+        uri.strip_prefix("file://")?
+    };
+    // If the path starts with a drive letter (e.g. C:/), use it as-is.
+    // Otherwise re-add the leading slash (Unix absolute path).
+    let has_drive = path_str.len() >= 2
+        && path_str.as_bytes()[0].is_ascii_alphabetic()
+        && path_str.as_bytes()[1] == b':';
+    if has_drive {
+        Some(PathBuf::from(path_str))
+    } else {
+        Some(PathBuf::from(format!("/{path_str}")))
+    }
 }
 
 /// Map a file extension (or filename) to an LSP language identifier.
@@ -2187,12 +2214,25 @@ mod tests {
         let uri = path_to_uri(Path::new("/home/user/file.rs"));
         assert!(uri.starts_with("file://"));
         assert!(uri.contains("file.rs"));
+        // URI must use forward slashes
+        assert!(!uri.contains('\\'));
     }
 
     #[test]
     fn test_uri_to_path() {
-        let path = uri_to_path("file:///home/user/file.rs");
-        assert_eq!(path, Some(PathBuf::from("/home/user/file.rs")));
+        #[cfg(not(target_os = "windows"))]
+        {
+            let path = uri_to_path("file:///home/user/file.rs");
+            assert_eq!(path, Some(PathBuf::from("/home/user/file.rs")));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let path = uri_to_path("file:///C:/Users/user/file.rs");
+            assert_eq!(path, Some(PathBuf::from("C:/Users/user/file.rs")));
+            // Also handle legacy two-slash format
+            let path2 = uri_to_path("file://C:/Users/user/file.rs");
+            assert_eq!(path2, Some(PathBuf::from("C:/Users/user/file.rs")));
+        }
     }
 
     #[test]
