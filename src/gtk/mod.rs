@@ -3896,9 +3896,51 @@ impl SimpleComponent for App {
         {
             let pos_cell = mouse_pos_cell.clone();
             let pos_cell_leave = mouse_pos_cell.clone();
+            let engine_motion = engine.clone();
+            let lh_motion = line_height_cell.clone();
+            let cw_motion = char_width_cell.clone();
+            let da_motion = widgets.drawing_area.clone();
             let mc = gtk4::EventControllerMotion::new();
             mc.connect_motion(move |_, x, y| {
                 pos_cell.set((x, y));
+                // Update context menu hover selection.
+                if let Ok(mut eng) = engine_motion.try_borrow_mut() {
+                    let needs_redraw = if let Some(ref cm) = eng.context_menu {
+                        let lh = lh_motion.get();
+                        let cw = cw_motion.get();
+                        if lh >= 1.0 && cw >= 1.0 {
+                            let col = (x / cw) as u16;
+                            let row = (y / lh) as u16;
+                            let tw = (da_motion.width() as f64 / cw) as u16;
+                            let th = (da_motion.height() as f64 / lh) as u16;
+                            match crate::core::engine::resolve_context_menu_click(
+                                &cm.items,
+                                cm.screen_x,
+                                cm.screen_y,
+                                tw,
+                                th,
+                                col,
+                                row,
+                            ) {
+                                crate::core::engine::ContextMenuClickResult::Item(idx)
+                                    if cm.selected != idx =>
+                                {
+                                    Some(idx)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(idx) = needs_redraw {
+                        eng.context_menu.as_mut().unwrap().selected = idx;
+                        drop(eng);
+                        da_motion.queue_draw();
+                    }
+                }
             });
             mc.connect_leave(move |_| {
                 pos_cell_leave.set((-1.0, -1.0));
@@ -3962,59 +4004,6 @@ impl SimpleComponent for App {
                 }
             });
             widgets.drawing_area.add_controller(rc_gesture);
-        }
-
-        // Context menu hover: update selected item as mouse moves over the popup.
-        {
-            let engine_hover = engine.clone();
-            let lh_cell = line_height_cell.clone();
-            let cw_cell = char_width_cell.clone();
-            let da_hover = widgets.drawing_area.clone();
-            let motion = gtk4::EventControllerMotion::new();
-            motion.connect_motion(move |_, x, y| {
-                // Resolve hover target from immutable borrow, then update if changed.
-                let hover_result = {
-                    let Ok(engine) = engine_hover.try_borrow() else {
-                        return;
-                    };
-                    let Some(ref cm) = engine.context_menu else {
-                        return;
-                    };
-                    let lh = lh_cell.get();
-                    let cw = cw_cell.get();
-                    if lh < 1.0 || cw < 1.0 {
-                        return;
-                    }
-                    let col = (x / cw) as u16;
-                    let row = (y / lh) as u16;
-                    let tw = (da_hover.width() as f64 / cw) as u16;
-                    let th = (da_hover.height() as f64 / lh) as u16;
-                    let result = crate::core::engine::resolve_context_menu_click(
-                        &cm.items,
-                        cm.screen_x,
-                        cm.screen_y,
-                        tw,
-                        th,
-                        col,
-                        row,
-                    );
-                    let old = cm.selected;
-                    // engine (Ref) dropped here at end of block
-                    (result, old)
-                };
-                if let crate::core::engine::ContextMenuClickResult::Item(idx) = hover_result.0 {
-                    if hover_result.1 != idx {
-                        if let Ok(mut eng) = engine_hover.try_borrow_mut() {
-                            if let Some(ref mut cm) = eng.context_menu {
-                                cm.selected = idx;
-                            }
-                            drop(eng);
-                            da_hover.queue_draw();
-                        }
-                    }
-                }
-            });
-            widgets.drawing_area.add_controller(motion);
         }
 
         // Tab switcher auto-confirm: poll modifier state every 50ms while open.
