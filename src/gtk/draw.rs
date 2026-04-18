@@ -3543,11 +3543,11 @@ pub(super) fn draw_context_menu_popup(
             cr.fill().ok();
         }
 
-        // Label.
+        // Label — disabled items heavily darkened for obvious visual distinction.
         let fg = if item.enabled {
             theme.fuzzy_fg
         } else {
-            theme.line_number_fg
+            theme.fuzzy_fg.darken(0.5)
         };
         let (r, g, b) = fg.to_cairo();
         cr.set_source_rgb(r, g, b);
