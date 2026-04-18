@@ -27,7 +27,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 |-------|--------|--------|----------------|-----------------|
 | **Phase A.0** — workspace scaffold | ✅ Done | `36ccad3` | `quadraui-phase-a0-*` | any |
 | **Phase A.1a** — `TreeView` primitive + TUI SC panel | ✅ Done | `bac137e` | `quadraui-phase-a1a-*` | any (TUI) |
-| **Phase A.1b** — GTK `draw_tree` + GTK SC panel | 🟡 Next | — | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
+| **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | Phase A.2 — `TreeView` for explorer | ⬜ Queued | — | `quadraui-phase-a2-*` | any (GTK replaces native TreeView) |
 | Phase A.3 — `Form` + settings panel | ⬜ Queued | — | `quadraui-phase-a3-*` | any |
@@ -41,8 +41,30 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1b and A.1c are independent — they can be done on different machines in
-either order or in parallel.
+A.1c is independent from the already-shipped A.1a/b and can be done on a
+Windows machine.
+
+---
+
+## Lessons learned during this wave
+
+- **Adapters must preserve the flat-row count the engine expects.** The
+  first draft of `source_control_to_tree_view()` added a `(no changes)`
+  placeholder row for empty + expanded sections. That single extra row
+  shifted the `sc.selected` (flat index) → `selected_path` (TreePath)
+  mapping off by one, and `sc_flat_to_section_idx()` disagreed with the
+  visual layout. Symptom: `Tab` and `Enter` acted on the wrong section;
+  staging worked only because the file rows were always in non-empty
+  sections. Fix (absorbed into `e12601e`): drop the placeholder. Rule:
+  **any adapter row the engine doesn't count is a bug.** Backends that
+  want an empty-state hint should render it as a visual detail that
+  doesn't occupy a selectable row.
+
+- **Flat-index selection mapping is the single biggest regression risk**
+  in every backend migration. Always smoke-test keyboard nav (`j`/`k`)
+  after touching an adapter. If the highlight visually lands on a
+  non-header row but key behaviour says otherwise, the adapter has
+  added or dropped a row.
 
 ---
 

@@ -9,9 +9,11 @@
 
 All non-trivial work should be tracked via GitHub Issues. Issues are the source of truth for what needs doing, why, and what the design is.
 
-**For ALL changes (issue work, bug fixes, doc updates, release prep):**
+**Documentation-only changes** (pure `.md` edits, or comment-only edits in source files) may be committed directly to `develop` and pushed. No branch, no smoke test, no path decision. This includes `PLAN.md`, `PROJECT_STATE.md`, `README.md`, `docs/*.md`, and `CLAUDE.md` itself. If any code changes accompany the doc edit — even a one-line code change — use the full branch workflow below.
 
-1. **Always work on a local branch off `develop`.** Never commit directly to `develop`. Branch naming:
+**For all other changes (issue work, bug fixes, code changes, release prep):**
+
+1. **Always work on a local branch off `develop`.** Never commit code directly to `develop`. Branch naming:
    - Issue work: `issue-{number}-{short-description}`
    - Other work: `{kind}-{short-description}` (e.g. `fix-integration-tests-1based`, `docs-workflow-branch-required`, `release-0.11.0`)
 2. Do the work on that branch, committing as you go.
