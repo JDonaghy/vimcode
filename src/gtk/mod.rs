@@ -3972,7 +3972,9 @@ impl SimpleComponent for App {
             let da_hover = widgets.drawing_area.clone();
             let motion = gtk4::EventControllerMotion::new();
             motion.connect_motion(move |_, x, y| {
-                let mut engine = engine_hover.borrow_mut();
+                let Ok(mut engine) = engine_hover.try_borrow_mut() else {
+                    return; // Engine already borrowed (e.g. by draw function)
+                };
                 if engine.context_menu.is_none() {
                     return;
                 }
