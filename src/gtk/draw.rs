@@ -3525,25 +3525,9 @@ pub(super) fn draw_context_menu_popup(
     } else {
         None
     };
-    // Use hover index if mouse is over an item; otherwise use keyboard selection
-    // only if the mouse is outside the popup (so keyboard nav still works).
-    let mouse_inside_popup = if mouse_pos.0 >= 0.0 {
-        let mcol = (mouse_pos.0 / char_width) as u16;
-        let mrow = (mouse_pos.1 / line_height) as u16;
-        mcol >= (px / char_width) as u16
-            && mcol < ((px + popup_w) / char_width) as u16
-            && mrow >= (py / line_height) as u16
-            && mrow < ((py + popup_h) / line_height) as u16
-    } else {
-        false
-    };
-    let selected = if let Some(idx) = hover_idx {
-        idx
-    } else if mouse_inside_popup {
-        usize::MAX // no highlight (mouse on separator/border)
-    } else {
-        cm.selected_idx // keyboard selection when mouse is outside
-    };
+    // Use hover index if mouse is over an item; otherwise keep engine selection
+    // (preserves last-hovered or keyboard-navigated item when mouse leaves).
+    let selected = hover_idx.unwrap_or(cm.selected_idx);
 
     // Items.
     let mut visual_row: usize = 0;
