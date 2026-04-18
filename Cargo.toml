@@ -37,12 +37,16 @@ name = "vimcode-win"
 path = "src/win_gui_bin.rs"
 required-features = ["win-gui"]
 
+[workspace]
+members = ["quadraui"]
+
 [features]
 default = ["gui"]
 gui = ["gtk4", "relm4", "pangocairo", "gio"]
 win-gui = ["windows"]
 
 [dependencies]
+quadraui = { path = "quadraui" }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
