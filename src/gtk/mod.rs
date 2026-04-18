@@ -4063,14 +4063,26 @@ impl SimpleComponent for App {
                 x,
                 y,
             } => {
-                self.handle_tab_right_click(group_id, tab_idx, x, y, &sender);
+                let cw = self.cached_char_width.max(1.0);
+                let lh = self.cached_line_height.max(1.0);
+                let cx = (x / cw) as u16;
+                let cy = (y / lh) as u16;
+                self.engine
+                    .borrow_mut()
+                    .open_tab_context_menu(group_id, tab_idx, cx, cy);
+                self.draw_needed.set(true);
             }
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
                 // Kept as a no-op for exhaustive match.
             }
             Msg::EditorRightClick { x, y } => {
-                self.handle_editor_right_click(x, y);
+                let cw = self.cached_char_width.max(1.0);
+                let lh = self.cached_line_height.max(1.0);
+                let cx = (x / cw) as u16;
+                let cy = (y / lh) as u16;
+                self.engine.borrow_mut().open_editor_context_menu(cx, cy);
+                self.draw_needed.set(true);
             }
             Msg::Resize => {
                 // Propagate window resize to open terminal panes.
@@ -5085,6 +5097,64 @@ impl App {
             return;
         }
 
+        // Dismiss context menu on any key press (Escape, or j/k for nav, Enter to confirm).
+        if self.engine.borrow().context_menu.is_some() {
+            let mut engine = self.engine.borrow_mut();
+            match key_name.as_str() {
+                "Escape" => {
+                    engine.close_context_menu();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "Return" => {
+                    let _act = engine.context_menu_confirm();
+                    let needs_refresh = engine.explorer_needs_refresh;
+                    if needs_refresh {
+                        engine.explorer_needs_refresh = false;
+                    }
+                    drop(engine);
+                    if needs_refresh {
+                        sender.input(Msg::RefreshFileTree);
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "j" | "Down" => {
+                    if let Some(ref mut cm) = engine.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = (cm.selected + 1) % len;
+                        }
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                "k" | "Up" => {
+                    if let Some(ref mut cm) = engine.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = if cm.selected > 0 {
+                                cm.selected - 1
+                            } else {
+                                len - 1
+                            };
+                        }
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                _ => {
+                    engine.close_context_menu();
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    // Fall through to normal key handling
+                }
+            }
+        }
+
         // Dismiss any panel hover popup on key press.
         self.engine.borrow_mut().dismiss_panel_hover_now();
         if let Some(ref da) = *self.panel_hover_da.borrow() {
@@ -5750,6 +5820,57 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // ── Context menu click handling (engine-drawn) ──
+        if self.engine.borrow().context_menu.is_some() {
+            let cw = self.cached_char_width.max(1.0);
+            let lh = self.cached_line_height.max(1.0);
+            let click_col = (x / cw) as u16;
+            let click_row = (y / lh) as u16;
+            let term_w = (width / cw) as u16;
+            let term_h = (height / lh) as u16;
+
+            let result = {
+                let engine = self.engine.borrow();
+                let cm = engine.context_menu.as_ref().unwrap();
+                crate::core::engine::resolve_context_menu_click(
+                    &cm.items,
+                    cm.screen_x,
+                    cm.screen_y,
+                    term_w,
+                    term_h,
+                    click_col,
+                    click_row,
+                )
+            };
+
+            use crate::core::engine::ContextMenuClickResult;
+            match result {
+                ContextMenuClickResult::Item(idx) => {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.context_menu.as_mut().unwrap().selected = idx;
+                    // context_menu_confirm() handles the action internally and
+                    // consumes the menu.
+                    let _act = engine.context_menu_confirm();
+                    let needs_tree_refresh = engine.explorer_needs_refresh;
+                    if needs_tree_refresh {
+                        engine.explorer_needs_refresh = false;
+                    }
+                    drop(engine);
+                    if needs_tree_refresh {
+                        sender.input(Msg::RefreshFileTree);
+                    }
+                }
+                ContextMenuClickResult::InsidePopup => {
+                    // Click inside but not on an item — ignore
+                }
+                ContextMenuClickResult::Outside => {
+                    self.engine.borrow_mut().close_context_menu();
+                }
+            }
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Find/replace overlay click handling (using shared hit regions) ──
         if self.engine.borrow().find_replace_open {
             let cw = self.cached_char_width.max(1.0);
@@ -6898,6 +7019,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_tab_right_click(
         &mut self,
         group_id: core::window::GroupId,
@@ -7122,6 +7244,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_editor_right_click(&mut self, x: f64, y: f64) {
         let da = match self.drawing_area.borrow().as_ref() {
             Some(da) => da.clone(),
