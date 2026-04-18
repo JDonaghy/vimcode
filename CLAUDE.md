@@ -4,15 +4,26 @@
 3. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
 4. Prompt user to update `PROJECT_STATE.md` after significant tasks
 
-## Issue-Driven Workflow
+## Development Workflow
+
 All non-trivial work should be tracked via GitHub Issues. Issues are the source of truth for what needs doing, why, and what the design is.
 
-**Starting work on an issue:**
-1. Create a feature branch from `develop`: `git checkout -b issue-{number}-{short-description} develop`
-2. Do the work on that branch, committing as you go
-3. **Do NOT push or create a PR until the user has run smoke tests and confirmed the changes work.** Commit locally, offer smoke tests, wait for approval before pushing.
-4. When the user approves, push and create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
-5. The user reviews and merges the PR. When the user confirms the merge, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close
+**For ALL changes (issue work, bug fixes, doc updates, release prep):**
+
+1. **Always work on a local branch off `develop`.** Never commit directly to `develop`. Branch naming:
+   - Issue work: `issue-{number}-{short-description}`
+   - Other work: `{kind}-{short-description}` (e.g. `fix-integration-tests-1based`, `docs-workflow-branch-required`, `release-0.11.0`)
+2. Do the work on that branch, committing as you go.
+3. **Do NOT push the branch yet.** Keep it local until one of the following applies:
+   - **(a)** The user has run smoke tests and confirmed the changes work, OR
+   - **(b)** The user has explicitly agreed that smoke testing is not needed (e.g. test-only, doc-only, or config-only changes where the change itself is self-verifying).
+   Offer smoke tests explicitly and wait for approval.
+4. **Once approved, ask the user which landing path they want:**
+   - **Path A — merge locally + push.** For small / trivial changes (test fixes, typo fixes, doc updates): fast-forward-merge the branch into `develop` locally with `git merge --ff-only <branch>`, push `develop`, delete the branch. No PR, no separate review.
+   - **Path B — push branch + open PR.** For normal feature or bugfix work, and anything closing an issue: push the branch, open a PR to `develop` with `gh pr create`. If the work closes an issue, reference it with "Closes #{number}" in the PR body. User reviews and merges.
+5. **When the user confirms a merge that closes an issue**, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close.
+
+**Why both paths exist:** Path A is lower ceremony for changes so small that a PR review adds no information (a 2-line test fix where the fix *is* the verification). Path B is the default for work that warrants a review artifact, closes an issue, or is large enough that someone might want to see the diff separately from the merge commit. **When in doubt, default to Path B.**
 
 **Creating issues:**
 - At session end, create issues for any planned but unstarted work discussed during the session
