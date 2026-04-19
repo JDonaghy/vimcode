@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 299 — quadraui Phase A.5b shipped: GTK `draw_list` + GTK quickfix migration) | **Tests:** 5219 total (full `cargo test --no-default-features`); 1939 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 300 — quadraui Phase A.4b shipped: GTK `draw_palette` + GTK command-palette migration) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,33 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 300 — Phase A.4b shipped + quickfix fixes around A.5b:**
+
+1. **`quadraui_gtk::draw_palette`** added as the Cairo/Pango counterpart to
+   A.4's TUI renderer. Bordered popup (Cairo stroke instead of box
+   chars), title `Title  N/M`, query row with cursor block, separator,
+   scrollable item rows with Pango per-character fuzzy-match
+   highlighting, right-aligned detail, optional scrollbar.
+2. **GTK picker migrated** — `draw_picker_popup` early-branches through
+   `render::picker_panel_to_palette()` + `draw_palette` for flat pickers
+   (command palette, buffer switcher, mark jumper, git-branch picker,
+   diagnostic list). Preview / tree pickers (open-file, symbols) keep
+   the legacy Cairo renderer, matching the TUI fall-through.
+3. **A.5b smoke-test fallout handled on the way:** clearing quickfix
+   focus on editor click (GTK + TUI), focusing the quickfix panel on
+   `:grep` and `gr` (closes #150), and fixing TUI j/k/q key dispatch
+   (engine intercept now normalises `key_name=""` + `unicode=Some(c)`
+   to a single char string so handler `match` arms work across both
+   backends). 2 new lib tests.
+4. **Test count 5219 → 5223** from focus/normalisation tests added in
+   A.5b follow-ups. All quality gates pass (fmt, clippy on both
+   builds, full test suite, cargo build).
+5. **Next up:** A.3c-2 (settings native→DrawingArea) and A.2b
+   (explorer native→DrawingArea) remain as the larger architectural
+   migrations on Linux.
+
+---
 
 **Session 299 — Phase A.5b shipped (GTK `draw_list` + quickfix migration):**
 

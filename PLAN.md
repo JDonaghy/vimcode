@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 299 — A.5b shipped; GTK migrations A.3c-2 / A.4b / A.2b remain queued)
+> **Last updated:** 2026-04-19 (Session 300 — A.4b shipped; GTK migrations A.3c-2 / A.2b remain queued)
 
 ---
 
@@ -38,7 +38,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.3c-2** — GTK settings panel uses `draw_form` (native → DrawingArea) | 🟡 Unblocked | — | `quadraui-phase-a3c2-*` | Linux / macOS with GTK4 |
 | **Phase A.3d** — `TextInput` cursor + selection in `Form` | ✅ Done | `f7f3a51` | `quadraui-phase-a3d-*` | any |
 | **Phase A.4** — `Palette` primitive + TUI command palette | ✅ Done | `534c386` | `quadraui-phase-a4-*` | any |
-| **Phase A.4b** — GTK `draw_palette` + GTK command palette | ⬜ Queued | — | `quadraui-phase-a4b-*` | Linux / macOS with GTK4 |
+| **Phase A.4b** — GTK `draw_palette` + GTK command palette | ✅ Done | `c8f2d91` | `quadraui-phase-a4b-*` | Linux / macOS with GTK4 |
 | **Phase A.5** — `ListView` primitive + TUI quickfix | ✅ Done | `63d1b29` | `quadraui-phase-a5-*` | any |
 | **Phase A.5b** — GTK `draw_list` + GTK quickfix | ✅ Done | `e1ea5ea` | `quadraui-phase-a5b-*` | Linux / macOS with GTK4 |
 | Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
@@ -53,8 +53,8 @@ A.1c and A.2c need a Windows machine. A.2b and A.3c-2 are **unblocked**
 on Linux now that A.3d shipped cursor-aware `TextInput`. Both are
 architectural migrations from native GTK widgets to `DrawingArea` +
 `quadraui_gtk::draw_form`/`draw_tree` — medium-large scope each.
-Lower-risk remaining work on Linux: **A.4b** (port `draw_palette` to
-GTK — palette primitive already exists from A.4).
+The lower-risk GTK stages (A.1b, A.4b, A.5b) are all done; the
+remaining Linux queue is A.3c-2 and A.2b.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)
