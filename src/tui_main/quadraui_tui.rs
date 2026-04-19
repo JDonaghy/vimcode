@@ -559,14 +559,27 @@ pub(super) fn draw_palette(
     let has_scrollbar = total > visible_rows;
     let item_end_col = if has_scrollbar { w - 2 } else { w - 1 };
 
+    // Clamp scroll_offset so the selected item is always visible. The engine
+    // updates scroll_top with a conservative heuristic that doesn't know the
+    // actual renderer row count, so the renderer is authoritative here.
+    let effective_offset = if visible_rows == 0 {
+        0
+    } else if palette.selected_idx < palette.scroll_offset {
+        palette.selected_idx
+    } else if palette.selected_idx >= palette.scroll_offset + visible_rows {
+        palette.selected_idx + 1 - visible_rows
+    } else {
+        palette.scroll_offset
+    };
+
     for (vis_i, item) in palette
         .items
         .iter()
         .enumerate()
-        .skip(palette.scroll_offset)
+        .skip(effective_offset)
         .take(visible_rows)
     {
-        let row = items_row0 + (vis_i - palette.scroll_offset) as u16;
+        let row = items_row0 + (vis_i - effective_offset) as u16;
         if row >= items_row_end {
             break;
         }
@@ -640,8 +653,8 @@ pub(super) fn draw_palette(
             let sb_col = w - 2;
             let track_len = visible_rows;
             let thumb_len = (visible_rows * visible_rows / total.max(1)).max(1);
-            let thumb_start = palette.scroll_offset * track_len / total.max(1);
-            let vi_off = vis_i - palette.scroll_offset;
+            let thumb_start = effective_offset * track_len / total.max(1);
+            let vi_off = vis_i - effective_offset;
             let in_thumb = vi_off >= thumb_start && vi_off < thumb_start + thumb_len;
             let ch = if in_thumb { '█' } else { '░' };
             set_cell(buf, x0 + sb_col, row, ch, border_fg, bg);
@@ -649,7 +662,7 @@ pub(super) fn draw_palette(
     }
 
     // Empty rows between last item and bottom border: just borders.
-    let drawn = (total - palette.scroll_offset).min(visible_rows) as u16;
+    let drawn = total.saturating_sub(effective_offset).min(visible_rows) as u16;
     for row in items_row0 + drawn..items_row_end {
         set_cell(buf, x0, row, '│', border_fg, bg);
         if w >= 2 {

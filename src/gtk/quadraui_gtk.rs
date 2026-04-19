@@ -757,13 +757,33 @@ pub(super) fn draw_palette(
     cr.stroke().ok();
 
     // ── Result rows ───────────────────────────────────────────────────
+    // Leave a small inset above the popup's bottom border so neither the
+    // item-row backgrounds nor the scrollbar thumb bleed into/through the
+    // border stroke line.
+    const BOTTOM_INSET: f64 = 4.0;
     let rows_y = sep_y + 1.0;
-    let rows_h = (y + h) - rows_y;
+    let rows_h = ((y + h) - rows_y - BOTTOM_INSET).max(0.0);
     let visible_rows = (rows_h / line_height) as usize;
+    // Snap the usable row area to a whole number of rows so the last item
+    // always occupies a full line_height cell.
+    let rows_h = visible_rows as f64 * line_height;
     let total = palette.items.len();
     let has_scrollbar = total > visible_rows;
     const SB_W: f64 = 6.0;
     let content_w = if has_scrollbar { w - SB_W } else { w };
+
+    // Clamp scroll_offset so the selected item is always visible. The engine
+    // updates scroll_top with a conservative heuristic that doesn't know the
+    // actual renderer row count, so the renderer is authoritative here.
+    let effective_offset = if visible_rows == 0 {
+        0
+    } else if palette.selected_idx < palette.scroll_offset {
+        palette.selected_idx
+    } else if palette.selected_idx >= palette.scroll_offset + visible_rows {
+        palette.selected_idx + 1 - visible_rows
+    } else {
+        palette.scroll_offset
+    };
 
     cr.save().ok();
     cr.rectangle(x, rows_y, content_w, rows_h);
@@ -773,10 +793,10 @@ pub(super) fn draw_palette(
         .items
         .iter()
         .enumerate()
-        .skip(palette.scroll_offset)
+        .skip(effective_offset)
         .take(visible_rows)
     {
-        let row_i = vis_i - palette.scroll_offset;
+        let row_i = vis_i - effective_offset;
         let row_y = rows_y + row_i as f64 * line_height;
         let is_selected = vis_i == palette.selected_idx && palette.has_focus;
 
@@ -892,7 +912,7 @@ pub(super) fn draw_palette(
         let thumb_h = (sb_track_h * thumb_ratio).max(8.0);
         let max_scroll = total.saturating_sub(visible_rows) as f64;
         let scroll_frac = if max_scroll > 0.0 {
-            palette.scroll_offset as f64 / max_scroll
+            effective_offset as f64 / max_scroll
         } else {
             0.0
         };

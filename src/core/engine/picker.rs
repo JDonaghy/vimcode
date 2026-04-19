@@ -2117,9 +2117,18 @@ impl Engine {
         }
     }
 
-    /// Adjust scroll_top so the selected item is visible (assuming ~20 visible rows).
+    /// Adjust scroll_top so the selected item is visible.
+    ///
+    /// The engine doesn't know the actual renderer row count, so this uses
+    /// a conservative heuristic. Renderers are the authoritative source of
+    /// truth: `quadraui_tui::draw_palette` and `quadraui_gtk::draw_palette`
+    /// both clamp `scroll_offset` at render time to guarantee the selected
+    /// item is always visible regardless of the engine's estimate.
     fn picker_update_scroll(&mut self) {
-        let visible = 20usize; // approximate; render layer will clip
+        // Small enough that narrow terminals don't leave the selection
+        // off-screen via the engine's scroll state. Renderer clamp catches
+        // the rest.
+        let visible = 8usize;
         if self.picker_selected < self.picker_scroll_top {
             self.picker_scroll_top = self.picker_selected;
         } else if self.picker_selected >= self.picker_scroll_top + visible {
