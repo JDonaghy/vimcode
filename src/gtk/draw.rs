@@ -3932,44 +3932,33 @@ pub(super) fn draw_quickfix_panel(
         return;
     };
 
-    // Header row
-    let (hr, hg, hb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(hr, hg, hb);
-    cr.rectangle(editor_x, editor_y, editor_w, line_height);
-    cr.fill().ok();
-    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
-    let title = format!("  QUICKFIX  ({} items){}", qf.total_items, focus_mark);
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-    layout.set_attributes(None);
-    layout.set_text(&title);
-    cr.move_to(editor_x, editor_y);
-    pangocairo::show_layout(cr, layout);
-
-    // Result rows
+    // Phase A.5b migration: quickfix now renders through the shared
+    // `quadraui::ListView` primitive. The adapter produces a ListView
+    // with a `QUICKFIX (N items)` header; `quadraui_gtk::draw_list`
+    // renders header + rows with selection indicator.
+    //
+    // Scroll-to-selection: reserve one row for the header, then keep the
+    // selected item within the remaining visible rows. Matches prior
+    // GTK behaviour.
     let visible_rows = ((qf_px / line_height) as usize).saturating_sub(1);
-    let scroll_top = (qf.selected_idx + 1).saturating_sub(visible_rows);
-    for row_idx in 0..visible_rows {
-        let item_idx = scroll_top + row_idx;
-        if item_idx >= qf.items.len() {
-            break;
-        }
-        let ry = editor_y + line_height * (row_idx + 1) as f64;
-        let is_selected = item_idx == qf.selected_idx;
-        if is_selected {
-            let (sr, sg, sb) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(sr, sg, sb);
-            cr.rectangle(editor_x, ry, editor_w, line_height);
-            cr.fill().ok();
-        }
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let text = format!("{}{}", prefix, qf.items[item_idx]);
-        let (ir, ig, ib) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(ir, ig, ib);
-        layout.set_text(&text);
-        cr.move_to(editor_x, ry);
-        pangocairo::show_layout(cr, layout);
-    }
+    let scroll_top = if visible_rows == 0 {
+        0
+    } else {
+        (qf.selected_idx + 1).saturating_sub(visible_rows)
+    };
+    let mut list = render::quickfix_to_list_view(qf);
+    list.scroll_offset = scroll_top;
+    super::quadraui_gtk::draw_list(
+        cr,
+        layout,
+        editor_x,
+        editor_y,
+        editor_w,
+        qf_px,
+        &list,
+        theme,
+        line_height,
+    );
 }
 
 /// Nerd Font icons for the terminal panel toolbar.
