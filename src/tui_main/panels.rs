@@ -3825,44 +3825,13 @@ pub(super) fn render_quickfix_panel(
     if area.height == 0 {
         return;
     }
-    let hdr_fg = rc(theme.status_fg);
-    let hdr_bg = rc(theme.status_bg);
-    let item_fg = rc(theme.fuzzy_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let row_bg = rc(theme.background);
-
-    // Header row
-    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
-    let header = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-    }
-    for (i, ch) in header.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-    }
-
-    // Result rows
-    let visible_rows = area.height.saturating_sub(1) as usize;
-    for row_idx in 0..visible_rows {
-        let item_idx = scroll_top + row_idx;
-        let ry = area.y + 1 + row_idx as u16;
-        if ry >= area.y + area.height {
-            break;
-        }
-        let is_selected = item_idx == qf.selected_idx;
-        let bg = if is_selected { sel_bg } else { row_bg };
-        // Clear the row
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, ry, ' ', item_fg, bg);
-        }
-        if item_idx < qf.items.len() {
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let text = format!("{}{}", prefix, qf.items[item_idx]);
-            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, ry, ch, item_fg, bg);
-            }
-        }
-    }
+    // Phase A.5 migration: quickfix panel now renders through the
+    // shared `quadraui::ListView` primitive. The adapter produces a
+    // ListView with a `QUICKFIX (N items)` header; `draw_list` renders
+    // header + rows with selection indicator + dimmed detail.
+    let mut list = render::quickfix_to_list_view(qf);
+    list.scroll_offset = scroll_top;
+    super::quadraui_tui::draw_list(buf, area, &list, theme);
 }
 
 // ─── Terminal panel ───────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 //! This module provides `draw_*` free functions that render `quadraui`
 //! primitives into a ratatui `Buffer`. Over time this file will grow to
 //! cover every primitive; currently supports `TreeView` (A.1a),
-//! `Form` (A.3a), and `Palette` (A.4).
+//! `Form` (A.3a), `Palette` (A.4), and `ListView` (A.5).
 
 use super::*;
 use ratatui::buffer::Buffer;
@@ -668,5 +668,143 @@ pub(super) fn draw_palette(
             '─'
         };
         set_cell(buf, x0 + col, row, ch, border_fg, bg);
+    }
+}
+
+/// Draw a `quadraui::ListView` into `area` on `buf`.
+///
+/// Layout: optional title header (if `list.title` is `Some`), then one
+/// row per item. Selected row gets a `▶ ` prefix and `sel_bg`
+/// background. Optional icons sit left of the text; optional detail
+/// text is right-aligned and dimmed.
+pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let row_bg = rc(theme.background);
+    let dim_fg = rc(theme.line_number_fg);
+    let error_fg = rc(theme.diagnostic_error);
+    let warn_fg = rc(theme.diagnostic_warning);
+
+    let mut y = area.y;
+
+    // Title header (optional).
+    if let Some(ref title) = list.title {
+        if y < area.y + area.height {
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, y, ' ', hdr_fg, hdr_bg);
+            }
+            draw_styled_text(
+                buf,
+                area,
+                y,
+                1,
+                title,
+                hdr_fg,
+                hdr_bg,
+                quadraui::Decoration::Normal,
+                dim_fg,
+            );
+            y += 1;
+        }
+    }
+
+    let items_end = area.y + area.height;
+
+    for (vis_i, item) in list
+        .items
+        .iter()
+        .enumerate()
+        .skip(list.scroll_offset)
+        .take((items_end.saturating_sub(y)) as usize)
+    {
+        if y >= items_end {
+            break;
+        }
+
+        let is_selected = vis_i == list.selected_idx && list.has_focus;
+        let bg = if is_selected { sel_bg } else { row_bg };
+        let decoration_fg = match item.decoration {
+            quadraui::Decoration::Error => error_fg,
+            quadraui::Decoration::Warning => warn_fg,
+            quadraui::Decoration::Muted => dim_fg,
+            _ => fg,
+        };
+
+        // Fill row background.
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', decoration_fg, bg);
+        }
+
+        let mut col = 0u16;
+
+        // Selection indicator.
+        let prefix = if is_selected { "▶ " } else { "  " };
+        for ch in prefix.chars() {
+            if col >= area.width {
+                break;
+            }
+            set_cell(buf, area.x + col, y, ch, decoration_fg, bg);
+            col += 1;
+        }
+
+        // Icon (optional).
+        if let Some(ref icon) = item.icon {
+            let glyph = if crate::icons::nerd_fonts_enabled() {
+                icon.glyph.as_str()
+            } else {
+                icon.fallback.as_str()
+            };
+            for ch in glyph.chars() {
+                if col >= area.width {
+                    break;
+                }
+                set_cell(buf, area.x + col, y, ch, decoration_fg, bg);
+                col += 1;
+            }
+            if col < area.width {
+                set_cell(buf, area.x + col, y, ' ', decoration_fg, bg);
+                col += 1;
+            }
+        }
+
+        // Text.
+        let text_end_col = draw_styled_text(
+            buf,
+            area,
+            y,
+            col as usize,
+            &item.text,
+            decoration_fg,
+            bg,
+            item.decoration,
+            dim_fg,
+        );
+
+        // Detail (right-aligned, dimmed).
+        if let Some(ref detail) = item.detail {
+            let detail_w: usize = detail.spans.iter().map(|s| s.text.chars().count()).sum();
+            let start = (area.width as usize).saturating_sub(detail_w + 1);
+            if start > text_end_col + 1 {
+                draw_styled_text(
+                    buf,
+                    area,
+                    y,
+                    start,
+                    detail,
+                    dim_fg,
+                    bg,
+                    quadraui::Decoration::Muted,
+                    dim_fg,
+                );
+            }
+        }
+
+        y += 1;
     }
 }

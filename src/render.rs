@@ -5542,6 +5542,40 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
     })
 }
 
+/// Adapt the quickfix panel data into a generic `quadraui::ListView`.
+///
+/// The quickfix panel is a simple flat list of pre-formatted strings
+/// with a header. `ListView` maps one-to-one. No decoration per row
+/// because the input strings don't carry severity info; future
+/// enhancement: parse severity from the text or extend
+/// `QuickfixPanel` to carry `Decoration`.
+pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
+    use quadraui::{ListItem, ListView, StyledText, WidgetId};
+
+    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
+    let title_text = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
+
+    let items: Vec<ListItem> = qf
+        .items
+        .iter()
+        .map(|s| ListItem {
+            text: StyledText::plain(s),
+            icon: None,
+            detail: None,
+            decoration: quadraui::Decoration::Normal,
+        })
+        .collect();
+
+    ListView {
+        id: WidgetId::new("quickfix"),
+        title: Some(StyledText::plain(title_text)),
+        items,
+        selected_idx: qf.selected_idx,
+        scroll_offset: 0, // set by caller from local scroll_top
+        has_focus: qf.has_focus,
+    }
+}
+
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     // Always build so backends can check ext_sidebar_has_focus.
     let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
