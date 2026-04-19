@@ -106,6 +106,139 @@ pub(super) fn explorer_to_tree_view(sidebar: &TuiSidebar, engine: &Engine) -> qu
     }
 }
 
+/// Convert `Engine`'s settings state into a generic `quadraui::Form` for
+/// rendering through `quadraui_tui::draw_form`.
+///
+/// Scope for Phase A.3b: covers the scrollable field list only. The
+/// panel's header row and search input stay on the legacy render path,
+/// and the caller falls back to legacy when inline edit is active
+/// (`settings_editing.is_some()` or `ext_settings_editing.is_some()`)
+/// — the current `Form` primitive has no cursor-aware text input yet,
+/// so editing keeps its existing inline rendering until the primitive
+/// gains text-cursor support.
+///
+/// Field type mapping:
+/// - `CoreCategory` / `ExtCategory` → `FieldKind::Label` (collapsible header)
+/// - `CoreSetting` with `Bool` → `FieldKind::Toggle`
+/// - `CoreSetting` with any other type → `FieldKind::ReadOnly`
+///   (enum cycling / numeric / string values still work — keys are
+///   handled by `engine.handle_settings_key()`; the adapter just shows
+///   the current value)
+/// - `ExtSetting` mapped analogously via the manifest's declared type.
+pub(super) fn settings_to_form(engine: &Engine) -> quadraui::Form {
+    use crate::core::engine::SettingsRow;
+    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+    use quadraui::{FieldKind, Form, FormField, StyledText, WidgetId};
+
+    let flat = engine.settings_flat_list();
+    let cats = setting_categories();
+
+    let mut fields: Vec<FormField> = Vec::with_capacity(flat.len());
+    for row in &flat {
+        let field = match row {
+            SettingsRow::CoreCategory(cat_idx) => {
+                let collapsed = *cat_idx < engine.settings_collapsed.len()
+                    && engine.settings_collapsed[*cat_idx];
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let cat_name = cats.get(*cat_idx).copied().unwrap_or("?");
+                FormField {
+                    id: WidgetId::new(format!("cat-{}", cat_idx)),
+                    label: StyledText::plain(format!("{}{}", arrow, cat_name)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::ExtCategory(name) => {
+                let collapsed = engine
+                    .ext_settings_collapsed
+                    .get(name)
+                    .copied()
+                    .unwrap_or(false);
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let display = engine
+                    .ext_available_manifests()
+                    .into_iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| name.clone());
+                FormField {
+                    id: WidgetId::new(format!("ext-cat-{}", name)),
+                    label: StyledText::plain(format!("{}{}", arrow, display)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::CoreSetting(idx) => {
+                let def = &SETTING_DEFS[*idx];
+                let value_str = engine.settings.get_value_str(def.key);
+                let kind = match def.setting_type {
+                    SettingType::Bool => FieldKind::Toggle {
+                        value: value_str == "true",
+                    },
+                    _ => FieldKind::ReadOnly {
+                        value: StyledText::plain(value_str),
+                    },
+                };
+                FormField {
+                    id: WidgetId::new(format!("setting-{}", idx)),
+                    label: StyledText::plain(def.label),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::ExtSetting(ext_name, key) => {
+                let def_opt = engine.find_ext_setting_def(ext_name, key);
+                let value_str = engine.get_ext_setting(ext_name, key);
+                let (label_str, kind) = if let Some(d) = def_opt {
+                    let label = if d.label.is_empty() {
+                        key.clone()
+                    } else {
+                        d.label.clone()
+                    };
+                    let kind = if d.r#type == "bool" {
+                        FieldKind::Toggle {
+                            value: value_str == "true",
+                        }
+                    } else {
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        }
+                    };
+                    (label, kind)
+                } else {
+                    (
+                        key.clone(),
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        },
+                    )
+                };
+                FormField {
+                    id: WidgetId::new(format!("ext-setting-{}-{}", ext_name, key)),
+                    label: StyledText::plain(label_str),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+        };
+        fields.push(field);
+    }
+
+    let focused_field = fields.get(engine.settings_selected).map(|f| f.id.clone());
+
+    Form {
+        id: WidgetId::new("settings"),
+        fields,
+        focused_field,
+        scroll_offset: engine.settings_scroll_top,
+        has_focus: engine.settings_has_focus,
+    }
+}
+
 pub(super) fn render_activity_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -822,6 +955,45 @@ pub(super) fn render_settings_panel(
     let content_start = area.y + 2;
     let content_height = area.height.saturating_sub(2) as usize;
     if content_height == 0 {
+        return;
+    }
+
+    // Phase A.3b migration: when no inline edit is active, render the
+    // field list via the shared `quadraui::Form` primitive. The legacy
+    // inline renderer below still handles inline-edit modes (integer /
+    // string cursor, enum cycling UI) until the `Form` primitive gains
+    // text-cursor support.
+    let has_inline_edit =
+        engine.settings_editing.is_some() || engine.ext_settings_editing.is_some();
+    if !has_inline_edit {
+        let form = settings_to_form(engine);
+        // Reserve rightmost column for the scrollbar.
+        let form_area = Rect {
+            x: area.x,
+            y: content_start,
+            width: area.width.saturating_sub(1),
+            height: content_height as u16,
+        };
+        super::quadraui_tui::draw_form(buf, form_area, &form, theme);
+
+        // Scrollbar (mirrors the legacy renderer below).
+        let total = engine.settings_flat_list().len();
+        let scroll = engine.settings_scroll_top;
+        if total > content_height && content_height > 0 {
+            let sb_col = area.x + area.width - 1;
+            let track_len = content_height;
+            let thumb_len = (content_height * content_height / total).max(1);
+            let thumb_start = scroll * track_len / total;
+            for i in 0..track_len {
+                let y = content_start + i as u16;
+                let ch = if i >= thumb_start && i < thumb_start + thumb_len {
+                    '█'
+                } else {
+                    '░'
+                };
+                set_cell(buf, sb_col, y, ch, dim_fg, bg);
+            }
+        }
         return;
     }
 
