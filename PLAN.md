@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 298 — A.3a shipped (Form primitive + TUI draw_form), A.3b next)
+> **Last updated:** 2026-04-19 (Session 298 — A.3b + A.3d shipped; A.3c and A.2b unblocked)
 
 ---
 
@@ -30,11 +30,12 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
-| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | ⬜ Deferred — waits on A.3 (`Form`/`TextInput` primitives needed for inline rename) | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
+| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | 🟡 Unblocked (TextInput cursor now exists; ready to implement) | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
-| **Phase A.3b** — TUI settings panel uses `Form` | 🟡 Next | — | `quadraui-phase-a3b-*` | any |
-| **Phase A.3c** — GTK `draw_form` + GTK settings | ⬜ Queued | — | `quadraui-phase-a3c-*` | Linux / macOS with GTK4 |
+| **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
+| **Phase A.3c** — GTK `draw_form` + GTK settings | 🟡 Unblocked (TextInput cursor now exists; biggish — native-widget → DrawingArea migration) | — | `quadraui-phase-a3c-*` | Linux / macOS with GTK4 |
+| **Phase A.3d** — `TextInput` cursor + selection in `Form` | ✅ Done | `f7f3a51` | `quadraui-phase-a3d-*` | any |
 | Phase A.4 — `Palette` (command palette) | ⬜ Queued | — | `quadraui-phase-a4-*` | any |
 | Phase A.5 — `ListView` (quickfix, git status list) | ⬜ Queued | — | `quadraui-phase-a5-*` | any |
 | Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
@@ -45,12 +46,12 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c and A.2c both need a Windows machine. A.2b is **deferred** behind
-A.3 — the explorer's inline rename and new-entry features need a text
-input primitive, which A.3 delivers via `Form` / `TextInput`. Tackling
-A.2b before A.3 would mean shipping dialog fallbacks and re-working
-them in a subsequent stage, so we let the primitive catalog catch up
-first. Next work on Linux is **A.3 (`Form` for settings panel)**.
+A.1c and A.2c need a Windows machine. A.2b and A.3c are **unblocked**
+on Linux now that A.3d shipped cursor-aware `TextInput`. Both are
+architectural migrations from native GTK widgets to `DrawingArea` +
+`quadraui_gtk::draw_form`/`draw_tree` — medium-large scope each.
+Alternate lower-risk work: **A.4 Palette** (small, well-scoped,
+command-palette) or **A.5 ListView** (flat variant of TreeView).
 
 ---
 
@@ -232,15 +233,12 @@ Form is a new primitive with more event surface than TreeView.
 
 ## Phase A.2b — GTK explorer (replaces native `gtk4::TreeView`)
 
-**Status:** ⬜ **Deferred** behind A.3. Come back here after A.3 ships
-Form / TextInput primitives — the explorer's inline rename and
-new-entry rows will render as an embedded `TextInput` in a `TreeRow`
-rather than a dialog fallback. Without Form, A.2b either loses inline
-editing (regression) or builds dialog fallbacks that get re-worked
-later.
+**Status:** 🟡 Unblocked as of A.3d (`f7f3a51`). The `Form` primitive
+now supports cursor-aware `TextInput`, which means the explorer's
+inline rename and new-entry rows can render an embedded `TextInput`
+inside a `TreeRow` without dialog fallbacks.
 
-Original A.2b pickup content below is still valid; just wait until
-A.3 has landed before starting.
+Pickup content below is the full plan.
 
 ---
 
