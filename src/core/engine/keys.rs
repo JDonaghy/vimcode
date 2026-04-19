@@ -177,7 +177,16 @@ impl Engine {
 
         // Quickfix panel intercepts all keys when it has focus.
         if self.quickfix_has_focus {
-            return self.handle_quickfix_key(key_name, ctrl);
+            // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
+            // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
+            // navigate consistently across backends (mirrors the pattern
+            // used for editor-hover key routing).
+            let qf_key = if key_name.is_empty() {
+                unicode.map(|c| c.to_string()).unwrap_or_default()
+            } else {
+                key_name.to_string()
+            };
+            return self.handle_quickfix_key(&qf_key, ctrl);
         }
 
         // Debug sidebar intercepts all keys when it has focus.

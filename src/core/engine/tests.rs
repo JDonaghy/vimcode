@@ -11329,6 +11329,45 @@ fn test_mouse_click_positions_cursor() {
 }
 
 #[test]
+fn test_quickfix_j_k_q_work_with_tui_key_encoding() {
+    // TUI encodes printable keys as `key_name=""` + `unicode=Some(c)`,
+    // unlike GTK which sends `key_name="j"`. The quickfix intercept
+    // must normalise so j/k/q/n/p behave identically in both backends.
+    let mut engine = Engine::new();
+    engine.quickfix_items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    engine.quickfix_open = true;
+    engine.quickfix_has_focus = true;
+    engine.quickfix_selected = 0;
+
+    // j (TUI encoding) → selection advances
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 1, "j should advance selection");
+
+    // j again → 2
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 2);
+
+    // k (TUI encoding) → selection retreats
+    engine.handle_key("", Some('k'), false);
+    assert_eq!(engine.quickfix_selected, 1, "k should retreat selection");
+
+    // GTK encoding of j/k still works (regression guard)
+    engine.handle_key("j", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 2, "GTK-style j still works");
+    engine.handle_key("k", Some('k'), false);
+    assert_eq!(engine.quickfix_selected, 1, "GTK-style k still works");
+
+    // q (TUI encoding) → close panel
+    engine.handle_key("", Some('q'), false);
+    assert!(!engine.quickfix_open, "q should close the panel");
+    assert!(!engine.quickfix_has_focus);
+}
+
+#[test]
 fn test_mouse_click_clears_quickfix_focus() {
     // Clicking into the editor must release quickfix focus so subsequent
     // keystrokes route to the buffer and the `[FOCUS]` marker disappears.
