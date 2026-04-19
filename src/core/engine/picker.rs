@@ -2193,7 +2193,11 @@ impl Engine {
                 self.quickfix_items = results;
                 self.quickfix_selected = 0;
                 self.quickfix_open = true;
-                self.quickfix_has_focus = false;
+                // Focus the panel so j/k/Enter drive the result list
+                // immediately — matches VimCode's other "open panel"
+                // commands (:copen) and the UX convention users expect
+                // after an interactive search.
+                self.quickfix_has_focus = n > 0;
                 self.message = format!("{} match{}", n, if n == 1 { "" } else { "es" });
             }
             Err(e) => {

@@ -10285,8 +10285,8 @@ fn test_grep_populates_quickfix() {
     );
     assert!(engine.quickfix_open);
     assert!(
-        !engine.quickfix_has_focus,
-        "focus should return to editor after :grep"
+        engine.quickfix_has_focus,
+        ":grep should focus the quickfix panel so j/k/Enter drive the results"
     );
     assert!(engine.message.contains("match"));
 }
