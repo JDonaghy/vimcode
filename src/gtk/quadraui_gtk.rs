@@ -3,7 +3,8 @@
 //! Cairo + Pango equivalent of `src/tui_main/quadraui_tui.rs`. Each
 //! `draw_*` function consumes a `quadraui` primitive description and
 //! rasterises it onto the provided `cairo::Context`. Currently supports
-//! `TreeView` (A.1b), `Form` (A.3c), and `ListView` (A.5b).
+//! `TreeView` (A.1b), `Form` (A.3c), `ListView` (A.5b), and `Palette`
+//! (A.4b).
 
 use super::*;
 
@@ -633,4 +634,272 @@ pub(super) fn draw_list(
     }
 
     layout.set_attributes(None);
+}
+
+/// Draw a `quadraui::Palette` modal into `(x, y, w, h)` on `cr`.
+///
+/// Layout mirrors the TUI `draw_palette` reference:
+///   row 0         — title bar with `Title  N/M` count (when `total_count > 0`)
+///   row 1         — query row `> <text>` with a cursor block at `query_cursor`
+///   horizontal    — separator line beneath the query
+///   rows 2..N     — filtered items, selected row highlighted, fuzzy-match
+///                   characters coloured, optional right-aligned detail text
+///   scrollbar     — on the right when items overflow
+///
+/// Caller is responsible for sizing / centring the popup within the
+/// editor area. Draws a solid rectangle border (Cairo stroke) instead
+/// of TUI-style box-drawing glyphs.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_palette(
+    cr: &Context,
+    layout: &pango::Layout,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    palette: &quadraui::Palette,
+    theme: &Theme,
+    line_height: f64,
+) {
+    if w < 20.0 || h < line_height * 4.0 {
+        return;
+    }
+
+    let (bg_r, bg_g, bg_b) = vc_to_cairo(theme.fuzzy_bg);
+    let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.fuzzy_fg);
+    let (query_r, query_g, query_b) = vc_to_cairo(theme.fuzzy_query_fg);
+    let (border_r, border_g, border_b) = vc_to_cairo(theme.fuzzy_border);
+    let (title_r, title_g, title_b) = vc_to_cairo(theme.fuzzy_title_fg);
+    let (match_r, match_g, match_b) = vc_to_cairo(theme.fuzzy_match_fg);
+    let (sel_r, sel_g, sel_b) = vc_to_cairo(theme.fuzzy_selected_bg);
+    let (dim_r, dim_g, dim_b) = vc_to_cairo(theme.line_number_fg);
+
+    // Background fill + border stroke.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    cr.set_source_rgb(border_r, border_g, border_b);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, w, h);
+    cr.stroke().ok();
+
+    layout.set_attributes(None);
+
+    // ── Title row ─────────────────────────────────────────────────────
+    let title_text = if palette.total_count > 0 {
+        format!(
+            " {}  {}/{} ",
+            palette.title,
+            palette.items.len(),
+            palette.total_count
+        )
+    } else {
+        format!(" {} ", palette.title)
+    };
+    cr.set_source_rgb(title_r, title_g, title_b);
+    layout.set_text(&title_text);
+    let (_, th) = layout.pixel_size();
+    cr.move_to(x + 8.0, y + (line_height - th as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    // ── Query row ─────────────────────────────────────────────────────
+    let query_y = y + line_height;
+    let prompt = "> ";
+    cr.set_source_rgb(query_r, query_g, query_b);
+    layout.set_text(prompt);
+    let (prompt_w, qh) = layout.pixel_size();
+    cr.move_to(x + 8.0, query_y + (line_height - qh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    let query_text_x = x + 8.0 + prompt_w as f64;
+    layout.set_text(&palette.query);
+    let (query_w, _) = layout.pixel_size();
+    cr.move_to(query_text_x, query_y + (line_height - qh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    // Cursor block at the byte offset `query_cursor`.
+    let cursor_prefix: &str = if palette.query_cursor >= palette.query.len() {
+        palette.query.as_str()
+    } else {
+        &palette.query[..palette.query_cursor]
+    };
+    layout.set_text(cursor_prefix);
+    let (cursor_prefix_w, _) = layout.pixel_size();
+    let cursor_x = query_text_x + cursor_prefix_w as f64;
+    let cursor_char: String = palette
+        .query
+        .get(palette.query_cursor..)
+        .and_then(|s| s.chars().next())
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    layout.set_text(&cursor_char);
+    let (cursor_w, _) = layout.pixel_size();
+    let cursor_w = (cursor_w as f64).max(line_height * 0.45);
+    // Fill cursor block with query_fg and re-draw the covered char in bg.
+    cr.set_source_rgb(query_r, query_g, query_b);
+    cr.rectangle(cursor_x, query_y, cursor_w, line_height);
+    cr.fill().ok();
+    if !cursor_char.trim().is_empty() {
+        cr.set_source_rgb(bg_r, bg_g, bg_b);
+        cr.move_to(cursor_x, query_y + (line_height - qh as f64) / 2.0);
+        layout.set_text(&cursor_char);
+        pangocairo::show_layout(cr, layout);
+    }
+    let _ = query_w; // currently unused; keep measurement for future right-edge clipping
+
+    // ── Separator row ─────────────────────────────────────────────────
+    let sep_y = y + 2.0 * line_height;
+    cr.set_source_rgb(border_r, border_g, border_b);
+    cr.set_line_width(1.0);
+    cr.move_to(x, sep_y);
+    cr.line_to(x + w, sep_y);
+    cr.stroke().ok();
+
+    // ── Result rows ───────────────────────────────────────────────────
+    let rows_y = sep_y + 1.0;
+    let rows_h = (y + h) - rows_y;
+    let visible_rows = (rows_h / line_height) as usize;
+    let total = palette.items.len();
+    let has_scrollbar = total > visible_rows;
+    const SB_W: f64 = 6.0;
+    let content_w = if has_scrollbar { w - SB_W } else { w };
+
+    cr.save().ok();
+    cr.rectangle(x, rows_y, content_w, rows_h);
+    cr.clip();
+
+    for (vis_i, item) in palette
+        .items
+        .iter()
+        .enumerate()
+        .skip(palette.scroll_offset)
+        .take(visible_rows)
+    {
+        let row_i = vis_i - palette.scroll_offset;
+        let row_y = rows_y + row_i as f64 * line_height;
+        let is_selected = vis_i == palette.selected_idx && palette.has_focus;
+
+        if is_selected {
+            cr.set_source_rgb(sel_r, sel_g, sel_b);
+            cr.rectangle(x, row_y, content_w, line_height);
+            cr.fill().ok();
+        }
+
+        // Concatenate all text spans for rendering + fuzzy-match mapping.
+        let full_text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
+
+        // Build a Pango AttrList: default fg over full range, then match_fg
+        // spans at each `match_positions` byte offset (1 char each).
+        let attr_list = pango::AttrList::new();
+        let mut attr_fg = pango::AttrColor::new_foreground(
+            (fg_r * 65535.0) as u16,
+            (fg_g * 65535.0) as u16,
+            (fg_b * 65535.0) as u16,
+        );
+        attr_fg.set_start_index(0);
+        attr_fg.set_end_index(full_text.len() as u32);
+        attr_list.insert(attr_fg);
+
+        if !item.match_positions.is_empty() {
+            for &pos in &item.match_positions {
+                if pos >= full_text.len() {
+                    continue;
+                }
+                let char_len = full_text[pos..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                let mut attr_match = pango::AttrColor::new_foreground(
+                    (match_r * 65535.0) as u16,
+                    (match_g * 65535.0) as u16,
+                    (match_b * 65535.0) as u16,
+                );
+                attr_match.set_start_index(pos as u32);
+                attr_match.set_end_index((pos + char_len) as u32);
+                attr_list.insert(attr_match);
+            }
+        }
+
+        // Horizontal cursor position for text after icon.
+        let mut cursor = x + 8.0;
+
+        // Icon (optional).
+        if let Some(ref icon) = item.icon {
+            let glyph = if icons::nerd_fonts_enabled() {
+                icon.glyph.as_str()
+            } else {
+                icon.fallback.as_str()
+            };
+            layout.set_attributes(None);
+            cr.set_source_rgb(fg_r, fg_g, fg_b);
+            layout.set_text(glyph);
+            let (iw, ih) = layout.pixel_size();
+            cr.move_to(cursor, row_y + (line_height - ih as f64) / 2.0);
+            pangocairo::show_layout(cr, layout);
+            cursor += iw as f64 + 6.0;
+        }
+
+        // Reserve space for right-aligned detail so text doesn't overlap.
+        let detail_info = item.detail.as_ref().map(|detail| {
+            let detail_text: String = detail.spans.iter().map(|s| s.text.as_str()).collect();
+            layout.set_attributes(None);
+            layout.set_text(&detail_text);
+            let (dw, _) = layout.pixel_size();
+            (detail_text, dw as f64)
+        });
+        let detail_reserve = detail_info
+            .as_ref()
+            .map(|(_, dw)| *dw + 12.0)
+            .unwrap_or(0.0);
+        let _ = detail_reserve; // text draws within content_w; detail paints last
+
+        // Primary text.
+        layout.set_text(&full_text);
+        layout.set_attributes(Some(&attr_list));
+        let (_, lh) = layout.pixel_size();
+        cr.move_to(cursor, row_y + (line_height - lh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+
+        // Detail (right-aligned, dimmed).
+        if let Some((detail_text, dw)) = detail_info {
+            let dx = x + content_w - dw - 8.0;
+            cr.set_source_rgb(dim_r, dim_g, dim_b);
+            layout.set_attributes(None);
+            layout.set_text(&detail_text);
+            let (_, dh) = layout.pixel_size();
+            cr.move_to(dx, row_y + (line_height - dh as f64) / 2.0);
+            pangocairo::show_layout(cr, layout);
+        }
+    }
+
+    cr.restore().ok();
+    layout.set_attributes(None);
+
+    // ── Scrollbar ─────────────────────────────────────────────────────
+    if has_scrollbar && visible_rows > 0 {
+        let sb_x = x + w - SB_W;
+        let sb_track_y = rows_y;
+        let sb_track_h = rows_h;
+
+        // Track (dim bg tinted toward black).
+        cr.set_source_rgb(bg_r * 0.7, bg_g * 0.7, bg_b * 0.7);
+        cr.rectangle(sb_x, sb_track_y, SB_W, sb_track_h);
+        cr.fill().ok();
+
+        let thumb_ratio = visible_rows as f64 / total as f64;
+        let thumb_h = (sb_track_h * thumb_ratio).max(8.0);
+        let max_scroll = total.saturating_sub(visible_rows) as f64;
+        let scroll_frac = if max_scroll > 0.0 {
+            palette.scroll_offset as f64 / max_scroll
+        } else {
+            0.0
+        };
+        let thumb_y = sb_track_y + scroll_frac * (sb_track_h - thumb_h);
+
+        cr.set_source_rgb(border_r, border_g, border_b);
+        cr.rectangle(sb_x + 1.0, thumb_y, SB_W - 2.0, thumb_h);
+        cr.fill().ok();
+    }
 }

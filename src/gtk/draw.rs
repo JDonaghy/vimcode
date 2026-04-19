@@ -2918,6 +2918,29 @@ pub(super) fn draw_picker_popup(
 
     let has_preview = picker.preview.is_some();
 
+    // Phase A.4b migration: flat-list palettes (no preview pane, no tree
+    // depth) render through the shared `quadraui::Palette` primitive.
+    // File and symbol pickers fall through to the legacy renderer below
+    // because the primitive doesn't carry preview / tree indent yet.
+    if let Some(palette) = render::picker_panel_to_palette(picker) {
+        let popup_w = (editor_width * 0.55).max(500.0);
+        let popup_h = (editor_height * 0.60).max(350.0);
+        let popup_x = (editor_width - popup_w) / 2.0;
+        let popup_y = (editor_height - popup_h) / 2.0;
+        super::quadraui_gtk::draw_palette(
+            cr,
+            layout,
+            popup_x,
+            popup_y,
+            popup_w,
+            popup_h,
+            &palette,
+            theme,
+            line_height,
+        );
+        return;
+    }
+
     // Size adapts based on whether we have a preview pane
     let popup_w = if has_preview {
         (editor_width * 0.8).max(600.0)
