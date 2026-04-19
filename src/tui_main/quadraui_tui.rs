@@ -201,13 +201,9 @@ fn draw_styled_text(
 /// Disabled fields render dimmed and their inputs are bracketed the
 /// same as enabled ones (the app skips them during focus navigation).
 ///
-/// Focused field gets a subtle background tint. The primitive does not
-/// paint a text-input cursor; cursor / selection rendering is a later
-/// primitive extension.
-// Dead-code allow: draw_form has no consumer in the TUI until A.3b
-// migrates the settings panel. Phase A.3a ships the primitive + TUI
-// renderer together so A.3b is a single-purpose migration PR.
-#[allow(dead_code)]
+/// Focused field gets a subtle background tint. Text input cursor
+/// and selection (A.3d) are rendered when the `TextInput` field's
+/// `cursor` / `selection_anchor` are `Some(_)`.
 pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -293,34 +289,74 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
                     }
                 }
             }
-            quadraui::FieldKind::TextInput { value, placeholder } => {
+            quadraui::FieldKind::TextInput {
+                value,
+                placeholder,
+                cursor,
+                selection_anchor,
+            } => {
                 let shown = if value.is_empty() {
                     placeholder.as_str()
                 } else {
                     value.as_str()
                 };
                 let input_fg = if value.is_empty() { dim_fg } else { field_fg };
-                // Max input width uses whatever's left after the label,
-                // capped at two-thirds of the row.
                 let max_input = (area.width as usize * 2 / 3).max(10);
                 let desired = shown.chars().count().min(max_input);
                 let start_col = (area.width as usize).saturating_sub(desired + 2);
+
+                // Selection range (byte offsets) — only when value non-empty.
+                let (sel_lo, sel_hi) = if value.is_empty() {
+                    (0, 0)
+                } else {
+                    match (cursor, selection_anchor) {
+                        (Some(c), Some(a)) if c != a => (*c.min(a), *c.max(a)),
+                        _ => (0, 0),
+                    }
+                };
+
                 if start_col > label_end + 1 {
                     // Left bracket.
                     if start_col > 0 && start_col - 1 < area.width as usize {
                         set_cell(buf, area.x + (start_col - 1) as u16, y, '[', dim_fg, row_bg);
                     }
                     let mut col = start_col;
+                    let mut byte = 0usize;
                     for ch in shown.chars().take(desired) {
                         if col >= area.width as usize {
                             break;
                         }
-                        set_cell(buf, area.x + col as u16, y, ch, input_fg, row_bg);
+                        let in_selection = sel_hi > sel_lo && byte >= sel_lo && byte < sel_hi;
+                        let cell_bg = if in_selection { sel_bg } else { row_bg };
+                        set_cell(buf, area.x + col as u16, y, ch, input_fg, cell_bg);
                         col += 1;
+                        byte += ch.len_utf8();
                     }
                     // Right bracket.
                     if col < area.width as usize {
                         set_cell(buf, area.x + col as u16, y, ']', dim_fg, row_bg);
+                    }
+
+                    // Cursor rendering: invert fg/bg at the cursor position.
+                    // Only shown when the value is non-empty; cursor inside
+                    // the placeholder text is a later refinement.
+                    if let Some(cur) = cursor {
+                        if !value.is_empty() {
+                            let mut byte = 0usize;
+                            let mut char_idx = 0usize;
+                            for ch in shown.chars().take(desired) {
+                                if byte >= *cur {
+                                    break;
+                                }
+                                byte += ch.len_utf8();
+                                char_idx += 1;
+                            }
+                            let cursor_col = start_col + char_idx;
+                            if cursor_col < area.width as usize {
+                                let ch = shown.chars().nth(char_idx).unwrap_or(' ');
+                                set_cell(buf, area.x + cursor_col as u16, y, ch, row_bg, field_fg);
+                            }
+                        }
                     }
                 }
             }
