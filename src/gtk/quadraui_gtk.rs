@@ -665,6 +665,14 @@ pub(super) fn draw_palette(
         return;
     }
 
+    // Hard clip the whole palette render to the popup bounds so nothing
+    // — not the selection background, not the scrollbar thumb, not the
+    // match-highlight attributes — can escape the popup frame. Closed
+    // with the matching `cr.restore()` at the end of this function.
+    cr.save().ok();
+    cr.rectangle(x, y, w, h);
+    cr.clip();
+
     let (bg_r, bg_g, bg_b) = vc_to_cairo(theme.fuzzy_bg);
     let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.fuzzy_fg);
     let (query_r, query_g, query_b) = vc_to_cairo(theme.fuzzy_query_fg);
@@ -922,4 +930,7 @@ pub(super) fn draw_palette(
         cr.rectangle(sb_x + 1.0, thumb_y, SB_W - 2.0, thumb_h);
         cr.fill().ok();
     }
+
+    // Close the outer popup-bounds clip opened at function start.
+    cr.restore().ok();
 }
