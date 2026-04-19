@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-18 (end of Session 297)
+> **Last updated:** 2026-04-19 (Session 298 — A.2a shipped, A.2b next)
 
 ---
 
@@ -29,7 +29,9 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1a** — `TreeView` primitive + TUI SC panel | ✅ Done | `bac137e` | `quadraui-phase-a1a-*` | any (TUI) |
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
-| Phase A.2 — `TreeView` for explorer | ⬜ Queued | — | `quadraui-phase-a2-*` | any (GTK replaces native TreeView) |
+| **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
+| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | 🟡 Next | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
+| **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | Phase A.3 — `Form` + settings panel | ⬜ Queued | — | `quadraui-phase-a3-*` | any |
 | Phase A.4 — `Palette` (command palette) | ⬜ Queued | — | `quadraui-phase-a4-*` | any |
 | Phase A.5 — `ListView` (quickfix, git status list) | ⬜ Queued | — | `quadraui-phase-a5-*` | any |
@@ -41,8 +43,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c is independent from the already-shipped A.1a/b and can be done on a
-Windows machine.
+A.1c and A.2c both need a Windows machine. A.2b can proceed on Linux
+in parallel with any Windows work.
 
 ---
 
@@ -65,6 +67,16 @@ Windows machine.
   after touching an adapter. If the highlight visually lands on a
   non-header row but key behaviour says otherwise, the adapter has
   added or dropped a row.
+
+- **Branches are not automatically headers.** Early `draw_tree`
+  implementations (TUI + GTK) applied section-header background styling
+  to every branch row (any row with `is_expanded = Some(_)`). That was
+  correct for SC (branches are section titles) but wrong for the
+  explorer (branches are just directories and should look like sibling
+  files). Fix (absorbed into `1c4bbd7`): added `Decoration::Header`.
+  Apps tag header rows explicitly; backends style them distinctly.
+  `is_expanded`-ness is now purely about chevron rendering. Rule:
+  **tree hierarchy and visual emphasis are orthogonal.**
 
 ---
 
@@ -146,27 +158,83 @@ Summary:
 
 ---
 
-## Phase A.1b — GTK `draw_tree`
+## Phase A.2b — GTK explorer (replaces native `gtk4::TreeView`)
 
-**Branch:** `quadraui-phase-a1b-treeview-gtk` off `develop`.
+**Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` off `develop`.
 
-**Platform:** Linux or macOS with GTK4 (4.10+). Cannot be done on Windows
-without a GTK4 install, which is unsupported.
+**Platform:** Linux or macOS with GTK4 (4.10+).
+
+**This is the biggest architectural migration in all of Phase A.** Unlike
+the SC panel (A.1b), which was already rendered into a `DrawingArea`,
+the GTK explorer today uses a **native `gtk4::TreeView` widget with a
+`TreeStore` model**. Migrating means tearing out the native widget
+entirely and rendering the explorer into a `DrawingArea` via
+`quadraui_gtk::draw_tree`.
+
+**What the native widget provides today (that we lose by default):**
+
+- Built-in vertical scrolling with kinetic inertia
+- Native keyboard navigation (Up/Down/Left/Right/Page-Up/Down/Home/End)
+- Right-click context menu integration
+- Accessibility tree exposed to screen readers / AT-SPI
+- Native drag-and-drop handles
+- Row focus outline, hover states
+
+A.2b reimplements **only what's needed right now** on top of the
+primitive. The rest defers to later quadraui stages (context menus,
+a11y, drag-drop).
 
 **Scope:**
 
-1. Create `src/gtk/quadraui_gtk.rs` with `draw_tree(ctx: &cairo::Context, area: Rect, tree: &quadraui::TreeView, theme: &Theme)`.
-2. Port the TUI reference (`src/tui_main/quadraui_tui.rs`) to Cairo/Pango:
-   row background fill, chevron, icon (nerd-font-aware via
-   `crate::icons::nerd_fonts_enabled()`), styled text, badge.
-3. In `src/gtk/draw.rs::draw_source_control_panel()`, replace the
-   section-rendering loop with a call to `render::source_control_to_tree_view()`
-   followed by `quadraui_gtk::draw_tree(ctx, section_area, &tree, theme)`.
-4. Keep the header / commit input / button row / popups untouched — same
-   scope boundary as A.1a.
+1. Find the GTK explorer widget setup in `src/gtk/mod.rs` (search for
+   `TreeView::new()` or similar) and the associated `TreeStore` /
+   `ListStore` construction. Remove them.
+2. Replace with a `DrawingArea` sized and placed the same way as the
+   SC sidebar panel (and the existing explorer).
+3. Add an `explorer_to_tree_view()` adapter in `src/gtk/draw.rs` (or
+   `src/render.rs` if it should be shared — TUI's version currently
+   lives in `src/tui_main/panels.rs`, so consider lifting it to
+   `render.rs` for reuse). **Same adapter output as TUI A.2a** —
+   `quadraui::TreeView` with `Decoration::Header` only on sections
+   (explorer has none, so dirs stay `Decoration::Normal`).
+4. Wire the DrawingArea's draw callback to call
+   `quadraui_gtk::draw_tree()` with the adapted tree.
+5. Re-wire click handling: the old `TreeView` widget dispatched
+   `row-activated` / `cursor-changed` signals. Now clicks land on the
+   DrawingArea; compute `row = (click_y / item_height)` and update
+   `sidebar.selected`, then call existing engine methods to
+   open/toggle/etc. Use `src/tui_main/mouse.rs` explorer click handling
+   as the reference.
+6. Re-wire keyboard handling: capture Key controller events on the
+   DrawingArea, dispatch `j/k/l/h/Enter/Escape` to the same engine
+   methods the TUI uses. Use `src/tui_main/mod.rs` lines 2640-2760
+   as the reference.
+7. Add a scrollbar overlay (mirror what the TUI does in
+   `render_explorer_scrollbar` — or use a Cairo version of the same
+   thumb-and-track pattern).
 
-**Reference implementation:** `src/tui_main/quadraui_tui.rs` is the template.
-Function-for-function translation to Cairo; only the rasterisation calls change.
+**Special-mode handling (rename / new-entry):** same pattern as TUI's
+A.2a: when `engine.explorer_rename.is_some()` or
+`engine.explorer_new_entry.is_some()`, fall through to a legacy path.
+For the GTK migration, the "legacy path" will need to be written
+because the old native-widget code won't exist any more. Options:
+(a) render the edit input as a GTK `Entry` widget overlaid on the
+relevant row, or (b) defer rename/new-entry to a stage after Form
+lands. **Recommendation:** option (b) — keep A.2b focused on baseline
+rendering. Mark rename/new-entry as unavailable in GTK during A.2b
+(the TUI keeps working). Restore them after `Form` / `TextInput`
+primitive lands.
+
+**Reference implementations:**
+- `src/tui_main/panels.rs::explorer_to_tree_view` (adapter)
+- `src/tui_main/panels.rs::render_sidebar` (rendering dispatch, special-mode branch)
+- `src/tui_main/quadraui_tui.rs::draw_tree` (rendering template, TUI)
+- `src/gtk/quadraui_gtk.rs::draw_tree` (rendering template, GTK — already exists for SC)
+
+**Pre-flight reading:**
+- [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) — lessons
+  from the Win-GUI build. Click geometry vs. draw geometry mismatches
+  (§5) are the most likely class of bug when wiring the DrawingArea.
 
 **Smoke test after implementing:**
 
@@ -174,17 +242,31 @@ Function-for-function translation to Cairo; only the rasterisation calls change.
 cargo run   # default GUI
 ```
 
-- Click the git icon in the activity bar.
-- Verify sections render identically to the TUI (chevrons, icons, badges).
-- Keyboard nav / Tab / click behaviour unchanged from before.
-- Window resize doesn't break the layout.
+1. Explorer panel renders on launch — tree of files and dirs, icons,
+   indent, chevrons.
+2. `j`/`k` moves selection through all visible rows.
+3. `l`/Enter on a file opens it in the editor.
+4. `l`/Enter on a dir toggles expand/collapse.
+5. `h` on an expanded dir collapses it; `h` at root unfocuses (matches
+   TUI behaviour).
+6. Scrollbar updates as selection / content changes.
+7. Git indicators (M/A/D) appear right-aligned on modified files.
+8. Diagnostics: errors/warnings badge on files with LSP diagnostics.
+9. Mouse click on any row selects it.
+10. **Known regressions** vs. old native widget (document clearly if
+    they affect users):
+    - Inline rename (deferred)
+    - Drag-and-drop (deferred — wasn't in TUI either)
+    - Context menus (deferred to A.x)
+    - Accessibility tree (deferred — v1.1 per design §7.6)
 
-**Out of scope for A.1b (defer to later stages):**
+**Out of scope for A.2b:**
 
-- `TreeEvent` routing (mouse/key events still flow through existing engine
-  methods for A.1; event-based routing is its own later sub-stage).
-- Primitive-owned scroll state.
-- Context menus.
+- `TreeEvent` routing (still direct-to-engine for Phase A)
+- Primitive-owned scroll state
+- Context menus
+- Inline rename (falls under Form primitive)
+- Native drag-and-drop
 
 ---
 
