@@ -5542,6 +5542,142 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
     })
 }
 
+/// Convert `Engine`'s settings state into a generic `quadraui::Form`
+/// for rendering through either `quadraui_tui::draw_form` (A.3b) or
+/// `quadraui_gtk::draw_form` (A.3c). Backend-agnostic; reads only
+/// engine fields.
+///
+/// Scope: covers the scrollable field list. Callers still handle the
+/// panel header / search input / scrollbar themselves, and fall back
+/// to a legacy inline renderer when `settings_editing.is_some()` or
+/// `ext_settings_editing.is_some()` because the `Form` primitive does
+/// not yet render an editable `TextInput` for inline-edit mode (the
+/// cursor-aware primitive support landed in A.3d but the adapter has
+/// not been upgraded to emit `TextInput` for active-edit fields —
+/// tracked as a future refinement).
+///
+/// Field type mapping:
+/// - `CoreCategory` / `ExtCategory` → `FieldKind::Label` (collapsible header)
+/// - `CoreSetting` with `Bool` → `FieldKind::Toggle`
+/// - `CoreSetting` with any other type → `FieldKind::ReadOnly`
+///   (enum cycling / numeric / string values still work — keys are
+///   handled by `engine.handle_settings_key()`; the adapter just shows
+///   the current value)
+/// - `ExtSetting` mapped analogously via the manifest's declared type.
+pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
+    use crate::core::engine::SettingsRow;
+    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+    use quadraui::{FieldKind, Form, FormField, StyledText, WidgetId};
+
+    let flat = engine.settings_flat_list();
+    let cats = setting_categories();
+
+    let mut fields: Vec<FormField> = Vec::with_capacity(flat.len());
+    for row in &flat {
+        let field = match row {
+            SettingsRow::CoreCategory(cat_idx) => {
+                let collapsed = *cat_idx < engine.settings_collapsed.len()
+                    && engine.settings_collapsed[*cat_idx];
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let cat_name = cats.get(*cat_idx).copied().unwrap_or("?");
+                FormField {
+                    id: WidgetId::new(format!("cat-{}", cat_idx)),
+                    label: StyledText::plain(format!("{}{}", arrow, cat_name)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::ExtCategory(name) => {
+                let collapsed = engine
+                    .ext_settings_collapsed
+                    .get(name)
+                    .copied()
+                    .unwrap_or(false);
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let display = engine
+                    .ext_available_manifests()
+                    .into_iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| name.clone());
+                FormField {
+                    id: WidgetId::new(format!("ext-cat-{}", name)),
+                    label: StyledText::plain(format!("{}{}", arrow, display)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::CoreSetting(idx) => {
+                let def = &SETTING_DEFS[*idx];
+                let value_str = engine.settings.get_value_str(def.key);
+                let kind = match def.setting_type {
+                    SettingType::Bool => FieldKind::Toggle {
+                        value: value_str == "true",
+                    },
+                    _ => FieldKind::ReadOnly {
+                        value: StyledText::plain(value_str),
+                    },
+                };
+                FormField {
+                    id: WidgetId::new(format!("setting-{}", idx)),
+                    label: StyledText::plain(def.label),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+            SettingsRow::ExtSetting(ext_name, key) => {
+                let def_opt = engine.find_ext_setting_def(ext_name, key);
+                let value_str = engine.get_ext_setting(ext_name, key);
+                let (label_str, kind) = if let Some(d) = def_opt {
+                    let label = if d.label.is_empty() {
+                        key.clone()
+                    } else {
+                        d.label.clone()
+                    };
+                    let kind = if d.r#type == "bool" {
+                        FieldKind::Toggle {
+                            value: value_str == "true",
+                        }
+                    } else {
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        }
+                    };
+                    (label, kind)
+                } else {
+                    (
+                        key.clone(),
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        },
+                    )
+                };
+                FormField {
+                    id: WidgetId::new(format!("ext-setting-{}-{}", ext_name, key)),
+                    label: StyledText::plain(label_str),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                }
+            }
+        };
+        fields.push(field);
+    }
+
+    let focused_field = fields.get(engine.settings_selected).map(|f| f.id.clone());
+
+    Form {
+        id: WidgetId::new("settings"),
+        fields,
+        focused_field,
+        scroll_offset: engine.settings_scroll_top,
+        has_focus: engine.settings_has_focus,
+    }
+}
+
 /// Adapt the quickfix panel data into a generic `quadraui::ListView`.
 ///
 /// The quickfix panel is a simple flat list of pre-formatted strings
