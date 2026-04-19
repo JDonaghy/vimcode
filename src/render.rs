@@ -5497,6 +5497,51 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
     }
 }
 
+/// Adapt the picker panel's `PickerPanel` render data into a generic
+/// `quadraui::Palette` for rendering through the shared primitive.
+///
+/// Phase A.4 scope: flat-list palettes only. Returns `None` when the
+/// caller should fall through to the legacy renderer:
+/// - `preview.is_some()` — file / symbol picker with right-side preview pane
+/// - any item has `depth > 0` or `expandable` — tree-structured picker
+///
+/// When `Some(Palette)` is returned, the backend can render the full
+/// modal via `quadraui_tui::draw_palette` (TUI) or `quadraui_gtk::draw_palette`
+/// (GTK, when A.4b ships).
+pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette> {
+    use quadraui::{Palette, PaletteItem, StyledText, WidgetId};
+
+    if picker.preview.is_some() {
+        return None;
+    }
+    if picker.items.iter().any(|it| it.depth > 0 || it.expandable) {
+        return None;
+    }
+
+    let items: Vec<PaletteItem> = picker
+        .items
+        .iter()
+        .map(|it| PaletteItem {
+            text: StyledText::plain(&it.display),
+            detail: it.detail.as_deref().map(StyledText::plain),
+            icon: None,
+            match_positions: it.match_positions.clone(),
+        })
+        .collect();
+
+    Some(Palette {
+        id: WidgetId::new("picker"),
+        title: picker.title.clone(),
+        query: picker.query.clone(),
+        query_cursor: picker.query.len(),
+        items,
+        selected_idx: picker.selected_idx,
+        scroll_offset: picker.scroll_top,
+        total_count: picker.total_count,
+        has_focus: true,
+    })
+}
+
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     // Always build so backends can check ext_sidebar_has_focus.
     let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,

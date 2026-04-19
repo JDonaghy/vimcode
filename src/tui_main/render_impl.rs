@@ -1775,6 +1775,25 @@ pub(super) fn render_picker_popup(
     let term_rows = term_area.height;
     let has_preview = picker.preview.is_some();
 
+    // Phase A.4 migration: flat-list palettes (no preview pane, no tree
+    // depth) render through the shared `quadraui::Palette` primitive.
+    // File and symbol pickers fall through to the legacy renderer below
+    // because the primitive doesn't carry preview / tree indent yet.
+    if let Some(palette) = render::picker_panel_to_palette(picker) {
+        let width = (term_cols * 55 / 100).max(55);
+        let height = (term_rows * 60 / 100).max(16);
+        let x = (term_cols.saturating_sub(width)) / 2;
+        let y = (term_rows.saturating_sub(height)) / 2;
+        let area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        super::quadraui_tui::draw_palette(frame.buffer_mut(), area, &palette, theme);
+        return;
+    }
+
     // Size adapts based on whether we have a preview pane
     let width = if has_preview {
         (term_cols * 4 / 5).max(60)

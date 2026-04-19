@@ -2,8 +2,8 @@
 //!
 //! This module provides `draw_*` free functions that render `quadraui`
 //! primitives into a ratatui `Buffer`. Over time this file will grow to
-//! cover every primitive; currently supports `TreeView` (A.1a) and
-//! `Form` (A.3a).
+//! cover every primitive; currently supports `TreeView` (A.1a),
+//! `Form` (A.3a), and `Palette` (A.4).
 
 use super::*;
 use ratatui::buffer::Buffer;
@@ -412,5 +412,261 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
                 }
             }
         }
+    }
+}
+
+/// Draw a `quadraui::Palette` modal overlay into `area` on `buf`.
+///
+/// Layout (matches the pre-migration picker popup minus the preview
+/// pane and tree-indent rendering — those cases fall through to the
+/// legacy renderer until the primitive carries them):
+///
+/// ```text
+/// ╭─ Title  N/M ──╮
+/// │ > query▌      │
+/// ├───────────────┤
+/// │  Item 1       │
+/// │  Item 2       │
+/// │  Item 3 detail│
+/// ╰───────────────╯
+/// ```
+///
+/// `match_positions` on each item highlight matched characters with
+/// the accent `fuzzy_match_fg` colour.
+pub(super) fn draw_palette(
+    buf: &mut Buffer,
+    area: Rect,
+    palette: &quadraui::Palette,
+    theme: &Theme,
+) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    let bg = rc(theme.fuzzy_bg);
+    let fg = rc(theme.fuzzy_fg);
+    let query_fg = rc(theme.fuzzy_query_fg);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
+    let match_fg = rc(theme.fuzzy_match_fg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let dim_fg = rc(theme.line_number_fg);
+
+    let x0 = area.x;
+    let y0 = area.y;
+    let w = area.width;
+    let h = area.height;
+    let y_end = y0 + h;
+
+    // Clear the popup area so cycling between pickers with different
+    // content lengths doesn't leave stale characters behind.
+    for y in y0..y_end {
+        for x in x0..x0 + w {
+            set_cell(buf, x, y, ' ', fg, bg);
+        }
+    }
+
+    // Top border with title.
+    for col in 0..w {
+        let ch = if col == 0 {
+            '╭'
+        } else if col == w - 1 {
+            '╮'
+        } else {
+            '─'
+        };
+        set_cell(buf, x0 + col, y0, ch, border_fg, bg);
+    }
+    let title_text = if palette.total_count > 0 {
+        format!(
+            " {}  {}/{} ",
+            palette.title,
+            palette.items.len(),
+            palette.total_count
+        )
+    } else {
+        format!(" {} ", palette.title)
+    };
+    for (i, ch) in title_text.chars().enumerate() {
+        let col = 2 + i as u16;
+        if col + 1 >= w {
+            break;
+        }
+        set_cell(buf, x0 + col, y0, ch, title_fg, bg);
+    }
+
+    // Query line.
+    if h >= 3 {
+        let row = y0 + 1;
+        set_cell(buf, x0, row, '│', border_fg, bg);
+        if w >= 2 {
+            set_cell(buf, x0 + w - 1, row, '│', border_fg, bg);
+        }
+        let prompt = "> ";
+        let mut col = 1u16;
+        for ch in prompt.chars() {
+            if col + 1 >= w {
+                break;
+            }
+            set_cell(buf, x0 + col, row, ch, query_fg, bg);
+            col += 1;
+        }
+        let query_start = col;
+        for ch in palette.query.chars() {
+            if col + 1 >= w {
+                break;
+            }
+            set_cell(buf, x0 + col, row, ch, query_fg, bg);
+            col += 1;
+        }
+        // Cursor block: map byte offset → visible column.
+        let mut byte = 0usize;
+        let mut char_idx = 0usize;
+        for ch in palette.query.chars() {
+            if byte >= palette.query_cursor {
+                break;
+            }
+            byte += ch.len_utf8();
+            char_idx += 1;
+        }
+        let cursor_col = query_start + char_idx as u16;
+        if cursor_col + 1 < w {
+            let ch = palette.query.chars().nth(char_idx).unwrap_or(' ');
+            set_cell(buf, x0 + cursor_col, row, ch, bg, query_fg);
+        }
+    }
+
+    // Separator row.
+    if h >= 4 {
+        let row = y0 + 2;
+        for col in 0..w {
+            let ch = if col == 0 {
+                '├'
+            } else if col == w - 1 {
+                '┤'
+            } else {
+                '─'
+            };
+            set_cell(buf, x0 + col, row, ch, border_fg, bg);
+        }
+    }
+
+    // Result rows.
+    let items_row0 = y0 + 3;
+    let items_row_end = y_end - 1;
+    let visible_rows = items_row_end.saturating_sub(items_row0) as usize;
+    let total = palette.items.len();
+    let has_scrollbar = total > visible_rows;
+    let item_end_col = if has_scrollbar { w - 2 } else { w - 1 };
+
+    for (vis_i, item) in palette
+        .items
+        .iter()
+        .enumerate()
+        .skip(palette.scroll_offset)
+        .take(visible_rows)
+    {
+        let row = items_row0 + (vis_i - palette.scroll_offset) as u16;
+        if row >= items_row_end {
+            break;
+        }
+        let is_selected = vis_i == palette.selected_idx && palette.has_focus;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        set_cell(buf, x0, row, '│', border_fg, bg);
+        if w >= 2 {
+            set_cell(buf, x0 + w - 1, row, '│', border_fg, bg);
+        }
+        for col in 1..item_end_col {
+            set_cell(buf, x0 + col, row, ' ', fg, row_bg);
+        }
+
+        let mut col = 2u16;
+
+        // Icon.
+        if let Some(ref icon) = item.icon {
+            let glyph = if crate::icons::nerd_fonts_enabled() {
+                icon.glyph.as_str()
+            } else {
+                icon.fallback.as_str()
+            };
+            for ch in glyph.chars() {
+                if col >= item_end_col {
+                    break;
+                }
+                set_cell(buf, x0 + col, row, ch, fg, row_bg);
+                col += 1;
+            }
+            if col < item_end_col {
+                set_cell(buf, x0 + col, row, ' ', fg, row_bg);
+                col += 1;
+            }
+        }
+
+        // Text — per-character match-highlighting based on byte offsets.
+        let full_text: String = item.text.spans.iter().map(|s| s.text.as_str()).collect();
+        let mut byte = 0usize;
+        for ch in full_text.chars() {
+            if col >= item_end_col {
+                break;
+            }
+            let is_match = item.match_positions.contains(&byte);
+            let ch_fg = if is_match { match_fg } else { fg };
+            set_cell(buf, x0 + col, row, ch, ch_fg, row_bg);
+            col += 1;
+            byte += ch.len_utf8();
+        }
+        let text_end_col = col;
+
+        // Detail (right-aligned, dimmed) — only drawn when there's room.
+        if let Some(ref detail) = item.detail {
+            let detail_text: String = detail.spans.iter().map(|s| s.text.as_str()).collect();
+            let detail_w = detail_text.chars().count() as u16;
+            if item_end_col > text_end_col + detail_w + 1 {
+                let start = item_end_col.saturating_sub(detail_w + 1);
+                let mut dcol = start;
+                for ch in detail_text.chars() {
+                    if dcol >= item_end_col {
+                        break;
+                    }
+                    set_cell(buf, x0 + dcol, row, ch, dim_fg, row_bg);
+                    dcol += 1;
+                }
+            }
+        }
+
+        // Scrollbar.
+        if has_scrollbar {
+            let sb_col = w - 2;
+            let track_len = visible_rows;
+            let thumb_len = (visible_rows * visible_rows / total.max(1)).max(1);
+            let thumb_start = palette.scroll_offset * track_len / total.max(1);
+            let vi_off = vis_i - palette.scroll_offset;
+            let in_thumb = vi_off >= thumb_start && vi_off < thumb_start + thumb_len;
+            let ch = if in_thumb { '█' } else { '░' };
+            set_cell(buf, x0 + sb_col, row, ch, border_fg, bg);
+        }
+    }
+
+    // Empty rows between last item and bottom border: just borders.
+    let drawn = (total - palette.scroll_offset).min(visible_rows) as u16;
+    for row in items_row0 + drawn..items_row_end {
+        set_cell(buf, x0, row, '│', border_fg, bg);
+        if w >= 2 {
+            set_cell(buf, x0 + w - 1, row, '│', border_fg, bg);
+        }
+    }
+
+    // Bottom border.
+    let row = y_end - 1;
+    for col in 0..w {
+        let ch = if col == 0 {
+            '╰'
+        } else if col == w - 1 {
+            '╯'
+        } else {
+            '─'
+        };
+        set_cell(buf, x0 + col, row, ch, border_fg, bg);
     }
 }
