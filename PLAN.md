@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 298 — A.4 shipped; A.5 next; A.2b / A.3c / A.4b unblocked on Linux)
+> **Last updated:** 2026-04-19 (Session 298 — A.3c and A.5 shipped; GTK migrations A.3c-2 / A.4b / A.5b / A.2b queued)
 
 ---
 
@@ -34,11 +34,13 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
 | **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
-| **Phase A.3c** — GTK `draw_form` + GTK settings | 🟡 Unblocked (TextInput cursor now exists; biggish — native-widget → DrawingArea migration) | — | `quadraui-phase-a3c-*` | Linux / macOS with GTK4 |
+| **Phase A.3c** — GTK `draw_form` primitive (migration deferred) | ✅ Done | `3f34a03` | `quadraui-phase-a3c-*` | any |
+| **Phase A.3c-2** — GTK settings panel uses `draw_form` (native → DrawingArea) | 🟡 Unblocked | — | `quadraui-phase-a3c2-*` | Linux / macOS with GTK4 |
 | **Phase A.3d** — `TextInput` cursor + selection in `Form` | ✅ Done | `f7f3a51` | `quadraui-phase-a3d-*` | any |
 | **Phase A.4** — `Palette` primitive + TUI command palette | ✅ Done | `534c386` | `quadraui-phase-a4-*` | any |
 | **Phase A.4b** — GTK `draw_palette` + GTK command palette | ⬜ Queued | — | `quadraui-phase-a4b-*` | Linux / macOS with GTK4 |
-| **Phase A.5** — `ListView` primitive + quickfix / git status list | 🟡 Next | — | `quadraui-phase-a5-*` | any |
+| **Phase A.5** — `ListView` primitive + TUI quickfix | ✅ Done | `63d1b29` | `quadraui-phase-a5-*` | any |
+| **Phase A.5b** — GTK `draw_list` + GTK quickfix | ⬜ Queued | — | `quadraui-phase-a5b-*` | Linux / macOS with GTK4 |
 | Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
 | Phase A.7 — `Terminal` primitive | ⬜ Queued | — | `quadraui-phase-a7-*` | any |
 | Phase A.8 — `TextDisplay` | ⬜ Queued | — | `quadraui-phase-a8-*` | any |
