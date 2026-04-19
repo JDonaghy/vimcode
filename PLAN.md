@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 298 — A.2a shipped, A.2b deferred behind A.3, A.3 next)
+> **Last updated:** 2026-04-19 (Session 298 — A.3a shipped (Form primitive + TUI draw_form), A.3b next)
 
 ---
 
@@ -32,7 +32,9 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
 | **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | ⬜ Deferred — waits on A.3 (`Form`/`TextInput` primitives needed for inline rename) | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
-| **Phase A.3** — `Form` primitive + settings panel | 🟡 Next | — | `quadraui-phase-a3-*` | any |
+| **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
+| **Phase A.3b** — TUI settings panel uses `Form` | 🟡 Next | — | `quadraui-phase-a3b-*` | any |
+| **Phase A.3c** — GTK `draw_form` + GTK settings | ⬜ Queued | — | `quadraui-phase-a3c-*` | Linux / macOS with GTK4 |
 | Phase A.4 — `Palette` (command palette) | ⬜ Queued | — | `quadraui-phase-a4-*` | any |
 | Phase A.5 — `ListView` (quickfix, git status list) | ⬜ Queued | — | `quadraui-phase-a5-*` | any |
 | Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
