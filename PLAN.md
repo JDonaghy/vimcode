@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 298 — A.2a shipped, A.2b next)
+> **Last updated:** 2026-04-19 (Session 298 — A.2a shipped, A.2b deferred behind A.3, A.3 next)
 
 ---
 
@@ -30,9 +30,9 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
-| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | 🟡 Next | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
+| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | ⬜ Deferred — waits on A.3 (`Form`/`TextInput` primitives needed for inline rename) | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
-| Phase A.3 — `Form` + settings panel | ⬜ Queued | — | `quadraui-phase-a3-*` | any |
+| **Phase A.3** — `Form` primitive + settings panel | 🟡 Next | — | `quadraui-phase-a3-*` | any |
 | Phase A.4 — `Palette` (command palette) | ⬜ Queued | — | `quadraui-phase-a4-*` | any |
 | Phase A.5 — `ListView` (quickfix, git status list) | ⬜ Queued | — | `quadraui-phase-a5-*` | any |
 | Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
@@ -43,8 +43,12 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c and A.2c both need a Windows machine. A.2b can proceed on Linux
-in parallel with any Windows work.
+A.1c and A.2c both need a Windows machine. A.2b is **deferred** behind
+A.3 — the explorer's inline rename and new-entry features need a text
+input primitive, which A.3 delivers via `Form` / `TextInput`. Tackling
+A.2b before A.3 would mean shipping dialog fallbacks and re-working
+them in a subsequent stage, so we let the primitive catalog catch up
+first. Next work on Linux is **A.3 (`Form` for settings panel)**.
 
 ---
 
@@ -158,7 +162,86 @@ Summary:
 
 ---
 
+## Phase A.3 — `Form` primitive + settings panel
+
+**Branch:** `quadraui-phase-a3-form-settings` off `develop`.
+
+**Platform:** any — settings panel exists in TUI and GTK.
+
+**Why this is next (reordered ahead of A.2b):** A.2b (GTK explorer) needs
+a text-input primitive for inline rename / new-entry. Building A.2b
+before Form/TextInput exists would mean dialog fallbacks and re-work
+when the primitive later lands, so we let the catalog catch up first.
+
+**Scope — new primitives in `quadraui`:**
+
+- `Form` — container primitive holding labeled field rows.
+- Field types for v1 baseline: `Toggle` (bool), `TextInput` (string),
+  `Button`. (Richer fields — `Dropdown`, `Slider`, `ColorPicker` —
+  tracked in #143 and defer to a follow-up.)
+- `FormEvent` variants: `ToggleChanged { id, value }`,
+  `TextInputChanged { id, value }`, `ButtonClicked { id }`, plus
+  `KeyPressed { key, modifiers }` for app-level routing.
+- All types owned + serde-compatible per plugin invariants (§10).
+
+**Scope — migration:**
+
+1. Define `quadraui::primitives::form` with the types above.
+2. Add `draw_form()` in each TUI + GTK backend (Win-GUI deferred).
+3. New adapter `settings_to_form()` in `src/render.rs` — converts
+   `Engine.settings` state into a `quadraui::Form` description.
+4. TUI `render_settings_panel()` in `src/tui_main/panels.rs` — replace
+   with `draw_form()` call when no special state is active.
+5. GTK settings panel (it exists imperatively, not via a native widget) —
+   replace with `draw_form()` call.
+6. Keyboard navigation between fields: Tab / arrows / typing for
+   `TextInput` focus; Space to toggle; Enter to activate buttons.
+7. Scroll for long settings lists (primitive-owned? or app-owned as in A.1/A.2).
+
+**Out of scope for A.3:**
+
+- `Dropdown`, `Slider`, `ColorPicker` fields (tracked in #143). Enum-valued
+  settings keep using text-input + validation until #143 lands.
+- Settings search / filter input (can reuse the `TextInput` primitive,
+  though).
+- Win-GUI port (follow-up stage A.3c).
+
+**Reference implementations:** None yet — Form is a brand-new primitive.
+The `TreeView` primitive (`quadraui/src/primitives/tree.rs`) is the
+template for shape (data struct + event enum + backend draw function).
+
+**Smoke test after implementing:**
+
+```bash
+cargo run --bin vcd    # TUI
+cargo run              # GUI
+```
+
+- Settings panel renders with current values
+- Tab / arrow keys move between fields
+- Toggle settings flip with Space
+- Text input fields accept typing, Backspace, Enter commits, Escape cancels
+- Button rows dispatch the expected engine action
+
+**Rough size estimate:** Larger than A.1a/A.1b (~600–900 lines) because
+Form is a new primitive with more event surface than TreeView.
+
+---
+
 ## Phase A.2b — GTK explorer (replaces native `gtk4::TreeView`)
+
+**Status:** ⬜ **Deferred** behind A.3. Come back here after A.3 ships
+Form / TextInput primitives — the explorer's inline rename and
+new-entry rows will render as an embedded `TextInput` in a `TreeRow`
+rather than a dialog fallback. Without Form, A.2b either loses inline
+editing (regression) or builds dialog fallbacks that get re-worked
+later.
+
+Original A.2b pickup content below is still valid; just wait until
+A.3 has landed before starting.
+
+---
+
 
 **Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` off `develop`.
 
