@@ -2,7 +2,8 @@
 //!
 //! This module provides `draw_*` free functions that render `quadraui`
 //! primitives into a ratatui `Buffer`. Over time this file will grow to
-//! cover every primitive; for Phase A.1a it supports only `TreeView`.
+//! cover every primitive; currently supports `TreeView` (A.1a) and
+//! `Form` (A.3a).
 
 use super::*;
 use ratatui::buffer::Buffer;
@@ -191,4 +192,189 @@ fn draw_styled_text(
         }
     }
     col
+}
+
+/// Draw a `quadraui::Form` into `area` on `buf`.
+///
+/// Layout: one row per field. Label on the left, input on the right.
+/// Headers (`FieldKind::Label`) span the full width in bold.
+/// Disabled fields render dimmed and their inputs are bracketed the
+/// same as enabled ones (the app skips them during focus navigation).
+///
+/// Focused field gets a subtle background tint. The primitive does not
+/// paint a text-input cursor; cursor / selection rendering is a later
+/// primitive extension.
+// Dead-code allow: draw_form has no consumer in the TUI until A.3b
+// migrates the settings panel. Phase A.3a ships the primitive + TUI
+// renderer together so A.3b is a single-purpose migration PR.
+#[allow(dead_code)]
+pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let bg = rc(theme.tab_bar_bg);
+    let fg = rc(theme.foreground);
+    let hdr_fg = rc(theme.status_fg);
+    let hdr_bg = rc(theme.status_bg);
+    let sel_bg = rc(theme.fuzzy_selected_bg);
+    let dim_fg = rc(theme.line_number_fg);
+    let accent_fg = rc(theme.cursor);
+
+    // Field row height in cells. TUI keeps it compact at 1; GTK will use
+    // taller rows (item_height-style) when A.3b/c land.
+    let row_h: u16 = 1;
+
+    let visible = form
+        .fields
+        .iter()
+        .skip(form.scroll_offset)
+        .take(area.height as usize);
+
+    for (vis_i, field) in visible.enumerate() {
+        let y = area.y + (vis_i as u16) * row_h;
+        if y >= area.y + area.height {
+            break;
+        }
+
+        let is_focused = form.has_focus
+            && form
+                .focused_field
+                .as_ref()
+                .is_some_and(|id| id == &field.id);
+        let is_header = matches!(field.kind, quadraui::FieldKind::Label);
+
+        let (default_fg, row_bg) = match (is_header, is_focused) {
+            (_, true) => (fg, sel_bg),
+            (true, false) => (hdr_fg, hdr_bg),
+            (false, false) => (fg, bg),
+        };
+
+        // Fill the row.
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', default_fg, row_bg);
+        }
+
+        let field_fg = if field.disabled { dim_fg } else { default_fg };
+
+        // Label on the left (column 1 for a small indent).
+        let label_col = 1usize;
+        let label_end = draw_styled_text(
+            buf,
+            area,
+            y,
+            label_col,
+            &field.label,
+            field_fg,
+            row_bg,
+            quadraui::Decoration::Normal,
+            dim_fg,
+        );
+
+        // Input rendering — right-side, aligned to column area.width.saturating_sub(input_width + 1)
+        // except headers and read-only display which use whatever space is left on the same row.
+        match &field.kind {
+            quadraui::FieldKind::Label => {
+                // No separate input — label spans the row.
+            }
+            quadraui::FieldKind::Toggle { value } => {
+                let glyph = if *value { "[x]" } else { "[ ]" };
+                let w = glyph.chars().count();
+                let start_col = (area.width as usize).saturating_sub(w + 2);
+                if start_col > label_end + 1 {
+                    let input_fg = if *value { accent_fg } else { field_fg };
+                    let mut col = start_col;
+                    for ch in glyph.chars() {
+                        if col >= area.width as usize {
+                            break;
+                        }
+                        set_cell(buf, area.x + col as u16, y, ch, input_fg, row_bg);
+                        col += 1;
+                    }
+                }
+            }
+            quadraui::FieldKind::TextInput { value, placeholder } => {
+                let shown = if value.is_empty() {
+                    placeholder.as_str()
+                } else {
+                    value.as_str()
+                };
+                let input_fg = if value.is_empty() { dim_fg } else { field_fg };
+                // Max input width uses whatever's left after the label,
+                // capped at two-thirds of the row.
+                let max_input = (area.width as usize * 2 / 3).max(10);
+                let desired = shown.chars().count().min(max_input);
+                let start_col = (area.width as usize).saturating_sub(desired + 2);
+                if start_col > label_end + 1 {
+                    // Left bracket.
+                    if start_col > 0 && start_col - 1 < area.width as usize {
+                        set_cell(buf, area.x + (start_col - 1) as u16, y, '[', dim_fg, row_bg);
+                    }
+                    let mut col = start_col;
+                    for ch in shown.chars().take(desired) {
+                        if col >= area.width as usize {
+                            break;
+                        }
+                        set_cell(buf, area.x + col as u16, y, ch, input_fg, row_bg);
+                        col += 1;
+                    }
+                    // Right bracket.
+                    if col < area.width as usize {
+                        set_cell(buf, area.x + col as u16, y, ']', dim_fg, row_bg);
+                    }
+                }
+            }
+            quadraui::FieldKind::Button => {
+                // The field's label IS the button caption. Redraw it
+                // wrapped in angle-brackets on the right side, overwriting
+                // the normal label rendering.
+                // First blank out the left-side label we already drew.
+                for x in area.x..area.x + (label_end as u16).min(area.width) {
+                    set_cell(buf, x, y, ' ', default_fg, row_bg);
+                }
+                let width = field.label.visible_width() + 4; // "< ... >"
+                let start_col = (area.width as usize).saturating_sub(width + 1);
+                if start_col < area.width as usize {
+                    let brk_fg = if is_focused { accent_fg } else { dim_fg };
+                    let text_fg = if field.disabled { dim_fg } else { field_fg };
+                    set_cell(buf, area.x + start_col as u16, y, '<', brk_fg, row_bg);
+                    let after_lt = draw_styled_text(
+                        buf,
+                        area,
+                        y,
+                        start_col + 2,
+                        &field.label,
+                        text_fg,
+                        row_bg,
+                        quadraui::Decoration::Normal,
+                        dim_fg,
+                    );
+                    if after_lt < area.width as usize {
+                        set_cell(buf, area.x + after_lt as u16, y, ' ', brk_fg, row_bg);
+                    }
+                    if after_lt + 1 < area.width as usize {
+                        set_cell(buf, area.x + (after_lt + 1) as u16, y, '>', brk_fg, row_bg);
+                    }
+                }
+            }
+            quadraui::FieldKind::ReadOnly { value } => {
+                // Draw the read-only value right-aligned, dimmed.
+                let w = value.visible_width();
+                let start_col = (area.width as usize).saturating_sub(w + 2);
+                if start_col > label_end + 1 {
+                    draw_styled_text(
+                        buf,
+                        area,
+                        y,
+                        start_col,
+                        value,
+                        dim_fg,
+                        row_bg,
+                        quadraui::Decoration::Muted,
+                        dim_fg,
+                    );
+                }
+            }
+        }
+    }
 }
