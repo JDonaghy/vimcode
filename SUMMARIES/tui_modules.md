@@ -1,6 +1,6 @@
 # TUI Backend Modules
 
-## src/tui_main/mod.rs — 4,230 lines
+## src/tui_main/mod.rs — 4,237 lines
 TUI application shell using ratatui + crossterm. Contains setup, event loop, key translation, clipboard, and cell rendering helpers.
 - `run(file_path, debug_log)` — entry point; sets up terminal, runs event loop, restores terminal on exit
 - `event_loop(terminal, engine)` — main loop: poll events, dispatch keys, call draw_frame, poll async (LSP/DAP/terminal/search)
@@ -35,7 +35,7 @@ Sidebar panel rendering for all TUI panels.
 - Extension dynamic panels (Lua-registered panels)
 - Panel hover popup rendering
 
-## src/tui_main/mouse.rs — 2,661 lines
+## src/tui_main/mouse.rs — 2,892 lines
 All TUI mouse interaction handling.
 - `handle_mouse(event, engine, layout)` — top-level mouse dispatcher
 - Activity bar clicks (panel switching)
@@ -43,7 +43,7 @@ All TUI mouse interaction handling.
 - Editor clicks (cursor placement, selection, drag)
 - Tab bar clicks (tab switch, close button, action menu `…` button, drag between groups)
 - Sidebar resize drag (Alt+Left/Right or mouse drag on border)
-- Scrollbar drag (vertical + horizontal, editor + panel)
+- Scrollbar drag (vertical + horizontal, editor + panel, picker popup)
 - Status bar clicks (branch name click opens branch picker)
 - Terminal panel clicks
 - Source control / extensions / debug sidebar clicks

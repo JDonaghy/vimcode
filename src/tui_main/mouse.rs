@@ -21,6 +21,7 @@ pub(super) fn handle_mouse(
     dragging_group_divider: &mut Option<usize>,
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     dragging_generic_sb: &mut Option<SidebarScrollDrag>,
+    dragging_picker_sb: &mut Option<SidebarScrollDrag>,
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
@@ -339,6 +340,32 @@ pub(super) fn handle_mouse(
 
     // ── Unified picker mouse handling ────────────────────────────────────────
     if engine.picker_open {
+        // Active scrollbar drag — update scroll_top from the mouse row and
+        // short-circuit the rest of picker mouse routing for this event.
+        if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
+            if let Some(ref drag) = *dragging_picker_sb {
+                if drag.track_len > 0 && drag.total > 0 {
+                    let end = drag.track_abs_start + drag.track_len - 1;
+                    let clamped = row.clamp(drag.track_abs_start, end);
+                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
+                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
+                    let new_top = (ratio * max_scroll as f64).round() as usize;
+                    engine.picker_scroll_top = new_top;
+                    // `draw_palette` clamps its effective scroll offset to
+                    // keep `picker_selected` on-screen, so a drag that leaves
+                    // selection outside the new viewport would snap back
+                    // visually. Pull selection to the nearest visible edge.
+                    let visible = drag.track_len as usize;
+                    if engine.picker_selected < new_top {
+                        engine.picker_selected = new_top;
+                    } else if engine.picker_selected >= new_top + visible {
+                        engine.picker_selected = new_top + visible - 1;
+                    }
+                    engine.picker_load_preview();
+                }
+                return sidebar_width;
+            }
+        }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
@@ -358,6 +385,44 @@ pub(super) fn handle_mouse(
                 let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
                 let results_start = popup_y + 3;
                 let results_end = popup_y + popup_h - 1;
+                let visible_rows = results_end.saturating_sub(results_start) as usize;
+                let total_items = engine.picker_items.len();
+
+                // Scrollbar hit-test — flat palette and legacy single-pane
+                // pickers both render a scrollbar at `popup_w - 2` when the
+                // list overflows. Clicking the track (or the 1-column right
+                // border next to it) jumps to that row and starts a thumb
+                // drag. Including the border column avoids surprise
+                // item-selection clicks on the popup's right edge.
+                let has_scrollbar = !has_preview && total_items > visible_rows && popup_w >= 2;
+                let sb_col = popup_x + popup_w - 2;
+                if has_scrollbar
+                    && col >= sb_col
+                    && col < popup_x + popup_w
+                    && row >= results_start
+                    && row < results_end
+                    && visible_rows > 0
+                {
+                    let rel = (row - results_start) as f64;
+                    let ratio = rel / visible_rows as f64;
+                    let max_scroll = total_items.saturating_sub(visible_rows);
+                    let new_top = (ratio * max_scroll as f64).round() as usize;
+                    engine.picker_scroll_top = new_top;
+                    // Nudge selection into the new viewport so the renderer's
+                    // selection-anchored clamp doesn't snap the scroll back.
+                    if engine.picker_selected < new_top {
+                        engine.picker_selected = new_top;
+                    } else if engine.picker_selected >= new_top + visible_rows {
+                        engine.picker_selected = new_top + visible_rows - 1;
+                    }
+                    engine.picker_load_preview();
+                    *dragging_picker_sb = Some(SidebarScrollDrag {
+                        track_abs_start: results_start,
+                        track_len: visible_rows as u16,
+                        total: total_items,
+                    });
+                    return sidebar_width;
+                }
 
                 if col >= popup_x
                     && col < popup_x + popup_w
@@ -388,6 +453,9 @@ pub(super) fn handle_mouse(
                 {
                     engine.close_picker();
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                *dragging_picker_sb = None;
             }
             MouseEventKind::ScrollDown => {
                 // Check if scroll is over the preview pane (right side).
@@ -808,6 +876,7 @@ pub(super) fn handle_mouse(
             *dragging_debug_output_sb = None;
             *dragging_settings_sb = None;
             *dragging_generic_sb = None;
+            *dragging_picker_sb = None;
             *dragging_group_divider = None;
             *cmd_dragging = false;
             *hover_selecting = false;

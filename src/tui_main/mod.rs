@@ -1031,6 +1031,8 @@ fn event_loop(
     // Non-None while user is dragging a sidebar scrollbar that has no dedicated drag state.
     // Used for explorer and ext panel scrollbars to prevent text selection leaking.
     let mut dragging_generic_sb: Option<SidebarScrollDrag> = None;
+    // Non-None while user is dragging the unified picker popup's scrollbar thumb.
+    let mut dragging_picker_sb: Option<SidebarScrollDrag> = None;
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -3631,6 +3633,7 @@ fn event_loop(
                                 &mut dragging_group_divider,
                                 &mut dragging_settings_sb,
                                 &mut dragging_generic_sb,
+                                &mut dragging_picker_sb,
                                 last_layout.as_ref(),
                                 &mut last_click_time,
                                 &mut last_click_pos,
@@ -3682,6 +3685,7 @@ fn event_loop(
                     &mut dragging_group_divider,
                     &mut dragging_settings_sb,
                     &mut dragging_generic_sb,
+                    &mut dragging_picker_sb,
                     last_layout.as_ref(),
                     &mut last_click_time,
                     &mut last_click_pos,

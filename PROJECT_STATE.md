@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 300 — quadraui Phase A.4b shipped: GTK `draw_palette` + GTK command-palette migration) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 301 — fix #151: TUI palette scrollbar now draggable) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,29 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 301 — Fix #151: TUI palette scrollbar now draggable:**
+
+1. **Mouse-drag on the TUI palette scrollbar thumb (and track-click jump)
+   now scrolls the result list** — surfaced while smoke-testing A.4b
+   (c8f2d91). The scrollbar drawn by both `quadraui_tui::draw_palette`
+   (flat palettes) and the legacy preview-pane renderer
+   (`render_picker_popup`) was render-only.
+2. **`dragging_picker_sb: Option<SidebarScrollDrag>`** added to the TUI
+   event loop and threaded into `handle_mouse`. Hit-test on mouse-down
+   (col == popup_x + popup_w - 2, within the results-row band) both
+   jump-scrolls to that row *and* starts a drag; mouse-drag updates
+   `engine.picker_scroll_top` via the standard ratio; mouse-up clears
+   the drag. Matches the existing `dragging_settings_sb` pattern.
+3. **Only the TUI scope of #151 is addressed here.** The GTK palette has
+   the same unwired scrollbar but is explicitly called out in the issue
+   as a follow-up (GTK `draw_palette` lacks hit regions).
+4. **No new tests** — scrollbar drag is pure TUI interaction that would
+   need a ratatui/crossterm harness that doesn't exist in this repo.
+   All existing 5223 tests pass; fmt + clippy (default + no-default-features)
+   + cargo build all clean.
+
+---
 
 **Session 300 — Phase A.4b shipped + quickfix fixes around A.5b:**
 
