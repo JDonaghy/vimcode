@@ -4631,17 +4631,17 @@ fn sync_scrollbar_positions(
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
     // Hide scrollbars for windows not in the current visible set
-    // (e.g. windows in non-active tabs).
+    // (e.g. windows in non-active tabs), or when a modal popup is
+    // open. Native gtk4::Scrollbar widgets render above the
+    // DrawingArea, so they would otherwise poke through the
+    // palette / picker / tab-switcher overlays.
     let visible_ids: std::collections::HashSet<core::WindowId> =
         window_rects.iter().map(|(wid, _)| *wid).collect();
+    let modal_open = engine.picker_open || engine.tab_switcher_open;
     for (wid, ws) in scrollbars.iter() {
-        if visible_ids.contains(wid) {
-            ws.vertical.set_visible(true);
-            ws.cursor_indicator.set_visible(true);
-        } else {
-            ws.vertical.set_visible(false);
-            ws.cursor_indicator.set_visible(false);
-        }
+        let show = visible_ids.contains(wid) && !modal_open;
+        ws.vertical.set_visible(show);
+        ws.cursor_indicator.set_visible(show);
     }
 
     for (window_id, rect) in &window_rects {
@@ -4968,17 +4968,17 @@ impl App {
         }
 
         // Hide scrollbars for windows that exist but aren't visible
-        // (e.g. windows in non-active tabs).
+        // (e.g. windows in non-active tabs), or when a modal popup is
+        // open. Native gtk4::Scrollbar widgets render above the
+        // DrawingArea, so they would otherwise poke through the
+        // palette / picker / tab-switcher overlays.
         let visible_ids: std::collections::HashSet<core::WindowId> =
             window_rects.iter().map(|(wid, _)| *wid).collect();
+        let modal_open = engine.picker_open || engine.tab_switcher_open;
         for (wid, ws) in scrollbars.iter() {
-            if visible_ids.contains(wid) {
-                ws.vertical.set_visible(true);
-                ws.cursor_indicator.set_visible(true);
-            } else {
-                ws.vertical.set_visible(false);
-                ws.cursor_indicator.set_visible(false);
-            }
+            let show = visible_ids.contains(wid) && !modal_open;
+            ws.vertical.set_visible(show);
+            ws.cursor_indicator.set_visible(show);
         }
 
         // Create/update scrollbars for each window
