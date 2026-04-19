@@ -7478,6 +7478,11 @@ impl Engine {
         self.mouse_drag_word_origin = None;
         self.mouse_drag_active = false;
         self.mouse_drag_origin_window = None;
+        // Clicking into the editor returns keyboard focus to the buffer, so
+        // any bottom-panel focus (currently just quickfix) must be released
+        // — otherwise the panel keeps the `[FOCUS]` marker and j/k keep
+        // routing to the panel until Esc is pressed.
+        self.quickfix_has_focus = false;
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);

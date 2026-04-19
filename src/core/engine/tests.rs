@@ -11329,6 +11329,26 @@ fn test_mouse_click_positions_cursor() {
 }
 
 #[test]
+fn test_mouse_click_clears_quickfix_focus() {
+    // Clicking into the editor must release quickfix focus so subsequent
+    // keystrokes route to the buffer and the `[FOCUS]` marker disappears.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    // Simulate a focused quickfix panel.
+    engine.quickfix_open = true;
+    engine.quickfix_has_focus = true;
+
+    let wid = engine.active_window_id();
+    engine.mouse_click(wid, 0, 3);
+
+    assert!(!engine.quickfix_has_focus);
+    // Panel stays open — click only releases focus, it doesn't close.
+    assert!(engine.quickfix_open);
+}
+
+#[test]
 fn test_mouse_drag_enters_visual_mode() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello world");
