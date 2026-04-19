@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 18, 2026 (Session 297 — v0.10.0 release + quadraui Phase A.0 and A.1a shipped) | **Tests:** 5219 total (full `cargo test --no-default-features`); 1939 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 299 — quadraui Phase A.5b shipped: GTK `draw_list` + GTK quickfix migration) | **Tests:** 5219 total (full `cargo test --no-default-features`); 1939 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,33 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 299 — Phase A.5b shipped (GTK `draw_list` + quickfix migration):**
+
+1. **`quadraui_gtk::draw_list`** added as the Cairo/Pango counterpart to
+   A.5's TUI renderer. Optional title header in status-bar styling,
+   flat rows at `line_height`-per-row, `▶ ` selection prefix, optional
+   icon + detail, decoration-aware fg colour (Error/Warning/Muted/Header).
+2. **GTK quickfix migrated** (`draw_quickfix_panel` in `src/gtk/draw.rs`)
+   from an inline Cairo loop to a thin wrapper around
+   `render::quickfix_to_list_view()` (the adapter already existed from
+   A.5) + `draw_list`. Keeps scroll-to-selection behaviour. Net delta
+   -38 lines of GTK rendering code.
+3. **`docs/DECISIONS_quadraui_primitives.md`** — new running decision log
+   for primitive-distinctness calls. D-001 records the retroactive
+   rationale for `ListView` being separate from `TreeView`; D-002
+   recommends the same call for `DataTable` #140. Establishes the
+   principle *"one primitive per UX concept, not per algebraic
+   reduction"*.
+4. **Test count unchanged at 5219** — pure refactor, no new tests. All
+   quality gates pass (fmt, clippy on both no-default-features and
+   default GTK build, full test suite, cargo build).
+5. **Next up:** A.4b (GTK `draw_palette`) remains the smallest unblocked
+   GTK stage. A.3c-2 (settings native→DrawingArea) and A.2b (explorer
+   native→DrawingArea) are the bigger architectural migrations still
+   queued on Linux.
+
+---
 
 **Session 297 (continued) — Phase A.0 + A.1a shipped after the release:**
 
