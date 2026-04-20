@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 305 — A.6a: `StatusBar` primitive + TUI per-window status line migration) | **Tests:** 5240 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 15. Prior `cargo test --no-default-features` figure was 5225 vimcode-only
+**Last updated:** Apr 20, 2026 (Session 306 — A.6b: GTK `draw_status_bar` migration) | **Tests:** 5240 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 15
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,18 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 306 — Phase A.6b: GTK `draw_status_bar` migration:**
+
+1. **New `quadraui_gtk::draw_status_bar`** in `src/gtk/quadraui_gtk.rs` — Cairo + Pango counterpart to the TUI renderer shipped in A.6a. Same contract: background fill from first segment's `bg`, left segments accumulate from `x`, right segments right-aligned inside `width`, per-segment bold via `pango::Weight::Bold`. Returns `Vec<StatusBarHitRegion>` in bar-local coordinates so the caller can populate the per-window click map.
+2. **GTK `draw_window_status_bar` reduced to ~20 lines.** The 100-line Cairo+Pango routine (segment measure / fill / stroke / weight-attrs, duplicated for left and right halves) is gone. The wrapper now adapts `WindowStatusLine → quadraui::StatusBar` via the A.6a adapter, calls `quadraui_gtk::draw_status_bar`, and decodes the returned `WidgetId`s back to `StatusAction` for the existing per-window `status_segment_map`. Click dispatch in `src/gtk/click.rs` is unchanged.
+3. **Hit-region float→u16 conversion** in the GTK backend uses a saturating clamp — GTK bars render in pixels (typically up to ~2500 px wide at 4K), well within `u16::MAX = 65535`. The TUI variant uses character cells; both fit. A later stage may widen `StatusBarHitRegion::col` / `width` to `u32` if HiDPI bars ever approach the limit.
+4. **All Linux GTK primitives are now migrated through quadraui** — Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b). The GTK backend's primitive-independent rendering surface shrinks another ~80 lines; what's left in `src/gtk/draw.rs` is editor / popup / sidebar-chrome rendering.
+5. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5240/0/19, unchanged), `cargo build` (both default + `--no-default-features`).
+6. **Net diff:** +140 / –99 lines across 4 files. `src/gtk/quadraui_gtk.rs` grows with `draw_status_bar`; `src/gtk/draw.rs` shrinks where the inline routine used to live.
+7. **Awaiting smoke test.** GTK per-window status line should render identically to before: same colours, widths, bold weights, right-alignment of the right half, clickable segments, separated-status-line row above the terminal panel. Focus specifically on the narrow-window edge case flagged during A.6a smoke testing (#157 if filed) — behaviour there is unchanged by this migration but worth confirming the primitive doesn't make it worse.
+
+---
 
 **Session 305 — Phase A.6a: `StatusBar` primitive + TUI per-window status line migration:**
 

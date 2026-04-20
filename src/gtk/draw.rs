@@ -4324,6 +4324,13 @@ pub(super) fn draw_status_line(
 
 /// Draw a per-window status bar with styled segments.
 #[allow(clippy::too_many_arguments)]
+/// Render a per-window / separated status bar row (A.6b).
+///
+/// Delegates to `quadraui_gtk::draw_status_bar` via the
+/// `window_status_line_to_status_bar` adapter. `StatusAction` is decoded from
+/// the primitive's `WidgetId`s so the existing per-window
+/// `status_segment_map` stays on `StatusAction` and the click handler in
+/// `src/gtk/click.rs` is unchanged.
 fn draw_window_status_bar(
     cr: &Context,
     layout: &pango::Layout,
@@ -4335,97 +4342,19 @@ fn draw_window_status_bar(
     line_height: f64,
     segment_zones: &mut Vec<(f64, f64, crate::core::engine::StatusAction)>,
 ) {
-    // Fill background using the first segment's bg (derived from theme, not status_bg)
-    let fill_bg = status
-        .left_segments
-        .first()
-        .or(status.right_segments.first())
-        .map(|s| s.bg)
-        .unwrap_or(theme.background);
-    let (br, bg, bb) = fill_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(x, y, width, line_height);
-    cr.fill().ok();
+    let bar =
+        render::window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
+    let regions =
+        super::quadraui_gtk::draw_status_bar(cr, layout, x, y, width, line_height, &bar, theme);
 
-    layout.set_attributes(None);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    // Draw left segments
     segment_zones.clear();
-    let mut cx = x;
-    for seg in &status.left_segments {
-        let (sr, sg, sb) = seg.bg.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        // Measure segment width
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
-        let (seg_w, _) = layout.pixel_size();
-        let seg_w = seg_w as f64;
-        if let Some(ref action) = seg.action {
-            segment_zones.push((cx - x, cx - x + seg_w, action.clone()));
-        }
-        // Draw segment background
-        cr.rectangle(cx, y, seg_w, line_height);
-        cr.fill().ok();
-        // Draw segment text
-        let (fr, fg, fb) = seg.fg.to_cairo();
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(cx, y);
-        pangocairo::show_layout(cr, layout);
-        cx += seg_w;
-        if cx >= x + width {
-            break;
+    for region in regions {
+        if let Some(action) = render::status_action_from_id(region.id.as_str()) {
+            let start = region.col as f64;
+            let end = start + region.width as f64;
+            segment_zones.push((start, end, action));
         }
     }
-
-    // Draw right segments, right-aligned
-    let mut right_total_w = 0.0;
-    for seg in &status.right_segments {
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
-        let (seg_w, _) = layout.pixel_size();
-        right_total_w += seg_w as f64;
-    }
-    let mut rx = (x + width - right_total_w).max(cx);
-    for seg in &status.right_segments {
-        let (sr, sg, sb) = seg.bg.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
-        let (seg_w, _) = layout.pixel_size();
-        let seg_w = seg_w as f64;
-        if let Some(ref action) = seg.action {
-            segment_zones.push((rx - x, rx - x + seg_w, action.clone()));
-        }
-        cr.rectangle(rx, y, seg_w, line_height);
-        cr.fill().ok();
-        let (fr, fg, fb) = seg.fg.to_cairo();
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(rx, y);
-        pangocairo::show_layout(cr, layout);
-        rx += seg_w;
-    }
-
-    layout.set_attributes(None);
 }
 
 pub(super) fn draw_wildmenu(

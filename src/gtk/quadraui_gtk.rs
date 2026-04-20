@@ -934,3 +934,131 @@ pub(super) fn draw_palette(
     // Close the outer popup-bounds clip opened at function start.
     cr.restore().ok();
 }
+
+/// Draw a `quadraui::StatusBar` as a single row `line_height` tall.
+///
+/// Layout matches the TUI backend: left segments accumulate from the left
+/// edge, right segments are right-aligned inside `width`. When the two
+/// halves would collide, the left half wins up to where it meets the
+/// right (Cairo just clips at the segment boundary).
+///
+/// Returns hit regions in local coordinates (relative to `x`) — caller
+/// pushes them into the per-window segment map for click resolution.
+/// Bold segments use Pango's bold weight attribute.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_status_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    x: f64,
+    y: f64,
+    width: f64,
+    line_height: f64,
+    bar: &quadraui::StatusBar,
+    theme: &Theme,
+) -> Vec<quadraui::StatusBarHitRegion> {
+    // Reset layout state the same way the legacy renderer did.
+    layout.set_attributes(None);
+    layout.set_width(-1);
+    layout.set_ellipsize(pango::EllipsizeMode::None);
+
+    // Background fill: first segment's bg, else theme bg.
+    let fill = bar
+        .left_segments
+        .first()
+        .or(bar.right_segments.first())
+        .map(|s| qc_to_cairo(s.bg))
+        .unwrap_or_else(|| vc_to_cairo(theme.background));
+    cr.set_source_rgb(fill.0, fill.1, fill.2);
+    cr.rectangle(x, y, width, line_height);
+    cr.fill().ok();
+
+    let mut regions: Vec<quadraui::StatusBarHitRegion> = Vec::new();
+
+    // Helper: apply bold attribute to the shared layout if the segment wants it.
+    // Returns true when a bold attribute was installed, so the caller can clear afterwards.
+    let apply_bold = |layout: &pango::Layout, bold: bool| {
+        if bold {
+            let attrs = pango::AttrList::new();
+            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
+            layout.set_attributes(Some(&attrs));
+        } else {
+            layout.set_attributes(None);
+        }
+    };
+
+    // ── Left segments — accumulate from x ────────────────────────────────
+    let mut cx = x;
+    for seg in &bar.left_segments {
+        layout.set_text(&seg.text);
+        apply_bold(layout, seg.bold);
+        let (seg_w_px, _) = layout.pixel_size();
+        let seg_w = seg_w_px as f64;
+
+        if let Some(ref id) = seg.action_id {
+            // Hit region widths use px (StatusBarHitRegion stores u16),
+            // but for Cairo we need f64. We keep the primitive's u16 shape
+            // by saturating; the real-world bar is far under u16::MAX px.
+            regions.push(quadraui::StatusBarHitRegion {
+                col: ((cx - x).round() as i64).clamp(0, u16::MAX as i64) as u16,
+                width: (seg_w.round() as i64).clamp(0, u16::MAX as i64) as u16,
+                id: id.clone(),
+            });
+        }
+
+        let (sr, sg, sb) = qc_to_cairo(seg.bg);
+        cr.set_source_rgb(sr, sg, sb);
+        cr.rectangle(cx, y, seg_w, line_height);
+        cr.fill().ok();
+
+        let (fr, fg, fb) = qc_to_cairo(seg.fg);
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(cx, y);
+        pangocairo::show_layout(cr, layout);
+
+        cx += seg_w;
+        if cx >= x + width {
+            break;
+        }
+    }
+
+    // ── Right segments — right-aligned ──────────────────────────────────
+    let mut right_total_w = 0.0;
+    for seg in &bar.right_segments {
+        layout.set_text(&seg.text);
+        apply_bold(layout, seg.bold);
+        let (w_px, _) = layout.pixel_size();
+        right_total_w += w_px as f64;
+    }
+
+    let mut rx = (x + width - right_total_w).max(cx);
+    for seg in &bar.right_segments {
+        layout.set_text(&seg.text);
+        apply_bold(layout, seg.bold);
+        let (w_px, _) = layout.pixel_size();
+        let seg_w = w_px as f64;
+
+        if let Some(ref id) = seg.action_id {
+            regions.push(quadraui::StatusBarHitRegion {
+                col: ((rx - x).round() as i64).clamp(0, u16::MAX as i64) as u16,
+                width: (seg_w.round() as i64).clamp(0, u16::MAX as i64) as u16,
+                id: id.clone(),
+            });
+        }
+
+        let (sr, sg, sb) = qc_to_cairo(seg.bg);
+        cr.set_source_rgb(sr, sg, sb);
+        cr.rectangle(rx, y, seg_w, line_height);
+        cr.fill().ok();
+
+        let (fr, fg, fb) = qc_to_cairo(seg.fg);
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(rx, y);
+        pangocairo::show_layout(cr, layout);
+
+        rx += seg_w;
+    }
+
+    layout.set_attributes(None);
+
+    regions
+}
