@@ -101,6 +101,16 @@ struct App {
     explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Flat row model + expand / selection state backing the explorer DA.
     explorer_state: Rc<RefCell<ExplorerState>>,
+    /// Row height actually used by the most recent `draw_explorer_panel`
+    /// call. The draw callback writes this each frame from the same Pango
+    /// context it renders with, so click and scroll handlers hit-test with
+    /// byte-exact row math (Cairo-backed Pango contexts can report
+    /// line-heights that drift from `cached_ui_line_height` on HiDPI).
+    explorer_row_height_cell: Rc<Cell<f64>>,
+    /// Fractional dy accumulator for the explorer scroll wheel. Small
+    /// trackpad deltas are summed here until they exceed one row, so no
+    /// scroll event is silently dropped.
+    explorer_scroll_accum: Rc<Cell<f64>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -1789,6 +1799,8 @@ impl SimpleComponent for App {
         };
         let explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
+        let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
@@ -1902,6 +1914,8 @@ impl SimpleComponent for App {
             active_panel: SidebarPanel::Explorer,
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             explorer_state: explorer_state.clone(),
+            explorer_row_height_cell: explorer_row_height_cell.clone(),
+            explorer_scroll_accum: explorer_scroll_accum.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
@@ -2048,6 +2062,7 @@ impl SimpleComponent for App {
         {
             let engine_d = engine.clone();
             let state_d = explorer_state.clone();
+            let row_h_cell = explorer_row_height_cell.clone();
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -2058,6 +2073,12 @@ impl SimpleComponent for App {
                 let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                // Publish the row height we're rendering with, so the click
+                // and scroll handlers hit-test against the same numbers.
+                // `draw_tree` uses `(line_height * 1.4).round()` — keep the
+                // formula in sync with `quadraui_gtk::draw_tree`.
+                let row_h = (line_height * 1.4).round().max(1.0);
+                row_h_cell.set(row_h);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
                 let state = state_d.borrow();
@@ -4087,9 +4108,7 @@ impl App {
             .as_ref()
             .map(|da| {
                 let h = da.height() as f64;
-                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
-                    .round()
-                    .max(1.0);
+                let item_h = self.explorer_row_height_cell.get().max(1.0);
                 (h / item_h).floor().max(0.0) as usize
             })
             .unwrap_or(20);
@@ -8720,16 +8739,25 @@ impl App {
                     .borrow()
                     .as_ref()
                     .map(|da| {
-                        let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
-                            .round()
-                            .max(1.0);
+                        let item_h = self.explorer_row_height_cell.get().max(1.0);
                         (da.height() as f64 / item_h).floor().max(0.0) as usize
                     })
                     .unwrap_or(0);
                 let max_scroll = total.saturating_sub(viewport);
+                // GTK scroll events can arrive with fractional `dy`
+                // (trackpads, smooth scrolling) as well as integer steps
+                // (mouse wheel notches). We accumulate the scaled delta
+                // so small trackpad deltas aren't silently dropped and
+                // large wheel notches still move a noticeable amount.
+                let scaled = dy * 3.0;
+                let accum = self.explorer_scroll_accum.get() + scaled;
+                let step = accum.trunc() as isize;
+                self.explorer_scroll_accum.set(accum - step as f64);
+                if step == 0 {
+                    return;
+                }
                 let mut st = self.explorer_state.borrow_mut();
-                let delta = dy.round() as isize * 3;
-                let new_top = (st.scroll_top as isize + delta).max(0) as usize;
+                let new_top = (st.scroll_top as isize + step).max(0) as usize;
                 st.scroll_top = new_top.min(max_scroll);
                 drop(st);
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
@@ -8803,9 +8831,7 @@ impl App {
             .borrow()
             .as_ref()
             .map(|da| {
-                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
-                    .round()
-                    .max(1.0);
+                let item_h = self.explorer_row_height_cell.get().max(1.0);
                 (da.height() as f64 / item_h).floor().max(0.0) as usize
             })
             .unwrap_or(0)
@@ -8818,9 +8844,7 @@ impl App {
         let total = state.rows.len();
         let scroll_top = state.scroll_top;
         drop(state);
-        let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
-            .round()
-            .max(1.0);
+        let item_h = self.explorer_row_height_cell.get().max(1.0);
         let local = (y / item_h).floor().max(0.0) as usize;
         let idx = scroll_top + local;
         if idx < total {
@@ -8890,6 +8914,33 @@ impl App {
             return;
         }
 
+        // Vim-style single-char navigation keys (j/k/h/l) take priority
+        // over the generic explorer_keys shortcuts so the user can always
+        // navigate the tree regardless of how explorer_keys is configured.
+        if !ctrl {
+            if let Some(ch) = unicode {
+                match ch {
+                    'j' => {
+                        self.explorer_move_selection(1);
+                        return;
+                    }
+                    'k' => {
+                        self.explorer_move_selection(-1);
+                        return;
+                    }
+                    'l' => {
+                        sender.input(Msg::ExplorerActivateSelected);
+                        return;
+                    }
+                    'h' => {
+                        self.explorer_collapse_or_parent();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         match key_name.as_str() {
             "Return" | "KP_Enter" => {
                 sender.input(Msg::ExplorerActivateSelected);
@@ -8926,47 +8977,11 @@ impl App {
                 self.queue_explorer_draw();
             }
             "Right" => {
-                // l / Right — activate (open or expand).
+                // Right — activate (open or expand).
                 sender.input(Msg::ExplorerActivateSelected);
             }
             "Left" => {
-                // h / Left — if current row is an expanded dir collapse
-                // it; otherwise move selection to its parent depth row.
-                let (idx, is_dir, is_expanded, depth) = {
-                    let st = self.explorer_state.borrow();
-                    if st.selected >= st.rows.len() {
-                        return;
-                    }
-                    let r = &st.rows[st.selected];
-                    (st.selected, r.is_dir, r.is_expanded, r.depth)
-                };
-                if is_dir && is_expanded {
-                    let root = self.engine.borrow().cwd.clone();
-                    let show_hidden = self.engine.borrow().settings.show_hidden_files;
-                    let case_insensitive =
-                        self.engine.borrow().settings.explorer_sort_case_insensitive;
-                    self.explorer_state.borrow_mut().toggle_dir(
-                        idx,
-                        &root,
-                        show_hidden,
-                        case_insensitive,
-                    );
-                    self.queue_explorer_draw();
-                } else if depth > 0 {
-                    let new_selected = {
-                        let st = self.explorer_state.borrow();
-                        (0..idx)
-                            .rev()
-                            .find(|&i| st.rows[i].depth < depth)
-                            .unwrap_or(0)
-                    };
-                    let mut st = self.explorer_state.borrow_mut();
-                    st.selected = new_selected;
-                    let v = self.explorer_viewport_rows();
-                    st.ensure_visible(v);
-                    drop(st);
-                    self.queue_explorer_draw();
-                }
+                self.explorer_collapse_or_parent();
             }
             _ => {
                 // Single-char explorer shortcuts (a/A/D/r/M etc.).
@@ -9005,9 +9020,7 @@ impl App {
             .borrow()
             .as_ref()
             .map(|da| {
-                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
-                    .round()
-                    .max(1.0);
+                let item_h = self.explorer_row_height_cell.get().max(1.0);
                 (da.height() as f64 / item_h).floor().max(0.0) as usize
             })
             .unwrap_or(0);
@@ -9019,6 +9032,42 @@ impl App {
     fn queue_explorer_draw(&self) {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.queue_draw();
+        }
+    }
+
+    /// h / Left behaviour: collapse the current dir if it is expanded,
+    /// otherwise move selection to the parent-depth row above.
+    fn explorer_collapse_or_parent(&self) {
+        let (idx, is_dir, is_expanded, depth) = {
+            let st = self.explorer_state.borrow();
+            if st.selected >= st.rows.len() {
+                return;
+            }
+            let r = &st.rows[st.selected];
+            (st.selected, r.is_dir, r.is_expanded, r.depth)
+        };
+        if is_dir && is_expanded {
+            let root = self.engine.borrow().cwd.clone();
+            let show_hidden = self.engine.borrow().settings.show_hidden_files;
+            let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
+            self.explorer_state
+                .borrow_mut()
+                .toggle_dir(idx, &root, show_hidden, case_insensitive);
+            self.queue_explorer_draw();
+        } else if depth > 0 {
+            let new_selected = {
+                let st = self.explorer_state.borrow();
+                (0..idx)
+                    .rev()
+                    .find(|&i| st.rows[i].depth < depth)
+                    .unwrap_or(0)
+            };
+            let mut st = self.explorer_state.borrow_mut();
+            st.selected = new_selected;
+            let v = self.explorer_viewport_rows();
+            st.ensure_visible(v);
+            drop(st);
+            self.queue_explorer_draw();
         }
     }
 
