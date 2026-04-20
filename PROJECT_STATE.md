@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 303 — Phase A.2b-1: GTK explorer data-model scaffolding + draw_explorer_panel, inert) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 303 — Phase A.2b-2: GTK explorer atomic switchover, native TreeView → DrawingArea, awaiting smoke test) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,74 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 303 — Phase A.2b-2: GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`):**
+
+1. **The `view!` macro block** for `explorer_panel` now holds a single
+   `#[name = "explorer_da"]` `gtk4::DrawingArea` instead of a
+   `ScrolledWindow` + `TreeView` with its inline 60-line
+   `EventControllerKey`. Mirrors the A.3c-2 settings-panel shape.
+2. **App struct** — removed `tree_store`, `tree_has_focus`,
+   `file_tree_view`, `name_cell`; added `explorer_sidebar_da_ref` and
+   `explorer_state: Rc<RefCell<ExplorerState>>`.
+3. **Imperative DA setup** (after the settings-DA block in `init`):
+   draw callback calling `draw_explorer_panel` with the adapter
+   `explorer::explorer_to_tree_view`, `GestureClick` left (single →
+   preview, double → open / toggle dir), `GestureClick` right (opens
+   context menu at click coords), `EventControllerKey` (routes to
+   `Msg::ExplorerKey`), and `EventControllerScroll` (wheel scroll).
+4. **All 14 right-click context-menu actions** preserved — new_file,
+   new_folder, rename, delete, copy_path, copy_relative_path, reveal,
+   select_for_diff, diff_with_selected, open_side, open_side_vsplit,
+   open_terminal, find_in_folder. Extracted into a dedicated
+   `show_explorer_context_menu()` helper on `App`.
+5. **Rename / new-file / new-folder inline editing deferred** — those
+   three actions now route through `Msg::PromptRenameFile`,
+   `Msg::PromptNewFile`, `Msg::PromptNewFolder`, each opening a simple
+   modal `gtk4::Dialog` with a `gtk4::Entry` (pre-selected stem for
+   rename, empty entry for new-file/folder). Inline text-cursor
+   rendering inside `draw_tree` rows is left for a follow-up session
+   once the `Form`/`TextInput` primitive ergonomics for row-embedded
+   input are proven.
+6. **Drag-and-drop** — the 100-line `DragSource` / `DropTarget` block
+   was removed; tracked as follow-up [#149](https://github.com/JDonaghy/vimcode/issues/149).
+7. **`SidebarPanel::Explorer` added to the `Msg::SwitchPanel`
+   `grab_focus` block** — per the A.3c-2 lesson, the activity-bar
+   `gtk4::Button` keeps focus after click; without this, keyboard
+   input silently goes nowhere.
+8. **App methods added**: `reveal_path_in_explorer` (replaces
+   `highlight_file_in_tree` callsites), `refresh_explorer`,
+   `explorer_viewport_rows`, `explorer_row_at`, `explorer_move_selection`,
+   `queue_explorer_draw`, `handle_explorer_da_key`,
+   `handle_explorer_da_click`, `handle_explorer_da_right_click`,
+   `show_explorer_context_menu`, `prompt_for_name`.
+9. **Deleted `src/gtk/tree.rs`** (503 lines). `validate_name` moved to
+   `src/gtk/util.rs`; all other helpers (`build_file_tree_*`,
+   `tree_row_expanded`, `update_tree_indicators`,
+   `selected_parent_dir_from_app`, `selected_file_path_from_app`,
+   `highlight_file_in_tree`, `find_tree_iter_for_path`,
+   `remove_new_entry_rows`, `TREE_DUMMY_PATH`) removed.
+10. **`start_inline_new_entry` replaced by `prompt_for_name`** — a
+    generic modal-dialog helper reused by all three rename/new-entry
+    prompts.
+11. **`update_tree_indicators` periodic refresh removed** — the DA
+    pulls indicators from `engine.explorer_indicators()` via the
+    adapter on every draw, so the 1 Hz tick just calls `queue_draw()`.
+12. **Quality gates all pass** — `cargo fmt`, `cargo clippy -- -D warnings`
+    (default + `--no-default-features`), full
+    `cargo test --no-default-features` (5223 / 0 / 19, same as
+    baseline), `cargo build` (default + `--no-default-features`).
+    **Net diff:** +936 / –1513 lines across 5 files (-577 net).
+    `src/gtk/mod.rs` shrinks from 10,161 → 10,070; `src/gtk/tree.rs`
+    (503 lines) deleted.
+13. **Known scope gaps (deferred):**
+    - Inline rename / new-entry editing inside `draw_tree` rows
+      (follow-up issue to file after smoke-test).
+    - Drag-and-drop (#149).
+    - Context-menu as a `quadraui` primitive (not yet specced).
+14. **Awaiting smoke test.** Checklist in #152.
+
+---
 
 **Session 303 — Phase A.2b-1: GTK explorer scaffolding landed (inert):**
 

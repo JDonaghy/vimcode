@@ -5426,10 +5426,8 @@ pub(super) fn draw_settings_panel(
 // for long trees. Row heights come from `draw_tree` itself
 // (`line_height * 1.4`), so the scrollbar math here uses the same scalar
 // to resolve the visible-row count — any future change must keep the two
-// in sync. Phase A.2b sub-phase 1 ships this as inert (no callsite); the
-// atomic TreeView → DrawingArea switchover in sub-phase 2 wires it in.
+// in sync.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(super) fn draw_explorer_panel(
     cr: &Context,
     layout: &pango::Layout,

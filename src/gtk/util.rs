@@ -5,6 +5,29 @@ pub(super) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
 }
 
+/// Validate a filename for the explorer file / folder creation flow.
+pub(super) fn validate_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("Name cannot contain slashes".to_string());
+    }
+    if name.contains('\0') {
+        return Err("Name cannot contain null characters".to_string());
+    }
+    #[cfg(windows)]
+    {
+        if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
+            return Err("Name contains invalid characters".to_string());
+        }
+    }
+    if name == "." || name == ".." {
+        return Err("Invalid name".to_string());
+    }
+    Ok(())
+}
+
 /// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
 pub(super) fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
     crate::render::matches_key_binding(

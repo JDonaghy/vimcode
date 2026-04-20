@@ -37,13 +37,12 @@ mod css;
 mod draw;
 mod explorer;
 mod quadraui_gtk;
-mod tree;
 mod util;
 
 use click::*;
 use css::*;
 use draw::*;
-use tree::*;
+use explorer::ExplorerState;
 use util::*;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,11 +95,12 @@ struct App {
     draw_needed: Rc<Cell<bool>>,
     sidebar_visible: bool,
     active_panel: SidebarPanel,
-    tree_store: Option<gtk4::TreeStore>,
-    tree_has_focus: bool,
-    file_tree_view: Rc<RefCell<Option<gtk4::TreeView>>>,
-    /// Cell renderer for filenames in the explorer tree (for triggering inline editing).
-    name_cell: Rc<RefCell<Option<gtk4::CellRendererText>>>,
+    /// DrawingArea for the file explorer sidebar (Phase A.2b-2: native
+    /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
+    /// `draw_explorer_panel`).
+    explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Flat row model + expand / selection state backing the explorer DA.
+    explorer_state: Rc<RefCell<ExplorerState>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -350,6 +350,34 @@ enum Msg {
     /// Explorer CRUD action triggered by keyboard shortcut (the char string).
     ExplorerAction(String),
     ExplorerActivateSelected,
+    /// Key press routed to the explorer DrawingArea (Phase A.2b-2).
+    ExplorerKey {
+        key_name: String,
+        unicode: Option<char>,
+        ctrl: bool,
+    },
+    /// Left-click at (x, y) on the explorer DrawingArea. `n_press` is 1 for
+    /// single-click (preview), 2+ for double-click (open permanent / toggle dir).
+    ExplorerClick {
+        x: f64,
+        y: f64,
+        n_press: i32,
+    },
+    /// Right-click at (x, y) on the explorer DrawingArea — opens the context menu.
+    ExplorerRightClick {
+        x: f64,
+        y: f64,
+    },
+    /// Mouse-wheel on the explorer DrawingArea. Positive dy scrolls down.
+    ExplorerScroll(f64),
+    /// Prompt the user for a filename to rename `path` to. Dialog fallback
+    /// used by GTK since inline TextInput editing on `draw_tree` rows is
+    /// deferred until a future primitive stage.
+    PromptRenameFile(PathBuf),
+    /// Prompt the user for a filename for a new file under `parent_dir`.
+    PromptNewFile(PathBuf),
+    /// Prompt the user for a folder name under `parent_dir`.
+    PromptNewFolder(PathBuf),
     /// Show confirmation dialog before deleting.
     ConfirmDeletePath(PathBuf),
     /// Refresh the file tree from current working directory.
@@ -820,7 +848,7 @@ impl SimpleComponent for App {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar-container"],
 
-                        // Explorer panel
+                        // Explorer panel (A.2b-2: DrawingArea + quadraui_gtk::draw_tree)
                         #[name = "explorer_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
@@ -829,85 +857,12 @@ impl SimpleComponent for App {
                             #[watch]
                             set_visible: model.active_panel == SidebarPanel::Explorer,
 
-                        // Scrollable tree view
-                        #[name = "file_tree_scroll"]
-                        gtk4::ScrolledWindow {
-                            set_vexpand: true,
-                            set_hscrollbar_policy: gtk4::PolicyType::Automatic,
-                            set_vscrollbar_policy: gtk4::PolicyType::Automatic,
-
-                            #[name = "file_tree_view"]
-                            gtk4::TreeView {
-                                set_headers_visible: false,
-                                set_enable_tree_lines: false,
-                                set_show_expanders: true,
-                                set_level_indentation: 0,
+                            #[name = "explorer_da"]
+                            gtk4::DrawingArea {
+                                set_hexpand: true,
+                                set_vexpand: true,
                                 set_focusable: true,
-                                set_enable_search: false,
-
-                                add_controller = gtk4::EventControllerKey {
-                                    connect_key_pressed[sender, engine] => move |_, key, _, modifier| {
-                                        let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-
-                                        // Escape returns focus to editor
-                                        if key_name == "Escape" {
-                                            sender.input(Msg::FocusEditor);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-
-                                        // Panel navigation — same shortcuts work from within tree view
-                                        let pk = engine.borrow().settings.panel_keys.clone();
-                                        if matches_gtk_key(&pk.toggle_sidebar, key, modifier) {
-                                            sender.input(Msg::ToggleSidebar);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if matches_gtk_key(&pk.focus_explorer, key, modifier) {
-                                            sender.input(Msg::ToggleFocusExplorer);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if matches_gtk_key(&pk.focus_search, key, modifier) {
-                                            sender.input(Msg::ToggleFocusSearch);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Enter: use our handler that syncs cursor→selection first
-                                        // (native row_activated uses selection which lags behind arrow-key cursor)
-                                        if matches!(key_name.as_str(), "Return" | "KP_Enter") {
-                                            sender.input(Msg::ExplorerActivateSelected);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Arrow keys + space: let TreeView handle natively
-                                        if matches!(key_name.as_str(), "Up" | "Down" | "Left" | "Right" | "space") {
-                                            return gtk4::glib::Propagation::Proceed;
-                                        }
-
-                                        // Explorer CRUD keys (a/A/D/r/M etc.)
-                                        if !modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-                                            if let Some(ch) = key.to_unicode() {
-                                                let ch_str = ch.to_string();
-                                                // Resolve action with a short-lived borrow
-                                                let is_explorer_key = {
-                                                    let ek = &engine.borrow().settings.explorer_keys;
-                                                    ch_str == ek.new_file || ch_str == ek.new_folder
-                                                        || ch_str == ek.delete || ch_str == ek.rename
-                                                        || ch_str == ek.move_file
-                                                };
-                                                if is_explorer_key {
-                                                    // Defer via idle to avoid any borrow conflicts
-                                                    let s = sender.clone();
-                                                    gtk4::glib::idle_add_local_once(move || {
-                                                        s.input(Msg::ExplorerAction(ch_str));
-                                                    });
-                                                    return gtk4::glib::Propagation::Stop;
-                                                }
-                                            }
-                                        }
-
-                                        // Stop all other keys from triggering TreeView search
-                                        gtk4::glib::Propagation::Stop
-                                    }
-                                },
                             },
-                        },
                         },
 
                         // Settings panel — Phase A.3c-2: native widget tree replaced
@@ -1825,18 +1780,14 @@ impl SimpleComponent for App {
             );
         }
 
-        // Create TreeStore with 6 columns: Icon, Name, FullPath, FgColor, Indicator, IndicatorColor
-        let tree_store = gtk4::TreeStore::new(&[
-            gtk4::glib::Type::STRING, // 0: Icon
-            gtk4::glib::Type::STRING, // 1: Name
-            gtk4::glib::Type::STRING, // 2: Full path
-            gtk4::glib::Type::STRING, // 3: Foreground color (hex)
-            gtk4::glib::Type::STRING, // 4: Indicator text (e.g. "M", "2⚠", "1✗")
-            gtk4::glib::Type::STRING, // 5: Indicator foreground color (hex)
-        ]);
-
-        let file_tree_view_ref = Rc::new(RefCell::new(None));
-        let name_cell_ref: Rc<RefCell<Option<gtk4::CellRendererText>>> =
+        // Explorer sidebar state (Phase A.2b-2): flat-row model backing
+        // the DrawingArea. Initialised from the engine's cwd so the root
+        // folder starts expanded, matching the TUI's default.
+        let explorer_state: Rc<RefCell<ExplorerState>> = {
+            let root = engine.borrow().cwd.clone();
+            Rc::new(RefCell::new(ExplorerState::new(&root)))
+        };
+        let explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
@@ -1949,10 +1900,8 @@ impl SimpleComponent for App {
             sidebar_visible,
             window: root.clone(),
             active_panel: SidebarPanel::Explorer,
-            tree_store: Some(tree_store.clone()),
-            tree_has_focus: false,
-            file_tree_view: file_tree_view_ref.clone(),
-            name_cell: name_cell_ref.clone(),
+            explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
+            explorer_state: explorer_state.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
@@ -2025,7 +1974,7 @@ impl SimpleComponent for App {
         let widgets = view_output!();
 
         // Store widget references
-        *file_tree_view_ref.borrow_mut() = Some(widgets.file_tree_view.clone());
+        *explorer_sidebar_da_ref.borrow_mut() = Some(widgets.explorer_da.clone());
         *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
         *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
         *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
@@ -2094,6 +2043,79 @@ impl SimpleComponent for App {
             widgets.settings_da.add_controller(scroll_ctrl);
         }
         *settings_da_ref.borrow_mut() = Some(widgets.settings_da.clone());
+
+        // ── Explorer sidebar (Phase A.2b-2: native TreeView → DrawingArea) ─────
+        {
+            let engine_d = engine.clone();
+            let state_d = explorer_state.clone();
+            widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine_d.borrow();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
+                let font_desc = FontDescription::from_string(UI_FONT);
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                layout.set_font_description(Some(&font_desc));
+                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                let line_height =
+                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                let state = state_d.borrow();
+                let has_focus = engine.explorer_has_focus;
+                let tree = explorer::explorer_to_tree_view(&state, has_focus, &engine);
+                draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);
+            });
+        }
+        {
+            let sender_ex = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                sender_ex
+                    .send(Msg::ExplorerKey {
+                        key_name,
+                        unicode,
+                        ctrl,
+                    })
+                    .ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.explorer_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_ex = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, n_press, x, y| {
+                sender_ex.send(Msg::ExplorerClick { x, y, n_press }).ok();
+            });
+            widgets.explorer_da.add_controller(gesture);
+        }
+        {
+            let sender_ex = sender.input_sender().clone();
+            let right_click = gtk4::GestureClick::new();
+            right_click.set_button(3);
+            right_click.connect_pressed(move |_, _n_press, x, y| {
+                sender_ex.send(Msg::ExplorerRightClick { x, y }).ok();
+            });
+            widgets.explorer_da.add_controller(right_click);
+        }
+        {
+            let sender_ex = sender.input_sender().clone();
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                sender_ex.send(Msg::ExplorerScroll(dy)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.explorer_da.add_controller(scroll_ctrl);
+        }
+
+        // Drag-and-drop from the explorer was part of the native
+        // `gtk4::TreeView` setup. DnD is deferred — tracked as
+        // https://github.com/JDonaghy/vimcode/issues/149.
 
         // ── Sidebar resize drag handle ─────────────────────────────────────────
         // Attach the GestureDrag to main_hbox (which never moves during a sidebar
@@ -2990,633 +3012,6 @@ impl SimpleComponent for App {
                     btn.set_tooltip_text(Some("Maximize"));
                 }
             });
-        }
-
-        // Build tree from current working directory
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (dir_fg_hex, file_fg_hex) = {
-            let theme = Theme::from_name(&engine.borrow().settings.colorscheme);
-            (
-                theme.explorer_dir_fg.to_hex(),
-                theme.explorer_file_fg.to_hex(),
-            )
-        };
-        build_file_tree_with_root(
-            &tree_store,
-            &cwd,
-            engine.borrow().settings.show_hidden_files,
-            engine.borrow().settings.explorer_sort_case_insensitive,
-            &dir_fg_hex,
-            &file_fg_hex,
-        );
-
-        // Read font family for nerd font icon rendering.  Prefer the bundled
-        // "Symbols Nerd Font" (installed at startup) so icons render even if the
-        // user's editor font lacks Nerd Font glyphs.
-        let user_font = engine.borrow().settings.font_family.clone();
-        let nf_font = format!("Symbols Nerd Font, {user_font}");
-
-        // Setup TreeView columns
-        // Icon + filename column (indent together via GTK expander)
-        let col = gtk4::TreeViewColumn::new();
-
-        // Icon cell renderer (non-expanding) — uses bundled nerd font for glyph support
-        let icon_cell = gtk4::CellRendererText::new();
-        icon_cell.set_property("font", &nf_font);
-        col.pack_start(&icon_cell, false);
-        col.add_attribute(&icon_cell, "text", 0);
-        col.add_attribute(&icon_cell, "foreground", 3);
-
-        // Filename cell renderer (expanding) — made editable on demand for inline rename
-        let name_cell = gtk4::CellRendererText::new();
-        name_cell.set_property("ellipsize", gtk4::pango::EllipsizeMode::End);
-        col.pack_start(&name_cell, true);
-        col.add_attribute(&name_cell, "text", 1);
-        col.add_attribute(&name_cell, "foreground", 3);
-
-        // Store name_cell for later use by StartInlineNewFile/Folder handlers
-        *name_cell_ref.borrow_mut() = Some(name_cell.clone());
-
-        // Handle inline cell editing for rename and new file/folder creation
-        {
-            let sender_for_edit = sender.clone();
-            let ts_for_edit = tree_store.clone();
-            let name_cell_for_cancel = name_cell.clone();
-            let ts_for_cancel = tree_store.clone();
-            let sender_for_cancel = sender.clone();
-            name_cell.connect_edited(move |cell, tree_path, new_text| {
-                // Disable editable after edit completes
-                cell.set_property("editable", false);
-                let new_name = new_text.trim();
-                // Get the path/marker from the TreeStore (column 2)
-                if let Some(iter) = ts_for_edit.iter(&tree_path) {
-                    let path_str: String =
-                        ts_for_edit.get_value(&iter, 2).get().unwrap_or_default();
-                    if let Some(parent_dir) = path_str.strip_prefix("__NEW_FILE__") {
-                        // New file creation — remove temporary row
-                        ts_for_edit.remove(&iter);
-                        if !new_name.is_empty() {
-                            sender_for_edit.input(Msg::CreateFile(
-                                PathBuf::from(parent_dir),
-                                new_name.to_string(),
-                            ));
-                        }
-                    } else if let Some(parent_dir) = path_str.strip_prefix("__NEW_FOLDER__") {
-                        // New folder creation — remove temporary row
-                        ts_for_edit.remove(&iter);
-                        if !new_name.is_empty() {
-                            sender_for_edit.input(Msg::CreateFolder(
-                                PathBuf::from(parent_dir),
-                                new_name.to_string(),
-                            ));
-                        }
-                    } else if !new_name.is_empty() && !path_str.is_empty() {
-                        // Regular rename
-                        let old_path = PathBuf::from(&path_str);
-                        sender_for_edit.input(Msg::RenameFile(old_path, new_name.to_string()));
-                    }
-                }
-            });
-            {
-                let ts = tree_store.clone();
-                name_cell.connect_editing_started(move |_cell, editable, tree_path| {
-                    // For renames, pre-select only the stem (filename without
-                    // extension) so the user can type a new name while keeping
-                    // the extension.  New-file entries start empty, so no selection.
-                    use gtk4::prelude::{EditableExt, TreeModelExt};
-                    let path_str: String = ts
-                        .iter(&tree_path)
-                        .and_then(|iter| ts.get_value(&iter, 2).get::<String>().ok())
-                        .unwrap_or_default();
-                    // Skip marker rows (new file/folder creation)
-                    if path_str.starts_with("__NEW_FILE__")
-                        || path_str.starts_with("__NEW_FOLDER__")
-                        || path_str.is_empty()
-                    {
-                        return;
-                    }
-                    // Get filename from path
-                    let name = std::path::Path::new(&path_str)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if name.is_empty() {
-                        return;
-                    }
-                    let is_dir = std::path::Path::new(&path_str).is_dir();
-                    let stem_end = if is_dir {
-                        name.len()
-                    } else {
-                        name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len())
-                    };
-                    // The editable widget is typically an Entry implementing Editable.
-                    // Upcast to Object then try downcasting to Editable.
-                    let widget: gtk4::Widget = editable.clone().upcast();
-                    if let Ok(e) = widget.dynamic_cast::<gtk4::Entry>() {
-                        // Defer selection to idle so GTK finishes setting up the editor.
-                        gtk4::glib::idle_add_local_once(move || {
-                            e.select_region(0, stem_end as i32);
-                        });
-                    }
-                });
-            }
-            name_cell.connect_editing_canceled(move |_cell| {
-                // Disable editable when editing is cancelled
-                name_cell_for_cancel.set_property("editable", false);
-                // Remove any temporary new-entry rows
-                if let Some(iter) = ts_for_cancel.iter_first() {
-                    remove_new_entry_rows(&ts_for_cancel, &iter);
-                }
-                sender_for_cancel.input(Msg::RefreshFileTree);
-            });
-        }
-
-        col.set_expand(true);
-        // Fixed sizing lets the column shrink to fit available space
-        // instead of growing to the natural width of the longest filename.
-        col.set_sizing(gtk4::TreeViewColumnSizing::Fixed);
-        widgets.file_tree_view.append_column(&col);
-
-        // Separate right-aligned column for indicators (M/error/warning badges).
-        // A dedicated column ensures indicators are always visible regardless of
-        // tree width — packing them into the name column caused clipping.
-        let indicator_col = gtk4::TreeViewColumn::new();
-        let indicator_cell = gtk4::CellRendererText::new();
-        indicator_cell.set_property("xalign", 1.0f32);
-        indicator_col.pack_start(&indicator_cell, false);
-        indicator_col.add_attribute(&indicator_cell, "text", 4);
-        indicator_col.add_attribute(&indicator_cell, "foreground", 5);
-        widgets.file_tree_view.append_column(&indicator_col);
-
-        // Set the model on the TreeView
-        widgets.file_tree_view.set_model(Some(&tree_store));
-
-        // Lazy-load: populate directory children when the user expands a row.
-        {
-            let engine_ref = engine.clone();
-            let tree_store_ref = tree_store.clone();
-            widgets
-                .file_tree_view
-                .connect_row_expanded(move |_tree_view, iter, _tree_path| {
-                    let e = engine_ref.borrow();
-                    let show_hidden = e.settings.show_hidden_files;
-                    let case_insensitive = e.settings.explorer_sort_case_insensitive;
-                    let theme = Theme::from_name(&e.settings.colorscheme);
-                    let dir_fg_hex = theme.explorer_dir_fg.to_hex();
-                    let file_fg_hex = theme.explorer_file_fg.to_hex();
-                    drop(e);
-                    tree_row_expanded(
-                        &tree_store_ref,
-                        iter,
-                        show_hidden,
-                        case_insensitive,
-                        &dir_fg_hex,
-                        &file_fg_hex,
-                    );
-                });
-        }
-
-        // Expand the root node so the tree contents are visible
-        widgets
-            .file_tree_view
-            .expand_row(&gtk4::TreePath::from_indices(&[0]), false);
-
-        // Highlight the active file from the restored session in the tree.
-        if let Some(path) = engine.borrow().file_path().cloned() {
-            highlight_file_in_tree(&widgets.file_tree_view, &path);
-        }
-
-        // Connect double-click signal to open files
-        let sender_for_tree = sender.clone();
-        widgets
-            .file_tree_view
-            .connect_row_activated(move |tree_view, tree_path, _column| {
-                if let Some(model) = tree_view.model() {
-                    if let Some(iter) = model.iter(tree_path) {
-                        // Use TreeModelExt::get to retrieve the value
-                        let full_path: String = model.get_value(&iter, 2).get().unwrap_or_default();
-
-                        let path_buf = PathBuf::from(full_path);
-                        if path_buf.is_file() {
-                            sender_for_tree.input(Msg::OpenFileFromSidebar(path_buf));
-                        } else if path_buf.is_dir() {
-                            if tree_view.row_expanded(tree_path) {
-                                tree_view.collapse_row(tree_path);
-                            } else {
-                                tree_view.expand_row(tree_path, false);
-                            }
-                        }
-                    }
-                }
-            });
-
-        // Connect single-click for preview mode
-        let sender_for_click = sender.clone();
-        let gesture = gtk4::GestureClick::new();
-        gesture.set_button(1); // Left mouse button
-        gesture.connect_released(move |gesture, n_press, x, y| {
-            if n_press != 1 {
-                return; // Double-click handled by row_activated
-            }
-            let widget = gesture.widget();
-            if let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() {
-                if let Some((Some(path), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
-                    if let Some(model) = tree_view.model() {
-                        if let Some(iter) = model.iter(&path) {
-                            let full_path: String =
-                                model.get_value(&iter, 2).get().unwrap_or_default();
-                            let path_buf = PathBuf::from(full_path);
-                            if path_buf.is_file() {
-                                sender_for_click.input(Msg::PreviewFileFromSidebar(path_buf));
-                            } else {
-                                // Clicking a directory keeps explorer focus so
-                                // keyboard shortcuts (a/A/D/r) work immediately.
-                                sender_for_click.input(Msg::FocusExplorer);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        widgets.file_tree_view.add_controller(gesture);
-
-        // Right-click context menu — plain Popover with flat buttons (no
-        // PopoverMenu, avoids GTK4 internal ScrolledWindow sizing issues).
-        {
-            let sender_rc = sender.clone();
-            let ctx_pop_rc = active_ctx_popover_ref.clone();
-            let engine_ctx = engine.clone();
-            let name_cell_rc = name_cell.clone();
-            let right_click = gtk4::GestureClick::new();
-            right_click.set_button(3);
-            right_click.connect_pressed(move |gesture, _n_press, x, y| {
-                let widget = gesture.widget();
-                let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
-                    return;
-                };
-                // Select the row under cursor
-                if let Some((Some(tp), _, _, _)) = tree_view.path_at_pos(x as i32, y as i32) {
-                    tree_view.selection().select_path(&tp);
-                }
-                let selected_path: Option<PathBuf> =
-                    tree_view.selection().selected().and_then(|(model, iter)| {
-                        let s: String = model.get_value(&iter, 2).get().ok()?;
-                        if s.is_empty() {
-                            None
-                        } else {
-                            Some(PathBuf::from(s))
-                        }
-                    });
-                // If clicking empty space below last entry, use workspace root
-                let (target, is_dir) = if let Some(path) = selected_path {
-                    let d = path.is_dir();
-                    (path, d)
-                } else {
-                    let root = engine_ctx.borrow().cwd.clone();
-                    (root, true)
-                };
-
-                // Build gio::Menu from engine-generated items (single source of truth).
-                engine_ctx
-                    .borrow_mut()
-                    .open_explorer_context_menu(target.clone(), is_dir, 0, 0);
-                let items: Vec<core::engine::ContextMenuItem> = engine_ctx
-                    .borrow()
-                    .context_menu
-                    .as_ref()
-                    .map(|cm| cm.items.clone())
-                    .unwrap_or_default();
-                engine_ctx.borrow_mut().close_context_menu();
-                let menu = build_gio_menu_from_engine_items(&items, "ctx");
-
-                // Collect enabled state from engine items keyed by action string.
-                let ctx_enabled: std::collections::HashMap<String, bool> = items
-                    .iter()
-                    .map(|it| (it.action.clone(), it.enabled))
-                    .collect();
-
-                // Build action group. `add_ctx_action` respects engine-driven enabled state.
-                let actions = gtk4::gio::SimpleActionGroup::new();
-                // Helper: register action and apply engine-driven enabled state.
-                let add_action = |actions: &gtk4::gio::SimpleActionGroup,
-                                  a: &gtk4::gio::SimpleAction| {
-                    if ctx_enabled.get(a.name().as_str()) == Some(&false) {
-                        a.set_enabled(false);
-                    }
-                    actions.add_action(a);
-                };
-                let parent_dir = if target.is_dir() {
-                    target.clone()
-                } else {
-                    target
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf()
-                };
-
-                {
-                    let s = sender_rc.clone();
-                    let pd = parent_dir.clone();
-                    let pop_ref = ctx_pop_rc.clone();
-                    let a = gtk4::gio::SimpleAction::new("new_file", None);
-                    a.connect_activate(move |_, _| {
-                        // Close popover first so it doesn't steal focus from inline editor
-                        if let Some(ref p) = *pop_ref.borrow() {
-                            p.popdown();
-                        }
-                        s.input(Msg::StartInlineNewFile(pd.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let pd = parent_dir.clone();
-                    let pop_ref = ctx_pop_rc.clone();
-                    let a = gtk4::gio::SimpleAction::new("new_folder", None);
-                    a.connect_activate(move |_, _| {
-                        // Close popover first so it doesn't steal focus from inline editor
-                        if let Some(ref p) = *pop_ref.borrow() {
-                            p.popdown();
-                        }
-                        s.input(Msg::StartInlineNewFolder(pd.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let tv = tree_view.clone();
-                    let nc = name_cell_rc.clone();
-                    let pop_ref = ctx_pop_rc.clone();
-                    let a = gtk4::gio::SimpleAction::new("rename", None);
-                    a.connect_activate(move |_, _| {
-                        // Close the context menu popover first so it doesn't
-                        // steal focus from the inline editor.
-                        if let Some(ref p) = *pop_ref.borrow() {
-                            p.popdown();
-                        }
-                        // Delay editing start so the popover has time to
-                        // fully close — otherwise GTK fires editing_canceled
-                        // immediately when focus shifts.
-                        let tv2 = tv.clone();
-                        let nc2 = nc.clone();
-                        gtk4::glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(50),
-                            move || {
-                                nc2.set_property("editable", true);
-                                if let Some(column) = tv2.column(0) {
-                                    if let Some((model, iter)) = tv2.selection().selected() {
-                                        let tree_path = model.path(&iter);
-                                        gtk4::prelude::TreeViewExt::set_cursor(
-                                            &tv2,
-                                            &tree_path,
-                                            Some(&column),
-                                            true,
-                                        );
-                                    }
-                                }
-                            },
-                        );
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("delete", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::ConfirmDeletePath(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("copy_path", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::CopyPath(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("copy_relative_path", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::CopyRelativePath(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("reveal", None);
-                    a.connect_activate(move |_, _| {
-                        let dir = if tgt.is_dir() {
-                            tgt.clone()
-                        } else {
-                            tgt.parent()
-                                .unwrap_or(std::path::Path::new("."))
-                                .to_path_buf()
-                        };
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(&dir)
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("select_for_diff", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::SelectForDiff(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("diff_with_selected", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::DiffWithSelected(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("open_side", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::OpenSide(tgt.clone()));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let eng = engine_ctx.clone();
-                    let tgt = target.clone();
-                    let a = gtk4::gio::SimpleAction::new("open_side_vsplit", None);
-                    a.connect_activate(move |_, _| {
-                        let mut e = eng.borrow_mut();
-                        e.split_window(crate::core::window::SplitDirection::Vertical, None);
-                        let _ = e.open_file_with_mode(&tgt, crate::core::OpenMode::Permanent);
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let tgt = target.clone();
-                    let tgt_is_dir = is_dir;
-                    let a = gtk4::gio::SimpleAction::new("open_terminal", None);
-                    a.connect_activate(move |_, _| {
-                        let dir = if tgt_is_dir {
-                            tgt.clone()
-                        } else {
-                            tgt.parent()
-                                .unwrap_or(std::path::Path::new("."))
-                                .to_path_buf()
-                        };
-                        s.input(Msg::OpenTerminalAt(dir));
-                    });
-                    add_action(&actions, &a);
-                }
-                {
-                    let s = sender_rc.clone();
-                    let a = gtk4::gio::SimpleAction::new("find_in_folder", None);
-                    a.connect_activate(move |_, _| {
-                        s.input(Msg::ToggleFocusSearch);
-                    });
-                    add_action(&actions, &a);
-                }
-
-                // Clean up previous popover, create new PopoverMenu.
-                let n_rows = menu_row_count(&menu);
-                // Parent to the ScrolledWindow (tree_view's parent) so that
-                // hover events work correctly — PopoverMenu inside a
-                // ScrolledWindow's child doesn't receive motion events properly.
-                let popover_parent: gtk4::Widget = tree_view
-                    .parent()
-                    .unwrap_or_else(|| tree_view.clone().upcast());
-                let (px, py) = tree_view
-                    .translate_coordinates(&popover_parent, x, y)
-                    .unwrap_or((x, y));
-                popover_parent.insert_action_group("ctx", Some(&actions));
-                swap_ctx_popover(&ctx_pop_rc, {
-                    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
-                    popover.set_parent(&popover_parent);
-                    popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(
-                        px as i32, py as i32, 1, 1,
-                    )));
-                    popover.set_has_arrow(false);
-                    popover.set_position(gtk4::PositionType::Right);
-                    popover.set_size_request(-1, n_rows * 22 + 14);
-                    popover
-                });
-                if let Some(ref p) = *ctx_pop_rc.borrow() {
-                    p.popup();
-                }
-            });
-            widgets.file_tree_view.add_controller(right_click);
-        }
-
-        // Drag-and-drop: DragSource (initiator) + DropTarget (receiver)
-        //
-        // We store the dragged path in a shared Rc so the drop handler can
-        // read it directly — avoids relying on GValue content negotiation
-        // which can crash on some GTK4 builds when types don't match.
-        {
-            let drag_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
-
-            // DragSource
-            let drag_source = gtk4::DragSource::new();
-            drag_source.set_actions(gtk4::gdk::DragAction::MOVE);
-            let drag_path_src = drag_path.clone();
-            drag_source.connect_prepare(move |ds, x, y| {
-                let widget = ds.widget();
-                let tree_view = widget.downcast_ref::<gtk4::TreeView>()?;
-                let file_path: Option<PathBuf> = (|| {
-                    let (tp, _, _, _) = tree_view.path_at_pos(x as i32, y as i32)?;
-                    let model = tree_view.model()?;
-                    let iter = model.iter(&tp?)?;
-                    let s: String = model.get_value(&iter, 2).get().ok()?;
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(PathBuf::from(s))
-                    }
-                })();
-                *drag_path_src.borrow_mut() = file_path.clone();
-                // Provide a dummy string content so GTK accepts the drag gesture.
-                file_path.map(|p| {
-                    let path_str: String = p.to_string_lossy().into_owned();
-                    gtk4::gdk::ContentProvider::for_value(&path_str.to_value())
-                })
-            });
-            let drag_path_icon = drag_path.clone();
-            drag_source.connect_drag_begin(move |_source, drag| {
-                // Set a custom drag icon — prevents GTK from snapshotting the
-                // TreeView row, which can cause a core dump on GTK4 >= 4.10.
-                let icon_widget = gtk4::DragIcon::for_drag(drag);
-                if let Some(drag_icon) = icon_widget.downcast_ref::<gtk4::DragIcon>() {
-                    let name = drag_path_icon
-                        .borrow()
-                        .as_ref()
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| "File".to_string());
-                    let label = gtk4::Label::new(Some(&name));
-                    drag_icon.set_child(Some(&label));
-                }
-            });
-            let drag_path_end = drag_path.clone();
-            drag_source.connect_drag_end(move |_source, _drag, _delete_data| {
-                // Clear leftover drag state (covers cancelled/failed drags).
-                *drag_path_end.borrow_mut() = None;
-            });
-            widgets.file_tree_view.add_controller(drag_source);
-
-            // DropTarget
-            let sender_drop = sender.clone();
-            let drag_path_drop = drag_path.clone();
-            let drop_target =
-                gtk4::DropTarget::new(gtk4::glib::Type::STRING, gtk4::gdk::DragAction::MOVE);
-            drop_target.connect_drop(move |dt, _value, x, y| {
-                // Read source from the shared Rc (set by connect_prepare).
-                let src = drag_path_drop.borrow_mut().take();
-                let Some(src) = src else {
-                    return false;
-                };
-                let widget = dt.widget();
-                let Some(tree_view) = widget.downcast_ref::<gtk4::TreeView>() else {
-                    return false;
-                };
-                // Find destination directory at drop position.
-                let dest_dir: Option<PathBuf> = (|| {
-                    let (tp, _, _, _) = tree_view.path_at_pos(x as i32, y as i32)?;
-                    let model = tree_view.model()?;
-                    let iter = model.iter(&tp?)?;
-                    let s: String = model.get_value(&iter, 2).get().ok()?;
-                    if s.is_empty() {
-                        return None;
-                    }
-                    let p = PathBuf::from(s);
-                    Some(if p.is_dir() {
-                        p
-                    } else {
-                        p.parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .to_path_buf()
-                    })
-                })();
-                let Some(dest_dir) = dest_dir else {
-                    return false;
-                };
-                // Don't move to the same directory
-                if src.parent() == Some(dest_dir.as_path()) {
-                    return false;
-                }
-                sender_drop.input(Msg::MoveFile(src, dest_dir));
-                true
-            });
-            widgets.file_tree_view.add_controller(drop_target);
         }
 
         // Set the actual title after widget creation
@@ -4549,6 +3944,15 @@ impl SimpleComponent for App {
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
                 self.handle_settings_msg(msg);
             }
+            Msg::ExplorerKey { .. }
+            | Msg::ExplorerClick { .. }
+            | Msg::ExplorerRightClick { .. }
+            | Msg::ExplorerScroll(_)
+            | Msg::PromptRenameFile(_)
+            | Msg::PromptNewFile(_)
+            | Msg::PromptNewFolder(_) => {
+                self.handle_explorer_msg(msg, &sender);
+            }
             Msg::ExtPanelKey(_, _)
             | Msg::ExtPanelClick(_, _, _)
             | Msg::ExtPanelRightClick(_, _)
@@ -4666,6 +4070,57 @@ fn sync_scrollbar_positions(
 }
 
 impl App {
+    /// Reveal `target` in the explorer sidebar: expand all ancestors,
+    /// rebuild the row list, select the matching row, scroll into view,
+    /// and queue a redraw of the explorer DrawingArea. Phase A.2b-2
+    /// replacement for `highlight_file_in_tree` (which operated on the
+    /// native `gtk4::TreeView`).
+    fn reveal_path_in_explorer(&self, target: &Path) {
+        let engine = self.engine.borrow();
+        let root = engine.cwd.clone();
+        let show_hidden = engine.settings.show_hidden_files;
+        let case_insensitive = engine.settings.explorer_sort_case_insensitive;
+        drop(engine);
+        let viewport_rows = self
+            .explorer_sidebar_da_ref
+            .borrow()
+            .as_ref()
+            .map(|da| {
+                let h = da.height() as f64;
+                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
+                    .round()
+                    .max(1.0);
+                (h / item_h).floor().max(0.0) as usize
+            })
+            .unwrap_or(20);
+        self.explorer_state.borrow_mut().reveal_path(
+            target,
+            &root,
+            viewport_rows,
+            show_hidden,
+            case_insensitive,
+        );
+        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            da.queue_draw();
+        }
+    }
+
+    /// Rebuild the explorer flat-row list from disk (used after file
+    /// create/rename/delete/move or when `cwd` changes) and redraw the DA.
+    fn refresh_explorer(&self) {
+        let engine = self.engine.borrow();
+        let root = engine.cwd.clone();
+        let show_hidden = engine.settings.show_hidden_files;
+        let case_insensitive = engine.settings.explorer_sort_case_insensitive;
+        drop(engine);
+        self.explorer_state
+            .borrow_mut()
+            .rebuild(&root, show_hidden, case_insensitive);
+        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            da.queue_draw();
+        }
+    }
+
     /// Save the current session state and exit the process immediately.
     /// This is the canonical quit path — called when there are no unsaved changes.
     fn save_session_and_exit(&self) -> ! {
@@ -4717,13 +4172,10 @@ impl App {
                 match engine.open_file_with_mode(&path, OpenMode::Permanent) {
                     Ok(()) => {
                         drop(engine);
-                        if let Some(ref tree) = *self.file_tree_view.borrow() {
-                            highlight_file_in_tree(tree, &path);
-                        }
+                        self.reveal_path_in_explorer(&path);
                         if let Some(ref drawing) = *self.drawing_area.borrow() {
                             drawing.grab_focus();
                         }
-                        self.tree_has_focus = false;
                     }
                     Err(e) => {
                         engine.message = e;
@@ -5233,7 +4685,7 @@ impl App {
             let key_mapped = map_gtk_key_name(key_name.as_str());
             if key_mapped == "Escape" {
                 self.engine.borrow_mut().explorer_has_focus = false;
-                self.tree_has_focus = false;
+                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }
@@ -5430,9 +4882,7 @@ impl App {
                 let file_path = engine.file_path().cloned();
                 drop(engine);
                 if let Some(path) = file_path {
-                    if let Some(ref tree) = *self.file_tree_view.borrow() {
-                        highlight_file_in_tree(tree, &path);
-                    }
+                    self.reveal_path_in_explorer(&path);
                 }
             }
         }
@@ -5679,17 +5129,10 @@ impl App {
                 da.queue_draw();
             }
         }
-        // Check whether the explorer cell renderer is actively being edited.
-        // Many tree operations (indicator update, refresh) must be deferred
-        // while editing is active or they destroy the GTK cell editor widget.
-        let cell_editing = self.name_cell.borrow().as_ref().is_some_and(|nc| {
-            use gtk4::prelude::CellRendererExt;
-            nc.is_editing()
-        });
-        // Explorer refresh after confirmed file move.
-        // Defer while a cell is being inline-edited — store.clear() would
-        // destroy the active editor widget.
-        if !cell_editing && self.engine.borrow().explorer_needs_refresh {
+        // Explorer refresh after confirmed file move. Phase A.2b-2 removed
+        // the inline cell-editor, so there's no widget-destruction race to
+        // defer around any more — refresh whenever the engine asks for it.
+        if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             sender.input(Msg::RefreshFileTree);
         }
@@ -5820,28 +5263,16 @@ impl App {
                 self.draw_needed.set(true);
             }
         }
-        // Update explorer tree indicators (modified/diagnostics) every ~1s.
-        // Skip while a cell is being edited (guard computed above).
-        if !cell_editing
-            && self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1)
-        {
+        // Explorer tree indicators (modified/diagnostics) are now pulled by
+        // the DrawingArea's draw callback from `engine.explorer_indicators()`
+        // via the `explorer_to_tree_view` adapter, so we just trigger a
+        // redraw on a 1 Hz cadence to pick up background changes.
+        if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tree_indicator_update = std::time::Instant::now();
-            if let Some(ref store) = self.tree_store {
-                let engine = self.engine.borrow();
-                let (git_statuses, diag_counts) = engine.explorer_indicators();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let default_fg = theme.explorer_file_fg.to_hex();
-                update_tree_indicators(
-                    store,
-                    &git_statuses,
-                    &diag_counts,
-                    &theme.git_added.to_hex(),
-                    &theme.git_modified.to_hex(),
-                    &theme.git_deleted.to_hex(),
-                    &theme.diagnostic_error.to_hex(),
-                    &theme.diagnostic_warning.to_hex(),
-                    &default_fg,
-                );
+            if self.active_panel == SidebarPanel::Explorer {
+                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
             }
         }
         // Sync the OS window title with the active buffer name (taskbar/pager).
@@ -6621,15 +6052,7 @@ impl App {
                                 drop(engine);
                                 if new_file_path != file_before_click {
                                     if let Some(path) = new_file_path {
-                                        let tree_ref = self.file_tree_view.clone();
-                                        gtk4::glib::timeout_add_local_once(
-                                            std::time::Duration::from_millis(50),
-                                            move || {
-                                                if let Some(ref tree) = *tree_ref.borrow() {
-                                                    highlight_file_in_tree(tree, &path);
-                                                }
-                                            },
-                                        );
+                                        self.reveal_path_in_explorer(&path);
                                     }
                                 }
                                 self.draw_needed.set(true);
@@ -6644,15 +6067,12 @@ impl App {
 
                     // Reveal the active file in the sidebar tree only when the
                     // active file actually changed (e.g. tab click), NOT on every
-                    // editor click.  highlight_file_in_tree does a full DFS of the
-                    // GTK TreeStore which is O(N_files) and very slow in debug builds.
+                    // editor click.
                     let new_file_path = engine.file_path().cloned();
                     drop(engine);
                     if new_file_path != file_before_click {
                         if let Some(path) = new_file_path {
-                            if let Some(ref tree) = *self.file_tree_view.borrow() {
-                                highlight_file_in_tree(tree, &path);
-                            }
+                            self.reveal_path_in_explorer(&path);
                         }
                     }
                     self.draw_needed.set(true);
@@ -7778,7 +7198,7 @@ impl App {
 
                 // Give focus to the debug sidebar
                 engine.dap_sidebar_has_focus = true;
-                self.tree_has_focus = false;
+                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
 
                 if row_idx == 0 {
                     // Header — no-op
@@ -7924,7 +7344,7 @@ impl App {
                 if lh <= 0.0 {
                     return;
                 }
-                self.tree_has_focus = false;
+                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.grab_focus();
                 }
@@ -9011,6 +8431,11 @@ impl App {
                                 da.grab_focus();
                             }
                         }
+                        SidebarPanel::Explorer => {
+                            if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -9029,14 +8454,10 @@ impl App {
                     engine.open_file_in_tab(&path);
                     engine.explorer_has_focus = false;
                 }
-                self.tree_has_focus = false;
-                if let Some(ref tree) = *self.file_tree_view.borrow() {
-                    highlight_file_in_tree(tree, &path);
-                }
+                self.reveal_path_in_explorer(&path);
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }
-                self.tree_has_focus = false;
                 self.draw_needed.set(true);
             }
             Msg::OpenSide(path) => {
@@ -9048,7 +8469,7 @@ impl App {
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }
-                self.tree_has_focus = false;
+                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 self.draw_needed.set(true);
             }
             Msg::PreviewFileFromSidebar(path) => {
@@ -9056,13 +8477,10 @@ impl App {
                 // Single-click: open as a preview tab (replaceable by next single-click).
                 engine.open_file_preview(&path);
                 drop(engine);
-                if let Some(ref tree) = *self.file_tree_view.borrow() {
-                    highlight_file_in_tree(tree, &path);
-                }
+                self.reveal_path_in_explorer(&path);
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }
-                self.tree_has_focus = false;
                 self.draw_needed.set(true);
             }
             Msg::CreateFile(parent_dir, name) => {
@@ -9122,14 +8540,7 @@ impl App {
                     Ok(_) => {
                         self.engine.borrow_mut().message = format!("Created folder: {}", name);
                         sender.input(Msg::RefreshFileTree);
-                        // Highlight the new folder in the tree after refresh
-                        let tree_ref = self.file_tree_view.clone();
-                        let path = folder_path.clone();
-                        gtk4::glib::idle_add_local_once(move || {
-                            if let Some(ref tree) = *tree_ref.borrow() {
-                                highlight_file_in_tree(tree, &path);
-                            }
-                        });
+                        self.reveal_path_in_explorer(&folder_path);
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message =
@@ -9139,95 +8550,77 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::StartInlineNewFile(parent_dir) => {
-                let is_folder = false;
-                self.start_inline_new_entry(parent_dir, is_folder);
+                sender.input(Msg::PromptNewFile(parent_dir));
             }
             Msg::StartInlineNewFolder(parent_dir) => {
-                let is_folder = true;
-                self.start_inline_new_entry(parent_dir, is_folder);
+                sender.input(Msg::PromptNewFolder(parent_dir));
             }
             Msg::ExplorerActivateSelected => {
-                if let Some(ref tv) = *self.file_tree_view.borrow() {
-                    // Try cursor position first (tracks arrow-key navigation),
-                    // fall back to selection.
-                    use gtk4::prelude::TreeViewExt;
-                    let tp = TreeViewExt::cursor(tv).0.or_else(|| {
-                        tv.selection()
-                            .selected()
-                            .map(|(_, iter)| tv.model().unwrap().path(&iter))
-                    });
-                    let model = tv.model();
-                    if let (Some(tp), Some(model)) = (tp, model) {
-                        // Sync selection to cursor so visual highlight matches.
-                        tv.selection().select_path(&tp);
-                        if let Some(iter) = model.iter(&tp) {
-                            let full_path: String =
-                                model.get_value(&iter, 2).get().unwrap_or_default();
-                            let path_buf = PathBuf::from(&full_path);
-                            if path_buf.is_dir() {
-                                if tv.row_expanded(&tp) {
-                                    tv.collapse_row(&tp);
-                                } else {
-                                    tv.expand_row(&tp, false);
-                                }
-                            } else if path_buf.is_file() {
-                                sender.input(Msg::OpenFileFromSidebar(path_buf));
-                            }
+                let state = self.explorer_state.borrow();
+                if state.selected < state.rows.len() {
+                    let row = &state.rows[state.selected];
+                    let path = row.path.clone();
+                    let is_dir = row.is_dir;
+                    drop(state);
+                    if is_dir {
+                        let root = self.engine.borrow().cwd.clone();
+                        let show_hidden = self.engine.borrow().settings.show_hidden_files;
+                        let case_insensitive =
+                            self.engine.borrow().settings.explorer_sort_case_insensitive;
+                        let idx = self.explorer_state.borrow().selected;
+                        self.explorer_state.borrow_mut().toggle_dir(
+                            idx,
+                            &root,
+                            show_hidden,
+                            case_insensitive,
+                        );
+                        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                            da.queue_draw();
                         }
+                    } else {
+                        sender.input(Msg::OpenFileFromSidebar(path));
                     }
                 }
             }
             Msg::ExplorerAction(key_str) => {
                 use crate::core::settings::ExplorerAction;
-                // Resolve the action first, then drop the engine borrow before
-                // calling methods that may re-borrow (e.g. start_inline_new_entry).
                 let action = key_str
                     .chars()
                     .next()
                     .and_then(|ch| self.engine.borrow().settings.explorer_keys.resolve(ch));
                 if let Some(action) = action {
+                    let selected_path: Option<PathBuf> = {
+                        let state = self.explorer_state.borrow();
+                        if state.selected < state.rows.len() {
+                            Some(state.rows[state.selected].path.clone())
+                        } else {
+                            None
+                        }
+                    };
+                    let parent_dir = match selected_path.as_ref() {
+                        Some(p) if p.is_dir() => p.clone(),
+                        Some(p) => p
+                            .parent()
+                            .map(|pp| pp.to_path_buf())
+                            .unwrap_or_else(|| self.engine.borrow().cwd.clone()),
+                        None => self.engine.borrow().cwd.clone(),
+                    };
                     match action {
                         ExplorerAction::NewFile => {
-                            let parent_dir = selected_parent_dir_from_app(&self.file_tree_view);
-                            self.start_inline_new_entry(parent_dir, false);
+                            sender.input(Msg::PromptNewFile(parent_dir));
                         }
                         ExplorerAction::NewFolder => {
-                            let parent_dir = selected_parent_dir_from_app(&self.file_tree_view);
-                            self.start_inline_new_entry(parent_dir, true);
+                            sender.input(Msg::PromptNewFolder(parent_dir));
                         }
                         ExplorerAction::Delete => {
-                            if let Some(path) = selected_file_path_from_app(&self.file_tree_view) {
+                            if let Some(path) = selected_path {
                                 sender.input(Msg::ConfirmDeletePath(path));
                             }
                         }
                         ExplorerAction::Rename => {
-                            // Trigger GTK native inline cell editing.
-                            // Slight delay so any pending focus changes settle.
-                            let tv_ref = self.file_tree_view.clone();
-                            let nc_ref = self.name_cell.clone();
-                            gtk4::glib::timeout_add_local_once(
-                                std::time::Duration::from_millis(50),
-                                move || {
-                                    if let Some(ref tv) = *tv_ref.borrow() {
-                                        if let Some(ref nc) = *nc_ref.borrow() {
-                                            nc.set_property("editable", true);
-                                            if let Some(column) = tv.column(0) {
-                                                if let Some((model, iter)) =
-                                                    tv.selection().selected()
-                                                {
-                                                    let tree_path = model.path(&iter);
-                                                    gtk4::prelude::TreeViewExt::set_cursor(
-                                                        tv,
-                                                        &tree_path,
-                                                        Some(&column),
-                                                        true,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                            );
+                            if let Some(path) = selected_path {
+                                sender.input(Msg::PromptRenameFile(path));
+                            }
                         }
                         ExplorerAction::MoveFile => {
                             // Move not yet supported via keyboard in GTK
@@ -9241,74 +8634,23 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::RefreshFileTree => {
-                if let Some(ref store) = self.tree_store {
-                    let cwd = self.engine.borrow().cwd.clone();
-                    let (dir_fg_hex, file_fg_hex) = {
-                        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-                        (
-                            theme.explorer_dir_fg.to_hex(),
-                            theme.explorer_file_fg.to_hex(),
-                        )
-                    };
-                    store.clear();
-                    build_file_tree_with_root(
-                        store,
-                        &cwd,
-                        self.engine.borrow().settings.show_hidden_files,
-                        self.engine.borrow().settings.explorer_sort_case_insensitive,
-                        &dir_fg_hex,
-                        &file_fg_hex,
-                    );
-                    // Update explorer indicators (modified/diagnostics)
-                    {
-                        let engine = self.engine.borrow();
-                        let (git_statuses, diag_counts) = engine.explorer_indicators();
-                        let theme = Theme::from_name(&engine.settings.colorscheme);
-                        let default_fg = if theme.is_light() {
-                            theme.foreground.to_hex()
-                        } else {
-                            theme.status_fg.to_hex()
-                        };
-                        update_tree_indicators(
-                            store,
-                            &git_statuses,
-                            &diag_counts,
-                            &theme.git_added.to_hex(),
-                            &theme.git_modified.to_hex(),
-                            &theme.git_deleted.to_hex(),
-                            &theme.diagnostic_error.to_hex(),
-                            &theme.diagnostic_warning.to_hex(),
-                            &default_fg,
-                        );
-                    }
-                    if let Some(ref tv) = *self.file_tree_view.borrow() {
-                        tv.expand_row(&gtk4::TreePath::from_indices(&[0]), false);
-                        // Highlight the active file in the tree after rebuild.
-                        if let Some(path) = self.engine.borrow().file_path().cloned() {
-                            highlight_file_in_tree(tv, &path);
-                        }
-                    }
+                self.refresh_explorer();
+                if let Some(path) = self.engine.borrow().file_path().cloned() {
+                    self.reveal_path_in_explorer(&path);
                 }
                 self.draw_needed.set(true);
             }
             Msg::FocusExplorer => {
-                // Ensure sidebar is visible and explorer is active
                 self.sidebar_visible = true;
                 self.active_panel = SidebarPanel::Explorer;
-                self.tree_has_focus = true;
                 self.engine.borrow_mut().explorer_has_focus = true;
-
-                // Grab focus on tree view
-                if let Some(ref tree) = *self.file_tree_view.borrow() {
-                    tree.grab_focus();
+                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                    da.grab_focus();
                 }
-
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusExplorer => {
-                if self.tree_has_focus {
-                    // Already focused — return to editor
-                    self.tree_has_focus = false;
+                if self.engine.borrow().explorer_has_focus {
                     self.engine.borrow_mut().explorer_has_focus = false;
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
@@ -9316,10 +8658,9 @@ impl App {
                 } else {
                     self.sidebar_visible = true;
                     self.active_panel = SidebarPanel::Explorer;
-                    self.tree_has_focus = true;
                     self.engine.borrow_mut().explorer_has_focus = true;
-                    if let Some(ref tree) = *self.file_tree_view.borrow() {
-                        tree.grab_focus();
+                    if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                        da.grab_focus();
                     }
                 }
                 self.draw_needed.set(true);
@@ -9329,7 +8670,7 @@ impl App {
                 // When "exiting" we keep the sidebar visible (don't touch sidebar_visible)
                 // to avoid a white-area artifact from the Revealer animation — Ctrl+B
                 // closes the sidebar entirely.
-                self.tree_has_focus = false;
+                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
                     // Already showing search — return keyboard focus to editor, keep panel open.
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
@@ -9346,7 +8687,6 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::FocusEditor => {
-                self.tree_has_focus = false;
                 {
                     let mut engine = self.engine.borrow_mut();
                     engine.explorer_has_focus = false;
@@ -9360,83 +8700,651 @@ impl App {
 
                 self.draw_needed.set(true);
             }
+            Msg::ExplorerKey {
+                key_name,
+                unicode,
+                ctrl,
+            } => {
+                self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
+            }
+            Msg::ExplorerClick { x, y, n_press } => {
+                self.handle_explorer_da_click(x, y, n_press, sender);
+            }
+            Msg::ExplorerRightClick { x, y } => {
+                self.handle_explorer_da_right_click(x, y, sender);
+            }
+            Msg::ExplorerScroll(dy) => {
+                let total = self.explorer_state.borrow().rows.len();
+                let viewport = self
+                    .explorer_sidebar_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| {
+                        let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
+                            .round()
+                            .max(1.0);
+                        (da.height() as f64 / item_h).floor().max(0.0) as usize
+                    })
+                    .unwrap_or(0);
+                let max_scroll = total.saturating_sub(viewport);
+                let mut st = self.explorer_state.borrow_mut();
+                let delta = dy.round() as isize * 3;
+                let new_top = (st.scroll_top as isize + delta).max(0) as usize;
+                st.scroll_top = new_top.min(max_scroll);
+                drop(st);
+                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+            }
+            Msg::PromptRenameFile(path) => {
+                let sender_clone = sender.input_sender().clone();
+                let initial = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let path_for_close = path.clone();
+                self.prompt_for_name(
+                    "Rename",
+                    &format!("Rename '{}' to:", initial),
+                    &initial,
+                    Box::new(move |name| {
+                        sender_clone
+                            .send(Msg::RenameFile(path_for_close.clone(), name))
+                            .ok();
+                    }),
+                );
+            }
+            Msg::PromptNewFile(parent_dir) => {
+                let sender_clone = sender.input_sender().clone();
+                self.prompt_for_name(
+                    "New File",
+                    &format!(
+                        "Create file under {}:",
+                        parent_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy())
+                            .unwrap_or_default()
+                    ),
+                    "",
+                    Box::new(move |name| {
+                        sender_clone
+                            .send(Msg::CreateFile(parent_dir.clone(), name))
+                            .ok();
+                    }),
+                );
+            }
+            Msg::PromptNewFolder(parent_dir) => {
+                let sender_clone = sender.input_sender().clone();
+                self.prompt_for_name(
+                    "New Folder",
+                    &format!(
+                        "Create folder under {}:",
+                        parent_dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy())
+                            .unwrap_or_default()
+                    ),
+                    "",
+                    Box::new(move |name| {
+                        sender_clone
+                            .send(Msg::CreateFolder(parent_dir.clone(), name))
+                            .ok();
+                    }),
+                );
+            }
             _ => unreachable!(),
         }
     }
 
-    /// Insert a temporary row in the TreeStore and start inline editing for new file/folder.
-    fn start_inline_new_entry(&self, parent_dir: PathBuf, is_folder: bool) {
-        // Extract colorscheme before borrowing tree_view to avoid RefCell conflicts.
-        let colorscheme = self.engine.borrow().settings.colorscheme.clone();
-        let theme = Theme::from_name(&colorscheme);
-        let fg_hex = theme.foreground.to_hex();
+    /// Visible-row capacity of the explorer DrawingArea in the current
+    /// allocation. Returns 0 when the DA hasn't been measured yet.
+    fn explorer_viewport_rows(&self) -> usize {
+        self.explorer_sidebar_da_ref
+            .borrow()
+            .as_ref()
+            .map(|da| {
+                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
+                    .round()
+                    .max(1.0);
+                (da.height() as f64 / item_h).floor().max(0.0) as usize
+            })
+            .unwrap_or(0)
+    }
 
-        if let Some(ref tree_view) = *self.file_tree_view.borrow() {
-            if let Some(model) = tree_view.model() {
-                if let Some(tree_store) = model.downcast_ref::<gtk4::TreeStore>() {
-                    // Find the parent iter in the tree store
-                    let parent_iter = find_tree_iter_for_path(tree_store, &parent_dir);
+    /// Pixel y → flat row index. Returns None if out of bounds or
+    /// scroll_offset overshoots the row count.
+    fn explorer_row_at(&self, y: f64) -> Option<usize> {
+        let state = self.explorer_state.borrow();
+        let total = state.rows.len();
+        let scroll_top = state.scroll_top;
+        drop(state);
+        let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
+            .round()
+            .max(1.0);
+        let local = (y / item_h).floor().max(0.0) as usize;
+        let idx = scroll_top + local;
+        if idx < total {
+            Some(idx)
+        } else {
+            None
+        }
+    }
 
-                    // Expand the parent row if it exists
-                    if let Some(ref pi) = parent_iter {
-                        let path = tree_store.path(pi);
-                        tree_view.expand_row(&path, false);
+    fn handle_explorer_da_key(
+        &mut self,
+        key_name: String,
+        unicode: Option<char>,
+        ctrl: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        // Escape returns focus to editor.
+        if key_name == "Escape" {
+            sender.input(Msg::FocusEditor);
+            return;
+        }
+        // Panel-nav shortcuts (Ctrl-B / Ctrl-Shift-E / Ctrl-Shift-F).
+        // `matches_gtk_key` takes a `gtk4::gdk::Key` — we lost the original
+        // here (it was consumed in the controller callback to build the
+        // String), so dispatch by name for the common cases.
+        let pk_toggle_sidebar = self
+            .engine
+            .borrow()
+            .settings
+            .panel_keys
+            .toggle_sidebar
+            .clone();
+        let pk_focus_explorer = self
+            .engine
+            .borrow()
+            .settings
+            .panel_keys
+            .focus_explorer
+            .clone();
+        let pk_focus_search = self
+            .engine
+            .borrow()
+            .settings
+            .panel_keys
+            .focus_search
+            .clone();
+        // Build a printable form of the current key for the settings
+        // string comparison (e.g. "Ctrl-B", "Ctrl-Shift-E"). The settings
+        // format is defined in `util::matches_gtk_key`; we approximate
+        // here and only match exact strings — good enough for the common
+        // defaults.
+        let printable = match (ctrl, unicode) {
+            (true, Some(c)) => format!("Ctrl-{}", c.to_ascii_uppercase()),
+            (false, Some(c)) => c.to_string(),
+            _ => key_name.clone(),
+        };
+        if printable == pk_toggle_sidebar {
+            sender.input(Msg::ToggleSidebar);
+            return;
+        }
+        if printable == pk_focus_explorer {
+            sender.input(Msg::ToggleFocusExplorer);
+            return;
+        }
+        if printable == pk_focus_search {
+            sender.input(Msg::ToggleFocusSearch);
+            return;
+        }
+
+        match key_name.as_str() {
+            "Return" | "KP_Enter" => {
+                sender.input(Msg::ExplorerActivateSelected);
+            }
+            "Down" => {
+                self.explorer_move_selection(1);
+            }
+            "Up" => {
+                self.explorer_move_selection(-1);
+            }
+            "Page_Down" | "KP_Page_Down" => {
+                let v = self.explorer_viewport_rows().max(1) as isize;
+                self.explorer_move_selection(v);
+            }
+            "Page_Up" | "KP_Page_Up" => {
+                let v = self.explorer_viewport_rows().max(1) as isize;
+                self.explorer_move_selection(-v);
+            }
+            "Home" => {
+                let mut st = self.explorer_state.borrow_mut();
+                st.selected = 0;
+                st.scroll_top = 0;
+                drop(st);
+                self.queue_explorer_draw();
+            }
+            "End" => {
+                let mut st = self.explorer_state.borrow_mut();
+                if !st.rows.is_empty() {
+                    st.selected = st.rows.len() - 1;
+                }
+                let v = self.explorer_viewport_rows();
+                st.ensure_visible(v);
+                drop(st);
+                self.queue_explorer_draw();
+            }
+            "Right" => {
+                // l / Right — activate (open or expand).
+                sender.input(Msg::ExplorerActivateSelected);
+            }
+            "Left" => {
+                // h / Left — if current row is an expanded dir collapse
+                // it; otherwise move selection to its parent depth row.
+                let (idx, is_dir, is_expanded, depth) = {
+                    let st = self.explorer_state.borrow();
+                    if st.selected >= st.rows.len() {
+                        return;
                     }
-
-                    // Insert a new row as the first child
-                    let new_iter = tree_store.prepend(parent_iter.as_ref());
-                    let icon = if is_folder {
-                        icons::FOLDER.nerd
-                    } else {
-                        icons::FILE_GENERIC.nerd
-                    };
-                    let marker = if is_folder {
-                        format!("__NEW_FOLDER__{}", parent_dir.display())
-                    } else {
-                        format!("__NEW_FILE__{}", parent_dir.display())
-                    };
-                    // Use valid hex colors to avoid GTK "Don't know color ''" warnings
-                    tree_store.set(
-                        &new_iter,
-                        &[
-                            (0, &icon.to_value()),
-                            (1, &"".to_value()),
-                            (2, &marker.to_value()),
-                            (3, &fg_hex.to_value()),
-                            (4, &"".to_value()),
-                            (5, &fg_hex.to_value()),
-                        ],
+                    let r = &st.rows[st.selected];
+                    (st.selected, r.is_dir, r.is_expanded, r.depth)
+                };
+                if is_dir && is_expanded {
+                    let root = self.engine.borrow().cwd.clone();
+                    let show_hidden = self.engine.borrow().settings.show_hidden_files;
+                    let case_insensitive =
+                        self.engine.borrow().settings.explorer_sort_case_insensitive;
+                    self.explorer_state.borrow_mut().toggle_dir(
+                        idx,
+                        &root,
+                        show_hidden,
+                        case_insensitive,
                     );
-
-                    // Start inline editing on the new row.
-                    // Delay slightly so the context menu popover has time to
-                    // fully close and release focus — otherwise GTK fires
-                    // `editing_canceled` immediately when focus shifts from
-                    // the popover to the cell editor.
-                    let tv = tree_view.clone();
-                    let name_cell_ref = self.name_cell.clone();
-                    let new_row_path = tree_store.path(&new_iter);
-                    gtk4::glib::timeout_add_local_once(
-                        std::time::Duration::from_millis(50),
-                        move || {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                if let Some(ref nc) = *name_cell_ref.borrow() {
-                                    nc.set_property("editable", true);
-                                    if let Some(column) = tv.column(0) {
-                                        gtk4::prelude::TreeViewExt::set_cursor(
-                                            &tv,
-                                            &new_row_path,
-                                            Some(&column),
-                                            true,
-                                        );
-                                    }
-                                }
-                            }));
-                        },
-                    );
+                    self.queue_explorer_draw();
+                } else if depth > 0 {
+                    let new_selected = {
+                        let st = self.explorer_state.borrow();
+                        (0..idx)
+                            .rev()
+                            .find(|&i| st.rows[i].depth < depth)
+                            .unwrap_or(0)
+                    };
+                    let mut st = self.explorer_state.borrow_mut();
+                    st.selected = new_selected;
+                    let v = self.explorer_viewport_rows();
+                    st.ensure_visible(v);
+                    drop(st);
+                    self.queue_explorer_draw();
+                }
+            }
+            _ => {
+                // Single-char explorer shortcuts (a/A/D/r/M etc.).
+                if !ctrl {
+                    if let Some(ch) = unicode {
+                        let ch_str = ch.to_string();
+                        let is_explorer_key = {
+                            let ek = &self.engine.borrow().settings.explorer_keys;
+                            ch_str == ek.new_file
+                                || ch_str == ek.new_folder
+                                || ch_str == ek.delete
+                                || ch_str == ek.rename
+                                || ch_str == ek.move_file
+                        };
+                        if is_explorer_key {
+                            sender.input(Msg::ExplorerAction(ch_str));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn explorer_move_selection(&self, delta: isize) {
+        let mut st = self.explorer_state.borrow_mut();
+        let total = st.rows.len();
+        if total == 0 {
+            return;
+        }
+        let new_sel = (st.selected as isize + delta)
+            .max(0)
+            .min(total as isize - 1) as usize;
+        st.selected = new_sel;
+        let viewport_rows = self
+            .explorer_sidebar_da_ref
+            .borrow()
+            .as_ref()
+            .map(|da| {
+                let item_h = (self.cached_ui_line_height.max(18.0) * 1.4)
+                    .round()
+                    .max(1.0);
+                (da.height() as f64 / item_h).floor().max(0.0) as usize
+            })
+            .unwrap_or(0);
+        st.ensure_visible(viewport_rows);
+        drop(st);
+        self.queue_explorer_draw();
+    }
+
+    fn queue_explorer_draw(&self) {
+        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            da.queue_draw();
+        }
+    }
+
+    fn handle_explorer_da_click(
+        &mut self,
+        _x: f64,
+        y: f64,
+        n_press: i32,
+        sender: &ComponentSender<Self>,
+    ) {
+        // Grab focus so subsequent keys route to us.
+        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            da.grab_focus();
+        }
+        self.engine.borrow_mut().explorer_has_focus = true;
+        let Some(idx) = self.explorer_row_at(y) else {
+            return;
+        };
+        let (path, is_dir) = {
+            let mut st = self.explorer_state.borrow_mut();
+            st.selected = idx;
+            let row = &st.rows[idx];
+            (row.path.clone(), row.is_dir)
+        };
+        self.queue_explorer_draw();
+        if n_press >= 2 {
+            if is_dir {
+                let root = self.engine.borrow().cwd.clone();
+                let show_hidden = self.engine.borrow().settings.show_hidden_files;
+                let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
+                self.explorer_state.borrow_mut().toggle_dir(
+                    idx,
+                    &root,
+                    show_hidden,
+                    case_insensitive,
+                );
+                self.queue_explorer_draw();
+            } else {
+                sender.input(Msg::OpenFileFromSidebar(path));
+            }
+        } else {
+            // Single click: preview for files, focus-only for dirs.
+            if !is_dir {
+                sender.input(Msg::PreviewFileFromSidebar(path));
+            }
+        }
+    }
+
+    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, sender: &ComponentSender<Self>) {
+        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            da.grab_focus();
+        }
+        self.engine.borrow_mut().explorer_has_focus = true;
+        // If click lands on a row, select it before opening the menu.
+        // If below the last row, fall back to the workspace root.
+        let (target, is_dir) = if let Some(idx) = self.explorer_row_at(y) {
+            let mut st = self.explorer_state.borrow_mut();
+            st.selected = idx;
+            let row = &st.rows[idx];
+            (row.path.clone(), row.is_dir)
+        } else {
+            let root = self.engine.borrow().cwd.clone();
+            (root, true)
+        };
+        self.queue_explorer_draw();
+        self.show_explorer_context_menu(x, y, target, is_dir, sender);
+    }
+
+    fn show_explorer_context_menu(
+        &self,
+        x: f64,
+        y: f64,
+        target: PathBuf,
+        is_dir: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        let da: gtk4::DrawingArea = match self.explorer_sidebar_da_ref.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return,
+        };
+        // Build the engine-driven context menu items (for enabled state).
+        self.engine
+            .borrow_mut()
+            .open_explorer_context_menu(target.clone(), is_dir, 0, 0);
+        let items: Vec<core::engine::ContextMenuItem> = self
+            .engine
+            .borrow()
+            .context_menu
+            .as_ref()
+            .map(|cm| cm.items.clone())
+            .unwrap_or_default();
+        self.engine.borrow_mut().close_context_menu();
+        let menu = build_gio_menu_from_engine_items(&items, "ctx");
+        let ctx_enabled: std::collections::HashMap<String, bool> = items
+            .iter()
+            .map(|it| (it.action.clone(), it.enabled))
+            .collect();
+
+        let parent_dir = if target.is_dir() {
+            target.clone()
+        } else {
+            target
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        };
+
+        let actions = gtk4::gio::SimpleActionGroup::new();
+        let add_action = |actions: &gtk4::gio::SimpleActionGroup, a: &gtk4::gio::SimpleAction| {
+            if ctx_enabled.get(a.name().as_str()) == Some(&false) {
+                a.set_enabled(false);
+            }
+            actions.add_action(a);
+        };
+
+        {
+            let s = sender.input_sender().clone();
+            let pd = parent_dir.clone();
+            let a = gtk4::gio::SimpleAction::new("new_file", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::PromptNewFile(pd.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let pd = parent_dir.clone();
+            let a = gtk4::gio::SimpleAction::new("new_folder", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::PromptNewFolder(pd.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("rename", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::PromptRenameFile(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("delete", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::ConfirmDeletePath(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("copy_path", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::CopyPath(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("copy_relative_path", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::CopyRelativePath(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("reveal", None);
+            a.connect_activate(move |_, _| {
+                let dir = if t.is_dir() {
+                    t.clone()
+                } else {
+                    t.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                };
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("select_for_diff", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::SelectForDiff(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("diff_with_selected", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::DiffWithSelected(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("open_side", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::OpenSide(t.clone())).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let eng = self.engine.clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("open_side_vsplit", None);
+            a.connect_activate(move |_, _| {
+                let mut e = eng.borrow_mut();
+                e.split_window(crate::core::window::SplitDirection::Vertical, None);
+                let _ = e.open_file_with_mode(&t, crate::core::OpenMode::Permanent);
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let t = target.clone();
+            let a = gtk4::gio::SimpleAction::new("open_terminal", None);
+            a.connect_activate(move |_, _| {
+                let dir = if t.is_dir() {
+                    t.clone()
+                } else {
+                    t.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                };
+                s.send(Msg::OpenTerminalAt(dir)).ok();
+            });
+            add_action(&actions, &a);
+        }
+        {
+            let s = sender.input_sender().clone();
+            let a = gtk4::gio::SimpleAction::new("find_in_folder", None);
+            a.connect_activate(move |_, _| {
+                s.send(Msg::ToggleFocusSearch).ok();
+            });
+            add_action(&actions, &a);
+        }
+
+        let n_rows = menu_row_count(&menu);
+        let popover_parent: gtk4::Widget = da.clone().upcast();
+        popover_parent.insert_action_group("ctx", Some(&actions));
+        swap_ctx_popover(&self.active_ctx_popover, {
+            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+            popover.set_parent(&popover_parent);
+            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_has_arrow(false);
+            popover.set_position(gtk4::PositionType::Right);
+            popover.set_size_request(-1, n_rows * 22 + 14);
+            popover
+        });
+        if let Some(ref p) = *self.active_ctx_popover.borrow() {
+            p.popup();
+        }
+    }
+
+    /// Show a simple modal dialog with a text entry for rename /
+    /// new-file / new-folder flows. Phase A.2b-2 replaced the native
+    /// `gtk4::TreeView` inline cell editor with this fallback. On OK the
+    /// closure fires `on_confirm(name)`. Empty names close the dialog
+    /// silently.
+    fn prompt_for_name(
+        &self,
+        title: &str,
+        prompt: &str,
+        initial: &str,
+        on_confirm: Box<dyn Fn(String)>,
+    ) {
+        let dialog = gtk4::Dialog::with_buttons(
+            Some(title),
+            Some(&self.window),
+            gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
+            &[
+                ("Cancel", gtk4::ResponseType::Cancel),
+                ("OK", gtk4::ResponseType::Ok),
+            ],
+        );
+        dialog.set_default_response(gtk4::ResponseType::Ok);
+        let content = dialog.content_area();
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_spacing(6);
+        let label = gtk4::Label::new(Some(prompt));
+        label.set_halign(gtk4::Align::Start);
+        content.append(&label);
+        let entry = gtk4::Entry::new();
+        entry.set_text(initial);
+        entry.set_activates_default(true);
+        // Pre-select the stem (up to the last dot) so the user can type
+        // a new name while keeping the extension.
+        if !initial.is_empty() {
+            let stem_end = initial
+                .rfind('.')
+                .filter(|&i| i > 0)
+                .unwrap_or(initial.len()) as i32;
+            let entry_for_select = entry.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                entry_for_select.select_region(0, stem_end);
+            });
+        }
+        content.append(&entry);
+        let entry_for_response = entry.clone();
+        dialog.connect_response(move |d, resp| {
+            if resp == gtk4::ResponseType::Ok {
+                let name = entry_for_response.text().trim().to_string();
+                if !name.is_empty() {
+                    on_confirm(name);
+                }
+            }
+            d.close();
+        });
+        dialog.show();
     }
 
     fn handle_find_replace_msg(&mut self, msg: Msg) {

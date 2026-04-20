@@ -8,12 +8,9 @@
 //! future session can unify the two into `src/render.rs` once both
 //! backends have stabilised on `quadraui::TreeView`.
 //!
-//! Sub-phase 1 ships this module as inert scaffolding (the atomic
-//! TreeView → DrawingArea swap happens in sub-phase 2). The
-//! `#[allow(dead_code)]` attributes reflect that — they are removed when
-//! the callsites land.
-
-#![allow(dead_code)]
+//! Sub-phase 2 (A.2b-2) landed the atomic TreeView → DrawingArea swap
+//! and wires `ExplorerState` + adapters directly into the App's draw/
+//! click/key callbacks.
 
 use super::*;
 use std::collections::HashSet;

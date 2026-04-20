@@ -1,6 +1,6 @@
-# src/gtk/explorer.rs — 252 lines
+# src/gtk/explorer.rs — 285 lines
 
-GTK explorer sidebar state + data adapter for Phase A.2b migration to a `DrawingArea` + `quadraui_gtk::draw_tree` render path. Sub-phase 1 ships this module as inert scaffolding (no callsites yet); sub-phase 2 flips the wiring.
+GTK explorer sidebar state + data adapter. Phase A.2b-2 landed the atomic migration of the native `gtk4::TreeView` to a `DrawingArea` + `quadraui_gtk::draw_tree` render path; this module is the flat-row model + adapter that backs the DA's draw/click/key callbacks.
 
 ## Key Types
 - `ExplorerRow { depth, name, path, is_dir, is_expanded }` — one visible row in the flat explorer list. Mirrors TUI's `ExplorerRow`.
