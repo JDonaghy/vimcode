@@ -5438,9 +5438,9 @@ pub(super) fn draw_explorer_panel(
     w: f64,
     h: f64,
     line_height: f64,
-) {
+) -> Option<(f64, f64, f64, f64)> {
     if w <= 0.0 || h <= 0.0 {
-        return;
+        return None;
     }
 
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
@@ -5486,6 +5486,9 @@ pub(super) fn draw_explorer_panel(
         cr.set_source_rgb(dim_r, dim_g, dim_b);
         cr.rectangle(sb_x + 2.0, thumb_y, sb_w - 4.0, thumb_len);
         cr.fill().ok();
+        Some((sb_x, y, sb_w, track_len))
+    } else {
+        None
     }
 }
 

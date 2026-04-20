@@ -111,6 +111,12 @@ struct App {
     /// trackpad deltas are summed here until they exceed one row, so no
     /// scroll event is silently dropped.
     explorer_scroll_accum: Rc<Cell<f64>>,
+    /// Most recent scrollbar rect in DA-local coords, published by
+    /// `draw_explorer_panel` each frame: `Some((x, y, w, h))` when a
+    /// scrollbar is visible, `None` otherwise. Used by the click/drag
+    /// handlers to hit-test scrollbar interactions.
+    #[allow(clippy::type_complexity)]
+    explorer_scrollbar_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -1801,6 +1807,10 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(None));
         let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
         let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        #[allow(clippy::type_complexity)]
+        let explorer_scrollbar_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
+            Rc::new(Cell::new(None));
+        let explorer_scrollbar_drag_from: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
@@ -1916,6 +1926,7 @@ impl SimpleComponent for App {
             explorer_state: explorer_state.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
+            explorer_scrollbar_rect: explorer_scrollbar_rect.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
@@ -2063,6 +2074,7 @@ impl SimpleComponent for App {
             let engine_d = engine.clone();
             let state_d = explorer_state.clone();
             let row_h_cell = explorer_row_height_cell.clone();
+            let sb_rect_cell = explorer_scrollbar_rect.clone();
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -2073,10 +2085,6 @@ impl SimpleComponent for App {
                 let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                // Publish the row height we're rendering with, so the click
-                // and scroll handlers hit-test against the same numbers.
-                // `draw_tree` uses `(line_height * 1.4).round()` — keep the
-                // formula in sync with `quadraui_gtk::draw_tree`.
                 let row_h = (line_height * 1.4).round().max(1.0);
                 row_h_cell.set(row_h);
                 let w = da.width() as f64;
@@ -2084,7 +2092,9 @@ impl SimpleComponent for App {
                 let state = state_d.borrow();
                 let has_focus = engine.explorer_has_focus;
                 let tree = explorer::explorer_to_tree_view(&state, has_focus, &engine);
-                draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);
+                let sb_rect =
+                    draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);
+                sb_rect_cell.set(sb_rect);
             });
         }
         {
@@ -2133,6 +2143,73 @@ impl SimpleComponent for App {
             });
             widgets.explorer_da.add_controller(scroll_ctrl);
         }
+        // Scrollbar thumb drag: a dedicated `GestureDrag` on the explorer
+        // DA watches for drags that start inside the scrollbar track and
+        // translates vertical motion into `scroll_top` updates. Claiming
+        // the gesture on begin prevents the ancestor sidebar-resize
+        // `GestureDrag` on `main_hbox` from interpreting a thumb drag as
+        // a panel-width resize (the scrollbar lives right at the sidebar
+        // edge, so the ambiguity is real).
+        {
+            let sb_rect_cell = explorer_scrollbar_rect.clone();
+            let drag_from = explorer_scrollbar_drag_from.clone();
+            let state_d = explorer_state.clone();
+            let row_h_cell = explorer_row_height_cell.clone();
+            let da_for_draw = widgets.explorer_da.clone();
+            let da_for_update = widgets.explorer_da.clone();
+            let drag_from_update = drag_from.clone();
+            let sb_rect_update = sb_rect_cell.clone();
+            let state_update = state_d.clone();
+            let row_h_update = row_h_cell.clone();
+            let drag_from_end = drag_from.clone();
+            let gesture = gtk4::GestureDrag::new();
+            gesture.set_button(1);
+            gesture.connect_drag_begin(move |g, x_start, _y_start| {
+                let Some((sb_x, _sb_y, sb_w, _sb_h)) = sb_rect_cell.get() else {
+                    drag_from.set(None);
+                    return;
+                };
+                if x_start < sb_x || x_start > sb_x + sb_w {
+                    drag_from.set(None);
+                    return;
+                }
+                // Started on scrollbar — claim so sibling/parent drags
+                // (sidebar resize) don't also fire.
+                g.set_state(gtk4::EventSequenceState::Claimed);
+                let st = state_d.borrow();
+                drag_from.set(Some(st.scroll_top));
+                // A press on the track has already jump-scrolled via the
+                // click gesture; the drag-begin fires AFTER click-press,
+                // so `st.scroll_top` already reflects the jump. Subsequent
+                // drag_update deltas fine-tune from there.
+                da_for_draw.queue_draw();
+            });
+            gesture.connect_drag_update(move |_, _dx, dy| {
+                let Some(start_top) = drag_from_update.get() else {
+                    return;
+                };
+                let Some((_sb_x, _sb_y, _sb_w, sb_h)) = sb_rect_update.get() else {
+                    return;
+                };
+                let total = state_update.borrow().rows.len();
+                let item_h = row_h_update.get().max(1.0);
+                let viewport = (da_for_update.height() as f64 / item_h).floor().max(0.0) as usize;
+                let max_scroll = total.saturating_sub(viewport);
+                if max_scroll == 0 || sb_h <= 0.0 {
+                    return;
+                }
+                // `dy` is pixels on the track; convert to a row offset
+                // using the same ratio the draw uses to place the thumb.
+                let delta_rows = (dy / sb_h * max_scroll as f64).round() as isize;
+                let new_top = (start_top as isize + delta_rows).max(0) as usize;
+                state_update.borrow_mut().scroll_top = new_top.min(max_scroll);
+                da_for_update.queue_draw();
+            });
+            gesture.connect_drag_end(move |_, _, _| {
+                drag_from_end.set(None);
+            });
+            widgets.explorer_da.add_controller(gesture);
+        }
 
         // Drag-and-drop from the explorer was part of the native
         // `gtk4::TreeView` setup. DnD is deferred — tracked as
@@ -2164,16 +2241,16 @@ impl SimpleComponent for App {
                     is_sb_drag_begin.set(false);
                     return;
                 }
-                // The handle strip sits right after the sidebar.
-                // activity bar (48px) + sidebar_width = left edge of handle.
+                // The resize handle strip sits immediately to the right of
+                // the sidebar. Accept clicks only from the sidebar's right
+                // edge outward, so drags that start inside the sidebar
+                // (including on the explorer scrollbar which is flush with
+                // the right edge) aren't stolen as panel-resize drags.
                 const ACTIVITY_W: f64 = 48.0;
                 let aw = sb.allocated_width();
                 let sidebar_right = ACTIVITY_W + aw as f64;
-                // Accept clicks within ±10 px of the handle centre.
-                if (x - (sidebar_right + 3.0)).abs() <= 10.0 {
+                if x >= sidebar_right && x <= sidebar_right + 10.0 {
                     is_sb_drag_begin.set(true);
-                    // Use width_request (what we control) not allocated_width
-                    // (which may be larger due to GTK layout).
                     sw.set(sb.width_request());
                 } else {
                     is_sb_drag_begin.set(false);
@@ -8665,6 +8742,11 @@ impl App {
                 self.engine.borrow_mut().explorer_has_focus = true;
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                     da.grab_focus();
+                    // `draw_needed` only queues the editor DA / menu bar.
+                    // The explorer DA needs its own `queue_draw` to re-run
+                    // the draw callback so the selection highlight
+                    // appears now that `explorer_has_focus = true`.
+                    da.queue_draw();
                 }
                 self.draw_needed.set(true);
             }
@@ -8674,12 +8756,16 @@ impl App {
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
+                    if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
                 } else {
                     self.sidebar_visible = true;
                     self.active_panel = SidebarPanel::Explorer;
                     self.engine.borrow_mut().explorer_has_focus = true;
                     if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                         da.grab_focus();
+                        da.queue_draw();
                     }
                 }
                 self.draw_needed.set(true);
@@ -8715,6 +8801,10 @@ impl App {
                 // Grab focus on drawing area
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
+                }
+                // Redraw explorer so its selection highlight fades.
+                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                    da.queue_draw();
                 }
 
                 self.draw_needed.set(true);
@@ -9073,16 +9163,26 @@ impl App {
 
     fn handle_explorer_da_click(
         &mut self,
-        _x: f64,
+        x: f64,
         y: f64,
         n_press: i32,
         sender: &ComponentSender<Self>,
     ) {
-        // Grab focus so subsequent keys route to us.
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.grab_focus();
         }
         self.engine.borrow_mut().explorer_has_focus = true;
+
+        // Scrollbar click: jump-scroll so the click y becomes the thumb
+        // centre. Return early so the click doesn't also hit-test a row.
+        if let Some((sb_x, sb_y, sb_w, sb_h)) = self.explorer_scrollbar_rect.get() {
+            if x >= sb_x && x <= sb_x + sb_w && y >= sb_y && y <= sb_y + sb_h {
+                self.explorer_jump_scroll(y, sb_y, sb_h);
+                self.queue_explorer_draw();
+                return;
+            }
+        }
+
         let Some(idx) = self.explorer_row_at(y) else {
             return;
         };
@@ -9093,27 +9193,35 @@ impl App {
             (row.path.clone(), row.is_dir)
         };
         self.queue_explorer_draw();
-        if n_press >= 2 {
-            if is_dir {
-                let root = self.engine.borrow().cwd.clone();
-                let show_hidden = self.engine.borrow().settings.show_hidden_files;
-                let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
-                self.explorer_state.borrow_mut().toggle_dir(
-                    idx,
-                    &root,
-                    show_hidden,
-                    case_insensitive,
-                );
-                self.queue_explorer_draw();
-            } else {
-                sender.input(Msg::OpenFileFromSidebar(path));
-            }
+        if is_dir {
+            // Single or double click on a dir toggles expansion — matches
+            // typical file-tree UX.
+            let root = self.engine.borrow().cwd.clone();
+            let show_hidden = self.engine.borrow().settings.show_hidden_files;
+            let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
+            self.explorer_state
+                .borrow_mut()
+                .toggle_dir(idx, &root, show_hidden, case_insensitive);
+            self.queue_explorer_draw();
+        } else if n_press >= 2 {
+            sender.input(Msg::OpenFileFromSidebar(path));
         } else {
-            // Single click: preview for files, focus-only for dirs.
-            if !is_dir {
-                sender.input(Msg::PreviewFileFromSidebar(path));
-            }
+            sender.input(Msg::PreviewFileFromSidebar(path));
         }
+    }
+
+    /// Update `scroll_top` so the clicked y lands at the thumb position.
+    /// `sb_y` / `sb_h` are the scrollbar track bounds.
+    fn explorer_jump_scroll(&self, click_y: f64, sb_y: f64, sb_h: f64) {
+        let total = self.explorer_state.borrow().rows.len();
+        let viewport = self.explorer_viewport_rows();
+        let max_scroll = total.saturating_sub(viewport);
+        if max_scroll == 0 || sb_h <= 0.0 {
+            return;
+        }
+        let ratio = ((click_y - sb_y) / sb_h).clamp(0.0, 1.0);
+        let new_top = (ratio * max_scroll as f64).round() as usize;
+        self.explorer_state.borrow_mut().scroll_top = new_top.min(max_scroll);
     }
 
     fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, sender: &ComponentSender<Self>) {
