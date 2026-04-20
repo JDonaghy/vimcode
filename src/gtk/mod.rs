@@ -120,14 +120,9 @@ struct App {
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    /// The scrollable list box inside the Settings panel.
-    /// Cleared and rebuilt each time the panel is opened so widgets always
-    /// reflect the current engine.settings (e.g. after :set in the editor).
-    settings_list_box: Rc<RefCell<Option<gtk4::Box>>>,
-    /// Current search-filter sections for the Settings panel, shared with the
-    /// SearchEntry callback. Replaced (in place) on each panel rebuild.
-    #[allow(clippy::type_complexity)]
-    settings_sections: Rc<RefCell<Vec<(gtk4::Label, Vec<(String, gtk4::Box)>)>>>,
+    /// DrawingArea inside the Settings panel (Phase A.3c-2: native widget
+    /// tree replaced by a single DrawingArea that calls `draw_settings_panel`).
+    settings_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>>,
     // Per-window scrollbars and indicators
     window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
@@ -534,6 +529,12 @@ enum Msg {
     ExtSidebarKey(String, Option<char>),
     /// Click in the Extensions sidebar DrawingArea (x, y, n_press).
     ExtSidebarClick(f64, f64, i32),
+    /// Key press in the Settings sidebar DrawingArea (key_name, ctrl, unicode).
+    SettingsKey(String, bool, Option<char>),
+    /// Click in the Settings sidebar DrawingArea (x, y, n_press).
+    SettingsClick(f64, f64, i32),
+    /// Scroll wheel in the Settings sidebar DrawingArea (dy).
+    SettingsScroll(f64),
     /// Key press in an extension-provided panel DrawingArea (e.g. git-insights).
     ExtPanelKey(String, Option<char>),
     /// Click in an extension-provided panel DrawingArea (x, y, n_press).
@@ -908,13 +909,21 @@ impl SimpleComponent for App {
                         },
                         },
 
-                        // Settings panel — visibility managed imperatively via settings_panel_box
+                        // Settings panel — Phase A.3c-2: native widget tree replaced
+                        // by a single DrawingArea that renders via `draw_settings_panel`
+                        // (which calls `quadraui_gtk::draw_form`). Visibility
+                        // managed imperatively via settings_panel_box.
                         #[name = "settings_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
                             set_visible: false,  // hidden initially; toggled via settings_panel_box
-                            // Content built imperatively in init() after view_output!()
+
+                            #[name = "settings_da"]
+                            gtk4::DrawingArea {
+                                set_hexpand: true,
+                                set_vexpand: true,
+                            },
                         },
 
                         // Search panel
@@ -1896,6 +1905,7 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(None));
         let ext_dyn_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let settings_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
@@ -1974,8 +1984,7 @@ impl SimpleComponent for App {
             ext_dyn_panel_da_ref: ext_dyn_panel_da_ref.clone(),
             ext_dyn_panel_box: ext_dyn_panel_box_ref.clone(),
             settings_panel_box: settings_panel_box_ref.clone(),
-            settings_list_box: Rc::new(RefCell::new(None)),
-            settings_sections: Rc::new(RefCell::new(Vec::new())),
+            settings_da_ref: settings_da_ref.clone(),
             ai_panel_box_ref: ai_panel_box_ref.clone(),
             project_search_status: String::new(),
             search_results_list: search_results_list_ref.clone(),
@@ -2031,82 +2040,59 @@ impl SimpleComponent for App {
         *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
         *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
 
-        // ── Settings sidebar form (built imperatively) ─────────────────────────
+        // ── Settings sidebar (Phase A.3c-2: native widgets → DrawingArea) ──────
         {
-            let panel = widgets.settings_panel.clone();
-            let engine_b = engine.borrow();
-
-            // Header row
-            let header_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-            header_row.set_css_classes(&["sidebar-header"]);
-            let title_lbl = gtk4::Label::new(Some("  SETTINGS"));
-            title_lbl.set_css_classes(&["sidebar-title"]);
-            title_lbl.set_halign(gtk4::Align::Start);
-            title_lbl.set_hexpand(true);
-            header_row.append(&title_lbl);
-            panel.append(&header_row);
-
-            // Search entry
-            let search_entry = gtk4::SearchEntry::new();
-            search_entry.set_placeholder_text(Some("Search settings..."));
-            search_entry.set_margin_start(8);
-            search_entry.set_margin_end(8);
-            search_entry.set_margin_top(4);
-            search_entry.set_margin_bottom(4);
-            search_entry.set_hexpand(true);
-            search_entry.set_width_chars(1);
-            panel.append(&search_entry);
-
-            // Scrolled list of settings rows
-            let scroll = gtk4::ScrolledWindow::new();
-            scroll.set_vexpand(true);
-            scroll.set_hscrollbar_policy(gtk4::PolicyType::Never);
-            scroll.set_overlay_scrolling(false);
-
-            let list_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-            list_box.set_margin_bottom(8);
-
-            let sender_s = sender.input_sender().clone();
-            let sections = build_settings_form(&list_box, &engine_b.settings, &sender_s);
-            drop(engine_b);
-
-            // Store refs so the settings panel can be rebuilt when reopened.
-            *model.settings_list_box.borrow_mut() = Some(list_box.clone());
-            *model.settings_sections.borrow_mut() = sections;
-
-            // Wire up search filtering: show/hide rows + category headers.
-            // Capture the shared Rc so the callback still works after a rebuild.
-            let sections_rc = model.settings_sections.clone();
-            search_entry.connect_search_changed(move |entry| {
-                let query = entry.text().to_string().to_lowercase();
-                for (header, rows) in sections_rc.borrow().iter() {
-                    let mut any_visible = false;
-                    for (search_text, row) in rows {
-                        let visible = query.is_empty() || search_text.contains(&query);
-                        row.set_visible(visible);
-                        if visible {
-                            any_visible = true;
-                        }
-                    }
-                    header.set_visible(any_visible);
-                }
+            let engine_d = engine.clone();
+            widgets.settings_da.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine_d.borrow();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
+                let font_desc = FontDescription::from_string(UI_FONT);
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                layout.set_font_description(Some(&font_desc));
+                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                let line_height =
+                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
+                let w = da.width() as f64;
+                let h = da.height() as f64;
+                draw_settings_panel(cr, &layout, &engine, &theme, 0.0, 0.0, w, h, line_height);
             });
-
-            scroll.set_child(Some(&list_box));
-            panel.append(&scroll);
-
-            // Bottom: quick access to settings.json
-            let open_btn = gtk4::Button::with_label("Open settings.json");
-            open_btn.set_margin_start(8);
-            open_btn.set_margin_end(8);
-            open_btn.set_margin_top(4);
-            open_btn.set_margin_bottom(8);
-            let s_open = sender.input_sender().clone();
-            open_btn.connect_clicked(move |_| {
-                s_open.send(Msg::OpenSettingsFile).ok();
-            });
-            panel.append(&open_btn);
         }
+        {
+            let sender_set = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
+                sender_set
+                    .send(Msg::SettingsKey(key_name, ctrl, unicode))
+                    .ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.settings_da.set_focusable(true);
+            widgets.settings_da.add_controller(key_ctrl);
+        }
+        {
+            let sender_set = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, n_press, x, y| {
+                sender_set.send(Msg::SettingsClick(x, y, n_press)).ok();
+            });
+            widgets.settings_da.add_controller(gesture);
+        }
+        {
+            let sender_set = sender.input_sender().clone();
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                sender_set.send(Msg::SettingsScroll(dy)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.settings_da.add_controller(scroll_ctrl);
+        }
+        *settings_da_ref.borrow_mut() = Some(widgets.settings_da.clone());
 
         // ── Sidebar resize drag handle ─────────────────────────────────────────
         // Attach the GestureDrag to main_hbox (which never moves during a sidebar
@@ -4559,6 +4545,9 @@ impl SimpleComponent for App {
             Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarClick(_, _, _) => {
                 self.handle_ext_sidebar_msg(msg);
             }
+            Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
+                self.handle_settings_msg(msg);
+            }
             Msg::ExtPanelKey(_, _)
             | Msg::ExtPanelClick(_, _, _)
             | Msg::ExtPanelRightClick(_, _)
@@ -5314,6 +5303,23 @@ impl App {
                 drop(engine);
                 self.focus_editor_if_needed(still_focused && !has_dialog);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+                return;
+            }
+            if engine.settings_has_focus {
+                let mapped = map_gtk_key_name(key_name.as_str());
+                if engine.dialog.is_some() {
+                    engine.handle_key(mapped, unicode, ctrl);
+                } else {
+                    engine.handle_settings_key(mapped, ctrl, unicode);
+                }
+                let still_focused = engine.settings_has_focus;
+                let has_dialog = engine.dialog.is_some();
+                drop(engine);
+                self.focus_editor_if_needed(still_focused && !has_dialog);
+                if let Some(ref da) = *self.settings_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
@@ -8395,6 +8401,168 @@ impl App {
         }
     }
 
+    /// Phase A.3c-2: handle key/click/scroll messages routed from the
+    /// Settings sidebar DrawingArea. Geometry must mirror
+    /// `draw_settings_panel` in `src/gtk/draw.rs`:
+    ///   row 0 = header, row 1 = search, body = form rows of `row_h`,
+    ///   bottom row = "Open settings.json" footer.
+    fn handle_settings_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::SettingsKey(key_name, ctrl, unicode) => {
+                let mapped = map_gtk_key_name(key_name.as_str());
+                let mut engine = self.engine.borrow_mut();
+                if engine.dialog.is_some() {
+                    engine.handle_key(mapped, unicode, ctrl);
+                } else {
+                    engine.handle_settings_key(mapped, ctrl, unicode);
+                }
+                let still_focused = engine.settings_has_focus;
+                drop(engine);
+                self.focus_editor_if_needed(still_focused);
+                if let Some(ref da) = *self.settings_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::SettingsClick(x_click, y_click, n_press) => {
+                use crate::core::engine::SettingsRow;
+                use crate::core::settings::{SettingType, SETTING_DEFS};
+
+                let line_height = self.cached_ui_line_height.max(1.0);
+                let row_h = (line_height * 1.4_f64).round();
+                let body_top = line_height * 2.0; // header + search
+                let panel_w = self
+                    .settings_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.width() as f64)
+                    .unwrap_or(0.0);
+                let panel_h = self
+                    .settings_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.height() as f64)
+                    .unwrap_or(0.0);
+                let footer_top = (panel_h - line_height).max(body_top);
+                let body_h = (footer_top - body_top).max(0.0);
+
+                // Grab focus so subsequent keys reach this panel's controller
+                // (the activity-bar button keeps focus by default after click).
+                if let Some(ref da) = *self.settings_da_ref.borrow() {
+                    da.grab_focus();
+                }
+
+                let mut engine = self.engine.borrow_mut();
+                engine.settings_has_focus = true;
+
+                let total = engine.settings_flat_list().len();
+                let visible_rows = if row_h > 0.0 {
+                    (body_h / row_h).floor() as usize
+                } else {
+                    0
+                };
+                let need_sb = visible_rows > 0 && total > visible_rows;
+                let sb_w = if need_sb { 8.0 } else { 0.0 };
+                let form_right = (panel_w - sb_w).max(0.0);
+
+                if y_click < line_height {
+                    // Header row — no-op.
+                } else if y_click < body_top {
+                    // Search row — activate search input.
+                    engine.settings_input_active = true;
+                } else if y_click >= footer_top {
+                    // Footer row — open settings.json.
+                    drop(engine);
+                    let settings_path = std::env::var("HOME")
+                        .map(|h| format!("{}/.config/vimcode/settings.json", h))
+                        .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+                    self.engine
+                        .borrow_mut()
+                        .new_tab(Some(Path::new(&settings_path)));
+                    self.draw_needed.set(true);
+                    return;
+                } else if need_sb && x_click >= form_right {
+                    // Scrollbar track — jump-scroll so the click position maps
+                    // to the centre of the thumb (same behaviour as TUI).
+                    let track_len = body_h;
+                    let max_scroll = total.saturating_sub(visible_rows);
+                    let rel = (y_click - body_top).clamp(0.0, track_len);
+                    let ratio = if track_len > 0.0 {
+                        rel / track_len
+                    } else {
+                        0.0
+                    };
+                    engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
+                } else if row_h > 0.0 {
+                    // Body row.
+                    let local = ((y_click - body_top) / row_h) as usize;
+                    let scroll = engine.settings_scroll_top;
+                    let flat_idx = scroll + local;
+                    if flat_idx < total {
+                        engine.settings_selected = flat_idx;
+                        if n_press >= 2 {
+                            // Double-click = act on the row (toggle, expand,
+                            // open editor for Integer/StringVal — same as Enter
+                            // in keyboard nav).
+                            let row = engine.settings_flat_list()[flat_idx].clone();
+                            match row {
+                                SettingsRow::CoreSetting(idx) => {
+                                    let def = &SETTING_DEFS[idx];
+                                    if matches!(
+                                        def.setting_type,
+                                        SettingType::Integer { .. } | SettingType::StringVal
+                                    ) {
+                                        engine.settings_editing = Some(idx);
+                                        engine.settings_edit_buf =
+                                            engine.settings.get_value_str(def.key);
+                                    } else {
+                                        engine.handle_settings_key("Return", false, None);
+                                    }
+                                }
+                                _ => {
+                                    engine.handle_settings_key("Return", false, None);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                drop(engine);
+                if let Some(ref da) = *self.settings_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::SettingsScroll(dy) => {
+                let mut engine = self.engine.borrow_mut();
+                let total = engine.settings_flat_list().len();
+                let line_height = self.cached_ui_line_height.max(1.0);
+                let row_h = (line_height * 1.4_f64).round();
+                let body_top = line_height * 2.0;
+                let panel_h = self
+                    .settings_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.height() as f64)
+                    .unwrap_or(0.0);
+                let body_h = (panel_h - body_top - line_height).max(0.0);
+                let visible_rows = (body_h / row_h).floor() as usize;
+                let max_scroll = total.saturating_sub(visible_rows);
+                // dy is normally ±1 per wheel notch; multiply for a 3-row jump.
+                let step = if dy > 0.0 { 3 } else { -3 };
+                let new_scroll = (engine.settings_scroll_top as isize + step as isize)
+                    .clamp(0, max_scroll as isize) as usize;
+                engine.settings_scroll_top = new_scroll;
+                drop(engine);
+                if let Some(ref da) = *self.settings_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn handle_ext_panel_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ExtPanelKey(key_name, unicode) => {
@@ -8731,6 +8899,9 @@ impl App {
                                 engine.ext_panel_has_focus = true;
                                 engine.ext_panel_active = Some(name.clone());
                             }
+                            SidebarPanel::Settings => {
+                                self.engine.borrow_mut().settings_has_focus = true;
+                            }
                             _ => {}
                         }
                     }
@@ -8774,18 +8945,12 @@ impl App {
                             engine.plugin_event("panel_focus", name);
                         }
                     }
-                    // Rebuild settings form so widgets reflect current engine.settings
-                    // (e.g. toggles changed via :set command since the panel was last open).
+                    // Phase A.3c-2: Settings panel is a stateless DrawingArea; just
+                    // give it focus so key events route to handle_settings_key.
                     if self.active_panel == SidebarPanel::Settings {
-                        if let Some(ref lb) = *self.settings_list_box.borrow() {
-                            while let Some(child) = lb.first_child() {
-                                lb.remove(&child);
-                            }
-                            let engine = self.engine.borrow();
-                            let new_sections =
-                                build_settings_form(lb, &engine.settings, &self.sender);
-                            drop(engine);
-                            *self.settings_sections.borrow_mut() = new_sections;
+                        self.engine.borrow_mut().settings_has_focus = true;
+                        if let Some(ref da) = *self.settings_da_ref.borrow() {
+                            da.queue_draw();
                         }
                     }
                 }
@@ -8837,6 +9002,11 @@ impl App {
                         }
                         SidebarPanel::ExtPanel(_) => {
                             if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        SidebarPanel::Settings => {
+                            if let Some(ref da) = *self.settings_da_ref.borrow() {
                                 da.grab_focus();
                             }
                         }

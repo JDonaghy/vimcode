@@ -18,7 +18,6 @@ use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
-pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection};

@@ -1540,6 +1540,10 @@ impl Settings {
 #[derive(Debug, Clone)]
 pub enum SettingType {
     Bool,
+    /// `min`/`max` encode the valid range — kept for future range-aware
+    /// Form widgets (Slider, etc., per issue #143). Currently unread by
+    /// any backend now that GTK no longer renders a `SpinButton`.
+    #[allow(dead_code)]
     Integer {
         min: i32,
         max: i32,

@@ -5174,6 +5174,250 @@ pub(super) fn draw_source_control_panel(
     }
 }
 
+// ─── Settings sidebar panel ───────────────────────────────────────────────────
+
+/// Phase A.3c-2: settings panel renders into a `DrawingArea` via the
+/// shared `quadraui::Form` primitive. Layout from top to bottom:
+///   - Row 0: header bar (status-bar styling, "  SETTINGS")
+///   - Row 1: search input row (`/ <query>` with cursor when active)
+///   - Body: scrollable form (`quadraui_gtk::draw_form`) + scrollbar column
+///   - Bottom row: "Open settings.json" footer button (status-bar styling)
+///
+/// **Geometry contract:** the click handler in
+/// `App::handle_settings_msg` mirrors these row positions exactly
+/// (header @ 0..line_height, search @ line_height..2*line_height, body
+/// rows of `(line_height * 1.4).round()` starting at `2*line_height`,
+/// footer at `panel_h - line_height`). Update both sites together.
+///
+/// Inline-edit mode (Integer / String) overlays the editing row's value
+/// plus cursor on top of the form rendering, since `settings_to_form`
+/// does not yet emit `TextInput` for active-edit fields (tracked as a
+/// future adapter refinement; matches the TUI fallback in `panels.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_settings_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    engine: &Engine,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    use crate::core::engine::SettingsRow;
+    use crate::core::settings::SETTING_DEFS;
+
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+
+    // Geometry — keep in sync with `App::handle_settings_msg`.
+    let row_h = (line_height * 1.4).round();
+    let footer_h = line_height;
+
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+    let (accent_r, accent_g, accent_b) = theme.cursor.to_cairo();
+
+    // Background.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+    layout.set_attributes(None);
+
+    // ── Row 0: header bar ────────────────────────────────────────────────────
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, y, w, line_height);
+    cr.fill().ok();
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
+    layout.set_text("  SETTINGS");
+    let (_, header_lh) = layout.pixel_size();
+    cr.move_to(x + 2.0, y + (line_height - header_lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    // ── Row 1: search input ──────────────────────────────────────────────────
+    let search_y = y + line_height;
+    let search_active = engine.settings_input_active;
+    let (sb_r, sb_g, sb_b) = if search_active {
+        (sel_r, sel_g, sel_b)
+    } else {
+        (bg_r, bg_g, bg_b)
+    };
+    cr.set_source_rgb(sb_r, sb_g, sb_b);
+    cr.rectangle(x, search_y, w, line_height);
+    cr.fill().ok();
+
+    let prefix = " /  ";
+    cr.set_source_rgb(dim_r, dim_g, dim_b);
+    layout.set_text(prefix);
+    let (prefix_w, _) = layout.pixel_size();
+    cr.move_to(x + 2.0, search_y + (line_height - header_lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    let q_x = x + 2.0 + prefix_w as f64;
+    let q_color = if engine.settings_query.is_empty() {
+        (dim_r, dim_g, dim_b)
+    } else {
+        (fg_r, fg_g, fg_b)
+    };
+    let q_text: &str = if engine.settings_query.is_empty() && !search_active {
+        "Search settings…"
+    } else {
+        engine.settings_query.as_str()
+    };
+    cr.set_source_rgb(q_color.0, q_color.1, q_color.2);
+    layout.set_text(q_text);
+    let (q_w, _) = layout.pixel_size();
+    cr.move_to(q_x, search_y + (line_height - header_lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+
+    if search_active {
+        let cur_x = q_x
+            + if engine.settings_query.is_empty() {
+                0.0
+            } else {
+                q_w as f64
+            };
+        cr.set_source_rgb(accent_r, accent_g, accent_b);
+        cr.rectangle(cur_x, search_y + 2.0, 1.5, line_height - 4.0);
+        cr.fill().ok();
+    }
+
+    // ── Body: form + scrollbar; bottom row reserved for footer ──────────────
+    let body_y = y + line_height * 2.0;
+    let body_h = (y + h - body_y - footer_h).max(0.0);
+    if body_h <= 0.0 {
+        return;
+    }
+
+    let total = engine.settings_flat_list().len();
+    let visible_rows = (body_h / row_h).floor() as usize;
+    let need_sb = visible_rows > 0 && total > visible_rows;
+    let sb_w = if need_sb { 8.0 } else { 0.0 };
+    let form_w = (w - sb_w).max(0.0);
+
+    // Form rendering via the shared primitive.
+    let form = render::settings_to_form(engine);
+    super::quadraui_gtk::draw_form(
+        cr,
+        layout,
+        x,
+        body_y,
+        form_w,
+        body_h,
+        &form,
+        theme,
+        line_height,
+    );
+
+    // ── Inline-edit overlay ─────────────────────────────────────────────────
+    let editing_idx: Option<usize> = if let Some(def_idx) = engine.settings_editing {
+        engine
+            .settings_flat_list()
+            .iter()
+            .position(|r| matches!(r, SettingsRow::CoreSetting(i) if *i == def_idx))
+    } else if let Some((ext_name, ext_key)) = engine.ext_settings_editing.clone() {
+        engine.settings_flat_list().iter().position(
+            |r| matches!(r, SettingsRow::ExtSetting(en, ek) if en == &ext_name && ek == &ext_key),
+        )
+    } else {
+        None
+    };
+    if let Some(flat_idx) = editing_idx {
+        let scroll = engine.settings_scroll_top;
+        if flat_idx >= scroll {
+            let local = flat_idx - scroll;
+            let ey = body_y + local as f64 * row_h;
+            if ey + row_h <= body_y + body_h {
+                let buf = &engine.settings_edit_buf;
+                let value_max_w = (form_w * 0.6).max(80.0);
+                let input_right = x + form_w - 8.0;
+
+                // Highlight the row.
+                cr.set_source_rgb(sel_r, sel_g, sel_b);
+                cr.rectangle(x, ey, form_w, row_h);
+                cr.fill().ok();
+
+                // Re-draw label.
+                let flat = engine.settings_flat_list();
+                let label_text = match &flat[flat_idx] {
+                    SettingsRow::CoreSetting(i) => SETTING_DEFS[*i].label.to_string(),
+                    SettingsRow::ExtSetting(_, k) => k.clone(),
+                    _ => String::new(),
+                };
+                cr.set_source_rgb(fg_r, fg_g, fg_b);
+                layout.set_text(&label_text);
+                let (_, lh2) = layout.pixel_size();
+                cr.move_to(x + 6.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                // Bracketed editable value with cursor at end of buffer.
+                layout.set_text(buf);
+                let (bw, _) = layout.pixel_size();
+                let draw_w = (bw as f64).min(value_max_w);
+                let ix = input_right - draw_w - 14.0;
+
+                cr.set_source_rgb(dim_r, dim_g, dim_b);
+                layout.set_text("[");
+                cr.move_to(ix, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                cr.set_source_rgb(fg_r, fg_g, fg_b);
+                layout.set_text(buf);
+                cr.move_to(ix + 8.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                cr.set_source_rgb(dim_r, dim_g, dim_b);
+                layout.set_text("]");
+                cr.move_to(ix + 8.0 + draw_w + 2.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                // Cursor at end of buf.
+                cr.set_source_rgb(accent_r, accent_g, accent_b);
+                cr.rectangle(ix + 8.0 + bw as f64, ey + 3.0, 1.5, row_h - 6.0);
+                cr.fill().ok();
+            }
+        }
+    }
+
+    // ── Scrollbar ───────────────────────────────────────────────────────────
+    if need_sb {
+        let sb_x = x + form_w;
+        let track_len = body_h;
+        let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
+        let max_scroll = total.saturating_sub(visible_rows) as f64;
+        let scroll_ratio = if max_scroll > 0.0 {
+            engine.settings_scroll_top as f64 / max_scroll
+        } else {
+            0.0
+        };
+        let thumb_y = body_y + scroll_ratio * (track_len - thumb_len);
+        // Track.
+        cr.set_source_rgb(bg_r, bg_g, bg_b);
+        cr.rectangle(sb_x, body_y, sb_w, track_len);
+        cr.fill().ok();
+        // Thumb.
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        cr.rectangle(sb_x + 2.0, thumb_y, sb_w - 4.0, thumb_len);
+        cr.fill().ok();
+    }
+
+    // ── Footer: "Open settings.json" ───────────────────────────────────────
+    let footer_y = y + h - footer_h;
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, footer_y, w, footer_h);
+    cr.fill().ok();
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
+    layout.set_text("  Open settings.json");
+    cr.move_to(x + 4.0, footer_y + (footer_h - header_lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
+}
+
 // ─── Extension-provided panel (e.g. git-insights GIT LOG) ─────────────────────
 
 #[allow(clippy::too_many_arguments)]
