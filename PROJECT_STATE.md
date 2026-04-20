@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 301 — fix #151: TUI palette scrollbar now draggable) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 302 — Phase A.3c-2: GTK settings panel migrated to DrawingArea + draw_form) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,55 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 302 — Phase A.3c-2 shipped (GTK settings panel → DrawingArea + draw_form):**
+
+1. **GTK settings sidebar migrated** from a native widget tree
+   (`Switch`/`SpinButton`/`Entry`/`DropDown`/`Button` rows inside a
+   `ScrolledWindow`) to a single `DrawingArea` that calls
+   `quadraui_gtk::draw_form` (which has existed since A.3c). The panel
+   is now visually consistent with the TUI A.3b version and gains
+   in-place rendering of inline-edit cursor + bracketed value overlay.
+2. **New `draw_settings_panel` in `src/gtk/draw.rs`** — header bar +
+   search row (with cursor when active) + form body (via the
+   primitive) + scrollbar column + `Open settings.json` footer row.
+   Geometry contract documented in the doc comment so the click
+   handler in `App::handle_settings_msg` mirrors row positions.
+3. **New `App::handle_settings_msg` in `src/gtk/mod.rs`** — handles
+   `Msg::SettingsKey` / `SettingsClick` / `SettingsScroll`. Click
+   geometry: header → no-op, search → activate input, scrollbar track
+   → jump-scroll, body row → select (double-click toggles bools or
+   opens inline-edit for Integer/StringVal), footer → open
+   `settings.json` in a new tab. Mouse wheel scrolls 3 rows per notch.
+4. **Focus routing (the bug that surfaced during smoke test)** — the
+   activity-bar `gtk4::Button` keeps focus after click, so neither the
+   editor DA's key controller (capture phase, attached to the editor
+   DA) nor the new settings DA's controller fired for `j`/`k`/`/`.
+   Fixed by adding `SidebarPanel::Settings` to the per-panel
+   `grab_focus` block in `Msg::SwitchPanel` *and* calling
+   `da.grab_focus()` inside the click handler. The same pattern
+   already existed for SC / Extensions / Debug / AI — captured in
+   PLAN.md "Lessons learned" so future panels don't miss it.
+5. **Removed the dead `build_settings_form` / `build_setting_row`
+   from `src/gtk/util.rs`** (–206 lines). Removed the
+   `settings_list_box` / `settings_sections` `App` fields and the
+   panel-rebuild block on `SwitchPanel(Settings)` (DrawingArea is
+   stateless). Re-exports of `SettingDef`/`SettingType`/`SETTING_DEFS`
+   from `src/render.rs` removed (no longer needed).
+6. **`SettingType::Integer { min, max }` annotated `#[allow(dead_code)]`**
+   with a comment explaining the values are kept for future
+   range-aware Form widgets (Slider per #143). Currently no backend
+   reads them now that GTK no longer renders a `SpinButton`.
+7. **All quality gates pass** — `cargo fmt`, `cargo clippy`
+   (default and `--no-default-features`), full
+   `cargo test --no-default-features` (5223 / 0 / 19, same as
+   baseline), `cargo build`. **Net diff:** +513 / –302 lines across
+   5 files; `src/gtk/util.rs` shrinks from 482 → 276 lines.
+8. **Next up:** Phase A.2b (GTK explorer native `gtk4::TreeView` →
+   `DrawingArea` + `quadraui_gtk::draw_tree`) is the only remaining
+   large GTK migration on Linux. A.1c / A.2c need Windows.
+
+---
 
 **Session 301 — Fix #151: TUI palette scrollbar now draggable:**
 

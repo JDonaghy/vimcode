@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 300 — A.4b shipped; GTK migrations A.3c-2 / A.2b remain queued)
+> **Last updated:** 2026-04-19 (Session 302 — A.3c-2 shipped; A.2b is the only large GTK migration left on Linux)
 
 ---
 
@@ -35,7 +35,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
 | **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
 | **Phase A.3c** — GTK `draw_form` primitive (migration deferred) | ✅ Done | `3f34a03` | `quadraui-phase-a3c-*` | any |
-| **Phase A.3c-2** — GTK settings panel uses `draw_form` (native → DrawingArea) | 🟡 Unblocked | — | `quadraui-phase-a3c2-*` | Linux / macOS with GTK4 |
+| **Phase A.3c-2** — GTK settings panel uses `draw_form` (native → DrawingArea) | ✅ Done | `fa44a51` | `quadraui-phase-a3c2-*` | Linux / macOS with GTK4 |
 | **Phase A.3d** — `TextInput` cursor + selection in `Form` | ✅ Done | `f7f3a51` | `quadraui-phase-a3d-*` | any |
 | **Phase A.4** — `Palette` primitive + TUI command palette | ✅ Done | `534c386` | `quadraui-phase-a4-*` | any |
 | **Phase A.4b** — GTK `draw_palette` + GTK command palette | ✅ Done | `c8f2d91` | `quadraui-phase-a4b-*` | Linux / macOS with GTK4 |
@@ -49,12 +49,10 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c and A.2c need a Windows machine. A.2b and A.3c-2 are **unblocked**
-on Linux now that A.3d shipped cursor-aware `TextInput`. Both are
-architectural migrations from native GTK widgets to `DrawingArea` +
-`quadraui_gtk::draw_form`/`draw_tree` — medium-large scope each.
-The lower-risk GTK stages (A.1b, A.4b, A.5b) are all done; the
-remaining Linux queue is A.3c-2 and A.2b.
+A.1c and A.2c need a Windows machine. A.2b is the only remaining Linux
+GTK migration — explorer native `gtk4::TreeView` → `DrawingArea` +
+`quadraui_gtk::draw_tree`. The lower-risk GTK stages (A.1b, A.3c-2,
+A.4b, A.5b) are all done.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)
@@ -81,6 +79,22 @@ are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadr
   after touching an adapter. If the highlight visually lands on a
   non-header row but key behaviour says otherwise, the adapter has
   added or dropped a row.
+
+- **DrawingArea-based sidebars need explicit `grab_focus` after the
+  panel becomes visible.** A.3c-2 first shipped without this and the
+  symptom was: clicking the activity bar opened the panel and the
+  visual selection moved on click, but `j`/`k`/`/` keyboard input
+  silently went nowhere. The activity-bar `gtk4::Button` keeps focus
+  after click, the editor DA's key controller (capture phase, attached
+  to the editor DA) does not fire for keys destined elsewhere, and
+  the sidebar DA's own controller can't fire until something gives it
+  focus. Fix (absorbed into the A.3c-2 commit): add the new panel to
+  the per-panel `grab_focus` block in `Msg::SwitchPanel` *and* call
+  `da.grab_focus()` in the panel's click handler. The same pattern
+  already existed for SC / Extensions / Debug / AI; missing it for a
+  new panel is a silent regression. Rule: **every new sidebar DA must
+  appear in both the SwitchPanel grab-focus match and the click
+  handler**, otherwise its key controller is dead code.
 
 - **Branches are not automatically headers.** Early `draw_tree`
   implementations (TUI + GTK) applied section-header background styling

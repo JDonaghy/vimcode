@@ -1,4 +1,4 @@
-# src/gtk/mod.rs — 10,048 lines
+# src/gtk/mod.rs — 10,161 lines
 
 GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleComponent` impl (init/view/update). Contains the main event loop, window setup, input handling, and all GTK widget wiring.
 
@@ -28,6 +28,7 @@ GTK4/Relm4 application shell. Defines the `App` struct, `Msg` enum, and `SimpleC
 - `handle_sc_sidebar_msg()` — source control sidebar click/motion/key
 - `handle_ext_sidebar_msg()` — extensions sidebar key/click
 - `handle_ext_panel_msg()` — extension detail panel key/click/scroll/hover
+- `handle_settings_msg()` — settings sidebar key/click/scroll (Phase A.3c-2)
 - `handle_ai_sidebar_msg()` — AI sidebar key/click
 - `handle_sidebar_panel_msg()` — sidebar toggle/panel switch
 - `handle_explorer_msg()` — file tree open/preview/create/delete/refresh/focus/activate-selected

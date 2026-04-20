@@ -14,11 +14,17 @@ GTK CSS theme generation and loading.
 - `STATIC_CSS` — constant CSS for non-theme-dependent styles
 - `load_css()` — applies CSS to GTK display
 
-## src/gtk/util.rs — 468 lines
-GTK utility functions and settings form builders.
-- `matches_gtk_key(key_name, target)` — key name matching helper
-- Settings form builder functions for the settings sidebar (GTK native widgets)
-- `install_icon()` — installs Nerd Font icons into GTK icon theme
+## src/gtk/util.rs — 276 lines
+GTK utility functions.
+- `open_url(url)` — open URL in default browser
+- `matches_gtk_key(binding, key, state)` — key binding matcher (panel_keys)
+- `gtk_key_to_pty_bytes(key_name, unicode, ctrl)` — translate GTK key event to PTY input bytes
+- `build_gio_menu_from_engine_items()` — context-menu construction from engine items
+- `swap_ctx_popover()` — context-menu popover lifecycle helper
+- `install_bundled_icon_font()` / `install_icon_and_desktop()` — icon + desktop entry installation
+- `menu_row_count()` — count visible rows in a `gio::Menu`
+- `suppress_css_node_warning` — GLib log handler suppressing a known GTK4 assertion
+- (Phase A.3c-2: native-widget settings-form builders removed; Settings panel now renders into a DrawingArea via `quadraui_gtk::draw_form`.)
 
 ## src/gtk/tree.rs — 449 lines
 File explorer tree building with GTK TreeStore.
