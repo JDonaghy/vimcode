@@ -1123,6 +1123,13 @@ impl Settings {
             "font_family" => {
                 self.font_family = value.to_string();
             }
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.syntax_max_lines = n;
+                crate::core::buffer_manager::set_syntax_max_lines(n);
+            }
             _ => return Err(format!("Unknown option: {name}")),
         }
         Ok(())
@@ -1296,6 +1303,9 @@ impl Settings {
             } else {
                 "nonerdfonts".to_string()
             }),
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
+            }
             _ => Err(format!("Unknown option: {opt}")),
         }
     }
