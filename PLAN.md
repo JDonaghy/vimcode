@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 303 — A.2b-2 atomic switchover shipped and smoke-tested)
+> **Last updated:** 2026-04-20 (Session 305 — A.6a `StatusBar` primitive + TUI migration landed)
 
 ---
 
@@ -42,7 +42,11 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.4b** — GTK `draw_palette` + GTK command palette | ✅ Done | `c8f2d91` | `quadraui-phase-a4b-*` | Linux / macOS with GTK4 |
 | **Phase A.5** — `ListView` primitive + TUI quickfix | ✅ Done | `63d1b29` | `quadraui-phase-a5-*` | any |
 | **Phase A.5b** — GTK `draw_list` + GTK quickfix | ✅ Done | `e1ea5ea` | `quadraui-phase-a5b-*` | Linux / macOS with GTK4 |
-| Phase A.6 — `StatusBar` / `TabBar` / `ActivityBar` finish | ⬜ Queued | — | `quadraui-phase-a6-*` | any |
+| **Phase A.6a** — `StatusBar` primitive + TUI per-window status line migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6a-status-bar-tui` | any (TUI) |
+| Phase A.6b — GTK `draw_status_bar` | ⬜ Queued | — | `quadraui-phase-a6b-*` | Linux / macOS with GTK4 |
+| Phase A.6c — `TabBar` primitive + TUI | ⬜ Queued | — | `quadraui-phase-a6c-*` | any (TUI) |
+| Phase A.6d — GTK `draw_tab_bar` | ⬜ Queued | — | `quadraui-phase-a6d-*` | Linux / macOS with GTK4 |
+| Phase A.6e — `ActivityBar` primitive + TUI + GTK | ⬜ Queued | — | `quadraui-phase-a6e-*` | any |
 | Phase A.7 — `Terminal` primitive | ⬜ Queued | — | `quadraui-phase-a7-*` | any |
 | Phase A.8 — `TextDisplay` | ⬜ Queued | — | `quadraui-phase-a8-*` | any |
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Queued | — | `quadraui-phase-a9-*` | any — biggest stage |

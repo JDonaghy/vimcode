@@ -233,11 +233,7 @@ fn is_in_latex_command_or_math(
 /// Returns true if any byte in `[start, end)` overlaps a comment or string scope.
 /// Caller is expected to pass a slice already narrowed to a single line's
 /// highlights (see the pre-filter in `check_line`).
-fn is_in_comment_or_string(
-    highlights: &[(usize, usize, &str)],
-    start: usize,
-    end: usize,
-) -> bool {
+fn is_in_comment_or_string(highlights: &[(usize, usize, &str)], start: usize, end: usize) -> bool {
     for (hs, he, scope) in highlights {
         if *he <= start {
             continue;

@@ -821,3 +821,74 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
         y += 1;
     }
 }
+
+/// Draw a `quadraui::StatusBar` as a single row.
+///
+/// `area` is the target rect (height is ignored beyond the first row).
+/// Left segments accumulate from the left edge; right segments are
+/// right-aligned inside `area.width`. If the two halves would overlap
+/// (bar too narrow), the right half wins — left segments are truncated.
+///
+/// Background fill uses the first segment's `bg` so the bar looks
+/// continuous even when gaps exist between left and right halves.
+pub(super) fn draw_status_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    bar: &quadraui::StatusBar,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let y = area.y;
+
+    let fallback_bg = theme.background;
+    let fill_bg = bar
+        .left_segments
+        .first()
+        .or(bar.right_segments.first())
+        .map(|s| qc(s.bg))
+        .unwrap_or(RatatuiColor::Rgb(
+            fallback_bg.r,
+            fallback_bg.g,
+            fallback_bg.b,
+        ));
+    for col in 0..area.width {
+        set_cell(buf, area.x + col, y, ' ', fill_bg, fill_bg);
+    }
+
+    let draw_segments =
+        |buf: &mut Buffer, segments: &[quadraui::StatusBarSegment], start_x: u16| -> u16 {
+            let mut cx = start_x;
+            for seg in segments {
+                let fg = qc(seg.fg);
+                let bg = qc(seg.bg);
+                for ch in seg.text.chars() {
+                    if cx >= area.x + area.width {
+                        return cx;
+                    }
+                    set_cell(buf, cx, y, ch, fg, bg);
+                    if seg.bold {
+                        if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
+                            cell.set_style(
+                                ratatui::style::Style::default()
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            );
+                        }
+                    }
+                    cx += 1;
+                }
+            }
+            cx
+        };
+
+    draw_segments(buf, &bar.left_segments, area.x);
+
+    let right_width: u16 = bar
+        .right_segments
+        .iter()
+        .map(|s| s.text.chars().count() as u16)
+        .sum();
+    let right_start = (area.x + area.width).saturating_sub(right_width);
+    draw_segments(buf, &bar.right_segments, right_start);
+}

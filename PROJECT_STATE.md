@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 304 — Fix #154: `syntax_max_lines` gate skips tree-sitter parse on huge files at startup) | **Tests:** 5225 total (full `cargo test --no-default-features`); 1944 lib + 414 nvim conformance + ~2867 integration
+**Last updated:** Apr 20, 2026 (Session 305 — A.6a: `StatusBar` primitive + TUI per-window status line migration) | **Tests:** 5240 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 15. Prior `cargo test --no-default-features` figure was 5225 vimcode-only
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,23 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 305 — Phase A.6a: `StatusBar` primitive + TUI per-window status line migration:**
+
+1. **Scope decision.** PLAN.md had A.6 as a single "StatusBar / TabBar / ActivityBar finish" stage. Split into five sub-phases (A.6a–A.6e) matching the A.4/A.4b and A.5/A.5b cadence, so each primitive + backend migration is an independent smoke-testable slice rather than a large three-primitive diff.
+2. **New primitive `quadraui::primitives::status_bar`** — `StatusBar { id, left_segments, right_segments }`, `StatusBarSegment { text, fg, bg, bold, action_id: Option<WidgetId> }`, `StatusBarHitRegion`, `StatusBarEvent { SegmentClicked, KeyPressed }`. `StatusBar::hit_regions(bar_width)` + `resolve_click(col, bar_width)` live on the primitive for backend-neutral click resolution.
+3. **Engine-agnostic action encoding.** Per plugin invariant §10 ("primitives don't borrow app state"), quadraui can't see vimcode's `StatusAction` enum. Added `render::status_action_id(&StatusAction) -> &'static str` + `status_action_from_id(&str) -> Option<StatusAction>` so the adapter encodes engine enum → opaque `WidgetId` string (`"status:goto_line"`, etc.) and the click handler decodes back. Similar pattern will apply to TabBar and ActivityBar.
+4. **New adapter `render::window_status_line_to_status_bar()`** — converts the existing `WindowStatusLine` (built by `build_window_status_line`, Session 241–243) into a `quadraui::StatusBar`, flattening `StatusAction` to `WidgetId` via the encoder.
+5. **TUI `quadraui_tui::draw_status_bar`** — renders `StatusBar` into a ratatui `Buffer` with the same pixel-for-pixel behaviour as the old `render_window_status_line`: background fill from first segment's `bg`, left segments from left edge, right segments right-aligned, per-segment bold attribute. Both the old global status bar and per-window status bars now flow through this function.
+6. **TUI `render_window_status_line` reduced to 12 lines** — builds the primitive via the adapter and delegates to `draw_status_bar`. The previous ~60-line Cairo-like closure-based implementation is gone.
+7. **TUI click path `status_segment_hit_test` migrated** — now builds the primitive, calls `StatusBar::resolve_click`, decodes the returned `WidgetId` via `status_action_from_id`. External signature preserved (`WindowStatusLine` in, `Option<StatusAction>` out) so the ~20 callsites in `mouse.rs` are untouched.
+8. **GTK not yet migrated.** GTK still uses its own Pango-based `draw_window_status_bar` with `WindowStatusLine` directly. Tracked as A.6b.
+9. **2 new quadraui lib tests** — serde round-trip on `StatusBar` with interactive segments, and `hit_regions` + `resolve_click` on a mixed-side bar. Existing vimcode test count unchanged (5225) — the migration is a refactor with no behavioural change in any integration test.
+10. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), `cargo test --workspace --no-default-features` (5240/0/19, vimcode 5225 unchanged + quadraui 15 including 2 new), `cargo build` (both default + `--no-default-features`).
+11. **Net diff:** +296 / –52 lines across 8 files. `src/tui_main/render_impl.rs` shrinks by ~47 lines as the inline renderer becomes a delegation.
+12. **Awaiting smoke test.** TUI per-window status line should render identically and all clickable segments (mode / filename / cursor / language / indent / line ending / encoding / branch / LSP / toggles / notifications) must still open their existing pickers.
+
+---
 
 **Session 304 — Fix #154: startup tree-sitter parse on large files:**
 

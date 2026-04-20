@@ -3138,57 +3138,21 @@ fn render_window_status_line(
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
 ) {
-    use crate::render::StatusSegment;
-
-    // Use the first segment's bg to fill any gaps in the row
-    let fill_bg = status
-        .left_segments
-        .first()
-        .or(status.right_segments.first())
-        .map(|s| s.bg)
-        .unwrap_or(theme.background);
-    let bg = rc(fill_bg);
-    // Fill row with per-window status background
-    for col in 0..width {
-        set_cell(buf, x + col, y, ' ', bg, bg);
-    }
-
-    let draw_segments =
-        |buf: &mut ratatui::buffer::Buffer, segments: &[StatusSegment], start_x: u16| {
-            let mut cx = start_x;
-            for seg in segments {
-                let fg = rc(seg.fg);
-                let seg_bg = rc(seg.bg);
-                for ch in seg.text.chars() {
-                    if cx >= x + width {
-                        return cx;
-                    }
-                    set_cell(buf, cx, y, ch, fg, seg_bg);
-                    if seg.bold {
-                        if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
-                            cell.set_style(
-                                ratatui::style::Style::default()
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
-                            );
-                        }
-                    }
-                    cx += 1;
-                }
-            }
-            cx
-        };
-
-    // Draw left segments from left edge
-    draw_segments(buf, &status.left_segments, x);
-
-    // Draw right segments right-aligned
-    let right_width: u16 = status
-        .right_segments
-        .iter()
-        .map(|s| s.text.chars().count() as u16)
-        .sum();
-    let right_start = (x + width).saturating_sub(right_width);
-    draw_segments(buf, &status.right_segments, right_start);
+    // A.6a: status line rendering delegates to the quadraui `StatusBar`
+    // primitive. The adapter encodes engine-side `StatusAction` values as
+    // opaque `WidgetId` strings; `status_segment_hit_test` (in mouse.rs)
+    // decodes them back to `StatusAction` via `status_action_from_id`.
+    let bar = crate::render::window_status_line_to_status_bar(
+        status,
+        quadraui::WidgetId::new("status:window"),
+    );
+    let area = ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height: 1,
+    };
+    super::quadraui_tui::draw_status_bar(buf, area, &bar, theme);
 }
 
 pub(super) fn render_scrollbar(

@@ -2902,15 +2902,20 @@ pub(super) fn handle_mouse(
 }
 
 /// Walk status line segments and find which action (if any) is at `click_col`.
+///
+/// A.6a: now routes through the `quadraui::StatusBar` primitive.
+/// The adapter encodes `StatusAction` as opaque `WidgetId` strings, and
+/// `status_action_from_id` decodes them back to the engine enum for
+/// dispatch via `engine.handle_status_action`.
 fn status_segment_hit_test(
     status: &crate::render::WindowStatusLine,
     width: usize,
     click_col: usize,
 ) -> Option<crate::render::StatusAction> {
-    let regions = crate::render::compute_status_hit_regions(
-        &status.left_segments,
-        &status.right_segments,
-        width,
+    let bar = crate::render::window_status_line_to_status_bar(
+        status,
+        quadraui::WidgetId::new("status:window"),
     );
-    crate::render::resolve_status_bar_click(&regions, click_col as u16)
+    let id = bar.resolve_click(click_col as u16, width)?;
+    crate::render::status_action_from_id(id.as_str())
 }

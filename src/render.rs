@@ -8484,6 +8484,76 @@ pub fn resolve_status_bar_click(
     None
 }
 
+// ─── quadraui::StatusBar adapter (A.6a) ──────────────────────────────────────
+
+/// String id encoding a `StatusAction`. Paired with [`status_action_from_id`].
+/// Used to adapt vimcode's engine-side `StatusAction` enum to quadraui's
+/// type-erased `WidgetId`-keyed segment actions.
+pub fn status_action_id(action: &StatusAction) -> &'static str {
+    match action {
+        StatusAction::GoToLine => "status:goto_line",
+        StatusAction::ChangeLanguage => "status:change_language",
+        StatusAction::ChangeIndentation => "status:change_indentation",
+        StatusAction::ChangeLineEnding => "status:change_line_ending",
+        StatusAction::ChangeEncoding => "status:change_encoding",
+        StatusAction::SwitchBranch => "status:switch_branch",
+        StatusAction::LspInfo => "status:lsp_info",
+        StatusAction::ToggleSidebar => "status:toggle_sidebar",
+        StatusAction::TogglePanel => "status:toggle_panel",
+        StatusAction::ToggleMenuBar => "status:toggle_menu_bar",
+        StatusAction::DismissNotifications => "status:dismiss_notifications",
+    }
+}
+
+/// Inverse of [`status_action_id`]: decode a `WidgetId` string back into a
+/// `StatusAction`. Returns `None` for unknown ids (plugin-emitted, future, etc.).
+pub fn status_action_from_id(id: &str) -> Option<StatusAction> {
+    match id {
+        "status:goto_line" => Some(StatusAction::GoToLine),
+        "status:change_language" => Some(StatusAction::ChangeLanguage),
+        "status:change_indentation" => Some(StatusAction::ChangeIndentation),
+        "status:change_line_ending" => Some(StatusAction::ChangeLineEnding),
+        "status:change_encoding" => Some(StatusAction::ChangeEncoding),
+        "status:switch_branch" => Some(StatusAction::SwitchBranch),
+        "status:lsp_info" => Some(StatusAction::LspInfo),
+        "status:toggle_sidebar" => Some(StatusAction::ToggleSidebar),
+        "status:toggle_panel" => Some(StatusAction::TogglePanel),
+        "status:toggle_menu_bar" => Some(StatusAction::ToggleMenuBar),
+        "status:dismiss_notifications" => Some(StatusAction::DismissNotifications),
+        _ => None,
+    }
+}
+
+/// Convert a `WindowStatusLine` (built by `build_window_status_line`) into a
+/// `quadraui::StatusBar` primitive. Engine-owned `StatusAction` enums are
+/// flattened to opaque `WidgetId` strings so the primitive is
+/// engine-agnostic (plugin invariants §10).
+///
+/// `id` identifies the bar (useful if multiple status bars are rendered, e.g.
+/// per-window). Callers can use e.g. `WidgetId::new("status:w0")`.
+pub fn window_status_line_to_status_bar(
+    status: &WindowStatusLine,
+    id: quadraui::WidgetId,
+) -> quadraui::StatusBar {
+    fn to_seg(s: &StatusSegment) -> quadraui::StatusBarSegment {
+        quadraui::StatusBarSegment {
+            text: s.text.clone(),
+            fg: quadraui::Color::rgb(s.fg.r, s.fg.g, s.fg.b),
+            bg: quadraui::Color::rgb(s.bg.r, s.bg.g, s.bg.b),
+            bold: s.bold,
+            action_id: s
+                .action
+                .as_ref()
+                .map(|a| quadraui::WidgetId::new(status_action_id(a))),
+        }
+    }
+    quadraui::StatusBar {
+        id,
+        left_segments: status.left_segments.iter().map(to_seg).collect(),
+        right_segments: status.right_segments.iter().map(to_seg).collect(),
+    }
+}
+
 fn build_command_line(engine: &Engine) -> CommandLineData {
     let (text, right_align, show_cursor, cursor_anchor_text) = match engine.mode {
         Mode::Command if engine.history_search_active => {
