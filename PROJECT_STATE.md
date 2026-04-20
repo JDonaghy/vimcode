@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 303 — Phase A.2b-2: GTK explorer atomic switchover, native TreeView → DrawingArea, awaiting smoke test) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 20, 2026 (Session 303 — Phase A.2b-2: GTK explorer atomic switchover shipped and smoke-tested; two rounds of smoke-test fix follow-ups landed as `c57f594` + `26ed4e9`) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -91,7 +91,12 @@ When implementing a new key/command, add tests covering:
       (follow-up issue to file after smoke-test).
     - Drag-and-drop (#149).
     - Context-menu as a `quadraui` primitive (not yet specced).
-14. **Awaiting smoke test.** Checklist in #152.
+14. **Smoke-tested and shipped.** Two rounds of smoke-test fixes
+    landed as `c57f594` (click row offset, `j`/`k`/`h`/`l` nav,
+    trackpad scroll) and `26ed4e9` (scrollbar drag, folder
+    single-click toggle, sidebar-resize hit zone, Ctrl-W h
+    highlight). File-preview-on-single-click retested and working.
+    Issue #152 closed.
 
 ---
 

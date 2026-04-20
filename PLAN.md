@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 303 — A.2b-2 atomic switchover landed locally; awaiting smoke test)
+> **Last updated:** 2026-04-20 (Session 303 — A.2b-2 atomic switchover shipped and smoke-tested)
 
 ---
 
@@ -31,7 +31,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
 | **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | ✅ Done | `e34a72f` | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
-| **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | 🟡 Awaiting smoke test | — | `issue-152-a2b2-switchover-gtk` | Linux / macOS with GTK4 |
+| **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | ✅ Done | `26ed4e9` | `issue-152-a2b2-switchover-gtk` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
 | **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
@@ -50,16 +50,13 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c and A.2c need a Windows machine. A.2b is the only remaining Linux
-GTK migration — explorer native `gtk4::TreeView` → `DrawingArea` +
-`quadraui_gtk::draw_tree`. It has been **split into two sub-phases**
-because the atomic switchover is a ~1500-line diff across the view!
-macro, the App struct, ~50 scattered `Msg` handlers, and a context-menu
-rewrite; landing that as a single commit makes smoke-test regressions
-hard to bisect. Sub-phase 1 (scaffolding, inert) establishes a
-known-good foundation; sub-phase 2 flips the wiring and deletes the
-dead `gtk4::TreeView` code. The lower-risk GTK stages (A.1b, A.3c-2,
-A.4b, A.5b) are all done.
+A.1c and A.2c need a Windows machine. **All Linux GTK migrations are
+now done** — A.1b, A.2b, A.3c-2, A.4b, A.5b shipped. A.2b was split
+into two sub-phases because the atomic switchover was a ~1500-line
+diff across the view! macro, the App struct, ~50 scattered `Msg`
+handlers, and a context-menu rewrite; the split kept smoke-test
+regressions bisectable. The remaining open quadraui stages (A.6–A.9)
+are platform-neutral.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)
