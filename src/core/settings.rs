@@ -299,10 +299,23 @@ pub struct Settings {
     /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
     #[serde(default = "default_ctrl_f_action")]
     pub ctrl_f_action: String,
+
+    /// Maximum buffer line count for tree-sitter syntax highlighting.
+    /// Files with more lines than this render as plain text. Default 20_000
+    /// matches VSCode's tokenization cutoff and prevents the initial parse
+    /// from blocking the main thread for seconds on generated files
+    /// (Cargo.lock, logs). Set to a very large value to re-enable
+    /// highlighting for huge files.
+    #[serde(default = "default_syntax_max_lines")]
+    pub syntax_max_lines: usize,
 }
 
 fn default_ctrl_f_action() -> String {
     "find".to_string()
+}
+
+fn default_syntax_max_lines() -> usize {
+    20_000
 }
 
 fn default_indent_guides() -> bool {
@@ -745,6 +758,7 @@ impl Default for Settings {
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
             ctrl_f_action: default_ctrl_f_action(),
+            syntax_max_lines: default_syntax_max_lines(),
         }
     }
 }
@@ -1380,6 +1394,7 @@ impl Settings {
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
             "ctrl_f_action" => self.ctrl_f_action.clone(),
             "extension_registries" => self.extension_registries.join(", "),
+            "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
             _ => String::new(),
         }
     }
@@ -1506,6 +1521,12 @@ impl Settings {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+            }
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                self.syntax_max_lines = value
+                    .parse()
+                    .map_err(|_| format!("Invalid syntax_max_lines: {value}"))?;
+                crate::core::buffer_manager::set_syntax_max_lines(self.syntax_max_lines);
             }
             _ => return Err(format!("Unknown setting key: {key}")),
         }
@@ -1739,6 +1760,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer {
             min: 100,
             max: 60000,
+        },
+    },
+    SettingDef {
+        key: "syntax_max_lines",
+        label: "Syntax Highlighting Line Limit",
+        description: "Skip tree-sitter highlighting for buffers over this many lines (plain text for huge generated files)",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 0,
+            max: 1_000_000,
         },
     },
     SettingDef {

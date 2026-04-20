@@ -1088,6 +1088,7 @@ impl Engine {
                 return EngineAction::None;
             }
 
+            let prev_syntax_max_lines = self.settings.syntax_max_lines;
             match self.settings.parse_set_option(trimmed) {
                 Ok(msg) => {
                     if let Err(e) = self.settings.save() {
@@ -1104,6 +1105,14 @@ impl Engine {
             // Lazy-init spell checker when spell is enabled
             if self.settings.spell {
                 self.ensure_spell_checker();
+            }
+            // If the syntax-highlighting threshold changed, re-parse the
+            // active buffer so the new limit takes effect immediately.
+            // (The atomic was synced inside `set_value_str`; this picks up
+            // newly-enabled or newly-disabled highlighting on the visible
+            // buffer.)
+            if self.settings.syntax_max_lines != prev_syntax_max_lines {
+                self.update_syntax();
             }
             return EngineAction::None;
         }

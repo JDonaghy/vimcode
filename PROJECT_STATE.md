@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 303 — Phase A.2b-2: GTK explorer atomic switchover shipped and smoke-tested; two rounds of smoke-test fix follow-ups landed as `c57f594` + `26ed4e9`) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 20, 2026 (Session 304 — Fix #154: `syntax_max_lines` gate skips tree-sitter parse on huge files at startup) | **Tests:** 5225 total (full `cargo test --no-default-features`); 1944 lib + 414 nvim conformance + ~2867 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,53 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 304 — Fix #154: startup tree-sitter parse on large files:**
+
+1. **Root cause.** `BufferState::update_syntax` unconditionally called
+   `Syntax::parse(&text)` at file-open time. On 100k+-line generated
+   files (Cargo.lock, logs) this blocked the main thread for 5–10s
+   during session restore. Discovered while investigating #153 (idle
+   CPU); the startup spike was independent of the idle loops.
+2. **New setting `syntax_max_lines` (default 20_000)** — matches
+   VSCode's tokenization cutoff. Buffers over the threshold render
+   as plain text. `BufferState::update_syntax` now short-circuits
+   before `syn.parse()` when `buffer.content.len_lines() > limit`;
+   `self.syntax` stays installed so raising the limit and calling
+   `update_syntax` again re-enables highlighting without reopening.
+3. **Threshold source** — module-level `AtomicUsize SYNTAX_MAX_LINES`
+   in `buffer_manager.rs` (mirrors `session::suppress_disk_saves`
+   `AtomicBool` pattern). Seeded by `Engine::new` from settings and
+   resynced by `Settings::set_value_str` whenever the value changes
+   via `:set` or the settings-panel form. Avoids threading `max_lines`
+   through 20+ `update_syntax` callsites.
+4. **Re-parse on setting change.** `execute_command` (for `:set`) and
+   `ext_panel.rs` settings-form `Return` handler both call
+   `update_syntax()` after writing the new value, so toggling the
+   limit takes effect immediately on the active buffer.
+5. **Testability.** `update_syntax` split into a pure
+   `update_syntax_with_limit(max_lines)` plus a facade that reads the
+   atomic. The gate-logic test uses `_with_limit` directly to avoid
+   racing on the process-wide atomic with parallel `Engine::new`
+   calls in other tests. Atomic-sync path is covered implicitly by
+   every test that opens a file via `Engine`.
+6. **Tests.** 1 new lib test in `buffer_manager::tests` covering:
+   small buffer → highlights populate, huge buffer at low threshold
+   → parse skipped + highlights empty + syntax still installed,
+   raising threshold → re-parse re-enables highlighting.
+7. **Quality gates all pass** — `cargo fmt` (my files clean; pre-existing
+   `spell.rs` diff on develop unchanged), `cargo clippy -- -D warnings`
+   (default + `--no-default-features`), full `cargo test --no-default-features`
+   (5225 / 0 / 19 vs. baseline 5223), `cargo build` (default +
+   `--no-default-features`). **Net diff:** +136 / –1 lines across 5
+   files (buffer_manager, execute, ext_panel, engine/mod, settings).
+8. **Awaiting smoke test.** Repro from #154: open vimcode on a saved
+   session that includes a 100k+-line file (e.g. a big workspace's
+   Cargo.lock). Expect instant startup. `:set syntax_max_lines?`
+   confirms the threshold; `:set syntax_max_lines=500000` re-enables
+   highlighting on the same buffer.
+
+---
 
 **Session 303 — Phase A.2b-2: GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`):**
 

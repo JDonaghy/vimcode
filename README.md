@@ -730,6 +730,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
+| `syntax_max_lines=N` | `syntaxmaxlines` | 20000 | Skip tree-sitter highlighting for buffers over N lines (plain text for huge generated files) |
 | `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 

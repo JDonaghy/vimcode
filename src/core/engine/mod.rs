@@ -3587,6 +3587,10 @@ impl Engine {
         }
         engine.rebuild_user_keymaps();
         engine.ensure_spell_checker();
+        // Sync the syntax-highlighting line-count threshold before any file
+        // is opened via restore_session_files / CLI args, so huge buffers
+        // skip the expensive initial tree-sitter parse.
+        crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
         engine
     }
 

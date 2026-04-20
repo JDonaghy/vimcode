@@ -2042,6 +2042,12 @@ impl Engine {
                     if def.key == "spell" && self.settings.spell {
                         self.ensure_spell_checker();
                     }
+                    // Re-parse the active buffer when the syntax threshold
+                    // changes via the form so newly-enabled highlighting
+                    // appears on the currently-open huge file.
+                    if def.key == "syntax_max_lines" {
+                        self.update_syntax();
+                    }
                     self.settings_editing = None;
                     self.settings_edit_buf.clear();
                 }

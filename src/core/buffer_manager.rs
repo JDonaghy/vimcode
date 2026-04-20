@@ -1,11 +1,31 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use super::buffer::{Buffer, BufferId};
 use super::cursor::Cursor;
 use super::syntax::Syntax;
+
+/// Upper bound on line count for tree-sitter highlighting.
+///
+/// Buffers with more lines than this skip the expensive `Syntax::parse()` call
+/// in [`BufferState::update_syntax`] and render as plain text. Seeded by
+/// [`Engine::new`](super::engine::Engine::new) from `Settings::syntax_max_lines`
+/// and resynced on `:set syntax_max_lines=…`.
+static SYNTAX_MAX_LINES: AtomicUsize = AtomicUsize::new(20_000);
+
+/// Update the process-wide syntax-highlighting line-count threshold.
+/// Thread-safe; cheap to call on every `:set` change.
+pub fn set_syntax_max_lines(n: usize) {
+    SYNTAX_MAX_LINES.store(n, Ordering::Relaxed);
+}
+
+/// Current process-wide syntax-highlighting line-count threshold.
+pub fn syntax_max_lines() -> usize {
+    SYNTAX_MAX_LINES.load(Ordering::Relaxed)
+}
 
 /// Line ending format for a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,8 +288,24 @@ impl BufferState {
 
     /// Re-parse the buffer and update syntax highlights and max_col cache.
     pub fn update_syntax(&mut self) {
+        self.update_syntax_with_limit(syntax_max_lines());
+    }
+
+    /// Like [`update_syntax`] but with an explicit line-count threshold.
+    /// Skips tree-sitter parsing when the buffer exceeds `max_lines` — the
+    /// dominant startup cost for generated files (Cargo.lock, logs, etc.),
+    /// which blocks the main thread for seconds. Keeps `self.syntax`
+    /// installed so raising the limit and calling this again re-enables
+    /// highlighting without reopening the file.
+    ///
+    /// Exists separately from `update_syntax` so tests can exercise the gate
+    /// without racing on the process-wide [`SYNTAX_MAX_LINES`] atomic.
+    pub fn update_syntax_with_limit(&mut self, max_lines: usize) {
         let text = self.buffer.to_string();
-        self.highlights = if let Some(ref mut syn) = self.syntax {
+        let over_limit = self.buffer.content.len_lines() > max_lines;
+        self.highlights = if over_limit {
+            Vec::new()
+        } else if let Some(ref mut syn) = self.syntax {
             let mut hl = syn.parse(&text);
             // Ensure sorted by start_byte — the render pipeline uses binary
             // search (partition_point) to narrow highlights to the viewport.
@@ -1015,4 +1051,53 @@ mod tests {
         // file1 should be at front now
         assert_eq!(manager.recent_files.len(), 2);
     }
+
+    /// Covers the line-count gate in [`BufferState::update_syntax_with_limit`].
+    ///
+    /// Uses the `_with_limit` variant (not the atomic-reading `update_syntax`)
+    /// so parallel tests that call `Engine::new` — which writes to the
+    /// process-wide [`SYNTAX_MAX_LINES`] atomic — can't interfere.
+    #[test]
+    fn test_syntax_max_lines_gate() {
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        // Case 1: small buffer under a generous threshold — highlights populate.
+        let mut small = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+        small.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+        small.buffer.insert(0, "fn main() { let x = 42; }");
+        small.update_syntax_with_limit(20_000);
+        assert!(
+            !small.highlights.is_empty(),
+            "small buffer under threshold should get highlights"
+        );
+
+        // Case 2: buffer over a low threshold — parse is skipped, highlights
+        // empty, Syntax still installed so raising the limit re-enables it.
+        let mut big = BufferState::new(Buffer::new(crate::core::buffer::BufferId(0)));
+        big.syntax = Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+        big.buffer.insert(
+            0,
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\nfn g() {}\nfn h() {}\nfn i() {}\nfn j() {}\n",
+        );
+        big.update_syntax_with_limit(5);
+        assert!(
+            big.highlights.is_empty(),
+            "buffer over threshold should have no highlights"
+        );
+        assert!(big.syntax.is_some(), "syntax struct stays installed");
+
+        // Case 3: raise threshold and re-parse — highlights populate.
+        big.update_syntax_with_limit(usize::MAX);
+        assert!(
+            !big.highlights.is_empty(),
+            "buffer should get highlights after raising the limit"
+        );
+    }
+
+    // Note: the atomic-sync path (`set_syntax_max_lines` → `update_syntax`
+    // reading the global) is untested because it races with any parallel
+    // test that constructs an `Engine` — `Engine::new` writes the atomic
+    // from `Settings::default()`. The gate logic is covered above via
+    // `update_syntax_with_limit`; the production sync is a single-line
+    // `set_syntax_max_lines(...)` call in `Engine::new` and `set_value_str`.
 }
