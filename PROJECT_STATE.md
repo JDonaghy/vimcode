@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 306 — A.6b: GTK `draw_status_bar` migration) | **Tests:** 5240 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 15
+**Last updated:** Apr 20, 2026 (Session 307 — A.6c: `TabBar` primitive + TUI migration) | **Tests:** 5242 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 17
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,20 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 307 — Phase A.6c: `TabBar` primitive + TUI migration:**
+
+1. **New primitive `quadraui::primitives::tab_bar`** — declarative `TabBar { id, tabs, scroll_offset, right_segments, active_accent }`; `TabItem { label, is_active, is_dirty, is_preview }`; `TabBarSegment { text, width_cells, id: Option<WidgetId>, is_active }`; `TabBarEvent` with `TabActivated`, `TabClosed`, `ButtonClicked`, `KeyPressed`.
+2. **Rendering-only migration.** Unlike `StatusBar` (A.6a), which routed clicks through the primitive via `WidgetId` encoding, `TabBar` keeps the click path on vimcode's engine-side `TabBarClickTarget` enum because it has parameterised actions (`Tab(usize)`, `CloseTab(usize)`). The primitive's events + IDs exist for future plugin-declared tab bars (§10 invariants) but vimcode's click resolution still goes through the cached `GroupTabBar.hit_regions`.
+3. **TUI `quadraui_tui::draw_tab_bar`** — renders a `TabBar` into a ratatui `Buffer`, returns available tab-content width. Preserves every visual detail of the old `render_tab_bar`: dirty dot `●` vs close `×`, underline-accent on the filename portion only (chars after the last `": "`), italic for preview tabs, bold+underline for active. Right segments support mixed labels (diff "2 of 5") and clickable icon buttons. Nerd Font wide glyphs (`F0932`/`F0143`/`F0140`/`F0233`) use `set_cell_wide`; other PUA glyphs (`F0D7` for split-down) use regular `set_cell` to match pre-migration per-cell output.
+4. **TUI `render_tab_bar` reduced to a 12-line wrapper.** Builds the primitive via a new `build_tab_bar_primitive` helper (local to `render_impl.rs`), delegates to `draw_tab_bar`. External signature unchanged — all callers and the tab-bar scroll-offset bookkeeping are untouched.
+5. **Wide-glyph heuristic lesson.** First draft used a broad "PUA = wide" check that failed 6 snapshot tests: `SPLIT_DOWN` at `\u{f0d7}` is PUA but renders as 1 cell in practice. Narrowed the heuristic to an explicit allowlist of the 4 wide glyphs vimcode actually uses. Future wide-glyph additions must be added to `is_nerd_wide`. Recorded the lesson in PLAN.md.
+6. **2 new quadraui lib tests** — serde round-trip on `TabBar` (with tabs, right segments of mixed clickable/label, active accent), and `TabBarEvent` variants.
+7. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5242/0/19; vimcode 5225 unchanged, quadraui 15 → 17), `cargo build` (both default + `--no-default-features`).
+8. **Net diff:** +300 / –170 lines across 5 files.
+9. **Awaiting smoke test.** TUI tab bar should render identically — close/dirty indicators, prefix-vs-filename underline split, italic-on-preview, split/diff/action right-side buttons with correct wide-glyph handling. All tab/close/split/diff/action clicks still dispatch via the unchanged engine-level path.
+
+---
 
 **Session 306 — Phase A.6b: GTK `draw_status_bar` migration:**
 

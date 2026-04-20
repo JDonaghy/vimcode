@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 306 — A.6b GTK `draw_status_bar` migration)
+> **Last updated:** 2026-04-20 (Session 307 — A.6c `TabBar` primitive + TUI migration)
 
 ---
 
@@ -43,8 +43,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.5** — `ListView` primitive + TUI quickfix | ✅ Done | `63d1b29` | `quadraui-phase-a5-*` | any |
 | **Phase A.5b** — GTK `draw_list` + GTK quickfix | ✅ Done | `e1ea5ea` | `quadraui-phase-a5b-*` | Linux / macOS with GTK4 |
 | **Phase A.6a** — `StatusBar` primitive + TUI per-window status line migration | ✅ Done | `3b020ef` | `quadraui-phase-a6a-status-bar-tui` | any (TUI) |
-| **Phase A.6b** — GTK `draw_status_bar` migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6b-status-bar-gtk` | Linux / macOS with GTK4 |
-| Phase A.6c — `TabBar` primitive + TUI | ⬜ Queued | — | `quadraui-phase-a6c-*` | any (TUI) |
+| **Phase A.6b** — GTK `draw_status_bar` migration | ✅ Done | `96c48bf` | `quadraui-phase-a6b-status-bar-gtk` | Linux / macOS with GTK4 |
+| **Phase A.6c** — `TabBar` primitive + TUI migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6c-tab-bar-tui` | any (TUI) |
 | Phase A.6d — GTK `draw_tab_bar` | ⬜ Queued | — | `quadraui-phase-a6d-*` | Linux / macOS with GTK4 |
 | Phase A.6e — `ActivityBar` primitive + TUI + GTK | ⬜ Queued | — | `quadraui-phase-a6e-*` | any |
 | Phase A.7 — `Terminal` primitive | ⬜ Queued | — | `quadraui-phase-a7-*` | any |
@@ -103,6 +103,19 @@ are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadr
   new panel is a silent regression. Rule: **every new sidebar DA must
   appear in both the SwitchPanel grab-focus match and the click
   handler**, otherwise its key controller is dead code.
+
+- **Not every PUA glyph is 2 cells in a terminal.** First draft of
+  `quadraui_tui::draw_tab_bar` (A.6c) treated every Private Use Area
+  character (`U+E000..U+F8FF` + supplementary PUA) as wide and used
+  `set_cell_wide` for them. That broke 6 snapshot tests: `SPLIT_DOWN`
+  at `\u{f0d7}` is PUA but renders as 1 cell in practice, so the old
+  code used plain `set_cell` for it. The fix was to narrow the
+  wide-glyph predicate to an explicit allowlist of the 4 Nerd Font
+  icons vimcode actually uses as wide (`F0932 F0143 F0140 F0233`).
+  Rule: **wide-glyph treatment is per-glyph, not per-range.** When
+  adding a new Nerd Font icon to a primitive, test empirically whether
+  the terminal renders it as 1 or 2 cells and update `is_nerd_wide` if
+  it's 2.
 
 - **Branches are not automatically headers.** Early `draw_tree`
   implementations (TUI + GTK) applied section-header background styling

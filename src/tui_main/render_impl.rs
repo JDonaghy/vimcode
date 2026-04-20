@@ -1049,178 +1049,116 @@ pub(super) fn render_tab_bar(
     tab_scroll_offset: usize,
     focused_accent: Option<ratatui::style::Color>,
 ) -> usize {
-    let bar_bg = rc(theme.tab_bar_bg);
+    // A.6c: tab bar rendering delegates to the `quadraui::TabBar` primitive.
+    // This wrapper builds the primitive from render's `TabInfo` + the diff /
+    // split / action right-side slots, then calls `draw_tab_bar`.
+    let bar = build_tab_bar_primitive(
+        tabs,
+        show_split_btns,
+        diff_toolbar,
+        tab_scroll_offset,
+        focused_accent,
+    );
+    super::quadraui_tui::draw_tab_bar(buf, area, &bar, theme)
+}
 
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
-    }
+/// Build a `quadraui::TabBar` from the render-level tab args.
+///
+/// Right-side segment order (mirrors the existing pre-migration layout):
+/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
+///
+/// The `active_accent` field carries the underline colour only when the
+/// group is focused (active); when `focused_accent` is `None` the TUI
+/// renderer skips the underline, matching the old inactive-group behaviour.
+fn build_tab_bar_primitive(
+    tabs: &[render::TabInfo],
+    show_split_btns: bool,
+    diff_toolbar: Option<&render::DiffToolbarData>,
+    tab_scroll_offset: usize,
+    focused_accent: Option<ratatui::style::Color>,
+) -> quadraui::TabBar {
+    let tab_items: Vec<quadraui::TabItem> = tabs
+        .iter()
+        .map(|t| quadraui::TabItem {
+            label: t.name.clone(),
+            is_active: t.active,
+            is_dirty: t.dirty,
+            is_preview: t.preview,
+        })
+        .collect();
 
-    // Calculate total reserved columns at the right edge.
-    let diff_cols = if diff_toolbar.is_some() {
-        // 3 buttons + up to 6 chars for label like "2 of 5" + 1 space
-        let label_cols = diff_toolbar
-            .and_then(|d| d.change_label.as_ref())
-            .map(|l| l.len() as u16 + 1)
-            .unwrap_or(0);
-        DIFF_TOOLBAR_BTN_COLS + label_cols
-    } else {
-        0
-    };
-    let split_cols = if show_split_btns {
-        TAB_SPLIT_BOTH_COLS
-    } else {
-        0
-    };
-    let action_cols = TAB_ACTION_BTN_COLS;
-    let reserved = diff_cols + split_cols + action_cols;
+    let mut right: Vec<quadraui::TabBarSegment> = Vec::new();
 
-    // Reserve columns at the right edge for buttons.
-    let tab_end = if area.width >= reserved {
-        area.x + area.width - reserved
-    } else {
-        area.x + area.width
-    };
-
-    let mut x = area.x;
-    let tab_end_for_content = tab_end;
-
-    for tab in tabs.iter().skip(tab_scroll_offset) {
-        let (fg, bg) = match (tab.active, tab.preview) {
-            (true, true) => (rc(theme.tab_preview_active_fg), rc(theme.tab_active_bg)),
-            (true, false) => (rc(theme.tab_active_fg), rc(theme.tab_active_bg)),
-            (false, true) => (rc(theme.tab_preview_inactive_fg), rc(theme.tab_bar_bg)),
-            (false, false) => (rc(theme.tab_inactive_fg), rc(theme.tab_bar_bg)),
-        };
-        let modifier = if tab.active && focused_accent.is_some() {
-            if tab.preview {
-                Modifier::ITALIC | Modifier::UNDERLINED
-            } else {
-                Modifier::UNDERLINED
-            }
-        } else if tab.preview {
-            Modifier::ITALIC
-        } else {
-            Modifier::empty()
-        };
-
-        // Check if this tab would overflow the available space.
-        let name_w = tab.name.chars().count() as u16;
-        let tab_w = name_w + TAB_CLOSE_COLS;
-        if x + tab_w > tab_end_for_content {
-            break;
-        }
-
-        // Find where the filename starts (after the " N: " prefix) so the
-        // underline accent only covers the filename, not the number prefix.
-        let prefix_len = tab.name.find(": ").map(|p| p + 2).unwrap_or(0);
-        let prefix_mod = if tab.preview {
-            Modifier::ITALIC
-        } else {
-            Modifier::empty()
-        };
-        for (ci, ch) in tab.name.chars().enumerate() {
-            if x >= tab_end_for_content {
-                break;
-            }
-            let in_filename = ci >= prefix_len;
-            let cell_mod = if in_filename { modifier } else { prefix_mod };
-            let ul_color = if in_filename && tab.active {
-                focused_accent
-            } else {
-                None
-            };
-            set_cell_styled(buf, x, area.y, ch, fg, bg, cell_mod, ul_color);
-            x += 1;
-        }
-        // Show ● (modified dot) when dirty, × otherwise (VSCode style).
-        if x < tab_end_for_content {
-            let (close_ch, close_fg) = if tab.dirty {
-                ('●', rc(theme.foreground))
-            } else if tab.active {
-                (TAB_CLOSE_CHAR, rc(theme.tab_active_fg))
-            } else {
-                (TAB_CLOSE_CHAR, rc(theme.separator))
-            };
-            set_cell(buf, x, area.y, close_ch, close_fg, bg);
-            x += 1;
-        }
-        // Trailing separator space.
-        if x < tab_end_for_content {
-            set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
-            x += 1;
-        }
-    }
-
-    // Draw diff toolbar buttons (to the left of split buttons).
     if let Some(dt) = diff_toolbar {
-        if area.width >= reserved {
-            let mut bx = area.x + area.width - reserved;
-            let btn_fg = rc(theme.tab_inactive_fg);
-            let active_fg = rc(theme.tab_active_fg);
-            // Change label (e.g. "2/5")
-            if let Some(label) = &dt.change_label {
-                let label_fg = rc(theme.foreground);
-                set_cell(buf, bx, area.y, ' ', label_fg, bar_bg);
-                bx += 1;
-                for ch in label.chars() {
-                    set_cell(buf, bx, area.y, ch, label_fg, bar_bg);
-                    bx += 1;
-                }
-            }
-            // Prev button (space + 2-wide NF glyph = 3 cols)
-            set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-            set_cell_wide(buf, bx + 1, area.y, '\u{F0143}', btn_fg, bar_bg);
-            bx += DIFF_BTN_COLS;
-            // Next button
-            set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-            set_cell_wide(buf, bx + 1, area.y, '\u{F0140}', btn_fg, bar_bg);
-            bx += DIFF_BTN_COLS;
-            // Fold toggle button (highlighted when active)
-            let fold_fg = if dt.unchanged_hidden {
-                active_fg
-            } else {
-                btn_fg
-            };
-            set_cell(buf, bx, area.y, ' ', fold_fg, bar_bg);
-            set_cell_wide(buf, bx + 1, area.y, '\u{F0233}', fold_fg, bar_bg);
-            bx += DIFF_BTN_COLS;
+        // Optional "2 of 5" label (leading space + text).
+        if let Some(label) = &dt.change_label {
+            let text = format!(" {label}");
+            let width = text.chars().count() as u16;
+            right.push(quadraui::TabBarSegment {
+                text,
+                width_cells: width,
+                id: None,
+                is_active: false,
+            });
         }
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0143}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_prev")),
+            is_active: false,
+        });
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0140}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_next")),
+            is_active: false,
+        });
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0233}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_toggle")),
+            is_active: dt.unchanged_hidden,
+        });
     }
 
-    // Draw split-right then split-down buttons, then the action menu button.
-    if show_split_btns && area.width >= split_cols + action_cols {
-        let btn_fg = rc(theme.tab_inactive_fg);
-        let mut bx = area.x + area.width - split_cols - action_cols;
-        // Split-right button (space + 2-wide NF glyph = 3 cols)
-        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell_wide(buf, bx + 1, area.y, '\u{F0932}', btn_fg, bar_bg);
-        bx += TAB_SPLIT_BTN_COLS;
-        // Split-down button (caret-down ▾)
-        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell(
-            buf,
-            bx + 1,
-            area.y,
-            crate::icons::SPLIT_DOWN.c(),
-            btn_fg,
-            bar_bg,
-        );
-        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
+    if show_split_btns {
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0932}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:split_right")),
+            is_active: false,
+        });
+        // Split-down: space + regular-width caret + trailing space = 3 cells.
+        let split_down = crate::icons::SPLIT_DOWN.c();
+        right.push(quadraui::TabBarSegment {
+            text: format!(" {split_down} "),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:split_down")),
+            is_active: false,
+        });
     }
 
-    // Draw the editor action menu button ("…") at the far right.
-    if area.width >= action_cols {
-        let btn_fg = rc(theme.tab_inactive_fg);
-        let bx = area.x + area.width - action_cols;
-        set_cell(buf, bx, area.y, ' ', btn_fg, bar_bg);
-        set_cell(buf, bx + 1, area.y, '\u{22EF}', btn_fg, bar_bg); // ⋯
-        set_cell(buf, bx + 2, area.y, ' ', btn_fg, bar_bg);
-    }
+    // Action menu button " ⋯ ".
+    right.push(quadraui::TabBarSegment {
+        text: " \u{22EF} ".to_string(),
+        width_cells: 3,
+        id: Some(quadraui::WidgetId::new("tab:action_menu")),
+        is_active: false,
+    });
 
-    // Return the available tab bar width in columns so the engine can compute
-    // how many tabs fit.  (Returning a count caused a feedback-loop bug where
-    // the engine treated the count as column width, shrinking tabs each frame.)
-    (tab_end_for_content - area.x) as usize
+    // Convert ratatui Color to quadraui Color for the accent (RGB channels only).
+    let accent = focused_accent.and_then(|c| match c {
+        ratatui::style::Color::Rgb(r, g, b) => Some(quadraui::Color::rgb(r, g, b)),
+        _ => None,
+    });
+
+    quadraui::TabBar {
+        id: quadraui::WidgetId::new("tabs:group"),
+        tabs: tab_items,
+        scroll_offset: tab_scroll_offset,
+        right_segments: right,
+        active_accent: accent,
+    }
 }
 
 pub(super) fn render_breadcrumb_bar(

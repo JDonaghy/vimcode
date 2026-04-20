@@ -892,3 +892,173 @@ pub(super) fn draw_status_bar(
     let right_start = (area.x + area.width).saturating_sub(right_width);
     draw_segments(buf, &bar.right_segments, right_start);
 }
+
+/// Narrow hardcoded set of PUA glyphs that render as 2 cells in terminals
+/// and therefore need `set_cell_wide` (which marks the continuation cell).
+/// Matches the specific icons the old `render_tab_bar` used with
+/// `set_cell_wide` — other PUA chars (e.g. `SPLIT_DOWN` at `\u{f0d7}`)
+/// render as 1 cell in practice and use plain `set_cell`. Extend this list
+/// as new wide glyphs are added to tab bars / status bars.
+fn is_nerd_wide(c: char) -> bool {
+    matches!(
+        c,
+        '\u{F0932}' // SPLIT_RIGHT
+        | '\u{F0143}' // DIFF_PREV
+        | '\u{F0140}' // DIFF_NEXT
+        | '\u{F0233}' // DIFF_FOLD
+    )
+}
+
+/// Draw a `quadraui::TabBar` into `area`. Returns the width (in char cells)
+/// available for tab content (`bar_width - reserved_by_right_segments`).
+/// The engine uses this to decide how many tabs fit and what scroll offset
+/// to use on the next frame.
+///
+/// Visual details preserved from the old `render_tab_bar`:
+/// * Active tab: `tab_active_fg` + `tab_active_bg`, optional underline
+///   accent on the filename portion (chars after the last `": "`).
+/// * Dirty tab: close-position shows `●` (theme.foreground) instead of `×`.
+/// * Preview tab: italic text; double-italic-underlined when active+accent.
+/// * Right segments: each segment drawn in its native cell width, with
+///   Nerd Font wide glyphs using `set_cell_wide`. Highlighted segments
+///   (`is_active = true`) use `tab_active_fg` instead of `tab_inactive_fg`.
+pub(super) fn draw_tab_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    bar: &quadraui::TabBar,
+    theme: &Theme,
+) -> usize {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+
+    let bar_bg = rc(theme.tab_bar_bg);
+    let btn_fg = rc(theme.tab_inactive_fg);
+    let btn_fg_active = rc(theme.tab_active_fg);
+    let foreground = rc(theme.foreground);
+
+    // Fill bar background.
+    for x in area.x..area.x + area.width {
+        set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
+    }
+
+    // Sum reserved cells on the right.
+    let reserved: u16 = bar.right_segments.iter().map(|s| s.width_cells).sum();
+    let tab_end = if area.width >= reserved {
+        area.x + area.width - reserved
+    } else {
+        area.x + area.width
+    };
+    let tab_content_width = (tab_end - area.x) as usize;
+
+    // ── Right-aligned segments ──────────────────────────────────────────
+    if reserved <= area.width {
+        let mut bx = area.x + area.width - reserved;
+        for seg in &bar.right_segments {
+            let fg = if seg.is_active { btn_fg_active } else { btn_fg };
+            // Segment has `width_cells` cells total; iterate characters and
+            // advance x by 1 (regular) or 2 (wide) per char. Anchor to
+            // `bx + width_cells` at the end regardless of char-level math.
+            let seg_end = bx + seg.width_cells;
+            let mut cx = bx;
+            for ch in seg.text.chars() {
+                if cx >= seg_end {
+                    break;
+                }
+                if ch == ' ' {
+                    set_cell(buf, cx, area.y, ' ', fg, bar_bg);
+                    cx += 1;
+                } else if is_nerd_wide(ch) {
+                    if cx + 1 < seg_end + 1 {
+                        super::set_cell_wide(buf, cx, area.y, ch, fg, bar_bg);
+                        cx += 2;
+                    } else {
+                        // Not enough room for a 2-cell glyph — skip.
+                        cx += 1;
+                    }
+                } else {
+                    set_cell(buf, cx, area.y, ch, fg, bar_bg);
+                    cx += 1;
+                }
+            }
+            bx = seg_end;
+        }
+    }
+
+    // ── Tabs (left side) ────────────────────────────────────────────────
+    let accent = bar.active_accent.map(qc);
+    let active_fg = rc(theme.tab_active_fg);
+    let active_bg = rc(theme.tab_active_bg);
+    let preview_active_fg = rc(theme.tab_preview_active_fg);
+    let inactive_fg = rc(theme.tab_inactive_fg);
+    let preview_inactive_fg = rc(theme.tab_preview_inactive_fg);
+    let separator = rc(theme.separator);
+
+    let mut x = area.x;
+    for tab in bar.tabs.iter().skip(bar.scroll_offset) {
+        let (fg, bg) = match (tab.is_active, tab.is_preview) {
+            (true, true) => (preview_active_fg, active_bg),
+            (true, false) => (active_fg, active_bg),
+            (false, true) => (preview_inactive_fg, bar_bg),
+            (false, false) => (inactive_fg, bar_bg),
+        };
+
+        let mut modifier = ratatui::style::Modifier::empty();
+        if tab.is_preview {
+            modifier |= ratatui::style::Modifier::ITALIC;
+        }
+        if tab.is_active && accent.is_some() {
+            modifier |= ratatui::style::Modifier::UNDERLINED;
+        }
+        let prefix_mod = if tab.is_preview {
+            ratatui::style::Modifier::ITALIC
+        } else {
+            ratatui::style::Modifier::empty()
+        };
+
+        let name_w = tab.label.chars().count() as u16;
+        let tab_w = name_w + super::TAB_CLOSE_COLS;
+        if x + tab_w > tab_end {
+            break;
+        }
+
+        // Locate filename portion (after the last ": ") so only that part gets
+        // the underline accent; the " N: " prefix renders without underline.
+        let prefix_len = tab.label.rfind(": ").map(|p| p + 2).unwrap_or(0);
+
+        for (ci, ch) in tab.label.chars().enumerate() {
+            if x >= tab_end {
+                break;
+            }
+            let in_filename = ci >= prefix_len;
+            let cell_mod = if in_filename { modifier } else { prefix_mod };
+            let ul = if in_filename && tab.is_active {
+                accent
+            } else {
+                None
+            };
+            super::set_cell_styled(buf, x, area.y, ch, fg, bg, cell_mod, ul);
+            x += 1;
+        }
+
+        // Close indicator: ● for dirty, × otherwise.
+        if x < tab_end {
+            let (close_ch, close_fg) = if tab.is_dirty {
+                ('●', foreground)
+            } else if tab.is_active {
+                (super::TAB_CLOSE_CHAR, active_fg)
+            } else {
+                (super::TAB_CLOSE_CHAR, separator)
+            };
+            set_cell(buf, x, area.y, close_ch, close_fg, bg);
+            x += 1;
+        }
+        // Trailing separator space.
+        if x < tab_end {
+            set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
+            x += 1;
+        }
+    }
+
+    tab_content_width
+}
