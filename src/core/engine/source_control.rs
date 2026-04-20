@@ -3,7 +3,14 @@ use super::*;
 impl Engine {
     // ─── Source Control ────────────────────────────────────────────────────────
 
-    /// Refresh SC panel: re-run `git status` and `git worktree list`.
+    /// Refresh SC panel synchronously: re-run `git status`, `git worktree
+    /// list`, `git rev-list --count` (ahead/behind), and `git log -20`.
+    /// Four subprocesses — on a non-trivial workspace this takes ~1 s.
+    /// Use [`sc_refresh_async`] from the GUI poll loops to avoid blocking
+    /// the main thread; call this variant only from places that already
+    /// expect the refresh to have completed before returning (e.g. right
+    /// after a stage/unstage where the sidebar must reflect the new
+    /// state immediately).
     pub fn sc_refresh(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         self.sc_file_statuses = git::status_detailed(&dir);
@@ -12,6 +19,61 @@ impl Engine {
         self.sc_ahead = ahead;
         self.sc_behind = behind;
         self.sc_log = git::git_log(&dir, 20);
+        self.invalidate_explorer_indicators();
+    }
+
+    /// Spawn a background thread that runs the same four `git`
+    /// subprocesses as [`sc_refresh`] and delivers the snapshot back
+    /// via `sc_refresh_rx`. Subsequent calls are no-ops while a
+    /// previous refresh is still in flight, so the main thread can
+    /// call this as often as a polling loop wants without stacking
+    /// up threads. The UI poll loop should call [`poll_sc_refresh`]
+    /// each tick to drain the channel and apply the snapshot.
+    pub fn sc_refresh_async(&mut self) {
+        if self.sc_refresh_in_flight {
+            return;
+        }
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sc_refresh_rx = Some(rx);
+        self.sc_refresh_in_flight = true;
+        std::thread::spawn(move || {
+            let statuses = git::status_detailed(&dir);
+            let worktrees = git::worktree_list(&dir);
+            let (ahead, behind) = git::ahead_behind(&dir);
+            let log = git::git_log(&dir, 20);
+            let _ = tx.send((statuses, worktrees, ahead, behind, log));
+        });
+    }
+
+    /// Check whether the background `sc_refresh_async` thread has
+    /// delivered a snapshot and, if so, apply it to the engine state.
+    /// Returns `true` when new data was applied so the UI can redraw.
+    pub fn poll_sc_refresh(&mut self) -> bool {
+        let Some(ref rx) = self.sc_refresh_rx else {
+            return false;
+        };
+        let result = rx.try_recv();
+        match result {
+            Ok((statuses, worktrees, ahead, behind, log)) => {
+                self.sc_file_statuses = statuses;
+                self.sc_worktrees = worktrees;
+                self.sc_ahead = ahead;
+                self.sc_behind = behind;
+                self.sc_log = log;
+                self.sc_refresh_rx = None;
+                self.sc_refresh_in_flight = false;
+                self.invalidate_explorer_indicators();
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread dropped the tx without sending — treat as done.
+                self.sc_refresh_rx = None;
+                self.sc_refresh_in_flight = false;
+                false
+            }
+        }
     }
 
     /// Stage or unstage the currently selected SC item.

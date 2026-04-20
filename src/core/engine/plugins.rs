@@ -91,10 +91,17 @@ impl Engine {
     }
 
     /// Build a `PluginCallContext` from the current active buffer state.
-    /// When `skip_buf_lines` is true the expensive O(N) line-by-line
-    /// collection is omitted (used for cursor_move on clean buffers where
-    /// no plugin actually needs the line contents).
+    ///
+    /// `skip_buf_lines` is retained for API back-compat but is now a no-op
+    /// in practice: the buffer is exposed to Lua via a cheap `Rope` clone
+    /// (O(1) reference-counted) on the context, and `vimcode.buf.lines()`
+    /// / `buf.line(n)` / `buf.get_lines(s, e)` allocate `String`s only
+    /// for the range the plugin actually reads. Issue #153: the previous
+    /// eager `Vec<String>` build was O(N) in buffer line count and, for
+    /// plugins that chained `async_shell` callbacks, ran on every tick
+    /// — a 190 k-line buffer pinned CPU at 100 %.
     pub(crate) fn make_plugin_ctx(&self, skip_buf_lines: bool) -> plugin::PluginCallContext {
+        let _ = skip_buf_lines;
         let cwd = self.cwd.to_string_lossy().into_owned();
         let buf_id = self.active_buffer_id();
         let buf_state = self.buffer_manager.get(buf_id);
@@ -103,17 +110,7 @@ impl Engine {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
         let buf_dirty = buf_state.as_ref().map(|s| s.dirty).unwrap_or(false);
-        let buf_lines = if skip_buf_lines {
-            Vec::new()
-        } else {
-            buf_state
-                .map(|s| {
-                    (0..s.buffer.len_lines())
-                        .map(|i| s.buffer.content.line(i).to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let buf_rope = buf_state.map(|s| s.buffer.content.clone());
         let cursor = self.cursor();
 
         // Mode name
@@ -162,7 +159,7 @@ impl Engine {
         plugin::PluginCallContext {
             cwd,
             buf_path,
-            buf_lines,
+            buf_rope,
             buf_dirty,
             cursor_line: cursor.line + 1,
             cursor_col: cursor.col + 1,

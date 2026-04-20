@@ -641,6 +641,7 @@ impl Engine {
                 mgr.notify_did_close(path);
             }
             self.lsp_diagnostics.remove(path);
+            self.invalidate_explorer_indicators();
         }
     }
 
@@ -683,6 +684,7 @@ impl Engine {
                 state.semantic_tokens.clear();
             }
             self.lsp_diagnostics.remove(&path);
+            self.invalidate_explorer_indicators();
             self.lsp_code_actions.remove(&path);
             self.lsp_code_action_last_line = None;
             if let Some(mgr) = &mut self.lsp_manager {
@@ -788,6 +790,7 @@ impl Engine {
                             .collect()
                     };
                     self.lsp_diagnostics.insert(path, filtered);
+                    self.invalidate_explorer_indicators();
                 }
                 LspEvent::CompletionResponse {
                     request_id, items, ..

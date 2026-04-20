@@ -195,7 +195,34 @@ impl Engine {
     /// Returns (git_statuses, diag_counts) where:
     /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
     /// - diag_counts: canonical path → (error_lines, warning_lines) deduplicated by line number
+    ///
+    /// Result is cached in `explorer_indicators_cache`; call
+    /// `invalidate_explorer_indicators()` after mutating
+    /// `sc_file_statuses` or `lsp_diagnostics` so the next call
+    /// recomputes. Caching matters because this function canonicalises
+    /// every file-status path (a syscall each) and scans every
+    /// diagnostic — on a workspace with thousands of untracked files
+    /// the uncached version was costing seconds per explorer draw
+    /// (see #153).
     pub fn explorer_indicators(
+        &self,
+    ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
+        if let Some(ref cached) = *self.explorer_indicators_cache.borrow() {
+            return cached.clone();
+        }
+        let result = self.compute_explorer_indicators();
+        *self.explorer_indicators_cache.borrow_mut() = Some(result.clone());
+        result
+    }
+
+    /// Invalidate the cached explorer indicators so the next call
+    /// recomputes. Call this after any change to `sc_file_statuses` or
+    /// `lsp_diagnostics`.
+    pub fn invalidate_explorer_indicators(&self) {
+        *self.explorer_indicators_cache.borrow_mut() = None;
+    }
+
+    fn compute_explorer_indicators(
         &self,
     ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
         use crate::core::lsp::DiagnosticSeverity;

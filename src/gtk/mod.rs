@@ -5232,16 +5232,25 @@ impl App {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             sender.input(Msg::RefreshFileTree);
         }
-        // Auto-refresh SC panel every 2s to pick up external git changes.
-        // Also refresh when Explorer is active (for git status indicators).
+        // Auto-refresh SC panel periodically to pick up external git
+        // changes. Runs four `git` subprocesses (~1 s on a non-trivial
+        // workspace) on a background thread — blocking the main thread
+        // on this used to peg CPU at ~100 % (see #153). Only spawn when
+        // a panel actually needs the data; drain the receiver every
+        // tick so the snapshot arrives on the next draw.
         if self.sidebar_visible
             && (self.active_panel == SidebarPanel::Git
                 || self.active_panel == SidebarPanel::Explorer)
             && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
-            self.engine.borrow_mut().sc_refresh();
+            self.engine.borrow_mut().sc_refresh_async();
             self.last_sc_refresh = std::time::Instant::now();
+        }
+        if self.engine.borrow_mut().poll_sc_refresh() {
             if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                da.queue_draw();
+            }
+            if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
             self.draw_needed.set(true);

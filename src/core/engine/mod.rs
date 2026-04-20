@@ -2689,6 +2689,35 @@ pub struct Engine {
     /// Window ID of the tab pre-opened for the pending SC diff.
     pub sc_diff_pending_win: Option<WindowId>,
 
+    /// Receiver for background `sc_refresh` results (status + worktrees +
+    /// ahead/behind + log). The SC / Explorer sidebars consume these
+    /// snapshots to render git indicators without blocking the main
+    /// thread on a burst of `git` subprocesses — four of them per
+    /// refresh took ~1 s on typical workspaces and pegged CPU at 100 %.
+    #[allow(clippy::type_complexity)]
+    pub sc_refresh_rx: Option<
+        std::sync::mpsc::Receiver<(
+            Vec<git::FileStatus>,
+            Vec<git::WorktreeEntry>,
+            u32,
+            u32,
+            Vec<git::GitLogEntry>,
+        )>,
+    >,
+    /// True while a background `sc_refresh` thread is in flight, so we
+    /// don't spawn another one on top of it.
+    pub sc_refresh_in_flight: bool,
+
+    /// Cached result of `explorer_indicators()`. The computation
+    /// canonicalises every file-status path and scans every LSP
+    /// diagnostic; on a workspace with thousands of untracked files
+    /// this was costing seconds per explorer draw (see #153). The
+    /// cache is invalidated via `invalidate_explorer_indicators()`
+    /// whenever `sc_file_statuses` or `lsp_diagnostics` changes.
+    #[allow(clippy::type_complexity)]
+    pub explorer_indicators_cache:
+        std::cell::RefCell<Option<(HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>)>>,
+
     // --- Inline diff peek popup ---
     /// Git diff peek popup state, or `None` when no peek is active.
     pub diff_peek: Option<DiffPeekState>,
@@ -3372,6 +3401,9 @@ impl Engine {
             diff_unchanged_hidden: false,
             sc_diff_rx: None,
             sc_diff_pending_win: None,
+            sc_refresh_rx: None,
+            sc_refresh_in_flight: false,
+            explorer_indicators_cache: std::cell::RefCell::new(None),
             diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,

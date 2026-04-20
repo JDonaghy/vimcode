@@ -135,6 +135,22 @@ pub fn check_line(
     syntax_lang: Option<SyntaxLanguage>,
 ) -> Vec<SpellError> {
     let mut errors = Vec::new();
+
+    // Pre-filter the buffer-wide highlight list down to only the ranges
+    // that overlap this line. Without this, `is_in_comment_or_string`
+    // re-scans all N highlights in the buffer for every word on every
+    // visible line on every draw — catastrophic on large files with
+    // many highlights (a 190 k-line Rust file with tens of thousands
+    // of highlights pegged CPU at 100 % — see issue #153). The filter
+    // itself is O(N) per line, but the subsequent per-word checks
+    // scan only the tiny per-line slice.
+    let line_end_byte = line_start_byte + line.len();
+    let line_highlights: Vec<(usize, usize, &str)> = highlights
+        .iter()
+        .filter(|(hs, he, _)| *he > line_start_byte && *hs < line_end_byte)
+        .map(|(hs, he, scope)| (*hs, *he, scope.as_str()))
+        .collect();
+
     // Extract words: contiguous runs of alphabetic + apostrophe chars
     let mut chars: Vec<(usize, char)> = line.char_indices().collect();
     // Add sentinel
@@ -168,13 +184,13 @@ pub fn check_line(
                     None => true,
                     Some(SyntaxLanguage::Latex) => {
                         // Inverted: check everything EXCEPT commands/math
-                        !is_in_latex_command_or_math(highlights, abs_start, abs_end)
+                        !is_in_latex_command_or_math(&line_highlights, abs_start, abs_end)
                     }
                     Some(SyntaxLanguage::Markdown) => {
                         // Markdown is prose — check all words like plain text
                         true
                     }
-                    Some(_) => is_in_comment_or_string(highlights, abs_start, abs_end),
+                    Some(_) => is_in_comment_or_string(&line_highlights, abs_start, abs_end),
                 };
 
                 if should_check && !checker.check_word(trimmed) {
@@ -192,8 +208,10 @@ pub fn check_line(
 }
 
 /// Returns true if any byte in `[start, end)` overlaps a LaTeX command or math scope.
+/// Caller is expected to pass a slice already narrowed to a single line's
+/// highlights (see the pre-filter in `check_line`).
 fn is_in_latex_command_or_math(
-    highlights: &[(usize, usize, String)],
+    highlights: &[(usize, usize, &str)],
     start: usize,
     end: usize,
 ) -> bool {
@@ -205,7 +223,7 @@ fn is_in_latex_command_or_math(
             continue;
         }
         // keyword = command_name, type = inline_formula/math_environment/displayed_equation
-        if scope == "keyword" || scope == "type" {
+        if *scope == "keyword" || *scope == "type" {
             return true;
         }
     }
@@ -213,8 +231,10 @@ fn is_in_latex_command_or_math(
 }
 
 /// Returns true if any byte in `[start, end)` overlaps a comment or string scope.
+/// Caller is expected to pass a slice already narrowed to a single line's
+/// highlights (see the pre-filter in `check_line`).
 fn is_in_comment_or_string(
-    highlights: &[(usize, usize, String)],
+    highlights: &[(usize, usize, &str)],
     start: usize,
     end: usize,
 ) -> bool {
