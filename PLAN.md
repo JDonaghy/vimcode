@@ -30,7 +30,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
-| **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | 🟡 Current | — | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
+| **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | ✅ Done | `e34a72f` | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
 | **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | ⬜ Queued | — | `quadraui-phase-a2b2-*` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
@@ -271,9 +271,9 @@ the wiring.
 
 ### Sub-phase A.2b-1 — scaffolding (inert)
 
-**Status:** 🟡 In progress on this branch.
+**Status:** ✅ Done (`e34a72f`).
 
-**Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` off `develop`.
+**Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` (merged, deleted).
 
 **Platform:** any (no GTK-specific runtime changes; the new code is not
 yet called).
@@ -298,9 +298,9 @@ yet called).
 
 ### Sub-phase A.2b-2 — atomic switchover
 
-**Status:** ⬜ Queued (next session).
+**Status:** ⬜ Queued. Tracked as [#152](https://github.com/JDonaghy/vimcode/issues/152).
 
-**Branch:** `quadraui-phase-a2b2-switchover-gtk` off `develop` (after A.2b-1 lands).
+**Branch:** `issue-152-a2b2-switchover-gtk` off `develop`.
 
 **Platform:** Linux or macOS with GTK4 (4.10+).
 
@@ -328,7 +328,7 @@ a11y, drag-drop).
 
 **Scope (sub-phase 2):**
 
-**Already landed in sub-phase 1** (commit pending as of this edit):
+**Already landed in sub-phase 1** (`e34a72f`):
 
 - `src/gtk/explorer.rs` with `ExplorerRow`, `ExplorerState`,
   `build_explorer_rows`, `explorer_to_tree_view` adapter.
