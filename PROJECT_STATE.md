@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 19, 2026 (Session 302 — Phase A.3c-2: GTK settings panel migrated to DrawingArea + draw_form) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
+**Last updated:** Apr 19, 2026 (Session 303 — Phase A.2b-1: GTK explorer data-model scaffolding + draw_explorer_panel, inert) | **Tests:** 5223 total (full `cargo test --no-default-features`); 1943 lib + 414 nvim conformance + ~2866 integration
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,40 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 303 — Phase A.2b-1: GTK explorer scaffolding landed (inert):**
+
+1. **Scope decision.** The full A.2b migration (native `gtk4::TreeView`
+   → `DrawingArea` + `quadraui_gtk::draw_tree`) is a ~1500-line diff
+   across the `view!` macro, the App struct, ~50 scattered `Msg`
+   handlers that reference `file_tree_view` / `tree_store` / `name_cell`,
+   plus a 310-line right-click context-menu rewrite. Rather than land
+   that atomically, the work was split into two sub-phases (recorded
+   in `PLAN.md`) so the new draw pipeline can be validated before the
+   destructive switchover.
+2. **New `src/gtk/explorer.rs`** — module with:
+   - `ExplorerRow { depth, name, path, is_dir, is_expanded }`
+   - `ExplorerState { rows, expanded, selected, scroll_top }` with
+     `new`, `rebuild`, `toggle_dir`, `ensure_visible`, `reveal_path`.
+   - `build_explorer_rows(root, expanded, show_hidden, case_insensitive)`
+     + `explorer_to_tree_view(state, has_focus, engine)` adapter.
+   - Intentionally duplicates the TUI's `ExplorerRow` / `collect_rows`
+     shape; unifying the two into `render.rs` is a future session.
+3. **New `draw_explorer_panel` in `src/gtk/draw.rs`** — calls
+   `quadraui_gtk::draw_tree` and overlays a Cairo scrollbar using the
+   same 8px-wide pattern as `draw_settings_panel` (A.3c-2). Row height
+   (`line_height * 1.4`) is kept in sync with `draw_tree` so the
+   visible-row count used by the scrollbar matches the rendered layout.
+4. **Sub-phase 1 is inert** — both additions are `#[allow(dead_code)]`;
+   the file tree still renders via the native `gtk4::TreeView`.
+   Sub-phase 2 flips the wiring and deletes the dead widget code.
+5. **All quality gates pass** — `cargo fmt`, `cargo clippy` (default +
+   `--no-default-features`), full `cargo test --no-default-features`
+   (5223 / 0 / 19, same as baseline), `cargo build` (default + `--no-default-features`).
+   **Net diff:** +319 / –0 lines (explorer.rs new, plus draw.rs +
+   mod.rs additions). Zero behavioural change.
+
+---
 
 **Session 302 — Phase A.3c-2 shipped (GTK settings panel → DrawingArea + draw_form):**
 

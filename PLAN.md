@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-19 (Session 302 — A.3c-2 shipped; A.2b is the only large GTK migration left on Linux)
+> **Last updated:** 2026-04-19 (Session 303 — A.2b split into two sub-phases; A.2b-1 scaffolding ready to merge)
 
 ---
 
@@ -30,7 +30,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
 | **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
-| **Phase A.2b** — GTK explorer (replaces native `gtk4::TreeView`) | 🟡 Unblocked (TextInput cursor now exists; ready to implement) | — | `quadraui-phase-a2b-*` | Linux / macOS with GTK4 |
+| **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | 🟡 Current | — | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
+| **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | ⬜ Queued | — | `quadraui-phase-a2b2-*` | Linux / macOS with GTK4 |
 | **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
 | **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
@@ -51,7 +52,13 @@ test app; target downstream apps include a cross-platform k8s dashboard
 
 A.1c and A.2c need a Windows machine. A.2b is the only remaining Linux
 GTK migration — explorer native `gtk4::TreeView` → `DrawingArea` +
-`quadraui_gtk::draw_tree`. The lower-risk GTK stages (A.1b, A.3c-2,
+`quadraui_gtk::draw_tree`. It has been **split into two sub-phases**
+because the atomic switchover is a ~1500-line diff across the view!
+macro, the App struct, ~50 scattered `Msg` handlers, and a context-menu
+rewrite; landing that as a single commit makes smoke-test regressions
+hard to bisect. Sub-phase 1 (scaffolding, inert) establishes a
+known-good foundation; sub-phase 2 flips the wiring and deletes the
+dead `gtk4::TreeView` code. The lower-risk GTK stages (A.1b, A.3c-2,
 A.4b, A.5b) are all done.
 
 Design decisions covering primitive-distinctness (why `ListView` is
@@ -252,19 +259,50 @@ Form is a new primitive with more event surface than TreeView.
 
 ---
 
-## Phase A.2b — GTK explorer (replaces native `gtk4::TreeView`)
+## Phase A.2b — GTK explorer migration (two sub-phases)
 
-**Status:** 🟡 Unblocked as of A.3d (`f7f3a51`). The `Form` primitive
-now supports cursor-aware `TextInput`, which means the explorer's
-inline rename and new-entry rows can render an embedded `TextInput`
-inside a `TreeRow` without dialog fallbacks.
+**Split rationale:** the full migration touches the `view!` macro,
+the App struct, ~50 scattered `Msg` handlers that reference
+`file_tree_view` / `tree_store` / `name_cell`, plus a 310-line
+right-click context-menu rewrite. Landing that atomically makes any
+smoke-test regression hard to bisect. Instead we ship the scaffolding
+dead-code-first so the draw pipeline is known-good before flipping
+the wiring.
 
-Pickup content below is the full plan.
+### Sub-phase A.2b-1 — scaffolding (inert)
 
----
-
+**Status:** 🟡 In progress on this branch.
 
 **Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` off `develop`.
+
+**Platform:** any (no GTK-specific runtime changes; the new code is not
+yet called).
+
+**What lands:**
+
+1. `src/gtk/explorer.rs` — new module with `ExplorerRow`,
+   `ExplorerState { rows, expanded, selected, scroll_top }`,
+   `build_explorer_rows`, and `explorer_to_tree_view` adapter. Mirrors
+   the TUI's `ExplorerRow` / `collect_rows` shape — intentionally
+   duplicated for sub-phase 1, to be unified into `src/render.rs` in a
+   later session once both backends have stabilised on
+   `quadraui::TreeView`.
+2. `draw_explorer_panel` in `src/gtk/draw.rs` — calls
+   `quadraui_gtk::draw_tree` and overlays a scrollbar using the same
+   pattern as `draw_settings_panel` (A.3c-2).
+3. Both pieces are `#[allow(dead_code)]`; the file tree still renders
+   via the native `gtk4::TreeView`.
+
+**Validation:** `cargo fmt`, `cargo clippy` (default + no-default-features),
+`cargo test --no-default-features` — all pass. No behavioural change.
+
+### Sub-phase A.2b-2 — atomic switchover
+
+**Status:** ⬜ Queued (next session).
+
+**Branch:** `quadraui-phase-a2b2-switchover-gtk` off `develop` (after A.2b-1 lands).
+
+**Platform:** Linux or macOS with GTK4 (4.10+).
 
 **Platform:** Linux or macOS with GTK4 (4.10+).
 
@@ -288,21 +326,26 @@ A.2b reimplements **only what's needed right now** on top of the
 primitive. The rest defers to later quadraui stages (context menus,
 a11y, drag-drop).
 
-**Scope:**
+**Scope (sub-phase 2):**
+
+**Already landed in sub-phase 1** (commit pending as of this edit):
+
+- `src/gtk/explorer.rs` with `ExplorerRow`, `ExplorerState`,
+  `build_explorer_rows`, `explorer_to_tree_view` adapter.
+- `draw_explorer_panel` in `src/gtk/draw.rs` (calls
+  `quadraui_gtk::draw_tree` + scrollbar overlay).
+
+**Remaining work for sub-phase 2:**
 
 1. Find the GTK explorer widget setup in `src/gtk/mod.rs` (search for
    `TreeView::new()` or similar) and the associated `TreeStore` /
    `ListStore` construction. Remove them.
 2. Replace with a `DrawingArea` sized and placed the same way as the
-   SC sidebar panel (and the existing explorer).
-3. Add an `explorer_to_tree_view()` adapter in `src/gtk/draw.rs` (or
-   `src/render.rs` if it should be shared — TUI's version currently
-   lives in `src/tui_main/panels.rs`, so consider lifting it to
-   `render.rs` for reuse). **Same adapter output as TUI A.2a** —
-   `quadraui::TreeView` with `Decoration::Header` only on sections
-   (explorer has none, so dirs stay `Decoration::Normal`).
+   SC sidebar panel.
+3. (done in sub-phase 1 — `explorer_to_tree_view` adapter already
+   exists in `src/gtk/explorer.rs`.)
 4. Wire the DrawingArea's draw callback to call
-   `quadraui_gtk::draw_tree()` with the adapted tree.
+   `draw_explorer_panel()` with the adapted tree.
 5. Re-wire click handling: the old `TreeView` widget dispatched
    `row-activated` / `cursor-changed` signals. Now clicks land on the
    DrawingArea; compute `row = (click_y / item_height)` and update

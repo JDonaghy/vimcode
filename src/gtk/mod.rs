@@ -35,6 +35,7 @@ use std::collections::HashMap;
 mod click;
 mod css;
 mod draw;
+mod explorer;
 mod quadraui_gtk;
 mod tree;
 mod util;

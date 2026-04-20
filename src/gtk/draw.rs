@@ -5418,6 +5418,79 @@ pub(super) fn draw_settings_panel(
     pangocairo::show_layout(cr, layout);
 }
 
+// ─── Explorer panel (Phase A.2b — DrawingArea migration) ──────────────────────
+//
+// `draw_explorer_panel` renders the file-tree sidebar through
+// `quadraui_gtk::draw_tree`, mirroring the settings-panel migration
+// (A.3c-2) in structure: background fill + a vertical scrollbar overlay
+// for long trees. Row heights come from `draw_tree` itself
+// (`line_height * 1.4`), so the scrollbar math here uses the same scalar
+// to resolve the visible-row count — any future change must keep the two
+// in sync. Phase A.2b sub-phase 1 ships this as inert (no callsite); the
+// atomic TreeView → DrawingArea switchover in sub-phase 2 wires it in.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(super) fn draw_explorer_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    tree: &quadraui::TreeView,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+
+    // Row heights must match `quadraui_gtk::draw_tree`: header rows use
+    // `line_height`, body rows use `line_height * 1.4`. The explorer
+    // currently emits no header rows (root dir is rendered as a regular
+    // branch), so the visible-row count uses the body height.
+    let item_height = (line_height * 1.4).round();
+    let total = tree.rows.len();
+    let visible_rows = if item_height > 0.0 {
+        (h / item_height).floor() as usize
+    } else {
+        0
+    };
+    let need_sb = visible_rows > 0 && total > visible_rows;
+    let sb_w = if need_sb { 8.0 } else { 0.0 };
+    let tree_w = (w - sb_w).max(0.0);
+
+    // Background covers the whole panel even when the tree is short, so
+    // empty space under the last row matches the rest of the sidebar.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+
+    super::quadraui_gtk::draw_tree(cr, layout, x, y, tree_w, h, tree, theme, line_height);
+
+    if need_sb {
+        let sb_x = x + tree_w;
+        let track_len = h;
+        let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
+        let max_scroll = total.saturating_sub(visible_rows) as f64;
+        let scroll_ratio = if max_scroll > 0.0 {
+            tree.scroll_offset as f64 / max_scroll
+        } else {
+            0.0
+        };
+        let thumb_y = y + scroll_ratio * (track_len - thumb_len);
+        cr.set_source_rgb(bg_r, bg_g, bg_b);
+        cr.rectangle(sb_x, y, sb_w, track_len);
+        cr.fill().ok();
+        cr.set_source_rgb(dim_r, dim_g, dim_b);
+        cr.rectangle(sb_x + 2.0, thumb_y, sb_w - 4.0, thumb_len);
+        cr.fill().ok();
+    }
+}
+
 // ─── Extension-provided panel (e.g. git-insights GIT LOG) ─────────────────────
 
 #[allow(clippy::too_many_arguments)]
