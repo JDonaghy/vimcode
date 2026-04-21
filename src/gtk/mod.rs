@@ -5115,27 +5115,54 @@ impl App {
 
     /// Apply tab-bar visible-column counts that the most recent draw callback
     /// pushed into `tab_visible_counts`, then re-check that every group's
-    /// active tab is on-screen. Idempotent: drains the queue, and the
-    /// visibility check is a no-op when active tabs are already visible.
+    /// active tab is on-screen. Schedules a redraw if any width or
+    /// scroll-offset changed.
     ///
     /// Called both from the top of `update()` (so engine logic always sees
     /// fresh widths) and from `handle_poll_tick` (belt-and-suspenders).
     ///
-    /// The visibility re-check matches TUI (`tui_main/mod.rs` after every
-    /// `terminal.draw`) and Win-GUI (`win_gui/mod.rs` after every `EndDraw`).
-    /// Without it, GTK was only restoring the "active tab visible" invariant
-    /// when the engine method itself called `ensure_active_tab_visible` — so
-    /// some paths that switched the active tab (e.g. double-click on an
-    /// already-open file in the explorer with stale width from a layout
-    /// change) could leave it scrolled off-screen.
+    /// Why the scroll-offset re-check + forced redraw: GTK has a one-frame
+    /// lag — the engine computes `tab_scroll_offset` using the width from
+    /// the *previous* draw. If a layout change between frames invalidated
+    /// that width, the current draw renders with a stale offset and the
+    /// active tab can land off-screen. The next drain detects the width
+    /// change and re-runs `ensure_active_tab_visible` with the fresh value.
+    /// Without queuing a redraw, the corrected offset wouldn't reach the
+    /// screen until some other event triggered one. With the forced
+    /// redraw, the system reaches a fixed point in ≤2 frames: the next
+    /// draw measures the same width, drain detects no change, no further
+    /// redraw is queued. (No infinite loop.)
+    ///
+    /// TUI and Win-GUI sidestep this by re-running ensure inline after
+    /// every draw — they don't have the borrow-during-draw constraint
+    /// that GTK has.
     fn drain_tab_visible_counts(&mut self) {
         let counts: Vec<(crate::core::window::GroupId, usize)> =
             self.tab_visible_counts.borrow_mut().drain(..).collect();
         let mut engine = self.engine.borrow_mut();
+        let mut width_changed = false;
         for (group_id, count) in counts {
+            let before = engine.editor_groups.get(&group_id).map(|g| g.tab_bar_width);
             engine.set_tab_visible_count(group_id, count);
+            let after = engine.editor_groups.get(&group_id).map(|g| g.tab_bar_width);
+            if before != after {
+                width_changed = true;
+            }
         }
+        let scrolls_before: std::collections::HashMap<crate::core::window::GroupId, usize> = engine
+            .editor_groups
+            .iter()
+            .map(|(&gid, g)| (gid, g.tab_scroll_offset))
+            .collect();
         engine.ensure_all_groups_tabs_visible();
+        let scroll_changed = engine
+            .editor_groups
+            .iter()
+            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
+        drop(engine);
+        if width_changed || scroll_changed {
+            self.draw_needed.set(true);
+        }
     }
 
     fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
