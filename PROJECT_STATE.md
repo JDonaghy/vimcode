@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 312 — A.8: `TextDisplay` primitive scaffolding; A.9 deferred) | **Tests:** 5249 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 24
+**Last updated:** Apr 20, 2026 (Session 314 — A.1c: Win-GUI `draw_tree` + SC panel migration) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,68 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 314 — Phase A.1c: Win-GUI `draw_tree` + SC panel migration (commit `25e94f8`):**
+
+1. **First primitive-driven rendering in the Win-GUI backend.** A.1c
+   was the last required Windows stage tracked in PLAN; A.2c (Win-GUI
+   explorer) is the only Win-GUI required stage still open. Optional
+   A.6/A.7 Win-GUI parity stages remain queued under "Win-GUI parity
+   scope" in PLAN.md.
+2. **New `src/win_gui/quadraui_win.rs`** — Direct2D/DirectWrite
+   counterpart to `quadraui_tui::draw_tree` (TUI) and
+   `quadraui_gtk::draw_tree` (GTK). ~195 lines. Renders tree bg,
+   per-row bg (header / muted / selection / default), indent +
+   chevron for branches, optional icon, text spans with per-span fg,
+   right-aligned badge with reserve width, span truncation to badge
+   edge.
+3. **Win-GUI SC panel sections loop deleted** — `draw.rs::draw_git_panel`
+   shrank by ~160 lines (the 4-section staged/unstaged/worktrees/log
+   render loop). Replaced with
+   `render::source_control_to_tree_view(sc, self.theme)` +
+   `quadraui_win::draw_tree(self, panel_x, top+ry, panel_w,
+   sections_h, &sc_tree)`. `add_color`/`del_color`/`mod_color` theme
+   bindings dropped from `draw_git_panel` — they're now encoded in
+   the adapter via `theme.git_added/deleted/modified`.
+4. **Row-height decision: uniform `line_height` (Win-GUI)**, not the
+   `line_height` / `1.4 * line_height` split GTK uses. Preserves the
+   pre-migration Win-GUI monospace cadence so the click-hit math in
+   `src/win_gui/mod.rs` (mouse-y / lh → flat row index) works
+   without modification. Recorded as a lesson in PLAN.md: different
+   backends can make different pixel-level decisions; the primitive
+   only constrains data, not layout.
+5. **`DrawContext` helper visibility.** Three private methods
+   (`draw_text`, `mono_text_width`, `solid_brush`) promoted to
+   `pub(super)` so the sibling `quadraui_win` module can reach them.
+   Matches how GTK's `quadraui_gtk` accesses `super::*`.
+6. **Scrollbar kept.** Total content height computed from
+   `sc_tree.rows.len() * lh` + commit rows + button row, so the
+   existing "thumb-without-offset" scrollbar indicator still draws
+   at the right size.
+7. **Quality gates all pass** — `cargo fmt` clean, `cargo clippy
+   --no-default-features -- -D warnings` clean (no warnings from
+   A.1c code), `cargo test --workspace --no-default-features`
+   5235/0/19 (identical to develop baseline), `cargo build --bin
+   vimcode-win --features win-gui --no-default-features` succeeds.
+8. **Known pre-existing issue not touched.** `cargo clippy --features
+   win-gui --no-default-features -- -D warnings` has 10 pre-existing
+   `collapsible_match` errors on develop (in `core/engine/vscode.rs`,
+   `core/lsp.rs`, `win_gui/mod.rs:2170` and others). Unrelated to
+   A.1c; should be filed as a separate housekeeping issue if desired.
+9. **Net diff:** +213 / –178 lines across 3 files (`win_gui/mod.rs`
+   adds the `pub mod quadraui_win` line; `win_gui/draw.rs` loses the
+   section render loop + the 3 unused theme bindings; new
+   `win_gui/quadraui_win.rs` at 196 lines).
+10. **Awaiting smoke test on Windows.** Verify the four sections
+    (STAGED CHANGES / CHANGES / WORKTREES if >1 / RECENT COMMITS)
+    render with expand chevrons, item-count badges, status-bg
+    styling on header rows. j/k moves selection across flat rows
+    with inverted bg highlight. Enter/Tab/s on files still
+    stages/unstages — click-hit math is unchanged because row height
+    stays at lh. Muted decoration on log entries renders in dim_fg.
+    Branch picker popup overlay unaffected.
+
+---
 
 **Session 312 — Phase A.8: `TextDisplay` primitive scaffolding (A.9 deferred):**
 

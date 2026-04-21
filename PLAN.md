@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 313 — Win-GUI pickup prep; stage table refreshed)
+> **Last updated:** 2026-04-20 (Session 314 — A.1c shipped: Win-GUI `draw_tree` + SC panel migration)
 
 ---
 
@@ -28,7 +28,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.0** — workspace scaffold | ✅ Done | `36ccad3` | `quadraui-phase-a0-*` | any |
 | **Phase A.1a** — `TreeView` primitive + TUI SC panel | ✅ Done | `bac137e` | `quadraui-phase-a1a-*` | any (TUI) |
 | **Phase A.1b** — GTK `draw_tree` + GTK SC panel | ✅ Done | `e12601e` | `quadraui-phase-a1b-*` | Linux / macOS with GTK4 |
-| **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | 🟡 Next | — | `quadraui-phase-a1c-*` | Windows |
+| **Phase A.1c** — Win-GUI `draw_tree` + Win-GUI SC panel | ✅ Done | `25e94f8` | `quadraui-phase-a1c-treeview-win-gui` | Windows |
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
 | **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | ✅ Done | `e34a72f` | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
 | **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | ✅ Done | `26ed4e9` | `issue-152-a2b2-switchover-gtk` | Linux / macOS with GTK4 |
@@ -56,8 +56,9 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.1c and A.2c need a Windows machine. **All Linux GTK migrations are
-now done** — A.1b, A.2b, A.3c-2, A.4b, A.5b shipped. A.2b was split
+A.2c needs a Windows machine (A.1c shipped in Session 314). **All
+Linux GTK migrations are now done** — A.1b, A.2b, A.3c-2, A.4b, A.5b
+shipped. A.2b was split
 into two sub-phases because the atomic switchover was a ~1500-line
 diff across the view! macro, the App struct, ~50 scattered `Msg`
 handlers, and a context-menu rewrite; the split kept smoke-test
@@ -131,6 +132,19 @@ are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadr
   adding a new Nerd Font icon to a primitive, test empirically whether
   the terminal renders it as 1 or 2 cells and update `is_nerd_wide` if
   it's 2.
+
+- **Win-GUI row heights stay uniform; GTK leaves are taller.** A.1c
+  could have copied GTK's `line_height` / `line_height * 1.4`
+  header/leaf split directly. It intentionally doesn't — the pre-
+  migration Win-GUI SC panel used uniform `lh` rows everywhere, so
+  the click-hit math in `src/win_gui/mod.rs` (which divides a mouse
+  y offset by `lh` to get a flat row index) worked without per-row
+  adjustment. Introducing a 1.4× leaf height would have silently
+  broken that. Rule: **when porting a primitive's draw function to
+  a new backend, match the new backend's pre-migration row cadence,
+  not the other backend's.** Different backends are allowed to make
+  different pixel-level decisions; the primitive only constrains
+  data, not layout.
 
 - **Branches are not automatically headers.** Early `draw_tree`
   implementations (TUI + GTK) applied section-header background styling
