@@ -3436,11 +3436,12 @@ impl SimpleComponent for App {
         let status_seg_for_draw = model.status_segment_map.clone();
         widgets
             .drawing_area
-            .set_draw_func(move |da, cr, width, height| {
+            .set_draw_func(move |_, cr, width, height| {
                 // Wrap in catch_unwind to prevent GTK abort on panic in extern "C" callback.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // ── Phase 1: paint (immutable engine borrow) ──────────────
-                    {
+                    // Closure for one paint pass — borrows engine immutably,
+                    // calls draw_editor, drops the borrow.
+                    let do_paint = || {
                         let engine = engine_clone.borrow();
                         draw_editor(
                             cr,
@@ -3463,27 +3464,40 @@ impl SimpleComponent for App {
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
                         );
-                    }
-                    // Engine borrow dropped here.
+                    };
 
-                    // ── Phase 2: post-draw apply + ensure (shared with TUI/Win-GUI) ──
-                    // GTK can't do this inline during draw because the engine
-                    // is immutably borrowed above. By doing it AFTER the draw
-                    // (still inside the same set_draw_func callback), we get
-                    // the same "every paint is followed by apply+ensure"
-                    // invariant TUI and Win-GUI maintain. If anything changed,
-                    // schedule one more draw via idle_add — that's the GTK
-                    // equivalent of TUI/Win-GUI's loop-back. Converges in
-                    // ≤2 frames since the second draw measures the same width.
+                    // ── Pass 1: paint with current engine state ──────────────
+                    do_paint();
+
+                    // ── Apply measured widths + ensure visibility (shared) ────
                     let widths: Vec<(crate::core::window::GroupId, usize)> =
                         tab_vis_for_draw.borrow_mut().drain(..).collect();
                     if !widths.is_empty() {
                         let changed = engine_clone.borrow_mut().post_draw_apply_widths(&widths);
+
+                        // ── Pass 2: if state changed, repaint with fresh
+                        // scroll_offset — overdraws pass 1 in the same Cairo
+                        // context. Eliminates the one-frame lag GTK had with
+                        // the previous "schedule another draw via idle_add"
+                        // approach (which didn't fire during continuous
+                        // drag-resize because GTK's idle queue was starved
+                        // by resize events). Converges within this single
+                        // callback: pass 2 measures the same width and pushes
+                        // to the queue, but the next paint's apply detects
+                        // no change and skips pass 2.
                         if changed {
-                            let da_clone = da.clone();
-                            gtk4::glib::idle_add_local_once(move || {
-                                da_clone.queue_draw();
-                            });
+                            // Discard pass 1's queued widths — they're stale
+                            // now that we've applied them. Pass 2 will push
+                            // its own (which match the current engine state).
+                            tab_vis_for_draw.borrow_mut().clear();
+                            do_paint();
+                            // Drain pass 2's widths into engine so the next
+                            // paint sees a stable state and skips its own
+                            // pass 2.
+                            let widths2: Vec<_> = tab_vis_for_draw.borrow_mut().drain(..).collect();
+                            if !widths2.is_empty() {
+                                let _ = engine_clone.borrow_mut().post_draw_apply_widths(&widths2);
+                            }
                         }
                     }
                 }));

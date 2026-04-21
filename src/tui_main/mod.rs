@@ -1276,10 +1276,55 @@ fn event_loop(
             // Apply per-group tab bar widths measured by the just-completed
             // draw and re-check that every group's active tab is on-screen.
             // Shared across all backends — see Engine::post_draw_apply_widths.
-            // TUI's main loop redraws frequently enough that we ignore the
-            // returned "changed" flag (any state change will be picked up by
-            // the next iteration's redraw).
-            let _ = engine.post_draw_apply_widths(&tab_visible_counts);
+            //
+            // If the apply changed scroll_offset, repaint immediately so the
+            // user never sees the stale frame. The rebuild + repaint costs
+            // <1ms on a typical terminal; only happens when state actually
+            // changed (resize, new file open, etc.) — fixed point in 2
+            // passes.
+            if engine.post_draw_apply_widths(&tab_visible_counts) {
+                if let Ok(size) = terminal.size() {
+                    let area = Rect {
+                        x: 0,
+                        y: 0,
+                        width: size.width,
+                        height: size.height,
+                    };
+                    let s2 = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
+                    last_layout = Some(s2);
+                    let mut tab_visible_counts2: Vec<(crate::core::window::GroupId, usize)> =
+                        Vec::new();
+                    terminal
+                        .draw(|frame| {
+                            if let Some(s) = last_layout.as_ref() {
+                                let drop_target =
+                                    explorer_drag_active.as_ref().and_then(|&(_, t)| t);
+                                draw_frame(
+                                    frame,
+                                    s,
+                                    &theme,
+                                    &mut sidebar,
+                                    engine,
+                                    sidebar_width,
+                                    quickfix_scroll_top,
+                                    debug_output_scroll,
+                                    folder_picker.as_ref(),
+                                    quit_confirm,
+                                    close_tab_confirm,
+                                    cmd_sel,
+                                    drop_target,
+                                    &mut hover_link_rects,
+                                    &mut hover_popup_rect,
+                                    &mut editor_hover_popup_rect,
+                                    &mut editor_hover_link_rects,
+                                    &mut tab_visible_counts2,
+                                );
+                            }
+                        })
+                        .expect("draw frame");
+                    let _ = engine.post_draw_apply_widths(&tab_visible_counts2);
+                }
+            }
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {
