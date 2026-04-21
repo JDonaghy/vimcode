@@ -5114,19 +5114,28 @@ impl App {
     }
 
     /// Apply tab-bar visible-column counts that the most recent draw callback
-    /// pushed into `tab_visible_counts`. Idempotent: drains the queue.
+    /// pushed into `tab_visible_counts`, then re-check that every group's
+    /// active tab is on-screen. Idempotent: drains the queue, and the
+    /// visibility check is a no-op when active tabs are already visible.
+    ///
     /// Called both from the top of `update()` (so engine logic always sees
     /// fresh widths) and from `handle_poll_tick` (belt-and-suspenders).
+    ///
+    /// The visibility re-check matches TUI (`tui_main/mod.rs` after every
+    /// `terminal.draw`) and Win-GUI (`win_gui/mod.rs` after every `EndDraw`).
+    /// Without it, GTK was only restoring the "active tab visible" invariant
+    /// when the engine method itself called `ensure_active_tab_visible` — so
+    /// some paths that switched the active tab (e.g. double-click on an
+    /// already-open file in the explorer with stale width from a layout
+    /// change) could leave it scrolled off-screen.
     fn drain_tab_visible_counts(&mut self) {
         let counts: Vec<(crate::core::window::GroupId, usize)> =
             self.tab_visible_counts.borrow_mut().drain(..).collect();
-        if counts.is_empty() {
-            return;
-        }
         let mut engine = self.engine.borrow_mut();
         for (group_id, count) in counts {
             engine.set_tab_visible_count(group_id, count);
         }
+        engine.ensure_all_groups_tabs_visible();
     }
 
     fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
