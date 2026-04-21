@@ -146,7 +146,127 @@ When implementing a new backend, verify each of these independently:
 
 **How to apply:** Extract the Y layout computation into a shared function or replicate the draw's arithmetic exactly in the click handler. If the draw adds `lh * 0.3` gap, the click handler must too.
 
-## 12. Terminal integration requires three interaction layers
+## 12. Unit-mismatch is the silent killer when sharing render logic
+
+**The bug pattern:** An algorithm shared across backends measures elements
+in some "width" unit. Backend A uses char cells (TUI), Backend B uses pixels
+(GTK / Win-GUI / macOS). The shared algorithm calls a single measurement
+function that is *implicitly* tied to one backend's units. The other
+backend silently gets wrong layouts that **look like timing bugs** —
+"the tab disappears for a moment", "this element is clipped intermittently",
+"works after a resize" — but are actually deterministic unit-confusion bugs.
+
+**Concrete case (the one that motivated this lesson):** `Engine::tab_display_width`
+was tuned for TUI's `" 1: name "` + close + separator format (~`name + 6` cells).
+GTK renders the same tab with `tab_pad*2 + tab_inner_gap + close_btn + outer_gap`
+of *pixel* padding (≈ `name + 6` cells when divided by `char_w`, but the
+engine assumed only `+2` for close+separator). Engine under-estimated each
+GTK tab by ~4 cells. With many visible tabs, the mismatch compounded:
+engine thought N tabs fit, GTK actually fitted N-1, the rightmost (often
+the active tab when newly opened or scrolled-to) got clipped.
+
+**Detection signal:** *one backend exhibits a layout bug that another
+doesn't, despite both consuming the same engine state*. Suspect units
+**before** chasing timing / event scheduling. Three rounds of band-aid
+fixes (drain timing, idle_add scheduling, two-pass paint) chased the wrong
+hypothesis here. The user predicted the right architecture in the question:
+"is there a way for all backends to share the same logic?" — yes, and the
+prerequisite is making the unit a parameter, not a hardcoded assumption.
+
+**The rule:** any shared rendering algorithm that takes a "width" parameter
+**must** take a `measure` closure too. The unit becomes implicit (the
+closure's return type and `width` use the same units, whatever they are).
+Each backend supplies its native measurer:
+
+- TUI: `|i| s.chars().count()` (cell counts)
+- GTK: `|i| { layout.set_text(s); pad + layout.pixel_size().0 + ... }` (pixels)
+- Win-GUI: DirectWrite measurer (pixels)
+- macOS: Core Text measurer (pixels)
+
+**How to apply:** when extracting any "fit X within Y" / "where does Z
+scroll to" / "which slice fits in N units" algorithm into a shared helper,
+make it generic over `measure: Fn(...) -> usize`. Two existing examples:
+
+- `quadraui::TabBar::fit_active_scroll_offset<F>(active, count, width, measure)`
+- `quadraui::StatusBar::fit_right_start<F>(width, gap, measure)`
+
+When adding a new backend, audit every engine method that touches geometry.
+If it has a `width: usize` parameter or computes per-element widths
+internally, ask: *what unit? whose measurement?* If the answer is "TUI cells",
+that method needs a measurer parameter or the new backend needs its own
+parallel computation.
+
+## 13. GTK's `idle_add_local_once` is unreliable during continuous events
+
+**The bug:** During a window drag-resize, GTK's main loop processes resize
+events back-to-back without ever truly idling. `idle_add_local_once`
+callbacks scheduled from inside a draw handler **don't fire** until the
+event burst ends — and even then, only opportunistically. The user sees
+a stale frame the entire time and may think the app is broken.
+
+**The rule:** don't use `idle_add` for timing-critical visual corrections
+that need to land in the **next** paint after the current one. The
+deferral semantics aren't suitable for "I just learned something during
+this draw and need to repaint with corrected state."
+
+**How to apply (GTK):** when you need a follow-up paint after the current
+one (e.g., the just-completed draw measured something the engine state
+doesn't reflect yet), do the second paint **inline within the same
+`set_draw_func` callback**:
+
+```rust
+.set_draw_func(move |_, cr, w, h| {
+    let do_paint = || { /* borrow engine, draw_editor */ };
+
+    do_paint();              // pass 1
+    let measured = drain_measurements();
+    let changed = engine.borrow_mut().apply(&measured);  // mutate state
+    if changed {
+        do_paint();          // pass 2 — overdraws pass 1 in same Cairo context
+    }
+});
+```
+
+Cairo's pass-2 fill clears pass-1's pixels (because `draw_editor` paints
+the background first), so the user sees only pass-2's output when GTK
+commits the frame. Converges in 2 passes if the algorithm is correct
+(pass 2's measurements match pass-2-applied state, no further change
+detected). See `src/gtk/mod.rs::set_draw_func` for the live example.
+
+**Why this works and idle_add doesn't:** the inline second paint happens
+in the same `set_draw_func` call before GTK commits the frame buffer to
+the screen. `idle_add` schedules a NEW frame, which has to wait for GTK
+to decide it's idle.
+
+## 14. "TUI works → make GTK work" — suspect units, not timing
+
+**The instinct trap:** when a feature works in one backend (TUI) and
+breaks in another (GTK), the natural debugging instinct is to look for
+async/Msg/event-scheduling differences. *That instinct is usually wrong.*
+The likely cause is a unit mismatch in shared logic (see lesson #12).
+
+**The pattern:** if both backends call the same engine method and only
+one exhibits a layout bug, the engine method is either:
+
+1. Using its own (wrong-for-this-backend) measurement internally — fix
+   by parameterising over a measurer (lesson #12), OR
+2. Assuming an implicit unit in a "width" parameter — fix the same way.
+
+**Anti-pattern signals (chase units instead):**
+
+- Bug is "deterministic and reproducible" but feels timing-related.
+- Symptoms differ by element-count or label-length (more tabs = worse,
+  longer filenames = worse) — that's the unit-mismatch error compounding.
+- "Works after a resize" or "works after a refresh" — the post-event
+  redraw happens to land on a screen state where the wrong number is
+  still close enough.
+
+**How to apply:** when first investigating a backend-divergent layout bug,
+*before* writing any timing fix, grep for hardcoded geometry constants
+in the shared algorithm (`+2`, `* char_w`, `* line_height`, etc.). Those
+constants are unit assumptions that don't transfer between backends.
+
+## 15. Terminal integration requires three interaction layers
 
 **The rule:** A terminal panel needs all three layers to be usable:
 1. **Focus management** — clicking terminal sets focus, clicking elsewhere clears it. Must handle both single-pane and split-pane cases.

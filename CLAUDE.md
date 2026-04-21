@@ -82,6 +82,8 @@ The `SUMMARIES/` directory contains concise summaries of every major source file
 
 **Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there. When building a new native GUI backend (e.g. macOS), read **`docs/NATIVE_GUI_LESSONS.md`** first — it documents pitfalls from Win-GUI (breadcrumb offset bugs, multi-group layout issues, click/draw parity, backend checklist).
 
+**Cross-backend rendering algorithms:** any "fit X within Y" / "where does Z scroll to" / "which slice fits in N units" logic that's shared across backends MUST be parameterised over a measurement closure — never hardcode a unit (chars vs pixels). Put the algorithm in `quadraui` as `fn ...<F: Fn(...) -> usize>(..., measure: F)`. Each backend supplies its native measurer (TUI: `chars().count()`, GTK: Pango pixel widths, Win-GUI: DirectWrite, macOS: Core Text). Established examples: `quadraui::StatusBar::fit_right_start` and `quadraui::TabBar::fit_active_scroll_offset`. **When debugging a layout bug present in one backend but not another, suspect units before timing** — see `docs/NATIVE_GUI_LESSONS.md` §12, §13, §14.
+
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |

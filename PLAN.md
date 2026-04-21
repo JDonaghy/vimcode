@@ -157,6 +157,35 @@ are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadr
   `is_expanded`-ness is now purely about chevron rendering. Rule:
   **tree hierarchy and visual emphasis are orthogonal.**
 
+- **Generic-over-measurer is the cross-backend pattern.** When a
+  rendering algorithm needs a "width" or per-element measurement
+  (`fit X within Y`, `where does Z scroll to`, `which slice fits`),
+  put the algorithm in `quadraui` parameterised over a measurement
+  closure. Each backend supplies its native unit (TUI: char count,
+  GTK: Pango pixel, Win-GUI: DirectWrite, macOS: Core Text). Two
+  examples now live in the codebase as the established template:
+  `quadraui::StatusBar::fit_right_start<F>` (#159) and
+  `quadraui::TabBar::fit_active_scroll_offset<F>` (#158). The
+  alternative — putting the algorithm in `Engine` with hardcoded
+  TUI units — silently breaks every non-TUI backend with off-by-N
+  layout bugs that look like timing bugs but aren't. **Default to
+  the generic pattern from day one for any new "fit/scroll/elide"
+  primitive logic.** See `docs/NATIVE_GUI_LESSONS.md` §12 for the
+  detailed analysis.
+
+- **GTK's `idle_add_local_once` doesn't fire reliably during
+  continuous events.** When you need a follow-up paint after the
+  current draw (because the current draw measured something that
+  changes engine state), do the second paint inline within the
+  same `set_draw_func` callback (overdraw in the same Cairo
+  context) rather than scheduling via `idle_add`. During window
+  drag-resize, GTK's idle queue is starved by resize events and
+  the idle callback never fires until the drag ends — the user
+  sees a stale frame the entire time. The two-pass-paint pattern
+  in `src/gtk/mod.rs::set_draw_func` is the GTK equivalent of
+  TUI's loop-iteration redraw and Win-GUI's WM_PAINT cycle. See
+  `docs/NATIVE_GUI_LESSONS.md` §13 + §14.
+
 ---
 
 ## Picking this up on another machine
