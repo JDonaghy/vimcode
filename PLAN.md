@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 309 — A.6e `ActivityBar` primitive + TUI migration; A.6 split extended)
+> **Last updated:** 2026-04-20 (Session 310 — A.6f GTK ActivityBar native→DrawingArea migration; A.6 complete)
 
 ---
 
@@ -46,8 +46,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.6b** — GTK `draw_status_bar` migration | ✅ Done | `96c48bf` | `quadraui-phase-a6b-status-bar-gtk` | Linux / macOS with GTK4 |
 | **Phase A.6c** — `TabBar` primitive + TUI migration | ✅ Done | `2196b27` | `quadraui-phase-a6c-tab-bar-tui` | any (TUI) |
 | **Phase A.6d** — GTK `draw_tab_bar` migration | ✅ Done | `e93b857` | `quadraui-phase-a6d-tab-bar-gtk` | Linux / macOS with GTK4 |
-| **Phase A.6e** — `ActivityBar` primitive + TUI migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6e-activity-bar` | any (TUI) |
-| Phase A.6f — GTK ActivityBar native→DrawingArea migration | ⬜ Queued | — | `quadraui-phase-a6f-*` | Linux / macOS with GTK4 |
+| **Phase A.6e** — `ActivityBar` primitive + TUI migration | ✅ Done | `2c89dcf` | `quadraui-phase-a6e-activity-bar` | any (TUI) |
+| **Phase A.6f** — GTK ActivityBar native→DrawingArea migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6f-activity-bar-gtk` | Linux / macOS with GTK4 |
 | Phase A.7 — `Terminal` primitive | ⬜ Queued | — | `quadraui-phase-a7-*` | any |
 | Phase A.8 — `TextDisplay` | ⬜ Queued | — | `quadraui-phase-a8-*` | any |
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Queued | — | `quadraui-phase-a9-*` | any — biggest stage |

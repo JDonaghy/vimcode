@@ -1406,3 +1406,150 @@ pub(super) fn draw_tab_bar(
         available_cols,
     }
 }
+
+// ─── Activity bar (A.6f) ─────────────────────────────────────────────────────
+
+/// Fixed height (in pixels) of a single activity bar row — matches the
+/// legacy `gtk4::Button { set_height_request: 48 }` used in the view!
+/// macro. Shared with the click hit-test in `src/gtk/mod.rs`.
+pub(super) const ACTIVITY_ROW_PX: f64 = 48.0;
+
+/// Per-row hit region for the GTK activity bar, in DA-local coordinates.
+/// Caller dispatches on `id.as_str()` (e.g. `"activity:explorer"` or
+/// `"activity:ext:foo"`) to resolve to a `SidebarPanel` variant.
+#[derive(Debug, Clone)]
+pub(super) struct ActivityBarHit {
+    pub y_start: f64,
+    pub y_end: f64,
+    pub id: quadraui::WidgetId,
+    pub tooltip: String,
+}
+
+/// Draw a `quadraui::ActivityBar` as a vertical icon strip. Cairo + Pango
+/// equivalent of the TUI `quadraui_tui::draw_activity_bar`.
+///
+/// Geometry: top items from `y=0` downward at `ACTIVITY_ROW_PX` per row;
+/// bottom items pin to the bottom edge upward. Icons rendered centred
+/// horizontally and vertically in each cell using a Nerd-Font-sized Pango
+/// layout (24 px, matching the `.activity-button` CSS from the legacy
+/// native-widget path). Active items get a 2 px left-edge accent bar;
+/// hovered items get a subtle background tint.
+///
+/// Returns per-row hit regions so the caller can route clicks and render
+/// hover tooltips.
+pub(super) fn draw_activity_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    width: f64,
+    height: f64,
+    bar: &quadraui::ActivityBar,
+    theme: &Theme,
+    hovered_idx: Option<usize>,
+) -> Vec<ActivityBarHit> {
+    use pango::FontDescription;
+
+    // Background.
+    let (br, bgc, bb) = vc_to_cairo(theme.tab_bar_bg);
+    cr.set_source_rgb(br, bgc, bb);
+    cr.rectangle(0.0, 0.0, width, height);
+    cr.fill().ok();
+
+    // Right-edge separator matches the `.activity-bar { border-right }` CSS.
+    let (sr, sg, sb) = vc_to_cairo(theme.separator);
+    cr.set_source_rgb(sr, sg, sb);
+    cr.rectangle(width - 1.0, 0.0, 1.0, height);
+    cr.fill().ok();
+
+    let saved_font = layout.font_description().unwrap_or_default();
+    let icon_font = FontDescription::from_string("Symbols Nerd Font, monospace 20");
+    layout.set_font_description(Some(&icon_font));
+    layout.set_attributes(None);
+
+    let accent_col = bar.active_accent.map(qc_to_cairo).unwrap_or_else(|| {
+        let c = theme.cursor;
+        (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
+    });
+    let inactive_fg = vc_to_cairo(theme.status_inactive_fg);
+    let active_fg = vc_to_cairo(theme.foreground);
+    let hover_bg = {
+        // Subtle tint ~10% lighter than the bar bg, falling back to foreground-at-alpha.
+        let c = theme.tab_bar_bg.lighten(0.10);
+        (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
+    };
+
+    let rows_total = ((height / ACTIVITY_ROW_PX).floor() as usize).max(1);
+    let bottom_count = bar.bottom_items.len().min(rows_total);
+    let top_capacity = rows_total.saturating_sub(bottom_count);
+    let mut regions: Vec<ActivityBarHit> = Vec::new();
+
+    let draw_row = |y: f64,
+                    item: &quadraui::ActivityItem,
+                    row_idx: usize,
+                    regions: &mut Vec<ActivityBarHit>| {
+        let is_hovered = hovered_idx == Some(row_idx);
+
+        // Hover background tint.
+        if is_hovered {
+            cr.set_source_rgb(hover_bg.0, hover_bg.1, hover_bg.2);
+            cr.rectangle(0.0, y, width, ACTIVITY_ROW_PX);
+            cr.fill().ok();
+        }
+
+        // Left accent bar on active rows (2 px, full row height).
+        if item.is_active {
+            cr.set_source_rgb(accent_col.0, accent_col.1, accent_col.2);
+            cr.rectangle(0.0, y, 2.0, ACTIVITY_ROW_PX);
+            cr.fill().ok();
+        }
+
+        // Icon glyph, centred in the row.
+        layout.set_text(&item.icon);
+        let (iw, ih) = layout.pixel_size();
+        let fg = if item.is_active || is_hovered {
+            active_fg
+        } else {
+            inactive_fg
+        };
+        cr.set_source_rgb(fg.0, fg.1, fg.2);
+        cr.move_to(
+            (width - iw as f64) / 2.0,
+            y + (ACTIVITY_ROW_PX - ih as f64) / 2.0,
+        );
+        pangocairo::show_layout(cr, layout);
+
+        regions.push(ActivityBarHit {
+            y_start: y,
+            y_end: y + ACTIVITY_ROW_PX,
+            id: item.id.clone(),
+            tooltip: item.tooltip.clone(),
+        });
+    };
+
+    // Top items — clipped to `top_capacity` rows.
+    for (row_idx, item) in bar.top_items.iter().take(top_capacity).enumerate() {
+        draw_row(
+            row_idx as f64 * ACTIVITY_ROW_PX,
+            item,
+            row_idx,
+            &mut regions,
+        );
+    }
+
+    // Bottom items — render from the bottom upward, preserving declared order.
+    // (Item 0 ends up at the bottom-most row when there's only one.)
+    let mut bottom_row = rows_total.saturating_sub(1);
+    for item in bar.bottom_items.iter().rev().take(bottom_count) {
+        let y = bottom_row as f64 * ACTIVITY_ROW_PX;
+        // Bottom items sit AFTER the top-capacity rows in the regions list so
+        // the caller can look them up by row index deterministically.
+        draw_row(y, item, regions.len(), &mut regions);
+        if bottom_row == 0 {
+            break;
+        }
+        bottom_row -= 1;
+    }
+
+    layout.set_font_description(Some(&saved_font));
+
+    regions
+}

@@ -99,6 +99,12 @@ struct App {
     /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
     /// `draw_explorer_panel`).
     explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// A.6f: activity bar DA handle; used to queue redraws when panel
+    /// state or extension registrations change.
+    activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// A.6f: shared `active_panel` mirror — lets the draw func read the
+    /// current panel without borrowing `&self`. Updated in `Msg::SwitchPanel`.
+    activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>>,
     /// Flat row model + expand / selection state backing the explorer DA.
     explorer_state: Rc<RefCell<ExplorerState>>,
     /// Row height actually used by the most recent `draw_explorer_panel`
@@ -256,6 +262,124 @@ struct App {
 ///
 /// This is the canonical superset mapping — callers that only care about a
 /// subset simply ignore the extra translations (they're harmless).
+/// A.6f: adapter — build the `quadraui::ActivityBar` primitive that the
+/// GTK activity bar DrawingArea renders each frame.
+///
+/// Item order matches the pre-migration view! macro layout:
+/// * Top: explorer · search · debug · git · extensions · AI
+///   · dynamically-registered extension panels (sorted by name)
+/// * Bottom: settings
+///
+/// GTK has no keyboard-focused highlight (mouse-driven UX), so every
+/// `is_keyboard_selected` is false. Hover state is layered in by the
+/// draw function via a separate `hovered_idx` parameter.
+fn build_gtk_activity_bar_primitive(
+    engine: &crate::core::engine::Engine,
+    active: &SidebarPanel,
+    theme: &crate::render::Theme,
+) -> quadraui::ActivityBar {
+    let fixed = [
+        (
+            SidebarPanel::Explorer,
+            icons::EXPLORER.nerd,
+            "Explorer (Ctrl+Shift+E)",
+            "activity:explorer",
+        ),
+        (
+            SidebarPanel::Search,
+            icons::SEARCH_COD.nerd,
+            "Search (Ctrl+Shift+F)",
+            "activity:search",
+        ),
+        (
+            SidebarPanel::Debug,
+            icons::DEBUG.nerd,
+            "Debug",
+            "activity:debug",
+        ),
+        (
+            SidebarPanel::Git,
+            icons::GIT_BRANCH.nerd,
+            "Source Control",
+            "activity:git",
+        ),
+        (
+            SidebarPanel::Extensions,
+            icons::EXTENSIONS.nerd,
+            "Extensions",
+            "activity:extensions",
+        ),
+        (
+            SidebarPanel::Ai,
+            icons::AI_CHAT.nerd,
+            "AI Assistant",
+            "activity:ai",
+        ),
+    ];
+
+    let mut top: Vec<quadraui::ActivityItem> = fixed
+        .iter()
+        .map(|(panel, icon, tooltip, id)| quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(*id),
+            icon: (*icon).to_string(),
+            tooltip: (*tooltip).to_string(),
+            is_active: active == panel,
+            is_keyboard_selected: false,
+        })
+        .collect();
+
+    // Dynamic extension panels (sorted by name).
+    let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
+    ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
+    for panel in ext_panels {
+        let is_active = matches!(active, SidebarPanel::ExtPanel(n) if n == &panel.name);
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
+            icon: panel.resolved_icon().to_string(),
+            tooltip: panel.title.clone(),
+            is_active,
+            is_keyboard_selected: false,
+        });
+    }
+
+    let bottom = vec![quadraui::ActivityItem {
+        id: quadraui::WidgetId::new("activity:settings"),
+        icon: icons::SETTINGS.nerd.to_string(),
+        tooltip: "Settings".to_string(),
+        is_active: matches!(active, SidebarPanel::Settings),
+        is_keyboard_selected: false,
+    }];
+
+    quadraui::ActivityBar {
+        id: quadraui::WidgetId::new("activity-bar"),
+        top_items: top,
+        bottom_items: bottom,
+        active_accent: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
+        selection_bg: None,
+    }
+}
+
+/// A.6f: decode a `WidgetId` from `build_gtk_activity_bar_primitive` into
+/// the engine-side `SidebarPanel` enum used by `Msg::SwitchPanel`.
+fn activity_id_to_panel(id: &str) -> Option<SidebarPanel> {
+    match id {
+        "activity:explorer" => Some(SidebarPanel::Explorer),
+        "activity:search" => Some(SidebarPanel::Search),
+        "activity:debug" => Some(SidebarPanel::Debug),
+        "activity:git" => Some(SidebarPanel::Git),
+        "activity:extensions" => Some(SidebarPanel::Extensions),
+        "activity:ai" => Some(SidebarPanel::Ai),
+        "activity:settings" => Some(SidebarPanel::Settings),
+        other => other
+            .strip_prefix("activity:ext:")
+            .map(|name| SidebarPanel::ExtPanel(name.to_string())),
+    }
+}
+
 fn map_gtk_key_name(gdk_name: &str) -> &str {
     match gdk_name {
         "Return" | "KP_Enter" => "Return",
@@ -721,125 +845,19 @@ impl SimpleComponent for App {
                     set_orientation: gtk4::Orientation::Horizontal,
                     set_vexpand: true,
 
-                // Activity Bar (48px, always visible)
+                // Activity Bar (48px, always visible).
+                // A.6f: migrated from a `gtk4::Box` with native `gtk4::Button`
+                // children to a single `DrawingArea` that renders via
+                // `quadraui_gtk::draw_activity_bar`. Rendering + click +
+                // hover + tooltip wiring is imperative (below this view!
+                // macro) to match the A.2b-2 / A.3c-2 pattern.
                 #[name = "activity_bar"]
-                gtk4::Box {
-                    set_orientation: gtk4::Orientation::Vertical,
+                gtk4::DrawingArea {
                     set_width_request: 48,
+                    set_vexpand: true,
                     set_css_classes: &["activity-bar"],
-
-                    #[name = "explorer_button"]
-                    gtk4::Button {
-                        set_label: icons::EXPLORER.nerd,
-                        set_tooltip_text: Some("Explorer (Ctrl+Shift+E)"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-
-                        #[watch]
-                        set_css_classes: if model.active_panel == SidebarPanel::Explorer && model.sidebar_visible {
-                            &["activity-button", "active"]
-                        } else {
-                            &["activity-button"]
-                        },
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Explorer));
-                        }
-                    },
-
-                    #[name = "search_button"]
-                    gtk4::Button {
-                        set_label: icons::SEARCH_COD.nerd,
-                        set_tooltip_text: Some("Search (Ctrl+Shift+F)"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-
-                        #[watch]
-                        set_css_classes: if model.active_panel == SidebarPanel::Search && model.sidebar_visible {
-                            &["activity-button", "active"]
-                        } else {
-                            &["activity-button"]
-                        },
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Search));
-                        }
-                    },
-
-                    #[name = "debug_button"]
-                    gtk4::Button {
-                        set_label: icons::DEBUG.nerd,
-                        set_tooltip_text: Some("Debug"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-
-                        #[watch]
-                        set_css_classes: if model.active_panel == SidebarPanel::Debug && model.sidebar_visible {
-                            &["activity-button", "active"]
-                        } else {
-                            &["activity-button"]
-                        },
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Debug));
-                        }
-                    },
-
-                    gtk4::Button {
-                        set_label: icons::GIT_BRANCH.nerd,
-                        set_tooltip_text: Some("Source Control"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: true,
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Git));
-                        }
-                    },
-
-                    gtk4::Button {
-                        set_label: icons::EXTENSIONS.nerd,
-                        set_tooltip_text: Some("Extensions"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: true,
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Extensions));
-                        }
-                    },
-
-                    gtk4::Button {
-                        set_label: icons::AI_CHAT.nerd,
-                        set_tooltip_text: Some("AI Assistant"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: true,
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Ai));
-                        }
-                    },
-
-                    gtk4::Separator {
-                        set_vexpand: true, // Pushes settings to bottom
-                    },
-
-                    gtk4::Button {
-                        set_label: icons::SETTINGS.nerd,
-                        set_tooltip_text: Some("Settings"),
-                        set_width_request: 48,
-                        set_height_request: 48,
-                        set_css_classes: &["activity-button"],
-                        set_sensitive: true,
-
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::SwitchPanel(SidebarPanel::Settings));
-                        }
-                    },
+                    set_can_focus: true,
+                    set_has_tooltip: true,
                 },
 
                 // Sidebar (collapsible with Revealer)
@@ -1805,6 +1823,13 @@ impl SimpleComponent for App {
         };
         let explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
+        let activity_bar_hits: Rc<RefCell<Vec<crate::gtk::quadraui_gtk::ActivityBarHit>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        let activity_bar_hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>> =
+            Rc::new(RefCell::new(None));
         let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
         let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         #[allow(clippy::type_complexity)]
@@ -1923,6 +1948,8 @@ impl SimpleComponent for App {
             window: root.clone(),
             active_panel: SidebarPanel::Explorer,
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
+            activity_bar_da_ref: activity_bar_da_ref.clone(),
+            activity_bar_active_panel: activity_bar_active_panel.clone(),
             explorer_state: explorer_state.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
@@ -2978,44 +3005,110 @@ impl SimpleComponent for App {
         }
         *ext_dyn_panel_da_ref.borrow_mut() = Some(widgets.ext_dyn_panel_da.clone());
 
-        // ── Dynamic activity bar buttons for extension-provided panels ────────
+        // ── Activity bar (A.6f: native Button chain → DrawingArea) ────────────
         {
-            let eng = engine.borrow();
-            let mut panels: Vec<_> = eng.ext_panels.values().collect();
-            panels.sort_by(|a, b| a.name.cmp(&b.name));
-            // Find the Separator widget in the activity bar (push-to-bottom spacer).
-            // Insert ext panel buttons just before it.
-            let activity_bar = &widgets.activity_bar;
-            let mut separator_widget: Option<gtk4::Widget> = None;
-            let mut child = activity_bar.first_child();
-            while let Some(ref w) = child {
-                if w.downcast_ref::<gtk4::Separator>().is_some() {
-                    separator_widget = Some(w.clone());
-                    break;
-                }
-                child = w.next_sibling();
-            }
-            // Track the last button we inserted so the next one goes after it.
-            let mut insert_after: Option<gtk4::Widget> =
-                separator_widget.as_ref().and_then(|s| s.prev_sibling());
-            for panel in &panels {
-                let btn = gtk4::Button::new();
-                btn.set_label(&panel.resolved_icon().to_string());
-                btn.set_tooltip_text(Some(&panel.title));
-                btn.set_width_request(48);
-                btn.set_height_request(48);
-                btn.set_css_classes(&["activity-button"]);
-                let panel_name = panel.name.clone();
-                let sender_btn = sender.input_sender().clone();
-                btn.connect_clicked(move |_| {
-                    sender_btn
-                        .send(Msg::SwitchPanel(SidebarPanel::ExtPanel(panel_name.clone())))
-                        .ok();
-                });
-                activity_bar.insert_child_after(&btn, insert_after.as_ref());
-                insert_after = Some(btn.upcast());
-            }
+            let engine_d = engine.clone();
+            let hits_d = activity_bar_hits.clone();
+            let hover_d = activity_bar_hover.clone();
+            let active_panel_d = Rc::new(RefCell::new(SidebarPanel::Explorer));
+            let active_panel_write = active_panel_d.clone();
+            // Mirror the current `active_panel` into the refcell via an update-time hook.
+            // Done below in `update()` — this refcell is published here so the draw func
+            // can read it without borrowing `self`.
+            *activity_bar_active_panel.borrow_mut() = Some(active_panel_d);
+            widgets.activity_bar.set_draw_func(move |da, cr, _w, _h| {
+                let engine = engine_d.borrow();
+                let theme = Theme::from_name(&engine.settings.colorscheme);
+                let pango_ctx = pangocairo::create_context(cr);
+                let layout = pango::Layout::new(&pango_ctx);
+                let active = active_panel_write.borrow().clone();
+                let bar = build_gtk_activity_bar_primitive(&engine, &active, &theme);
+                let hovered = hover_d.get();
+                let hits = crate::gtk::quadraui_gtk::draw_activity_bar(
+                    cr,
+                    &layout,
+                    da.width() as f64,
+                    da.height() as f64,
+                    &bar,
+                    &theme,
+                    hovered,
+                );
+                *hits_d.borrow_mut() = hits;
+            });
         }
+        // Left-click: resolve row → SidebarPanel → Msg::SwitchPanel.
+        {
+            let sender_c = sender.input_sender().clone();
+            let hits_c = activity_bar_hits.clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _n, _x, y| {
+                let hits = hits_c.borrow();
+                for hit in hits.iter() {
+                    if y >= hit.y_start && y < hit.y_end {
+                        if let Some(panel) = activity_id_to_panel(hit.id.as_str()) {
+                            let _ = sender_c.send(Msg::SwitchPanel(panel));
+                        }
+                        return;
+                    }
+                }
+            });
+            widgets.activity_bar.add_controller(gesture);
+        }
+        // Hover tracking — updates the cell used by the draw func and queues a redraw.
+        {
+            let hits_m = activity_bar_hits.clone();
+            let hover_m = activity_bar_hover.clone();
+            let da_weak = widgets.activity_bar.downgrade();
+            let motion = gtk4::EventControllerMotion::new();
+            motion.connect_motion(move |_, _x, y| {
+                let hits = hits_m.borrow();
+                let mut new_hover: Option<usize> = None;
+                for (i, hit) in hits.iter().enumerate() {
+                    if y >= hit.y_start && y < hit.y_end {
+                        new_hover = Some(i);
+                        break;
+                    }
+                }
+                if hover_m.get() != new_hover {
+                    hover_m.set(new_hover);
+                    if let Some(da) = da_weak.upgrade() {
+                        da.queue_draw();
+                    }
+                }
+            });
+            let hover_leave = activity_bar_hover.clone();
+            let da_weak_leave = widgets.activity_bar.downgrade();
+            motion.connect_leave(move |_| {
+                if hover_leave.get().is_some() {
+                    hover_leave.set(None);
+                    if let Some(da) = da_weak_leave.upgrade() {
+                        da.queue_draw();
+                    }
+                }
+            });
+            widgets.activity_bar.add_controller(motion);
+        }
+        // Per-row tooltip via the query-tooltip signal.
+        {
+            let hits_t = activity_bar_hits.clone();
+            widgets
+                .activity_bar
+                .connect_query_tooltip(move |_, _x, y, _kbd, tooltip| {
+                    let hits = hits_t.borrow();
+                    for hit in hits.iter() {
+                        if (y as f64) >= hit.y_start && (y as f64) < hit.y_end {
+                            if !hit.tooltip.is_empty() {
+                                tooltip.set_text(Some(&hit.tooltip));
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    false
+                });
+        }
+        *activity_bar_da_ref.borrow_mut() = Some(widgets.activity_bar.clone());
 
         // AI sidebar DrawingArea: draw function + key controller + click gesture
         {
@@ -8543,6 +8636,15 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                // A.6f: mirror the active panel into the shared cell read by the
+                // activity-bar draw callback, and queue a redraw so the accent
+                // bar updates.
+                if let Some(mirror) = self.activity_bar_active_panel.borrow().as_ref() {
+                    *mirror.borrow_mut() = self.active_panel.clone();
+                }
+                if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                    da.queue_draw();
                 }
                 self.draw_needed.set(true);
             }

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 309 — A.6e: `ActivityBar` primitive + TUI migration) | **Tests:** 5244 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 19
+**Last updated:** Apr 20, 2026 (Session 310 — A.6f: GTK ActivityBar native→DrawingArea migration; A.6 complete) | **Tests:** 5244 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 19
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,22 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 310 — Phase A.6f: GTK ActivityBar native→DrawingArea migration (A.6 complete):**
+
+1. **Atomic switchover.** The view! macro's `activity_bar` `gtk4::Box` with 7 fixed `gtk4::Button` widgets + inline `Separator` spacer is now a single `gtk4::DrawingArea { set_width_request: 48, set_has_tooltip: true, set_can_focus: true }`. Follows the A.2b-2 + A.3c-2 pattern.
+2. **New `quadraui_gtk::draw_activity_bar`** — Cairo + Pango renderer that consumes a `quadraui::ActivityBar` + extra `hovered_idx` param. Returns `Vec<ActivityBarHit>` in DA-local pixel coordinates for the caller's click + hover + tooltip pipeline. Geometry: 48 px per row (matches the pre-migration `set_height_request: 48`), icons centred in each row at 20 px Nerd Font size (matches the `.activity-button` CSS), 2 px left-edge accent bar for active rows, subtle hover-bg tint.
+3. **Dynamic extension button injection block deleted** (~35 lines). Extension panel icons now flow through the same primitive + draw path as the fixed panels; adding an extension panel just appears as a new `ActivityItem` the next time the DA redraws. Simpler than the old `insert_child_after` bookkeeping.
+4. **GTK-specific adapter `build_gtk_activity_bar_primitive`** in `src/gtk/mod.rs`. Builds the primitive from `Engine.ext_panels` + the current `SidebarPanel`. Tooltips populated (unlike TUI which leaves them empty): "Explorer (Ctrl+Shift+E)", "Search (Ctrl+Shift+F)", etc. GTK has no keyboard-focused highlight (native widgets manage tab nav), so all `is_keyboard_selected` are false.
+5. **`activity_id_to_panel` decoder** — `WidgetId::as_str()` → `SidebarPanel`, including `"activity:ext:<name>"` → `SidebarPanel::ExtPanel(name)`. Click handler dispatches via this decoder to `Msg::SwitchPanel`, keeping the engine-side dispatch path unchanged.
+6. **Interaction wiring**: `GestureClick` resolves rows via the stored `activity_bar_hits` vec. `EventControllerMotion` updates a hover `Rc<Cell<Option<usize>>>` and calls `queue_draw` when the hovered row changes (also on `leave`). `connect_query_tooltip` fires the native GTK tooltip popover using per-row `tooltip` strings. `Msg::SwitchPanel` handler now mirrors the active panel into a shared `Rc<RefCell<SidebarPanel>>` the draw callback reads without borrowing `&self`, and queues a redraw.
+7. **Lessons learned (added to PLAN.md):** for atomic switchover of native widget chains to DrawingArea, the pattern is (a) shared interaction state lives in `Rc<RefCell<_>>` / `Rc<Cell<_>>` so draw callbacks don't borrow `&self`, (b) per-frame interaction state (hover row, active selection mirror) gets written synchronously from the interaction handler that changes it, paired with a `queue_draw`, (c) deferred poll-tick dispatch should be avoided for anything affecting visual state (cf. #158's pre-existing tab-scroll lag).
+8. **All A.6 stages now complete.** Quadraui primitives shipped: Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b), TabBar (A.6d), ActivityBar (A.6f). All Linux GTK migrations done. Windows (A.1c / A.2c) remain for a machine with that toolchain.
+9. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; `clippy::explicit_counter_loop` flagged a manual row-index counter I'd written — simplified to `.enumerate()`), full `cargo test --workspace --no-default-features` (5244/0/19, unchanged from A.6e), `cargo build` both configurations.
+10. **Net diff:** +380 / –160 lines across 4 files. `src/gtk/mod.rs` shrinks by ~100 lines (native button chain + dynamic injection deleted; imperative DA setup added); `src/gtk/quadraui_gtk.rs` grows by ~160 (`draw_activity_bar` + `ActivityBarHit`).
+11. **Awaiting smoke test.** GTK activity bar should render identically: 7 fixed icons (hamburger was TUI-only — the GTK version had no hamburger row, stays that way), dynamic extension panel icons in the middle, settings pinned bottom. Hover a row → subtle tint + native tooltip popover after dwell. Click any icon → panel switches + active-accent bar appears on the left edge of that row. Opening a new extension panel → its icon appears on the next redraw.
+
+---
 
 **Session 309 — Phase A.6e: `ActivityBar` primitive + TUI migration:**
 
