@@ -13,7 +13,7 @@
 ## Active wave — `quadraui` cross-platform UI crate extraction
 
 Extracting a reusable UI crate from vimcode per
-[`docs/UI_CRATE_DESIGN.md`](docs/UI_CRATE_DESIGN.md). vimcode is the
+[`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md). vimcode is the
 test app; target downstream apps include a cross-platform k8s dashboard
 (see issue [#145](https://github.com/JDonaghy/vimcode/issues/145)).
 
@@ -68,7 +68,7 @@ optional — see "Win-GUI parity scope" below.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)
-are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadraui_primitives.md).
+are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
 
 ---
 
@@ -661,7 +661,7 @@ functions and to call the existing adapters from its own draw paths.
 
 ## Design invariants that must hold across all stages
 
-From [`docs/UI_CRATE_DESIGN.md`](docs/UI_CRATE_DESIGN.md) §10
+From [`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md) §10
 (plugin-driven UI invariants). Breaking any of these would force a breaking
 quadraui API change when Lua plugins start declaring UI (see issues
 [#146](https://github.com/JDonaghy/vimcode/issues/146) and
@@ -684,7 +684,7 @@ If you write a new primitive or extend an existing one, verify all six.
 
 | Doc | Purpose |
 |-----|---------|
-| [`docs/UI_CRATE_DESIGN.md`](docs/UI_CRATE_DESIGN.md) | Authoritative design. All 13 §7 decisions are resolved. Start here. |
+| [`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md) | Authoritative design. All 13 §7 decisions are resolved. Start here. |
 | [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) | Cross-backend bug patterns — read before A.1c. |
 | [`CLAUDE.md`](CLAUDE.md) | Project-wide rules, quality gates, branching workflow. |
 | [`PROJECT_STATE.md`](PROJECT_STATE.md) | Session-by-session progress (historical). |

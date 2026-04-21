@@ -10,10 +10,10 @@
 Extract a **cross-platform UI crate** from vimcode that lets developers build rich, fast, keyboard-driven desktop + terminal applications from a single codebase.
 
 Targets:
-- **Windows** — native via Direct2D + DirectWrite (already working in `src/win_gui/`)
-- **Linux** — native via GTK4 + Cairo + Pango (already working in `src/gtk/`)
-- **macOS** — native via Core Graphics + Core Text (planned, issue #47)
-- **TUI** — ratatui + crossterm (already working in `src/tui_main/`)
+- **Windows** — native via Direct2D + DirectWrite (reference implementation in vimcode's `src/win_gui/`)
+- **Linux** — native via GTK4 + Cairo + Pango (reference implementation in vimcode's `src/gtk/`)
+- **macOS** — native via Core Graphics + Core Text (planned)
+- **TUI** — ratatui + crossterm (reference implementation in vimcode's `src/tui_main/`)
 
 **Test app:** vimcode. It stresses the library: 20+ panels, complex text editing, drag-and-drop splits, tree views, forms, modals, command palette, dialogs.
 
