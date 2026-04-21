@@ -1036,44 +1036,32 @@ pub(super) fn draw_status_bar(
     // last — see `render::build_window_status_line`. The highest-priority
     // segment is always kept, even if it alone overflows; #157's clip
     // truncates visually in that edge case.
-    const MIN_GAP_PX: f64 = 16.0;
-    let right_widths_px: Vec<f64> = bar
-        .right_segments
+    //
+    // The drop *policy* lives in `quadraui::StatusBar::fit_right_start`;
+    // we just supply a Pango pixel measurer. Same code path as the TUI
+    // backend uses (with a char-count measurer), so any policy tweak
+    // applies to both — and to Win-GUI / macOS once they migrate.
+    const MIN_GAP_PX: usize = 16;
+    let measure_px = |seg: &quadraui::StatusBarSegment| -> usize {
+        layout.set_text(&seg.text);
+        apply_bold(layout, seg.bold);
+        layout.pixel_size().0.max(0) as usize
+    };
+    let bar_w_px = width.round().max(0.0) as usize;
+    let start_idx = bar.fit_right_start(bar_w_px, MIN_GAP_PX, measure_px);
+
+    // Re-measure visible widths after fit (the layout's last-set state is
+    // not guaranteed to be the segment we want to draw next).
+    let visible_widths_px: Vec<f64> = bar.right_segments[start_idx..]
         .iter()
-        .map(|seg| {
-            layout.set_text(&seg.text);
-            apply_bold(layout, seg.bold);
-            let (w_px, _) = layout.pixel_size();
-            w_px as f64
-        })
+        .map(|seg| measure_px(seg) as f64)
         .collect();
-    let right_total_w: f64 = right_widths_px.iter().sum();
-    let left_end_px = cx - x;
-    let max_right_px = (width - left_end_px - MIN_GAP_PX).max(0.0);
-
-    let mut start_idx = 0;
-    if !bar.right_segments.is_empty() && right_total_w > max_right_px {
-        let last = bar.right_segments.len() - 1;
-        let mut remaining = right_total_w;
-        for (i, w) in right_widths_px.iter().enumerate() {
-            if remaining <= max_right_px {
-                start_idx = i;
-                break;
-            }
-            if i == last {
-                start_idx = i;
-                break;
-            }
-            remaining -= w;
-        }
-    }
-
-    let visible_total_w: f64 = right_widths_px[start_idx..].iter().sum();
+    let visible_total_w: f64 = visible_widths_px.iter().sum();
     let mut rx = (x + width - visible_total_w).max(cx);
     for (offset, seg) in bar.right_segments[start_idx..].iter().enumerate() {
         layout.set_text(&seg.text);
         apply_bold(layout, seg.bold);
-        let seg_w = right_widths_px[start_idx + offset];
+        let seg_w = visible_widths_px[offset];
 
         if let Some(ref id) = seg.action_id {
             regions.push(quadraui::StatusBarHitRegion {
