@@ -114,107 +114,118 @@ pub(super) fn render_activity_bar(
     _menu_bar_visible: bool,
     engine: &Engine,
 ) {
-    let bar_bg = rc(theme.tab_bar_bg);
-    let icon_fg = rc(theme.activity_bar_fg);
-    let accent_fg = rc(theme.cursor); // left-edge accent bar for active panel
-    let toolbar_sel_bg = rc(theme.cursor); // highlight for toolbar-focused selection
+    // A.6e: activity bar rendering delegates to the `quadraui::ActivityBar`
+    // primitive. Build the declarative state from TuiSidebar + Engine,
+    // then call `draw_activity_bar`.
+    let bar = build_activity_bar_primitive(sidebar, engine, theme);
+    super::quadraui_tui::draw_activity_bar(buf, area, &bar, theme);
+}
 
-    // Fill entire activity bar background
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', icon_fg, bar_bg);
-        }
-    }
+/// Build a `quadraui::ActivityBar` describing the current sidebar state.
+///
+/// Item ordering (matches the pre-migration layout):
+/// * Top: hamburger (menu) · explorer · search · debug · git · extensions
+///   · AI · dynamically-registered extension panels
+/// * Bottom: settings
+///
+/// Toolbar-keyboard selection indices are preserved:
+/// 0 = hamburger, 1-6 = fixed panels, 7 = settings, 8+ = extension panels.
+fn build_activity_bar_primitive(
+    sidebar: &TuiSidebar,
+    engine: &Engine,
+    theme: &Theme,
+) -> quadraui::ActivityBar {
+    let kbd_sel = |idx: u16| sidebar.toolbar_focused && sidebar.toolbar_selected == idx;
+    let active = |panel: TuiPanel| sidebar.visible && sidebar.active_panel == panel;
 
-    // Row 0: Hamburger icon (menu bar toggle)
-    if area.height >= 1 {
-        let y = area.y;
-        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == 0;
-        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
-        let fg = icon_fg;
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, row_bg);
-        }
-        if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, crate::icons::HAMBURGER.c(), fg, row_bg);
-        }
-    }
+    let mut top = Vec::new();
+    top.push(quadraui::ActivityItem {
+        id: quadraui::WidgetId::new("activity:menu"),
+        icon: crate::icons::HAMBURGER.c().to_string(),
+        tooltip: "Menu".to_string(),
+        is_active: false,
+        is_keyboard_selected: kbd_sel(0),
+    });
 
-    // Top buttons: Explorer (1), Search (2), Debug (3), Git (4), Extensions (5), AI (6)
-    let top_buttons: &[(u16, TuiPanel, char)] = &[
-        (1, TuiPanel::Explorer, crate::icons::EXPLORER.c()),
-        (2, TuiPanel::Search, crate::icons::SEARCH.c()),
-        (3, TuiPanel::Debug, crate::icons::DEBUG.c()),
-        (4, TuiPanel::Git, crate::icons::GIT_BRANCH.c()),
-        (5, TuiPanel::Extensions, crate::icons::EXTENSIONS.c()),
-        (6, TuiPanel::Ai, crate::icons::AI_CHAT.c()),
+    let fixed = [
+        (
+            1u16,
+            TuiPanel::Explorer,
+            crate::icons::EXPLORER.c(),
+            "Explorer",
+        ),
+        (2, TuiPanel::Search, crate::icons::SEARCH.c(), "Search"),
+        (3, TuiPanel::Debug, crate::icons::DEBUG.c(), "Debug"),
+        (
+            4,
+            TuiPanel::Git,
+            crate::icons::GIT_BRANCH.c(),
+            "Source Control",
+        ),
+        (
+            5,
+            TuiPanel::Extensions,
+            crate::icons::EXTENSIONS.c(),
+            "Extensions",
+        ),
+        (6, TuiPanel::Ai, crate::icons::AI_CHAT.c(), "AI Assistant"),
     ];
-
-    for &(row_off, panel, icon) in top_buttons {
-        let y = area.y + row_off;
-        if y >= area.y + area.height {
-            break;
-        }
-        let is_active = sidebar.visible && sidebar.active_panel == panel;
-        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == row_off;
-        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
-        let fg = icon_fg;
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, row_bg);
-        }
-        if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, icon, fg, row_bg);
-        }
-        if is_active && !is_kbd_sel {
-            // Left accent bar for active panel
-            set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
-        }
+    for (idx, panel, icon, tooltip) in fixed {
+        let id_str = match panel {
+            TuiPanel::Explorer => "activity:explorer",
+            TuiPanel::Search => "activity:search",
+            TuiPanel::Debug => "activity:debug",
+            TuiPanel::Git => "activity:git",
+            TuiPanel::Extensions => "activity:extensions",
+            TuiPanel::Ai => "activity:ai",
+            _ => "activity:unknown",
+        };
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(id_str),
+            icon: icon.to_string(),
+            tooltip: tooltip.to_string(),
+            is_active: active(panel),
+            is_keyboard_selected: kbd_sel(idx),
+        });
     }
 
-    // Extension panel icons (after the fixed 6 panels, starting at row 7)
-    {
-        let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
-        ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
-        for (i, panel) in ext_panels.iter().enumerate() {
-            let row_off = 7 + i as u16;
-            let y = area.y + row_off;
-            if y >= area.y + area.height.saturating_sub(1) {
-                break; // leave room for settings at bottom
-            }
-            let is_active =
-                sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sidebar.visible;
-            let toolbar_idx = 8 + i as u16; // 0=hamburger, 1-6=panels, 7=settings, 8+=ext
-            let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == toolbar_idx;
-            let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
-            let fg = icon_fg;
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, y, ' ', fg, row_bg);
-            }
-            if area.width >= 3 {
-                set_cell(buf, area.x + 1, y, panel.resolved_icon(), fg, row_bg);
-            }
-            if is_active && !is_kbd_sel {
-                set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
-            }
-        }
+    // Dynamic extension panels (sorted by name; toolbar indices 8+).
+    let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
+    ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
+    for (i, panel) in ext_panels.iter().enumerate() {
+        let toolbar_idx = 8 + i as u16;
+        let is_active = sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sidebar.visible;
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
+            icon: panel.resolved_icon().to_string(),
+            tooltip: panel.title.clone(),
+            is_active,
+            is_keyboard_selected: kbd_sel(toolbar_idx),
+        });
     }
 
-    // Settings button pinned to the bottom row (like VSCode)
-    if area.height >= 1 {
-        let y = area.y + area.height - 1;
-        let is_active = sidebar.visible && sidebar.active_panel == TuiPanel::Settings;
-        let is_kbd_sel = sidebar.toolbar_focused && sidebar.toolbar_selected == 7;
-        let row_bg = if is_kbd_sel { toolbar_sel_bg } else { bar_bg };
-        let fg = icon_fg;
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, row_bg);
-        }
-        if area.width >= 3 {
-            set_cell(buf, area.x + 1, y, crate::icons::SETTINGS.c(), fg, row_bg);
-        }
-        if is_active && !is_kbd_sel {
-            set_cell(buf, area.x, y, '▎', accent_fg, bar_bg);
-        }
+    let bottom = vec![quadraui::ActivityItem {
+        id: quadraui::WidgetId::new("activity:settings"),
+        icon: crate::icons::SETTINGS.c().to_string(),
+        tooltip: "Settings".to_string(),
+        is_active: active(TuiPanel::Settings),
+        is_keyboard_selected: kbd_sel(7),
+    }];
+
+    quadraui::ActivityBar {
+        id: quadraui::WidgetId::new("activity-bar"),
+        top_items: top,
+        bottom_items: bottom,
+        active_accent: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
+        selection_bg: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
     }
 }
 

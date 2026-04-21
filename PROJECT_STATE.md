@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 308 — A.6d: GTK `draw_tab_bar` migration) | **Tests:** 5242 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 17
+**Last updated:** Apr 20, 2026 (Session 309 — A.6e: `ActivityBar` primitive + TUI migration) | **Tests:** 5244 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 19
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,21 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 309 — Phase A.6e: `ActivityBar` primitive + TUI migration:**
+
+1. **Scope decision.** A.6 was originally planned with A.6e as a combined TUI + GTK slice. Looking at the GTK activity bar (a `gtk4::Box` with 7 native `gtk4::Button` widgets plus dynamic extension panels added via `insert_child_after`), migrating to a primitive-backed DrawingArea would be another A.2b-2-scale atomic rewrite (click + hover + tooltip + focus + dynamic rebuild). Extended the split pattern: A.6e is TUI-only; GTK lands as A.6f.
+2. **New primitive `quadraui::primitives::activity_bar`** — `ActivityBar { id, top_items, bottom_items, active_accent, selection_bg }`; `ActivityItem { id, icon, tooltip, is_active, is_keyboard_selected }`; `ActivityBarEvent` with `ItemClicked` + `KeyPressed`. Top items render from the top downward; bottom items pin to the bottom and win if the area is too small to fit both.
+3. **TUI `quadraui_tui::draw_activity_bar`** — one row per item, icon at `area.x + 1` (leaving the left column for the `▎` accent bar when active). Active-without-keyboard-selection gets the accent; keyboard-selected gets a full-row selection-bg fill that takes precedence over the accent. Matches the previous bespoke renderer exactly.
+4. **Tooltip field added but unused by TUI.** TUI has no hover UI at the character-cell level; the field is carried for the A.6f GTK migration where `set_tooltip_text` on each row will consume it.
+5. **`build_activity_bar_primitive` in `src/tui_main/panels.rs`** — builds the declarative state from `TuiSidebar` + `Engine` + theme. Preserves the existing keyboard-selection index mapping (0 = hamburger, 1-6 = fixed panels, 7 = settings, 8+ = dynamically-registered extension panels) so `toolbar_selected` bookkeeping in `mod.rs` is unchanged. Click resolution stays on the existing row-arithmetic path.
+6. **`TuiPanel` enum branch list made explicit.** The adapter's `match panel` has arms for all 6 real panels plus a `_` fallback. Rust's exhaustiveness check will flag new TuiPanel variants that need an icon + tooltip in the adapter.
+7. **2 new quadraui lib tests** — serde round-trip on `ActivityBar` (top + bottom items, accent + selection bg), `ActivityBarEvent` variants.
+8. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; clippy::needless_borrows flagged a `&format!(…)` → `format!(…)` simplification), full `cargo test --workspace --no-default-features` (5244/0/19, vimcode 5225 unchanged, quadraui 17→19), `cargo build` both configurations.
+9. **Net diff:** +260 / –100 lines across 5 files. `src/tui_main/panels.rs::render_activity_bar` shrinks from ~110 lines to ~10 plus a ~90-line adapter helper (most of the bulk is the `ActivityItem` construction for each of the 8 fixed + N dynamic rows).
+10. **Awaiting smoke test.** TUI activity bar should render identically: hamburger at top, Explorer/Search/Debug/Git/Extensions/AI rows, extension panel icons below, settings pinned at bottom, `▎` accent on active item, selection-bg fill on keyboard-focused item, no hover affordance (TUI doesn't track per-cell mouse hover).
+
+---
 
 **Session 308 — Phase A.6d: GTK `draw_tab_bar` migration:**
 

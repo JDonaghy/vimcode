@@ -1062,3 +1062,78 @@ pub(super) fn draw_tab_bar(
 
     tab_content_width
 }
+
+/// Draw a `quadraui::ActivityBar` as a vertical icon strip.
+///
+/// Top items render from the top edge downward, one row per item.
+/// Bottom items render from the bottom edge upward. If the two groups
+/// would overlap (area too small), bottom items win and top items are
+/// clipped. Each item occupies a single row (no row height beyond 1),
+/// and the icon is painted at `area.x + 1` to leave the left column
+/// free for the active-item accent bar `▎`.
+///
+/// Keyboard-selected items get a full-row selection-bg fill; active
+/// items get a left-edge accent bar (unless keyboard-selected, where
+/// the selection bg takes precedence).
+pub(super) fn draw_activity_bar(
+    buf: &mut Buffer,
+    area: Rect,
+    bar: &quadraui::ActivityBar,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let bar_bg = rc(theme.tab_bar_bg);
+    let icon_fg = rc(theme.activity_bar_fg);
+    let accent_fg = bar.active_accent.map(qc).unwrap_or(rc(theme.cursor));
+    let sel_bg = bar.selection_bg.map(qc).unwrap_or(rc(theme.cursor));
+
+    // Fill the entire strip with the bar background.
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', icon_fg, bar_bg);
+        }
+    }
+
+    let draw_row = |buf: &mut Buffer, y: u16, item: &quadraui::ActivityItem| {
+        let row_bg = if item.is_keyboard_selected {
+            sel_bg
+        } else {
+            bar_bg
+        };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, y, ' ', icon_fg, row_bg);
+        }
+        if area.width >= 3 {
+            let icon_ch = item.icon.chars().next().unwrap_or('?');
+            set_cell(buf, area.x + 1, y, icon_ch, icon_fg, row_bg);
+        }
+        if item.is_active && !item.is_keyboard_selected {
+            set_cell(buf, area.x, y, '\u{258E}', accent_fg, bar_bg); // ▎
+        }
+    };
+
+    // Bottom items take priority — compute how many will fit.
+    let bottom_rows_available = area.height as usize;
+    let bottom_count = bar.bottom_items.len().min(bottom_rows_available);
+    let top_rows_available = (area.height as usize).saturating_sub(bottom_count);
+
+    // Top items — draw from top, clipped.
+    for (i, item) in bar.top_items.iter().enumerate() {
+        if i >= top_rows_available {
+            break;
+        }
+        draw_row(buf, area.y + i as u16, item);
+    }
+
+    // Bottom items — draw from bottom upward.
+    for (i, item) in bar.bottom_items.iter().rev().enumerate() {
+        let y = area.y + area.height - 1 - i as u16;
+        if y < area.y {
+            break;
+        }
+        draw_row(buf, y, item);
+    }
+}
