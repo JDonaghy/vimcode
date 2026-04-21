@@ -116,16 +116,15 @@ pub(super) fn draw_tree(
             cursor_x += cw * 1.5;
         }
 
-        // Icon (optional).
-        if let Some(ref icon) = row.icon {
-            let glyph = if crate::icons::nerd_fonts_enabled() {
-                icon.glyph.as_str()
-            } else {
-                icon.fallback.as_str()
-            };
-            ctx.draw_text(glyph, cursor_x, y_off, def_fg);
-            cursor_x += ctx.mono_text_width(glyph) + cw * 0.5;
-        }
+        // Per-row icons (folder / file-type nerd glyphs) are intentionally
+        // skipped on Win-GUI until the backend gains a tree-sized icon
+        // IDWriteTextFormat (editor-font-size Nerd Font / Segoe MDL2 with
+        // left alignment). Drawing them through `ctx.draw_text` would use
+        // the mono editor font (typically Consolas), which has no Nerd
+        // Font glyphs — so nerd codepoints render as tofu and the ASCII
+        // fallbacks ("+", ".") look like accidental punctuation. Matches
+        // the pre-A.2c Win-GUI explorer (chevron + name only).
+        let _ = row.icon.as_ref();
 
         // Reserve space for the right-aligned badge so text truncation
         // doesn't overwrite it.
