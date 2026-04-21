@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 315 — A.2c: Win-GUI explorer migration) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
+**Last updated:** Apr 21, 2026 (Session 316 — docs + diff-view bug filed) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,16 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 316 — Documentation: status-bar notifications (closes #156); diff-view alignment bug filed (#166):**
+
+1. **README.md — new "Status-bar notifications" subsection** under the status-line area (just before the "Font" bullet). Documents the spinner-vs-bell indicator: animated Braille spinner (`⠋⠙⠹…`) in function color while in-progress, `󰂞` (Nerd Font) / `*` (ASCII) in string-literal color when done. Covers the three real triggers currently wired up — LSP/DAP server install, project-wide search, project-wide replace — with their actual in-progress and done messages. Calls out the 5-second auto-dismiss and click-to-dismiss behaviour. Notes that the spinner is not clickable (informational only).
+2. **Accuracy check:** the issue body listed `GitOperation`, `LspIndexing`, `ExtensionInstall` as triggers, but `grep` shows those `NotificationKind` variants are defined in the enum yet **never passed to `notify()`** in live code (only `LspInstall`, `ProjectSearch`, `ProjectReplace` are). Doc only describes what's real.
+3. **Issue #166 filed — side-by-side diff pane drift past the first hunk.** Root-cause analysis: `Engine::sync_scroll_binds()` (`src/core/engine/search.rs:277`) maps active→partner through `diff_aligned`, but then stores the partner's scroll as a **buffer line** rather than an **aligned-row index**. When the partner's aligned entry at the mapped index is a padding row, the fallback walks forward to the next real `source_line`, so the partner skips past padding the active keeps emitting. Every hunk compounds the drift. Fix sketches included: (1) treat `scroll_top` as an aligned-row index for diff-pair windows, (2) back `target_idx` up to the start of a padding run before translating to a buffer line, (3) render-side fallback that lands on the first aligned entry (padding) when multiple match a given `source_line`.
+4. **Path A (docs-only)** — README.md + PROJECT_STATE.md committed directly to `develop` per the CLAUDE.md documentation-only-change rule.
+5. **#34 (terminal maximize) is next** — Path B (branch + PR). Will land separately.
+
+---
 
 **Session 315 — Phase A.2c: Win-GUI explorer migration:**
 

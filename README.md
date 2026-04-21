@@ -822,6 +822,23 @@ All three GUI/TUI backends consume the same `ScreenLayout` abstraction from `ren
 
 **Per-window status line** — mode, filename, branch, filetype, indentation, encoding, line ending, Ln:Col, LSP status; clickable segments open pickers (language, indentation, line ending, branch); layout toggle icons (sidebar, terminal, menu bar) with Nerd Font glyphs or `[S]`/`[T]`/`[M]` fallbacks — dimmed when inactive
 
+**Status-bar notifications** — a single indicator on the right side of the status bar reports background-operation state, followed by a short message (truncated to 29 chars)
+
+| State | Icon | Color |
+|-------|------|-------|
+| In progress | animated Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) | function color |
+| Done | `󰂞` (Nerd Font) / `*` (ASCII fallback) | string-literal color |
+
+Triggers currently wired up:
+
+| User action | In-progress message | Done message |
+|-------------|--------------------|--------------|
+| Install an LSP/DAP server (Extensions panel `i`, or `:ExtInstall <name>`) | `Installing <binary>…` | `Install complete` / `Install failed` |
+| Project-wide search (search panel) | `Searching for "<query>"…` | `Search complete` |
+| Project-wide replace (search panel) | `Replacing "<query>" → "<replacement>"…` | `Replace complete` |
+
+Done notifications auto-dismiss after **5 seconds**. Click the bell to dismiss them immediately. The spinner is purely informational — clicking it does nothing.
+
 **Font** — configurable family and size via `settings.json`
 
 ---
