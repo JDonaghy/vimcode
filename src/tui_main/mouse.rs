@@ -2916,6 +2916,9 @@ fn status_segment_hit_test(
         status,
         quadraui::WidgetId::new("status:window"),
     );
-    let id = bar.resolve_click(click_col as u16, width)?;
+    // #159: dropped right segments (narrow bar) must not be clickable.
+    // Mirror the 2-cell gap used by quadraui_tui::draw_status_bar.
+    const MIN_GAP_CELLS: usize = 2;
+    let id = bar.resolve_click_fit_chars(click_col as u16, width, MIN_GAP_CELLS)?;
     crate::render::status_action_from_id(id.as_str())
 }

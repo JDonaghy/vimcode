@@ -1,5 +1,6 @@
 ---
 source: src/tui_main/render_impl.rs
+assertion_line: 4351
 expression: "lines.join(\"\\n\")"
 ---
  󰍜  1: [No Name] ×                                  󰤲   ⋯
@@ -12,5 +13,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-    VISUAL  [No Name]Spaces: 4 utf-8 LF  Ln 1, Col 11  󰘖  󰆍
+    VISUAL  [No Name]    󰘖 utf-8 LF Spaces: 4  Ln 1, Col 11
  

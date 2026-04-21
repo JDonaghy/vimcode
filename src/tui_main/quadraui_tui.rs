@@ -884,13 +884,18 @@ pub(super) fn draw_status_bar(
 
     draw_segments(buf, &bar.left_segments, area.x);
 
-    let right_width: u16 = bar
-        .right_segments
+    // #159: drop low-priority right segments from the front until they fit
+    // with a 2-cell gap. `right_segments` is ordered least-important first,
+    // most-important (cursor position) last — see render::build_window_status_line.
+    const MIN_GAP_CELLS: usize = 2;
+    let start = bar.fit_right_start_chars(area.width as usize, MIN_GAP_CELLS);
+    let visible_right = &bar.right_segments[start..];
+    let right_width: u16 = visible_right
         .iter()
         .map(|s| s.text.chars().count() as u16)
         .sum();
     let right_start = (area.x + area.width).saturating_sub(right_width);
-    draw_segments(buf, &bar.right_segments, right_start);
+    draw_segments(buf, visible_right, right_start);
 }
 
 /// Narrow hardcoded set of PUA glyphs that render as 2 cells in terminals

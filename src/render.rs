@@ -8354,77 +8354,25 @@ pub fn build_window_status_line(
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
 
-        // Right side: LSP  filetype  indent  utf-8  LF/CRLF  Ln:Col
+        // Right side — ordered least-important → most-important (left → right
+        // when right-aligned). Narrow bars drop from the front of this list,
+        // so cursor position (highest priority) stays at the right edge.
+        // See issue #159 for priority rationale.
+        //
+        // Drop order (least → most important):
+        //   notification · menu toggle · panel toggle · sidebar toggle ·
+        //   utf-8 · line ending · indent · filetype · LSP · cursor pos
         let mut right = Vec::new();
-        {
-            use crate::core::lsp_manager::LspStatus;
-            let (lsp_text, lsp_fg) = match &lsp_status {
-                LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
-                LspStatus::Initializing(name) => {
-                    let label = if name.is_empty() { "LSP" } else { name };
-                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
-                }
-                LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
-                LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
-                LspStatus::None => (None, bar_fg),
-            };
-            if let Some(text) = lsp_text {
-                right.push(StatusSegment {
-                    text,
-                    fg: lsp_fg,
-                    bg: bar_bg,
-                    bold: false,
-                    action: Some(StatusAction::LspInfo),
-                });
-            }
-        }
-        if !filetype.is_empty() {
-            right.push(StatusSegment {
-                text: format!("{} ", filetype),
-                fg: bar_fg,
-                bg: bar_bg,
-                bold: false,
-                action: Some(StatusAction::ChangeLanguage),
-            });
-        }
-        right.push(StatusSegment {
-            text: indent_text.clone(),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeIndentation),
-        });
-        right.push(StatusSegment {
-            text: "utf-8 ".to_string(),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeEncoding),
-        });
-        right.push(StatusSegment {
-            text: format!("{} ", line_ending_str),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeLineEnding),
-        });
-        if let Some(c) = cursor {
-            right.push(StatusSegment {
-                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
-                fg: bar_fg,
-                bg: bar_bg,
-                bold: false,
-                action: Some(StatusAction::GoToLine),
-            });
-        }
 
-        // Notification indicator — spinner for in-progress, bell for done
-        if !engine.notifications.is_empty() {
+        // Build each segment optionally; push at the end in priority order.
+        // (Segments whose data is absent simply stay None and aren't pushed.)
+
+        // Notification — spinner for in-progress, bell for done
+        let notification_seg = if !engine.notifications.is_empty() {
             let nf = crate::icons::nerd_fonts_enabled();
             let has_active = engine.has_active_notifications();
             let has_done = engine.has_done_notifications();
             let (icon, fg_color) = if has_active {
-                // Spinner icon for in-progress operations
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let elapsed = engine
                     .notifications
@@ -8435,16 +8383,14 @@ pub fn build_window_status_line(
                     .map(|t| t.elapsed().as_millis() as usize / 100)
                     .unwrap_or(0);
                 let frame = frames[elapsed % frames.len()];
-                (format!("{frame}"), theme.function) // use function color (blue-ish) for spinner
+                (format!("{frame}"), theme.function)
             } else if has_done {
-                // Bell icon for completed notifications
                 let bell: &str = if nf { "󰂞" } else { "*" };
-                (bell.to_string(), theme.string_lit) // use string color (green-ish) for done
+                (bell.to_string(), theme.string_lit)
             } else {
                 (String::new(), bar_fg)
             };
             if !icon.is_empty() {
-                // Show the most recent notification message (truncated)
                 let msg = engine
                     .notifications
                     .last()
@@ -8461,17 +8407,21 @@ pub fn build_window_status_line(
                 } else {
                     None
                 };
-                right.push(StatusSegment {
+                Some(StatusSegment {
                     text: format!(" {icon} {msg} "),
                     fg: fg_color,
                     bg: bar_bg,
                     bold: false,
                     action,
-                });
+                })
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        // Layout toggle buttons — dim when inactive, normal when active
+        // Layout toggle buttons
         let toggle_fg = |active: bool| {
             if active {
                 bar_fg
@@ -8479,36 +8429,121 @@ pub fn build_window_status_line(
                 theme.status_inactive_fg
             }
         };
-
         let nf = crate::icons::nerd_fonts_enabled();
 
-        let sidebar_active = engine.session.explorer_visible;
-        right.push(StatusSegment {
-            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
-            fg: toggle_fg(sidebar_active),
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ToggleSidebar),
-        });
-
-        let panel_active = engine.terminal_open || engine.bottom_panel_open;
-        right.push(StatusSegment {
-            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
-            fg: toggle_fg(panel_active),
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::TogglePanel),
-        });
-
-        if engine.menu_bar_toggleable {
-            let menu_active = engine.menu_bar_visible;
-            right.push(StatusSegment {
+        let menu_toggle_seg = if engine.menu_bar_toggleable {
+            Some(StatusSegment {
                 text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
-                fg: toggle_fg(menu_active),
+                fg: toggle_fg(engine.menu_bar_visible),
                 bg: bar_bg,
                 bold: false,
                 action: Some(StatusAction::ToggleMenuBar),
-            });
+            })
+        } else {
+            None
+        };
+
+        let panel_toggle_seg = StatusSegment {
+            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            fg: toggle_fg(engine.terminal_open || engine.bottom_panel_open),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::TogglePanel),
+        };
+
+        let sidebar_toggle_seg = StatusSegment {
+            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            fg: toggle_fg(engine.session.explorer_visible),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ToggleSidebar),
+        };
+
+        let encoding_seg = StatusSegment {
+            text: "utf-8 ".to_string(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeEncoding),
+        };
+
+        let line_ending_seg = StatusSegment {
+            text: format!("{} ", line_ending_str),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeLineEnding),
+        };
+
+        let indent_seg = StatusSegment {
+            text: indent_text.clone(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeIndentation),
+        };
+
+        let filetype_seg = if !filetype.is_empty() {
+            Some(StatusSegment {
+                text: format!("{} ", filetype),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::ChangeLanguage),
+            })
+        } else {
+            None
+        };
+
+        let lsp_seg = {
+            use crate::core::lsp_manager::LspStatus;
+            let (lsp_text, lsp_fg) = match &lsp_status {
+                LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
+                LspStatus::Initializing(name) => {
+                    let label = if name.is_empty() { "LSP" } else { name };
+                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
+                }
+                LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
+                LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
+                LspStatus::None => (None, bar_fg),
+            };
+            lsp_text.map(|text| StatusSegment {
+                text,
+                fg: lsp_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::LspInfo),
+            })
+        };
+
+        let cursor_seg = cursor.map(|c| StatusSegment {
+            text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::GoToLine),
+        });
+
+        // Push in priority order: least-important first.
+        if let Some(s) = notification_seg {
+            right.push(s);
+        }
+        if let Some(s) = menu_toggle_seg {
+            right.push(s);
+        }
+        right.push(panel_toggle_seg);
+        right.push(sidebar_toggle_seg);
+        right.push(encoding_seg);
+        right.push(line_ending_seg);
+        right.push(indent_seg);
+        if let Some(s) = filetype_seg {
+            right.push(s);
+        }
+        if let Some(s) = lsp_seg {
+            right.push(s);
+        }
+        if let Some(s) = cursor_seg {
+            right.push(s);
         }
 
         WindowStatusLine {

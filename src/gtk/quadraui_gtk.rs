@@ -1029,20 +1029,51 @@ pub(super) fn draw_status_bar(
     }
 
     // ── Right segments — right-aligned ──────────────────────────────────
-    let mut right_total_w = 0.0;
-    for seg in &bar.right_segments {
-        layout.set_text(&seg.text);
-        apply_bold(layout, seg.bold);
-        let (w_px, _) = layout.pixel_size();
-        right_total_w += w_px as f64;
+    //
+    // #159: drop low-priority right segments from the front until they fit
+    // with a ~16 px gap after the rightmost left segment. `right_segments`
+    // is ordered least-important first, most-important (cursor position)
+    // last — see `render::build_window_status_line`. The highest-priority
+    // segment is always kept, even if it alone overflows; #157's clip
+    // truncates visually in that edge case.
+    const MIN_GAP_PX: f64 = 16.0;
+    let right_widths_px: Vec<f64> = bar
+        .right_segments
+        .iter()
+        .map(|seg| {
+            layout.set_text(&seg.text);
+            apply_bold(layout, seg.bold);
+            let (w_px, _) = layout.pixel_size();
+            w_px as f64
+        })
+        .collect();
+    let right_total_w: f64 = right_widths_px.iter().sum();
+    let left_end_px = cx - x;
+    let max_right_px = (width - left_end_px - MIN_GAP_PX).max(0.0);
+
+    let mut start_idx = 0;
+    if !bar.right_segments.is_empty() && right_total_w > max_right_px {
+        let last = bar.right_segments.len() - 1;
+        let mut remaining = right_total_w;
+        for (i, w) in right_widths_px.iter().enumerate() {
+            if remaining <= max_right_px {
+                start_idx = i;
+                break;
+            }
+            if i == last {
+                start_idx = i;
+                break;
+            }
+            remaining -= w;
+        }
     }
 
-    let mut rx = (x + width - right_total_w).max(cx);
-    for seg in &bar.right_segments {
+    let visible_total_w: f64 = right_widths_px[start_idx..].iter().sum();
+    let mut rx = (x + width - visible_total_w).max(cx);
+    for (offset, seg) in bar.right_segments[start_idx..].iter().enumerate() {
         layout.set_text(&seg.text);
         apply_bold(layout, seg.bold);
-        let (w_px, _) = layout.pixel_size();
-        let seg_w = w_px as f64;
+        let seg_w = right_widths_px[start_idx + offset];
 
         if let Some(ref id) = seg.action_id {
             regions.push(quadraui::StatusBarHitRegion {
