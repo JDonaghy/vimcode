@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 311 — A.7 `Terminal` primitive + TUI + GTK migration)
+> **Last updated:** 2026-04-20 (Session 312 — A.8 `TextDisplay` primitive scaffolding; A.9 deferred)
 
 ---
 
@@ -49,8 +49,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.6e** — `ActivityBar` primitive + TUI migration | ✅ Done | `2c89dcf` | `quadraui-phase-a6e-activity-bar` | any (TUI) |
 | **Phase A.6f** — GTK ActivityBar native→DrawingArea migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6f-activity-bar-gtk` | Linux / macOS with GTK4 |
 | **Phase A.7** — `Terminal` primitive + TUI + GTK cell migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a7-terminal` | any |
-| Phase A.8 — `TextDisplay` | ⬜ Queued | — | `quadraui-phase-a8-*` | any |
-| Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Queued | — | `quadraui-phase-a9-*` | any — biggest stage |
+| **Phase A.8** — `TextDisplay` primitive scaffolding (no migration) | 🟡 Awaiting smoke test | — | `quadraui-phase-a8-text-display` | any |
+| Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
 | Phase B — extract & stabilise API | ⬜ Later | — | — | any |
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |

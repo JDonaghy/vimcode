@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 311 — A.7: `Terminal` primitive + TUI + GTK cell migration) | **Tests:** 5246 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 21
+**Last updated:** Apr 20, 2026 (Session 312 — A.8: `TextDisplay` primitive scaffolding; A.9 deferred) | **Tests:** 5249 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,19 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 312 — Phase A.8: `TextDisplay` primitive scaffolding (A.9 deferred):**
+
+1. **Strategic decision: A.9 deferred indefinitely.** A.9 (`TextEditor` + `BufferView` adapter) would be a mechanical refactor of vimcode's editor surface through quadraui — zero functional benefit to vimcode users, ~thousands of lines, highest regression risk. The primitive only matters for downstream apps that want to embed a code-editor widget (SQL client #46, k8s dashboard #145, Postman clone #147). Until those apps materialise, A.9 is technical debt with no near-term payoff. PLAN.md stage table marks it Deferred.
+2. **A.8 scope kept small.** No vimcode consumer of `TextDisplay` exists yet — AI chat streaming, project search results, find-replace results, etc. all work fine on existing scratch-buffer / List-primitive plumbing. A.8 ships scaffolding-only: primitive types + serde + 3 lib tests, no backend draw functions and no migration. First consumer (k8s pod-log viewer per #144, or LSP trace tail) drives the backend work as A.8b/A.8c.
+3. **New primitive `quadraui::primitives::text_display`** — `TextDisplay { id, lines, scroll_offset, auto_scroll, max_lines, has_focus }`, `TextDisplayLine { spans, decoration, timestamp }`, `TextDisplayEvent` (`Scrolled` / `AutoScrollToggled` / `Copied` / `KeyPressed`).
+4. **Streaming-friendly API on the primitive itself:** `TextDisplay::new(id)` constructor + `append_line(line)` + `clear()` + `set_max_lines(n)` helpers. `max_lines = 0` means unbounded; positive cap evicts oldest lines via `Vec::drain(..)` when exceeded, with `scroll_offset` adjusted so the visible region stays anchored. Supports the 10k-lines/sec target from #144 — the primitive's append is `Vec::push` + bounded eviction; cost is amortised `O(1)`. Whether the backends can render that fast is the actual benchmark question; deferred to when a backend exists.
+5. **3 new quadraui lib tests** — `append_line` + cap eviction + clear + scroll-offset adjustment, serde round-trip on the full primitive (with mixed decorations + timestamps + spans), `TextDisplayEvent` variants.
+6. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5249/0/19, vimcode 5225 unchanged, quadraui 21→24), `cargo build` both configurations.
+7. **Net diff:** +250 / –5 lines across 4 files. New `quadraui/src/primitives/text_display.rs` is ~115 lines including doc comments. Vimcode source untouched.
+8. **Quadraui v1 status.** With A.8 scaffolded, the crate now has 9 primitives: Tree, Form, Palette, List, StatusBar, TabBar, ActivityBar, Terminal, TextDisplay. Only `TextEditor` (A.9, deferred) is missing from the design doc's v1 list. The crate is "extracted enough" for vimcode; further work waits for downstream-app demand.
+
+---
 
 **Session 311 — Phase A.7: `Terminal` primitive + TUI + GTK cell migration:**
 
