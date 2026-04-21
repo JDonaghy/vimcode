@@ -961,6 +961,13 @@ pub(super) fn draw_status_bar(
     layout.set_width(-1);
     layout.set_ellipsize(pango::EllipsizeMode::None);
 
+    // #157: clip to the bar's rect so right-aligned segments that overflow
+    // the available width are truncated at the right edge instead of
+    // painting past it into the next window's tab bar / status row.
+    cr.save().ok();
+    cr.rectangle(x, y, width, line_height);
+    cr.clip();
+
     // Background fill: first segment's bg, else theme bg.
     let fill = bar
         .left_segments
@@ -1059,6 +1066,7 @@ pub(super) fn draw_status_bar(
     }
 
     layout.set_attributes(None);
+    cr.restore().ok();
 
     regions
 }
