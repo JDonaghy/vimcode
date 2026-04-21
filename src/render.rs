@@ -8484,6 +8484,41 @@ pub fn resolve_status_bar_click(
     None
 }
 
+// ─── quadraui::Terminal adapter (A.7) ────────────────────────────────────────
+
+/// Convert a vimcode `TerminalCell` row grid into a `quadraui::Terminal`
+/// snapshot. Used by both TUI (`render_terminal_pane_cells`) and GTK
+/// (`draw_terminal_cells`) so the per-cell rendering path is shared.
+///
+/// The conversion is a 1:1 mapping — render-side cells already carry the
+/// overlay flags (selected, is_cursor, is_find_match, is_find_active) the
+/// primitive expects.
+pub fn terminal_cells_to_quadraui(
+    rows: &[Vec<TerminalCell>],
+    id: quadraui::WidgetId,
+) -> quadraui::Terminal {
+    let cells = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| quadraui::TerminalCell {
+                    ch: c.ch,
+                    fg: quadraui::Color::rgb(c.fg.0, c.fg.1, c.fg.2),
+                    bg: quadraui::Color::rgb(c.bg.0, c.bg.1, c.bg.2),
+                    bold: c.bold,
+                    italic: c.italic,
+                    underline: c.underline,
+                    selected: c.selected,
+                    is_cursor: c.is_cursor,
+                    is_find_match: c.is_find_match,
+                    is_find_active: c.is_find_active,
+                })
+                .collect()
+        })
+        .collect();
+    quadraui::Terminal { id, cells }
+}
+
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
 
 /// Build a `quadraui::TabBar` primitive from the render-level tab args.

@@ -1137,3 +1137,58 @@ pub(super) fn draw_activity_bar(
         draw_row(buf, y, item);
     }
 }
+
+/// Draw one row of a `quadraui::Terminal` cell grid into a ratatui buffer.
+///
+/// `start_x` / `screen_row` are the destination cell coordinates;
+/// `max_cols` clips the row to the visible width. `theme` supplies
+/// fallback colours for find-match overlays — the cell's own `fg` / `bg`
+/// win for normal cells and cursor/selection (which use inverted colours).
+///
+/// Caller iterates rows externally so the per-row terminal panel
+/// decoration (gutter / focus bar / scroll padding) layers naturally.
+/// Building the full `quadraui::Terminal` primitive once per frame and
+/// dispatching here per row keeps allocations bounded — every cell is
+/// drawn from already-owned data.
+pub(super) fn draw_terminal_row(
+    buf: &mut Buffer,
+    row: &[quadraui::TerminalCell],
+    start_x: u16,
+    screen_row: u16,
+    max_cols: u16,
+    theme: &Theme,
+) {
+    for (col_idx, cell) in row.iter().enumerate() {
+        let x = start_x + col_idx as u16;
+        if x >= start_x + max_cols {
+            break;
+        }
+        let fg = qc(cell.fg);
+        let bg = qc(cell.bg);
+        let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
+            (bg, fg)
+        } else if cell.is_find_active {
+            (rc(theme.search_match_fg), rc(theme.search_current_match_bg))
+        } else if cell.is_find_match {
+            (rc(theme.search_match_fg), rc(theme.search_match_bg))
+        } else {
+            (fg, bg)
+        };
+        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+        let mut modifier = ratatui::style::Modifier::empty();
+        if cell.bold {
+            modifier |= ratatui::style::Modifier::BOLD;
+        }
+        if cell.italic {
+            modifier |= ratatui::style::Modifier::ITALIC;
+        }
+        if cell.underline {
+            modifier |= ratatui::style::Modifier::UNDERLINED;
+        }
+        if modifier.is_empty() {
+            set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
+        } else {
+            super::set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier, None);
+        }
+    }
+}

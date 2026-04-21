@@ -3890,6 +3890,10 @@ pub(super) fn draw_terminal_panel(
 }
 
 /// Draw a grid of terminal cells into a rectangular region.
+/// A.7: GTK terminal cell rendering delegates to
+/// `quadraui_gtk::draw_terminal_cells` via the shared adapter. External
+/// signature preserved so callers in `src/gtk/draw.rs` (split + single
+/// pane terminal rendering) are untouched.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_terminal_cells(
     cr: &Context,
@@ -3902,78 +3906,18 @@ pub(super) fn draw_terminal_cells(
     char_width: f64,
     theme: &Theme,
 ) {
-    for (row_idx, row) in rows.iter().enumerate() {
-        let row_y = content_y + row_idx as f64 * line_height;
-        let mut cell_x = x;
-        for cell in row {
-            if cell_x + char_width > x + cell_area_w {
-                break;
-            }
-            let (br, bg, bb) = cell.bg;
-            let (fr, fg2, fb) = cell.fg;
-
-            // Cell background
-            let (draw_br, draw_bg, draw_bb) = if cell.is_cursor {
-                // Cursor: inverted colors (white on normal bg)
-                (fr, fg2, fb)
-            } else if cell.is_find_active {
-                // Active find match: orange background
-                (255u8, 165u8, 0u8)
-            } else if cell.is_find_match {
-                // Other find matches: dark amber background
-                (100u8, 80u8, 20u8)
-            } else if cell.selected {
-                // Selection highlight (use theme selection color)
-                let (sr, sg, sb) = theme.selection.to_cairo();
-                ((sr * 255.0) as u8, (sg * 255.0) as u8, (sb * 255.0) as u8)
-            } else {
-                (br, bg, bb)
-            };
-            cr.set_source_rgb(
-                draw_br as f64 / 255.0,
-                draw_bg as f64 / 255.0,
-                draw_bb as f64 / 255.0,
-            );
-            cr.rectangle(cell_x, row_y, char_width, line_height);
-            cr.fill().ok();
-
-            // Cell foreground text
-            let ch_str = cell.ch.to_string();
-            if cell.ch != ' ' {
-                let (draw_fr, draw_fg, draw_fb) = if cell.is_cursor {
-                    (br, bg, bb) // inverted for cursor
-                } else if cell.is_find_active {
-                    (0u8, 0u8, 0u8) // black text on orange
-                } else {
-                    (fr, fg2, fb)
-                };
-                cr.set_source_rgb(
-                    draw_fr as f64 / 255.0,
-                    draw_fg as f64 / 255.0,
-                    draw_fb as f64 / 255.0,
-                );
-
-                // Apply bold/italic via Pango attributes if needed
-                let attrs = AttrList::new();
-                if cell.bold {
-                    attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-                }
-                if cell.italic {
-                    attrs.insert(pango::AttrInt::new_style(pango::Style::Italic));
-                }
-                if cell.underline {
-                    attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
-                }
-                layout.set_attributes(Some(&attrs));
-                layout.set_text(&ch_str);
-                cr.move_to(cell_x, row_y);
-                pangocairo::show_layout(cr, layout);
-                layout.set_attributes(None);
-            }
-
-            cell_x += char_width;
-        }
-    }
+    let term = render::terminal_cells_to_quadraui(rows, quadraui::WidgetId::new("terminal:gtk"));
+    super::quadraui_gtk::draw_terminal_cells(
+        cr,
+        layout,
+        &term,
+        x,
+        content_y,
+        cell_area_w,
+        line_height,
+        char_width,
+        theme,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

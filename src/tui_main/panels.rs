@@ -3832,6 +3832,19 @@ pub(super) fn render_terminal_panel(
         let half_w = panel.split_left_cols; // left-pane column count (may reflect drag state)
         let div_col = area.x + half_w;
 
+        // A.7: build both panes' `quadraui::Terminal` primitives once before
+        // the row loop. The per-row drawer reads from the primitive's owned
+        // cell vec; building once avoids N allocations per frame for an
+        // N-row terminal.
+        let left_term = render::terminal_cells_to_quadraui(
+            left_rows,
+            quadraui::WidgetId::new("terminal:split-left"),
+        );
+        let right_term = render::terminal_cells_to_quadraui(
+            &panel.rows,
+            quadraui::WidgetId::new("terminal:split-right"),
+        );
+
         for row_idx in 0..content_rows {
             let screen_row = area.y + 1 + row_idx as u16;
             if screen_row >= area.y + area.height {
@@ -3845,7 +3858,7 @@ pub(super) fn render_terminal_panel(
             }
 
             // Left pane cells.
-            render_terminal_pane_cells(buf, left_rows, area.x, screen_row, half_w, row_idx, theme);
+            render_terminal_pane_cells(buf, &left_term, area.x, screen_row, half_w, row_idx, theme);
 
             // Divider column.
             let div_fg = rc(theme.separator);
@@ -3854,7 +3867,7 @@ pub(super) fn render_terminal_panel(
             // Right pane cells.
             render_terminal_pane_cells(
                 buf,
-                &panel.rows,
+                &right_term,
                 div_col + 1,
                 screen_row,
                 half_w,
@@ -3883,6 +3896,8 @@ pub(super) fn render_terminal_panel(
 
     // ── Normal single-pane content rows ──────────────────────────────────────
     let cell_width = area.width.saturating_sub(1); // leave last col for scrollbar
+    let term =
+        render::terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"));
     for row_idx in 0..content_rows {
         let screen_row = area.y + 1 + row_idx as u16;
         if screen_row >= area.y + area.height {
@@ -3894,15 +3909,7 @@ pub(super) fn render_terminal_panel(
             set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
         }
 
-        render_terminal_pane_cells(
-            buf,
-            &panel.rows,
-            area.x,
-            screen_row,
-            cell_width,
-            row_idx,
-            theme,
-        );
+        render_terminal_pane_cells(buf, &term, area.x, screen_row, cell_width, row_idx, theme);
 
         // Scrollbar column — same colors as the editor scrollbar.
         let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
@@ -3924,48 +3931,25 @@ pub(super) fn render_terminal_panel(
 /// Render one row of terminal pane cells into a ratatui buffer.
 pub(super) fn render_terminal_pane_cells(
     buf: &mut ratatui::buffer::Buffer,
-    rows: &[Vec<render::TerminalCell>],
+    term: &quadraui::Terminal,
     start_x: u16,
     screen_row: u16,
     max_cols: u16,
     row_idx: usize,
     theme: &Theme,
 ) {
-    if row_idx >= rows.len() {
+    // A.7: dispatch into the `quadraui::Terminal` row drawer. The primitive
+    // is built once per terminal per frame in the caller (above), so this
+    // inner loop just walks pre-converted cells.
+    if row_idx >= term.cells.len() {
         return;
     }
-    let row = &rows[row_idx];
-    for (col_idx, cell) in row.iter().enumerate() {
-        let x = start_x + col_idx as u16;
-        if x >= start_x + max_cols {
-            break;
-        }
-        let fg = RColor::Rgb(cell.fg.0, cell.fg.1, cell.fg.2);
-        let bg = RColor::Rgb(cell.bg.0, cell.bg.1, cell.bg.2);
-        let (draw_fg, draw_bg) = if cell.is_cursor || cell.selected {
-            (bg, fg)
-        } else if cell.is_find_active {
-            (rc(theme.search_match_fg), rc(theme.search_current_match_bg))
-        } else if cell.is_find_match {
-            (rc(theme.search_match_fg), rc(theme.search_match_bg))
-        } else {
-            (fg, bg)
-        };
-        let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-        let mut modifier = Modifier::empty();
-        if cell.bold {
-            modifier |= Modifier::BOLD;
-        }
-        if cell.italic {
-            modifier |= Modifier::ITALIC;
-        }
-        if cell.underline {
-            modifier |= Modifier::UNDERLINED;
-        }
-        if modifier.is_empty() {
-            set_cell(buf, x, screen_row, ch, draw_fg, draw_bg);
-        } else {
-            set_cell_styled(buf, x, screen_row, ch, draw_fg, draw_bg, modifier, None);
-        }
-    }
+    super::quadraui_tui::draw_terminal_row(
+        buf,
+        &term.cells[row_idx],
+        start_x,
+        screen_row,
+        max_cols,
+        theme,
+    );
 }

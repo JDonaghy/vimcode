@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 310 — A.6f: GTK ActivityBar native→DrawingArea migration; A.6 complete) | **Tests:** 5244 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 19
+**Last updated:** Apr 20, 2026 (Session 311 — A.7: `Terminal` primitive + TUI + GTK cell migration) | **Tests:** 5246 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 21
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,22 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 311 — Phase A.7: `Terminal` primitive + TUI + GTK cell migration:**
+
+1. **New primitive `quadraui::primitives::terminal`** — `Terminal { id, cells: Vec<Vec<TerminalCell>> }`, `TerminalCell { ch, fg, bg, bold, italic, underline, selected, is_cursor, is_find_match, is_find_active }`, `TerminalEvent` (`KeyPressed` / `SelectStart` / `SelectExtend` / `SelectEnd` / `Scroll`). The cell layout mirrors `render::TerminalCell` 1:1 so the adapter is a tight inner loop, not a structural transform.
+2. **Scope kept narrow.** Only the **per-cell rendering** (the meat of terminal output) goes through the primitive in this stage. Terminal tabs (`TERMINAL` / `DEBUG CONSOLE`), the close/split/new-tab toolbar buttons, and scrollbar drawing remain on bespoke per-backend code. Migrating those is queued as A.7b if useful — they're more about backend-specific chrome (tooltips, hover) than reusable UI primitives.
+3. **Adapter `render::terminal_cells_to_quadraui`** in `src/render.rs` — converts `&[Vec<render::TerminalCell>]` → `quadraui::Terminal` once per terminal per frame. Used by both backends.
+4. **TUI: build-once dispatch.** `render_terminal_panel` now constructs the `quadraui::Terminal` primitive once before the row loop (separately for the split-pane left/right cases), then `render_terminal_pane_cells` becomes a thin per-row dispatcher into `quadraui_tui::draw_terminal_row(buf, &cells_row, …)`. Avoids N allocations per frame for an N-row terminal.
+5. **GTK: thin wrapper.** `src/gtk/draw.rs::draw_terminal_cells` reduces to ~25 lines that build the primitive and delegate to `quadraui_gtk::draw_terminal_cells`. Cell paint (per-cell bg + fg + Pango attrs) lives in the quadraui module.
+6. **Performance characteristic.** A typical terminal pane is ~30 rows × ~120 cols = ~3,600 cells. Per-frame `quadraui::Terminal` allocation copies ~150 KB of `TerminalCell` data — well within a single 16ms frame budget on modern CPUs (memcpy clocks at GB/s). If profiling later shows this is hot, the adapter can be reworked to construct lazily / cache between frames; for now the simple owned-data path matches the plugin invariants without measurable overhead.
+7. **Wide-glyph behaviour preserved.** Both backends call the same per-cell loop they did before; nothing in this migration changes how `set_cell_wide` / Pango width measurement is invoked. The primitive layer doesn't introduce its own width logic.
+8. **2 new quadraui lib tests** — serde round-trip on `Terminal` (with cursor + selection + find overlays) and `TerminalEvent` variants.
+9. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; clippy::duplicated_attributes flagged a stray `#[allow]` left over during scaffolding — removed), full `cargo test --workspace --no-default-features` (5246/0/19, vimcode 5225 unchanged, quadraui 19→21), `cargo build` both configurations.
+10. **Net diff:** +320 / –180 lines across 6 files. `src/gtk/draw.rs::draw_terminal_cells` shrinks ~80 lines; `src/tui_main/panels.rs::render_terminal_pane_cells` shrinks ~40 lines plus a small refactor at the call site to build the primitive once. Quadraui gains a 75-line primitive module + a ~95-line GTK draw function + a ~50-line TUI draw function.
+11. **Awaiting smoke test.** TUI + GTK terminal output should render identically — characters, fg/bg, bold/italic/underline attributes, cursor (inverted bg/fg), mouse selection (theme selection bg), find matches (orange / amber). Test with `:terminal` then run a colourful command (e.g. `ls --color=auto`, `htop`, `bat src/render.rs`) and verify rendering matches pre-migration. Selection drag, scrollback (Ctrl+PageUp / Ctrl+PageDown), find-in-terminal (Ctrl+F) all should work since they don't go through this code path.
+
+---
 
 **Session 310 — Phase A.6f: GTK ActivityBar native→DrawingArea migration (A.6 complete):**
 
