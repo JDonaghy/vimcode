@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 314 — A.1c: Win-GUI `draw_tree` + SC panel migration) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
+**Last updated:** Apr 20, 2026 (Session 315 — A.2c: Win-GUI explorer migration) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,69 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 315 — Phase A.2c: Win-GUI explorer migration:**
+
+1. **Last required Win-GUI quadraui stage done.** A.2c completes the
+   originally-required platform-specific stages (A.1b/A.1c/A.2b/A.2c).
+   Optional A.6*/A.7 Win-GUI parity stages remain queued under
+   "Win-GUI parity scope" in PLAN.md but are not blockers for the
+   wave.
+2. **Shared adapter promoted to `render.rs`.** `ExplorerRow` and
+   `explorer_to_tree_view()` move out of `src/gtk/explorer.rs` into
+   `src/render.rs` so both GTK and Win-GUI can call the same builder.
+   The adapter takes `(rows: &[ExplorerRow], scroll_top, selected,
+   has_focus, engine)` — backend-neutral. GTK's `ExplorerState` now
+   wraps the shared `render::ExplorerRow`; `src/gtk/explorer.rs`
+   retains the state type + tree-walk helpers but re-exports the
+   adapter's row shape.
+3. **Win-GUI bespoke explorer render deleted.** `src/win_gui/draw.rs::
+   draw_explorer_panel` shrinks from ~75 lines of hand-rolled per-row
+   Cairo-style drawing (indent math, expand-arrow glyphs, file-color
+   fg pick) down to a ~20-line wrapper: draw the "EXPLORER" header,
+   call `render::explorer_to_tree_view`, delegate to
+   `quadraui_win::draw_tree` (introduced in A.1c).
+4. **Parity boost as a side-effect.** The shared adapter pulls in git
+   status letters + LSP diagnostic badges per row (via
+   `engine.explorer_indicators()`) — things the old Win-GUI explorer
+   didn't display. The primitive's uniform `line_height` rows keep
+   the flat-row click-hit math `(row - 1)` intact; no changes needed
+   in `src/win_gui/mod.rs`.
+5. **EXPLORER header kept outside the primitive.** Same pattern as
+   A.1c's SC panel: the panel header is a bespoke row above the tree,
+   and the tree starts at `top + line_height` with full remaining
+   height. Lets the click-hit math "subtract 1 for the header" stay
+   unchanged from pre-migration.
+6. **`WinSidebar.rows` type changes.** Local `ExplorerRow` deleted in
+   `src/win_gui/mod.rs`; replaced with `use crate::render::
+   ExplorerRow;`. `build_rows()` + `collect_explorer_rows()` still
+   live locally (they construct the shared type).
+7. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy
+   --no-default-features -- -D warnings` clean; `cargo clippy
+   --features win-gui --no-default-features` shows only the 10
+   pre-existing `collapsible_match` warnings that Session 314 already
+   noted. Full `cargo test --workspace --no-default-features`:
+   5235/0/19 (identical to Session 314 baseline). `cargo build --bin
+   vimcode-win --features win-gui --no-default-features` succeeds.
+8. **Net diff:** ~+145 / –115 across 5 files. `src/render.rs` gains
+   ~110 lines (the new `ExplorerRow` type + adapter). `src/gtk/
+   explorer.rs` shrinks ~90 lines (local adapter removed, replaced
+   by a re-export + pointer comment). `src/gtk/mod.rs` call-site
+   updates to the new signature. `src/win_gui/mod.rs` swaps the
+   struct def for a `use`. `src/win_gui/draw.rs` shrinks on
+   `draw_explorer_panel`.
+9. **Awaiting smoke test on Windows.** Verify: EXPLORER header still
+   renders at the top of the panel with foreground text. Tree rows
+   show folder/file icons per extension (Nerd Font when available,
+   fallback "." otherwise). Git-modified files show an `M`/`A`/`D`/
+   `?` badge on the right edge; files with LSP errors show a red
+   count badge; warnings show a yellow count badge. Selected row
+   gets the `fuzzy_selected_bg` fill — same as the SC panel rows.
+   j/k/space/Enter navigation + click + double-click behaviour
+   unchanged (click math in `src/win_gui/mod.rs` is untouched).
+   Right-click context menu still fires on file / folder rows.
+
+---
 
 **Session 314 — Phase A.1c: Win-GUI `draw_tree` + SC panel migration (commit `25e94f8`):**
 

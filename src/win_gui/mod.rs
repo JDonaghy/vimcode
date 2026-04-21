@@ -106,14 +106,12 @@ enum SidebarPanel {
     Settings,
 }
 
-#[derive(Debug, Clone)]
-struct ExplorerRow {
-    depth: usize,
-    name: String,
-    path: PathBuf,
-    is_dir: bool,
-    is_expanded: bool,
-}
+// `ExplorerRow` lives in `crate::render` and is shared with the GTK
+// backend (`src/gtk/explorer.rs` re-exports it). Both backends drive
+// their own flat-row list, scroll state, and selection; the shared
+// `crate::render::explorer_to_tree_view` adapter builds the
+// `quadraui::TreeView` the primitive draw functions consume.
+use crate::render::ExplorerRow;
 
 struct WinSidebar {
     visible: bool,

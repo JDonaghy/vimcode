@@ -5496,6 +5496,120 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
     }
 }
 
+/// One visible row in the flat explorer file-tree list. Shared across all
+/// backends; each backend maintains its own `Vec<ExplorerRow>` alongside
+/// scroll / selection state and calls `explorer_to_tree_view` once per
+/// frame to build the `quadraui::TreeView` the shared `draw_tree`
+/// primitive consumes.
+#[derive(Debug, Clone)]
+pub struct ExplorerRow {
+    pub depth: usize,
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+}
+
+/// Adapt a flat explorer row list into a `quadraui::TreeView` for the
+/// shared `draw_tree` primitive. Each backend drives its own flat-row
+/// model (GTK via `ExplorerState`, Win-GUI via `WinSidebar`) and calls
+/// this adapter on every draw.
+///
+/// Overlays per-row git status letters and LSP diagnostic counts via
+/// `engine.explorer_indicators()` — the cached indicator map keyed by
+/// canonical path. Directories get a folder glyph; files get the
+/// extension-based icon from `icons::file_icon`.
+pub fn explorer_to_tree_view(
+    rows: &[ExplorerRow],
+    scroll_top: usize,
+    selected: usize,
+    has_focus: bool,
+    engine: &Engine,
+) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, Icon as QIcon, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let (git_statuses, diag_counts) = engine.explorer_indicators();
+
+    let mut out: Vec<TreeRow> = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+
+        let diag = diag_counts.get(&canon).copied();
+        let git_label = git_statuses.get(&canon).copied();
+
+        let decoration = match diag {
+            Some((e, _)) if e > 0 => Decoration::Error,
+            Some((_, w)) if w > 0 => Decoration::Warning,
+            _ if git_label.is_some() => Decoration::Modified,
+            _ => Decoration::Normal,
+        };
+
+        let badge = if let Some((errors, warnings)) = diag {
+            if errors > 0 {
+                Some(Badge::plain(if errors > 9 {
+                    "9+".to_string()
+                } else {
+                    errors.to_string()
+                }))
+            } else if warnings > 0 {
+                Some(Badge::plain(if warnings > 9 {
+                    "9+".to_string()
+                } else {
+                    warnings.to_string()
+                }))
+            } else {
+                git_label.map(|label| Badge::plain(label.to_string()))
+            }
+        } else {
+            git_label.map(|label| Badge::plain(label.to_string()))
+        };
+
+        let icon = if row.is_dir {
+            Some(QIcon::new(
+                icons::FOLDER.nerd.to_string(),
+                icons::FOLDER.fallback.to_string(),
+            ))
+        } else {
+            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let glyph = icons::file_icon(ext).to_string();
+            Some(QIcon::new(glyph, ".".to_string()))
+        };
+
+        out.push(TreeRow {
+            path: vec![row_idx as u16],
+            indent: row.depth as u16,
+            icon,
+            text: StyledText::plain(&row.name),
+            badge,
+            is_expanded: if row.is_dir {
+                Some(row.is_expanded)
+            } else {
+                None
+            },
+            decoration,
+        });
+    }
+
+    let selected_path = if selected < out.len() {
+        Some(vec![selected as u16])
+    } else {
+        None
+    };
+
+    TreeView {
+        id: WidgetId::new("explorer-tree"),
+        rows: out,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: scroll_top,
+        style: TreeStyle::default(),
+        has_focus,
+    }
+}
+
 /// Adapt the picker panel's `PickerPanel` render data into a generic
 /// `quadraui::Palette` for rendering through the shared primitive.
 ///

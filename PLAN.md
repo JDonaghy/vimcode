@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 314 — A.1c shipped: Win-GUI `draw_tree` + SC panel migration)
+> **Last updated:** 2026-04-20 (Session 315 — A.2c shipped: Win-GUI explorer migration)
 
 ---
 
@@ -32,7 +32,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.2a** — `TreeView` explorer (TUI) + `Decoration::Header` | ✅ Done | `1c4bbd7` | `quadraui-phase-a2a-*` | any (TUI) |
 | **Phase A.2b-1** — GTK explorer scaffolding (data model + draw function, inert) | ✅ Done | `e34a72f` | `quadraui-phase-a2b-*` | any (compiles on all platforms) |
 | **Phase A.2b-2** — GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`) | ✅ Done | `26ed4e9` | `issue-152-a2b2-switchover-gtk` | Linux / macOS with GTK4 |
-| **Phase A.2c** — Win-GUI explorer | ⬜ Queued | — | `quadraui-phase-a2c-*` | Windows |
+| **Phase A.2c** — Win-GUI explorer | ✅ Done | _pending_ | `quadraui-phase-a2c-explorer-win-gui` | Windows |
 | **Phase A.3a** — `Form` primitive + TUI `draw_form` | ✅ Done | `4a4b456` | `quadraui-phase-a3a-*` | any |
 | **Phase A.3b** — TUI settings panel uses `Form` | ✅ Done | `e708e43` | `quadraui-phase-a3b-*` | any |
 | **Phase A.3c** — GTK `draw_form` primitive (migration deferred) | ✅ Done | `3f34a03` | `quadraui-phase-a3c-*` | any |
@@ -56,14 +56,15 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
 
-A.2c needs a Windows machine (A.1c shipped in Session 314). **All
-Linux GTK migrations are now done** — A.1b, A.2b, A.3c-2, A.4b, A.5b
-shipped. A.2b was split
-into two sub-phases because the atomic switchover was a ~1500-line
-diff across the view! macro, the App struct, ~50 scattered `Msg`
-handlers, and a context-menu rewrite; the split kept smoke-test
-regressions bisectable. The remaining open quadraui stages (A.6–A.9)
-are platform-neutral.
+**All required platform-specific stages are now done.** A.1b/A.2b/
+A.3c-2/A.4b/A.5b shipped on Linux GTK; A.1c (Session 314) and A.2c
+(Session 315) shipped on Windows. A.2b was split into two sub-phases
+because the atomic switchover was a ~1500-line diff across the view!
+macro, the App struct, ~50 scattered `Msg` handlers, and a context-
+menu rewrite; the split kept smoke-test regressions bisectable. The
+remaining open quadraui stages (A.6–A.9) are platform-neutral, and
+the Win-GUI parity stages (A.6*–A.7 for Windows) are explicitly
+optional — see "Win-GUI parity scope" below.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)

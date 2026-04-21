@@ -2118,7 +2118,13 @@ impl SimpleComponent for App {
                 let h = da.height() as f64;
                 let state = state_d.borrow();
                 let has_focus = engine.explorer_has_focus;
-                let tree = explorer::explorer_to_tree_view(&state, has_focus, &engine);
+                let tree = crate::render::explorer_to_tree_view(
+                    &state.rows,
+                    state.scroll_top,
+                    state.selected,
+                    has_focus,
+                    &engine,
+                );
                 let sb_rect =
                     draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);
                 sb_rect_cell.set(sb_rect);

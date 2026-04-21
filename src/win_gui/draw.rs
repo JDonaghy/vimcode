@@ -2643,7 +2643,7 @@ impl<'a> DrawContext<'a> {
         } else {
             match sidebar.active_panel {
                 SidebarPanel::Explorer => {
-                    self.draw_explorer_panel(sidebar, panel_x, panel_w, panel_h, top);
+                    self.draw_explorer_panel(sidebar, panel_x, panel_w, panel_h, top, engine);
                 }
                 SidebarPanel::Git => self.draw_git_panel(screen, panel_x, panel_w, panel_h, top),
                 SidebarPanel::Debug => {
@@ -2673,74 +2673,39 @@ impl<'a> DrawContext<'a> {
         sidebar: &WinSidebar,
         panel_x: f32,
         panel_w: f32,
-        _rt_h: f32,
+        panel_h: f32,
         top: f32,
+        engine: &crate::core::engine::Engine,
     ) {
-        let sel_color = if sidebar.has_focus {
-            self.theme.sidebar_sel_bg
-        } else {
-            self.theme.sidebar_sel_bg_inactive
-        };
-        // Header
-        let header_y = top;
+        // Row 0: "EXPLORER" panel header (kept as a bespoke row to match
+        // the pre-migration Win-GUI layout; SC/Debug/etc. panels also
+        // render their own headers outside the primitive). The tree
+        // begins at `top + line_height`.
         self.draw_text(
             "EXPLORER",
             panel_x + self.char_width,
-            header_y,
+            top,
             self.theme.foreground,
         );
 
-        // File tree rows
+        // Phase A.2c: file-tree rows now render through the shared
+        // `quadraui::TreeView` primitive. The adapter
+        // (`render::explorer_to_tree_view`) overlays git-status letters
+        // and LSP diagnostic badges onto each row; `quadraui_win::
+        // draw_tree` rasterises the tree with uniform `line_height`
+        // rows (matching A.1c's SC panel cadence) so the flat-row
+        // click-hit math in `src/win_gui/mod.rs` — `(row - 1)` to skip
+        // the EXPLORER header — remains valid.
         let tree_start_y = top + self.line_height;
-        let max_rows = ((_rt_h - tree_start_y) / self.line_height).floor() as usize;
-
-        for (vis_idx, row) in sidebar
-            .rows
-            .iter()
-            .skip(sidebar.scroll_top)
-            .take(max_rows)
-            .enumerate()
-        {
-            let actual_idx = sidebar.scroll_top + vis_idx;
-            let y = tree_start_y + vis_idx as f32 * self.line_height;
-
-            // Selection highlight
-            if actual_idx == sidebar.selected {
-                let sel_bg = self.solid_brush(sel_color);
-                unsafe {
-                    self.rt
-                        .FillRectangle(&rect_f(panel_x, y, panel_w, self.line_height), &sel_bg);
-                }
-            }
-
-            // Indent + expand arrow
-            let indent_px = row.depth as f32 * self.char_width * 1.5;
-            let text_x = panel_x + self.char_width + indent_px;
-
-            if row.is_dir {
-                let arrow = if row.is_expanded {
-                    "\u{25BC}"
-                } else {
-                    "\u{25B6}"
-                };
-                self.draw_text(arrow, text_x, y, self.theme.line_number_fg);
-                // Dir name after arrow
-                self.draw_text(
-                    &row.name,
-                    text_x + self.char_width * 1.5,
-                    y,
-                    self.theme.foreground,
-                );
-            } else {
-                // File name (no arrow, offset by arrow width for alignment)
-                self.draw_text(
-                    &row.name,
-                    text_x + self.char_width * 1.5,
-                    y,
-                    self.theme.explorer_file_fg,
-                );
-            }
-        }
+        let tree_h = (panel_h - self.line_height).max(0.0);
+        let tree = crate::render::explorer_to_tree_view(
+            &sidebar.rows,
+            sidebar.scroll_top,
+            sidebar.selected,
+            sidebar.has_focus,
+            engine,
+        );
+        super::quadraui_win::draw_tree(self, panel_x, tree_start_y, panel_w, tree_h, &tree);
     }
 
     // ─── Git (Source Control) panel ─────────────────────────────────────────
