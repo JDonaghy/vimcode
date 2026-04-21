@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 312 — A.8 `TextDisplay` primitive scaffolding; A.9 deferred)
+> **Last updated:** 2026-04-20 (Session 313 — Win-GUI pickup prep; stage table refreshed)
 
 ---
 
@@ -47,10 +47,11 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.6c** — `TabBar` primitive + TUI migration | ✅ Done | `2196b27` | `quadraui-phase-a6c-tab-bar-tui` | any (TUI) |
 | **Phase A.6d** — GTK `draw_tab_bar` migration | ✅ Done | `e93b857` | `quadraui-phase-a6d-tab-bar-gtk` | Linux / macOS with GTK4 |
 | **Phase A.6e** — `ActivityBar` primitive + TUI migration | ✅ Done | `2c89dcf` | `quadraui-phase-a6e-activity-bar` | any (TUI) |
-| **Phase A.6f** — GTK ActivityBar native→DrawingArea migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6f-activity-bar-gtk` | Linux / macOS with GTK4 |
-| **Phase A.7** — `Terminal` primitive + TUI + GTK cell migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a7-terminal` | any |
-| **Phase A.8** — `TextDisplay` primitive scaffolding (no migration) | 🟡 Awaiting smoke test | — | `quadraui-phase-a8-text-display` | any |
+| **Phase A.6f** — GTK ActivityBar native→DrawingArea migration | ✅ Done | `4d494a1` | `quadraui-phase-a6f-activity-bar-gtk` | Linux / macOS with GTK4 |
+| **Phase A.7** — `Terminal` primitive + TUI + GTK cell migration | ✅ Done | `aab8668` | `quadraui-phase-a7-terminal` | any |
+| **Phase A.8** — `TextDisplay` primitive scaffolding (no migration) | ✅ Done | `ff6b13f` | `quadraui-phase-a8-text-display` | any |
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
+| **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
 | Phase B — extract & stabilise API | ⬜ Later | — | — | any |
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
@@ -498,6 +499,119 @@ Running: `.\target\debug\vimcode-win.exe` (or use `cargo run --bin vimcode-win -
 - NEVER run `cargo test` with `--features win-gui` (spawns real windows).
 - Clippy: `cargo clippy --features win-gui --no-default-features`.
 - Build the binary: `cargo build --bin vimcode-win --features win-gui --no-default-features`.
+
+---
+
+## Phase A.2c — Win-GUI explorer
+
+**Branch:** `quadraui-phase-a2c-explorer-win-gui` off `develop`.
+
+**Platform:** Windows (same toolchain as A.1c).
+
+**Scope:**
+
+1. After A.1c lands `quadraui_win::draw_tree`, the same primitive renders
+   the explorer panel. Pattern mirrors A.2b-1 + A.2b-2 (Linux GTK):
+   - Build an `ExplorerState` (rows + expanded set + selection + scroll
+     offset) on the Win-GUI App. The Linux side put this in
+     `src/gtk/explorer.rs`; the Win-GUI equivalent should live in
+     `src/win_gui/explorer.rs` (or be inlined if the App is small).
+   - Adapter `explorer_to_tree_view(state, has_focus, engine)` — port
+     from `src/gtk/explorer.rs`. The function is platform-agnostic
+     except for the `quadraui::TreeView` it returns; can be largely
+     copied.
+   - Replace whatever the Win-GUI explorer currently renders with a
+     `quadraui_win::draw_tree(...)` call into the shared explorer rect.
+2. Click handling: hit-test by row index (fixed row height per the
+   primitive). Wire to engine's `open_file` / `toggle_dir` etc. Mirror
+   the Linux pattern in `src/gtk/mod.rs::handle_explorer_da_click`.
+3. Keyboard: `j/k/h/l/Enter` → engine. Mirror
+   `src/gtk/mod.rs::handle_explorer_da_key`.
+4. Scroll: mouse wheel → fractional accumulator → row scroll. Mirror
+   Linux's `explorer_scroll_accum`.
+5. Per-row tooltip / right-click context menu: **deferred** (same as
+   the Linux A.2b-2 deferral). Restore later when needed.
+
+**Pre-flight reading (MANDATORY):**
+
+- [`src/gtk/explorer.rs`](src/gtk/explorer.rs) — Linux reference for the
+  state model + adapter. The shape ports near-verbatim.
+- [`src/gtk/draw.rs::draw_explorer_panel`](src/gtk/draw.rs) — Linux
+  reference for the draw-callback structure (build primitive, call
+  `quadraui_gtk::draw_tree`, overlay scrollbar).
+- [`src/gtk/mod.rs`](src/gtk/mod.rs) — search for
+  `handle_explorer_da_click` / `handle_explorer_da_key` /
+  `handle_explorer_da_right_click` for click + key + menu wiring.
+- [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) — §5
+  (click/draw geometry mismatch) is the most likely class of bug.
+
+**Smoke test:**
+
+- Launch `vimcode-win.exe` with the explorer panel open.
+- Tree of files / dirs renders with chevrons + icons + indent.
+- `j`/`k` navigates rows; `l`/Enter opens / toggles.
+- Mouse click selects + opens.
+- Scroll wheel scrolls.
+- Git indicators / diagnostics badges (if Win-GUI has them) render.
+- Multi-group editor layouts don't break.
+
+---
+
+## Win-GUI parity scope (optional, post-A.1c / A.2c)
+
+A.6 and A.7 added Linux-side StatusBar / TabBar / ActivityBar / Terminal
+primitives + migrations through quadraui. **Win-GUI was not migrated
+through any of those stages** — its bespoke renderers are unaffected
+and continue to work as before. Win-GUI is the "newest backend" per
+[`CLAUDE.md`](CLAUDE.md) and historically lags features.
+
+**You don't have to do these to "finish" the wave.** A.1c + A.2c are
+the only Windows stages tracked as required. Everything below is
+optional polish — landing them brings Win-GUI up to feature parity
+with the Linux GTK side and demonstrates that the quadraui primitives
+work across all three rendering backends (Direct2D, Cairo, ratatui).
+
+| Optional stage | Adds | Linux reference | Estimated size |
+|----------------|------|-----------------|----------------|
+| A.6b-win | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines |
+| A.6d-win | Win-GUI `quadraui_win::draw_tab_bar` | `src/gtk/quadraui_gtk.rs::draw_tab_bar` (~340 lines) | ~400 lines |
+| A.6f-win | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
+| A.7-win | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
+
+**Scope each as its own branch** following the established pattern
+(`quadraui-phase-a6b-status-bar-win`, etc.), one stage per commit,
+smoke test before merge.
+
+**Adapters are already shared.** All the `render::*_to_quadraui` builders
+(`window_status_line_to_status_bar`, `build_tab_bar_primitive`,
+`terminal_cells_to_quadraui`) live in `src/render.rs` and are platform-
+agnostic. Win-GUI just needs the `quadraui_win::draw_*` rasterisation
+functions and to call the existing adapters from its own draw paths.
+
+**Lessons learned in A.6 / A.7 that apply to Win-GUI:**
+
+- **Wide-glyph allowlist, not range check.** `is_nerd_wide` started as
+  a PUA range test and broke 6 snapshot tests. Specific glyphs are
+  rendered wide; others aren't. Hardcode the allowlist (currently
+  4 chars: F0932 SPLIT_RIGHT, F0143 DIFF_PREV, F0140 DIFF_NEXT,
+  F0233 DIFF_FOLD). Direct2D's text layout will need the same care —
+  measure each PUA glyph empirically before deciding.
+- **WidgetId-based action dispatch (A.6a precedent).** For StatusBar +
+  TabBar, the engine-side action enums (`StatusAction`,
+  `TabBarClickTarget`) are encoded as opaque `WidgetId` strings in
+  the primitive (e.g. `"status:goto_line"`, `"tab:diff_prev"`).
+  Decoder helpers (`render::status_action_from_id`,
+  `activity_id_to_panel`) live next to the encoders. Follow the same
+  pattern in Win-GUI's click handlers.
+- **Rendering vs interaction state split.** Hover / drag / focus are
+  per-frame backend state, not primitive state. Pass them as extra
+  parameters to the `draw_*` function alongside the primitive (e.g.
+  `hovered_close_tab: Option<usize>`, `hovered_idx: Option<usize>`).
+  Keeps the primitive plugin-friendly without bloating it.
+- **Build the primitive once per frame, not per row.** A.7's first
+  draft built the `quadraui::Terminal` per-row in a loop (huge waste).
+  Build once at the top of the render call, dispatch row-by-row from
+  the owned data. Same applies to `draw_tab_bar` etc.
 
 ---
 
