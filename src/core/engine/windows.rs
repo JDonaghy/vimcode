@@ -1802,6 +1802,26 @@ impl Engine {
         self.active_group = saved;
     }
 
+    /// Write a backend-computed `tab_scroll_offset` for `group_id`. Returns
+    /// `true` if the value actually changed — backend uses this to decide
+    /// whether to re-paint (pass 2) so the corrected offset reaches the
+    /// screen.
+    ///
+    /// Use this when the backend's per-tab measurement differs from
+    /// `tab_display_width` (which is char-cell based and tuned for TUI).
+    /// GTK / Win-GUI / macOS have pixel-based padding that doesn't map to
+    /// char units, so they compute their own offset via
+    /// `quadraui::TabBar::fit_active_scroll_offset` and write it here.
+    pub fn set_tab_scroll_offset(&mut self, group_id: GroupId, offset: usize) -> bool {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if g.tab_scroll_offset != offset {
+                g.tab_scroll_offset = offset;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Apply per-group tab bar widths (in char-cells) measured by the most
     /// recent draw, then re-check that every group's active tab is on-screen.
     /// Returns `true` iff any width or any `tab_scroll_offset` actually

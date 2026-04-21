@@ -23,7 +23,7 @@ pub(super) fn draw_editor(
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     mouse_pos: (f64, f64),
-    tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
+    tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -211,7 +211,7 @@ pub(super) fn draw_editor(
             } else {
                 None
             };
-            let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
+            let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
                 cr,
                 &layout,
                 &theme,
@@ -239,13 +239,13 @@ pub(super) fn draw_editor(
             }
             tab_visible_counts_out
                 .borrow_mut()
-                .push((gtb.group_id, vis_count));
+                .push((gtb.group_id, vis_count, correct_offset));
             cr.restore().ok();
         }
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
+        let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
             cr,
             &layout,
             &theme,
@@ -280,7 +280,7 @@ pub(super) fn draw_editor(
         }
         tab_visible_counts_out
             .borrow_mut()
-            .push((engine.active_group, vis_count));
+            .push((engine.active_group, vis_count, correct_offset));
     }
 
     // 4b. Draw breadcrumb bar(s) below tab bar(s)
@@ -858,6 +858,7 @@ pub(super) fn draw_tab_bar(
         info.split_btns,
         info.available_cols,
         info.action_btn,
+        info.correct_scroll_offset,
     )
 }
 

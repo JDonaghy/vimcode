@@ -79,13 +79,18 @@ type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
 /// Populated by draw_window_status_bar, consumed by click hit-testing.
 type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
 
-/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions, split_btn_widths, visible_tab_count).
+/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions,
+/// split_btn_widths, visible_tab_count, action_btn, correct_scroll_offset).
+/// `correct_scroll_offset` is the offset that would make the active tab
+/// visible given THIS frame's pixel measurements; the caller compares to
+/// the engine's stored value and triggers a repaint if they differ.
 type TabBarDrawResult = (
     Vec<(f64, f64)>,
     Option<(f64, f64, f64, f64, f64, f64)>,
     Option<(f64, f64)>,
     usize,
     Option<(f64, f64)>, // action menu button (start_x, end_x)
+    usize,              // correct_scroll_offset (per-group, in pixels-aware units)
 );
 
 struct App {
@@ -1880,8 +1885,9 @@ impl SimpleComponent for App {
         let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let status_segment_map_cell: Rc<RefCell<StatusSegmentMap>> =
             Rc::new(RefCell::new(HashMap::new()));
-        let tab_visible_counts_cell: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>> =
-            Rc::new(RefCell::new(Vec::new()));
+        let tab_visible_counts_cell: Rc<
+            RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>,
+        > = Rc::new(RefCell::new(Vec::new()));
         #[allow(clippy::type_complexity)]
         let nav_arrow_rects_cell: Rc<RefCell<(f64, f64, f64, f64, f64)>> =
             Rc::new(RefCell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
@@ -3469,35 +3475,49 @@ impl SimpleComponent for App {
                     // ── Pass 1: paint with current engine state ──────────────
                     do_paint();
 
-                    // ── Apply measured widths + ensure visibility (shared) ────
-                    let widths: Vec<(crate::core::window::GroupId, usize)> =
+                    // ── Apply pixel-correct scroll offsets per group ─────────
+                    // Each tuple is (group_id, available_cols, correct_offset).
+                    // available_cols is reported but unused for GTK because
+                    // the engine's char-based ensure_active_tab_visible
+                    // algorithm under-estimates GTK's per-tab pixel width
+                    // (label + tab_pad*2 + inner_gap + close + outer_gap)
+                    // by ~4 chars, which causes the active tab to land
+                    // off-screen. Instead the GTK draw_tab_bar computes the
+                    // correct offset using actual Pango pixel measurements
+                    // via quadraui::TabBar::fit_active_scroll_offset, and we
+                    // write it directly to the engine here.
+                    //
+                    // TUI/Win-GUI keep using post_draw_apply_widths because
+                    // their measurements use the same units as the engine.
+                    let reports: Vec<(crate::core::window::GroupId, usize, usize)> =
                         tab_vis_for_draw.borrow_mut().drain(..).collect();
-                    if !widths.is_empty() {
-                        let changed = engine_clone.borrow_mut().post_draw_apply_widths(&widths);
-
-                        // ── Pass 2: if state changed, repaint with fresh
-                        // scroll_offset — overdraws pass 1 in the same Cairo
-                        // context. Eliminates the one-frame lag GTK had with
-                        // the previous "schedule another draw via idle_add"
-                        // approach (which didn't fire during continuous
-                        // drag-resize because GTK's idle queue was starved
-                        // by resize events). Converges within this single
-                        // callback: pass 2 measures the same width and pushes
-                        // to the queue, but the next paint's apply detects
-                        // no change and skips pass 2.
-                        if changed {
-                            // Discard pass 1's queued widths — they're stale
-                            // now that we've applied them. Pass 2 will push
-                            // its own (which match the current engine state).
-                            tab_vis_for_draw.borrow_mut().clear();
-                            do_paint();
-                            // Drain pass 2's widths into engine so the next
-                            // paint sees a stable state and skips its own
-                            // pass 2.
-                            let widths2: Vec<_> = tab_vis_for_draw.borrow_mut().drain(..).collect();
-                            if !widths2.is_empty() {
-                                let _ = engine_clone.borrow_mut().post_draw_apply_widths(&widths2);
+                    let mut changed = false;
+                    {
+                        let mut engine = engine_clone.borrow_mut();
+                        for (gid, _available_cols, correct_offset) in &reports {
+                            if engine.set_tab_scroll_offset(*gid, *correct_offset) {
+                                changed = true;
                             }
+                        }
+                    }
+
+                    // ── Pass 2: if state changed, repaint with fresh
+                    // scroll_offset — overdraws pass 1 in the same Cairo
+                    // context. Eliminates the one-frame lag. Converges
+                    // within this single callback: pass 2 measures the
+                    // same widths and computes the same correct_offset,
+                    // which now matches the engine state, so set returns
+                    // false and we don't loop.
+                    if changed {
+                        tab_vis_for_draw.borrow_mut().clear();
+                        do_paint();
+                        // Drain pass 2's reports so the queue is empty for
+                        // the next paint (avoids stale widths sitting around).
+                        let reports2: Vec<(_, _, _)> =
+                            tab_vis_for_draw.borrow_mut().drain(..).collect();
+                        let mut engine = engine_clone.borrow_mut();
+                        for (gid, _available_cols, correct_offset) in &reports2 {
+                            engine.set_tab_scroll_offset(*gid, *correct_offset);
                         }
                     }
                 }));

@@ -1112,6 +1112,16 @@ pub(super) struct TabBarHitInfo {
     /// Tab-bar content width in **character columns** (not pixels).
     /// Used by the engine to compute how many tabs fit at a given font.
     pub available_cols: usize,
+    /// The `scroll_offset` that would make the active tab visible in this
+    /// frame, computed from actual Pango pixel measurements via
+    /// `quadraui::TabBar::fit_active_scroll_offset`. The caller compares
+    /// this to the engine's current `tab_scroll_offset` and triggers a
+    /// repaint if they differ — the engine's char-based algorithm
+    /// (`tab_display_width`) under-estimates GTK tab widths by ~4 chars
+    /// per tab (it doesn't account for `tab_pad` / `tab_inner_gap` /
+    /// close button), so without this correction the active tab can land
+    /// off-screen.
+    pub correct_scroll_offset: usize,
 }
 
 /// Draw a `quadraui::TabBar` into `(0, y_offset, width, tab_row_height)`
@@ -1183,6 +1193,41 @@ pub(super) fn draw_tab_bar(
     let tab_pad = 14.0;
     let tab_inner_gap = 10.0;
     let tab_outer_gap = 1.0;
+
+    // Pre-measure every tab's full slot width (label + padding + close
+    // button + outer gap) in pixels. We use this for two things: the
+    // per-tab paint loop below, AND for `fit_active_scroll_offset` which
+    // tells the caller whether the engine's `tab_scroll_offset` is
+    // off — see `TabBarHitInfo.correct_scroll_offset`.
+    let tab_slot_widths: Vec<f64> = bar
+        .tabs
+        .iter()
+        .map(|tab| {
+            if tab.is_preview {
+                layout.set_font_description(Some(&italic_font));
+            } else {
+                layout.set_font_description(Some(&normal_font));
+            }
+            layout.set_text(&tab.label);
+            let (name_w, _) = layout.pixel_size();
+            tab_pad + name_w as f64 + tab_inner_gap + close_w + tab_pad + tab_outer_gap
+        })
+        .collect();
+
+    // Compute the scroll offset that would make the active tab visible
+    // given THIS frame's actual pixel widths. The caller compares to
+    // bar.scroll_offset and triggers a repaint if they differ.
+    let active_idx = bar.tabs.iter().position(|t| t.is_active);
+    let correct_scroll_offset = if let Some(active) = active_idx {
+        quadraui::TabBar::fit_active_scroll_offset(
+            active,
+            bar.tabs.len(),
+            effective_tab_area as usize,
+            |i| tab_slot_widths[i] as usize,
+        )
+    } else {
+        bar.scroll_offset
+    };
 
     let mut x = 0.0_f64;
     for (tab_idx, tab) in bar.tabs.iter().enumerate().skip(bar.scroll_offset) {
@@ -1431,6 +1476,7 @@ pub(super) fn draw_tab_bar(
         split_btns: split_info,
         action_btn: action_info,
         available_cols,
+        correct_scroll_offset,
     }
 }
 
