@@ -3655,6 +3655,13 @@ impl SimpleComponent for App {
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
+        // Apply tab visible counts queued by the most recent draw before any
+        // engine logic runs. Without this, a Msg arriving between a draw and
+        // the next 20 Hz poll tick would see stale group.tab_bar_width, and
+        // ensure_active_tab_visible could land a newly-opened tab off-screen.
+        // See issue #158.
+        self.drain_tab_visible_counts();
+
         // Track if this is a scrollbar change to avoid syncing feedback loop
         let is_scrollbar_msg = matches!(
             &msg,
@@ -5106,18 +5113,27 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// Apply tab-bar visible-column counts that the most recent draw callback
+    /// pushed into `tab_visible_counts`. Idempotent: drains the queue.
+    /// Called both from the top of `update()` (so engine logic always sees
+    /// fresh widths) and from `handle_poll_tick` (belt-and-suspenders).
+    fn drain_tab_visible_counts(&mut self) {
+        let counts: Vec<(crate::core::window::GroupId, usize)> =
+            self.tab_visible_counts.borrow_mut().drain(..).collect();
+        if counts.is_empty() {
+            return;
+        }
+        let mut engine = self.engine.borrow_mut();
+        for (group_id, count) in counts {
+            engine.set_tab_visible_count(group_id, count);
+        }
+    }
+
     fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
         // Apply tab visible counts reported by the last draw callback.
-        {
-            let counts = self.tab_visible_counts.borrow().clone();
-            if !counts.is_empty() {
-                let mut engine = self.engine.borrow_mut();
-                for (group_id, count) in &counts {
-                    engine.set_tab_visible_count(*group_id, *count);
-                }
-                self.tab_visible_counts.borrow_mut().clear();
-            }
-        }
+        // (Already drained at the top of update() for #158, but kept here
+        // as a belt-and-suspenders for any path that bypasses update.)
+        self.drain_tab_visible_counts();
         // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
