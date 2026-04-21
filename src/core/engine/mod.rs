@@ -51,6 +51,10 @@ pub enum EngineAction {
     Error,
     /// Open the integrated terminal panel (UI layer provides correct cols/rows)
     OpenTerminal,
+    /// Toggle terminal panel maximize (fill editor area). UI layer provides the
+    /// total available rows; engine flips `terminal_maximized` + swaps
+    /// `session.terminal_panel_rows`.
+    ToggleTerminalMaximize,
     /// Run a command in a visible terminal pane (UI layer provides cols/rows).
     /// The string is the shell command to execute.
     RunInTerminal(String),
@@ -2874,6 +2878,13 @@ pub struct Engine {
     /// Zero means "use the pane's actual PTY column count".
     /// Set by `terminal_split_set_drag_cols`; cleared by `terminal_split_finalize_drag`.
     pub terminal_split_left_cols: u16,
+    /// Whether the terminal panel is maximized (covers full editor area). Transient —
+    /// not persisted across restarts; clicking the divider or toggling restores the
+    /// saved row count from `terminal_saved_rows`.
+    pub terminal_maximized: bool,
+    /// Row count to restore when un-maximizing. Only meaningful while
+    /// `terminal_maximized` is true.
+    pub terminal_saved_rows: u16,
 
     // --- Special marks (for '', '., '<, '>) ---
     /// Position before last jump (for '' and `` marks).
@@ -3423,6 +3434,8 @@ impl Engine {
             terminal_find_matches: Vec::new(),
             terminal_split: false,
             terminal_split_left_cols: 0,
+            terminal_maximized: false,
+            terminal_saved_rows: 0,
             menu_bar_visible: false,
             menu_bar_toggleable: false,
             menu_open_idx: None,

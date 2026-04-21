@@ -68,6 +68,12 @@ impl Engine {
             return EngineAction::OpenTerminal;
         }
 
+        // Handle :TerminalMaximize / :TerminalMax — toggle maximize on the
+        // terminal panel. Backend supplies the available-row count.
+        if cmd == "TerminalMaximize" || cmd == "TerminalMax" {
+            return EngineAction::ToggleTerminalMaximize;
+        }
+
         // Handle workspace / folder commands (both user-typed names and menu action strings)
         if cmd == "OpenFolder" || cmd == "open_folder_dialog" {
             return EngineAction::OpenFolderDialog;

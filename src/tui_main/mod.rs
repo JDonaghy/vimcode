@@ -2840,6 +2840,29 @@ fn event_loop(
                             continue;
                         }
 
+                        // Ctrl+Shift+T: toggle terminal maximize (panel fills editor area)
+                        if matches_tui_key(&pk.toggle_terminal_maximize, code, mods) {
+                            let size = terminal.size().ok();
+                            let screen_h = size.map(|s| s.height).unwrap_or(24);
+                            let cols = size.map(|s| s.width).unwrap_or(80);
+                            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                            // Layout: menu + editor_tab(1) + editor_content + qf + tab_bar(1) +
+                            //         header(1) + terminal_content + status(1) + cmd(1)
+                            // When maximized we collapse editor_content to 0, leaving 5 fixed
+                            // chrome rows plus menu + qf.
+                            let target_rows =
+                                screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                            engine.toggle_terminal_maximize(target_rows);
+                            if engine.terminal_panes.is_empty() {
+                                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                            } else {
+                                engine.terminal_resize(cols, engine.session.terminal_panel_rows);
+                            }
+                            needs_redraw = true;
+                            continue;
+                        }
+
                         // Ctrl+L: force full screen redraw (clears rendering artifacts)
                         if ctrl && matches!(code, KeyCode::Char('l') | KeyCode::Char('L')) {
                             terminal.clear().ok();
@@ -3521,6 +3544,21 @@ fn event_loop(
                         if action == EngineAction::OpenTerminal {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                            needs_redraw = true;
+                        } else if action == EngineAction::ToggleTerminalMaximize {
+                            let size = terminal.size().ok();
+                            let screen_h = size.map(|s| s.height).unwrap_or(24);
+                            let cols = size.map(|s| s.width).unwrap_or(80);
+                            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                            let target_rows =
+                                screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                            engine.toggle_terminal_maximize(target_rows);
+                            if engine.terminal_panes.is_empty() {
+                                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                            } else {
+                                engine.terminal_resize(cols, engine.session.terminal_panel_rows);
+                            }
                             needs_redraw = true;
                         } else if let EngineAction::RunInTerminal(cmd) = action {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
@@ -4218,6 +4256,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             false
         }
         EngineAction::OpenTerminal | EngineAction::RunInTerminal(_) => false, // TUI handles terminal open in main event loop
+        EngineAction::ToggleTerminalMaximize => false, // TUI handles in main event loop (needs viewport rows)
         EngineAction::OpenFolderDialog
         | EngineAction::OpenWorkspaceDialog
         | EngineAction::SaveWorkspaceAsDialog

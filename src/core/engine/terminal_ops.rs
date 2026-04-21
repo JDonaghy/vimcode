@@ -178,8 +178,40 @@ impl Engine {
 
     /// Hide the terminal panel but keep all PTY panes running.
     pub fn close_terminal(&mut self) {
+        if self.terminal_maximized {
+            self.session.terminal_panel_rows = self.terminal_saved_rows.max(5);
+            self.terminal_maximized = false;
+        }
         self.terminal_open = false;
         self.terminal_has_focus = false;
+    }
+
+    /// Toggle "terminal maximized" state.
+    ///
+    /// When maximizing, saves the current `terminal_panel_rows` and expands the
+    /// panel to `target_rows`. Opens the terminal panel if it's not already
+    /// visible, and grabs focus.
+    ///
+    /// When un-maximizing, restores the saved row count.
+    ///
+    /// `target_rows` is the desired *content* row count for the terminal panel
+    /// when maximized — the backend computes this from its own viewport
+    /// geometry (total screen rows minus status/cmd/menu/tab-bar/header).
+    /// A minimum of 5 is enforced.
+    pub fn toggle_terminal_maximize(&mut self, target_rows: u16) {
+        if self.terminal_maximized {
+            self.session.terminal_panel_rows = self.terminal_saved_rows.max(5);
+            self.terminal_maximized = false;
+        } else {
+            self.terminal_open = true;
+            self.terminal_has_focus = true;
+            self.terminal_saved_rows = self.session.terminal_panel_rows;
+            let maxed = target_rows.max(5);
+            if maxed > self.session.terminal_panel_rows {
+                self.session.terminal_panel_rows = maxed;
+            }
+            self.terminal_maximized = true;
+        }
     }
 
     /// Toggle the integrated terminal:

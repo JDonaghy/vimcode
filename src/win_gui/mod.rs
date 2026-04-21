@@ -1786,6 +1786,35 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
+        // ── Ctrl-Shift-T: toggle terminal maximize ───────────────────────
+        if ctrl && shift && !alt && (key.key_name == "t" || key.key_name == "T") {
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(state.hwnd, &mut rc);
+            }
+            let width = (rc.right - rc.left) as f32;
+            let height = (rc.bottom - rc.top) as f32;
+            let cols = ((width - state.sidebar.total_width()) / state.char_width) as u16;
+            let lh = state.line_height.max(1.0);
+            // Reserve 3 rows for panel tab-bar + header + status line chrome.
+            let total_rows = (height / lh).floor() as u16;
+            let target = total_rows.saturating_sub(3).max(5);
+            state.engine.toggle_terminal_maximize(target);
+            if state.engine.terminal_panes.is_empty() {
+                state
+                    .engine
+                    .terminal_new_tab(cols, state.engine.session.terminal_panel_rows);
+            } else {
+                state
+                    .engine
+                    .terminal_resize(cols, state.engine.session.terminal_panel_rows);
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(state.hwnd), None, false);
+            }
+            return false;
+        }
+
         // ── Terminal key routing (when terminal has focus) ───────────────
         if state.engine.terminal_has_focus && state.engine.terminal_open {
             // Escape returns focus to editor
@@ -4502,6 +4531,29 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                         state.engine.session.terminal_panel_rows,
                                     );
                                 }
+                                EngineAction::ToggleTerminalMaximize => {
+                                    let cols = (rw_px / cw).floor() as u16;
+                                    let lh = state.line_height.max(1.0);
+                                    let mut rc = RECT::default();
+                                    unsafe {
+                                        let _ = GetClientRect(state.hwnd, &mut rc);
+                                    }
+                                    let height = (rc.bottom - rc.top) as f32;
+                                    let total_rows = (height / lh).floor() as u16;
+                                    let target = total_rows.saturating_sub(3).max(5);
+                                    state.engine.toggle_terminal_maximize(target);
+                                    if state.engine.terminal_panes.is_empty() {
+                                        state.engine.terminal_new_tab(
+                                            cols,
+                                            state.engine.session.terminal_panel_rows,
+                                        );
+                                    } else {
+                                        state.engine.terminal_resize(
+                                            cols,
+                                            state.engine.session.terminal_panel_rows,
+                                        );
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -6070,6 +6122,26 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             let rows = engine.session.terminal_panel_rows;
             let cols = 80; // will be updated by layout calculation
             engine.terminal_new_tab(cols, rows);
+            false
+        }
+        EngineAction::ToggleTerminalMaximize => {
+            // The standalone dispatcher has no access to the Win32 client rect,
+            // so we fall back to a generous target derived from the current
+            // saved rows. The next WM_PAINT cycle (which owns the real window
+            // metrics) will trigger a redraw; the PTY is re-sized immediately.
+            let cols = 80;
+            let target = engine
+                .session
+                .terminal_panel_rows
+                .saturating_add(30)
+                .max(30);
+            engine.toggle_terminal_maximize(target);
+            let rows = engine.session.terminal_panel_rows;
+            if engine.terminal_panes.is_empty() {
+                engine.terminal_new_tab(cols, rows);
+            } else {
+                engine.terminal_resize(cols, rows);
+            }
             false
         }
         EngineAction::RunInTerminal(cmd) => {

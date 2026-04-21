@@ -116,9 +116,11 @@ Unified fuzzy picker (Telescope-style), command center, quickfix, and branch pic
 - `picker_request_workspace_symbols()` — send LSP workspace/symbol request
 - `fuzzy_filter_items()` — shared fuzzy filter helper
 
-## terminal_ops.rs — 478 lines
+## terminal_ops.rs — 525 lines
 Integrated terminal management.
 - `terminal_toggle()` — Ctrl-T show/hide terminal panel
+- `toggle_terminal_maximize(target_rows)` — Ctrl-Shift-T toggle maximize; saves/restores session.terminal_panel_rows via terminal_saved_rows
+- `close_terminal()` — hide panel; auto-restores saved rows if maximized
 - `terminal_new()` — create new terminal tab
 - `terminal_close(idx)` — close terminal tab
 - `terminal_write(data)` — send input to active terminal

@@ -443,8 +443,10 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 ### Integrated Terminal
 
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
+- `Ctrl-Shift-T` — toggle **terminal maximize**: the panel grows to fill the entire editor area. Press again to restore the previous height. Works in TUI and GTK (Win-GUI supports the binding but panel geometry may lag until the next repaint)
 - `:term` / `:terminal` — open a **new terminal tab** (always spawns a fresh shell, even if the panel is already open)
-- The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions
+- `:TerminalMaximize` / `:TerminalMax` — toggle maximize from the ex-command line
+- The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions. Closing the terminal while maximized restores the saved height
 - Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`; starts in the editor's working directory
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
 - **Multiple terminal tabs** — each tab runs an independent PTY; the toolbar shows `[1] [2] …` labels:
@@ -1148,6 +1150,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:EditorGroupClose` / `:egc` | Close active editor group |
 | `:EditorGroupFocus` / `:egf` | Toggle focus between editor groups |
 | `:EditorGroupMoveTab` / `:egmt` | Move current tab to other editor group |
+| `:TerminalMaximize` / `:TerminalMax` | Toggle terminal panel maximize (fill editor area) |
 | `:Plugin list` | List loaded plugins |
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |

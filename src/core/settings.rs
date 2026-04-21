@@ -531,6 +531,9 @@ fn pk_command_palette() -> String {
 fn pk_open_terminal() -> String {
     "<C-t>".to_string()
 }
+fn pk_toggle_terminal_maximize() -> String {
+    "<C-S-t>".to_string()
+}
 fn pk_add_cursor() -> String {
     "<A-d>".to_string()
 }
@@ -567,6 +570,9 @@ pub struct PanelKeys {
     /// Toggle integrated terminal panel. Default: `<C-t>`
     #[serde(default = "pk_open_terminal")]
     pub open_terminal: String,
+    /// Toggle terminal panel maximize (fill editor area). Default: `<C-S-t>`
+    #[serde(default = "pk_toggle_terminal_maximize")]
+    pub toggle_terminal_maximize: String,
     /// Add cursor at next match of word under cursor. Default: `<A-d>`
     #[serde(default = "pk_add_cursor")]
     pub add_cursor: String,
@@ -606,6 +612,7 @@ impl Default for PanelKeys {
             live_grep: pk_live_grep(),
             command_palette: pk_command_palette(),
             open_terminal: pk_open_terminal(),
+            toggle_terminal_maximize: pk_toggle_terminal_maximize(),
             add_cursor: pk_add_cursor(),
             select_all_matches: pk_select_all_matches(),
             split_editor_right: String::new(),

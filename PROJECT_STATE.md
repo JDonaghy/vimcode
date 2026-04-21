@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 21, 2026 (Session 316 — docs + diff-view bug filed) | **Tests:** 5235 total (full `cargo test --workspace --no-default-features`); vimcode 5211 + quadraui 24
+**Last updated:** Apr 21, 2026 (Session 317 — terminal maximize) | **Tests:** 5263 total (full `cargo test --workspace --no-default-features`); vimcode 5239 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,22 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 317 — Terminal maximize (closes #34):**
+
+1. **New Engine state:** `terminal_maximized: bool` + `terminal_saved_rows: u16` on Engine (transient — not persisted in `SessionState`). Initialised to false/0 in `Engine::new()`.
+2. **New method `Engine::toggle_terminal_maximize(target_rows: u16)`** in `src/core/engine/terminal_ops.rs`: on maximize saves `session.terminal_panel_rows` into `terminal_saved_rows`, grows the panel to `target_rows` (floor 5, only grows — never shrinks below current), opens the terminal if closed, grabs focus. On un-maximize restores the saved rows. The backend is responsible for computing `target_rows` from its own viewport geometry.
+3. **Auto-restore on close:** `close_terminal()` now clears `terminal_maximized` and restores `terminal_saved_rows` if maximize was active. Prevents a "stuck maximized" state after reopening the panel.
+4. **New ex command** `:TerminalMaximize` / `:TerminalMax` returns new `EngineAction::ToggleTerminalMaximize`. Backends compute viewport rows + forward the action to `toggle_terminal_maximize`.
+5. **New panel keybinding** `panel_keys.toggle_terminal_maximize` (default `<C-S-t>`, VSCode parity with "Maximize Panel Size"). Added to `Settings::PanelKeys` with `pk_toggle_terminal_maximize()` default. Three backends all bind it: TUI (main event loop, `matches_tui_key`), GTK (`Msg::ToggleTerminalMaximize` routed via `matches_gtk_key`), Win-GUI (inline `ctrl && shift && key.key_name == "t"` check in the Win32 keyboard dispatcher).
+6. **Viewport computation:** each backend computes target rows as `total_rows.saturating_sub(chrome).max(5)` where chrome reserves space for status + cmd + panel tab-bar + header. TUI uses the crossterm `terminal.size()`; GTK uses the DrawingArea height + `cached_line_height` via new `App::terminal_target_maximize_rows()`; Win-GUI uses `GetClientRect` + `state.line_height`.
+7. **PTY resize:** every maximize/unmaximize path calls `engine.terminal_resize(cols, new_rows)` (or `terminal_new_tab` if no pane exists) so the shell receives SIGWINCH and reflows.
+8. **6 new integration tests** in `tests/terminal_maximize.rs` cover: flag set + rows grown; unmaximize restores saved rows; target below saved keeps saved (monotone grow); close while maximized restores; ex command returns the correct `EngineAction`; minimum floor of 5 rows. Total workspace tests 5263 (vimcode 5239 + quadraui 24); baseline at branch-off was 5257.
+9. **Docs:** README "Integrated Terminal" section gained Ctrl-Shift-T + `:TerminalMaximize` bullets, plus a command-mode table row. Win-GUI caveat noted (binding works; the standalone fallback action handler may paint one frame behind the key-path handler because it lacks direct `GetClientRect` access).
+10. **Quality gates all pass:** `cargo fmt`, `cargo clippy --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --no-default-features`. Win-GUI code paths follow existing backend patterns; `cargo build --features win-gui` isn't buildable on Linux (`windows-future` crate incompat, pre-existing) so smoke-test on a Windows machine.
+11. **Path B landing.** Branch `issue-34-terminal-maximize` off develop; PR expected after smoke test.
+
+---
 
 **Session 316 — Documentation: status-bar notifications (closes #156); diff-view alignment bug filed (#166):**
 

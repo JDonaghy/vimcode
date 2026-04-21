@@ -625,6 +625,8 @@ enum Msg {
     },
     /// Toggle the integrated terminal panel open/closed.
     ToggleTerminal,
+    /// Toggle the "terminal maximized" state (panel fills editor area).
+    ToggleTerminalMaximize,
     /// Open a new terminal tab at a specific directory.
     OpenTerminalAt(PathBuf),
     /// Open a new terminal tab.
@@ -1378,6 +1380,11 @@ impl SimpleComponent for App {
                                     // Ctrl+T: toggle terminal (checked first so it works even when terminal has focus)
                                     if matches_gtk_key(&pk.open_terminal, key, modifier) {
                                         sender.input(Msg::ToggleTerminal);
+                                        return gtk4::glib::Propagation::Stop;
+                                    }
+                                    // Ctrl+Shift+T: toggle terminal maximize (panel fills editor area)
+                                    if matches_gtk_key(&pk.toggle_terminal_maximize, key, modifier) {
+                                        sender.input(Msg::ToggleTerminalMaximize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     // Terminal key routing: when terminal has focus, all keys
@@ -4152,6 +4159,7 @@ impl SimpleComponent for App {
                 self.handle_file_ops_msg(msg, &sender);
             }
             Msg::ToggleTerminal
+            | Msg::ToggleTerminalMaximize
             | Msg::OpenTerminalAt(_)
             | Msg::NewTerminalTab
             | Msg::RunCommandInTerminal(_)
@@ -4439,6 +4447,9 @@ impl App {
                 } else {
                     sender.input(Msg::NewTerminalTab);
                 }
+            }
+            EngineAction::ToggleTerminalMaximize => {
+                sender.input(Msg::ToggleTerminalMaximize);
             }
             EngineAction::RunInTerminal(cmd) => {
                 sender.input(Msg::RunCommandInTerminal(cmd));
@@ -7173,6 +7184,24 @@ impl App {
                     self.engine.borrow_mut().terminal_new_tab(cols, rows);
                 } else {
                     self.engine.borrow_mut().toggle_terminal();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ToggleTerminalMaximize => {
+                let target = self.terminal_target_maximize_rows();
+                let cols = self.terminal_cols();
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.toggle_terminal_maximize(target);
+                }
+                // Create a pane if none exists; otherwise resize the existing
+                // PTY to the new content rows.
+                let needs_new_tab = self.engine.borrow().terminal_panes.is_empty();
+                let new_rows = self.engine.borrow().session.terminal_panel_rows;
+                if needs_new_tab {
+                    self.engine.borrow_mut().terminal_new_tab(cols, new_rows);
+                } else {
+                    self.engine.borrow_mut().terminal_resize(cols, new_rows);
                 }
                 self.draw_needed.set(true);
             }
@@ -10007,6 +10036,23 @@ impl App {
             80
         }
         .max(40)
+    }
+
+    /// Compute the target terminal content rows when maximizing: how many rows
+    /// of the editor area (in line_height units) the terminal can occupy if the
+    /// editor itself shrinks to zero, leaving only the tab bar + header + status
+    /// + cmd line chrome. Falls back to 10 if the DrawingArea isn't ready.
+    fn terminal_target_maximize_rows(&self) -> u16 {
+        let lh = self.cached_line_height.max(1.0);
+        if let Some(da) = self.drawing_area.borrow().as_ref() {
+            let da_h = da.height() as f64;
+            // DrawingArea excludes the always-on status + cmd bars. Reserve 3
+            // rows inside it for editor-tab + panel tab-bar + panel header.
+            let total = (da_h / lh).floor() as u16;
+            total.saturating_sub(3).max(5)
+        } else {
+            10
+        }
     }
 }
 
