@@ -1273,14 +1273,13 @@ fn event_loop(
                     }
                 })
                 .expect("draw frame");
-            // Report available tab bar width (in columns) back to the engine
-            // so that ensure_active_tab_visible() can compute how many tabs fit.
-            for (gid, width_cols) in &tab_visible_counts {
-                engine.set_tab_visible_count(*gid, *width_cols);
-            }
-            // After updating counts (e.g. after a terminal resize), re-check
-            // that every group's active tab is still visible.
-            engine.ensure_all_groups_tabs_visible();
+            // Apply per-group tab bar widths measured by the just-completed
+            // draw and re-check that every group's active tab is on-screen.
+            // Shared across all backends — see Engine::post_draw_apply_widths.
+            // TUI's main loop redraws frequently enough that we ignore the
+            // returned "changed" flag (any state change will be picked up by
+            // the next iteration's redraw).
+            let _ = engine.post_draw_apply_widths(&tab_visible_counts);
 
             // Set terminal cursor shape to match mode / pending key.
             let cursor_style = if !sidebar.has_focus && engine.pending_key == Some('r') {

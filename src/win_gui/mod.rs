@@ -1276,16 +1276,25 @@ fn on_paint(hwnd: HWND) {
             let _ = rt.EndDraw(None, None);
         }
 
-        // Report tab bar widths to engine so ensure_active_tab_visible() works.
-        // Convert pixel width to approximate character columns (matching
-        // tab_display_width's character-based calculation in the engine).
+        // Apply per-group tab bar widths measured by the just-completed
+        // draw and re-check that every group's active tab is on-screen.
+        // Shared across all backends — see Engine::post_draw_apply_widths.
+        // Win-GUI's paint loop redraws on every WM_PAINT, so we ignore the
+        // returned "changed" flag (any state change will be picked up by
+        // the next invalidation).
         if let Some(ref split) = screen.editor_group_split {
             let cw = state.char_width.max(1.0);
-            for gtb in &split.group_tab_bars {
-                let width_cols = (gtb.bounds.width as f32 / cw).floor() as usize;
-                state.engine.set_tab_visible_count(gtb.group_id, width_cols);
-            }
-            state.engine.ensure_all_groups_tabs_visible();
+            let widths: Vec<(crate::core::window::GroupId, usize)> = split
+                .group_tab_bars
+                .iter()
+                .map(|gtb| {
+                    (
+                        gtb.group_id,
+                        (gtb.bounds.width as f32 / cw).floor() as usize,
+                    )
+                })
+                .collect();
+            let _ = state.engine.post_draw_apply_widths(&widths);
         }
 
         // Cache popup rects for mouse hit-testing

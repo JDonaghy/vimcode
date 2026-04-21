@@ -16782,6 +16782,79 @@ fn test_tab_scroll_offset_pulls_back_when_room() {
 }
 
 #[test]
+fn test_post_draw_apply_widths_reports_changes() {
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+
+    // First call with a fresh width must report change (tab_bar_width
+    // defaults to usize::MAX, so any reported value differs).
+    let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
+    assert!(
+        changed,
+        "first apply with new width should report change so backend redraws"
+    );
+
+    // Second call with the same width is idempotent — must report no change
+    // so backends don't trigger redraw loops every frame.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
+    assert!(
+        !changed,
+        "no-op apply must report no change to avoid redraw loops"
+    );
+
+    // Different width reports change.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 60)]);
+    assert!(changed, "width change must be reported");
+}
+
+#[test]
+fn test_post_draw_apply_widths_detects_scroll_change() {
+    // Even when widths are unchanged, if ensure_active_tab_visible would
+    // recompute scroll_offset (e.g. because the active tab moved), the
+    // method must report change. Otherwise GTK's "queue redraw if changed"
+    // check would miss the corrected offset.
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+
+    // Set width to fit only ~4 tabs (each "[No Name]" is ~18 cols).
+    engine.post_draw_apply_widths(&[(group_id, 72)]);
+
+    // Open 6 tabs. The last new_tab() call sets active=5 and runs
+    // ensure_active_tab_visible internally, which will set a non-zero
+    // scroll_offset.
+    for _ in 0..5 {
+        engine.new_tab(None);
+    }
+    let scroll_after_open = engine
+        .editor_groups
+        .get(&group_id)
+        .unwrap()
+        .tab_scroll_offset;
+    assert!(
+        scroll_after_open > 0,
+        "test setup: 6 tabs in a 4-tab-wide bar should have non-zero scroll"
+    );
+
+    // Manually move active back to tab 0 without calling ensure. Now the
+    // engine state is "stale" — ensure should pull scroll_offset back to 0.
+    engine.editor_groups.get_mut(&group_id).unwrap().active_tab = 0;
+    let changed = engine.post_draw_apply_widths(&[(group_id, 72)]);
+    assert!(
+        changed,
+        "scroll_offset change (from ensure) must be reported even when width is unchanged"
+    );
+    assert_eq!(
+        engine
+            .editor_groups
+            .get(&group_id)
+            .unwrap()
+            .tab_scroll_offset,
+        0,
+        "after ensure with active=0, scroll_offset should pull back to 0"
+    );
+}
+
+#[test]
 fn test_new_tab_visible_in_small_group() {
     let mut engine = Engine::new();
 

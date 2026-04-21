@@ -1802,6 +1802,53 @@ impl Engine {
         self.active_group = saved;
     }
 
+    /// Apply per-group tab bar widths (in char-cells) measured by the most
+    /// recent draw, then re-check that every group's active tab is on-screen.
+    /// Returns `true` iff any width or any `tab_scroll_offset` actually
+    /// changed — when true, the calling backend should trigger one more
+    /// draw cycle so the corrected scroll offset reaches the screen.
+    ///
+    /// **This is the single contract every UI backend must call after each
+    /// completed paint** to maintain the "active tab visible" invariant.
+    /// Skipping it after a draw is a bug — the active tab may land off-screen
+    /// after layout changes (window resize, sidebar toggle, new file open)
+    /// and stay there until something else triggers a draw.
+    ///
+    /// Where each backend calls it:
+    /// - **TUI** (`tui_main/mod.rs`): inline after `terminal.draw(...)`.
+    /// - **Win-GUI** (`win_gui/mod.rs`): inline after `EndDraw`.
+    /// - **GTK** (`gtk/mod.rs`): inside the `set_draw_func` closure after
+    ///   the immutable engine borrow is dropped. If the call returns true,
+    ///   schedule one more draw via `glib::idle_add_local_once(|| da.queue_draw())`
+    ///   — that's the GTK equivalent of TUI/Win-GUI re-running the paint
+    ///   loop, deferred by one idle tick because GTK's borrow rules don't
+    ///   allow a synchronous re-render from inside a draw callback.
+    ///
+    /// The width/scroll change-tracking lets backends avoid an unconditional
+    /// extra paint per frame; the feedback loop converges in ≤2 frames
+    /// because the second draw measures the same width and reports no change.
+    pub fn post_draw_apply_widths(&mut self, widths: &[(GroupId, usize)]) -> bool {
+        let mut changed = false;
+        for &(gid, width) in widths {
+            let before = self.editor_groups.get(&gid).map(|g| g.tab_bar_width);
+            self.set_tab_visible_count(gid, width);
+            if before != self.editor_groups.get(&gid).map(|g| g.tab_bar_width) {
+                changed = true;
+            }
+        }
+        let scrolls_before: std::collections::HashMap<GroupId, usize> = self
+            .editor_groups
+            .iter()
+            .map(|(&gid, g)| (gid, g.tab_scroll_offset))
+            .collect();
+        self.ensure_all_groups_tabs_visible();
+        let scroll_changed = self
+            .editor_groups
+            .iter()
+            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
+        changed || scroll_changed
+    }
+
     // =======================================================================
     // Editor group management (VSCode-style split panes)
     // =======================================================================

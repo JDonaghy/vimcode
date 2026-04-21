@@ -203,8 +203,6 @@ struct App {
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
-    /// Tab visible counts reported by draw callback, applied to engine in tick handler.
-    tab_visible_counts: Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -2001,7 +1999,6 @@ impl SimpleComponent for App {
             action_btn_map: action_btn_map_cell.clone(),
             status_segment_map: status_segment_map_cell.clone(),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
-            tab_visible_counts: tab_visible_counts_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -3439,31 +3436,56 @@ impl SimpleComponent for App {
         let status_seg_for_draw = model.status_segment_map.clone();
         widgets
             .drawing_area
-            .set_draw_func(move |_, cr, width, height| {
+            .set_draw_func(move |da, cr, width, height| {
                 // Wrap in catch_unwind to prevent GTK abort on panic in extern "C" callback.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let engine = engine_clone.borrow();
-                    draw_editor(
-                        cr,
-                        &engine,
-                        width,
-                        height,
-                        &sender_for_draw,
-                        h_sb_hovered_for_draw.get(),
-                        tab_close_hover_for_draw.get(),
-                        h_sb_drag_for_draw.get(),
-                        &last_metrics_for_draw,
-                        &tab_slots_for_draw,
-                        &diff_btn_for_draw,
-                        &split_btn_for_draw,
-                        &action_btn_for_draw,
-                        &dialog_btn_for_draw,
-                        &editor_hover_rect_for_draw,
-                        &editor_hover_links_for_draw,
-                        mouse_pos_for_draw.get(),
-                        &tab_vis_for_draw,
-                        &status_seg_for_draw,
-                    );
+                    // ── Phase 1: paint (immutable engine borrow) ──────────────
+                    {
+                        let engine = engine_clone.borrow();
+                        draw_editor(
+                            cr,
+                            &engine,
+                            width,
+                            height,
+                            &sender_for_draw,
+                            h_sb_hovered_for_draw.get(),
+                            tab_close_hover_for_draw.get(),
+                            h_sb_drag_for_draw.get(),
+                            &last_metrics_for_draw,
+                            &tab_slots_for_draw,
+                            &diff_btn_for_draw,
+                            &split_btn_for_draw,
+                            &action_btn_for_draw,
+                            &dialog_btn_for_draw,
+                            &editor_hover_rect_for_draw,
+                            &editor_hover_links_for_draw,
+                            mouse_pos_for_draw.get(),
+                            &tab_vis_for_draw,
+                            &status_seg_for_draw,
+                        );
+                    }
+                    // Engine borrow dropped here.
+
+                    // ── Phase 2: post-draw apply + ensure (shared with TUI/Win-GUI) ──
+                    // GTK can't do this inline during draw because the engine
+                    // is immutably borrowed above. By doing it AFTER the draw
+                    // (still inside the same set_draw_func callback), we get
+                    // the same "every paint is followed by apply+ensure"
+                    // invariant TUI and Win-GUI maintain. If anything changed,
+                    // schedule one more draw via idle_add — that's the GTK
+                    // equivalent of TUI/Win-GUI's loop-back. Converges in
+                    // ≤2 frames since the second draw measures the same width.
+                    let widths: Vec<(crate::core::window::GroupId, usize)> =
+                        tab_vis_for_draw.borrow_mut().drain(..).collect();
+                    if !widths.is_empty() {
+                        let changed = engine_clone.borrow_mut().post_draw_apply_widths(&widths);
+                        if changed {
+                            let da_clone = da.clone();
+                            gtk4::glib::idle_add_local_once(move || {
+                                da_clone.queue_draw();
+                            });
+                        }
+                    }
                 }));
                 if let Err(e) = result {
                     eprintln!("draw_editor panic: {:?}", e);
@@ -3655,13 +3677,6 @@ impl SimpleComponent for App {
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
-        // Apply tab visible counts queued by the most recent draw before any
-        // engine logic runs. Without this, a Msg arriving between a draw and
-        // the next 20 Hz poll tick would see stale group.tab_bar_width, and
-        // ensure_active_tab_visible could land a newly-opened tab off-screen.
-        // See issue #158.
-        self.drain_tab_visible_counts();
-
         // Track if this is a scrollbar change to avoid syncing feedback loop
         let is_scrollbar_msg = matches!(
             &msg,
@@ -5113,63 +5128,7 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Apply tab-bar visible-column counts that the most recent draw callback
-    /// pushed into `tab_visible_counts`, then re-check that every group's
-    /// active tab is on-screen. Schedules a redraw if any width or
-    /// scroll-offset changed.
-    ///
-    /// Called both from the top of `update()` (so engine logic always sees
-    /// fresh widths) and from `handle_poll_tick` (belt-and-suspenders).
-    ///
-    /// Why the scroll-offset re-check + forced redraw: GTK has a one-frame
-    /// lag — the engine computes `tab_scroll_offset` using the width from
-    /// the *previous* draw. If a layout change between frames invalidated
-    /// that width, the current draw renders with a stale offset and the
-    /// active tab can land off-screen. The next drain detects the width
-    /// change and re-runs `ensure_active_tab_visible` with the fresh value.
-    /// Without queuing a redraw, the corrected offset wouldn't reach the
-    /// screen until some other event triggered one. With the forced
-    /// redraw, the system reaches a fixed point in ≤2 frames: the next
-    /// draw measures the same width, drain detects no change, no further
-    /// redraw is queued. (No infinite loop.)
-    ///
-    /// TUI and Win-GUI sidestep this by re-running ensure inline after
-    /// every draw — they don't have the borrow-during-draw constraint
-    /// that GTK has.
-    fn drain_tab_visible_counts(&mut self) {
-        let counts: Vec<(crate::core::window::GroupId, usize)> =
-            self.tab_visible_counts.borrow_mut().drain(..).collect();
-        let mut engine = self.engine.borrow_mut();
-        let mut width_changed = false;
-        for (group_id, count) in counts {
-            let before = engine.editor_groups.get(&group_id).map(|g| g.tab_bar_width);
-            engine.set_tab_visible_count(group_id, count);
-            let after = engine.editor_groups.get(&group_id).map(|g| g.tab_bar_width);
-            if before != after {
-                width_changed = true;
-            }
-        }
-        let scrolls_before: std::collections::HashMap<crate::core::window::GroupId, usize> = engine
-            .editor_groups
-            .iter()
-            .map(|(&gid, g)| (gid, g.tab_scroll_offset))
-            .collect();
-        engine.ensure_all_groups_tabs_visible();
-        let scroll_changed = engine
-            .editor_groups
-            .iter()
-            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
-        drop(engine);
-        if width_changed || scroll_changed {
-            self.draw_needed.set(true);
-        }
-    }
-
     fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
-        // Apply tab visible counts reported by the last draw callback.
-        // (Already drained at the top of update() for #158, but kept here
-        // as a belt-and-suspenders for any path that bypasses update.)
-        self.drain_tab_visible_counts();
         // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
