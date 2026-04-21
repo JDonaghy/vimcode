@@ -1535,18 +1535,17 @@ pub(super) fn draw_activity_bar(
         );
     }
 
-    // Bottom items — render from the bottom upward, preserving declared order.
-    // (Item 0 ends up at the bottom-most row when there's only one.)
-    let mut bottom_row = rows_total.saturating_sub(1);
-    for item in bar.bottom_items.iter().rev().take(bottom_count) {
-        let y = bottom_row as f64 * ACTIVITY_ROW_PX;
-        // Bottom items sit AFTER the top-capacity rows in the regions list so
-        // the caller can look them up by row index deterministically.
-        draw_row(y, item, regions.len(), &mut regions);
-        if bottom_row == 0 {
+    // Bottom items — anchored to the true bottom edge in pixels (not rounded
+    // down to a row-index boundary), so the settings icon ends flush with
+    // `height` even when `height` isn't an exact multiple of `ACTIVITY_ROW_PX`.
+    // The pre-migration `Separator { vexpand: true }` had this flex property;
+    // fixed-row layout would otherwise leave a leftover strip below settings.
+    for (k, item) in bar.bottom_items.iter().rev().take(bottom_count).enumerate() {
+        let y = height - (k + 1) as f64 * ACTIVITY_ROW_PX;
+        if y < 0.0 {
             break;
         }
-        bottom_row -= 1;
+        draw_row(y, item, regions.len(), &mut regions);
     }
 
     layout.set_font_description(Some(&saved_font));
