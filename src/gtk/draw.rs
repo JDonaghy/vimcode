@@ -811,6 +811,14 @@ pub(super) fn draw_tab_drag_overlay(
     }
 }
 
+/// A.6d: GTK tab bar renders via `quadraui_gtk::draw_tab_bar`.
+///
+/// Builds the shared `quadraui::TabBar` primitive via
+/// `render::build_tab_bar_primitive`, delegates to the Cairo+Pango
+/// renderer, and flattens the primitive-level `TabBarHitInfo` back into
+/// the legacy tuple the GTK click handler already consumes. External
+/// signature preserved so callers (`draw_window` + multi-group rendering)
+/// remain untouched.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_tab_bar(
     cr: &Context,
@@ -826,341 +834,30 @@ pub(super) fn draw_tab_bar(
     tab_scroll_offset: usize,
     accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
-    // Tab row is taller than line_height for vertical padding.
-    let tab_row_height = (line_height * 1.6).ceil();
-    let text_y_offset = y_offset + (tab_row_height - line_height) / 2.0;
-
-    // Tab bar background
-    let (r, g, b) = theme.tab_bar_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, tab_row_height);
-    cr.fill().ok();
-
-    // Clear any leftover Pango attributes (e.g. syntax highlighting from draw_window).
-    layout.set_attributes(None);
-
-    // Use sans-serif UI font for tabs (like VSCode)
-    let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
-    layout.set_font_description(Some(&ui_font_desc));
-
-    let normal_font = ui_font_desc.clone();
-    let mut italic_font = normal_font.clone();
-    italic_font.set_style(pango::Style::Italic);
-
-    // Measure both split buttons so tabs don't overlap them.
-    let btn_right_s = format!(" {} ", icons::SPLIT_RIGHT.nerd);
-    let btn_down_s = format!(" {} ", icons::SPLIT_DOWN.nerd);
-    let btn_right_text = btn_right_s.as_str();
-    let btn_down_text = btn_down_s.as_str();
-    let (both_btns_px, btn_right_px) = if show_split_btn {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(btn_right_text);
-        let (wr, _) = layout.pixel_size();
-        layout.set_text(btn_down_text);
-        let (wd, _) = layout.pixel_size();
-        (wr as f64 + wd as f64, wr as f64)
-    } else {
-        (0.0, 0.0)
-    };
-    // Measure diff toolbar buttons if present.
-    let diff_prev_s = format!(" {}", icons::DIFF_PREV.nerd);
-    let diff_next_s = format!(" {}", icons::DIFF_NEXT.nerd);
-    let diff_fold_s = format!(" {}", icons::DIFF_FOLD.nerd);
-    let diff_btn_prev_text = diff_prev_s.as_str();
-    let diff_btn_next_text = diff_next_s.as_str();
-    let diff_btn_fold_text = diff_fold_s.as_str();
-    let (diff_btns_px, diff_label_px) = if let Some(dt) = diff_toolbar {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(diff_btn_prev_text);
-        let (wp, _) = layout.pixel_size();
-        layout.set_text(diff_btn_next_text);
-        let (wn, _) = layout.pixel_size();
-        layout.set_text(diff_btn_fold_text);
-        let (wf, _) = layout.pixel_size();
-        let btns = wp as f64 + wn as f64 + wf as f64;
-        let label = if let Some(lbl) = &dt.change_label {
-            layout.set_text(&format!(" {lbl}"));
-            let (wl, _) = layout.pixel_size();
-            wl as f64
-        } else {
-            0.0
-        };
-        (btns, label)
-    } else {
-        (0.0, 0.0)
-    };
-    let diff_total_px = diff_btns_px + diff_label_px;
-
-    // Measure the action menu button ("…").
-    let action_btn_s = " \u{22EF} "; // " ⋯ " (midline ellipsis)
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text(action_btn_s);
-    let (action_w_i, _) = layout.pixel_size();
-    let action_btn_px = action_w_i as f64;
-
-    let tab_area_width = width - both_btns_px - diff_total_px - action_btn_px;
-
-    // Measure the close button (×) once for use in every tab.
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text("×");
-    let (close_w_i, _) = layout.pixel_size();
-    let close_w = close_w_i as f64;
-    // Gap between tab name and ×, and gap between tabs.
-    let tab_pad = 14.0; // horizontal padding inside each tab
-    let tab_inner_gap = 10.0; // space between name and ×
-    let tab_outer_gap = 1.0; // space between tabs
-
-    let mut x = 0.0_f64;
-    let effective_tab_area = tab_area_width;
-
-    let mut slot_positions: Vec<(f64, f64)> = Vec::with_capacity(tabs.len());
-    // Fill slots for hidden tabs (before scroll offset) with zero-width entries
-    // so that slot_positions indices match tab indices.
-    for _ in 0..tab_scroll_offset.min(tabs.len()) {
-        slot_positions.push((0.0, 0.0));
-    }
-    for (tab_idx, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
-        // Use italic font for preview tabs
-        if tab.preview {
-            layout.set_font_description(Some(&italic_font));
-        } else {
-            layout.set_font_description(Some(&normal_font));
-        }
-
-        layout.set_text(&tab.name);
-        let (tab_width, _) = layout.pixel_size();
-        let tab_w = tab_width as f64;
-        // Total per-tab slot: pad + name + gap + × + pad + outer_gap
-        let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
-        let slot_w = tab_content_w + tab_outer_gap;
-
-        // Stop drawing tabs if they would overrun the available area.
-        if x + slot_w > effective_tab_area {
-            break;
-        }
-        slot_positions.push((x, x + slot_w));
-
-        // Tab background (covers pad + name + gap + × + pad)
-        let bg = if tab.active {
-            theme.tab_active_bg
-        } else {
-            theme.tab_bar_bg
-        };
-        let (br, bg_g, bb) = bg.to_cairo();
-        cr.set_source_rgb(br, bg_g, bb);
-        cr.rectangle(x, y_offset, tab_content_w, tab_row_height);
-        cr.fill().ok();
-
-        // Accent line at top of active tab in focused group.
-        if tab.active {
-            if let Some(accent) = accent_color {
-                let (ar, ag, ab) = accent.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(x, y_offset, tab_content_w, 2.0);
-                cr.fill().ok();
-            }
-        }
-
-        // Tab text — dimmed colours for preview tabs
-        cr.move_to(x + tab_pad, text_y_offset);
-        let fg = if tab.preview {
-            if tab.active {
-                theme.tab_preview_active_fg
-            } else {
-                theme.tab_preview_inactive_fg
-            }
-        } else if tab.active {
-            theme.tab_active_fg
-        } else {
-            theme.tab_inactive_fg
-        };
-        let (fr, fg_g, fb) = fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        layout.set_font_description(Some(
-            &(if tab.preview {
-                italic_font.clone()
-            } else {
-                normal_font.clone()
-            }),
-        ));
-        pangocairo::show_layout(cr, layout);
-
-        // Close (×) button — dim on inactive, matches active fg on the active tab.
-        let close_x = x + tab_pad + tab_w + tab_inner_gap;
-        let is_close_hovered = hovered_close_tab == Some(tab_idx);
-        if is_close_hovered {
-            // Draw a subtle rounded background behind the × on hover.
-            let pad = 2.0;
-            let rx = close_x - pad;
-            let ry = text_y_offset + pad;
-            let rw = close_w + pad * 2.0;
-            let rh = line_height - pad * 2.0;
-            let (hr, hg, hb) = theme.foreground.to_cairo();
-            cr.set_source_rgba(hr, hg, hb, 0.15);
-            let radius = 3.0;
-            cr.new_path();
-            cr.arc(
-                rx + rw - radius,
-                ry + radius,
-                radius,
-                -std::f64::consts::FRAC_PI_2,
-                0.0,
-            );
-            cr.arc(
-                rx + rw - radius,
-                ry + rh - radius,
-                radius,
-                0.0,
-                std::f64::consts::FRAC_PI_2,
-            );
-            cr.arc(
-                rx + radius,
-                ry + rh - radius,
-                radius,
-                std::f64::consts::FRAC_PI_2,
-                std::f64::consts::PI,
-            );
-            cr.arc(
-                rx + radius,
-                ry + radius,
-                radius,
-                std::f64::consts::PI,
-                3.0 * std::f64::consts::FRAC_PI_2,
-            );
-            cr.close_path();
-            cr.fill().ok();
-        }
-        // Show ● (modified dot) when dirty and not hovered, × otherwise (VSCode style).
-        let close_glyph = if tab.dirty && !is_close_hovered {
-            "●"
-        } else {
-            "×"
-        };
-        let (xr, xg, xb) = if tab.dirty && !is_close_hovered {
-            // White/foreground dot for modified indicator
-            theme.foreground.to_cairo()
-        } else if is_close_hovered {
-            theme.foreground.to_cairo()
-        } else if tab.active {
-            theme.tab_inactive_fg.to_cairo()
-        } else {
-            theme.separator.to_cairo()
-        };
-        cr.set_source_rgb(xr, xg, xb);
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(close_glyph);
-        cr.move_to(close_x, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-
-        x += slot_w;
-    }
-
-    // Draw diff toolbar buttons (to the left of split buttons).
-    let diff_btn_pos: Option<(f64, f64, f64, f64, f64, f64)> = if let Some(dt) = diff_toolbar {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        let mut dx = width - both_btns_px - diff_total_px - action_btn_px;
-        // Change label (e.g. " 2 of 5")
-        if let Some(lbl) = &dt.change_label {
-            let (fr2, fg2, fb2) = theme.foreground.to_cairo();
-            cr.set_source_rgb(fr2, fg2, fb2);
-            layout.set_text(&format!(" {lbl}"));
-            cr.move_to(dx, text_y_offset);
-            pangocairo::show_layout(cr, layout);
-            dx += diff_label_px;
-        }
-        // Prev button
-        let prev_start = dx;
-        cr.set_source_rgb(fr, fg_g, fb);
-        layout.set_text(diff_btn_prev_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wp, _) = layout.pixel_size();
-        dx += wp as f64;
-        let prev_end = dx;
-        // Next button
-        let next_start = dx;
-        layout.set_text(diff_btn_next_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wn, _) = layout.pixel_size();
-        dx += wn as f64;
-        let next_end = dx;
-        // Fold toggle (highlighted when active)
-        let fold_start = dx;
-        if dt.unchanged_hidden {
-            let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-        }
-        layout.set_text(diff_btn_fold_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wf, _) = layout.pixel_size();
-        let fold_end = dx + wf as f64;
-        Some((
-            prev_start, prev_end, next_start, next_end, fold_start, fold_end,
-        ))
-    } else {
-        None
-    };
-
-    // Draw split-right then split-down buttons at the right edge.
-    if show_split_btn && both_btns_px > 0.0 {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        // Split-right button (shifted left to make room for action button)
-        layout.set_text(btn_right_text);
-        cr.move_to(width - both_btns_px - action_btn_px, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        // Split-down button
-        layout.set_text(btn_down_text);
-        cr.move_to(
-            width - both_btns_px - action_btn_px + btn_right_px,
-            text_y_offset,
-        );
-        pangocairo::show_layout(cr, layout);
-    }
-
-    let split_btn_info = if show_split_btn && both_btns_px > 0.0 {
-        Some((both_btns_px, btn_right_px))
-    } else {
-        None
-    };
-
-    // Measure average character width, then report tab bar width in
-    // character-column equivalents so the engine can compute tab fits
-    // using char-based tab name widths.  Use a representative sample
-    // string instead of just "M" — proportional fonts make "M" much
-    // wider than the average character, causing the engine to think
-    // fewer tabs fit than actually do.
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text("ABCDabcd0123.:_");
-    let (sample_px, _) = layout.pixel_size();
-    let char_w = (sample_px as f64 / 15.0).max(1.0);
-    let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
-
-    // Draw the editor action menu button ("…") at the far right.
-    let action_btn_info = {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        let ax = width - action_btn_px;
-        layout.set_text(action_btn_s);
-        cr.move_to(ax, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        Some((ax, width))
-    };
-
-    // Restore original editor font for subsequent rendering
-    layout.set_font_description(Some(&saved_font));
+    let accent = accent_color.map(render::to_quadraui_color);
+    let bar = render::build_tab_bar_primitive(
+        tabs,
+        show_split_btn,
+        diff_toolbar,
+        tab_scroll_offset,
+        accent,
+    );
+    let info = super::quadraui_gtk::draw_tab_bar(
+        cr,
+        layout,
+        width,
+        line_height,
+        y_offset,
+        &bar,
+        theme,
+        hovered_close_tab,
+    );
     (
-        slot_positions,
-        diff_btn_pos,
-        split_btn_info,
-        available_cols,
-        action_btn_info,
+        info.slot_positions,
+        info.diff_btns,
+        info.split_btns,
+        info.available_cols,
+        info.action_btn,
     )
 }
 

@@ -8484,6 +8484,106 @@ pub fn resolve_status_bar_click(
     None
 }
 
+// ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
+
+/// Build a `quadraui::TabBar` primitive from the render-level tab args.
+/// Shared by TUI and GTK backends — the primitive is layout-agnostic;
+/// backends interpret it against their own measurement / drawing models.
+///
+/// Right-side segment order (mirrors the pre-migration layout):
+/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
+///
+/// `active_accent` carries the active-tab accent colour only when the group
+/// is focused. TUI interprets as underline; GTK as 2px top bar.
+/// `width_cells` on each segment is a TUI hint; GTK measures with Pango.
+pub fn build_tab_bar_primitive(
+    tabs: &[TabInfo],
+    show_split_btns: bool,
+    diff_toolbar: Option<&DiffToolbarData>,
+    tab_scroll_offset: usize,
+    active_accent: Option<quadraui::Color>,
+) -> quadraui::TabBar {
+    let tab_items: Vec<quadraui::TabItem> = tabs
+        .iter()
+        .map(|t| quadraui::TabItem {
+            label: t.name.clone(),
+            is_active: t.active,
+            is_dirty: t.dirty,
+            is_preview: t.preview,
+        })
+        .collect();
+
+    let mut right: Vec<quadraui::TabBarSegment> = Vec::new();
+
+    if let Some(dt) = diff_toolbar {
+        if let Some(label) = &dt.change_label {
+            let text = format!(" {label}");
+            let width = text.chars().count() as u16;
+            right.push(quadraui::TabBarSegment {
+                text,
+                width_cells: width,
+                id: None,
+                is_active: false,
+            });
+        }
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0143}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_prev")),
+            is_active: false,
+        });
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0140}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_next")),
+            is_active: false,
+        });
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0233}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:diff_toggle")),
+            is_active: dt.unchanged_hidden,
+        });
+    }
+
+    if show_split_btns {
+        right.push(quadraui::TabBarSegment {
+            text: " \u{F0932}".to_string(),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:split_right")),
+            is_active: false,
+        });
+        let split_down = crate::icons::SPLIT_DOWN.c();
+        right.push(quadraui::TabBarSegment {
+            text: format!(" {split_down} "),
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new("tab:split_down")),
+            is_active: false,
+        });
+    }
+
+    right.push(quadraui::TabBarSegment {
+        text: " \u{22EF} ".to_string(),
+        width_cells: 3,
+        id: Some(quadraui::WidgetId::new("tab:action_menu")),
+        is_active: false,
+    });
+
+    quadraui::TabBar {
+        id: quadraui::WidgetId::new("tabs:group"),
+        tabs: tab_items,
+        scroll_offset: tab_scroll_offset,
+        right_segments: right,
+        active_accent,
+    }
+}
+
+/// Convert a vimcode `Color` into a `quadraui::Color`. Used by GTK to pass
+/// the theme accent colour into `build_tab_bar_primitive`.
+pub fn to_quadraui_color(c: Color) -> quadraui::Color {
+    quadraui::Color::rgb(c.r, c.g, c.b)
+}
+
 // ─── quadraui::StatusBar adapter (A.6a) ──────────────────────────────────────
 
 /// String id encoding a `StatusAction`. Paired with [`status_action_from_id`].

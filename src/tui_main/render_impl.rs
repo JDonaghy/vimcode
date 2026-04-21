@@ -1052,113 +1052,19 @@ pub(super) fn render_tab_bar(
     // A.6c: tab bar rendering delegates to the `quadraui::TabBar` primitive.
     // This wrapper builds the primitive from render's `TabInfo` + the diff /
     // split / action right-side slots, then calls `draw_tab_bar`.
-    let bar = build_tab_bar_primitive(
-        tabs,
-        show_split_btns,
-        diff_toolbar,
-        tab_scroll_offset,
-        focused_accent,
-    );
-    super::quadraui_tui::draw_tab_bar(buf, area, &bar, theme)
-}
-
-/// Build a `quadraui::TabBar` from the render-level tab args.
-///
-/// Right-side segment order (mirrors the existing pre-migration layout):
-/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
-///
-/// The `active_accent` field carries the underline colour only when the
-/// group is focused (active); when `focused_accent` is `None` the TUI
-/// renderer skips the underline, matching the old inactive-group behaviour.
-fn build_tab_bar_primitive(
-    tabs: &[render::TabInfo],
-    show_split_btns: bool,
-    diff_toolbar: Option<&render::DiffToolbarData>,
-    tab_scroll_offset: usize,
-    focused_accent: Option<ratatui::style::Color>,
-) -> quadraui::TabBar {
-    let tab_items: Vec<quadraui::TabItem> = tabs
-        .iter()
-        .map(|t| quadraui::TabItem {
-            label: t.name.clone(),
-            is_active: t.active,
-            is_dirty: t.dirty,
-            is_preview: t.preview,
-        })
-        .collect();
-
-    let mut right: Vec<quadraui::TabBarSegment> = Vec::new();
-
-    if let Some(dt) = diff_toolbar {
-        // Optional "2 of 5" label (leading space + text).
-        if let Some(label) = &dt.change_label {
-            let text = format!(" {label}");
-            let width = text.chars().count() as u16;
-            right.push(quadraui::TabBarSegment {
-                text,
-                width_cells: width,
-                id: None,
-                is_active: false,
-            });
-        }
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0143}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_prev")),
-            is_active: false,
-        });
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0140}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_next")),
-            is_active: false,
-        });
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0233}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_toggle")),
-            is_active: dt.unchanged_hidden,
-        });
-    }
-
-    if show_split_btns {
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0932}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:split_right")),
-            is_active: false,
-        });
-        // Split-down: space + regular-width caret + trailing space = 3 cells.
-        let split_down = crate::icons::SPLIT_DOWN.c();
-        right.push(quadraui::TabBarSegment {
-            text: format!(" {split_down} "),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:split_down")),
-            is_active: false,
-        });
-    }
-
-    // Action menu button " ⋯ ".
-    right.push(quadraui::TabBarSegment {
-        text: " \u{22EF} ".to_string(),
-        width_cells: 3,
-        id: Some(quadraui::WidgetId::new("tab:action_menu")),
-        is_active: false,
-    });
-
-    // Convert ratatui Color to quadraui Color for the accent (RGB channels only).
+    // Convert ratatui RGB accent → quadraui::Color for the shared adapter.
     let accent = focused_accent.and_then(|c| match c {
         ratatui::style::Color::Rgb(r, g, b) => Some(quadraui::Color::rgb(r, g, b)),
         _ => None,
     });
-
-    quadraui::TabBar {
-        id: quadraui::WidgetId::new("tabs:group"),
-        tabs: tab_items,
-        scroll_offset: tab_scroll_offset,
-        right_segments: right,
-        active_accent: accent,
-    }
+    let bar = render::build_tab_bar_primitive(
+        tabs,
+        show_split_btns,
+        diff_toolbar,
+        tab_scroll_offset,
+        accent,
+    );
+    super::quadraui_tui::draw_tab_bar(buf, area, &bar, theme)
 }
 
 pub(super) fn render_breadcrumb_bar(

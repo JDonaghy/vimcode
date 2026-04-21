@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 307 — A.6c `TabBar` primitive + TUI migration)
+> **Last updated:** 2026-04-20 (Session 308 — A.6d GTK `draw_tab_bar` migration)
 
 ---
 
@@ -44,8 +44,8 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.5b** — GTK `draw_list` + GTK quickfix | ✅ Done | `e1ea5ea` | `quadraui-phase-a5b-*` | Linux / macOS with GTK4 |
 | **Phase A.6a** — `StatusBar` primitive + TUI per-window status line migration | ✅ Done | `3b020ef` | `quadraui-phase-a6a-status-bar-tui` | any (TUI) |
 | **Phase A.6b** — GTK `draw_status_bar` migration | ✅ Done | `96c48bf` | `quadraui-phase-a6b-status-bar-gtk` | Linux / macOS with GTK4 |
-| **Phase A.6c** — `TabBar` primitive + TUI migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6c-tab-bar-tui` | any (TUI) |
-| Phase A.6d — GTK `draw_tab_bar` | ⬜ Queued | — | `quadraui-phase-a6d-*` | Linux / macOS with GTK4 |
+| **Phase A.6c** — `TabBar` primitive + TUI migration | ✅ Done | `2196b27` | `quadraui-phase-a6c-tab-bar-tui` | any (TUI) |
+| **Phase A.6d** — GTK `draw_tab_bar` migration | 🟡 Awaiting smoke test | — | `quadraui-phase-a6d-tab-bar-gtk` | Linux / macOS with GTK4 |
 | Phase A.6e — `ActivityBar` primitive + TUI + GTK | ⬜ Queued | — | `quadraui-phase-a6e-*` | any |
 | Phase A.7 — `Terminal` primitive | ⬜ Queued | — | `quadraui-phase-a7-*` | any |
 | Phase A.8 — `TextDisplay` | ⬜ Queued | — | `quadraui-phase-a8-*` | any |
@@ -103,6 +103,19 @@ are documented in [`docs/DECISIONS_quadraui_primitives.md`](docs/DECISIONS_quadr
   new panel is a silent regression. Rule: **every new sidebar DA must
   appear in both the SwitchPanel grab-focus match and the click
   handler**, otherwise its key controller is dead code.
+
+- **Rendering state belongs in the primitive; per-frame interaction
+  state does not.** A.6d split the GTK tab bar migration by keeping
+  `quadraui::TabBar` purely declarative (tabs + their flags + accent
+  + right segments) and letting the GTK backend's `draw_tab_bar`
+  accept a separate `hovered_close_tab: Option<usize>` parameter for
+  the mouse-hover rounded-bg affordance. Plugin-declared tab bars
+  still work because plugins don't need hover-overlay control — the
+  backend computes hover from its own event stream and overlays
+  visually. Rule: **if something can only be known by the backend
+  (cursor position, focus-within, scroll momentum), pass it alongside
+  the primitive rather than bloating the primitive with backend-owned
+  state.**
 
 - **Not every PUA glyph is 2 cells in a terminal.** First draft of
   `quadraui_tui::draw_tab_bar` (A.6c) treated every Private Use Area

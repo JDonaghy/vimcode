@@ -1062,3 +1062,347 @@ pub(super) fn draw_status_bar(
 
     regions
 }
+
+// ─── Tab bar (A.6d) ──────────────────────────────────────────────────────────
+
+/// Per-frame hit-region output of `draw_tab_bar`.
+///
+/// All positions are absolute pixel coordinates inside the target surface;
+/// the caller typically stores them keyed by `GroupId` and consults them
+/// when resolving mouse events.
+#[derive(Debug, Default, Clone)]
+pub(super) struct TabBarHitInfo {
+    /// `[(start_x, end_x)]` per tab index. Tabs before `scroll_offset` get
+    /// zero-width `(0.0, 0.0)` sentinels so indices match the tab list.
+    pub slot_positions: Vec<(f64, f64)>,
+    /// `(prev_start, prev_end, next_start, next_end, fold_start, fold_end)`
+    /// — the three diff toolbar buttons' x ranges, if rendered.
+    pub diff_btns: Option<(f64, f64, f64, f64, f64, f64)>,
+    /// `(total_split_width, split_right_width)` for click dispatch.
+    pub split_btns: Option<(f64, f64)>,
+    /// `(start_x, end_x)` of the action menu button.
+    pub action_btn: Option<(f64, f64)>,
+    /// Tab-bar content width in **character columns** (not pixels).
+    /// Used by the engine to compute how many tabs fit at a given font.
+    pub available_cols: usize,
+}
+
+/// Draw a `quadraui::TabBar` into `(0, y_offset, width, tab_row_height)`
+/// on `cr`, using a sans-serif UI font for labels (not the editor's
+/// monospace font).
+///
+/// `hovered_close_tab` is a per-frame interaction override: when `Some(i)`
+/// the primitive's `i`-th visible tab gets a rounded hover background behind
+/// its close button. Part of the GTK-specific draw contract — the primitive
+/// itself has no mouse-state.
+///
+/// Returns per-frame hit regions so the caller can dispatch clicks
+/// (`App::tab_slot_positions_by_group`, etc.).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_tab_bar(
+    cr: &Context,
+    layout: &pango::Layout,
+    width: f64,
+    line_height: f64,
+    y_offset: f64,
+    bar: &quadraui::TabBar,
+    theme: &Theme,
+    hovered_close_tab: Option<usize>,
+) -> TabBarHitInfo {
+    use pango::FontDescription;
+
+    // Tab row is taller than line_height for vertical padding.
+    let tab_row_height = (line_height * 1.6).ceil();
+    let text_y_offset = y_offset + (tab_row_height - line_height) / 2.0;
+
+    // Tab bar background
+    let (r, g, b) = vc_to_cairo(theme.tab_bar_bg);
+    cr.set_source_rgb(r, g, b);
+    cr.rectangle(0.0, y_offset, width, tab_row_height);
+    cr.fill().ok();
+
+    layout.set_attributes(None);
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(super::UI_FONT);
+    layout.set_font_description(Some(&ui_font_desc));
+
+    let normal_font = ui_font_desc.clone();
+    let mut italic_font = normal_font.clone();
+    italic_font.set_style(pango::Style::Italic);
+
+    // Measure each right-side segment's pixel width.
+    let mut right_widths: Vec<f64> = Vec::with_capacity(bar.right_segments.len());
+    for seg in &bar.right_segments {
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text(&seg.text);
+        let (w, _) = layout.pixel_size();
+        right_widths.push(w as f64);
+    }
+    let reserved_px: f64 = right_widths.iter().sum();
+    let effective_tab_area = (width - reserved_px).max(0.0);
+
+    // Per-tab measurement + layout + paint.
+    let mut slot_positions: Vec<(f64, f64)> = Vec::with_capacity(bar.tabs.len());
+    for _ in 0..bar.scroll_offset.min(bar.tabs.len()) {
+        slot_positions.push((0.0, 0.0));
+    }
+
+    let close_w = {
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text("×");
+        let (w, _) = layout.pixel_size();
+        w as f64
+    };
+    let tab_pad = 14.0;
+    let tab_inner_gap = 10.0;
+    let tab_outer_gap = 1.0;
+
+    let mut x = 0.0_f64;
+    for (tab_idx, tab) in bar.tabs.iter().enumerate().skip(bar.scroll_offset) {
+        if tab.is_preview {
+            layout.set_font_description(Some(&italic_font));
+        } else {
+            layout.set_font_description(Some(&normal_font));
+        }
+        layout.set_text(&tab.label);
+        let (tab_name_w, _) = layout.pixel_size();
+        let tab_w = tab_name_w as f64;
+        let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
+        let slot_w = tab_content_w + tab_outer_gap;
+        if x + slot_w > effective_tab_area {
+            break;
+        }
+        slot_positions.push((x, x + slot_w));
+
+        // Tab background.
+        let bg_col = if tab.is_active {
+            theme.tab_active_bg
+        } else {
+            theme.tab_bar_bg
+        };
+        let (br, bgc, bb) = vc_to_cairo(bg_col);
+        cr.set_source_rgb(br, bgc, bb);
+        cr.rectangle(x, y_offset, tab_content_w, tab_row_height);
+        cr.fill().ok();
+
+        // Top accent bar for active tab in focused group.
+        if tab.is_active {
+            if let Some(accent) = bar.active_accent {
+                let (ar, ag, ab) = qc_to_cairo(accent);
+                cr.set_source_rgb(ar, ag, ab);
+                cr.rectangle(x, y_offset, tab_content_w, 2.0);
+                cr.fill().ok();
+            }
+        }
+
+        // Tab text.
+        let fg_col = match (tab.is_active, tab.is_preview) {
+            (true, true) => theme.tab_preview_active_fg,
+            (true, false) => theme.tab_active_fg,
+            (false, true) => theme.tab_preview_inactive_fg,
+            (false, false) => theme.tab_inactive_fg,
+        };
+        let (fr, fgc, fb) = vc_to_cairo(fg_col);
+        cr.set_source_rgb(fr, fgc, fb);
+        layout.set_font_description(Some(if tab.is_preview {
+            &italic_font
+        } else {
+            &normal_font
+        }));
+        cr.move_to(x + tab_pad, text_y_offset);
+        pangocairo::show_layout(cr, layout);
+
+        // Close (×) or dirty (●) button — with optional rounded hover bg.
+        let close_x = x + tab_pad + tab_w + tab_inner_gap;
+        let is_close_hovered = hovered_close_tab == Some(tab_idx);
+        if is_close_hovered {
+            let pad = 2.0;
+            let rx = close_x - pad;
+            let ry = text_y_offset + pad;
+            let rw = close_w + pad * 2.0;
+            let rh = line_height - pad * 2.0;
+            let (hr, hg, hb) = vc_to_cairo(theme.foreground);
+            cr.set_source_rgba(hr, hg, hb, 0.15);
+            let radius = 3.0;
+            cr.new_path();
+            cr.arc(
+                rx + rw - radius,
+                ry + radius,
+                radius,
+                -std::f64::consts::FRAC_PI_2,
+                0.0,
+            );
+            cr.arc(
+                rx + rw - radius,
+                ry + rh - radius,
+                radius,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            );
+            cr.arc(
+                rx + radius,
+                ry + rh - radius,
+                radius,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+            );
+            cr.arc(
+                rx + radius,
+                ry + radius,
+                radius,
+                std::f64::consts::PI,
+                3.0 * std::f64::consts::FRAC_PI_2,
+            );
+            cr.close_path();
+            cr.fill().ok();
+        }
+        let close_glyph = if tab.is_dirty && !is_close_hovered {
+            "●"
+        } else {
+            "×"
+        };
+        let close_fg = if tab.is_dirty || is_close_hovered {
+            theme.foreground
+        } else if tab.is_active {
+            theme.tab_inactive_fg
+        } else {
+            theme.separator
+        };
+        let (cr_, cg_, cb_) = vc_to_cairo(close_fg);
+        cr.set_source_rgb(cr_, cg_, cb_);
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text(close_glyph);
+        cr.move_to(close_x, text_y_offset);
+        pangocairo::show_layout(cr, layout);
+
+        x += slot_w;
+    }
+
+    // ── Right-side segments ─────────────────────────────────────────────
+    //
+    // Each segment has a pre-measured width and is rendered with normal
+    // weight (no bold). Clickable segments' hit regions are derived from
+    // `build_tab_bar_primitive`'s segment order: the adapter emits
+    // [diff_label?] [diff prev] [diff next] [diff fold] [split right]
+    // [split down] [action menu]. We walk the emitted segments and
+    // classify clickable ones by their WidgetId.
+    let mut diff_regions: Option<[f64; 6]> = None;
+    let mut split_info: Option<(f64, f64)> = None;
+    let mut action_info: Option<(f64, f64)> = None;
+
+    // Accumulate segment positions left-to-right, starting at `right_base`.
+    let right_base = width - reserved_px;
+    let mut sx = right_base;
+    let mut prev_x: Option<f64> = None;
+    let mut next_x: Option<f64> = None;
+    let mut fold_x: Option<f64> = None;
+    let mut split_right_x: Option<f64> = None;
+    let mut split_down_x: Option<f64> = None;
+
+    for (i, seg) in bar.right_segments.iter().enumerate() {
+        let seg_w = right_widths[i];
+        let fg_col = if seg.is_active {
+            theme.tab_active_fg
+        } else {
+            theme.tab_inactive_fg
+        };
+        let (fr, fg_, fb) = vc_to_cairo(fg_col);
+        cr.set_source_rgb(fr, fg_, fb);
+        layout.set_font_description(Some(&normal_font));
+        layout.set_text(&seg.text);
+        cr.move_to(sx, text_y_offset);
+        pangocairo::show_layout(cr, layout);
+
+        if let Some(ref id) = seg.id {
+            match id.as_str() {
+                "tab:diff_prev" => prev_x = Some(sx),
+                "tab:diff_next" => next_x = Some(sx),
+                "tab:diff_toggle" => fold_x = Some(sx),
+                "tab:split_right" => split_right_x = Some(sx),
+                "tab:split_down" => split_down_x = Some(sx),
+                "tab:action_menu" => action_info = Some((sx, sx + seg_w)),
+                _ => {}
+            }
+        }
+        sx += seg_w;
+    }
+
+    // Derive the legacy 6-tuple and 2-tuple shapes the GTK click handler
+    // expects. Missing buttons degrade gracefully — callers already check
+    // `Option::is_some()`.
+    if let (Some(p), Some(n), Some(f)) = (prev_x, next_x, fold_x) {
+        // Need each button's end x; recompute from measured widths.
+        let prev_idx = bar
+            .right_segments
+            .iter()
+            .position(|s| {
+                s.id.as_ref()
+                    .is_some_and(|id| id.as_str() == "tab:diff_prev")
+            })
+            .unwrap();
+        let next_idx = bar
+            .right_segments
+            .iter()
+            .position(|s| {
+                s.id.as_ref()
+                    .is_some_and(|id| id.as_str() == "tab:diff_next")
+            })
+            .unwrap();
+        let fold_idx = bar
+            .right_segments
+            .iter()
+            .position(|s| {
+                s.id.as_ref()
+                    .is_some_and(|id| id.as_str() == "tab:diff_toggle")
+            })
+            .unwrap();
+        diff_regions = Some([
+            p,
+            p + right_widths[prev_idx],
+            n,
+            n + right_widths[next_idx],
+            f,
+            f + right_widths[fold_idx],
+        ]);
+    }
+    if let (Some(sr), Some(_sd)) = (split_right_x, split_down_x) {
+        let sr_idx = bar
+            .right_segments
+            .iter()
+            .position(|s| {
+                s.id.as_ref()
+                    .is_some_and(|id| id.as_str() == "tab:split_right")
+            })
+            .unwrap();
+        let sd_idx = bar
+            .right_segments
+            .iter()
+            .position(|s| {
+                s.id.as_ref()
+                    .is_some_and(|id| id.as_str() == "tab:split_down")
+            })
+            .unwrap();
+        let sr_w = right_widths[sr_idx];
+        let sd_w = right_widths[sd_idx];
+        split_info = Some((sr_w + sd_w, sr_w));
+        // Redundant but preserves the original (both_btns_px, btn_right_px) contract.
+        let _ = sr;
+    }
+
+    // Sample measurement for char-col estimation (shared with old renderer).
+    layout.set_font_description(Some(&normal_font));
+    layout.set_text("ABCDabcd0123.:_");
+    let (sample_px, _) = layout.pixel_size();
+    let char_w = (sample_px as f64 / 15.0).max(1.0);
+    let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
+
+    layout.set_font_description(Some(&saved_font));
+
+    TabBarHitInfo {
+        slot_positions,
+        diff_btns: diff_regions.map(|a| (a[0], a[1], a[2], a[3], a[4], a[5])),
+        split_btns: split_info,
+        action_btn: action_info,
+        available_cols,
+    }
+}

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 20, 2026 (Session 307 — A.6c: `TabBar` primitive + TUI migration) | **Tests:** 5242 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 17
+**Last updated:** Apr 20, 2026 (Session 308 — A.6d: GTK `draw_tab_bar` migration) | **Tests:** 5242 total (full `cargo test --workspace --no-default-features`); vimcode 5225 + quadraui 17
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,21 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 308 — Phase A.6d: GTK `draw_tab_bar` migration:**
+
+1. **Shared adapter promoted to `render.rs`** — `build_tab_bar_primitive` (previously TUI-local) moved to `src/render.rs` so both backends use the same primitive construction. Accepts `Option<quadraui::Color>` for the accent; each backend converts its own colour type up-front. TUI's ratatui→quadraui conversion happens in `render_tab_bar`; GTK's uses the new `render::to_quadraui_color` helper on its `render::Color` theme field.
+2. **New `quadraui_gtk::draw_tab_bar`** — Cairo+Pango renderer that consumes a `quadraui::TabBar` + an extra GTK-only per-frame `hovered_close_tab: Option<usize>`. Preserves all GTK visual details: 1.6× line_height tab row, sans-serif UI font (separate from editor monospace), italic-on-preview font, 2px top accent bar on active tab, rounded hover background behind close button, ● vs × close glyph.
+3. **New `TabBarHitInfo` struct** replacing the bespoke 5-tuple return type. Same data (per-tab slots, diff button rects, split info, action menu rect, available char columns) but named fields. GTK `draw.rs::draw_tab_bar` wrapper flattens it back to the legacy `TabBarDrawResult` tuple so the click-dispatch path (`src/gtk/click.rs`, `src/gtk/mod.rs`) stays untouched.
+4. **Rendering-vs-interaction split pattern.** The primitive is pure declarative state (tabs + their visual flags + right segments + accent). GTK's `draw_tab_bar` accepts per-frame interaction state (`hovered_close_tab`) as an extra parameter alongside the primitive. Captured in PLAN.md "Lessons learned" for future primitives that need hover / drag / focus overlays.
+5. **Right-segment dispatch by `WidgetId`.** The GTK renderer walks `bar.right_segments` and classifies clickable segments by their `id.as_str()` (`"tab:diff_prev"`, `"tab:split_right"`, etc.) so it can populate the legacy per-button hit-region tuple without re-duplicating the layout logic. Same WidgetId→enum mapping pattern as A.6a's `status_action_from_id`.
+6. **GTK `draw_tab_bar` wrapper reduced to ~40 lines.** The 350-line Cairo+Pango routine (tab measurement, per-tab paint, hover affordance, right-button layout) is gone. The wrapper adapts colour, builds the primitive, delegates, unpacks `TabBarHitInfo` into the legacy tuple.
+7. **All Linux GTK tab-bar / status-bar / primitive migrations are now done.** Primitives shipped: Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b), TabBar (A.6d). Remaining quadraui work on Linux: ActivityBar (A.6e), Terminal (A.7), TextDisplay (A.8), TextEditor (A.9).
+8. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; `clippy::if_same_then_else` flagged a pre-existing `if A { foreground } else if B { foreground }` branch I'd preserved from the old code — simplified to `if A || B`), full `cargo test --workspace --no-default-features` (5242/0/19, unchanged), `cargo build` both configurations.
+9. **Net diff:** +480 / –430 lines across 4 files. `src/gtk/draw.rs` shrinks ~300 lines (the tab-bar renderer extracted out); `src/gtk/quadraui_gtk.rs` grows by ~340. `src/render.rs` gains the shared ~85-line adapter; `src/tui_main/render_impl.rs` shrinks by ~85 lines (now just calls the shared adapter).
+10. **Awaiting smoke test.** GTK tab bar should render identically — tab padding (14px outer + 10px inner gap), 2px top accent on active tab, italic preview, hover rounded bg on close, dirty dot ● / close ×, split+diff+action right buttons, correct hit regions so clicks still dispatch through the unchanged `src/gtk/click.rs` path.
+
+---
 
 **Session 307 — Phase A.6c: `TabBar` primitive + TUI migration:**
 
