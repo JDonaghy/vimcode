@@ -2761,9 +2761,6 @@ impl<'a> DrawContext<'a> {
         let sel_bg = self.theme.fuzzy_selected_bg;
         let hdr_bg = self.theme.status_bg;
         let hdr_fg = self.theme.status_fg;
-        let add_color = self.theme.git_added;
-        let del_color = self.theme.git_deleted;
-        let mod_color = self.theme.git_modified;
 
         // Background fill
         let bg_brush = self.solid_brush(bg);
@@ -2935,185 +2932,26 @@ impl<'a> DrawContext<'a> {
             return;
         }
 
-        // ── Sections ────────────────────────────────────────────────────
-        let show_worktrees = sc.worktrees.len() > 1;
-        #[allow(clippy::type_complexity)]
-        let sections: [(
-            &str,
-            &[crate::render::ScFileItem],
-            Option<&[crate::render::ScWorktreeItem]>,
-            usize,
-        ); 4] = [
-            ("STAGED CHANGES", &sc.staged, None, 0),
-            ("CHANGES", &sc.unstaged, None, 1),
-            ("WORKTREES", &[], Some(&sc.worktrees), 2),
-            ("RECENT COMMITS", &[], None, 3),
-        ];
-
-        let mut flat_row: usize = 0;
-
-        for (section_label, file_items, wt_items, sec_idx) in &sections {
-            if *sec_idx == 2 && !show_worktrees {
-                continue;
-            }
-            if top + ry >= top + content_bottom {
-                break;
-            }
-
-            let is_expanded = sc.sections_expanded[*sec_idx];
-            let expand_icon = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
-
-            // Section header row
-            let is_hdr_selected = sc.has_focus && sc.selected == flat_row;
-            let hdr_row_bg = if is_hdr_selected { sel_bg } else { hdr_bg };
-            let hdr_brush = self.solid_brush(hdr_row_bg);
-            unsafe {
-                self.rt
-                    .FillRectangle(&rect_f(panel_x, top + ry, panel_w, lh), &hdr_brush);
-            }
-
-            // Item count badge
-            let count = if *sec_idx == 2 {
-                wt_items.map(|v| v.len()).unwrap_or(0)
-            } else if *sec_idx == 3 {
-                sc.log.len()
-            } else {
-                file_items.len()
-            };
-            let badge = if count > 0 {
-                format!(" ({})", count)
-            } else {
-                String::new()
-            };
-            let hdr_text = format!(" {} {}{}", expand_icon, section_label, badge);
-            self.draw_text(&hdr_text, panel_x, top + ry, hdr_fg);
-            ry += lh;
-            flat_row += 1;
-
-            if !is_expanded {
-                continue;
-            }
-
-            // Section items
-            if *sec_idx == 3 {
-                // Log entries
-                if sc.log.is_empty() {
-                    if top + ry < top + content_bottom {
-                        self.draw_text("  (no commits)", panel_x, top + ry, dim);
-                        ry += lh;
-                    }
-                } else {
-                    for entry in &sc.log {
-                        if top + ry >= top + content_bottom {
-                            break;
-                        }
-                        let is_selected = sc.has_focus && sc.selected == flat_row;
-                        if is_selected {
-                            let sel_brush = self.solid_brush(sel_bg);
-                            unsafe {
-                                self.rt.FillRectangle(
-                                    &rect_f(panel_x, top + ry, panel_w, lh),
-                                    &sel_brush,
-                                );
-                            }
-                        }
-                        let hash_short = &entry.hash[..7.min(entry.hash.len())];
-                        self.draw_text(&format!("  {} ", hash_short), panel_x, top + ry, dim);
-                        let hash_w = self.mono_text_width(&format!("  {} ", hash_short));
-                        let msg_color = if is_selected { fg } else { dim };
-                        self.draw_text(&entry.message, panel_x + hash_w, top + ry, msg_color);
-                        ry += lh;
-                        flat_row += 1;
-                    }
-                }
-            } else if *sec_idx == 2 {
-                // Worktrees
-                if let Some(wts) = wt_items {
-                    for wt in *wts {
-                        if top + ry >= top + content_bottom {
-                            break;
-                        }
-                        let is_selected = sc.has_focus && sc.selected == flat_row;
-                        if is_selected {
-                            let sel_brush = self.solid_brush(sel_bg);
-                            unsafe {
-                                self.rt.FillRectangle(
-                                    &rect_f(panel_x, top + ry, panel_w, lh),
-                                    &sel_brush,
-                                );
-                            }
-                        }
-                        let check = if wt.is_current { "\u{2713}" } else { " " };
-                        let main_marker = if wt.is_main { " [main]" } else { "" };
-                        let text = format!("  {} {} {}{}", check, wt.branch, wt.path, main_marker);
-                        let text_color = if is_selected { fg } else { dim };
-                        self.draw_text(&text, panel_x, top + ry, text_color);
-                        ry += lh;
-                        flat_row += 1;
-                    }
-                }
-            } else {
-                // File items (staged / unstaged)
-                if file_items.is_empty() {
-                    if top + ry < top + content_bottom {
-                        self.draw_text("  (no changes)", panel_x, top + ry, dim);
-                        ry += lh;
-                    }
-                } else {
-                    for fi in *file_items {
-                        if top + ry >= top + content_bottom {
-                            break;
-                        }
-                        let is_selected = sc.has_focus && sc.selected == flat_row;
-                        if is_selected {
-                            let sel_brush = self.solid_brush(sel_bg);
-                            unsafe {
-                                self.rt.FillRectangle(
-                                    &rect_f(panel_x, top + ry, panel_w, lh),
-                                    &sel_brush,
-                                );
-                            }
-                        }
-                        let status_color = match fi.status_char {
-                            'A' => add_color,
-                            'D' => del_color,
-                            _ => mod_color,
-                        };
-                        // Status char colored
-                        let status_text = format!("  {} ", fi.status_char);
-                        self.draw_text(&status_text, panel_x, top + ry, status_color);
-                        // Path
-                        let path_x = panel_x + self.mono_text_width(&status_text);
-                        let path_color = if is_selected { fg } else { dim };
-                        // Truncate path to fit panel
-                        let max_path_chars =
-                            ((panel_w - self.mono_text_width(&status_text) - 4.0) / cw) as usize;
-                        if fi.path.chars().count() > max_path_chars && max_path_chars > 1 {
-                            let truncated: String = fi
-                                .path
-                                .chars()
-                                .take(max_path_chars.saturating_sub(1))
-                                .chain(std::iter::once('\u{2026}'))
-                                .collect();
-                            self.draw_text(&truncated, path_x, top + ry, path_color);
-                        } else {
-                            self.draw_text(&fi.path, path_x, top + ry, path_color);
-                        }
-                        ry += lh;
-                        flat_row += 1;
-                    }
-                }
-            }
-        }
+        // ── Sections — migrated to the `quadraui::TreeView` primitive ──
+        // (Phase A.1c). Adapter builds a TreeView covering the four
+        // sections (Staged / Changes / Worktrees / Log); `quadraui_win::
+        // draw_tree` renders it with Direct2D + DirectWrite. Row height
+        // is `lh` uniformly, matching the previous layout so the
+        // click-hit math in `src/win_gui/mod.rs` continues to work.
+        let sc_tree = crate::render::source_control_to_tree_view(sc, self.theme);
+        let tree_row_count = sc_tree.rows.len();
+        let sections_h = (content_bottom - ry).max(0.0);
+        super::quadraui_win::draw_tree(self, panel_x, top + ry, panel_w, sections_h, &sc_tree);
+        ry += tree_row_count as f32 * lh;
 
         // ── Scrollbar ───────────────────────────────────────────────────
-        // Total content rows = flat_row count + commit rows + button row + gaps
+        // Total content rows = tree rows + commit rows + button row + gaps.
         let total_content_h = ry;
         let visible_h = content_bottom - lh; // minus header
         if total_content_h > visible_h && visible_h > 0.0 {
             let track_h = content_bottom - lh;
             let thumb_h = (track_h * visible_h / total_content_h).max(8.0);
-            // No scroll offset for now (sections are rendered top-to-bottom)
+            // No scroll offset for now (sections are rendered top-to-bottom).
             let sb_x = panel_x + panel_w - 5.0;
             let dim_brush = self.solid_brush(dim);
             unsafe {
@@ -4739,7 +4577,7 @@ impl<'a> DrawContext<'a> {
 
     // ─── Text helpers ───────────────────────────────────────────────────────
 
-    fn draw_text(&self, text: &str, x: f32, y: f32, color: Color) {
+    pub(super) fn draw_text(&self, text: &str, x: f32, y: f32, color: Color) {
         if text.is_empty() {
             return;
         }
@@ -4813,11 +4651,11 @@ impl<'a> DrawContext<'a> {
     }
 
     /// Approximate monospace text width using char_width × char count.
-    fn mono_text_width(&self, text: &str) -> f32 {
+    pub(super) fn mono_text_width(&self, text: &str) -> f32 {
         self.char_width * text.chars().count() as f32
     }
 
-    fn solid_brush(&self, c: Color) -> ID2D1SolidColorBrush {
+    pub(super) fn solid_brush(&self, c: Color) -> ID2D1SolidColorBrush {
         unsafe {
             self.rt
                 .CreateSolidColorBrush(&color_f(c), None)
