@@ -66,9 +66,12 @@ pub(super) fn draw_editor(
             .ok();
     }
 
-    // Calculate layout regions
+    // Calculate layout regions.
+    // When terminal is maximized, breadcrumbs are suppressed — the editor
+    // area is reduced to the tab row only so the panel can fill the rest.
+    let show_breadcrumbs = engine.settings.breadcrumbs && !engine.terminal_maximized;
     let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
+    let tab_bar_height = if show_breadcrumbs {
         tab_row_height + line_height
     } else {
         tab_row_height
@@ -283,9 +286,10 @@ pub(super) fn draw_editor(
             .push((engine.active_group, vis_count, correct_offset));
     }
 
-    // 4b. Draw breadcrumb bar(s) below tab bar(s)
+    // 4b. Draw breadcrumb bar(s) below tab bar(s). Skipped while the terminal
+    // is maximized so the panel can claim the breadcrumb row.
     for bc in &screen.breadcrumbs {
-        if bc.segments.is_empty() {
+        if bc.segments.is_empty() || engine.terminal_maximized {
             continue;
         }
         // Breadcrumb bar sits one line_height above the window content (bc.bounds.y)

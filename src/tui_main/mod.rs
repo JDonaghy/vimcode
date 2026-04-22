@@ -1174,15 +1174,17 @@ fn event_loop(
                 .width
                 .saturating_sub(ab_w + sidebar_cols + gutter_approx);
             // Compute how many rows the tab bar + breadcrumbs consume.
+            // Breadcrumbs are hidden while the terminal is maximized.
+            let show_breadcrumbs = engine.settings.breadcrumbs && !engine.terminal_maximized;
             let tab_bar_rows: u16 = {
                 let has_single_tab = engine.active_group().tabs.len() <= 1;
                 if engine.settings.hide_single_tab && has_single_tab {
-                    if engine.settings.breadcrumbs {
+                    if show_breadcrumbs {
                         1
                     } else {
                         0
                     }
-                } else if engine.settings.breadcrumbs {
+                } else if show_breadcrumbs {
                     2
                 } else {
                     1

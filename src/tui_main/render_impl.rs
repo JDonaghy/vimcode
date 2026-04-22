@@ -52,11 +52,12 @@ pub(super) fn build_screen_for_tui(
     };
     let content_cols = area.width.saturating_sub(ab_width + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
-    let tui_tab_bar_height = if engine.settings.breadcrumbs {
-        2.0
-    } else {
-        1.0
-    };
+    let tui_tab_bar_height =
+        if engine.settings.breadcrumbs && !engine.terminal_maximized {
+            2.0
+        } else {
+            1.0
+        };
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
     debug_log!(
@@ -262,7 +263,11 @@ pub(super) fn draw_frame(
         render_all_windows(frame, editor_area, &screen.windows, theme);
         // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
         // the group's window content (bounds.y - tab_bar_height).
-        let tui_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+        let tui_tbh: u16 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
+            2
+        } else {
+            1
+        };
         for gtb in split.group_tab_bars.iter() {
             if engine.is_tab_bar_hidden(gtb.group_id) {
                 continue;
@@ -297,9 +302,10 @@ pub(super) fn draw_frame(
                 tab_visible_counts_out.push((gtb.group_id, vis));
             }
         }
-        // Draw breadcrumb bars (below each group's tab bar).
+        // Draw breadcrumb bars (below each group's tab bar). Hidden while the
+        // terminal panel is maximized so it can claim the row.
         for bc in &screen.breadcrumbs {
-            if bc.segments.is_empty() {
+            if bc.segments.is_empty() || engine.terminal_maximized {
                 continue;
             }
             let bc_x = bc.bounds.x as u16 + editor_area.x;
@@ -364,9 +370,10 @@ pub(super) fn draw_frame(
             );
             tab_visible_counts_out.push((engine.active_group, vis));
         }
-        // Draw breadcrumb bar for the single group.
+        // Draw breadcrumb bar for the single group. Hidden while the terminal
+        // panel is maximized.
         if let Some(bc) = screen.breadcrumbs.first() {
-            if !bc.segments.is_empty() {
+            if !bc.segments.is_empty() && !engine.terminal_maximized {
                 let bc_y = if engine.is_tab_bar_hidden(engine.active_group) {
                     editor_area.y
                 } else {
