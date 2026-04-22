@@ -3403,22 +3403,19 @@ impl SimpleComponent for App {
                     e.set_viewport_lines(viewport_lines.max(1));
                     e.set_viewport_cols(viewport_cols.max(40));
                 }
-                // If the terminal is maximized, re-sync the PTY rows to the
-                // new window size so the shell reflows immediately rather
-                // than on the next user toggle.
-                {
-                    let e = engine_for_resize.borrow();
-                    if e.terminal_maximized && !e.terminal_panes.is_empty() {
-                        let target =
-                            gtk_terminal_target_maximize_rows(&e, height as f64, line_height);
-                        let effective = e.effective_terminal_panel_rows(target);
-                        let cols = (width as f64 / char_width).floor() as u16;
-                        drop(e);
-                        engine_for_resize
-                            .borrow_mut()
-                            .terminal_resize(cols.max(40), effective);
-                    }
-                }
+                // NB: we intentionally do NOT call `terminal_resize` here when
+                // `terminal_maximized` is true. During drag-resize GTK fires
+                // this handler many times per second, and each `terminal_resize`
+                // sends SIGWINCH + re-lays out the VT100 grid. Combined with
+                // Relm4's `Msg::Resize` going through an idle queue that's
+                // starved under continuous events (see PLAN.md lesson
+                // "idle_add_local_once"), the panel ends up drawing at
+                // NEW dimensions while the VT100 is still catching up —
+                // which shows as stale cells / phantom prompts. The panel's
+                // *visual* size does still track the window via
+                // `effective_terminal_panel_rows` on every frame; the PTY
+                // simply stays at its toggle-time size until the user
+                // un-maximizes (which re-syncs via the toggle handlers).
                 sender_clone.input(Msg::Resize);
             });
 

@@ -115,8 +115,9 @@ pub(super) fn effective_terminal_panel_rows_tui(engine: &Engine, screen_h: u16) 
 
 pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
     // Build a PanelChromeDesc in native TUI row units and let the engine own
-    // the arithmetic. Editor `tab_bar_rows = 0` — the tab bar + breadcrumbs
-    // collapse behind the maximized panel (matches VSCode).
+    // the arithmetic. `tab_bar_rows = 1` keeps the editor tab row visible
+    // (matches GTK). Breadcrumbs are still suppressed in `render_impl.rs`
+    // when `terminal_maximized` is true, so reserving 1 row is sufficient.
     let per_window = engine.settings.window_status_line;
     crate::core::engine::PanelChromeDesc {
         viewport_rows: screen_h,
@@ -128,7 +129,7 @@ pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) 
         } else {
             0
         },
-        tab_bar_rows: 0,
+        tab_bar_rows: 1,
         separated_status_rows: 0,
         // per-window status on → only cmd line remains global.
         // per-window status off → global status + cmd line.
