@@ -10041,34 +10041,26 @@ impl App {
         .max(40)
     }
 
-    /// Compute the target terminal content rows when maximizing: the engine's
-    /// `terminal_panel_rows` setting such that the rendered panel (which takes
-    /// `(terminal_panel_rows + 2) * line_height` pixels) fills the editor area
-    /// above the status line.
+    /// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
+    ///
+    /// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh`
+    /// pixels (2 chrome rows = bottom-panel tab bar + terminal toolbar). The
+    /// editor's own tab bar / breadcrumb rows are **not** reserved — under
+    /// maximize they're hidden behind the terminal, matching VSCode's
+    /// "Maximize Panel Size".
     ///
     /// Mirrors the geometry in `gtk::draw::draw_frame`:
     ///   editor_bounds.height = da_height
-    ///                        - status_bar_height
-    ///                        - debug_toolbar_px
-    ///                        - qf_px
-    ///                        - term_px
-    ///                        - separated_status_px
-    /// So the largest `term_px` that lets editor_bounds.height reach 0 is
-    /// `da_height - status - debug_toolbar - qf - separated_status`.
-    /// The tab bar also has to fit, but it lives inside `editor_bounds`; since
-    /// the tab row is conventionally always visible, we subtract it too.
+    ///                        - status_bar_height     (always)
+    ///                        - debug_toolbar_px      (if visible)
+    ///                        - qf_px                 (if quickfix open)
+    ///                        - term_px               ← we want this maximal
+    ///                        - separated_status_px   (per-window + !slat + term)
     fn terminal_target_maximize_rows(&self) -> u16 {
         let lh = self.cached_line_height.max(1.0);
         if let Some(da) = self.drawing_area.borrow().as_ref() {
             let da_h = da.height() as f64;
             let engine = self.engine.borrow();
-            // Mirror draw.rs constants.
-            let tab_row_height = (lh * 1.6).ceil();
-            let tab_bar_height = if engine.settings.breadcrumbs {
-                tab_row_height + lh
-            } else {
-                tab_row_height
-            };
             let wildmenu_px = if engine.wildmenu_items.is_empty() {
                 0.0
             } else {
@@ -10087,12 +10079,9 @@ impl App {
             let has_separated = per_window_status
                 && !engine.settings.status_line_above_terminal;
             let separated_status_px = if has_separated { lh } else { 0.0 };
-            let chrome = status_bar_height
-                + tab_bar_height
-                + qf_px
-                + debug_toolbar_px
-                + separated_status_px;
-            // terminal panel occupies (rows + 2) * lh, so:
+            let chrome =
+                status_bar_height + qf_px + debug_toolbar_px + separated_status_px;
+            // Reserve at least 5 content rows even on very small windows.
             let available = (da_h - chrome).max(lh * 7.0);
             let term_rows = (available / lh).floor() as u16;
             term_rows.saturating_sub(2).max(5)

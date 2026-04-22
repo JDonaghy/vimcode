@@ -99,28 +99,26 @@ use crate::render::{
 
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
-/// Compute the target `terminal_panel_rows` when maximizing in the TUI so the
-/// panel fills all rows the editor could give up, leaving only the editor's
-/// tab bar + breadcrumb chrome, the menu bar (if any), quickfix (if any), the
-/// debug toolbar (if any), the wildmenu (if any), and the global status + cmd
-/// lines. Mirrors the chrome-row math in the main event-loop layout block.
+/// Compute the target `terminal_panel_rows` when maximizing in the TUI: the
+/// panel takes every editor row it can. We intentionally **don't** reserve
+/// space for the editor's own tab bar / breadcrumbs — when the panel is
+/// maximized those are hidden behind the terminal (matching VSCode's
+/// "Maximize Panel Size"). Only status bar, command line, bottom-panel tabs,
+/// terminal toolbar, plus any menu/qf/dbg/wildmenu rows are reserved.
 pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
     let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
     let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
     let wm_row: u16 = if !engine.wildmenu_items.is_empty() { 1 } else { 0 };
-    let has_single_tab = engine.active_group().tabs.len() <= 1;
-    let tab_bar_rows: u16 = if engine.settings.hide_single_tab && has_single_tab {
-        if engine.settings.breadcrumbs { 1 } else { 0 }
-    } else if engine.settings.breadcrumbs {
-        2
-    } else {
-        1
-    };
-    // Chrome: status(1) + cmd(1) + terminal tab bar(1) + terminal header(1).
+    // Chrome rows that must remain visible:
+    //   status(1) + cmd(1) + bottom-panel tabs(1) + terminal toolbar(1) = 4
+    // The `+ 2` inside `trm_rows = terminal_panel_rows + 2` already accounts
+    // for the bottom-panel tabs + terminal toolbar, so we only subtract
+    // status + cmd + the extra chrome rows from the screen before handing
+    // `(target + 2)` back to the layout.
     let fixed_chrome: u16 = 4;
     screen_h
-        .saturating_sub(menu_row + qf_rows + dbg_row + wm_row + tab_bar_rows + fixed_chrome)
+        .saturating_sub(menu_row + qf_rows + dbg_row + wm_row + fixed_chrome)
         .max(5)
 }
 
