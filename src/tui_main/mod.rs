@@ -105,6 +105,14 @@ use crate::render::{
 /// maximized those are hidden behind the terminal (matching VSCode's
 /// "Maximize Panel Size"). Only status bar, command line, bottom-panel tabs,
 /// terminal toolbar, plus any menu/qf/dbg/wildmenu rows are reserved.
+/// Return the effective content-row count for the terminal panel in the TUI.
+/// Equivalent to `engine.effective_terminal_panel_rows(target)` where `target`
+/// is derived from the current screen height.
+pub(super) fn effective_terminal_panel_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
+    let target = terminal_target_maximize_rows_tui(engine, screen_h);
+    engine.effective_terminal_panel_rows(target)
+}
+
 pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
     let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };

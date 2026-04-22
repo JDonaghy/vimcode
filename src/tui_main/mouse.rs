@@ -810,7 +810,7 @@ pub(super) fn handle_mouse(
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
                 let strip_rows: u16 = if engine.terminal_open {
-                    engine.session.terminal_panel_rows + 1
+                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
                 } else {
                     0
                 };
@@ -1022,7 +1022,7 @@ pub(super) fn handle_mouse(
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
                 let strip_rows: u16 = if engine.terminal_open {
-                    engine.session.terminal_panel_rows + 1
+                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
                 } else {
                     0
                 };
@@ -1048,12 +1048,12 @@ pub(super) fn handle_mouse(
                     && !engine.dap_output_lines.is_empty();
                 if debug_output_open {
                     let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                    let panel_height = engine.session.terminal_panel_rows + 2;
+                    let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
                     let panel_y =
                         term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
                     let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
                     if row >= panel_y && row < panel_end {
-                        let content_rows = engine.session.terminal_panel_rows as usize;
+                        let content_rows = super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
                         let total = engine.dap_output_lines.len();
                         let max_scroll = total.saturating_sub(content_rows);
                         if matches!(ev.kind, MouseEventKind::ScrollUp) {
@@ -1184,7 +1184,7 @@ pub(super) fn handle_mouse(
         {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
             let strip_rows: u16 = if engine.terminal_open {
-                engine.session.terminal_panel_rows + 1
+                super::effective_terminal_panel_rows_tui(engine, term_height) + 1
             } else {
                 0
             };
@@ -1697,7 +1697,7 @@ pub(super) fn handle_mouse(
     if engine.debug_toolbar_visible {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
+            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
         } else {
             0
         };
@@ -1734,7 +1734,7 @@ pub(super) fn handle_mouse(
             } else {
                 1
             };
-            let panel_height = engine.session.terminal_panel_rows + 2;
+            let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
             // Bottom panel y = term_height - cmd(1) - status - wildmenu - debug_toolbar - panel
             let tab_bar_row = term_height
                 .saturating_sub(1 + global_status_rows + wildmenu_rows + dt_rows + panel_height);
@@ -1765,18 +1765,18 @@ pub(super) fn handle_mouse(
             && !engine.dap_output_lines.is_empty();
         if debug_output_open {
             let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let panel_height = engine.session.terminal_panel_rows + 2;
+            let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
             let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
             let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
             if row >= panel_y && row < panel_end {
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
                 let sb_col = term_width.saturating_sub(1);
                 let total = engine.dap_output_lines.len();
-                let content_rows = engine.session.terminal_panel_rows as usize;
+                let content_rows = super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
                 if total > content_rows && col == sb_col && row >= panel_y + 2 {
                     // Click on scrollbar track — start drag.
                     let track_start = panel_y + 2; // after tab-bar row + header row
-                    let track_len = engine.session.terminal_panel_rows;
+                    let track_len = super::effective_terminal_panel_rows_tui(engine, term_height);
                     *dragging_debug_output_sb = Some((track_start, track_len, total));
                 }
                 return sidebar_width;
@@ -1787,7 +1787,7 @@ pub(super) fn handle_mouse(
     if sep_status_rows > 0 {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
+            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
         } else {
             0
         };
@@ -1825,7 +1825,7 @@ pub(super) fn handle_mouse(
     {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
+            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
         } else {
             0
         };
