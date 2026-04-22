@@ -52,9 +52,13 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.8** — `TextDisplay` primitive scaffolding (no migration) | ✅ Done | `ff6b13f` | `quadraui-phase-a8-text-display` | any |
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
 | **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
-| Phase B — extract & stabilise API | ⬜ Later | — | — | any |
+| **Phase B.1** — `UiEvent` + `Accelerator` + `Backend` trait scaffolding | ✅ Done | _tbd_ | `quadraui-phase-b1-backend-trait` | any |
+| Phase B.2 — pilot migration: terminal maximize to `Accelerator::Global` | ⬜ Next | — | `quadraui-phase-b2-maximize-pilot` | any |
+| Phase B.3 — layout primitives (`Panel`, `Split`, `Tabs`, `MenuBar`, `Modal`) | ⬜ After B.2 | — | `quadraui-phase-b3-layout` | any |
+| Phase B.4+ — migrate remaining vimcode subsystems to UiEvent | ⬜ After B.3 | — | `quadraui-phase-b4-*` | any |
+| Phase B.5 — Postman-class validation app (#169) | ⬜ After B.3/B.4 | — | _new workspace member_ | any |
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
-| Phase D — polish + k8s validation app | ⬜ Later | — | — | any |
+| Phase D — polish + k8s validation app (#145) | ⬜ Later | — | — | any |
 
 **All required platform-specific stages are now done.** A.1b/A.2b/
 A.3c-2/A.4b/A.5b shipped on Linux GTK; A.1c (Session 314) and A.2c

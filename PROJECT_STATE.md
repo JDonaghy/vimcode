@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 21, 2026 (Session 318 — chrome helper + APP_ARCHITECTURE.md) | **Tests:** 5273 total (full `cargo test --workspace --no-default-features`); vimcode 5249 + quadraui 24
+**Last updated:** Apr 22, 2026 (Session 319 — Phase B.1 Backend trait scaffold) | **Tests:** 5295 total (full `cargo test --workspace --no-default-features`); vimcode 5249 + quadraui 46
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,20 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 319 — Phase B.1 Backend trait scaffolding (#169 blocker):**
+
+1. **Pure additive quadraui types.** Three new files — `quadraui/src/event.rs`, `quadraui/src/accelerator.rs`, `quadraui/src/backend.rs` — plus re-exports in `lib.rs`. No vimcode runtime changes; no migration. The abstractions coexist with existing per-backend dispatch as designed in `BACKEND_TRAIT_PROPOSAL.md` §5 Phase B.1.
+2. **`UiEvent` enum (~60 variants/fields).** Backend-neutral event data covering input (`Accelerator`, `KeyPressed`, `CharTyped`), mouse (`MouseDown/Up/Moved/Entered/Left/DoubleClick/Scroll`), window (`WindowResized/Close/Focused/DpiChanged`), files (`FilesDropped/ClipboardPaste`), primitive-specific events re-wrapped (`Tree`, `List`, `Form`, `Palette`, `TabBar`, `StatusBar`, `ActivityBar`, `Terminal`, `TextDisplay`), and `BackendNative` escape hatch. All `Debug + Clone + PartialEq + Serialize + Deserialize` per §2 invariants. Supporting types: `Key`/`NamedKey`, `MouseButton`, `ButtonMask`, `Point`, `Rect`, `ScrollDelta`, `Viewport`, `BackendNativeEvent`.
+3. **`Accelerator` + `KeyBinding` + dual-format parser.** 13 universal bindings (`Save`, `Copy`, `Undo`, `Find`, ...) that render platform-appropriately, plus `KeyBinding::Literal(String)` that accepts **both** vim-style (`<C-S-t>`) and plus-style (`Ctrl+Shift+T`) input — first character dispatches. `AcceleratorScope` variants for `Global`/`Widget`/`Mode`. `Platform` enum and `render_accelerator`/`render_binding` helpers produce `⌘⇧T` on macOS, `Ctrl+Shift+T` elsewhere.
+4. **`Backend` trait + `PlatformServices` trait.** Frame lifecycle (`begin_frame`/`end_frame`), event polling (`poll_events`/`wait_events`), accelerator registration (`register_accelerator`/`unregister_accelerator`), services access, and **9 per-primitive draw methods** (`draw_tree`/`draw_list`/`draw_form`/.../`draw_text_display`) per Decision 2 (B). No `AnyPrimitive` enum. `Clipboard` sub-trait, `FileDialogOptions`, `Notification` support types.
+5. **22 new lib tests in `accelerator.rs`** covering both parser formats, modifier aliases (`Cmd`/`Command`/`Super`/`Win`/`Meta`), case-insensitivity, rejection cases, render platform-parity, serde round-trip. Quadraui test count: 24 → 46. Workspace total: 5273 → 5295.
+6. **Documentation updates.** `PLAN.md` stage table gains Phase B.1 (Done) + B.2/B.3/B.4/B.5 rows; `PROJECT_STATE.md` session note.
+7. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy --workspace --no-default-features -- -D warnings` clean; `cargo test --workspace --no-default-features` 5295/0/19.
+8. **What this PR does NOT do.** Zero vimcode runtime change. No existing code migrated. No behaviour change for users. Pure additive — the new types sit unused until Phase B.2 (terminal maximize pilot migration) lands.
+9. **Path B landing.** Branch `quadraui-phase-b1-backend-trait` off develop; pushed for PR review.
+
+---
 
 **Session 318 — Closing the "where does app logic go?" gap:**
 
