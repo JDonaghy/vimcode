@@ -99,6 +99,31 @@ use crate::render::{
 
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
+/// Compute the target `terminal_panel_rows` when maximizing in the TUI so the
+/// panel fills all rows the editor could give up, leaving only the editor's
+/// tab bar + breadcrumb chrome, the menu bar (if any), quickfix (if any), the
+/// debug toolbar (if any), the wildmenu (if any), and the global status + cmd
+/// lines. Mirrors the chrome-row math in the main event-loop layout block.
+pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
+    let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+    let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wm_row: u16 = if !engine.wildmenu_items.is_empty() { 1 } else { 0 };
+    let has_single_tab = engine.active_group().tabs.len() <= 1;
+    let tab_bar_rows: u16 = if engine.settings.hide_single_tab && has_single_tab {
+        if engine.settings.breadcrumbs { 1 } else { 0 }
+    } else if engine.settings.breadcrumbs {
+        2
+    } else {
+        1
+    };
+    // Chrome: status(1) + cmd(1) + terminal tab bar(1) + terminal header(1).
+    let fixed_chrome: u16 = 4;
+    screen_h
+        .saturating_sub(menu_row + qf_rows + dbg_row + wm_row + tab_bar_rows + fixed_chrome)
+        .max(5)
+}
+
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
     let key_char = match code {
         KeyCode::Char(c) => Some(c),
@@ -2845,14 +2870,7 @@ fn event_loop(
                             let size = terminal.size().ok();
                             let screen_h = size.map(|s| s.height).unwrap_or(24);
                             let cols = size.map(|s| s.width).unwrap_or(80);
-                            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                            // Layout: menu + editor_tab(1) + editor_content + qf + tab_bar(1) +
-                            //         header(1) + terminal_content + status(1) + cmd(1)
-                            // When maximized we collapse editor_content to 0, leaving 5 fixed
-                            // chrome rows plus menu + qf.
-                            let target_rows =
-                                screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                            let target_rows = terminal_target_maximize_rows_tui(engine, screen_h);
                             engine.toggle_terminal_maximize(target_rows);
                             if engine.terminal_panes.is_empty() {
                                 engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
@@ -3549,10 +3567,7 @@ fn event_loop(
                             let size = terminal.size().ok();
                             let screen_h = size.map(|s| s.height).unwrap_or(24);
                             let cols = size.map(|s| s.width).unwrap_or(80);
-                            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                            let target_rows =
-                                screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                            let target_rows = terminal_target_maximize_rows_tui(engine, screen_h);
                             engine.toggle_terminal_maximize(target_rows);
                             if engine.terminal_panes.is_empty() {
                                 engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);

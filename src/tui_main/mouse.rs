@@ -1851,9 +1851,7 @@ pub(super) fn handle_mouse(
                     // Maximize button (2 cols left of close)
                     let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
                     let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                    let target_rows = screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                    let target_rows = super::terminal_target_maximize_rows_tui(engine, screen_h);
                     engine.toggle_terminal_maximize(target_rows);
                     engine.terminal_resize(full_cols, engine.session.terminal_panel_rows);
                 } else if col >= term_width.saturating_sub(6) {
