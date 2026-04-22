@@ -117,7 +117,11 @@ pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) 
     let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
     let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wm_row: u16 = if !engine.wildmenu_items.is_empty() { 1 } else { 0 };
+    let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
     // Chrome rows that must remain visible:
     //   status(1) + cmd(1) + bottom-panel tabs(1) + terminal toolbar(1) = 4
     // The `+ 2` inside `trm_rows = terminal_panel_rows + 2` already accounts

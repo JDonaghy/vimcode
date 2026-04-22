@@ -1048,12 +1048,14 @@ pub(super) fn handle_mouse(
                     && !engine.dap_output_lines.is_empty();
                 if debug_output_open {
                     let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                    let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
+                    let panel_height =
+                        super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
                     let panel_y =
                         term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
                     let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
                     if row >= panel_y && row < panel_end {
-                        let content_rows = super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
+                        let content_rows =
+                            super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
                         let total = engine.dap_output_lines.len();
                         let max_scroll = total.saturating_sub(content_rows);
                         if matches!(ev.kind, MouseEventKind::ScrollUp) {
@@ -1772,7 +1774,8 @@ pub(super) fn handle_mouse(
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
                 let sb_col = term_width.saturating_sub(1);
                 let total = engine.dap_output_lines.len();
-                let content_rows = super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
+                let content_rows =
+                    super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
                 if total > content_rows && col == sb_col && row >= panel_y + 2 {
                     // Click on scrollbar track — start drag.
                     let track_start = panel_y + 2; // after tab-bar row + header row

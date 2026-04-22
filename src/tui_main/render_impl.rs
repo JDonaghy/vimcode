@@ -53,12 +53,11 @@ pub(super) fn build_screen_for_tui(
     };
     let content_cols = area.width.saturating_sub(ab_width + sidebar_cols);
     let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
-    let tui_tab_bar_height =
-        if engine.settings.breadcrumbs && !engine.terminal_maximized {
-            2.0
-        } else {
-            1.0
-        };
+    let tui_tab_bar_height = if engine.settings.breadcrumbs && !engine.terminal_maximized {
+        2.0
+    } else {
+        1.0
+    };
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
     debug_log!(

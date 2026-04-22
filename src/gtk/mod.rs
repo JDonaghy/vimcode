@@ -3409,11 +3409,8 @@ impl SimpleComponent for App {
                 {
                     let e = engine_for_resize.borrow();
                     if e.terminal_maximized && !e.terminal_panes.is_empty() {
-                        let target = gtk_terminal_target_maximize_rows(
-                            &e,
-                            height as f64,
-                            line_height,
-                        );
+                        let target =
+                            gtk_terminal_target_maximize_rows(&e, height as f64, line_height);
                         let effective = e.effective_terminal_panel_rows(target);
                         let cols = (width as f64 / char_width).floor() as u16;
                         drop(e);
@@ -5992,14 +5989,10 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     // Must use the *effective* rows so hit-testing lines up
                     // with where the panel is actually drawn when maximized.
-                    let target = gtk_terminal_target_maximize_rows(
-                        &engine,
-                        height,
-                        self.cached_line_height,
-                    );
+                    let target =
+                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
                     let effective_rows = engine.effective_terminal_panel_rows(target);
-                    let term_px =
-                        (effective_rows as f64 + 2.0) * self.cached_line_height;
+                    let term_px = (effective_rows as f64 + 2.0) * self.cached_line_height;
                     let global_status_rows = if engine.settings.window_status_line {
                         0.0
                     } else {
@@ -6550,11 +6543,8 @@ impl App {
             if term_rows > 0 {
                 let term_px = {
                     let engine = self.engine.borrow();
-                    let target = gtk_terminal_target_maximize_rows(
-                        &engine,
-                        height,
-                        self.cached_line_height,
-                    );
+                    let target =
+                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
                     let effective = engine.effective_terminal_panel_rows(target);
                     (effective as f64 + 2.0) * self.cached_line_height
                 };
@@ -6590,14 +6580,10 @@ impl App {
                 if engine.terminal_open || engine.bottom_panel_open {
                     // Must use the *effective* rows so hit-testing lines up
                     // with where the panel is actually drawn when maximized.
-                    let target = gtk_terminal_target_maximize_rows(
-                        &engine,
-                        height,
-                        self.cached_line_height,
-                    );
+                    let target =
+                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
                     let effective_rows = engine.effective_terminal_panel_rows(target);
-                    let term_px =
-                        (effective_rows as f64 + 2.0) * self.cached_line_height;
+                    let term_px = (effective_rows as f64 + 2.0) * self.cached_line_height;
                     let global_status_rows = if engine.settings.window_status_line {
                         0.0
                     } else {
@@ -7243,16 +7229,11 @@ impl App {
                 // Create a pane if none exists; otherwise resize the existing
                 // PTY to the new effective content rows.
                 let needs_new_tab = self.engine.borrow().terminal_panes.is_empty();
-                let effective = self
-                    .engine
-                    .borrow()
-                    .effective_terminal_panel_rows(target);
+                let effective = self.engine.borrow().effective_terminal_panel_rows(target);
                 if needs_new_tab {
                     self.engine.borrow_mut().terminal_new_tab(cols, effective);
                 } else {
-                    self.engine
-                        .borrow_mut()
-                        .terminal_resize(cols, effective);
+                    self.engine.borrow_mut().terminal_resize(cols, effective);
                 }
                 self.draw_needed.set(true);
             }
@@ -10150,9 +10131,12 @@ pub(super) fn gtk_terminal_target_maximize_rows(
     } else {
         0.0
     };
-    let debug_toolbar_px = if engine.debug_toolbar_visible { lh } else { 0.0 };
-    let has_separated =
-        per_window_status && !engine.settings.status_line_above_terminal;
+    let debug_toolbar_px = if engine.debug_toolbar_visible {
+        lh
+    } else {
+        0.0
+    };
+    let has_separated = per_window_status && !engine.settings.status_line_above_terminal;
     let separated_status_px = if has_separated { lh } else { 0.0 };
     let tab_row_height = (lh * 1.6).ceil();
     let chrome =
