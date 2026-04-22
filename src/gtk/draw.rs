@@ -417,7 +417,25 @@ pub(super) fn draw_editor(
 
     // 5g. Draw bottom panel (Terminal or Debug Output) with a tab bar.
     if term_px > 0.0 {
-        let term_y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
+        // When maximized, snap the panel up to the editor tab bar's bottom
+        // edge. Without this, the row-based `PanelChromeDesc` helper reserves
+        // `ceil(1.6) = 2` row-units for the editor tab bar while GTK's
+        // actual `tab_bar_height = ceil(1.6 * line_height)` is only 1.6 lh —
+        // the 0.4 lh slack leaks through as a strip of editor content above
+        // the terminal, and shows up as a partial first line ("25 …").
+        let (term_y, term_px) = if engine.terminal_maximized {
+            let snapped_y = tab_bar_height;
+            let snapped_px = (height as f64
+                - status_bar_height
+                - debug_toolbar_px
+                - separated_status_px
+                - snapped_y)
+                .max(line_height);
+            (snapped_y, snapped_px)
+        } else {
+            let y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
+            (y, term_px)
+        };
         // Tab bar row (1 line high) at the top of the bottom panel area.
         draw_bottom_panel_tabs(
             cr,
