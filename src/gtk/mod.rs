@@ -6090,16 +6090,19 @@ impl App {
                     let tab_count = self.engine.borrow().terminal_panes.len();
                     let tab_area_px =
                         tab_count as f64 * TERMINAL_TAB_COLS as f64 * self.cached_char_width;
-                    // Right-aligned buttons (3 chars each): + ⊞ ×
+                    // Right-aligned buttons (2 cols each): + ⊞ □ ×
                     let close_x = width - self.cached_char_width * 2.0;
-                    let split_x = width - self.cached_char_width * 4.0;
-                    let add_x = width - self.cached_char_width * 6.0;
+                    let max_x = width - self.cached_char_width * 4.0;
+                    let split_x = width - self.cached_char_width * 6.0;
+                    let add_x = width - self.cached_char_width * 8.0;
                     if x < tab_area_px && self.cached_char_width > 0.0 {
                         let idx =
                             (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width)) as usize;
                         sender.input(Msg::TerminalSwitchTab(idx));
                     } else if x >= close_x {
                         sender.input(Msg::TerminalCloseActiveTab);
+                    } else if x >= max_x {
+                        sender.input(Msg::ToggleTerminalMaximize);
                     } else if x >= split_x {
                         sender.input(Msg::TerminalToggleSplit);
                     } else if x >= add_x {

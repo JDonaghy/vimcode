@@ -444,6 +444,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
 - `Ctrl-Shift-T` — toggle **terminal maximize**: the panel grows to fill the entire editor area. Press again to restore the previous height. Works in TUI and GTK (Win-GUI supports the binding but panel geometry may lag until the next repaint)
+- Click the `󰊗` / `󰊓` icon in the terminal toolbar (between split `󰤼` and close `󰅖`) to toggle maximize with the mouse
 - `:term` / `:terminal` — open a **new terminal tab** (always spawns a fresh shell, even if the panel is already open)
 - `:TerminalMaximize` / `:TerminalMax` — toggle maximize from the ex-command line
 - The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions. Closing the terminal while maximized restores the saved height
@@ -467,7 +468,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 - **Horizontal split** — click `󰤼` in the toolbar (or `Ctrl-W` when split is active) to toggle a side-by-side two-pane view:
   - Click either pane or press `Ctrl-W` to switch keyboard focus between panes
   - Drag the `│` divider left/right to resize the panes; both PTYs are resized on mouse release
-- **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
+- **Nerd Font toolbar** — tab strip + split (`󰤼`), maximize (`󰊗` / `󰊓` when maximized), and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions
 - When a shell exits (Ctrl-D, `exit`, etc.) its tab closes immediately; the panel closes automatically when the last tab exits; clicking outside the terminal returns focus to the editor

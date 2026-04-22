@@ -3685,6 +3685,8 @@ pub(super) fn draw_quickfix_panel(
 /// Nerd Font icons for the terminal panel toolbar.
 pub(super) const NF_CLOSE: &str = "󰅖"; // nf-md-close_box
 pub(super) const NF_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
+pub(super) const NF_MAXIMIZE: &str = "󰊗"; // nf-md-fullscreen
+pub(super) const NF_UNMAXIMIZE: &str = "󰊓"; // nf-md-fullscreen_exit
 
 /// Draw the integrated terminal bottom panel.
 #[allow(clippy::too_many_arguments)]
@@ -3770,9 +3772,14 @@ pub(super) fn draw_terminal_panel(
             pangocairo::show_layout(cr, layout);
         }
 
-        // Right-aligned toolbar buttons: + ⊞ ×  (each ~2 chars wide)
+        // Right-aligned toolbar buttons: + ⊞ □ ×   (add, split, max, close)
         cr.set_source_rgb(fr, fg2, fb);
-        let btn_text = format!("+ {} {}", NF_SPLIT, NF_CLOSE);
+        let maxicon = if panel.maximized {
+            NF_UNMAXIMIZE
+        } else {
+            NF_MAXIMIZE
+        };
+        let btn_text = format!("+ {} {} {}", NF_SPLIT, maxicon, NF_CLOSE);
         layout.set_text(&btn_text);
         let (btn_w, _) = layout.pixel_size();
         cr.move_to(x + w - btn_w as f64 - 4.0, y);

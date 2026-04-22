@@ -1178,6 +1178,9 @@ pub struct TerminalPanel {
     pub split_left_cols: u16,
     /// Which pane has keyboard focus in split view: 0 = left, 1 = right.
     pub split_focus: u8,
+    /// Whether the panel is currently maximized (fills editor area).
+    /// Backends can render a different icon glyph based on this.
+    pub maximized: bool,
 }
 
 // ─── Menu bar / debug toolbar ─────────────────────────────────────────────────
@@ -1959,6 +1962,10 @@ pub enum UiAction {
     /// Click terminal close (×) button.
     /// Must call: `engine.terminal_close_active_tab()`
     TerminalCloseButton,
+    /// Click terminal maximize (□) button.
+    /// Must call: `engine.toggle_terminal_maximize(target_rows)`
+    /// followed by `engine.terminal_resize(cols, engine.session.terminal_panel_rows)`.
+    TerminalMaximizeButton,
     /// Click in split terminal pane → switch focus.
     /// Must set: `engine.terminal_active = 0 or 1`
     TerminalSplitPaneClick,
@@ -2003,6 +2010,7 @@ pub fn all_required_ui_actions() -> Vec<UiAction> {
         UiAction::TerminalSplitButton,
         UiAction::TerminalAddButton,
         UiAction::TerminalCloseButton,
+        UiAction::TerminalMaximizeButton,
         UiAction::TerminalSplitPaneClick,
         UiAction::ActivityBarClick,
         UiAction::ActivityBarSettingsClick,
@@ -2051,6 +2059,8 @@ pub fn collect_ui_actions_tui() -> Vec<UiAction> {
         UiAction::TerminalAddButton,
         // mouse.rs — terminal_close_active_tab
         UiAction::TerminalCloseButton,
+        // mouse.rs — toggle_terminal_maximize button on toolbar
+        UiAction::TerminalMaximizeButton,
         // mouse.rs:1650 — terminal split pane click
         UiAction::TerminalSplitPaneClick,
         // panels.rs — activity bar icon click
@@ -2103,6 +2113,8 @@ pub fn collect_ui_actions_wingui() -> Vec<UiAction> {
         UiAction::TerminalAddButton,
         // mod.rs — terminal_close_active_tab
         UiAction::TerminalCloseButton,
+        // mod.rs — toggle_terminal_maximize button on toolbar
+        UiAction::TerminalMaximizeButton,
         // mod.rs — terminal_active = 0/1
         UiAction::TerminalSplitPaneClick,
         // mod.rs — sidebar panel toggle
@@ -6245,6 +6257,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                 left_pane.cols
             },
             split_focus: engine.terminal_active as u8,
+            maximized: engine.terminal_maximized,
         });
     }
 
@@ -6271,6 +6284,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         split_left_rows: None,
         split_left_cols: 0,
         split_focus: 0,
+        maximized: engine.terminal_maximized,
     })
 }
 
@@ -10202,6 +10216,10 @@ mod tests {
             (
                 UiAction::TerminalCloseButton,
                 &["terminal_close_active_tab"],
+            ),
+            (
+                UiAction::TerminalMaximizeButton,
+                &["toggle_terminal_maximize"],
             ),
             (UiAction::TerminalSplitPaneClick, &["terminal_active"]),
             // Activity bar: check for panel toggle dispatch

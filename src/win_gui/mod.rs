@@ -4378,12 +4378,28 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     state.engine.terminal_close_active_tab();
                     state.engine.terminal_has_focus = true;
                 } else if px >= client_w - cw * 4.0 {
+                    // Maximize button — toggle panel maximize
+                    let cols = ((client_w - editor_left) / cw).floor() as u16;
+                    let lh = state.line_height.max(1.0);
+                    let mut rc = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(hwnd, &mut rc);
+                    }
+                    let height = (rc.bottom - rc.top) as f32;
+                    let total_rows = (height / lh).floor() as u16;
+                    let target = total_rows.saturating_sub(3).max(5);
+                    state.engine.toggle_terminal_maximize(target);
+                    state
+                        .engine
+                        .terminal_resize(cols, state.engine.session.terminal_panel_rows);
+                    state.engine.terminal_has_focus = true;
+                } else if px >= client_w - cw * 6.0 {
                     // Split button — toggle terminal split
                     let full_cols = ((client_w - editor_left) / cw).floor() as u16;
                     let rows = state.engine.session.terminal_panel_rows;
                     state.engine.terminal_toggle_split(full_cols, rows);
                     state.engine.terminal_has_focus = true;
-                } else if px >= client_w - cw * 6.0 {
+                } else if px >= client_w - cw * 8.0 {
                     // Add button — new terminal tab
                     let cols = ((client_w - editor_left) / cw).floor() as u16;
                     let rows = state.engine.session.terminal_panel_rows;

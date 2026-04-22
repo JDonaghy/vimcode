@@ -4165,15 +4165,28 @@ impl<'a> DrawContext<'a> {
             tx += label.chars().count() as f32 * cw;
         }
 
-        // Toolbar buttons (right-aligned): + split × ...
+        // Toolbar buttons (right-aligned): + split max × ...
         {
             let nf = crate::icons::nerd_fonts_enabled();
             let btn_close = if nf { "×" } else { "x" };
             let btn_split = if nf { "󰤼" } else { "⊞" };
+            let btn_max = if term.maximized {
+                if nf {
+                    "󰊓"
+                } else {
+                    "["
+                }
+            } else if nf {
+                "󰊗"
+            } else {
+                "]"
+            };
             let btn_add = "+";
-            // Draw right-to-left: × split +
+            // Draw right-to-left: × max split +
             let mut bx = width - cw * 2.0;
             self.draw_text(btn_close, bx, panel_y, self.theme.line_number_fg);
+            bx -= cw * 2.0;
+            self.draw_text(btn_max, bx, panel_y, self.theme.line_number_fg);
             bx -= cw * 2.0;
             self.draw_text(btn_split, bx, panel_y, self.theme.line_number_fg);
             bx -= cw * 2.0;

@@ -3717,6 +3717,8 @@ pub(super) fn render_quickfix_panel(
 /// Nerd Font icons for the terminal toolbar.
 pub(super) const NF_TERMINAL_CLOSE: &str = "󰅖"; // nf-md-close_box
 pub(super) const NF_TERMINAL_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
+pub(super) const NF_TERMINAL_MAXIMIZE: &str = "󰊗"; // nf-md-fullscreen
+pub(super) const NF_TERMINAL_UNMAXIMIZE: &str = "󰊓"; // nf-md-fullscreen_exit
 
 pub(super) fn render_terminal_panel(
     buf: &mut ratatui::buffer::Buffer,
@@ -3792,8 +3794,13 @@ pub(super) fn render_terminal_panel(
             }
         }
 
-        // Right-aligned icons: + ⊞ ×
-        let icons = format!("+ {} {}", NF_TERMINAL_SPLIT, NF_TERMINAL_CLOSE);
+        // Right-aligned icons: + ⊞ □ ×   (add, split, maximize, close)
+        let maxicon = if panel.maximized {
+            NF_TERMINAL_UNMAXIMIZE
+        } else {
+            NF_TERMINAL_MAXIMIZE
+        };
+        let icons = format!("+ {} {} {}", NF_TERMINAL_SPLIT, maxicon, NF_TERMINAL_CLOSE);
         let icon_chars: Vec<char> = icons.chars().collect();
         let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
         for (i, &ch) in icon_chars.iter().enumerate() {

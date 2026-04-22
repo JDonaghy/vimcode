@@ -1848,11 +1848,20 @@ pub(super) fn handle_mouse(
                     // Close icon (rightmost 2 cols)
                     engine.terminal_close_active_tab();
                 } else if col >= term_width.saturating_sub(4) {
-                    // Split button (2 cols left of close)
+                    // Maximize button (2 cols left of close)
+                    let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+                    let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                    let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                    let target_rows = screen_h.saturating_sub(menu_row + qf_rows + 5).max(5);
+                    engine.toggle_terminal_maximize(target_rows);
+                    engine.terminal_resize(full_cols, engine.session.terminal_panel_rows);
+                } else if col >= term_width.saturating_sub(6) {
+                    // Split button (2 cols left of maximize)
                     let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
                     let rows = engine.session.terminal_panel_rows;
                     engine.terminal_toggle_split(full_cols, rows);
-                } else if col >= term_width.saturating_sub(6) {
+                } else if col >= term_width.saturating_sub(8) {
                     // Add button (2 cols left of split)
                     let cols = terminal_size.map(|s| s.width).unwrap_or(80);
                     let rows = engine.session.terminal_panel_rows;
