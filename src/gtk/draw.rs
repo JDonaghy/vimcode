@@ -485,7 +485,10 @@ pub(super) fn draw_editor(
     );
 
     // 5j. Draw per-window status bars (after scrollbars so they paint on top)
-    if per_window_status {
+    //     When terminal_maximized, the editor area is collapsed to just the
+    //     tab bar; drawing the per-window status line there would overlap the
+    //     terminal toolbar below, so we skip it entirely.
+    if per_window_status && !engine.terminal_maximized {
         for rendered_window in &screen.windows {
             if let Some(ref status) = rendered_window.status_line {
                 let wr = &rendered_window.rect;

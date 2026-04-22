@@ -10081,14 +10081,20 @@ impl App {
             let has_separated = per_window_status
                 && !engine.settings.status_line_above_terminal;
             let separated_status_px = if has_separated { lh } else { 0.0 };
-            // Editor tab row stays visible; breadcrumbs are hidden behind the
-            // panel when maximized.
+            // Reserve space for the editor tab bar (+ breadcrumbs if enabled)
+            // so they render cleanly. Matches draw_frame's tab_bar_height so
+            // window rects don't underflow and overlap the terminal panel.
             let tab_row_height = (lh * 1.6).ceil();
+            let tab_bar_height = if engine.settings.breadcrumbs {
+                tab_row_height + lh
+            } else {
+                tab_row_height
+            };
             let chrome = status_bar_height
                 + qf_px
                 + debug_toolbar_px
                 + separated_status_px
-                + tab_row_height;
+                + tab_bar_height;
             // Reserve at least 5 content rows even on very small windows.
             let available = (da_h - chrome).max(lh * 7.0);
             let term_rows = (available / lh).floor() as u16;
