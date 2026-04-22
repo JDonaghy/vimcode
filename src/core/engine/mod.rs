@@ -35,6 +35,13 @@ use std::borrow::Cow;
 
 use super::{Cursor, Mode};
 
+// ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────────────
+// Engine owns the registered accelerators + the dispatch entry point. Backends
+// look up matches via [`Engine::match_accelerator`] in their existing key
+// handlers, then call [`Engine::handle_ui_event`] with viewport context.
+// See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11.
+pub use quadraui::{Accelerator, AcceleratorId, AcceleratorScope, KeyBinding, UiEvent};
+
 /// High bit marker for synthetic "Non-Public Members" group var_refs.
 /// Real DAP adapters use sequential integers that never set this bit.
 const SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000;
@@ -74,6 +81,37 @@ pub enum EngineAction {
     QuitWithError,
     /// Open a URL in the default browser (validated as safe by the engine).
     OpenUrl(String),
+}
+
+/// One entry in the engine's accelerator registry. Caches the parsed form of
+/// `acc.binding` so [`Engine::match_accelerator`] can do a tight comparison
+/// without re-parsing per keypress.
+#[derive(Debug)]
+pub struct RegisteredAccelerator {
+    pub acc: Accelerator,
+    /// Cached parse of `acc.binding` in vimcode's native form
+    /// (`(ctrl, shift, alt, key_name)`). `None` if the binding string is
+    /// unparseable; the registration is still kept so `unregister_accelerator`
+    /// can find it by id.
+    pub parsed: Option<(bool, bool, bool, String)>,
+}
+
+/// Per-call backend context that [`Engine::handle_ui_event`] needs to act on
+/// terminal-oriented accelerators. Backends fill this in from their own native
+/// viewport math (TUI: cells; GTK/Win-GUI: pixel/line_height).
+///
+/// See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11 for the rationale on
+/// why the engine doesn't compute these itself: the per-backend chrome
+/// arithmetic uses native units, and `PanelChromeDesc` is the right place
+/// for backends to derive `terminal_max_rows`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UiEventContext {
+    /// Terminal width in columns/cells (TUI: crossterm size; GTK/Win-GUI:
+    /// `floor(width_px / char_width)`).
+    pub terminal_cols: u16,
+    /// Maximum content rows the terminal panel can fill when maximized.
+    /// Backends compute via `PanelChromeDesc::max_panel_content_rows()`.
+    pub terminal_max_rows: u16,
 }
 
 /// Row-count description of everything that surrounds a bottom panel (terminal,
@@ -3276,6 +3314,13 @@ pub struct Engine {
     file_watcher_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
     /// Paths that have been reported as modified but not yet handled (avoids duplicate dialogs).
     pub file_watcher_pending: HashSet<PathBuf>,
+
+    // ─── Phase B.2: accelerator registry ─────────────────────────────────
+    /// Registered accelerators. Backends call [`Engine::match_accelerator`]
+    /// from their existing key handlers to look up matches; on a match
+    /// they dispatch via [`Engine::handle_ui_event`] with backend-supplied
+    /// viewport context. See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11.
+    pub accelerators: Vec<RegisteredAccelerator>,
 }
 
 impl Engine {
@@ -3667,9 +3712,12 @@ impl Engine {
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
+            accelerators: Vec::new(),
         };
         // Initialize file watcher
         engine.init_file_watcher();
+        // Register Phase B.2 accelerators (terminal maximize for now).
+        engine.register_default_accelerators();
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
@@ -3803,6 +3851,131 @@ impl Engine {
     /// Returns true if there are any completed notifications waiting to be dismissed.
     pub fn has_done_notifications(&self) -> bool {
         self.notifications.iter().any(|n| n.done)
+    }
+
+    // ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────
+    //
+    // Backends look up matches synchronously via `match_accelerator` from
+    // their existing key handlers. On a match they fill a `UiEventContext`
+    // (terminal cols + max-rows in their native units) and call
+    // `handle_ui_event`. The engine owns the dispatch — no per-backend
+    // duplication of the toggle + resize sequence.
+    //
+    // See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11 for the design,
+    // including why this is engine-owned (not backend-owned) for B.2.
+
+    /// Register an accelerator. Re-registration with the same id replaces
+    /// the prior entry (for live rebinding).
+    pub fn register_accelerator(&mut self, acc: Accelerator) {
+        let parsed = match &acc.binding {
+            KeyBinding::Literal(s) => crate::core::settings::parse_key_binding_named(s),
+            // Universal bindings render platform-appropriately; for vimcode
+            // (Linux/Windows; macOS not yet a backend) Ctrl+letter is the
+            // canonical form. parse_key_binding_named handles the vim-style
+            // strings.
+            KeyBinding::Save => crate::core::settings::parse_key_binding_named("<C-s>"),
+            KeyBinding::Open => crate::core::settings::parse_key_binding_named("<C-o>"),
+            KeyBinding::New => crate::core::settings::parse_key_binding_named("<C-n>"),
+            KeyBinding::Close => crate::core::settings::parse_key_binding_named("<C-w>"),
+            KeyBinding::Copy => crate::core::settings::parse_key_binding_named("<C-c>"),
+            KeyBinding::Cut => crate::core::settings::parse_key_binding_named("<C-x>"),
+            KeyBinding::Paste => crate::core::settings::parse_key_binding_named("<C-v>"),
+            KeyBinding::Undo => crate::core::settings::parse_key_binding_named("<C-z>"),
+            KeyBinding::Redo => crate::core::settings::parse_key_binding_named("<C-S-z>"),
+            KeyBinding::SelectAll => crate::core::settings::parse_key_binding_named("<C-a>"),
+            KeyBinding::Find => crate::core::settings::parse_key_binding_named("<C-f>"),
+            KeyBinding::Replace => crate::core::settings::parse_key_binding_named("<C-h>"),
+            KeyBinding::Quit => crate::core::settings::parse_key_binding_named("<C-q>"),
+        };
+        self.accelerators.retain(|r| r.acc.id != acc.id);
+        self.accelerators
+            .push(RegisteredAccelerator { acc, parsed });
+    }
+
+    /// Remove a previously-registered accelerator by id. No-op if not found.
+    /// Public API surface for live rebinding; no internal callers in B.2 yet
+    /// (the integration test suite covers the behaviour).
+    #[allow(dead_code)]
+    pub fn unregister_accelerator(&mut self, id: &AcceleratorId) {
+        self.accelerators.retain(|r| &r.acc.id != id);
+    }
+
+    /// Look up the registered accelerator (if any) that matches the given
+    /// modifier+key combo. First-match-wins, scope-filtered (only `Global`
+    /// scope is honoured in B.2; `Widget` and `Mode` scope are deferred to
+    /// B.3+).
+    ///
+    /// Backends pass the same `(ctrl, shift, alt, key_char, is_tab,
+    /// is_space, is_escape)` shape they already use with
+    /// [`crate::render::matches_key_binding`], so this slots into existing
+    /// key-handler sites without translation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_accelerator(
+        &self,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        key_char: Option<char>,
+        is_tab: bool,
+        is_space: bool,
+        is_escape: bool,
+    ) -> Option<AcceleratorId> {
+        for reg in &self.accelerators {
+            if !matches!(reg.acc.scope, AcceleratorScope::Global) {
+                continue;
+            }
+            let Some((want_ctrl, want_shift, want_alt, ref key_name)) = reg.parsed else {
+                continue;
+            };
+            if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
+                continue;
+            }
+            let matches = match key_name.as_str() {
+                "Tab" | "tab" => is_tab,
+                "Space" | "space" => is_space,
+                "Escape" | "Esc" => is_escape,
+                s if s.chars().count() == 1 => {
+                    let want = s.chars().next().unwrap().to_ascii_lowercase();
+                    key_char
+                        .map(|c| c.to_ascii_lowercase() == want)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if matches {
+                return Some(reg.acc.id.clone());
+            }
+        }
+        None
+    }
+
+    /// Dispatch a `UiEvent` to its engine-side handler. B.2 supports exactly
+    /// one accelerator (`"terminal.toggle_maximize"`); other arms are no-ops
+    /// for now.
+    pub fn handle_ui_event(&mut self, ev: UiEvent, ctx: UiEventContext) {
+        if let UiEvent::Accelerator(id, _mods) = ev {
+            if id.as_str() == "terminal.toggle_maximize" {
+                self.toggle_terminal_maximize();
+                let effective = self.effective_terminal_panel_rows(ctx.terminal_max_rows);
+                if self.terminal_panes.is_empty() {
+                    self.terminal_new_tab(ctx.terminal_cols, effective);
+                } else {
+                    self.terminal_resize(ctx.terminal_cols, effective);
+                }
+            }
+        }
+    }
+
+    /// Register the built-in accelerators that ship with vimcode. Called
+    /// once from `Engine::new()`. New accelerators added in B.4+ go here.
+    /// Public so integration tests can re-run after resetting settings.
+    pub fn register_default_accelerators(&mut self) {
+        self.register_accelerator(Accelerator {
+            id: AcceleratorId::new("terminal.toggle_maximize"),
+            binding: KeyBinding::Literal(self.settings.panel_keys.toggle_terminal_maximize.clone()),
+            scope: AcceleratorScope::Global,
+            label: Some("Toggle terminal maximize".into()),
+        });
     }
 }
 

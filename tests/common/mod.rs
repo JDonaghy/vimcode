@@ -23,6 +23,11 @@ pub fn engine_with(text: &str) -> Engine {
     // Reset mode + keymaps in case Engine::new() loaded VSCode mode from disk.
     e.mode = Mode::Normal;
     e.rebuild_user_keymaps();
+    // Re-register Phase B.2 accelerators against the reset settings so the
+    // registry uses the default `<C-S-t>` binding (not whatever the user's
+    // real settings.json had on disk).
+    e.accelerators.clear();
+    e.register_default_accelerators();
     if !text.is_empty() {
         e.buffer_mut().insert(0, text);
     }

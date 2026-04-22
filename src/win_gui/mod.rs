@@ -1829,8 +1829,24 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             return false;
         }
 
-        // ── Ctrl-Shift-T: toggle terminal maximize ───────────────────────
-        if ctrl && shift && !alt && (key.key_name == "t" || key.key_name == "T") {
+        // Phase B.2: accelerator-registry dispatch.
+        // Replaces inline `if ctrl && shift && key == "t"` checks with a
+        // single registry lookup. Other accelerators added in B.4+ flow
+        // through the same path with no per-binding code.
+        let key_char = if key.key_name.chars().count() == 1 {
+            key.key_name.chars().next()
+        } else {
+            None
+        };
+        if let Some(id) = state.engine.match_accelerator(
+            ctrl,
+            shift,
+            alt,
+            key_char,
+            key.key_name == "Tab",
+            key_char == Some(' '),
+            key.key_name == "Escape",
+        ) {
             let mut rc = RECT::default();
             unsafe {
                 let _ = GetClientRect(state.hwnd, &mut rc);
@@ -1839,14 +1855,22 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             let height = (rc.bottom - rc.top) as f32;
             let cols = ((width - state.sidebar.total_width()) / state.char_width) as u16;
             let lh = state.line_height.max(1.0);
-            let target = win_gui_terminal_target_maximize_rows(&state.engine, height, lh);
-            state.engine.toggle_terminal_maximize();
-            let effective = state.engine.effective_terminal_panel_rows(target);
-            if state.engine.terminal_panes.is_empty() {
-                state.engine.terminal_new_tab(cols, effective);
-            } else {
-                state.engine.terminal_resize(cols, effective);
-            }
+            let ctx = crate::core::engine::UiEventContext {
+                terminal_cols: cols,
+                terminal_max_rows: win_gui_terminal_target_maximize_rows(&state.engine, height, lh),
+            };
+            state.engine.handle_ui_event(
+                crate::core::engine::UiEvent::Accelerator(
+                    id,
+                    quadraui::Modifiers {
+                        ctrl,
+                        shift,
+                        alt,
+                        cmd: false,
+                    },
+                ),
+                ctx,
+            );
             unsafe {
                 let _ = InvalidateRect(Some(state.hwnd), None, false);
             }
@@ -4584,6 +4608,8 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                     );
                                 }
                                 EngineAction::ToggleTerminalMaximize => {
+                                    // Phase B.2: route through engine's
+                                    // UiEvent dispatch.
                                     let cols = (rw_px / cw).floor() as u16;
                                     let lh = state.line_height.max(1.0);
                                     let mut rc = RECT::default();
@@ -4591,19 +4617,23 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                         let _ = GetClientRect(state.hwnd, &mut rc);
                                     }
                                     let height = (rc.bottom - rc.top) as f32;
-                                    let target = win_gui_terminal_target_maximize_rows(
-                                        &state.engine,
-                                        height,
-                                        lh,
+                                    let ctx = crate::core::engine::UiEventContext {
+                                        terminal_cols: cols,
+                                        terminal_max_rows: win_gui_terminal_target_maximize_rows(
+                                            &state.engine,
+                                            height,
+                                            lh,
+                                        ),
+                                    };
+                                    state.engine.handle_ui_event(
+                                        crate::core::engine::UiEvent::Accelerator(
+                                            crate::core::engine::AcceleratorId::new(
+                                                "terminal.toggle_maximize",
+                                            ),
+                                            quadraui::Modifiers::default(),
+                                        ),
+                                        ctx,
                                     );
-                                    state.engine.toggle_terminal_maximize();
-                                    let effective =
-                                        state.engine.effective_terminal_panel_rows(target);
-                                    if state.engine.terminal_panes.is_empty() {
-                                        state.engine.terminal_new_tab(cols, effective);
-                                    } else {
-                                        state.engine.terminal_resize(cols, effective);
-                                    }
                                 }
                                 _ => {}
                             }
@@ -6176,17 +6206,21 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             false
         }
         EngineAction::ToggleTerminalMaximize => {
-            // The standalone dispatcher has no access to the Win32 client rect.
-            // Since the panel size is now derived at render time from
-            // `Engine::effective_terminal_panel_rows(target)` and the next
-            // WM_PAINT cycle will supply the right target, we just flip the
-            // flag here — WM_PAINT will handle the actual resize.
-            let cols = 80;
-            engine.toggle_terminal_maximize();
-            let rows = engine.session.terminal_panel_rows;
-            if engine.terminal_panes.is_empty() {
-                engine.terminal_new_tab(cols, rows);
-            }
+            // Standalone dispatcher (palette/action handler) — no client
+            // rect access here. Phase B.2: route through engine's UiEvent
+            // dispatch with terminal_max_rows=0; WM_PAINT picks up the
+            // saved-rows fallback via `effective_terminal_panel_rows`.
+            let ctx = crate::core::engine::UiEventContext {
+                terminal_cols: 80,
+                terminal_max_rows: 0,
+            };
+            engine.handle_ui_event(
+                crate::core::engine::UiEvent::Accelerator(
+                    crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                    quadraui::Modifiers::default(),
+                ),
+                ctx,
+            );
             false
         }
         EngineAction::RunInTerminal(cmd) => {

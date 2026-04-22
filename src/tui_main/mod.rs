@@ -2884,19 +2884,41 @@ fn event_loop(
                             continue;
                         }
 
-                        // Ctrl+Shift+T: toggle terminal maximize (panel fills editor area)
-                        if matches_tui_key(&pk.toggle_terminal_maximize, code, mods) {
+                        // Phase B.2: keybinding accelerator dispatch.
+                        // Engine owns the registry + dispatch. Backends just
+                        // look up + supply native viewport ctx.
+                        if let Some(acc_id) = engine.match_accelerator(
+                            mods.contains(KeyModifiers::CONTROL),
+                            mods.contains(KeyModifiers::SHIFT),
+                            mods.contains(KeyModifiers::ALT),
+                            match code {
+                                KeyCode::Char(c) => Some(c),
+                                _ => None,
+                            },
+                            matches!(code, KeyCode::Tab),
+                            matches!(code, KeyCode::Char(' ')),
+                            matches!(code, KeyCode::Esc),
+                        ) {
                             let size = terminal.size().ok();
-                            let screen_h = size.map(|s| s.height).unwrap_or(24);
-                            let cols = size.map(|s| s.width).unwrap_or(80);
-                            engine.toggle_terminal_maximize();
-                            let target = terminal_target_maximize_rows_tui(engine, screen_h);
-                            let effective = engine.effective_terminal_panel_rows(target);
-                            if engine.terminal_panes.is_empty() {
-                                engine.terminal_new_tab(cols, effective);
-                            } else {
-                                engine.terminal_resize(cols, effective);
-                            }
+                            let ctx = crate::core::engine::UiEventContext {
+                                terminal_cols: size.map(|s| s.width).unwrap_or(80),
+                                terminal_max_rows: terminal_target_maximize_rows_tui(
+                                    engine,
+                                    size.map(|s| s.height).unwrap_or(24),
+                                ),
+                            };
+                            engine.handle_ui_event(
+                                crate::core::engine::UiEvent::Accelerator(
+                                    acc_id,
+                                    quadraui::Modifiers {
+                                        ctrl: mods.contains(KeyModifiers::CONTROL),
+                                        shift: mods.contains(KeyModifiers::SHIFT),
+                                        alt: mods.contains(KeyModifiers::ALT),
+                                        cmd: false,
+                                    },
+                                ),
+                                ctx,
+                            );
                             needs_redraw = true;
                             continue;
                         }
@@ -3584,17 +3606,28 @@ fn event_loop(
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                             needs_redraw = true;
                         } else if action == EngineAction::ToggleTerminalMaximize {
+                            // Phase B.2: route through engine's UiEvent
+                            // dispatch — same path as the keybinding above.
+                            // This site stays because :TerminalMaximize ex
+                            // command + toolbar click still return the
+                            // EngineAction; B.4 may collapse them too.
                             let size = terminal.size().ok();
-                            let screen_h = size.map(|s| s.height).unwrap_or(24);
-                            let cols = size.map(|s| s.width).unwrap_or(80);
-                            engine.toggle_terminal_maximize();
-                            let target = terminal_target_maximize_rows_tui(engine, screen_h);
-                            let effective = engine.effective_terminal_panel_rows(target);
-                            if engine.terminal_panes.is_empty() {
-                                engine.terminal_new_tab(cols, effective);
-                            } else {
-                                engine.terminal_resize(cols, effective);
-                            }
+                            let ctx = crate::core::engine::UiEventContext {
+                                terminal_cols: size.map(|s| s.width).unwrap_or(80),
+                                terminal_max_rows: terminal_target_maximize_rows_tui(
+                                    engine,
+                                    size.map(|s| s.height).unwrap_or(24),
+                                ),
+                            };
+                            engine.handle_ui_event(
+                                crate::core::engine::UiEvent::Accelerator(
+                                    crate::core::engine::AcceleratorId::new(
+                                        "terminal.toggle_maximize",
+                                    ),
+                                    quadraui::Modifiers::default(),
+                                ),
+                                ctx,
+                            );
                             needs_redraw = true;
                         } else if let EngineAction::RunInTerminal(cmd) = action {
                             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);

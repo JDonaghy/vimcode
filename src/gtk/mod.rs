@@ -1382,10 +1382,27 @@ impl SimpleComponent for App {
                                         sender.input(Msg::ToggleTerminal);
                                         return gtk4::glib::Propagation::Stop;
                                     }
-                                    // Ctrl+Shift+T: toggle terminal maximize (panel fills editor area)
-                                    if matches_gtk_key(&pk.toggle_terminal_maximize, key, modifier) {
-                                        sender.input(Msg::ToggleTerminalMaximize);
-                                        return gtk4::glib::Propagation::Stop;
+                                    // Phase B.2: accelerator-registry dispatch.
+                                    // Replaces per-binding `matches_gtk_key`
+                                    // checks with a single registry lookup.
+                                    {
+                                        let eng = engine.borrow();
+                                        if let Some(id) = eng.match_accelerator(
+                                            modifier.contains(gdk::ModifierType::CONTROL_MASK),
+                                            modifier.contains(gdk::ModifierType::SHIFT_MASK),
+                                            modifier.contains(gdk::ModifierType::ALT_MASK),
+                                            key.to_unicode(),
+                                            key == gdk::Key::Tab
+                                                || key == gdk::Key::ISO_Left_Tab,
+                                            key.to_unicode() == Some(' '),
+                                            key == gdk::Key::Escape,
+                                        ) {
+                                            drop(eng);
+                                            if id.as_str() == "terminal.toggle_maximize" {
+                                                sender.input(Msg::ToggleTerminalMaximize);
+                                            }
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
                                     }
                                     // Terminal key routing: when terminal has focus, all keys
                                     // are forwarded as PTY bytes without going to the engine.
@@ -7217,21 +7234,20 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ToggleTerminalMaximize => {
-                let target = self.terminal_target_maximize_rows();
-                let cols = self.terminal_cols();
-                {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.toggle_terminal_maximize();
-                }
-                // Create a pane if none exists; otherwise resize the existing
-                // PTY to the new effective content rows.
-                let needs_new_tab = self.engine.borrow().terminal_panes.is_empty();
-                let effective = self.engine.borrow().effective_terminal_panel_rows(target);
-                if needs_new_tab {
-                    self.engine.borrow_mut().terminal_new_tab(cols, effective);
-                } else {
-                    self.engine.borrow_mut().terminal_resize(cols, effective);
-                }
+                // Phase B.2: route through engine's UiEvent dispatch — same
+                // path as the keybinding above + the EngineAction handler
+                // + the toolbar click handler.
+                let ctx = crate::core::engine::UiEventContext {
+                    terminal_cols: self.terminal_cols(),
+                    terminal_max_rows: self.terminal_target_maximize_rows(),
+                };
+                self.engine.borrow_mut().handle_ui_event(
+                    crate::core::engine::UiEvent::Accelerator(
+                        crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                        quadraui::Modifiers::default(),
+                    ),
+                    ctx,
+                );
                 self.draw_needed.set(true);
             }
             Msg::OpenTerminalAt(dir) => {

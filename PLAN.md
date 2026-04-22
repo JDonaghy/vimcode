@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-22 (Session 320 — Phase B.2 sketch landed: see `BACKEND_TRAIT_PROPOSAL.md` §11)
+> **Last updated:** 2026-04-22 (Session 321 — Phase B.2 shipped: engine-owned accelerator registry)
 
 ---
 
@@ -53,7 +53,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
 | **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
 | **Phase B.1** — `UiEvent` + `Accelerator` + `Backend` trait scaffolding | ✅ Done | _tbd_ | `quadraui-phase-b1-backend-trait` | any |
-| Phase B.2 — pilot migration: terminal maximize to `Accelerator::Global` | ⬜ **Next — sketch first** (see below) | — | `quadraui-phase-b2-maximize-pilot` | any |
+| **Phase B.2** — pilot migration: terminal maximize to `Accelerator::Global` | ✅ Done | _tbd_ | `quadraui-phase-b2-maximize-pilot` | any |
 | Phase B.3 — layout primitives (`Panel`, `Split`, `Tabs`, `MenuBar`, `Modal`) | ⬜ After B.2 | — | `quadraui-phase-b3-layout` | any |
 | Phase B.4+ — migrate remaining vimcode subsystems to UiEvent | ⬜ After B.3 | — | `quadraui-phase-b4-*` | any |
 | Phase B.5 — Postman-class validation app (#169) | ⬜ After B.3/B.4 | — | _new workspace member_ | any |

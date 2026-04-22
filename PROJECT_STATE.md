@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 22, 2026 (Session 319 — Phase B.1 Backend trait scaffold) | **Tests:** 5295 total (full `cargo test --workspace --no-default-features`); vimcode 5249 + quadraui 46
+**Last updated:** Apr 22, 2026 (Session 321 — Phase B.2 terminal-maximize accelerator migration) | **Tests:** 5305 total (full `cargo test --workspace --no-default-features`); vimcode 5259 + quadraui 46
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,70 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 321 — Phase B.2 terminal-maximize accelerator migration:**
+
+1. **Engine-owned accelerator registry.** New `src/core/engine/mod.rs`
+   types + methods: `RegisteredAccelerator { acc, parsed }`,
+   `UiEventContext { terminal_cols, terminal_max_rows }`, and on
+   `Engine`: `accelerators: Vec<RegisteredAccelerator>` field;
+   `register_accelerator`, `unregister_accelerator`,
+   `match_accelerator`, `handle_ui_event`,
+   `register_default_accelerators`. Re-exports
+   `quadraui::{Accelerator, AcceleratorId, AcceleratorScope,
+   KeyBinding, UiEvent}`. `Engine::new()` registers
+   `"terminal.toggle_maximize"` from
+   `settings.panel_keys.toggle_terminal_maximize`.
+2. **Departs from §11 Q3.** The "backend owns the event loop" shape
+   was more invasive than one accelerator justified (~400 LOC of
+   back-translation for keys not yet migrated). Final shape:
+   engine owns the registry; backends call
+   `engine.match_accelerator(...)` synchronously from existing
+   key handlers. Same B.1 types exercised; zero event-loop
+   disruption. Backend-owned events can land in B.4 when
+   accelerator count grows.
+3. **Six sites migrated.** `src/tui_main/mod.rs:2888` (terminal-panel
+   early-intercept) and `:3586` (EngineAction arm). `src/gtk/mod.rs:
+   1386` (EventControllerKey closure) and `:7219`
+   (`Msg::ToggleTerminalMaximize` handler). `src/win_gui/mod.rs:1832`
+   (WndProc cascade) and `:4586` + `:6178` (EngineAction handlers).
+   Each `matches_*_key(&pk.toggle_terminal_maximize, ...)` + per-
+   backend flip+resize sequence collapses to
+   `engine.match_accelerator(...)` + `engine.handle_ui_event(...)`.
+4. **`EngineAction::ToggleTerminalMaximize` kept.** The ex command
+   `:TerminalMaximize` and toolbar click still return this action;
+   their handlers just route through `engine.handle_ui_event` now.
+   Full collapse is B.4 work.
+5. **10 new integration tests** in `tests/accelerator_registry.rs`:
+   default registration, match positive/negative, case
+   insensitivity, toggle + idempotent re-toggle,
+   unknown-accelerator no-op, re-register-same-id-replaces,
+   unregister-removes, non-Global-scope filtering. Workspace total
+   5295 → 5305.
+6. **`src/lib.rs` re-exports `quadraui`** so integration tests and
+   future downstream consumers pin to the version vimcode is built
+   against.
+7. **§11 updated** with "B.2 implementation notes" subsection
+   documenting the engine-owned vs backend-owned choice + rationale.
+   PLAN.md stage table marks B.2 Done.
+8. **Quality gates all pass.** `cargo fmt`, `cargo clippy
+   --no-default-features -- -D warnings`, `cargo clippy -- -D
+   warnings` (GTK), full `cargo test --workspace
+   --no-default-features` 5305/0/19. Win-GUI syntax manually
+   reviewed (cargo check --features win-gui fails on Linux due to
+   pre-existing `windows-future-0.2.1` incompat; user must verify
+   Windows build).
+9. **Net diff:** +339 / –74 across 6 files. Payoff materialises at
+   accelerator #2: each new binding adds ~1 line per backend.
+10. **Awaiting smoke test.** Verify: Ctrl+Shift+T still toggles
+    terminal maximize in TUI (kitty / modern alacritty without tmux,
+    since tmux strips Shift bit per §11 spike findings) and GTK.
+    `:TerminalMaximize` ex command still works. Toolbar maximize/
+    unmaximize button still works.
+11. **Path B landing.** Branch `quadraui-phase-b2-maximize-pilot`
+    off develop; PR expected after smoke test.
+
+---
 
 **Session 319 — Phase B.1 Backend trait scaffolding (#169 blocker):**
 
