@@ -186,6 +186,49 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
   TUI's loop-iteration redraw and Win-GUI's WM_PAINT cycle. See
   `docs/NATIVE_GUI_LESSONS.md` §13 + §14.
 
+- **Render-time effective values beat mutation-at-toggle-time.** The
+  first draft of terminal maximize (#34) mutated
+  `session.terminal_panel_rows` at the moment the user pressed
+  `Ctrl+Shift+T` — the panel size was captured once. Window
+  resizes afterwards didn't re-derive anything, so the panel
+  stayed frozen at its toggle-time height while the window grew.
+  Fix (commit `5bcb1bd`): the flag-only toggle +
+  `Engine::effective_terminal_panel_rows(target)` pattern. Each
+  backend calls the accessor **every frame** during layout; the
+  `target` comes from current viewport geometry. Window resize
+  → new target → new effective → panel tracks the window
+  automatically. Rule: **if state affects per-frame rendering AND
+  can be invalidated by backend events (resize, reflow, focus),
+  store a flag, not a captured dimension. Expose an `effective_*`
+  accessor that the render code calls every frame.** See
+  `quadraui/docs/APP_ARCHITECTURE.md` for the full worked example.
+
+- **Mouse hit-tests mirror draw-time geometry.** With the
+  maximize refactor (above), a second category of bug bit twice:
+  every backend site that read `session.terminal_panel_rows`
+  (stored) for *hit-testing* was off-by-N when the panel was
+  maximized, because the draw code was using the *effective*
+  value. Clicks on the maximize / close / split / add buttons
+  landed in dead space. Fixes: `1d7141a` (GTK), `507d63a` (TUI).
+  Rule: **every backend site that computes a rect for hit-testing
+  must use the same effective value the draw code used.** Grep
+  for the raw field after every feature that introduces a new
+  "effective" accessor. The count-and-replace model is dumb but
+  reliable; every backend hit-test is a separate opportunity to
+  miss a substitution.
+
+- **Chrome arithmetic belongs in the engine, not in each backend.**
+  Three backends × one "how many rows does the terminal get when
+  maximized?" formula = three implementations that drift. Extract
+  a `*ChromeDesc`-style struct in `src/core/engine/` that backends
+  **fill with measurements**, then call a shared
+  `.max_panel_content_rows()` method. Backends provide units
+  (TUI cell-count, GTK Pango px / `line_height`, Win-GUI DirectWrite
+  / `line_height`); the engine owns the subtraction. See
+  `PanelChromeDesc` (introduced alongside this lesson) as the
+  reference pattern. Rule: **backends provide measurements, not
+  formulas.**
+
 ---
 
 ## Picking this up on another machine

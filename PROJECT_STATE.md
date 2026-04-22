@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 21, 2026 (Session 317 — terminal maximize) | **Tests:** 5263 total (full `cargo test --workspace --no-default-features`); vimcode 5239 + quadraui 24
+**Last updated:** Apr 21, 2026 (Session 318 — chrome helper + APP_ARCHITECTURE.md) | **Tests:** 5273 total (full `cargo test --workspace --no-default-features`); vimcode 5249 + quadraui 24
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,70 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 318 — Closing the "where does app logic go?" gap:**
+
+1. **User feedback after #34:** the terminal maximize wave landed
+   logic across 10 files with 61 references to the maximize helpers —
+   most of it duplicated plumbing across three backends (target-rows
+   math, keybinding intercept, resize handler, hit-test). User asked
+   whether it's too ambitious to expect a cross-platform UI crate to
+   abstract more of this away. Answer: it's the stated vision, but a
+   Phase A / Phase B roadmap gap. Addressed via docs + one shared
+   helper; larger abstractions (layout primitives, `Backend` trait)
+   stay parked for Phase B.
+2. **New doc `quadraui/docs/APP_ARCHITECTURE.md`** (~220 lines) —
+   sibling to `UI_CRATE_DESIGN.md` (vision) and
+   `docs/NATIVE_GUI_LESSONS.md` (backend implementer). Audience is
+   the app developer. Covers: the layer cake
+   (Engine → render adapter → primitive → backend draw), a
+   "where does each kind of thing go?" table, a full worked example
+   tracing the 11-commit maximize ship through every layer, six
+   rules-of-thumb distilled from maximize + earlier lessons, and an
+   11-question checklist for new features. Links back to `PLAN.md`
+   lessons and the reference commits (`5bcb1bd`, `1d7141a`, `507d63a`).
+3. **New shared helper `PanelChromeDesc`** in `src/core/engine/mod.rs`
+   (near `EngineAction`): row-unit struct with fields for
+   `viewport_rows`, `menu_rows`, `quickfix_rows`, `debug_toolbar_rows`,
+   `wildmenu_rows`, `tab_bar_rows`, `separated_status_rows`,
+   `status_cmd_rows`, `panel_chrome_rows`, `min_content_rows`, and a
+   single method `max_panel_content_rows()` that does the
+   saturating-subtract + clamp. Backends fill the struct in their
+   own native units (TUI cell count; GTK `da_height / line_height`;
+   Win-GUI `client_height_px / line_height`). Five lib-tests cover
+   typical TUI, full chrome, min-floor clamp, zero-min clamp, and
+   default construction (`test_panel_chrome_*`).
+4. **Backend rewiring:**
+   - `tui_main::terminal_target_maximize_rows_tui` shrinks to a
+     `PanelChromeDesc { … }.max_panel_content_rows()` call.
+   - `gtk::gtk_terminal_target_maximize_rows` does the same; the
+     `1.6 * line_height` tab row rounds up to 2 row-units (≤0.4 lh
+     slack, absorbed by the subsequent clamp).
+   - `win_gui::win_gui_terminal_target_maximize_rows` is new (extracted
+     from three inline `total_rows.saturating_sub(3).max(5)` copies at
+     the keyboard, action-dispatch, and toolbar-click sites). ~20 lines
+     of duplicated arithmetic deleted across the three backends.
+5. **PLAN.md "Lessons learned"** gains three entries:
+   - "Render-time effective values beat mutation-at-toggle-time" (rule
+     + `5bcb1bd` commit reference).
+   - "Mouse hit-tests mirror draw-time geometry" (rule + `1d7141a` +
+     `507d63a` commit references).
+   - "Chrome arithmetic belongs in the engine, not in each backend"
+     (rule + `PanelChromeDesc` reference).
+6. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy
+   --no-default-features -- -D warnings` clean; `cargo clippy
+   -- -D warnings` (GTK) clean; full workspace test 5273/0/19. All
+   six `tests/terminal_maximize.rs` integration tests continue to
+   pass unchanged — the refactor is strictly internal.
+7. **Net diff:** ~+340 / –85 across 6 files. Biggest add:
+   `APP_ARCHITECTURE.md` (new). Struct + method: ~100 lines in
+   `engine/mod.rs`. Tests: ~75 lines. Backend rewiring is net
+   negative (deletes arithmetic; adds struct-literal + call).
+8. **Path B landing.** Branch `followup-chrome-helper` off develop;
+   quality-gated and awaiting smoke test — no runtime behaviour
+   changes but the maximize path is on the refactored code now.
+
+---
 
 **Session 317 — Terminal maximize (closes #34):**
 

@@ -10117,33 +10117,37 @@ pub(super) fn gtk_terminal_target_maximize_rows(
     da_height: f64,
     line_height: f64,
 ) -> u16 {
+    // Convert GTK's pixel-based chrome into row units, then hand off to the
+    // shared `PanelChromeDesc::max_panel_content_rows`. The editor tab row is
+    // `1.6 * lh`, which rounds up to 2 row-units when reserved — the
+    // clamping in `max_panel_content_rows` absorbs that ≤0.4 lh of slack.
     let lh = line_height.max(1.0);
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        lh
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
-    let status_bar_height = lh * global_status_rows + wildmenu_px;
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * lh
-    } else {
-        0.0
-    };
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        lh
-    } else {
-        0.0
-    };
-    let has_separated = per_window_status && !engine.settings.status_line_above_terminal;
-    let separated_status_px = if has_separated { lh } else { 0.0 };
-    let tab_row_height = (lh * 1.6).ceil();
-    let chrome =
-        status_bar_height + qf_px + debug_toolbar_px + separated_status_px + tab_row_height;
-    let available = (da_height - chrome).max(lh * 7.0);
-    let term_rows = (available / lh).floor() as u16;
-    term_rows.saturating_sub(2).max(5)
+    let viewport_rows = (da_height / lh).floor() as u16;
+    let per_window = engine.settings.window_status_line;
+    let has_separated = per_window && !engine.settings.status_line_above_terminal;
+    crate::core::engine::PanelChromeDesc {
+        viewport_rows,
+        menu_rows: 0, // GTK menu bar lives outside the DrawingArea.
+        quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+            6
+        } else {
+            0
+        },
+        debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
+        wildmenu_rows: if engine.wildmenu_items.is_empty() {
+            0
+        } else {
+            1
+        },
+        // 1.6 lh for tab row → reserve 2 row-units (ceiling).
+        tab_bar_rows: 2,
+        separated_status_rows: if has_separated { 1 } else { 0 },
+        // per-window: cmd(1); otherwise: status + cmd (2).
+        status_cmd_rows: if per_window { 1 } else { 2 },
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    }
+    .max_panel_content_rows()
 }
 
 fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {

@@ -76,6 +76,85 @@ pub enum EngineAction {
     OpenUrl(String),
 }
 
+/// Row-count description of everything that surrounds a bottom panel (terminal,
+/// debug output, future equivalents) in the active viewport. Each backend fills
+/// this in using its own native units converted to row count, then calls
+/// [`PanelChromeDesc::max_panel_content_rows`] to get the largest *content*
+/// row count the panel can take when maximized.
+///
+/// The intent is to let the engine own the "what fits?" arithmetic so TUI,
+/// GTK, and Win-GUI can't drift — each would otherwise reimplement the same
+/// subtraction of menu / qf / dbg / wildmenu / tab-bar / status / cmd rows.
+///
+/// For normal (non-maximized) rendering, backends keep using
+/// `session.terminal_panel_rows` directly — this helper only matters when
+/// computing the `max_target_rows` argument to
+/// [`Engine::effective_terminal_panel_rows`].
+///
+/// # Mental model
+///
+/// The viewport is a stack of rows. `viewport_rows = sum(every chrome field)
+/// + content_rows`. Rearranged:
+/// `content_rows = viewport_rows − sum(chrome)`, clamped to
+/// `min_content_rows`.
+#[derive(Debug, Clone, Default)]
+pub struct PanelChromeDesc {
+    /// Total rows available in the backend's viewport.
+    /// - TUI: crossterm screen height in cells.
+    /// - GTK: `floor(drawing_area.height() / line_height)`.
+    /// - Win-GUI: `floor(client_rect.height / line_height)`.
+    pub viewport_rows: u16,
+    /// Menu bar row (0 or 1). For GTK this is 0 — the menu bar lives
+    /// outside the DrawingArea.
+    pub menu_rows: u16,
+    /// Quickfix panel rows (0 or 6).
+    pub quickfix_rows: u16,
+    /// Debug toolbar row (0 or 1).
+    pub debug_toolbar_rows: u16,
+    /// Wildmenu row (0 or 1).
+    pub wildmenu_rows: u16,
+    /// Editor tab-bar + optional breadcrumbs. When maximizing a bottom
+    /// panel, callers usually pass **1** (the tab row only) because
+    /// breadcrumbs collapse behind the panel.
+    pub tab_bar_rows: u16,
+    /// "Separated" per-window status row below the bottom panel, if
+    /// the `window_status_line` + `!status_line_above_terminal` combo
+    /// is active.
+    pub separated_status_rows: u16,
+    /// Global status + command-line rows. Typically 1 (per-window
+    /// status on, only cmd line remains globally) or 2 (per-window
+    /// status off, both global status and cmd).
+    pub status_cmd_rows: u16,
+    /// Chrome *inside* the bottom panel itself: bottom-panel tabs
+    /// ("TERMINAL" / "DEBUG CONSOLE") + terminal/debug toolbar.
+    /// For terminal / debug output, this is **2**.
+    pub panel_chrome_rows: u16,
+    /// Minimum content rows to guarantee even on cramped viewports.
+    pub min_content_rows: u16,
+}
+
+impl PanelChromeDesc {
+    /// Largest panel *content* row count that fits in the viewport after
+    /// subtracting every chrome row. Floor at `min_content_rows.max(1)`.
+    ///
+    /// Backends pass this return value to
+    /// [`Engine::effective_terminal_panel_rows`] as the `max_target_rows`
+    /// argument.
+    pub fn max_panel_content_rows(&self) -> u16 {
+        let used = self.menu_rows
+            + self.quickfix_rows
+            + self.debug_toolbar_rows
+            + self.wildmenu_rows
+            + self.tab_bar_rows
+            + self.separated_status_rows
+            + self.status_cmd_rows
+            + self.panel_chrome_rows;
+        self.viewport_rows
+            .saturating_sub(used)
+            .max(self.min_content_rows.max(1))
+    }
+}
+
 /// A row in the Settings sidebar flat list.
 /// Distinguishes core settings from extension-declared settings.
 #[derive(Debug, Clone)]

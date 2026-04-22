@@ -18521,6 +18521,88 @@ fn test_status_action_existing_actions_return_none() {
         .is_none());
 }
 
+// ── PanelChromeDesc tests ───────────────────────────────────────────────
+
+#[test]
+fn test_panel_chrome_typical_tui_maximize() {
+    // TUI with a 40-row terminal, no menu / qf / dbg / wm, per-window
+    // status on (so status_cmd_rows=1, tab_bar_rows=1 since breadcrumbs
+    // collapse behind panel), panel_chrome_rows=2 (bottom-tabs + toolbar).
+    let d = super::PanelChromeDesc {
+        viewport_rows: 40,
+        menu_rows: 0,
+        quickfix_rows: 0,
+        debug_toolbar_rows: 0,
+        wildmenu_rows: 0,
+        tab_bar_rows: 1,
+        separated_status_rows: 0,
+        status_cmd_rows: 1,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 40 - (1 + 1 + 2) = 36
+    assert_eq!(d.max_panel_content_rows(), 36);
+}
+
+#[test]
+fn test_panel_chrome_full_tui_chrome() {
+    // All chrome on: menu, qf(6), dbg, wm, tab bar, global status+cmd (2),
+    // separated status, panel internal chrome (2).
+    let d = super::PanelChromeDesc {
+        viewport_rows: 50,
+        menu_rows: 1,
+        quickfix_rows: 6,
+        debug_toolbar_rows: 1,
+        wildmenu_rows: 1,
+        tab_bar_rows: 1,
+        separated_status_rows: 1,
+        status_cmd_rows: 2,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 50 - (1+6+1+1+1+1+2+2) = 50 - 15 = 35
+    assert_eq!(d.max_panel_content_rows(), 35);
+}
+
+#[test]
+fn test_panel_chrome_clamps_to_min_content_rows() {
+    // Viewport too small; result should floor at min_content_rows.
+    let d = super::PanelChromeDesc {
+        viewport_rows: 3,
+        menu_rows: 0,
+        quickfix_rows: 0,
+        debug_toolbar_rows: 0,
+        wildmenu_rows: 0,
+        tab_bar_rows: 1,
+        separated_status_rows: 0,
+        status_cmd_rows: 2,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 3 - 5 = underflow → saturating_sub gives 0 → max(5) = 5
+    assert_eq!(d.max_panel_content_rows(), 5);
+}
+
+#[test]
+fn test_panel_chrome_zero_min_content_clamps_to_one() {
+    let d = super::PanelChromeDesc {
+        viewport_rows: 2,
+        panel_chrome_rows: 2,
+        status_cmd_rows: 2,
+        min_content_rows: 0,
+        ..Default::default()
+    };
+    // 2 - 4 underflows → 0, then max(min_content_rows.max(1)) = 1
+    assert_eq!(d.max_panel_content_rows(), 1);
+}
+
+#[test]
+fn test_panel_chrome_default_is_zero_plus_floor_one() {
+    let d = super::PanelChromeDesc::default();
+    // Everything zero → saturating_sub gives 0 → .max(min_content_rows.max(1)) = 1
+    assert_eq!(d.max_panel_content_rows(), 1);
+}
+
 // ── Notification system tests ───────────────────────────────────────────
 
 #[test]

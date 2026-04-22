@@ -1634,6 +1634,37 @@ fn cache_layout(
     }
 }
 
+/// Compute the target `terminal_panel_rows` when maximizing the Win-GUI
+/// terminal panel. Mirrors the TUI and GTK helpers; hands off to
+/// [`PanelChromeDesc::max_panel_content_rows`] for the actual arithmetic.
+fn win_gui_terminal_target_maximize_rows(engine: &Engine, client_height_px: f32, lh: f32) -> u16 {
+    let lh = lh.max(1.0);
+    let viewport_rows = (client_height_px / lh).floor() as u16;
+    let per_window = engine.settings.window_status_line;
+    let has_separated = per_window && !engine.settings.status_line_above_terminal;
+    crate::core::engine::PanelChromeDesc {
+        viewport_rows,
+        menu_rows: 0,
+        quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+            6
+        } else {
+            0
+        },
+        debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
+        wildmenu_rows: if engine.wildmenu_items.is_empty() {
+            0
+        } else {
+            1
+        },
+        tab_bar_rows: 1,
+        separated_status_rows: if has_separated { 1 } else { 0 },
+        status_cmd_rows: if per_window { 1 } else { 2 },
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    }
+    .max_panel_content_rows()
+}
+
 fn on_resize(hwnd: HWND) {
     APP.with(|app| {
         let mut app = app.borrow_mut();
@@ -1661,8 +1692,7 @@ fn on_resize(hwnd: HWND) {
             let height = (rc.bottom - rc.top) as f32;
             let lh = state.line_height.max(1.0);
             let cols = ((width - state.sidebar.total_width()) / state.char_width).max(40.0) as u16;
-            let total_rows = (height / lh).floor() as u16;
-            let target = total_rows.saturating_sub(3).max(5);
+            let target = win_gui_terminal_target_maximize_rows(&state.engine, height, lh);
             let effective = state.engine.effective_terminal_panel_rows(target);
             state.engine.terminal_resize(cols, effective);
         }
@@ -1809,8 +1839,7 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             let height = (rc.bottom - rc.top) as f32;
             let cols = ((width - state.sidebar.total_width()) / state.char_width) as u16;
             let lh = state.line_height.max(1.0);
-            let total_rows = (height / lh).floor() as u16;
-            let target = total_rows.saturating_sub(3).max(5);
+            let target = win_gui_terminal_target_maximize_rows(&state.engine, height, lh);
             state.engine.toggle_terminal_maximize();
             let effective = state.engine.effective_terminal_panel_rows(target);
             if state.engine.terminal_panes.is_empty() {
@@ -4395,8 +4424,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                         let _ = GetClientRect(hwnd, &mut rc);
                     }
                     let height = (rc.bottom - rc.top) as f32;
-                    let total_rows = (height / lh).floor() as u16;
-                    let target = total_rows.saturating_sub(3).max(5);
+                    let target = win_gui_terminal_target_maximize_rows(&state.engine, height, lh);
                     state.engine.toggle_terminal_maximize();
                     let effective = state.engine.effective_terminal_panel_rows(target);
                     state.engine.terminal_resize(cols, effective);
@@ -4563,8 +4591,11 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                         let _ = GetClientRect(state.hwnd, &mut rc);
                                     }
                                     let height = (rc.bottom - rc.top) as f32;
-                                    let total_rows = (height / lh).floor() as u16;
-                                    let target = total_rows.saturating_sub(3).max(5);
+                                    let target = win_gui_terminal_target_maximize_rows(
+                                        &state.engine,
+                                        height,
+                                        lh,
+                                    );
                                     state.engine.toggle_terminal_maximize();
                                     let effective =
                                         state.engine.effective_terminal_panel_rows(target);

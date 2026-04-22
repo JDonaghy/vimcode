@@ -114,24 +114,29 @@ pub(super) fn effective_terminal_panel_rows_tui(engine: &Engine, screen_h: u16) 
 }
 
 pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
-    let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-    let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-    let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-    let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
-        1
-    } else {
-        0
-    };
-    // Chrome rows that must remain visible:
-    //   status(1) + cmd(1) + bottom-panel tabs(1) + terminal toolbar(1) = 4
-    // The `+ 2` inside `trm_rows = terminal_panel_rows + 2` already accounts
-    // for the bottom-panel tabs + terminal toolbar, so we only subtract
-    // status + cmd + the extra chrome rows from the screen before handing
-    // `(target + 2)` back to the layout.
-    let fixed_chrome: u16 = 4;
-    screen_h
-        .saturating_sub(menu_row + qf_rows + dbg_row + wm_row + fixed_chrome)
-        .max(5)
+    // Build a PanelChromeDesc in native TUI row units and let the engine own
+    // the arithmetic. Editor `tab_bar_rows = 0` — the tab bar + breadcrumbs
+    // collapse behind the maximized panel (matches VSCode).
+    let per_window = engine.settings.window_status_line;
+    crate::core::engine::PanelChromeDesc {
+        viewport_rows: screen_h,
+        menu_rows: if engine.menu_bar_visible { 1 } else { 0 },
+        quickfix_rows: if engine.quickfix_open { 6 } else { 0 },
+        debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
+        wildmenu_rows: if !engine.wildmenu_items.is_empty() {
+            1
+        } else {
+            0
+        },
+        tab_bar_rows: 0,
+        separated_status_rows: 0,
+        // per-window status on → only cmd line remains global.
+        // per-window status off → global status + cmd line.
+        status_cmd_rows: if per_window { 1 } else { 2 },
+        panel_chrome_rows: 2, // bottom-panel tabs + terminal toolbar
+        min_content_rows: 5,
+    }
+    .max_panel_content_rows()
 }
 
 fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
