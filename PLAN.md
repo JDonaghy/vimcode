@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-20 (Session 315 — A.2c shipped: Win-GUI explorer migration)
+> **Last updated:** 2026-04-22 (Session 320 — Phase B.2 sketch landed: see `BACKEND_TRAIT_PROPOSAL.md` §11)
 
 ---
 
@@ -237,8 +237,15 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
 
 ## Phase B.2 starting notes — terminal-maximize pilot migration
 
-**Status:** Ready to start, but sketch design questions first before any
-code. Branch: `quadraui-phase-b2-maximize-pilot` off develop.
+**Status (2026-04-22):** Design sketch landed in
+[`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md`](quadraui/docs/BACKEND_TRAIT_PROPOSAL.md)
+§11. All five PLAN-level questions (Q1–Q5 below) have concrete answers
+grounded in file:line refs from the existing TUI / GTK / Win-GUI
+dispatch paths. **Code work is unblocked**; recommended next step is
+the optional TUI-only spike (~half-day) before going broad — see
+§11's closing subsection.
+
+Branch: `quadraui-phase-b2-maximize-pilot` off develop.
 
 ### What gets migrated in B.2
 
@@ -345,7 +352,8 @@ B.1. Fresh session is appropriate for the sketch + code work; all
 the load-bearing artifacts are on develop:
 
 - `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §1–§10 (all 5 decisions
-  resolved)
+  resolved); §11 (Phase B.2 implementation notes — answers to the
+  five design questions below, grounded in file:line refs)
 - `quadraui/docs/APP_ARCHITECTURE.md` (app-developer patterns)
 - `docs/NATIVE_GUI_LESSONS.md` (backend-implementer pitfalls)
 - `PLAN.md` § "Lessons learned" (maximize-era rules)
