@@ -5990,8 +5990,16 @@ impl App {
             let in_terminal = if self.cached_line_height > 0.0 {
                 let engine = self.engine.borrow();
                 if engine.terminal_open || engine.bottom_panel_open {
+                    // Must use the *effective* rows so hit-testing lines up
+                    // with where the panel is actually drawn when maximized.
+                    let target = gtk_terminal_target_maximize_rows(
+                        &engine,
+                        height,
+                        self.cached_line_height,
+                    );
+                    let effective_rows = engine.effective_terminal_panel_rows(target);
                     let term_px =
-                        (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
+                        (effective_rows as f64 + 2.0) * self.cached_line_height;
                     let global_status_rows = if engine.settings.window_status_line {
                         0.0
                     } else {
@@ -6540,8 +6548,16 @@ impl App {
                 }
             };
             if term_rows > 0 {
-                let term_px = (self.engine.borrow().session.terminal_panel_rows as f64 + 2.0)
-                    * self.cached_line_height;
+                let term_px = {
+                    let engine = self.engine.borrow();
+                    let target = gtk_terminal_target_maximize_rows(
+                        &engine,
+                        height,
+                        self.cached_line_height,
+                    );
+                    let effective = engine.effective_terminal_panel_rows(target);
+                    (effective as f64 + 2.0) * self.cached_line_height
+                };
                 let global_status_rows = if self.engine.borrow().settings.window_status_line {
                     0.0
                 } else {
@@ -6572,8 +6588,16 @@ impl App {
             let in_terminal = if self.cached_line_height > 0.0 {
                 let engine = self.engine.borrow();
                 if engine.terminal_open || engine.bottom_panel_open {
+                    // Must use the *effective* rows so hit-testing lines up
+                    // with where the panel is actually drawn when maximized.
+                    let target = gtk_terminal_target_maximize_rows(
+                        &engine,
+                        height,
+                        self.cached_line_height,
+                    );
+                    let effective_rows = engine.effective_terminal_panel_rows(target);
                     let term_px =
-                        (engine.session.terminal_panel_rows as f64 + 2.0) * self.cached_line_height;
+                        (effective_rows as f64 + 2.0) * self.cached_line_height;
                     let global_status_rows = if engine.settings.window_status_line {
                         0.0
                     } else {
