@@ -1654,6 +1654,19 @@ fn on_resize(hwnd: HWND) {
             }
         }
 
+        // If the terminal panel is maximized, re-sync the PTY rows/cols to
+        // the new window dimensions so the shell reflows on resize.
+        if state.engine.terminal_maximized && !state.engine.terminal_panes.is_empty() {
+            let width = (rc.right - rc.left) as f32;
+            let height = (rc.bottom - rc.top) as f32;
+            let lh = state.line_height.max(1.0);
+            let cols = ((width - state.sidebar.total_width()) / state.char_width).max(40.0) as u16;
+            let total_rows = (height / lh).floor() as u16;
+            let target = total_rows.saturating_sub(3).max(5);
+            let effective = state.engine.effective_terminal_panel_rows(target);
+            state.engine.terminal_resize(cols, effective);
+        }
+
         unsafe {
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
@@ -1796,18 +1809,14 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             let height = (rc.bottom - rc.top) as f32;
             let cols = ((width - state.sidebar.total_width()) / state.char_width) as u16;
             let lh = state.line_height.max(1.0);
-            // Reserve 3 rows for panel tab-bar + header + status line chrome.
             let total_rows = (height / lh).floor() as u16;
             let target = total_rows.saturating_sub(3).max(5);
-            state.engine.toggle_terminal_maximize(target);
+            state.engine.toggle_terminal_maximize();
+            let effective = state.engine.effective_terminal_panel_rows(target);
             if state.engine.terminal_panes.is_empty() {
-                state
-                    .engine
-                    .terminal_new_tab(cols, state.engine.session.terminal_panel_rows);
+                state.engine.terminal_new_tab(cols, effective);
             } else {
-                state
-                    .engine
-                    .terminal_resize(cols, state.engine.session.terminal_panel_rows);
+                state.engine.terminal_resize(cols, effective);
             }
             unsafe {
                 let _ = InvalidateRect(Some(state.hwnd), None, false);
@@ -4388,10 +4397,9 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     let height = (rc.bottom - rc.top) as f32;
                     let total_rows = (height / lh).floor() as u16;
                     let target = total_rows.saturating_sub(3).max(5);
-                    state.engine.toggle_terminal_maximize(target);
-                    state
-                        .engine
-                        .terminal_resize(cols, state.engine.session.terminal_panel_rows);
+                    state.engine.toggle_terminal_maximize();
+                    let effective = state.engine.effective_terminal_panel_rows(target);
+                    state.engine.terminal_resize(cols, effective);
                     state.engine.terminal_has_focus = true;
                 } else if px >= client_w - cw * 6.0 {
                     // Split button — toggle terminal split
@@ -4557,17 +4565,13 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                                     let height = (rc.bottom - rc.top) as f32;
                                     let total_rows = (height / lh).floor() as u16;
                                     let target = total_rows.saturating_sub(3).max(5);
-                                    state.engine.toggle_terminal_maximize(target);
+                                    state.engine.toggle_terminal_maximize();
+                                    let effective =
+                                        state.engine.effective_terminal_panel_rows(target);
                                     if state.engine.terminal_panes.is_empty() {
-                                        state.engine.terminal_new_tab(
-                                            cols,
-                                            state.engine.session.terminal_panel_rows,
-                                        );
+                                        state.engine.terminal_new_tab(cols, effective);
                                     } else {
-                                        state.engine.terminal_resize(
-                                            cols,
-                                            state.engine.session.terminal_panel_rows,
-                                        );
+                                        state.engine.terminal_resize(cols, effective);
                                     }
                                 }
                                 _ => {}
@@ -6141,22 +6145,16 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
             false
         }
         EngineAction::ToggleTerminalMaximize => {
-            // The standalone dispatcher has no access to the Win32 client rect,
-            // so we fall back to a generous target derived from the current
-            // saved rows. The next WM_PAINT cycle (which owns the real window
-            // metrics) will trigger a redraw; the PTY is re-sized immediately.
+            // The standalone dispatcher has no access to the Win32 client rect.
+            // Since the panel size is now derived at render time from
+            // `Engine::effective_terminal_panel_rows(target)` and the next
+            // WM_PAINT cycle will supply the right target, we just flip the
+            // flag here — WM_PAINT will handle the actual resize.
             let cols = 80;
-            let target = engine
-                .session
-                .terminal_panel_rows
-                .saturating_add(30)
-                .max(30);
-            engine.toggle_terminal_maximize(target);
+            engine.toggle_terminal_maximize();
             let rows = engine.session.terminal_panel_rows;
             if engine.terminal_panes.is_empty() {
                 engine.terminal_new_tab(cols, rows);
-            } else {
-                engine.terminal_resize(cols, rows);
             }
             false
         }

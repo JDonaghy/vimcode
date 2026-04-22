@@ -1145,7 +1145,8 @@ fn event_loop(
         if let Ok(size) = terminal.size() {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
             let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
-                engine.session.terminal_panel_rows + 2 // match draw_frame: tab bar + header + content
+                let target = terminal_target_maximize_rows_tui(engine, size.height);
+                engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
             } else {
                 0
             };
@@ -2870,12 +2871,13 @@ fn event_loop(
                             let size = terminal.size().ok();
                             let screen_h = size.map(|s| s.height).unwrap_or(24);
                             let cols = size.map(|s| s.width).unwrap_or(80);
-                            let target_rows = terminal_target_maximize_rows_tui(engine, screen_h);
-                            engine.toggle_terminal_maximize(target_rows);
+                            engine.toggle_terminal_maximize();
+                            let target = terminal_target_maximize_rows_tui(engine, screen_h);
+                            let effective = engine.effective_terminal_panel_rows(target);
                             if engine.terminal_panes.is_empty() {
-                                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                                engine.terminal_new_tab(cols, effective);
                             } else {
-                                engine.terminal_resize(cols, engine.session.terminal_panel_rows);
+                                engine.terminal_resize(cols, effective);
                             }
                             needs_redraw = true;
                             continue;
@@ -3567,12 +3569,13 @@ fn event_loop(
                             let size = terminal.size().ok();
                             let screen_h = size.map(|s| s.height).unwrap_or(24);
                             let cols = size.map(|s| s.width).unwrap_or(80);
-                            let target_rows = terminal_target_maximize_rows_tui(engine, screen_h);
-                            engine.toggle_terminal_maximize(target_rows);
+                            engine.toggle_terminal_maximize();
+                            let target = terminal_target_maximize_rows_tui(engine, screen_h);
+                            let effective = engine.effective_terminal_panel_rows(target);
                             if engine.terminal_panes.is_empty() {
-                                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                                engine.terminal_new_tab(cols, effective);
                             } else {
-                                engine.terminal_resize(cols, engine.session.terminal_panel_rows);
+                                engine.terminal_resize(cols, effective);
                             }
                             needs_redraw = true;
                         } else if let EngineAction::RunInTerminal(cmd) = action {

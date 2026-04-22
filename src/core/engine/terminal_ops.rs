@@ -178,39 +178,44 @@ impl Engine {
 
     /// Hide the terminal panel but keep all PTY panes running.
     pub fn close_terminal(&mut self) {
-        if self.terminal_maximized {
-            self.session.terminal_panel_rows = self.terminal_saved_rows.max(5);
-            self.terminal_maximized = false;
-        }
+        self.terminal_maximized = false;
         self.terminal_open = false;
         self.terminal_has_focus = false;
     }
 
     /// Toggle "terminal maximized" state.
     ///
-    /// When maximizing, saves the current `terminal_panel_rows` and expands the
-    /// panel to `target_rows`. Opens the terminal panel if it's not already
-    /// visible, and grabs focus.
+    /// This only flips `terminal_maximized`; the stored user-preferred panel
+    /// height (`session.terminal_panel_rows`) is left untouched. Each
+    /// backend's layout code is responsible for asking
+    /// [`Engine::effective_terminal_panel_rows`] on every frame, so window
+    /// resizes automatically re-derive the maximized panel size without any
+    /// re-trigger from the keybinding / click handlers.
     ///
-    /// When un-maximizing, restores the saved row count.
-    ///
-    /// `target_rows` is the desired *content* row count for the terminal panel
-    /// when maximized — the backend computes this from its own viewport
-    /// geometry (total screen rows minus status/cmd/menu/tab-bar/header).
-    /// A minimum of 5 is enforced.
-    pub fn toggle_terminal_maximize(&mut self, target_rows: u16) {
+    /// Opens the terminal panel if it's not already visible, and grabs focus
+    /// on maximize.
+    pub fn toggle_terminal_maximize(&mut self) {
         if self.terminal_maximized {
-            self.session.terminal_panel_rows = self.terminal_saved_rows.max(5);
             self.terminal_maximized = false;
         } else {
             self.terminal_open = true;
             self.terminal_has_focus = true;
-            self.terminal_saved_rows = self.session.terminal_panel_rows;
-            let maxed = target_rows.max(5);
-            if maxed > self.session.terminal_panel_rows {
-                self.session.terminal_panel_rows = maxed;
-            }
             self.terminal_maximized = true;
+        }
+    }
+
+    /// Return the effective content-row count for the terminal panel: either
+    /// the maximized target (backend-computed `max_target_rows`) when the
+    /// maximize flag is set, or the user-preferred `session.terminal_panel_rows`.
+    ///
+    /// Backends call this **every frame** during layout, after they've
+    /// computed how many rows the panel could take given current window
+    /// dimensions. That's what makes window-resize handling automatic.
+    pub fn effective_terminal_panel_rows(&self, max_target_rows: u16) -> u16 {
+        if self.terminal_maximized {
+            max_target_rows.max(self.session.terminal_panel_rows).max(5)
+        } else {
+            self.session.terminal_panel_rows
         }
     }
 

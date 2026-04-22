@@ -1851,9 +1851,10 @@ pub(super) fn handle_mouse(
                     // Maximize button (2 cols left of close)
                     let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
                     let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let target_rows = super::terminal_target_maximize_rows_tui(engine, screen_h);
-                    engine.toggle_terminal_maximize(target_rows);
-                    engine.terminal_resize(full_cols, engine.session.terminal_panel_rows);
+                    engine.toggle_terminal_maximize();
+                    let target = super::terminal_target_maximize_rows_tui(engine, screen_h);
+                    let effective = engine.effective_terminal_panel_rows(target);
+                    engine.terminal_resize(full_cols, effective);
                 } else if col >= term_width.saturating_sub(6) {
                     // Split button (2 cols left of maximize)
                     let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);

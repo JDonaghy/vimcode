@@ -15,7 +15,8 @@ pub(super) fn build_screen_for_tui(
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let term_height: u16 = if bottom_panel_open {
-        engine.session.terminal_panel_rows + 2 // 1 tab bar row + 1 header row + content
+        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
+        engine.effective_terminal_panel_rows(target) + 2 // tab bar + header + content
     } else {
         0
     };
@@ -151,7 +152,8 @@ pub(super) fn draw_frame(
     let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let bottom_panel_height: u16 = if bottom_panel_open {
-        engine.session.terminal_panel_rows + 2
+        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
+        engine.effective_terminal_panel_rows(target) + 2
     } else {
         0
     };

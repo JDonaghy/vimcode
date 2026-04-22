@@ -3403,6 +3403,25 @@ impl SimpleComponent for App {
                     e.set_viewport_lines(viewport_lines.max(1));
                     e.set_viewport_cols(viewport_cols.max(40));
                 }
+                // If the terminal is maximized, re-sync the PTY rows to the
+                // new window size so the shell reflows immediately rather
+                // than on the next user toggle.
+                {
+                    let e = engine_for_resize.borrow();
+                    if e.terminal_maximized && !e.terminal_panes.is_empty() {
+                        let target = gtk_terminal_target_maximize_rows(
+                            &e,
+                            height as f64,
+                            line_height,
+                        );
+                        let effective = e.effective_terminal_panel_rows(target);
+                        let cols = (width as f64 / char_width).floor() as u16;
+                        drop(e);
+                        engine_for_resize
+                            .borrow_mut()
+                            .terminal_resize(cols.max(40), effective);
+                    }
+                }
                 sender_clone.input(Msg::Resize);
             });
 
@@ -7195,16 +7214,21 @@ impl App {
                 let cols = self.terminal_cols();
                 {
                     let mut engine = self.engine.borrow_mut();
-                    engine.toggle_terminal_maximize(target);
+                    engine.toggle_terminal_maximize();
                 }
                 // Create a pane if none exists; otherwise resize the existing
-                // PTY to the new content rows.
+                // PTY to the new effective content rows.
                 let needs_new_tab = self.engine.borrow().terminal_panes.is_empty();
-                let new_rows = self.engine.borrow().session.terminal_panel_rows;
+                let effective = self
+                    .engine
+                    .borrow()
+                    .effective_terminal_panel_rows(target);
                 if needs_new_tab {
-                    self.engine.borrow_mut().terminal_new_tab(cols, new_rows);
+                    self.engine.borrow_mut().terminal_new_tab(cols, effective);
                 } else {
-                    self.engine.borrow_mut().terminal_resize(cols, new_rows);
+                    self.engine
+                        .borrow_mut()
+                        .terminal_resize(cols, effective);
                 }
                 self.draw_needed.set(true);
             }
@@ -10041,59 +10065,10 @@ impl App {
         .max(40)
     }
 
-    /// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
-    ///
-    /// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh`
-    /// pixels (2 chrome rows = bottom-panel tab bar + terminal toolbar). We
-    /// keep the editor's **tab row** visible so the user can still see which
-    /// files are open (matching VSCode's "Maximize Panel Size" and the TUI
-    /// behaviour), but **drop breadcrumbs** — they're not load-bearing during
-    /// a maximized terminal session.
-    ///
-    /// Mirrors the geometry in `gtk::draw::draw_frame`:
-    ///   editor_bounds.height = da_height
-    ///                        - status_bar_height     (always)
-    ///                        - debug_toolbar_px      (if visible)
-    ///                        - qf_px                 (if quickfix open)
-    ///                        - term_px               ← we want this maximal
-    ///                        - separated_status_px   (per-window + !slat + term)
-    ///   …and the editor's `tab_bar_height` is a slice out of editor_bounds.
     fn terminal_target_maximize_rows(&self) -> u16 {
         let lh = self.cached_line_height.max(1.0);
         if let Some(da) = self.drawing_area.borrow().as_ref() {
-            let da_h = da.height() as f64;
-            let engine = self.engine.borrow();
-            let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                0.0
-            } else {
-                lh
-            };
-            let per_window_status = engine.settings.window_status_line;
-            let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
-            let status_bar_height = lh * global_status_rows + wildmenu_px;
-            let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty()
-            {
-                6.0 * lh
-            } else {
-                0.0
-            };
-            let debug_toolbar_px = if engine.debug_toolbar_visible { lh } else { 0.0 };
-            let has_separated = per_window_status
-                && !engine.settings.status_line_above_terminal;
-            let separated_status_px = if has_separated { lh } else { 0.0 };
-            // Post-maximize `draw_frame` drops the breadcrumb row, so reserve
-            // just `tab_row_height`. Matches the `!terminal_maximized` branch
-            // in draw.rs.
-            let tab_row_height = (lh * 1.6).ceil();
-            let chrome = status_bar_height
-                + qf_px
-                + debug_toolbar_px
-                + separated_status_px
-                + tab_row_height;
-            // Reserve at least 5 content rows even on very small windows.
-            let available = (da_h - chrome).max(lh * 7.0);
-            let term_rows = (available / lh).floor() as u16;
-            term_rows.saturating_sub(2).max(5)
+            gtk_terminal_target_maximize_rows(&self.engine.borrow(), da.height() as f64, lh)
         } else {
             10
         }
@@ -10124,6 +10099,45 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
 
 /// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
 /// so that group rects and divider positions are consistent across draw and click.
+/// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
+///
+/// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh` pixels
+/// (2 chrome rows = bottom-panel tab bar + terminal toolbar). Editor tab bar
+/// stays visible (1 row reserved); breadcrumbs are suppressed elsewhere so
+/// we don't reserve a row for them here. Called every frame from `draw_frame`
+/// and `gtk_editor_bottom`, so window resize automatically re-derives the
+/// maximized panel size.
+pub(super) fn gtk_terminal_target_maximize_rows(
+    engine: &Engine,
+    da_height: f64,
+    line_height: f64,
+) -> u16 {
+    let lh = line_height.max(1.0);
+    let wildmenu_px = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        lh
+    };
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
+    let status_bar_height = lh * global_status_rows + wildmenu_px;
+    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * lh
+    } else {
+        0.0
+    };
+    let debug_toolbar_px = if engine.debug_toolbar_visible { lh } else { 0.0 };
+    let has_separated =
+        per_window_status && !engine.settings.status_line_above_terminal;
+    let separated_status_px = if has_separated { lh } else { 0.0 };
+    let tab_row_height = (lh * 1.6).ceil();
+    let chrome =
+        status_bar_height + qf_px + debug_toolbar_px + separated_status_px + tab_row_height;
+    let available = (da_height - chrome).max(lh * 7.0);
+    let term_rows = (available / lh).floor() as u16;
+    term_rows.saturating_sub(2).max(5)
+}
+
 fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
     let wildmenu_px = if engine.wildmenu_items.is_empty() {
         0.0
@@ -10146,7 +10160,8 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
         0.0
     };
     let term_px = if bp_open {
-        (engine.session.terminal_panel_rows as f64 + 2.0) * line_height
+        let target = gtk_terminal_target_maximize_rows(engine, da_height, line_height);
+        (engine.effective_terminal_panel_rows(target) as f64 + 2.0) * line_height
     } else {
         0.0
     };
