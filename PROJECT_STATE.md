@@ -37,7 +37,8 @@ When implementing a new key/command, add tests covering:
 6. **Documentation updates.** `PLAN.md` stage table gains Phase B.1 (Done) + B.2/B.3/B.4/B.5 rows; `PROJECT_STATE.md` session note.
 7. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy --workspace --no-default-features -- -D warnings` clean; `cargo test --workspace --no-default-features` 5295/0/19.
 8. **What this PR does NOT do.** Zero vimcode runtime change. No existing code migrated. No behaviour change for users. Pure additive — the new types sit unused until Phase B.2 (terminal maximize pilot migration) lands.
-9. **Path B landing.** Branch `quadraui-phase-b1-backend-trait` off develop; pushed for PR review.
+9. **Path B landing.** Branch `quadraui-phase-b1-backend-trait` off develop; merged via PR #170 at `06dec4a` on 2026-04-22.
+10. **Next session — sketch before code.** Phase B.2 (terminal-maximize pilot migration) needs 5 design questions answered in `BACKEND_TRAIT_PROPOSAL.md` §11 **before** touching code. See `PLAN.md` §"Phase B.2 starting notes" for the full list (TuiBackend struct shape, event translation algorithm, main-loop integration, GTK event ownership, Win-GUI message-pump hookup), realistic scope (~+250/-75 LOC, not the aspirational -60), and workflow reminders.
 
 ---
 

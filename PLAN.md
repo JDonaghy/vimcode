@@ -53,7 +53,7 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
 | **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
 | **Phase B.1** — `UiEvent` + `Accelerator` + `Backend` trait scaffolding | ✅ Done | _tbd_ | `quadraui-phase-b1-backend-trait` | any |
-| Phase B.2 — pilot migration: terminal maximize to `Accelerator::Global` | ⬜ Next | — | `quadraui-phase-b2-maximize-pilot` | any |
+| Phase B.2 — pilot migration: terminal maximize to `Accelerator::Global` | ⬜ **Next — sketch first** (see below) | — | `quadraui-phase-b2-maximize-pilot` | any |
 | Phase B.3 — layout primitives (`Panel`, `Split`, `Tabs`, `MenuBar`, `Modal`) | ⬜ After B.2 | — | `quadraui-phase-b3-layout` | any |
 | Phase B.4+ — migrate remaining vimcode subsystems to UiEvent | ⬜ After B.3 | — | `quadraui-phase-b4-*` | any |
 | Phase B.5 — Postman-class validation app (#169) | ⬜ After B.3/B.4 | — | _new workspace member_ | any |
@@ -232,6 +232,138 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
   `PanelChromeDesc` (introduced alongside this lesson) as the
   reference pattern. Rule: **backends provide measurements, not
   formulas.**
+
+---
+
+## Phase B.2 starting notes — terminal-maximize pilot migration
+
+**Status:** Ready to start, but sketch design questions first before any
+code. Branch: `quadraui-phase-b2-maximize-pilot` off develop.
+
+### What gets migrated in B.2
+
+**Just the keybinding path for Ctrl+Shift+T.** Everything else stays
+bespoke for now and migrates later:
+
+- Toolbar button (click hit-test + dispatch) → stays; migrates in B.3
+  when `Panel` primitive owns its click regions.
+- `:TerminalMaximize` ex command → stays on current `EngineAction`
+  path.
+- `PanelChromeDesc` chrome-rows math → stays; that's layout, not
+  dispatch.
+- Window-resize handler → stays; that's layout lifecycle, not
+  keybinding.
+- Per-window status suppression when maximized → stays.
+
+### What B.2 actually requires
+
+Three things, in order:
+
+1. **Real `Backend` impls** — the B.1 scaffolding has types but no
+   working impls yet. Each of `TuiBackend`, `GtkBackend`, `WinBackend`
+   needs:
+   - Struct holding the accelerator registry, event queue, and
+     whatever drawing-context reference is required (ratatui `Frame`,
+     Cairo `Context`, Direct2D `RenderTarget`).
+   - `register_accelerator()` storing registrations for
+     `poll_events()` to match against.
+   - `poll_events()` that drains native events (crossterm / GTK
+     signals / Win32 `WndProc`), compares key events to registered
+     accelerators, emits `UiEvent::Accelerator` on match or
+     `UiEvent::KeyPressed` / other variants for unmatched input.
+   - `draw_*` methods — trivial thin wrappers around the existing
+     free functions (`quadraui_tui::draw_tree`, etc.). No behaviour
+     change; apps that want to keep calling the free functions
+     directly still can.
+2. **Vimcode engine grows a `handle_ui_event(&mut self, UiEvent)`
+   entry point.** Dispatches `UiEvent::Accelerator("terminal.toggle_maximize", _)`
+   to the existing `toggle_terminal_maximize()` method. For B.2 this
+   has exactly one accelerator arm; B.4 adds more.
+3. **Delete** the old per-backend `pk.toggle_terminal_maximize`
+   key-matcher checks + their handlers in TUI `event_loop`, GTK key
+   controller, Win-GUI `on_key_down`. Plus the
+   `EngineAction::ToggleTerminalMaximize` action-dispatch branches
+   in each backend's action handler.
+
+### Realistic LOC delta
+
+The proposal's **aspirational -60 LOC net** is wrong for B.2 specifically.
+First real backend impl is ~150 new lines (struct + registration +
+event translation); old deletions are ~25 lines per backend. Net
+~**+250 / -75** across the three backends + engine dispatch.
+
+Payoff arrives in **Phase B.4** when each subsequent accelerator
+migration is +1 line (a new registration entry) and -20 lines
+(native-key plumbing deleted per backend). That's when the
+per-feature wins from the proposal actually materialise.
+
+### Open design questions — sketch before coding
+
+Spend 15-30 min writing answers into
+`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` as a new §11 "Phase B.2
+implementation notes" **before** touching any code:
+
+1. **TuiBackend struct shape.** Does it own the ratatui `Terminal`
+   end-to-end, or does the app pass a `&mut Frame<'_>` into
+   `begin_frame` via a backend-specific extension trait (violating
+   the clean `Backend` trait shape)? Resolution probably: struct
+   owns the `Terminal`; `begin_frame` gets a frame internally and
+   `draw_*` uses it. Has implications for how apps call `backend.run()`
+   or similar top-level method.
+2. **Native-event → UiEvent translation.** First-match-wins against
+   registered accelerators, else raw `UiEvent::KeyPressed`? What about
+   key events that partially match a binding's scope (widget-scoped
+   accelerator with wrong widget focused)? Translation happens in
+   `poll_events`; spell out the algorithm.
+3. **Main-loop integration.** Does vimcode's `event_loop` in
+   `tui_main/mod.rs` keep its current structure and call
+   `backend.poll_events()` once per tick, or does it invert to
+   `for ev in backend.poll_events() { engine.handle_ui_event(ev) }`?
+   Cleanest cutover vs. minimum-diff. Same question for GTK's Relm4
+   message loop and Win-GUI's message pump.
+4. **GTK event ownership.** GTK4 signals fire into Relm4 message
+   handlers on the main thread. Where does the Relm4 handler push an
+   event onto `GtkBackend`'s queue — is the backend a Relm4
+   component, or does it live as a side-channel the Relm4 handlers
+   write into?
+5. **Win-GUI message-pump integration.** `WndProc` callbacks are
+   synchronous; they can push directly onto the backend's queue.
+   Decide: does `WndProc` call through to the backend synchronously
+   (like `backend.push_native_event(...)`), or does it buffer raw
+   native events and translate later in `poll_events`?
+
+Answers close the only parts of the B.1 design that were sketched
+but not proven. Without them, the first `impl Backend for TuiBackend`
+will reveal the problems midway through, and the fix might involve
+changing the `Backend` trait signature — which blocks GTK/Win-GUI
+impls.
+
+### Do this in a new session
+
+This conversation ran the design through all 5 decisions and landed
+B.1. Fresh session is appropriate for the sketch + code work; all
+the load-bearing artifacts are on develop:
+
+- `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §1–§10 (all 5 decisions
+  resolved)
+- `quadraui/docs/APP_ARCHITECTURE.md` (app-developer patterns)
+- `docs/NATIVE_GUI_LESSONS.md` (backend-implementer pitfalls)
+- `PLAN.md` § "Lessons learned" (maximize-era rules)
+- This §"Phase B.2 starting notes" (what you're reading)
+- Open issues: #167, #168, #169, #170 merged at `06dec4a`
+
+### Workflow reminders
+
+Per `CLAUDE.md` "Development Workflow":
+
+- Branch off `develop`, not `main`.
+- **Do NOT push until user approves.** Offer smoke tests / ask "ready
+  to push?" before any `git push`.
+- **Ask user which path** (A = local ff-merge + push develop, B = push
+  branch + PR targeting `develop`) — don't infer.
+- When opening a PR, base is `develop`. `gh pr create` defaults to
+  `main`; always pass `--base develop` or `gh pr edit --base develop`
+  after creation.
 
 ---
 
