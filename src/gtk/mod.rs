@@ -10044,10 +10044,11 @@ impl App {
     /// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
     ///
     /// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh`
-    /// pixels (2 chrome rows = bottom-panel tab bar + terminal toolbar). The
-    /// editor's own tab bar / breadcrumb rows are **not** reserved — under
-    /// maximize they're hidden behind the terminal, matching VSCode's
-    /// "Maximize Panel Size".
+    /// pixels (2 chrome rows = bottom-panel tab bar + terminal toolbar). We
+    /// keep the editor's **tab row** visible so the user can still see which
+    /// files are open (matching VSCode's "Maximize Panel Size" and the TUI
+    /// behaviour), but **drop breadcrumbs** — they're not load-bearing during
+    /// a maximized terminal session.
     ///
     /// Mirrors the geometry in `gtk::draw::draw_frame`:
     ///   editor_bounds.height = da_height
@@ -10056,6 +10057,7 @@ impl App {
     ///                        - qf_px                 (if quickfix open)
     ///                        - term_px               ← we want this maximal
     ///                        - separated_status_px   (per-window + !slat + term)
+    ///   …and the editor's `tab_bar_height` is a slice out of editor_bounds.
     fn terminal_target_maximize_rows(&self) -> u16 {
         let lh = self.cached_line_height.max(1.0);
         if let Some(da) = self.drawing_area.borrow().as_ref() {
@@ -10079,8 +10081,14 @@ impl App {
             let has_separated = per_window_status
                 && !engine.settings.status_line_above_terminal;
             let separated_status_px = if has_separated { lh } else { 0.0 };
-            let chrome =
-                status_bar_height + qf_px + debug_toolbar_px + separated_status_px;
+            // Editor tab row stays visible; breadcrumbs are hidden behind the
+            // panel when maximized.
+            let tab_row_height = (lh * 1.6).ceil();
+            let chrome = status_bar_height
+                + qf_px
+                + debug_toolbar_px
+                + separated_status_px
+                + tab_row_height;
             // Reserve at least 5 content rows even on very small windows.
             let available = (da_h - chrome).max(lh * 7.0);
             let term_rows = (available / lh).floor() as u16;
