@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 22, 2026 (Session 321 — Phase B.2 terminal-maximize accelerator migration) | **Tests:** 5305 total (full `cargo test --workspace --no-default-features`); vimcode 5259 + quadraui 46
+**Last updated:** Apr 23, 2026 (Session 322 — Phase A.6b-win Win-GUI status bar via quadraui) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,43 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 322 — Phase A.6b-win Win-GUI status bar via quadraui:**
+
+1. **`quadraui_win::draw_status_bar` rasteriser** (`src/win_gui/quadraui_win.rs:+95`).
+   Direct2D / DirectWrite counterpart to `quadraui_gtk::draw_status_bar`:
+   per-segment background fills, left-segments-from-left + right-segments-
+   right-aligned layout, `quadraui::StatusBar::fit_right_start_chars` policy
+   so low-priority right segments drop cleanly when the bar is too narrow
+   (#159 fix; previously they overflowed past the right edge).
+2. **Two call sites refactored.** Per-window status bar inside
+   `draw_editor_window` (`src/win_gui/draw.rs:696`, ~40 LOC of bespoke
+   segment-fill code deleted) and `draw_separated_status_line`
+   (`src/win_gui/draw.rs:920`, ~30 LOC deleted) both build the primitive
+   via `render::window_status_line_to_status_bar` and call the new
+   rasteriser. The global bottom bar (`draw_status_bar`, plain text only,
+   only fires when per-window mode is OFF) was left as-is — no parity gap.
+3. **Hit-test stays in lockstep.** `win_status_segment_hit_test`
+   (`src/win_gui/mod.rs:6597`) now applies the same
+   `fit_right_start_chars(width, MIN_GAP_CHARS=2)` so clicks on a dropped
+   right segment cannot fire. Same primitive + same policy on both sides
+   (rasteriser + hit-test) keeps them aligned without a cached zone map.
+4. **Bold attribute deferred.** Win-GUI's text path uses a single non-bold
+   `IDWriteTextFormat`; supporting bold needs a second format and would
+   make the hit-test diverge from the rasteriser (proportional vs char-
+   count widths). Pre-A.6b code didn't honour bold either. Documented in
+   the rasteriser doc comment.
+5. **Pre-existing clippy unblock** (separate commit `ce1f500`): six
+   `collapsible_match` warnings introduced by the Rust 1.95.0 toolchain
+   bump in `dap_ops.rs`, `ext_panel.rs`, `keys.rs`, `motions.rs`,
+   `vscode.rs`, `lsp.rs`. Mechanical `cargo clippy --fix`. Was blocking
+   the A.6b-win quality gate.
+6. **Two settings paper-cuts surfaced during smoke test, filed as
+   separate issues:** #173 (`status_line_above_terminal` label is
+   inverted from its behaviour — `true` keeps bars *inside* windows, not
+   above the terminal) and #174 (`:set window_status_line` rejected
+   because the ex command only accepts vim-style `:set wsl`). Both
+   pre-existing, neither blocks A.6b-win.
 
 **Session 321 — Phase B.2 terminal-maximize accelerator migration:**
 

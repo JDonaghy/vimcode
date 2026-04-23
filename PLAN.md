@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-22 (Session 321 — Phase B.2 shipped: engine-owned accelerator registry)
+> **Last updated:** 2026-04-23 (Session 322 — Phase A.6b-win shipped: Win-GUI status bar via quadraui)
 
 ---
 
@@ -802,12 +802,12 @@ optional polish — landing them brings Win-GUI up to feature parity
 with the Linux GTK side and demonstrates that the quadraui primitives
 work across all three rendering backends (Direct2D, Cairo, ratatui).
 
-| Optional stage | Adds | Linux reference | Estimated size |
-|----------------|------|-----------------|----------------|
-| A.6b-win | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines |
-| A.6d-win | Win-GUI `quadraui_win::draw_tab_bar` | `src/gtk/quadraui_gtk.rs::draw_tab_bar` (~340 lines) | ~400 lines |
-| A.6f-win | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
-| A.7-win | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
+| Optional stage | Status | Adds | Linux reference | Estimated size |
+|----------------|--------|------|-----------------|----------------|
+| **A.6b-win** | ✅ Done | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines (actual: +135/-76) |
+| A.6d-win | ⬜ Next | Win-GUI `quadraui_win::draw_tab_bar` | `src/gtk/quadraui_gtk.rs::draw_tab_bar` (~340 lines) | ~400 lines |
+| A.6f-win | ⬜ Pending | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
+| A.7-win | ⬜ Pending | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
 
 **Scope each as its own branch** following the established pattern
 (`quadraui-phase-a6b-status-bar-win`, etc.), one stage per commit,
