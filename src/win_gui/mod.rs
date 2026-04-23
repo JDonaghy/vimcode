@@ -2263,12 +2263,11 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
                         state.sidebar.has_focus = false;
                         state.engine.search_has_focus = false;
                     }
-                    "Down" => {
+                    "Down"
                         // Switch to results mode
-                        if !state.engine.project_search_results.is_empty() {
+                        if !state.engine.project_search_results.is_empty() => {
                             state.sidebar.search_input_mode = false;
                         }
-                    }
                     _ => {}
                 }
             } else {
@@ -6593,18 +6592,27 @@ fn translate_key_to_pty(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
     }
 }
 
-/// Hit-test a per-window status bar click, returning the action if any segment matches.
+/// Hit-test a per-window status bar click, returning the action if any
+/// segment matches.
+///
+/// Applies `quadraui::StatusBar::fit_right_start_chars` so clicks on a
+/// right segment that the rasterizer dropped (because the bar was too
+/// narrow — see #159) cannot fire. Must stay in sync with
+/// `quadraui_win::draw_status_bar`'s fit policy: both pass the same
+/// `MIN_GAP_CHARS` so the visible-segment set agrees with the hit-test
+/// set.
 fn win_status_segment_hit_test(
     status: &crate::render::WindowStatusLine,
     width: usize,
     click_col: usize,
 ) -> Option<StatusAction> {
-    let right_width: usize = status
-        .right_segments
-        .iter()
-        .map(|s| s.text.chars().count())
-        .sum();
-    let right_start = width.saturating_sub(right_width);
+    const MIN_GAP_CHARS: usize = 2;
+
+    let bar = crate::render::window_status_line_to_status_bar(
+        status,
+        quadraui::WidgetId::new("status:hit"),
+    );
+    let start_idx = bar.fit_right_start_chars(width, MIN_GAP_CHARS);
 
     let mut col = 0;
     for seg in &status.left_segments {
@@ -6615,8 +6623,13 @@ fn win_status_segment_hit_test(
         col += seg_len;
     }
 
-    let mut col = right_start;
-    for seg in &status.right_segments {
+    let visible_widths: Vec<usize> = bar.right_segments[start_idx..]
+        .iter()
+        .map(|s| s.text.chars().count())
+        .collect();
+    let visible_total: usize = visible_widths.iter().sum();
+    let mut col = width.saturating_sub(visible_total).max(col);
+    for seg in status.right_segments.iter().skip(start_idx) {
         let seg_len = seg.text.chars().count();
         if click_col >= col && click_col < col + seg_len {
             return seg.action.clone();

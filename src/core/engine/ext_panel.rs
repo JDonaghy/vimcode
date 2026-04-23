@@ -2119,157 +2119,150 @@ impl Engine {
             "/" => {
                 self.settings_input_active = true;
             }
-            "j" | "Down" => {
-                if total > 0 {
-                    self.settings_selected = (self.settings_selected + 1).min(total - 1);
-                }
+            "j" | "Down" if total > 0 => {
+                self.settings_selected = (self.settings_selected + 1).min(total - 1);
             }
             "k" | "Up" => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
-            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
-                if self.settings_selected < total {
-                    match &flat[self.settings_selected] {
-                        SettingsRow::CoreCategory(cat_idx) => {
-                            let cat_idx = *cat_idx;
-                            if matches!(key, "Tab" | "Return" | "Space")
-                                && cat_idx < self.settings_collapsed.len()
-                            {
-                                self.settings_collapsed[cat_idx] =
-                                    !self.settings_collapsed[cat_idx];
-                            }
+            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left"
+                if self.settings_selected < total =>
+            {
+                match &flat[self.settings_selected] {
+                    SettingsRow::CoreCategory(cat_idx) => {
+                        let cat_idx = *cat_idx;
+                        if matches!(key, "Tab" | "Return" | "Space")
+                            && cat_idx < self.settings_collapsed.len()
+                        {
+                            self.settings_collapsed[cat_idx] = !self.settings_collapsed[cat_idx];
                         }
-                        SettingsRow::CoreSetting(idx) => {
-                            let idx = *idx;
-                            let def = &SETTING_DEFS[idx];
-                            match &def.setting_type {
-                                SettingType::Bool => {
-                                    if matches!(key, "Return" | "Space") {
-                                        let cur = self.settings.get_value_str(def.key);
-                                        let new_val = if cur == "true" { "false" } else { "true" };
-                                        if self.settings.set_value_str(def.key, new_val).is_ok() {
+                    }
+                    SettingsRow::CoreSetting(idx) => {
+                        let idx = *idx;
+                        let def = &SETTING_DEFS[idx];
+                        match &def.setting_type {
+                            SettingType::Bool => {
+                                if matches!(key, "Return" | "Space") {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    let new_val = if cur == "true" { "false" } else { "true" };
+                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
+                                        let _ = self.settings.save();
+                                    }
+                                    // Lazy-init spell checker when toggled on
+                                    if def.key == "spell" && self.settings.spell {
+                                        self.ensure_spell_checker();
+                                    }
+                                }
+                            }
+                            SettingType::Enum(options) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) =
+                                        options.iter().position(|&o| o == cur.as_str())
+                                    {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, options[next])
+                                            .is_ok()
+                                        {
                                             let _ = self.settings.save();
                                         }
-                                        // Lazy-init spell checker when toggled on
-                                        if def.key == "spell" && self.settings.spell {
-                                            self.ensure_spell_checker();
+                                    }
+                                }
+                            }
+                            SettingType::DynamicEnum(options_fn) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let options = options_fn();
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, &options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
                                         }
                                     }
                                 }
-                                SettingType::Enum(options) => {
+                            }
+                            SettingType::Integer { .. } | SettingType::StringVal => {
+                                if matches!(key, "Return") {
+                                    self.settings_editing = Some(idx);
+                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
+                                }
+                            }
+                            SettingType::BufferEditor => {
+                                if matches!(key, "Return" | "Space" | "l" | "Right") {
+                                    match def.key {
+                                        "keymaps" => self.open_keymaps_editor(),
+                                        "extension_registries" => self.open_registries_editor(),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SettingsRow::ExtCategory(name) => {
+                        if matches!(key, "Tab" | "Return" | "Space") {
+                            let collapsed = self
+                                .ext_settings_collapsed
+                                .entry(name.clone())
+                                .or_insert(false);
+                            *collapsed = !*collapsed;
+                        }
+                    }
+                    SettingsRow::ExtSetting(ext_name, ext_key) => {
+                        let ext_name = ext_name.clone();
+                        let ext_key = ext_key.clone();
+                        if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
+                            match def.r#type.as_str() {
+                                "bool" => {
+                                    if matches!(key, "Return" | "Space") {
+                                        let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                        let new_val = if cur == "true" { "false" } else { "true" };
+                                        self.set_ext_setting(&ext_name, &ext_key, new_val);
+                                    }
+                                }
+                                "enum" => {
                                     let forward = matches!(key, "Return" | "Space" | "l" | "Right");
                                     let backward = matches!(key, "h" | "Left");
-                                    if forward || backward {
-                                        let cur = self.settings.get_value_str(def.key);
+                                    if (forward || backward) && !def.options.is_empty() {
+                                        let cur = self.get_ext_setting(&ext_name, &ext_key);
                                         if let Some(pos) =
-                                            options.iter().position(|&o| o == cur.as_str())
+                                            def.options.iter().position(|o| o == &cur)
                                         {
                                             let next = if forward {
-                                                (pos + 1) % options.len()
+                                                (pos + 1) % def.options.len()
                                             } else {
-                                                (pos + options.len() - 1) % options.len()
+                                                (pos + def.options.len() - 1) % def.options.len()
                                             };
-                                            if self
-                                                .settings
-                                                .set_value_str(def.key, options[next])
-                                                .is_ok()
-                                            {
-                                                let _ = self.settings.save();
-                                            }
+                                            self.set_ext_setting(
+                                                &ext_name,
+                                                &ext_key,
+                                                &def.options[next],
+                                            );
                                         }
                                     }
                                 }
-                                SettingType::DynamicEnum(options_fn) => {
-                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                    let backward = matches!(key, "h" | "Left");
-                                    if forward || backward {
-                                        let options = options_fn();
-                                        let cur = self.settings.get_value_str(def.key);
-                                        if let Some(pos) = options.iter().position(|o| o == &cur) {
-                                            let next = if forward {
-                                                (pos + 1) % options.len()
-                                            } else {
-                                                (pos + options.len() - 1) % options.len()
-                                            };
-                                            if self
-                                                .settings
-                                                .set_value_str(def.key, &options[next])
-                                                .is_ok()
-                                            {
-                                                let _ = self.settings.save();
-                                            }
-                                        }
-                                    }
-                                }
-                                SettingType::Integer { .. } | SettingType::StringVal => {
+                                _ => {
                                     if matches!(key, "Return") {
-                                        self.settings_editing = Some(idx);
                                         self.settings_edit_buf =
-                                            self.settings.get_value_str(def.key);
-                                    }
-                                }
-                                SettingType::BufferEditor => {
-                                    if matches!(key, "Return" | "Space" | "l" | "Right") {
-                                        match def.key {
-                                            "keymaps" => self.open_keymaps_editor(),
-                                            "extension_registries" => self.open_registries_editor(),
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        SettingsRow::ExtCategory(name) => {
-                            if matches!(key, "Tab" | "Return" | "Space") {
-                                let collapsed = self
-                                    .ext_settings_collapsed
-                                    .entry(name.clone())
-                                    .or_insert(false);
-                                *collapsed = !*collapsed;
-                            }
-                        }
-                        SettingsRow::ExtSetting(ext_name, ext_key) => {
-                            let ext_name = ext_name.clone();
-                            let ext_key = ext_key.clone();
-                            if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
-                                match def.r#type.as_str() {
-                                    "bool" => {
-                                        if matches!(key, "Return" | "Space") {
-                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
-                                            let new_val =
-                                                if cur == "true" { "false" } else { "true" };
-                                            self.set_ext_setting(&ext_name, &ext_key, new_val);
-                                        }
-                                    }
-                                    "enum" => {
-                                        let forward =
-                                            matches!(key, "Return" | "Space" | "l" | "Right");
-                                        let backward = matches!(key, "h" | "Left");
-                                        if (forward || backward) && !def.options.is_empty() {
-                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
-                                            if let Some(pos) =
-                                                def.options.iter().position(|o| o == &cur)
-                                            {
-                                                let next = if forward {
-                                                    (pos + 1) % def.options.len()
-                                                } else {
-                                                    (pos + def.options.len() - 1)
-                                                        % def.options.len()
-                                                };
-                                                self.set_ext_setting(
-                                                    &ext_name,
-                                                    &ext_key,
-                                                    &def.options[next],
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if matches!(key, "Return") {
-                                            self.settings_edit_buf =
-                                                self.get_ext_setting(&ext_name, &ext_key);
-                                            self.ext_settings_editing = Some((ext_name, ext_key));
-                                        }
+                                            self.get_ext_setting(&ext_name, &ext_key);
+                                        self.ext_settings_editing = Some((ext_name, ext_key));
                                     }
                                 }
                             }

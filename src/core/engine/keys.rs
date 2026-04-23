@@ -811,20 +811,18 @@ impl Engine {
                     }
                     return EngineAction::None;
                 }
-                '0' => {
-                    if self.count.is_some() {
-                        // Accumulate: 10, 20, 100, etc.
-                        let new_count = self.count.unwrap() * 10;
-                        if new_count > 10_000 {
-                            self.count = Some(10_000);
-                            self.message = "Count limited to 10,000".to_string();
-                        } else {
-                            self.count = Some(new_count);
-                        }
-                        return EngineAction::None;
+                '0' if self.count.is_some() => {
+                    // Accumulate: 10, 20, 100, etc.
+                    let new_count = self.count.unwrap() * 10;
+                    if new_count > 10_000 {
+                        self.count = Some(10_000);
+                        self.message = "Count limited to 10,000".to_string();
+                    } else {
+                        self.count = Some(new_count);
                     }
-                    // Fall through to handle '0' as "go to column 0" below
+                    return EngineAction::None;
                 }
+                // Fall through to handle '0' as "go to column 0" below
                 _ => {}
             }
         }
@@ -2410,16 +2408,15 @@ impl Engine {
                 }
                 _ => {}
             },
-            'd' => {
+            'd'
                 // This should not be reached - 'd' is now handled as pending_operator
                 // But keep for backward compatibility during transition
-                if unicode == Some('d') {
+                if unicode == Some('d') => {
                     let count = self.take_count();
                     self.start_undo_group();
                     self.delete_lines(count, changed);
                     self.finish_undo_group();
                 }
-            }
             '"' => {
                 // Register selection: "x sets selected_register for next operation
                 // Uppercase A-Z appends to lowercase register

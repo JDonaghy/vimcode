@@ -1,7 +1,8 @@
 //! Win-GUI (Direct2D / DirectWrite) backend for `quadraui` primitives.
 //!
 //! Direct2D counterpart to `src/tui_main/quadraui_tui.rs` and
-//! `src/gtk/quadraui_gtk.rs`. Currently supports `TreeView` (A.1c).
+//! `src/gtk/quadraui_gtk.rs`. Currently supports `TreeView` (A.1c) and
+//! `StatusBar` (A.6b-win).
 
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
@@ -191,5 +192,96 @@ pub(super) fn draw_tree(
         }
 
         y_off += row_h;
+    }
+}
+
+// ─── StatusBar (A.6b-win) ────────────────────────────────────────────────────
+
+/// Minimum gap (in character columns) between the rightmost left segment
+/// and the leftmost visible right segment. Mirrors the GTK backend's
+/// `MIN_GAP_PX = 16` once converted to char widths (~2 mono cells).
+const STATUS_BAR_MIN_GAP_CHARS: usize = 2;
+
+/// Draw a `quadraui::StatusBar` into `(x, y, width, ctx.line_height)` on
+/// `ctx.rt`, using the editor's monospace font.
+///
+/// Matches the GTK reference (`src/gtk/quadraui_gtk.rs::draw_status_bar`)
+/// in shape: left segments accumulate from `x`; right segments are
+/// right-aligned, with low-priority segments dropped from the front per
+/// `quadraui::StatusBar::fit_right_start_chars` (#159) so the cursor
+/// position is always visible. Backgrounds clip when the two halves
+/// would collide.
+///
+/// Width and hit positions are computed in **character columns** (Win-GUI
+/// uses a fixed-width mono font: `pixel_width = chars().count() * char_width`).
+/// `win_status_segment_hit_test` consults the same `fit_right_start_chars`
+/// policy so clicks on a hidden right segment cannot fire.
+///
+/// **Bold attribute is ignored for v1.** Win-GUI's text path uses a
+/// single non-bold `IDWriteTextFormat`; supporting bold would require a
+/// second format and would make hit-test math diverge from the rasterizer
+/// (proportional vs char-count widths). The pre-A.6b Win-GUI per-window
+/// status bar didn't honour `bold` either.
+pub(super) fn draw_status_bar(
+    ctx: &DrawContext,
+    x: f32,
+    y: f32,
+    width: f32,
+    bar: &quadraui::StatusBar,
+) {
+    if width <= 0.0 {
+        return;
+    }
+    let cw = ctx.char_width;
+    let lh = ctx.line_height;
+    let bar_chars = (width / cw).floor() as usize;
+
+    // Background fill: first segment's bg, else theme.background.
+    let fill = bar
+        .left_segments
+        .first()
+        .or(bar.right_segments.first())
+        .map(|s| qc_to_color(s.bg))
+        .unwrap_or(ctx.theme.background);
+    unsafe {
+        let brush = ctx.solid_brush(fill);
+        ctx.rt.FillRectangle(&rect(x, y, width, lh), &brush);
+    }
+
+    // ── Left segments — accumulate from x ────────────────────────────────
+    let mut cx = x;
+    let x_end = x + width;
+    for seg in &bar.left_segments {
+        if cx >= x_end {
+            break;
+        }
+        let seg_w = seg.text.chars().count() as f32 * cw;
+        let visible_w = (x_end - cx).min(seg_w);
+        let bg = qc_to_color(seg.bg);
+        unsafe {
+            let brush = ctx.solid_brush(bg);
+            ctx.rt.FillRectangle(&rect(cx, y, visible_w, lh), &brush);
+        }
+        ctx.draw_text(&seg.text, cx, y, qc_to_color(seg.fg));
+        cx += seg_w;
+    }
+
+    // ── Right segments — drop low-priority ones until they fit ───────────
+    let start_idx = bar.fit_right_start_chars(bar_chars, STATUS_BAR_MIN_GAP_CHARS);
+    let visible_widths: Vec<f32> = bar.right_segments[start_idx..]
+        .iter()
+        .map(|seg| seg.text.chars().count() as f32 * cw)
+        .collect();
+    let visible_total: f32 = visible_widths.iter().sum();
+    let mut rx = (x + width - visible_total).max(cx);
+    for (offset, seg) in bar.right_segments[start_idx..].iter().enumerate() {
+        let seg_w = visible_widths[offset];
+        let bg = qc_to_color(seg.bg);
+        unsafe {
+            let brush = ctx.solid_brush(bg);
+            ctx.rt.FillRectangle(&rect(rx, y, seg_w, lh), &brush);
+        }
+        ctx.draw_text(&seg.text, rx, y, qc_to_color(seg.fg));
+        rx += seg_w;
     }
 }
