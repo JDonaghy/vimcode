@@ -486,7 +486,17 @@ pub(super) fn draw_frame(
             let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            render_hover_popup(frame, hover, popup_x, popup_y, frame.area(), theme);
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let area = frame.area();
+            let viewport = quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            );
+            let (tooltip, layout) =
+                render::hover_popup_to_quadraui_tooltip(hover, popup_x, popup_y, viewport);
+            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
         }
     }
 
@@ -1398,66 +1408,6 @@ pub(super) fn render_all_windows(
         render_window(frame, win_rect, window, theme);
     }
     render_separators(frame.buffer_mut(), editor_area, windows, theme);
-}
-
-pub(super) fn render_hover_popup(
-    frame: &mut ratatui::Frame,
-    hover: &render::HoverPopup,
-    popup_x: u16,
-    popup_y: u16,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let text_lines: Vec<&str> = hover.text.lines().collect();
-    let num_lines = text_lines.len().min(20) as u16;
-    if num_lines == 0 {
-        return;
-    }
-    let max_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let width = (max_len as u16 + 4).max(12);
-
-    // Place above cursor if possible, otherwise below
-    let y = if popup_y > num_lines {
-        popup_y - num_lines
-    } else {
-        popup_y + 1
-    };
-
-    // Clamp to screen bounds
-    let x = popup_x.min(term_area.width.saturating_sub(width));
-    let y = y.min(term_area.height.saturating_sub(num_lines));
-
-    let bg_color = rc(theme.hover_bg);
-    let fg_color = rc(theme.hover_fg);
-    let border_color = rc(theme.hover_border);
-
-    let buf = frame.buffer_mut();
-    for (i, text_line) in text_lines.iter().enumerate().take(num_lines as usize) {
-        let row_y = y + i as u16;
-        // Fill row background
-        for col in 0..width {
-            let cell_x = x + col;
-            if cell_x < term_area.width && row_y < term_area.height {
-                let cell = &mut buf[(cell_x, row_y)];
-                cell.set_bg(bg_color);
-                let ch = if col == 0 || col == width - 1 {
-                    '│'
-                } else {
-                    ' '
-                };
-                cell.set_char(ch).set_fg(border_color);
-            }
-        }
-        // Render text starting at col 1
-        let display = format!(" {}", text_line);
-        for (j, ch) in display.chars().enumerate() {
-            let cell_x = x + 1 + j as u16;
-            if cell_x + 1 < x + width && cell_x < term_area.width && row_y < term_area.height {
-                let cell = &mut buf[(cell_x, row_y)];
-                cell.set_char(ch).set_fg(fg_color).set_bg(bg_color);
-            }
-        }
-    }
 }
 
 pub(super) fn render_diff_peek_popup(

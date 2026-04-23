@@ -1476,6 +1476,50 @@ fn title_as_plain(text: &quadraui::StyledText) -> String {
         .collect::<String>()
 }
 
+/// Draw a `quadraui::Tooltip` into `layout.bounds` on `buf`. Renders a
+/// multi-line text box with side-bar borders only (`│` on the first and
+/// last columns, no top/bottom border) — matches the visual style used
+/// by the LSP hover popup. Text is split on `\n`; lines that exceed
+/// the box width are truncated.
+pub(super) fn draw_tooltip(
+    buf: &mut Buffer,
+    tooltip: &quadraui::Tooltip,
+    layout: &quadraui::TooltipLayout,
+    theme: &Theme,
+) {
+    let x = layout.bounds.x.round() as u16;
+    let y = layout.bounds.y.round() as u16;
+    let w = layout.bounds.width.round() as u16;
+    let h = layout.bounds.height.round() as u16;
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let fg = tooltip.fg.map(qc).unwrap_or_else(|| rc(theme.hover_fg));
+    let bg = tooltip.bg.map(qc).unwrap_or_else(|| rc(theme.hover_bg));
+    let border = rc(theme.hover_border);
+
+    let lines: Vec<&str> = tooltip.text.lines().collect();
+    for (i, text_line) in lines.iter().enumerate().take(h as usize) {
+        let row = y + i as u16;
+        // Fill the row with background + side borders.
+        for col in 0..w {
+            let ch = if col == 0 || col == w - 1 { '│' } else { ' ' };
+            let cell_fg = if col == 0 || col == w - 1 { border } else { fg };
+            set_cell(buf, x + col, row, ch, cell_fg, bg);
+        }
+        // Render text starting at col 2 (skip border + 1 pad).
+        for (j, ch) in text_line.chars().enumerate() {
+            let col = x + 2 + j as u16;
+            // Stop before the right border.
+            if col + 1 >= x + w {
+                break;
+            }
+            set_cell(buf, col, row, ch, fg, bg);
+        }
+    }
+}
+
 pub(super) fn draw_activity_bar(
     buf: &mut Buffer,
     area: Rect,

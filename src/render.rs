@@ -759,6 +759,50 @@ pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadrau
 
 // ─── HoverPopup ──────────────────────────────────────────────────────────────
 
+/// Convert an engine `HoverPopup` + on-screen anchor cell into a fully
+/// resolved `quadraui::Tooltip` and its `TooltipLayout`.
+///
+/// `anchor_x` / `anchor_y` are the screen cell at the requested symbol
+/// (cursor position, already resolved for scroll + gutter). The popup's
+/// width is sized to the longest text line + 4 cells of padding /
+/// border, and the height is the line count clamped to 20.
+///
+/// Placement is `Top` with fallback `Bottom` via the Tooltip primitive's
+/// own viewport-fit logic. The anchor rectangle is given
+/// `width = popup_width` so the primitive's horizontal-centering math
+/// aligns the popup's left edge with the cursor cell (as the legacy
+/// hover popup did). `margin=0` matches the legacy 0-cell gap above /
+/// 0-cell gap below the cursor line.
+pub fn hover_popup_to_quadraui_tooltip(
+    hover: &HoverPopup,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let text_lines: Vec<&str> = hover.text.lines().take(20).collect();
+    let num_lines = text_lines.len().max(1) as f32;
+    let max_len = text_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(10);
+    // +4: 1 left border + 1 left pad + 1 right pad + 1 right border.
+    let width = ((max_len + 4) as f32).max(12.0);
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp_hover"),
+        text: hover.text.clone(),
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so the primitive's center-on-anchor x
+    // math collapses to left-align with the cursor cell.
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, num_lines);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
+}
+
 /// Data needed to render the LSP hover popup.
 #[derive(Debug, Clone)]
 pub struct HoverPopup {
