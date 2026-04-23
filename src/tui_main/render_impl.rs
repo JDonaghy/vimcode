@@ -758,58 +758,65 @@ pub(super) fn draw_frame(
 
     // ── Close-tab confirm overlay ──────────────────────────────────────────────
     if close_tab_confirm {
-        // Build a Dialog primitive so the rendering goes through the
-        // shared D6 path — horizontal buttons, click interception.
-        let dialog = quadraui::Dialog {
-            id: quadraui::WidgetId::new("close_tab_confirm"),
-            title: quadraui::StyledText::plain("Unsaved Changes"),
-            body: quadraui::StyledText::plain("This file has unsaved changes."),
-            buttons: vec![
-                quadraui::DialogButton {
-                    id: quadraui::WidgetId::new("close_tab:save"),
-                    label: "Save".to_string(),
-                    is_default: true,
-                    is_cancel: false,
-                    tint: None,
-                },
-                quadraui::DialogButton {
-                    id: quadraui::WidgetId::new("close_tab:discard"),
-                    label: "Discard".to_string(),
-                    is_default: false,
-                    is_cancel: false,
-                    tint: None,
-                },
-                quadraui::DialogButton {
-                    id: quadraui::WidgetId::new("close_tab:cancel"),
-                    label: "Cancel".to_string(),
-                    is_default: false,
-                    is_cancel: true,
-                    tint: None,
-                },
-            ],
-            severity: Some(quadraui::DialogSeverity::Warning),
-            vertical_buttons: false,
-            input: None,
-        };
-        let viewport = quadraui::Rect::new(
-            area.x as f32,
-            area.y as f32,
-            area.width as f32,
-            area.height as f32,
-        );
-        let measure = quadraui::DialogMeasure {
-            width: 48.0,
-            title_height: 1.0,
-            body_height: 1.0,
-            input_height: 0.0,
-            button_row_height: 1.0,
-            button_width: 11.0,
-            button_gap: 2.0,
-            padding: 1.0,
-        };
-        let layout = dialog.layout(viewport, measure);
+        let (dialog, layout) = build_close_tab_dialog(area);
         super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
     }
+}
+
+/// Build the close-tab-confirm Dialog primitive + its resolved layout.
+/// Shared between the draw site (`render_window` above) and the mouse
+/// hit-test site (`mouse.rs`) so a button's visual rect and its click
+/// rect are identical by construction.
+pub(super) fn build_close_tab_dialog(area: Rect) -> (quadraui::Dialog, quadraui::DialogLayout) {
+    let dialog = quadraui::Dialog {
+        id: quadraui::WidgetId::new("close_tab_confirm"),
+        title: quadraui::StyledText::plain("Unsaved Changes"),
+        body: quadraui::StyledText::plain("This file has unsaved changes."),
+        buttons: vec![
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("close_tab:save"),
+                label: "Save".to_string(),
+                is_default: true,
+                is_cancel: false,
+                tint: None,
+            },
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("close_tab:discard"),
+                label: "Discard".to_string(),
+                is_default: false,
+                is_cancel: false,
+                tint: None,
+            },
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("close_tab:cancel"),
+                label: "Cancel".to_string(),
+                is_default: false,
+                is_cancel: true,
+                tint: None,
+            },
+        ],
+        severity: Some(quadraui::DialogSeverity::Warning),
+        vertical_buttons: false,
+        input: None,
+    };
+    let viewport = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    let measure = quadraui::DialogMeasure {
+        width: 48.0,
+        title_height: 1.0,
+        body_height: 1.0,
+        input_height: 0.0,
+        button_row_height: 1.0,
+        button_width: 11.0,
+        button_gap: 2.0,
+        padding: 1.0,
+    };
+    let layout = dialog.layout(viewport, measure);
+    (dialog, layout)
 }
 
 // ─── Tab bar constants ───────────────────────────────────────────────────────

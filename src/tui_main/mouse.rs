@@ -47,6 +47,54 @@ pub(super) fn handle_mouse(
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
+    // ── Close-tab confirm overlay click interception ────────────────────────
+    // Route clicks through DialogLayout::hit_test. Swallow all clicks while
+    // the overlay is visible so they don't fall through to the editor.
+    if *close_tab_confirm {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_size = terminal_size.unwrap_or_else(|| {
+                ratatui::layout::Size::new(term_height, 80)
+            });
+            let area = ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: term_size.width,
+                height: term_size.height,
+            };
+            let (_dialog, layout) = super::render_impl::build_close_tab_dialog(area);
+            match layout.hit_test(col as f32, row as f32) {
+                quadraui::DialogHit::Button(id) => match id.as_str() {
+                    "close_tab:save" => {
+                        engine.escape_to_normal();
+                        let _ = engine.save();
+                        engine.close_tab();
+                        *close_tab_confirm = false;
+                    }
+                    "close_tab:discard" => {
+                        engine.escape_to_normal();
+                        engine.close_tab();
+                        *close_tab_confirm = false;
+                    }
+                    "close_tab:cancel" => {
+                        engine.escape_to_normal();
+                        *close_tab_confirm = false;
+                    }
+                    _ => {}
+                },
+                quadraui::DialogHit::Outside => {
+                    // Click outside dialog: dismiss (same as pressing Escape).
+                    engine.escape_to_normal();
+                    *close_tab_confirm = false;
+                }
+                quadraui::DialogHit::Body => {
+                    // Click on dialog body (not a button): swallow.
+                }
+            }
+        }
+        // Swallow all other mouse events while the overlay is up.
+        return sidebar_width;
+    }
+
     let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
         0
     } else {
