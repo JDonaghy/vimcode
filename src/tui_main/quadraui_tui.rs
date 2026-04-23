@@ -1190,7 +1190,17 @@ pub(super) fn draw_activity_bar(
         }
     }
 
-    let draw_row = |buf: &mut Buffer, y: u16, item: &quadraui::ActivityItem| {
+    // Per D6: ask the primitive for a layout. ActivityBar uses
+    // uniform 1-cell rows in TUI; the layout handles top/bottom
+    // pinning and collision (bottom wins).
+    let layout = bar.layout(area.width as f32, area.height as f32, 1.0);
+
+    for visible in &layout.visible_items {
+        let y = area.y + visible.bounds.y.round() as u16;
+        let item = match visible.side {
+            quadraui::ActivitySide::Top => &bar.top_items[visible.item_idx],
+            quadraui::ActivitySide::Bottom => &bar.bottom_items[visible.item_idx],
+        };
         let row_bg = if item.is_keyboard_selected {
             sel_bg
         } else {
@@ -1206,28 +1216,6 @@ pub(super) fn draw_activity_bar(
         if item.is_active && !item.is_keyboard_selected {
             set_cell(buf, area.x, y, '\u{258E}', accent_fg, bar_bg); // ▎
         }
-    };
-
-    // Bottom items take priority — compute how many will fit.
-    let bottom_rows_available = area.height as usize;
-    let bottom_count = bar.bottom_items.len().min(bottom_rows_available);
-    let top_rows_available = (area.height as usize).saturating_sub(bottom_count);
-
-    // Top items — draw from top, clipped.
-    for (i, item) in bar.top_items.iter().enumerate() {
-        if i >= top_rows_available {
-            break;
-        }
-        draw_row(buf, area.y + i as u16, item);
-    }
-
-    // Bottom items — draw from bottom upward.
-    for (i, item) in bar.bottom_items.iter().rev().enumerate() {
-        let y = area.y + area.height - 1 - i as u16;
-        if y < area.y {
-            break;
-        }
-        draw_row(buf, y, item);
     }
 }
 
