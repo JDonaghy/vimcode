@@ -1523,9 +1523,9 @@ impl Engine {
                     }
                 }
             }
-            'F' => {
+            'F'
                 // Find backward (inclusive): search left of cursor
-                if col > 0 {
+                if col > 0 => {
                     for i in (0..col).rev() {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
@@ -1534,7 +1534,6 @@ impl Engine {
                         }
                     }
                 }
-            }
             't' => {
                 // Till forward (exclusive): stop before target
                 for i in (col + 1)..line_len {
@@ -1547,9 +1546,9 @@ impl Engine {
                     }
                 }
             }
-            'T' => {
+            'T'
                 // Till backward (exclusive): stop after target
-                if col > 0 {
+                if col > 0 => {
                     for i in (0..col).rev() {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
@@ -1558,7 +1557,6 @@ impl Engine {
                         }
                     }
                 }
-            }
             _ => {}
         }
         // Character not found - cursor doesn't move (Vim behavior)

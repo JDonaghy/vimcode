@@ -127,11 +127,9 @@ impl Engine {
         match op {
             "Right" => self.move_right_insert(),
             "Left" => self.move_left(),
-            "Up" => {
-                if self.view().cursor.line > 0 {
-                    self.view_mut().cursor.line -= 1;
-                    self.clamp_cursor_col_insert();
-                }
+            "Up" if self.view().cursor.line > 0 => {
+                self.view_mut().cursor.line -= 1;
+                self.clamp_cursor_col_insert();
             }
             "Down" => {
                 let max_line = self.buffer().len_lines().saturating_sub(1);

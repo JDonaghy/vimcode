@@ -856,16 +856,15 @@ impl Engine {
             "x" | "d" => {
                 let sel = self.dap_sidebar_selected;
                 match self.dap_sidebar_section {
-                    DebugSidebarSection::Watch => {
+                    DebugSidebarSection::Watch
                         // Remove the selected watch expression.
-                        if sel < self.dap_watch_expressions.len() {
+                        if sel < self.dap_watch_expressions.len() => {
                             self.dap_remove_watch(sel);
                             let new_len = self.dap_watch_expressions.len();
                             if self.dap_sidebar_selected >= new_len && new_len > 0 {
                                 self.dap_sidebar_selected = new_len - 1;
                             }
                         }
-                    }
                     DebugSidebarSection::Breakpoints => {
                         // Remove the selected breakpoint.
                         if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(sel) {

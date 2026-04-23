@@ -1509,13 +1509,11 @@ fn reader_thread(
             let is_error = json.get("error").is_some();
 
             match method.as_deref() {
-                Some("initialize") => {
-                    if !initialized_sent {
-                        if let Some(r) = result {
-                            if let Some(caps) = r.get("capabilities") {
-                                initialized_sent = true;
-                                let _ = tx.send(LspEvent::Initialized(server_id, caps.clone()));
-                            }
+                Some("initialize") if !initialized_sent => {
+                    if let Some(r) = result {
+                        if let Some(caps) = r.get("capabilities") {
+                            initialized_sent = true;
+                            let _ = tx.send(LspEvent::Initialized(server_id, caps.clone()));
                         }
                     }
                 }
