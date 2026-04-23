@@ -453,6 +453,13 @@ pub(super) fn draw_form(
                     pangocairo::show_layout(cr, layout);
                 }
             }
+            // New #143 field kinds (Slider / ColorPicker / Dropdown) are
+            // not yet rendered in GTK — they land with issue #143's
+            // migration PR. For now the row is blank on the right side,
+            // so existing forms keep working.
+            quadraui::FieldKind::Slider { .. }
+            | quadraui::FieldKind::ColorPicker { .. }
+            | quadraui::FieldKind::Dropdown { .. } => {}
         }
 
         y_off += row_h;

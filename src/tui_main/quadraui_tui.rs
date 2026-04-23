@@ -411,6 +411,93 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
                     );
                 }
             }
+            quadraui::FieldKind::Slider {
+                value,
+                min,
+                max,
+                step: _,
+            } => {
+                // Simple TUI slider: " [====----] value " right-aligned.
+                let range = (*max - *min).max(f32::EPSILON);
+                let frac = ((*value - *min) / range).clamp(0.0, 1.0);
+                let track_cells: usize = 12;
+                let filled = (frac * track_cells as f32).round() as usize;
+                let value_str = format!("{value:.2}");
+                let total = track_cells + 2 + value_str.chars().count() + 2; // "[" + track + "]" + space + value
+                let start_col = (area.width as usize).saturating_sub(total + 2);
+                if start_col > label_end + 1 {
+                    let mut col = start_col;
+                    set_cell(buf, area.x + col as u16, y, '[', dim_fg, row_bg);
+                    col += 1;
+                    for i in 0..track_cells {
+                        let ch = if i < filled { '=' } else { '-' };
+                        let fg = if i < filled { accent_fg } else { dim_fg };
+                        set_cell(buf, area.x + col as u16, y, ch, fg, row_bg);
+                        col += 1;
+                    }
+                    set_cell(buf, area.x + col as u16, y, ']', dim_fg, row_bg);
+                    col += 2;
+                    for ch in value_str.chars() {
+                        if col >= area.width as usize {
+                            break;
+                        }
+                        set_cell(buf, area.x + col as u16, y, ch, field_fg, row_bg);
+                        col += 1;
+                    }
+                }
+            }
+            quadraui::FieldKind::ColorPicker { value } => {
+                // Render "■ #rrggbb" with the swatch tinted. TUI can't
+                // do real colour picker; the click opens an app-supplied
+                // palette.
+                let hex = format!("#{:02x}{:02x}{:02x}", value.r, value.g, value.b);
+                let total = 2 + hex.chars().count(); // "■ " + hex
+                let start_col = (area.width as usize).saturating_sub(total + 2);
+                if start_col > label_end + 1 {
+                    let swatch_fg = ratatui::style::Color::Rgb(value.r, value.g, value.b);
+                    set_cell(buf, area.x + start_col as u16, y, '\u{25A0}', swatch_fg, row_bg);
+                    let mut col = start_col + 2;
+                    for ch in hex.chars() {
+                        if col >= area.width as usize {
+                            break;
+                        }
+                        set_cell(buf, area.x + col as u16, y, ch, field_fg, row_bg);
+                        col += 1;
+                    }
+                }
+            }
+            quadraui::FieldKind::Dropdown {
+                options,
+                selected_idx,
+            } => {
+                // Render the selected option + a "▾" chevron indicating
+                // the dropdown can expand. Apps draw the full list on
+                // activation separately.
+                let chosen = options
+                    .get(*selected_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                let label_w = chosen.visible_width();
+                let total = label_w + 4; // " text ▾ "
+                let start_col = (area.width as usize).saturating_sub(total + 1);
+                if start_col > label_end + 1 {
+                    draw_styled_text(
+                        buf,
+                        area,
+                        y,
+                        start_col + 1,
+                        &chosen,
+                        field_fg,
+                        row_bg,
+                        quadraui::Decoration::Normal,
+                        dim_fg,
+                    );
+                    let chev_col = start_col + 1 + label_w + 1;
+                    if chev_col < area.width as usize {
+                        set_cell(buf, area.x + chev_col as u16, y, '\u{25BE}', dim_fg, row_bg);
+                    }
+                }
+            }
         }
     }
 }
