@@ -11002,4 +11002,106 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── Tooltip adapter tests (hover popup + signature help) ───────────────
+
+    #[test]
+    fn test_hover_popup_to_tooltip_plain_multiline() {
+        let hover = HoverPopup {
+            text: "fn foo() -> i32\nReturns the answer.".to_string(),
+            anchor_line: 5,
+            anchor_col: 10,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = hover_popup_to_quadraui_tooltip(&hover, 30, 20, viewport);
+
+        // Plain multi-line path: styled is None, text carries newlines.
+        assert!(tooltip.styled.is_none());
+        assert!(tooltip.text.contains('\n'));
+        // Placement preferred Top — layout resolves to Top because there's
+        // room (anchor_y=20, height=2 → fits above).
+        assert_eq!(layout.resolved_placement, quadraui::ResolvedPlacement::Top);
+        // Popup is positioned above the cursor line.
+        assert!(layout.bounds.y < 20.0);
+    }
+
+    #[test]
+    fn test_signature_help_to_tooltip_highlights_active_param() {
+        let theme = Theme::onedark();
+        // Label: "fn from(s: &str) -> String"
+        //         0    5   9       18
+        // Params: param 0 is "s: &str" starting at byte 8 (after "fn from(").
+        let sig = SignatureHelp {
+            label: "fn from(s: &str) -> String".to_string(),
+            params: vec![(8, 15)], // byte offsets of "s: &str"
+            active_param: Some(0),
+            anchor_line: 3,
+            anchor_col: 20,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = signature_help_to_quadraui_tooltip(&sig, 40, 15, viewport, &theme);
+
+        // Styled path is active.
+        let styled = tooltip.styled.as_ref().expect("styled spans");
+        // 5 spans: leading " ", pre, active, post, trailing " ".
+        assert_eq!(styled.spans.len(), 5);
+        assert_eq!(styled.spans[0].text, " ");
+        assert_eq!(styled.spans[1].text, "fn from(");
+        assert_eq!(styled.spans[2].text, "s: &str");
+        assert_eq!(styled.spans[3].text, ") -> String");
+        assert_eq!(styled.spans[4].text, " ");
+
+        // Active span uses theme keyword colour; surrounding spans use hover_fg.
+        let kw = to_q_color(theme.keyword);
+        let fg = to_q_color(theme.hover_fg);
+        assert_eq!(styled.spans[2].fg, Some(kw));
+        assert_eq!(styled.spans[1].fg, Some(fg));
+        assert_eq!(styled.spans[3].fg, Some(fg));
+
+        // Single-line height; width sized to label + padding + borders.
+        assert_eq!(layout.bounds.height, 1.0);
+        assert!(layout.bounds.width >= 26.0);
+    }
+
+    #[test]
+    fn test_signature_help_to_tooltip_no_active_param() {
+        let theme = Theme::onedark();
+        let sig = SignatureHelp {
+            label: "fn noop()".to_string(),
+            params: Vec::new(),
+            active_param: None,
+            anchor_line: 0,
+            anchor_col: 0,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+
+        let styled = tooltip.styled.as_ref().expect("styled spans");
+        // Without active param: leading " ", full label as one span, trailing " ".
+        assert_eq!(styled.spans.len(), 3);
+        assert_eq!(styled.spans[1].text, "fn noop()");
+        // Everything uses hover_fg (no keyword highlight).
+        let fg = to_q_color(theme.hover_fg);
+        assert_eq!(styled.spans[1].fg, Some(fg));
+    }
+
+    #[test]
+    fn test_signature_help_active_param_out_of_range_falls_back() {
+        let theme = Theme::onedark();
+        // active_param index points past end of params list — adapter falls
+        // back to no-highlight path.
+        let sig = SignatureHelp {
+            label: "fn foo(x: i32)".to_string(),
+            params: vec![(7, 13)],
+            active_param: Some(5), // out of range
+            anchor_line: 0,
+            anchor_col: 0,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+        let styled = tooltip.styled.as_ref().expect("styled spans");
+        // Fallback: 3 spans (leading-pad, whole-label, trailing-pad).
+        assert_eq!(styled.spans.len(), 3);
+        assert_eq!(styled.spans[1].text, "fn foo(x: i32)");
+    }
 }

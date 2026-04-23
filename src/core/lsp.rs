@@ -992,6 +992,17 @@ impl LspServer {
                     "hover": {
                         "contentFormat": ["plaintext", "markdown"]
                     },
+                    "signatureHelp": {
+                        "dynamicRegistration": false,
+                        "signatureInformation": {
+                            "documentationFormat": ["plaintext", "markdown"],
+                            "parameterInformation": {
+                                "labelOffsetSupport": true
+                            },
+                            "activeParameterSupport": true
+                        },
+                        "contextSupport": false
+                    },
                     "publishDiagnostics": {
                         "relatedInformation": true
                     },
