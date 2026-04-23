@@ -796,11 +796,18 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
     let error_fg = rc(theme.diagnostic_error);
     let warn_fg = rc(theme.diagnostic_warning);
 
-    let mut y = area.y;
+    // Per D6: ask the primitive for a layout. Title row is 1 cell if
+    // present; items are 1 cell each. Layout resolves which items are
+    // visible and their y positions.
+    let title_h = if list.title.is_some() { 1.0 } else { 0.0 };
+    let layout = list.layout(area.width as f32, area.height as f32, title_h, |_| {
+        quadraui::ListItemMeasure::new(1.0)
+    });
 
-    // Title header (optional).
-    if let Some(ref title) = list.title {
-        if y < area.y + area.height {
+    // Draw title header (if present).
+    if let Some(title_bounds) = layout.title_bounds {
+        if let Some(ref title) = list.title {
+            let y = area.y + title_bounds.y.round() as u16;
             for x in area.x..area.x + area.width {
                 set_cell(buf, x, y, ' ', hdr_fg, hdr_bg);
             }
@@ -815,24 +822,13 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
                 quadraui::Decoration::Normal,
                 dim_fg,
             );
-            y += 1;
         }
     }
 
-    let items_end = area.y + area.height;
-
-    for (vis_i, item) in list
-        .items
-        .iter()
-        .enumerate()
-        .skip(list.scroll_offset)
-        .take((items_end.saturating_sub(y)) as usize)
-    {
-        if y >= items_end {
-            break;
-        }
-
-        let is_selected = vis_i == list.selected_idx && list.has_focus;
+    for visible_item in &layout.visible_items {
+        let item = &list.items[visible_item.item_idx];
+        let y = area.y + visible_item.bounds.y.round() as u16;
+        let is_selected = visible_item.item_idx == list.selected_idx && list.has_focus;
         let bg = if is_selected { sel_bg } else { row_bg };
         let decoration_fg = match item.decoration {
             quadraui::Decoration::Error => error_fg,
@@ -909,8 +905,6 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
                 );
             }
         }
-
-        y += 1;
     }
 }
 
