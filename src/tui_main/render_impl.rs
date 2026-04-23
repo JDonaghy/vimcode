@@ -554,7 +554,17 @@ pub(super) fn draw_frame(
             let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            render_signature_popup(frame, sig, popup_x, popup_y, frame.area(), theme);
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let area = frame.area();
+            let viewport = quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            );
+            let (tooltip, layout) =
+                render::signature_help_to_quadraui_tooltip(sig, popup_x, popup_y, viewport, theme);
+            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
         }
     }
 
@@ -1508,73 +1518,6 @@ pub(super) fn render_diff_peek_popup(
                 cx += 1;
             }
             cx += 2; // spacing between labels
-        }
-    }
-}
-
-pub(super) fn render_signature_popup(
-    frame: &mut ratatui::Frame,
-    sig: &render::SignatureHelp,
-    popup_x: u16,
-    popup_y: u16,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let label = &sig.label;
-    if label.is_empty() {
-        return;
-    }
-    let display = format!(" {} ", label);
-    let width = (display.len() as u16 + 2).max(12);
-
-    // Place above the cursor line if possible, otherwise below.
-    let y = if popup_y > 1 {
-        popup_y - 1
-    } else {
-        popup_y + 1
-    };
-    let x = popup_x.min(term_area.width.saturating_sub(width));
-    let y = y.min(term_area.height.saturating_sub(1));
-
-    let bg_color = rc(theme.hover_bg);
-    let fg_color = rc(theme.hover_fg);
-    let kw_color = rc(theme.keyword);
-    let border_color = rc(theme.hover_border);
-
-    // Compute which char indices are in the active parameter (byte → char mapping).
-    let active_char_range: Option<(usize, usize)> = sig.active_param.and_then(|idx| {
-        sig.params.get(idx).map(|&(start_byte, end_byte)| {
-            let char_start = label[..start_byte].chars().count() + 1; // +1 for leading space
-            let char_end = label[..end_byte].chars().count() + 1;
-            (char_start, char_end)
-        })
-    });
-
-    let buf = frame.buffer_mut();
-    // Draw background row
-    for col in 0..width {
-        let cell_x = x + col;
-        if cell_x < term_area.width && y < term_area.height {
-            let cell = &mut buf[(cell_x, y)];
-            cell.set_bg(bg_color);
-            let ch = if col == 0 || col == width - 1 {
-                '│'
-            } else {
-                ' '
-            };
-            cell.set_char(ch).set_fg(border_color);
-        }
-    }
-    // Draw each character of the display string with appropriate color.
-    for (j, ch) in display.chars().enumerate() {
-        let cell_x = x + 1 + j as u16;
-        if cell_x + 1 < x + width && cell_x < term_area.width && y < term_area.height {
-            let in_active = active_char_range
-                .map(|(s, e)| j >= s && j < e)
-                .unwrap_or(false);
-            let color = if in_active { kw_color } else { fg_color };
-            let cell = &mut buf[(cell_x, y)];
-            cell.set_char(ch).set_fg(color).set_bg(bg_color);
         }
     }
 }

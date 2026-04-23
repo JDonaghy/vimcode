@@ -1477,10 +1477,14 @@ fn title_as_plain(text: &quadraui::StyledText) -> String {
 }
 
 /// Draw a `quadraui::Tooltip` into `layout.bounds` on `buf`. Renders a
-/// multi-line text box with side-bar borders only (`│` on the first and
-/// last columns, no top/bottom border) — matches the visual style used
-/// by the LSP hover popup. Text is split on `\n`; lines that exceed
-/// the box width are truncated.
+/// text box with side-bar borders only (`│` on the first and last
+/// columns, no top/bottom border) — matches the visual style used by
+/// the LSP hover popup and signature help.
+///
+/// If `tooltip.styled` is `Some`, a single line of styled spans is
+/// rendered (signature help path). Otherwise `tooltip.text` is split
+/// on `\n` and each line is rendered plain (hover popup path). Lines
+/// that exceed the box width are truncated.
 pub(super) fn draw_tooltip(
     buf: &mut Buffer,
     tooltip: &quadraui::Tooltip,
@@ -1499,19 +1503,41 @@ pub(super) fn draw_tooltip(
     let bg = tooltip.bg.map(qc).unwrap_or_else(|| rc(theme.hover_bg));
     let border = rc(theme.hover_border);
 
-    let lines: Vec<&str> = tooltip.text.lines().collect();
-    for (i, text_line) in lines.iter().enumerate().take(h as usize) {
-        let row = y + i as u16;
-        // Fill the row with background + side borders.
+    // Helper: paint a row's side-bar borders + background fill.
+    let paint_row_background = |buf: &mut Buffer, row: u16| {
         for col in 0..w {
             let ch = if col == 0 || col == w - 1 { '│' } else { ' ' };
             let cell_fg = if col == 0 || col == w - 1 { border } else { fg };
             set_cell(buf, x + col, row, ch, cell_fg, bg);
         }
+    };
+
+    if let Some(ref styled) = tooltip.styled {
+        // Single-line styled path. Fill row 0 and render spans left-to-right.
+        paint_row_background(buf, y);
+        let mut col_off: u16 = 2; // skip border + 1 pad
+        for span in &styled.spans {
+            let span_fg = span.fg.map(qc).unwrap_or(fg);
+            let span_bg = span.bg.map(qc).unwrap_or(bg);
+            for ch in span.text.chars() {
+                let col = x + col_off;
+                if col + 1 >= x + w {
+                    return;
+                }
+                set_cell(buf, col, y, ch, span_fg, span_bg);
+                col_off += 1;
+            }
+        }
+        return;
+    }
+
+    let lines: Vec<&str> = tooltip.text.lines().collect();
+    for (i, text_line) in lines.iter().enumerate().take(h as usize) {
+        let row = y + i as u16;
+        paint_row_background(buf, row);
         // Render text starting at col 2 (skip border + 1 pad).
         for (j, ch) in text_line.chars().enumerate() {
             let col = x + 2 + j as u16;
-            // Stop before the right border.
             if col + 1 >= x + w {
                 break;
             }

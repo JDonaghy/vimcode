@@ -791,6 +791,7 @@ pub fn hover_popup_to_quadraui_tooltip(
     let tooltip = quadraui::Tooltip {
         id: quadraui::WidgetId::new("lsp_hover"),
         text: hover.text.clone(),
+        styled: None,
         placement: quadraui::TooltipPlacement::Top,
         bg: None,
         fg: None,
@@ -855,6 +856,81 @@ pub struct SignatureHelp {
     pub anchor_line: usize,
     /// Buffer column of the opening `(`.
     pub anchor_col: usize,
+}
+
+/// Convert a `SignatureHelp` + on-screen anchor cell into a fully
+/// resolved `quadraui::Tooltip` and its `TooltipLayout`.
+///
+/// The label is rendered as a single-line styled tooltip: text before
+/// and after the active parameter use the theme hover-fg; the active
+/// parameter is highlighted in the theme keyword colour.
+///
+/// Placement is `Top` with fallback `Bottom`. The anchor rectangle is
+/// given `width = popup_width` so the primitive's horizontal-centering
+/// math aligns the popup's left edge with the cursor cell (matching
+/// legacy behavior).
+pub fn signature_help_to_quadraui_tooltip(
+    sig: &SignatureHelp,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let label = &sig.label;
+    // Display adds a leading + trailing space inside the border, so
+    // `display_len` is `label_chars + 2`.
+    let label_chars = label.chars().count();
+    let display_len = label_chars + 2;
+    // +2 for the two side borders.
+    let width = ((display_len + 2) as f32).max(12.0);
+
+    // Build styled spans. The label's active parameter (if any) is
+    // highlighted in theme.keyword. Offsets in `sig.params` are byte
+    // offsets into `label` — convert to char-based splits.
+    let fg = to_q_color(theme.hover_fg);
+    let kw = to_q_color(theme.keyword);
+
+    let active_byte_range: Option<(usize, usize)> = sig
+        .active_param
+        .and_then(|idx| sig.params.get(idx).copied());
+
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    // Leading space inside the border.
+    spans.push(quadraui::StyledSpan::with_fg(" ", fg));
+    match active_byte_range {
+        Some((start, end)) if start < end && end <= label.len() => {
+            let pre = &label[..start];
+            let active = &label[start..end];
+            let post = &label[end..];
+            if !pre.is_empty() {
+                spans.push(quadraui::StyledSpan::with_fg(pre, fg));
+            }
+            spans.push(quadraui::StyledSpan::with_fg(active, kw));
+            if !post.is_empty() {
+                spans.push(quadraui::StyledSpan::with_fg(post, fg));
+            }
+        }
+        _ => {
+            spans.push(quadraui::StyledSpan::with_fg(label, fg));
+        }
+    }
+    // Trailing space inside the border.
+    spans.push(quadraui::StyledSpan::with_fg(" ", fg));
+
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp_signature_help"),
+        text: String::new(),
+        styled: Some(quadraui::StyledText { spans }),
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so centering math left-aligns popup
+    // with the cursor cell.
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, 1.0);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
 }
 
 // ─── PickerPanel (unified) ─────────────────────────────────────────────────
