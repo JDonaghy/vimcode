@@ -103,6 +103,7 @@ pub(super) fn draw_frame(
     debug_output_scroll: usize,
     folder_picker: Option<&FolderPickerState>,
     quit_confirm: bool,
+    quit_confirm_focus: usize,
     close_tab_confirm: bool,
     close_tab_confirm_focus: usize,
     cmd_sel: Option<(usize, usize)>,
@@ -707,7 +708,12 @@ pub(super) fn draw_frame(
             area.width.saturating_sub(2) as f32,
             area.height.saturating_sub(2) as f32,
         );
-        let max_label = ctx_menu.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+        let max_label = ctx_menu
+            .items
+            .iter()
+            .map(|i| i.label.len())
+            .max()
+            .unwrap_or(4);
         let max_shortcut = ctx_menu
             .items
             .iter()
@@ -738,7 +744,12 @@ pub(super) fn draw_frame(
             area.height as f32,
         );
         // Compute dimensions the same way the legacy draw did.
-        let body_max = dialog.body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let body_max = dialog
+            .body
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
         let btn_max_label = dialog
             .buttons
             .iter()
@@ -755,9 +766,10 @@ pub(super) fn draw_frame(
                 .sum::<usize>()
                 + 2
         };
-        let content_width = body_max.max(dialog.title.chars().count() + 4).max(btn_row_len);
-        let width =
-            (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
+        let content_width = body_max
+            .max(dialog.title.chars().count() + 4)
+            .max(btn_row_len);
+        let width = (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
         let measure = quadraui::DialogMeasure {
             width,
             title_height: 1.0,
@@ -785,7 +797,8 @@ pub(super) fn draw_frame(
 
     // ── Quit confirm overlay — rendered on top of absolutely everything ───────
     if quit_confirm {
-        render_quit_confirm_overlay(frame.buffer_mut(), area, theme);
+        let (dialog, layout) = build_quit_confirm_dialog(area, quit_confirm_focus);
+        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
     }
 
     // ── Close-tab confirm overlay ──────────────────────────────────────────────
@@ -802,6 +815,71 @@ pub(super) fn draw_frame(
 /// Button indices in the close-tab confirm dialog. Tab / arrow keys
 /// cycle `focus_idx` through these in order.
 pub(super) const CLOSE_TAB_BTN_COUNT: usize = 3;
+
+/// Button indices in the quit-confirm dialog (unsaved-changes-on-exit).
+/// Tab / arrow keys cycle `focus_idx` through these in order:
+/// 0 = Save All & Quit, 1 = Quit Anyway, 2 = Cancel.
+pub(super) const QUIT_CONFIRM_BTN_COUNT: usize = 3;
+
+/// Build the quit-confirm Dialog primitive + its resolved layout.
+/// Shared between the draw site (`render_window` above) and the mouse
+/// hit-test site (`mouse.rs`) so a button's visual rect and its click
+/// rect are identical by construction.
+pub(super) fn build_quit_confirm_dialog(
+    area: Rect,
+    focus_idx: usize,
+) -> (quadraui::Dialog, quadraui::DialogLayout) {
+    let focus = focus_idx.min(QUIT_CONFIRM_BTN_COUNT - 1);
+    let dialog = quadraui::Dialog {
+        id: quadraui::WidgetId::new("quit_confirm"),
+        title: quadraui::StyledText::plain("Unsaved Changes"),
+        body: quadraui::StyledText::plain("You have unsaved changes. Quit anyway?"),
+        buttons: vec![
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("quit:save_all"),
+                label: "[S] Save All & Quit".to_string(),
+                is_default: focus == 0,
+                is_cancel: false,
+                tint: None,
+            },
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("quit:force"),
+                label: "[Q] Quit Anyway".to_string(),
+                is_default: focus == 1,
+                is_cancel: false,
+                tint: None,
+            },
+            quadraui::DialogButton {
+                id: quadraui::WidgetId::new("quit:cancel"),
+                label: "[Esc] Cancel".to_string(),
+                is_default: focus == 2,
+                is_cancel: true,
+                tint: None,
+            },
+        ],
+        severity: Some(quadraui::DialogSeverity::Warning),
+        vertical_buttons: false,
+        input: None,
+    };
+    let viewport = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    let measure = quadraui::DialogMeasure {
+        width: 58.0,
+        title_height: 1.0,
+        body_height: 1.0,
+        input_height: 0.0,
+        button_row_height: 1.0,
+        button_width: 22.0,
+        button_gap: 2.0,
+        padding: 1.0,
+    };
+    let layout = dialog.layout(viewport, measure);
+    (dialog, layout)
+}
 
 pub(super) fn build_close_tab_dialog(
     area: Rect,
@@ -1321,7 +1399,6 @@ pub(super) fn render_all_windows(
     }
     render_separators(frame.buffer_mut(), editor_area, windows, theme);
 }
-
 
 pub(super) fn render_hover_popup(
     frame: &mut ratatui::Frame,
@@ -2217,129 +2294,6 @@ pub(super) fn render_tab_switcher_popup(
         }
     }
 }
-
-pub(super) fn render_quit_confirm_overlay(
-    buf: &mut ratatui::buffer::Buffer,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    // Lines of content (title, blank, message, blank, 3 options, blank, bottom)
-    let lines: &[(&str, bool)] = &[
-        ("  You have unsaved changes.", false),
-        ("", false),
-        ("  [S]   Save All & Quit", true),
-        ("  [Q]   Quit Without Saving", true),
-        ("  [Esc] Cancel", true),
-    ];
-    let title = " Unsaved Changes ";
-    let width: u16 = 42;
-    // top border + blank + content rows + blank + bottom border
-    let height: u16 = 2 + 1 + lines.len() as u16 + 1;
-
-    let x = (term_area.width.saturating_sub(width)) / 2;
-    let y = (term_area.height.saturating_sub(height)) / 2;
-
-    let bg_color = rc(theme.fuzzy_bg);
-    let fg_color = rc(theme.fuzzy_fg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-    let key_fg = rc(theme.fuzzy_query_fg);
-
-    // Top border row ╭─ Unsaved Changes ─╮
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 {
-            '╭'
-        } else if col == width - 1 {
-            '╮'
-        } else {
-            '─'
-        };
-        set_cell(buf, cx, y, ch, border_fg, bg_color);
-    }
-    // Overlay title
-    for (i, ch) in title.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width {
-            set_cell(buf, cx, y, ch, title_fg, bg_color);
-        }
-    }
-
-    // Blank row after title
-    let blank_row = y + 1;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 || col == width - 1 {
-            '│'
-        } else {
-            ' '
-        };
-        let fg = if col == 0 || col == width - 1 {
-            border_fg
-        } else {
-            fg_color
-        };
-        set_cell(buf, cx, blank_row, ch, fg, bg_color);
-    }
-
-    // Content rows
-    for (row_i, (text, is_key_row)) in lines.iter().enumerate() {
-        let ry = y + 2 + row_i as u16;
-        for col in 0..width {
-            let cx = x + col;
-            let ch = if col == 0 || col == width - 1 {
-                '│'
-            } else {
-                ' '
-            };
-            let fg = if col == 0 || col == width - 1 {
-                border_fg
-            } else {
-                fg_color
-            };
-            set_cell(buf, cx, ry, ch, fg, bg_color);
-        }
-        let row_fg = if *is_key_row { key_fg } else { fg_color };
-        for (j, ch) in text.chars().enumerate() {
-            let cx = x + 1 + j as u16;
-            if cx + 1 < x + width {
-                set_cell(buf, cx, ry, ch, row_fg, bg_color);
-            }
-        }
-    }
-
-    // Blank row before bottom border
-    let pre_bottom = y + 2 + lines.len() as u16;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 || col == width - 1 {
-            '│'
-        } else {
-            ' '
-        };
-        let fg = if col == 0 || col == width - 1 {
-            border_fg
-        } else {
-            fg_color
-        };
-        set_cell(buf, cx, pre_bottom, ch, fg, bg_color);
-    }
-
-    // Bottom border ╰──────╯
-    let bottom = y + height - 1;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 {
-            '╰'
-        } else if col == width - 1 {
-            '╯'
-        } else {
-            '─'
-        };
-        set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-    }
-}
-
 
 pub(super) fn render_window(
     frame: &mut ratatui::Frame,
@@ -3472,7 +3426,6 @@ pub(super) fn render_menu_dropdown(
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────
 
-
 // ─── Debug toolbar rendering ────────────────────────────────────────────────────────────
 
 pub(super) fn render_debug_toolbar(
@@ -3829,14 +3782,15 @@ mod tests {
                     &mut sidebar,
                     engine,
                     sidebar_width,
-                    0,    // quickfix_scroll_top
-                    0,    // debug_output_scroll
-                    None, // folder_picker
-                    false,
-                    false,
-                    0,    // close_tab_confirm_focus
-                    None, // cmd_sel
-                    None, // explorer_drop_target
+                    0,     // quickfix_scroll_top
+                    0,     // debug_output_scroll
+                    None,  // folder_picker
+                    false, // quit_confirm
+                    0,     // quit_confirm_focus
+                    false, // close_tab_confirm
+                    0,     // close_tab_confirm_focus
+                    None,  // cmd_sel
+                    None,  // explorer_drop_target
                     &mut hover_link_rects,
                     &mut hover_popup_rect,
                     &mut editor_hover_popup_rect,

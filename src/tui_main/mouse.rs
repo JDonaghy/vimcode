@@ -28,6 +28,7 @@ pub(super) fn handle_mouse(
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
     quit_confirm: &mut bool,
+    quit_confirm_focus: &mut usize,
     close_tab_confirm: &mut bool,
     close_tab_confirm_focus: &mut usize,
     cmd_sel: &mut Option<(usize, usize)>,
@@ -48,14 +49,68 @@ pub(super) fn handle_mouse(
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
+    // ── Quit-confirm overlay click interception ─────────────────────────────
+    // Route clicks through DialogLayout::hit_test. Swallow all clicks while
+    // the overlay is visible so they don't fall through to the editor.
+    if *quit_confirm {
+        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+            let term_size =
+                terminal_size.unwrap_or_else(|| ratatui::layout::Size::new(term_height, 80));
+            let area = ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: term_size.width,
+                height: term_size.height,
+            };
+            // Focus index doesn't matter for hit-testing (button positions
+            // don't depend on which one is focused); pass 0.
+            let (_dialog, layout) = super::render_impl::build_quit_confirm_dialog(area, 0);
+            match layout.hit_test(col as f32, row as f32) {
+                quadraui::DialogHit::Button(id) => match id.as_str() {
+                    "quit:save_all" => {
+                        engine.save_all_dirty();
+                        engine.cleanup_all_swaps();
+                        engine.lsp_shutdown();
+                        save_session(engine);
+                        *quit_confirm = false;
+                        *quit_confirm_focus = 0;
+                        *should_quit = true;
+                    }
+                    "quit:force" => {
+                        engine.cleanup_all_swaps();
+                        engine.lsp_shutdown();
+                        save_session(engine);
+                        *quit_confirm = false;
+                        *quit_confirm_focus = 0;
+                        *should_quit = true;
+                    }
+                    "quit:cancel" => {
+                        *quit_confirm = false;
+                        *quit_confirm_focus = 0;
+                    }
+                    _ => {}
+                },
+                quadraui::DialogHit::Outside => {
+                    // Click outside dialog: dismiss (same as pressing Escape).
+                    *quit_confirm = false;
+                    *quit_confirm_focus = 0;
+                }
+                quadraui::DialogHit::Body => {
+                    // Click on dialog body (not a button): swallow.
+                }
+            }
+        }
+        // Swallow all other mouse events while the overlay is up.
+        return sidebar_width;
+    }
+
     // ── Close-tab confirm overlay click interception ────────────────────────
     // Route clicks through DialogLayout::hit_test. Swallow all clicks while
     // the overlay is visible so they don't fall through to the editor.
     if *close_tab_confirm {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let term_size = terminal_size.unwrap_or_else(|| {
-                ratatui::layout::Size::new(term_height, 80)
-            });
+            let term_size =
+                terminal_size.unwrap_or_else(|| ratatui::layout::Size::new(term_height, 80));
             let area = ratatui::layout::Rect {
                 x: 0,
                 y: 0,
@@ -1749,6 +1804,7 @@ pub(super) fn handle_mouse(
                             ));
                         } else if act == EngineAction::QuitWithUnsaved {
                             *quit_confirm = true;
+                            *quit_confirm_focus = 0;
                         } else if act == EngineAction::ToggleSidebar {
                             sidebar.visible = !sidebar.visible;
                         } else if handle_action(engine, act) {

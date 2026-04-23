@@ -1245,7 +1245,12 @@ pub(super) fn draw_context_menu(
             set_cell(buf, inner_x + dx, row_y, ' ', item_fg, item_bg);
         }
         // Label at col +1 (small inset from border).
-        let label = item.label.spans.first().map(|s| s.text.as_str()).unwrap_or("");
+        let label = item
+            .label
+            .spans
+            .first()
+            .map(|s| s.text.as_str())
+            .unwrap_or("");
         for (i, ch) in label.chars().enumerate() {
             let col = inner_x + 1 + i as u16;
             if col >= inner_x + inner_w {
@@ -1310,7 +1315,12 @@ pub(super) fn draw_completions(
         set_cell(buf, x + w - 1, row_y, '│', border, bg);
 
         // Render the candidate text starting at col 2 (after border + space).
-        let label = item.label.spans.first().map(|s| s.text.as_str()).unwrap_or("");
+        let label = item
+            .label
+            .spans
+            .first()
+            .map(|s| s.text.as_str())
+            .unwrap_or("");
         let display = format!(" {label}");
         for (j, ch) in display.chars().enumerate() {
             let col = x + 1 + j as u16;

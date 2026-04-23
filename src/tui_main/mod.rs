@@ -91,8 +91,8 @@ use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::icons;
 use crate::render::{
-    self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow,
-    SelectionKind, Theme, WildmenuData,
+    self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow, SelectionKind,
+    Theme, WildmenuData,
 };
 
 // ─── Key binding helpers ──────────────────────────────────────────────────────
@@ -1109,6 +1109,10 @@ fn event_loop(
     let mut last_clipboard_content: Option<String> = None;
     // True when the quit-confirm overlay is shown (unsaved changes on exit).
     let mut quit_confirm = false;
+    // Which button is keyboard-focused in the quit-confirm dialog.
+    // 0 = Save All & Quit, 1 = Quit Anyway, 2 = Cancel. Reset to 0 whenever
+    // the dialog opens. Tab / Right arrow advance; Shift-Tab / Left arrow retreat.
+    let mut quit_confirm_focus: usize = 0;
     // True when the close-tab-confirm overlay is shown (unsaved changes on tab close).
     let mut close_tab_confirm = false;
     // Which button is keyboard-focused in the close-tab-confirm dialog.
@@ -1309,6 +1313,7 @@ fn event_loop(
                             debug_output_scroll,
                             folder_picker.as_ref(),
                             quit_confirm,
+                            quit_confirm_focus,
                             close_tab_confirm,
                             close_tab_confirm_focus,
                             cmd_sel,
@@ -1359,6 +1364,7 @@ fn event_loop(
                                     debug_output_scroll,
                                     folder_picker.as_ref(),
                                     quit_confirm,
+                                    quit_confirm_focus,
                                     close_tab_confirm,
                                     close_tab_confirm_focus,
                                     cmd_sel,
@@ -1615,19 +1621,40 @@ fn event_loop(
             Event::Key(key_event) => {
                 // ── Quit confirm overlay — intercept all keys ───────────────
                 if quit_confirm && key_event.kind != KeyEventKind::Release {
+                    // Helper: activate the button at `idx`. Returns Some(true)
+                    // when the app should quit, Some(false) when the dialog
+                    // just dismisses, None when the index is out of range.
+                    let activate_focused = |engine: &mut Engine, idx: usize| -> Option<bool> {
+                        match idx {
+                            0 => {
+                                engine.save_all_dirty();
+                                engine.cleanup_all_swaps();
+                                engine.lsp_shutdown();
+                                save_session(engine);
+                                Some(true)
+                            }
+                            1 => {
+                                engine.cleanup_all_swaps();
+                                engine.lsp_shutdown();
+                                save_session(engine);
+                                Some(true)
+                            }
+                            2 => Some(false),
+                            _ => None,
+                        }
+                    };
                     match key_event.code {
                         KeyCode::Char('s') | KeyCode::Char('S') => {
-                            engine.save_all_dirty();
-                            engine.cleanup_all_swaps();
-                            engine.lsp_shutdown();
-                            save_session(engine);
-                            return;
+                            quit_confirm = false;
+                            if let Some(true) = activate_focused(engine, 0) {
+                                return;
+                            }
                         }
                         KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            engine.cleanup_all_swaps();
-                            engine.lsp_shutdown();
-                            save_session(engine);
-                            return;
+                            quit_confirm = false;
+                            if let Some(true) = activate_focused(engine, 1) {
+                                return;
+                            }
                         }
                         KeyCode::Esc
                         | KeyCode::Char('c')
@@ -1635,8 +1662,29 @@ fn event_loop(
                         | KeyCode::Char('n')
                         | KeyCode::Char('N') => {
                             quit_confirm = false;
+                            let _ = activate_focused(engine, 2);
+                        }
+                        KeyCode::Enter => {
+                            quit_confirm = false;
+                            if let Some(true) = activate_focused(engine, quit_confirm_focus) {
+                                return;
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Right => {
+                            quit_confirm_focus =
+                                (quit_confirm_focus + 1) % render_impl::QUIT_CONFIRM_BTN_COUNT;
+                        }
+                        KeyCode::BackTab | KeyCode::Left => {
+                            quit_confirm_focus =
+                                (quit_confirm_focus + render_impl::QUIT_CONFIRM_BTN_COUNT - 1)
+                                    % render_impl::QUIT_CONFIRM_BTN_COUNT;
                         }
                         _ => {}
+                    }
+                    // Reset focus to 0 once the dialog closes so the next open
+                    // starts on Save All & Quit.
+                    if !quit_confirm {
+                        quit_confirm_focus = 0;
                     }
                     needs_redraw = true;
                     continue;
@@ -1697,10 +1745,9 @@ fn event_loop(
                                 (close_tab_confirm_focus + 1) % render_impl::CLOSE_TAB_BTN_COUNT;
                         }
                         KeyCode::BackTab | KeyCode::Left => {
-                            close_tab_confirm_focus = (close_tab_confirm_focus
-                                + render_impl::CLOSE_TAB_BTN_COUNT
-                                - 1)
-                                % render_impl::CLOSE_TAB_BTN_COUNT;
+                            close_tab_confirm_focus =
+                                (close_tab_confirm_focus + render_impl::CLOSE_TAB_BTN_COUNT - 1)
+                                    % render_impl::CLOSE_TAB_BTN_COUNT;
                         }
                         _ => {}
                     }
@@ -3345,6 +3392,7 @@ fn event_loop(
                                                         ));
                                                 } else if act == EngineAction::QuitWithUnsaved {
                                                     quit_confirm = true;
+                                                    quit_confirm_focus = 0;
                                                 } else if act == EngineAction::ToggleSidebar {
                                                     sidebar.visible = !sidebar.visible;
                                                 } else if handle_action(engine, act) {
@@ -3712,6 +3760,7 @@ fn event_loop(
                             needs_redraw = true;
                         } else if action == EngineAction::QuitWithUnsaved {
                             quit_confirm = true;
+                            quit_confirm_focus = 0;
                             needs_redraw = true;
                         } else if action == EngineAction::ToggleSidebar {
                             sidebar.visible = !sidebar.visible;
@@ -3844,8 +3893,9 @@ fn event_loop(
                                 &mut mouse_text_drag,
                                 &mut folder_picker,
                                 &mut quit_confirm,
+                                &mut quit_confirm_focus,
                                 &mut close_tab_confirm,
-                    &mut close_tab_confirm_focus,
+                                &mut close_tab_confirm_focus,
                                 &mut cmd_sel,
                                 &mut cmd_dragging,
                                 &mut mouse_should_quit,
@@ -3897,6 +3947,7 @@ fn event_loop(
                     &mut mouse_text_drag,
                     &mut folder_picker,
                     &mut quit_confirm,
+                    &mut quit_confirm_focus,
                     &mut close_tab_confirm,
                     &mut close_tab_confirm_focus,
                     &mut cmd_sel,
