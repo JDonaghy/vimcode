@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 327 — **B.3 readiness gate CLEAR**; all primitives shipped with D6 layout + hit_test; 6 of 9 TUI consumers migrated; ready for B.4 TUI rewrite) | **Tests:** 5406 total (full `cargo test --workspace --no-default-features`); vimcode 5244 + quadraui 162
+**Last updated:** Apr 23, 2026 (Session 327 — **B.3 readiness gate CLEAR**; B.4 chrome-only scope picked; Dialog primitive extended with optional input field; 6 of 9 TUI consumers migrated) | **Tests:** 5407 total (full `cargo test --workspace --no-default-features`); vimcode 5244 + quadraui 163
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -91,12 +91,40 @@ design-first required rather than mechanical).
 Zero test regressions throughout. Every commit was Path-A landed
 (ff-merge + push develop) after clippy-clean + full-suite-green.
 
-**What's next:** Phase B.4 — rewrite vimcode-tui from scratch on top
-of the finalized quadraui. This is a major architectural undertaking
-(the whole `src/tui_main/` tree is ~14k LOC across mod.rs / render_impl.rs
-/ quadraui_tui.rs / panels.rs / mouse.rs). Fresh event loop using
-`Backend::poll_events`, fresh input dispatch through `UiEvent`, fresh
-rendering using `primitive.layout()` end-to-end.
+**What's next:** Phase B.4 **chrome-only** (user-picked scope on
+2026-04-23 end of session). Editor viewport rendering stays on the
+existing `render::build_rendered_window` path. Chrome gets migrated
+primitive-by-primitive:
+
+**Dialog migration** — primitive extended with input field
+(`9f24313`), ready for adapter work. Still needed: write
+`quadraui_tui::draw_dialog` + replace `render_dialog_popup` in
+`src/tui_main/render_impl.rs:2352` + replace the parallel
+hit-test logic in `src/tui_main/mouse.rs:252`. Per-feature mapping:
+vimcode's engine-side `DialogButton { label, hotkey, action }` →
+quadraui's `DialogButton { id, label, is_default, is_cancel, tint }`;
+`hotkey` maps to Accelerator or is handled by backend.
+
+**Remaining substantive migrations** (each ~3–5 commits):
+- Dialog (in flight)
+- Context menu (vimcode's `open_editor_action_menu` → quadraui
+  `ContextMenu`)
+- Menu bar dropdown (`MENU_STRUCTURE` → quadraui `MenuBar` +
+  `ContextMenu` composition)
+- Completions popup (vimcode's `completion_display_only` flow →
+  quadraui `Completions`)
+- Palette (custom chrome, warrants design discussion first)
+
+**New TUI chrome not yet in vimcode** (additions rather than
+rewrites): Toast, Tooltip, Spinner, ProgressBar — wire up when a
+consumer needs them (e.g. git panel progress indicator #59 → Spinner).
+
+**Backend trait impl deferred.** Scaffolding attempted early this
+session but backed out due to API-friction; the trait currently
+takes `(rect, &primitive)` which doesn't quite match the practical
+`(primitive, layout, frame)` pattern the existing draw functions use.
+Resolving this lands alongside the event-loop rewrite; chrome-only
+B.4 doesn't require it.
 
 ---
 
