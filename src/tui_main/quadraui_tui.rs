@@ -835,6 +835,7 @@ pub(super) fn draw_status_bar(
     buf: &mut Buffer,
     area: Rect,
     bar: &quadraui::StatusBar,
+    layout: &quadraui::StatusBarLayout,
     theme: &Theme,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -857,45 +858,34 @@ pub(super) fn draw_status_bar(
         set_cell(buf, area.x + col, y, ' ', fill_bg, fill_bg);
     }
 
-    let draw_segments =
-        |buf: &mut Buffer, segments: &[quadraui::StatusBarSegment], start_x: u16| -> u16 {
-            let mut cx = start_x;
-            for seg in segments {
-                let fg = qc(seg.fg);
-                let bg = qc(seg.bg);
-                for ch in seg.text.chars() {
-                    if cx >= area.x + area.width {
-                        return cx;
-                    }
-                    set_cell(buf, cx, y, ch, fg, bg);
-                    if seg.bold {
-                        if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
-                            cell.set_style(
-                                ratatui::style::Style::default()
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
-                            );
-                        }
-                    }
-                    cx += 1;
+    // Iterate layout.visible_segments — positions are already resolved by
+    // quadraui::StatusBar::layout() per D6. The rasteriser just paints.
+    for vs in &layout.visible_segments {
+        let seg = match vs.side {
+            quadraui::StatusSegmentSide::Left => &bar.left_segments[vs.segment_idx],
+            quadraui::StatusSegmentSide::Right => &bar.right_segments[vs.segment_idx],
+        };
+        let fg = qc(seg.fg);
+        let bg = qc(seg.bg);
+        let start_x = area.x + vs.bounds.x.round() as u16;
+        let bar_end = area.x + area.width;
+        let mut cx = start_x;
+        for ch in seg.text.chars() {
+            if cx >= bar_end {
+                break;
+            }
+            set_cell(buf, cx, y, ch, fg, bg);
+            if seg.bold {
+                if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
+                    cell.set_style(
+                        ratatui::style::Style::default()
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    );
                 }
             }
-            cx
-        };
-
-    draw_segments(buf, &bar.left_segments, area.x);
-
-    // #159: drop low-priority right segments from the front until they fit
-    // with a 2-cell gap. `right_segments` is ordered least-important first,
-    // most-important (cursor position) last — see render::build_window_status_line.
-    const MIN_GAP_CELLS: usize = 2;
-    let start = bar.fit_right_start_chars(area.width as usize, MIN_GAP_CELLS);
-    let visible_right = &bar.right_segments[start..];
-    let right_width: u16 = visible_right
-        .iter()
-        .map(|s| s.text.chars().count() as u16)
-        .sum();
-    let right_start = (area.x + area.width).saturating_sub(right_width);
-    draw_segments(buf, visible_right, right_start);
+            cx += 1;
+        }
+    }
 }
 
 /// Narrow hardcoded set of PUA glyphs that render as 2 cells in terminals

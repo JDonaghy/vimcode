@@ -2914,10 +2914,11 @@ pub(super) fn handle_mouse(
 
 /// Walk status line segments and find which action (if any) is at `click_col`.
 ///
-/// A.6a: now routes through the `quadraui::StatusBar` primitive.
-/// The adapter encodes `StatusAction` as opaque `WidgetId` strings, and
-/// `status_action_from_id` decodes them back to the engine enum for
-/// dispatch via `engine.handle_status_action`.
+/// Per D6: builds the StatusBar primitive and its layout, then calls
+/// `StatusBarLayout::hit_test()`. Same layout math as the draw path
+/// (`render_window_status_line`), so clicks on dropped (invisible)
+/// segments can't fire — the layout's hit_regions only include segments
+/// that actually rendered.
 fn status_segment_hit_test(
     status: &crate::render::WindowStatusLine,
     width: usize,
@@ -2927,9 +2928,13 @@ fn status_segment_hit_test(
         status,
         quadraui::WidgetId::new("status:window"),
     );
-    // #159: dropped right segments (narrow bar) must not be clickable.
-    // Mirror the 2-cell gap used by quadraui_tui::draw_status_bar.
-    const MIN_GAP_CELLS: usize = 2;
-    let id = bar.resolve_click_fit_chars(click_col as u16, width, MIN_GAP_CELLS)?;
-    crate::render::status_action_from_id(id.as_str())
+    // Must match the min_gap used in render_window_status_line.
+    const MIN_GAP_CELLS: f32 = 2.0;
+    let layout = bar.layout(width as f32, 1.0, MIN_GAP_CELLS, |seg| {
+        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+    });
+    match layout.hit_test(click_col as f32, 0.0) {
+        quadraui::StatusBarHit::Segment(id) => crate::render::status_action_from_id(id.as_str()),
+        quadraui::StatusBarHit::Empty => None,
+    }
 }

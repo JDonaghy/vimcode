@@ -3000,21 +3000,31 @@ fn render_window_status_line(
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
 ) {
-    // A.6a: status line rendering delegates to the quadraui `StatusBar`
-    // primitive. The adapter encodes engine-side `StatusAction` values as
+    // Per D6: build the primitive, ask it for a StatusBarLayout, then
+    // hand both to the rasteriser. The rasteriser's only job is to turn
+    // the layout's visible_segments into cells.
+    //
+    // `StatusBar` adapter encodes engine-side `StatusAction` values as
     // opaque `WidgetId` strings; `status_segment_hit_test` (in mouse.rs)
-    // decodes them back to `StatusAction` via `status_action_from_id`.
+    // decodes them back to `StatusAction` via `status_action_from_id`
+    // after the layout's hit_test() resolves a click.
     let bar = crate::render::window_status_line_to_status_bar(
         status,
         quadraui::WidgetId::new("status:window"),
     );
+    // #159: 2-cell gap between left and right halves so right segments
+    // drop from the front when the bar is too narrow.
+    const MIN_GAP_CELLS: f32 = 2.0;
+    let layout = bar.layout(width as f32, 1.0, MIN_GAP_CELLS, |seg| {
+        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+    });
     let area = ratatui::layout::Rect {
         x,
         y,
         width,
         height: 1,
     };
-    super::quadraui_tui::draw_status_bar(buf, area, &bar, theme);
+    super::quadraui_tui::draw_status_bar(buf, area, &bar, &layout, theme);
 }
 
 pub(super) fn render_scrollbar(
