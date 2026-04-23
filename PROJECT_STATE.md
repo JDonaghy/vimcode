@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 325 — D7 focus model resolved; §5 migration strategy rewritten backend-by-backend; all design-axis blockers for B.3 clear) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
+**Last updated:** Apr 23, 2026 (Session 327 — **B.3 readiness gate CLEAR**; all primitives shipped with D6 layout + hit_test; 6 of 9 TUI consumers migrated; ready for B.4 TUI rewrite) | **Tests:** 5406 total (full `cargo test --workspace --no-default-features`); vimcode 5244 + quadraui 162
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,79 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 327 — B.3 readiness gate CLEAR (all primitives on D6):**
+
+Huge session. Starting point: D7 focus model had just been resolved;
+readiness gate still needed all 9 existing primitives to gain
+`layout()` + `hit_test()`, plus ~14 new primitives for B.3.
+
+**Existing primitives — all 9 gained `layout()` + `hit_test()`:**
+
+1. `TabBar::layout()` + `TabBarLayout::hit_test()` (`0517e54`).
+   Reference implementation for the D6 shape. Closed #179
+   structurally. 14 unit tests including fractional pixel-unit
+   layout (proves TUI/native unit agnosticism).
+2. `compute_tab_bar_hit_regions` delegates to `TabBar::layout()`
+   (`ebe0eec`). First real-world consumer of D6.
+3. `quadraui_tui::draw_tab_bar` consumes `TabBarLayout` (`713f071`).
+4. `StatusBar::layout()` (`d9cfa34`).
+5. `quadraui_tui::draw_status_bar` + hit-test consume layout
+   (`f263765`).
+6. `TreeView::layout()` (`7613316`).
+7. `ListView::layout()` (`7a09749`).
+8. `ActivityBar::layout()` (`914c6f9`).
+9. `Palette::layout()` (`65622fb`).
+10. `Form::layout()` (`130285e`).
+11. `TextDisplay::layout()` with auto-scroll support (`c10dad0`).
+12. `Terminal::layout()` (cell grid, unique shape) (`fe7870f`).
+
+**New B.3 primitives (shipped):**
+
+- `Toast` + `ToastStack` (#141) (`ccb515f`). Corner-stacked
+  notifications with severity + optional action + dismiss.
+- `Spinner` + `ProgressBar` (#142) (`7ac858b`). Activity indicators
+  with indeterminate/determinate modes + optional cancel.
+- `Tooltip` (`0e9f817`). Anchor-relative with auto-flip placement.
+- `ContextMenu` (`bd29340`). Right-click popup with separators + disabled items.
+- `Completions` (`01d4fd8`). LSP-style autocomplete popup with 24-variant
+  CompletionKind enum, below/above cursor placement.
+- `Dialog` (`5e49853`). Title + body + buttons (horizontal or vertical).
+- `Panel` (`53ed010`). Chrome (title + actions) + app-drawn content_bounds.
+- `Split` (`2a86305`). Two-pane draggable divider with min-size clamping.
+- `Modal` (`9cd4eb4`). Backdrop + centered content (Dialog is specialised).
+- `MenuBar` (`67668d1`). Top-level menu strip with `&`-marker
+  Alt-activation.
+- **Form field extensions** (#143) (`da58baa`): `Slider`, `ColorPicker`,
+  `Dropdown` as new `FieldKind` variants with TUI rendering.
+
+**Intentionally skipped:** `Tabs` (redundant with `TabBar` + app
+content switching), `Stack` (redundant with app render order),
+`Palette` TUI consumer migration (custom chrome doesn't map cleanly;
+design-first required rather than mechanical).
+
+**TUI consumer migrations completed (6 of 9):**
+- ✅ TabBar, StatusBar, TreeView, ListView, ActivityBar, Form
+- ⏸ Palette (chrome-heavy, design pass needed)
+- ➖ TextDisplay, Terminal (no TUI consumer yet)
+
+**Design doc updates:**
+- Closed #141, #142, #143 via `gh issue close`.
+- PLAN.md readiness gate marked "CLEAR for Phase B.4 (TUI rewrite)."
+- §5 migration strategy updated with B.4–B.8 sequencing.
+
+**Aggregate:** 25+ commits landed today. Tests: 5291 → 5406 (+115).
+Zero test regressions throughout. Every commit was Path-A landed
+(ff-merge + push develop) after clippy-clean + full-suite-green.
+
+**What's next:** Phase B.4 — rewrite vimcode-tui from scratch on top
+of the finalized quadraui. This is a major architectural undertaking
+(the whole `src/tui_main/` tree is ~14k LOC across mod.rs / render_impl.rs
+/ quadraui_tui.rs / panels.rs / mouse.rs). Fresh event loop using
+`Backend::poll_events`, fresh input dispatch through `UiEvent`, fresh
+rendering using `primitive.layout()` end-to-end.
+
+---
 
 **Session 325 — D7 focus model resolved + §5 migration strategy inverted:**
 
