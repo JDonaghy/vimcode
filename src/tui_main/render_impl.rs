@@ -692,7 +692,23 @@ pub(super) fn draw_frame(
 
     // ── Folder / workspace picker modal ──────────────────────────────────────
     if let Some(picker) = folder_picker {
-        render_folder_picker(frame, picker, area, theme);
+        // Sizing identical to the legacy popup: 60% of viewport
+        // width clamped to >= 50; 55% of viewport height clamped to >= 15.
+        let term_cols = area.width;
+        let term_rows = area.height;
+        let width = (term_cols * 3 / 5).max(50);
+        let height = (term_rows * 55 / 100).max(15);
+        let popup_x = (term_cols.saturating_sub(width)) / 2;
+        let popup_y = (term_rows.saturating_sub(height)) / 2;
+        let popup_area = Rect {
+            x: popup_x,
+            y: popup_y,
+            width,
+            height,
+        };
+        // Per D6: build quadraui::Palette + draw_palette.
+        let palette = folder_picker_to_palette(picker, width as usize);
+        super::quadraui_tui::draw_palette(frame.buffer_mut(), popup_area, &palette, theme);
     }
 
     // ── Find/replace overlay (top-right of active group) ───────────────────
@@ -977,6 +993,84 @@ pub(super) fn build_close_tab_dialog(
     };
     let layout = dialog.layout(viewport, measure);
     (dialog, layout)
+}
+
+/// Convert a TUI-local `FolderPickerState` into a `quadraui::Palette`.
+///
+/// FolderPickerState lives in the TUI module (it's not portable across
+/// backends yet), so this adapter is also TUI-local instead of in
+/// `render.rs`. Title format mirrors the legacy popup:
+///
+/// - `OpenFolder`: `" Open Folder <truncated-root>  N/M "`
+/// - `OpenRecent`: `" Open Recent  N "`
+///
+/// Each entry becomes a `PaletteItem` with an icon (📁 for folders,
+/// ⚙ for `.vimcode-workspace` files) and the path as the primary text.
+/// `query_cursor` is set to the end of the query (no internal-edit
+/// cursor model in the TUI picker yet). `total_count` enables the
+/// `N/M` chip in the title via `draw_palette`.
+fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> quadraui::Palette {
+    use quadraui::{Icon, Palette, PaletteItem, StyledText, WidgetId};
+
+    // Build title — matches the legacy folder-picker title format.
+    let title = match picker.mode {
+        FolderPickerMode::OpenFolder => {
+            let r = picker.root.to_string_lossy();
+            // Truncate from the left if too long. Reserve ~30 cells of
+            // chrome for the borders + count chip + padding.
+            let max = popup_width.saturating_sub(30).max(10);
+            let root_display = if r.len() > max {
+                format!("…{}", &r[r.len() - max..])
+            } else {
+                r.into_owned()
+            };
+            format!("Open Folder {}", root_display)
+        }
+        FolderPickerMode::OpenRecent => "Open Recent".to_string(),
+    };
+
+    let folder_icon = Icon {
+        glyph: "📁".to_string(),
+        fallback: "📁".to_string(),
+    };
+    let workspace_icon = Icon {
+        glyph: "⚙".to_string(),
+        fallback: "⚙".to_string(),
+    };
+
+    let items: Vec<PaletteItem> = picker
+        .filtered
+        .iter()
+        .map(|entry| {
+            let is_workspace = entry
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == ".vimcode-workspace")
+                .unwrap_or(false);
+            PaletteItem {
+                text: StyledText::plain(entry.to_string_lossy().to_string()),
+                detail: None,
+                icon: Some(if is_workspace {
+                    workspace_icon.clone()
+                } else {
+                    folder_icon.clone()
+                }),
+                match_positions: Vec::new(),
+            }
+        })
+        .collect();
+
+    Palette {
+        id: WidgetId::new("folder_picker"),
+        title,
+        query: picker.query.clone(),
+        query_cursor: picker.query.len(),
+        items,
+        selected_idx: picker.selected,
+        scroll_offset: picker.scroll_top,
+        total_count: picker.all_entries.len(),
+        has_focus: true,
+    }
 }
 
 // ─── Tab bar constants ───────────────────────────────────────────────────────
@@ -1540,189 +1634,6 @@ pub(super) fn render_diff_peek_popup(
                 cx += 1;
             }
             cx += 2; // spacing between labels
-        }
-    }
-}
-
-pub(super) fn render_folder_picker(
-    frame: &mut ratatui::Frame,
-    picker: &FolderPickerState,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let term_cols = term_area.width;
-    let term_rows = term_area.height;
-
-    // Same proportions as the fuzzy popup
-    let width = (term_cols * 3 / 5).max(50);
-    let height = (term_rows * 55 / 100).max(15);
-    let x = (term_cols.saturating_sub(width)) / 2;
-    let y = (term_rows.saturating_sub(height)) / 2;
-
-    let bg_color = rc(theme.fuzzy_bg);
-    let sel_bg_color = rc(theme.fuzzy_selected_bg);
-    let fg_color = rc(theme.fuzzy_fg);
-    let query_fg = rc(theme.fuzzy_query_fg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    let buf = frame.buffer_mut();
-
-    // Clear popup background so stale characters don't persist.
-    for row in y..y + height {
-        for col in x..x + width {
-            if col < term_area.width && row < term_area.height {
-                set_cell(buf, col, row, ' ', fg_color, bg_color);
-            }
-        }
-    }
-
-    // Title varies by mode; for folder modes show the current root for orientation
-    let root_display = if picker.mode != FolderPickerMode::OpenRecent {
-        let r = picker.root.to_string_lossy();
-        // Truncate from left if too long
-        let max = (width as usize).saturating_sub(30).max(10);
-        if r.len() > max {
-            format!("…{}", &r[r.len() - max..])
-        } else {
-            r.into_owned()
-        }
-    } else {
-        String::new()
-    };
-    let title_text = match picker.mode {
-        FolderPickerMode::OpenFolder => format!(
-            " Open Folder {}  {}/{} ",
-            root_display,
-            picker.filtered.len(),
-            picker.all_entries.len()
-        ),
-        FolderPickerMode::OpenRecent => format!(" Open Recent  {} ", picker.filtered.len()),
-    };
-
-    // Row 0: top border ╭─ Title ── N/M ──╮
-    for col in 0..width {
-        let cx = x + col;
-        if cx < term_area.width && y < term_area.height {
-            let ch = if col == 0 {
-                '╭'
-            } else if col == width - 1 {
-                '╮'
-            } else {
-                '─'
-            };
-            set_cell(buf, cx, y, ch, border_fg, bg_color);
-        }
-    }
-    for (i, ch) in title_text.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width && cx < term_area.width && y < term_area.height {
-            set_cell(buf, cx, y, ch, title_fg, bg_color);
-        }
-    }
-
-    // Row 1: query line │ > query_ │
-    let row1 = y + 1;
-    if row1 < term_area.height {
-        set_cell(buf, x, row1, '│', border_fg, bg_color);
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, row1, '│', border_fg, bg_color);
-        }
-        for col in 1..width - 1 {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, row1, ' ', fg_color, bg_color);
-            }
-        }
-        let query_display = format!("> {}", picker.query);
-        for (i, ch) in query_display.chars().enumerate() {
-            let cx = x + 1 + i as u16;
-            if cx + 1 < x + width && cx < term_area.width {
-                set_cell(buf, cx, row1, ch, query_fg, bg_color);
-            }
-        }
-        let cursor_col = x + 1 + query_display.chars().count() as u16;
-        if cursor_col + 1 < x + width && cursor_col < term_area.width {
-            set_cell(buf, cursor_col, row1, '▌', query_fg, bg_color);
-        }
-    }
-
-    // Row 2: separator ├───────┤
-    let row2 = y + 2;
-    if row2 < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '├'
-                } else if col == width - 1 {
-                    '┤'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, row2, ch, border_fg, bg_color);
-            }
-        }
-    }
-
-    // Result rows
-    let results_start = y + 3;
-    let results_end = y + height - 1;
-    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
-
-    for row_idx in 0..visible_rows {
-        let result_idx = picker.scroll_top + row_idx;
-        let ry = results_start + row_idx as u16;
-        if ry >= results_end || ry >= term_area.height {
-            break;
-        }
-        set_cell(buf, x, ry, '│', border_fg, bg_color);
-        if x + width - 1 < term_area.width {
-            set_cell(buf, x + width - 1, ry, '│', border_fg, bg_color);
-        }
-        let is_selected = result_idx == picker.selected;
-        let row_bg = if is_selected { sel_bg_color } else { bg_color };
-        for col in 1..width - 1 {
-            let cx = x + col;
-            if cx < term_area.width {
-                set_cell(buf, cx, ry, ' ', fg_color, row_bg);
-            }
-        }
-        if let Some(entry) = picker.filtered.get(result_idx) {
-            // Show workspace files differently with a marker
-            let display = entry.to_string_lossy();
-            let is_workspace = entry
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == ".vimcode-workspace")
-                .unwrap_or(false);
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let marker = if is_workspace { "⚙ " } else { "📁 " };
-            let row_text = format!("{}{}{}", prefix, marker, display);
-            for (j, ch) in row_text.chars().enumerate() {
-                let cx = x + 1 + j as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, fg_color, row_bg);
-                }
-            }
-        }
-    }
-
-    // Bottom border ╰───────╯
-    let bottom = y + height - 1;
-    if bottom < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╰'
-                } else if col == width - 1 {
-                    '╯'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-            }
         }
     }
 }
