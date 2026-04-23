@@ -65,15 +65,32 @@ pub(super) fn handle_mouse(
             match layout.hit_test(col as f32, row as f32) {
                 quadraui::DialogHit::Button(id) => match id.as_str() {
                     "close_tab:save" => {
+                        // Save + quit. `execute_command("quit")` handles
+                        // the last-window case (returns EngineAction::Quit)
+                        // automatically. Since we just saved, the dirty
+                        // check inside "quit" is satisfied.
                         engine.escape_to_normal();
                         let _ = engine.save();
-                        engine.close_tab();
+                        let action = engine.execute_command("quit");
                         *close_tab_confirm = false;
+                        if action == crate::core::engine::EngineAction::Quit
+                            && handle_action(engine, action)
+                        {
+                            *should_quit = true;
+                        }
                     }
                     "close_tab:discard" => {
+                        // Force-quit semantics via `quit!`. Handles the
+                        // last-window case (returns EngineAction::Quit)
+                        // and drops the buffer regardless of dirty flag.
                         engine.escape_to_normal();
-                        engine.close_tab();
+                        let action = engine.execute_command("quit!");
                         *close_tab_confirm = false;
+                        if action == crate::core::engine::EngineAction::Quit
+                            && handle_action(engine, action)
+                        {
+                            *should_quit = true;
+                        }
                     }
                     "close_tab:cancel" => {
                         engine.escape_to_normal();

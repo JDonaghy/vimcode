@@ -775,21 +775,21 @@ pub(super) fn build_close_tab_dialog(area: Rect) -> (quadraui::Dialog, quadraui:
         buttons: vec![
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:save"),
-                label: "Save".to_string(),
+                label: "[S] Save".to_string(),
                 is_default: true,
                 is_cancel: false,
                 tint: None,
             },
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:discard"),
-                label: "Discard".to_string(),
+                label: "[D] Discard".to_string(),
                 is_default: false,
                 is_cancel: false,
                 tint: None,
             },
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:cancel"),
-                label: "Cancel".to_string(),
+                label: "[Esc] Cancel".to_string(),
                 is_default: false,
                 is_cancel: true,
                 tint: None,
@@ -806,12 +806,12 @@ pub(super) fn build_close_tab_dialog(area: Rect) -> (quadraui::Dialog, quadraui:
         area.height as f32,
     );
     let measure = quadraui::DialogMeasure {
-        width: 48.0,
+        width: 54.0,
         title_height: 1.0,
         body_height: 1.0,
         input_height: 0.0,
         button_row_height: 1.0,
-        button_width: 11.0,
+        button_width: 14.0,
         button_gap: 2.0,
         padding: 1.0,
     };

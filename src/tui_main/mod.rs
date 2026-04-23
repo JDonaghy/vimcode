@@ -1642,13 +1642,19 @@ fn event_loop(
                         KeyCode::Char('s') | KeyCode::Char('S') => {
                             engine.escape_to_normal();
                             let _ = engine.save();
-                            engine.close_tab();
+                            let action = engine.execute_command("quit");
                             close_tab_confirm = false;
+                            if action == EngineAction::Quit && handle_action(engine, action) {
+                                return;
+                            }
                         }
                         KeyCode::Char('d') | KeyCode::Char('D') => {
                             engine.escape_to_normal();
-                            engine.close_tab();
+                            let action = engine.execute_command("quit!");
                             close_tab_confirm = false;
+                            if action == EngineAction::Quit && handle_action(engine, action) {
+                                return;
+                            }
                         }
                         KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                             engine.escape_to_normal();
