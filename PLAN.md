@@ -6,14 +6,37 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-22 (Session 323 — §6.2 resolved A; layout-axis decision added as D6 in BACKEND_TRAIT_PROPOSAL.md §9)
+> **Last updated:** 2026-04-23 (Session 324 — north-star goal + quadraui readiness gate added; strategy inverted from coexistence to backend-by-backend rewrite)
 
 ---
 
 ## Architectural focus
 
+**North-star goal:** Get quadraui complete enough to **rewrite
+vimcode on top of it**, then do that rewrite backend-by-backend:
+**TUI first** (reference implementation — lowest-cost iteration, no
+native deps), then **GTK**, then **Win-GUI**, then a fresh
+**macOS native** backend that drops in clean because the contract
+will be tight by the time it starts. The "coexistence rule" from
+`UI_CRATE_DESIGN.md` §7 (each Phase A stage shipped alongside
+existing code so nothing was ever half-migrated) is **superseded** —
+D6 makes half-migration loud at the type level rather than silent,
+and **vimcode has no external users yet**, so extended per-backend
+breakage during the rewrite is acceptable. Secondary goal: prove
+quadraui out for reuse (Postman-class app #169, k8s dashboard #145,
+SQL client #46) — follows naturally once vimcode is landed cleanly
+on top of it.
+
+**State of the backends going in:** TUI is the most complete and
+usable today; GTK and Win-GUI are full of bugs accumulated from the
+coexistence-era band-aid cycle. All three get rebuilt on quadraui
+during the rewrite; the goal is that after the rewrite, all four
+backends (TUI + GTK + Win-GUI + macOS) have the same feature surface
+and the same bug floor.
+
 **Wave:** quadraui Phase B (Backend trait + UiEvent + layout-owning
-primitives). Phase A complete except optional Win-GUI parity stages.
+primitives). Phase A complete except optional Win-GUI parity stages
+(no longer worth chasing — those backends get rebuilt anyway).
 
 **Resolved this cycle (`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §9):**
 - **D1–D5** (2026-04-22 morning): event/dispatch axis settled —
@@ -30,10 +53,56 @@ primitives). Phase A complete except optional Win-GUI parity stages.
 **Open architectural questions:**
 - §6.3 multi-window — defer to v1.x (vimcode + Postman are
   single-window).
-- §6.4 focus model — blocks `Panel` / `Tabs` / `Dialog` in B.3;
-  needs its own proposal pass.
+- **§6.4 focus model — blocks `Panel` / `Tabs` / `Dialog` in B.3;
+  needs its own proposal pass. This is the single remaining design
+  blocker before B.3 primitives can land.**
 - §6.5 IME — defer to v1.1.
-- §6.6 performance — profile after B.5.
+- §6.6 performance — profile after first backend rewrite (TUI).
+
+**Quadraui readiness gate — what unblocks the TUI rewrite:**
+
+*Design axes:*
+- ✅ D1–D6 (event/dispatch + render/layout axes).
+- ⬜ **§6.4 focus model** — next proposal pass (D7), in the D1–D6
+  style. Sub-questions: transitions (click/Tab/programmatic?),
+  destruction fallback, explicit-vs-implicit focusable, modal
+  interaction, native focus bridging.
+- §6.5 / §6.6 deferred — don't block.
+
+*Primitives that need `layout()` method (per D6):*
+- Existing with stable shape, gain `layout()`: `TabBar`, `StatusBar`,
+  `TreeView`, `ListView`, `ActivityBar`, `Form`, `Palette`,
+  `TextDisplay`. `TabBar::layout()` is the **reference
+  implementation** to build first (also closes #179).
+- New for B.3 (container primitives): `Panel`, `Split`, `Tabs`,
+  `Stack`, `MenuBar`, `Modal`, `Dialog`.
+- New for vimcode's actual surface: `ContextMenu`, `Completions`,
+  `Tooltip`, `Toast` (#141), `Spinner` + `ProgressBar` (#142),
+  form field primitives (#143: Slider, ColorPicker, Dropdown).
+
+*Backend trait final shape:*
+- `Backend::draw_*(&Layout)` throughout (mechanical migration once
+  each primitive's `layout()` lands).
+
+*TBD:* `TextEditor` / `BufferView` — Phase A.9 was marked deferred
+because vimcode's existing engine-owned text rendering path is still
+adequate. Decide at TUI-rewrite-start whether the rewrite needs a
+quadraui editor primitive or can keep the engine-owned path. Leaning
+toward keeping engine-owned for TUI; revisit when GTK rewrite starts.
+
+**Backend rewrite order (after readiness gate clears):**
+1. **TUI** — smallest surface, no native deps, fastest iteration
+   cycle. Stress-tests the quadraui contract. Rewrite discovers
+   whatever's wrong with the crate before any native-backend pain.
+2. **GTK** — primary Linux backend. Rewrite uses the TUI-proven
+   primitives; any gaps that show up here feed back into quadraui
+   and then forward to TUI.
+3. **Win-GUI** — third opinion on the contract. By this point, most
+   quadraui gaps should already be fixed.
+4. **macOS native** — the "easy" one. Core Graphics + Core Text;
+   the contract is tight by now, lessons encoded. Historically
+   blocked by the parallel complexity of maintaining three other
+   backends; under this plan, it's the last thing written.
 
 **If you're new here, read in order before touching `quadraui/`:**
 1. This section (you're reading it).
