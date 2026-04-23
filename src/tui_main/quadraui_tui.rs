@@ -37,14 +37,15 @@ pub(super) fn draw_tree(buf: &mut Buffer, area: Rect, tree: &quadraui::TreeView,
 
     let indent_cells = tree.style.indent as usize;
 
-    let visible = tree
-        .rows
-        .iter()
-        .skip(tree.scroll_offset)
-        .take(area.height as usize);
+    // Per D6: ask the primitive for a layout. TreeView is row-uniform
+    // in TUI (1 cell per row), so the measurer returns constant 1.0.
+    let layout = tree.layout(area.width as f32, area.height as f32, |_| {
+        quadraui::TreeRowMeasure::new(1.0)
+    });
 
-    for (vis_i, row) in visible.enumerate() {
-        let y = area.y + vis_i as u16;
+    for visible_row in &layout.visible_rows {
+        let row = &tree.rows[visible_row.row_idx];
+        let y = area.y + visible_row.bounds.y.round() as u16;
         if y >= area.y + area.height {
             break;
         }
@@ -455,7 +456,14 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
                 let start_col = (area.width as usize).saturating_sub(total + 2);
                 if start_col > label_end + 1 {
                     let swatch_fg = ratatui::style::Color::Rgb(value.r, value.g, value.b);
-                    set_cell(buf, area.x + start_col as u16, y, '\u{25A0}', swatch_fg, row_bg);
+                    set_cell(
+                        buf,
+                        area.x + start_col as u16,
+                        y,
+                        '\u{25A0}',
+                        swatch_fg,
+                        row_bg,
+                    );
                     let mut col = start_col + 2;
                     for ch in hex.chars() {
                         if col >= area.width as usize {
@@ -473,10 +481,7 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
                 // Render the selected option + a "▾" chevron indicating
                 // the dropdown can expand. Apps draw the full list on
                 // activation separately.
-                let chosen = options
-                    .get(*selected_idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let chosen = options.get(*selected_idx).cloned().unwrap_or_default();
                 let label_w = chosen.visible_width();
                 let total = label_w + 4; // " text ▾ "
                 let start_col = (area.width as usize).saturating_sub(total + 1);
