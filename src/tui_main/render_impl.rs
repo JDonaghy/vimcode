@@ -1057,10 +1057,9 @@ pub(super) fn render_tab_bar(
     tab_scroll_offset: usize,
     focused_accent: Option<ratatui::style::Color>,
 ) -> usize {
-    // A.6c: tab bar rendering delegates to the `quadraui::TabBar` primitive.
-    // This wrapper builds the primitive from render's `TabInfo` + the diff /
-    // split / action right-side slots, then calls `draw_tab_bar`.
-    // Convert ratatui RGB accent → quadraui::Color for the shared adapter.
+    // Per D6: build the primitive, ask it for a TabBarLayout, then hand
+    // both to the rasteriser. The rasteriser's only job is to turn the
+    // layout's rects into cells — it does not decide placement.
     let accent = focused_accent.and_then(|c| match c {
         ratatui::style::Color::Rgb(r, g, b) => Some(quadraui::Color::rgb(r, g, b)),
         _ => None,
@@ -1072,7 +1071,18 @@ pub(super) fn render_tab_bar(
         tab_scroll_offset,
         accent,
     );
-    super::quadraui_tui::draw_tab_bar(buf, area, &bar, theme)
+    let tab_widths: Vec<usize> = tabs
+        .iter()
+        .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+        .collect();
+    let layout = bar.layout(
+        area.width as f32,
+        area.height as f32,
+        0.0, // no scroll arrows in TUI (engine-side fit has already been applied)
+        |i| quadraui::TabMeasure::new(tab_widths[i] as f32, render::TAB_CLOSE_COLS as f32),
+        |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
+    );
+    super::quadraui_tui::draw_tab_bar(buf, area, &bar, &layout, theme)
 }
 
 pub(super) fn render_breadcrumb_bar(

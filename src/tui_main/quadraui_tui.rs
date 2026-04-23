@@ -914,12 +914,21 @@ fn is_nerd_wide(c: char) -> bool {
     )
 }
 
-/// Draw a `quadraui::TabBar` into `area`. Returns the width (in char cells)
-/// available for tab content (`bar_width - reserved_by_right_segments`).
-/// The engine uses this to decide how many tabs fit and what scroll offset
-/// to use on the next frame.
+/// Draw a `quadraui::TabBar` into `area`, consuming a pre-computed
+/// `TabBarLayout` per D6. Returns the width (in char cells) available
+/// for tab content (`bar_width - reserved_by_right_segments`). The
+/// engine uses this return value to decide how many tabs fit and what
+/// scroll offset to use on the next frame.
 ///
-/// Visual details preserved from the old `render_tab_bar`:
+/// # D6 contract
+///
+/// Positions come from `layout.visible_tabs` / `layout.visible_segments`
+/// — this function does not decide placement. It only rasterises what
+/// the layout says. If you see a layout problem here, fix it in
+/// [`quadraui::TabBar::layout`], not in this function.
+///
+/// # Visual details preserved from the pre-layout version
+///
 /// * Active tab: `tab_active_fg` + `tab_active_bg`, optional underline
 ///   accent on the filename portion (chars after the last `": "`).
 /// * Dirty tab: close-position shows `●` (theme.foreground) instead of `×`.
@@ -931,6 +940,7 @@ pub(super) fn draw_tab_bar(
     buf: &mut Buffer,
     area: Rect,
     bar: &quadraui::TabBar,
+    layout: &quadraui::TabBarLayout,
     theme: &Theme,
 ) -> usize {
     if area.width == 0 || area.height == 0 {
@@ -947,50 +957,44 @@ pub(super) fn draw_tab_bar(
         set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
     }
 
-    // Sum reserved cells on the right.
+    // Tab-content width (engine feedback): bar minus reserved right area.
     let reserved: u16 = bar.right_segments.iter().map(|s| s.width_cells).sum();
-    let tab_end = if area.width >= reserved {
-        area.x + area.width - reserved
+    let tab_content_width = if area.width >= reserved {
+        (area.width - reserved) as usize
     } else {
-        area.x + area.width
+        area.width as usize
     };
-    let tab_content_width = (tab_end - area.x) as usize;
 
-    // ── Right-aligned segments ──────────────────────────────────────────
-    if reserved <= area.width {
-        let mut bx = area.x + area.width - reserved;
-        for seg in &bar.right_segments {
-            let fg = if seg.is_active { btn_fg_active } else { btn_fg };
-            // Segment has `width_cells` cells total; iterate characters and
-            // advance x by 1 (regular) or 2 (wide) per char. Anchor to
-            // `bx + width_cells` at the end regardless of char-level math.
-            let seg_end = bx + seg.width_cells;
-            let mut cx = bx;
-            for ch in seg.text.chars() {
-                if cx >= seg_end {
-                    break;
-                }
-                if ch == ' ' {
-                    set_cell(buf, cx, area.y, ' ', fg, bar_bg);
-                    cx += 1;
-                } else if is_nerd_wide(ch) {
-                    if cx + 1 < seg_end + 1 {
-                        super::set_cell_wide(buf, cx, area.y, ch, fg, bar_bg);
-                        cx += 2;
-                    } else {
-                        // Not enough room for a 2-cell glyph — skip.
-                        cx += 1;
-                    }
-                } else {
-                    set_cell(buf, cx, area.y, ch, fg, bar_bg);
-                    cx += 1;
-                }
+    // ── Right-aligned segments (from layout) ───────────────────────────
+    for vs in &layout.visible_segments {
+        let seg = &bar.right_segments[vs.segment_idx];
+        let fg = if seg.is_active { btn_fg_active } else { btn_fg };
+        let bx = area.x + vs.bounds.x.round() as u16;
+        let seg_end = bx + seg.width_cells;
+        let mut cx = bx;
+        for ch in seg.text.chars() {
+            if cx >= seg_end {
+                break;
             }
-            bx = seg_end;
+            if ch == ' ' {
+                set_cell(buf, cx, area.y, ' ', fg, bar_bg);
+                cx += 1;
+            } else if is_nerd_wide(ch) {
+                if cx + 1 < seg_end + 1 {
+                    super::set_cell_wide(buf, cx, area.y, ch, fg, bar_bg);
+                    cx += 2;
+                } else {
+                    // Not enough room for a 2-cell glyph — skip.
+                    cx += 1;
+                }
+            } else {
+                set_cell(buf, cx, area.y, ch, fg, bar_bg);
+                cx += 1;
+            }
         }
     }
 
-    // ── Tabs (left side) ────────────────────────────────────────────────
+    // ── Tabs (from layout) ─────────────────────────────────────────────
     let accent = bar.active_accent.map(qc);
     let active_fg = rc(theme.tab_active_fg);
     let active_bg = rc(theme.tab_active_bg);
@@ -999,8 +1003,10 @@ pub(super) fn draw_tab_bar(
     let preview_inactive_fg = rc(theme.tab_preview_inactive_fg);
     let separator = rc(theme.separator);
 
-    let mut x = area.x;
-    for tab in bar.tabs.iter().skip(bar.scroll_offset) {
+    for vt in &layout.visible_tabs {
+        let tab = &bar.tabs[vt.tab_idx];
+        let tab_x = area.x + vt.bounds.x.round() as u16;
+
         let (fg, bg) = match (tab.is_active, tab.is_preview) {
             (true, true) => (preview_active_fg, active_bg),
             (true, false) => (active_fg, active_bg),
@@ -1021,18 +1027,24 @@ pub(super) fn draw_tab_bar(
             ratatui::style::Modifier::empty()
         };
 
-        let name_w = tab.label.chars().count() as u16;
-        let tab_w = name_w + super::TAB_CLOSE_COLS;
-        if x + tab_w > tab_end {
-            break;
-        }
+        // The layout carries total width; within that, close_bounds
+        // covers the trailing close-glyph + separator cells (if the tab
+        // has a close button). Label occupies the leading cells up to
+        // close_bounds.x.
+        let tab_width = vt.bounds.width.round() as u16;
+        let label_width = match vt.close_bounds {
+            Some(cb) => (cb.x - vt.bounds.x).round() as u16,
+            None => tab_width,
+        };
+        let tab_end = tab_x + tab_width;
+        let label_end = tab_x + label_width;
 
-        // Locate filename portion (after the last ": ") so only that part gets
-        // the underline accent; the " N: " prefix renders without underline.
+        // Filename portion (after the last ": ") carries the underline accent.
         let prefix_len = tab.label.rfind(": ").map(|p| p + 2).unwrap_or(0);
 
+        let mut x = tab_x;
         for (ci, ch) in tab.label.chars().enumerate() {
-            if x >= tab_end {
+            if x >= label_end {
                 break;
             }
             let in_filename = ci >= prefix_len;
@@ -1046,8 +1058,9 @@ pub(super) fn draw_tab_bar(
             x += 1;
         }
 
-        // Close indicator: ● for dirty, × otherwise.
-        if x < tab_end {
+        // Close indicator: ● for dirty, × otherwise. Only if the tab has
+        // a close button (close_bounds is Some).
+        if vt.close_bounds.is_some() && x < tab_end {
             let (close_ch, close_fg) = if tab.is_dirty {
                 ('●', foreground)
             } else if tab.is_active {
@@ -1058,10 +1071,9 @@ pub(super) fn draw_tab_bar(
             set_cell(buf, x, area.y, close_ch, close_fg, bg);
             x += 1;
         }
-        // Trailing separator space.
+        // Trailing separator space (within the tab's bounds, uses bar bg).
         if x < tab_end {
             set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
-            x += 1;
         }
     }
 
