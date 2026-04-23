@@ -708,7 +708,29 @@ pub(super) fn draw_frame(
 
     // ── Tab switcher popup ───────────────────────────────────────────────────
     if let Some(ref ts) = screen.tab_switcher {
-        render_tab_switcher_popup(frame.buffer_mut(), area, ts, theme);
+        if !ts.items.is_empty() {
+            // Sizing identical to the legacy popup: 45% of viewport
+            // width clamped to [40, 80]; height = visible_items + 2
+            // (top + bottom border rows). The bordered ListView's own
+            // layout reserves rows 0 and N-1 for borders.
+            let term_w = area.width;
+            let term_h = area.height;
+            let width = (term_w * 45 / 100).clamp(40, 80);
+            let max_visible = (term_h as usize).saturating_sub(4).min(20);
+            let visible = ts.items.len().min(max_visible);
+            let height = visible as u16 + 2;
+            let x = (term_w.saturating_sub(width)) / 2;
+            let y = (term_h.saturating_sub(height)) / 2;
+            let popup_area = Rect {
+                x,
+                y,
+                width,
+                height,
+            };
+            // Per D6: build quadraui::ListView (bordered) + draw_list.
+            let list = render::tab_switcher_to_quadraui_list_view(ts, max_visible);
+            super::quadraui_tui::draw_list(frame.buffer_mut(), popup_area, &list, theme);
+        }
     }
 
     // ── Context menu popup (above status/command line) ─────────────────────
@@ -2032,157 +2054,6 @@ pub(super) fn render_picker_popup(
                     '─'
                 };
                 set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-            }
-        }
-    }
-}
-
-pub(super) fn render_tab_switcher_popup(
-    buf: &mut ratatui::buffer::Buffer,
-    term_area: Rect,
-    ts: &render::TabSwitcherPanel,
-    theme: &Theme,
-) {
-    if ts.items.is_empty() {
-        return;
-    }
-    let item_count = ts.items.len();
-    // Size: 45% width (min 40, max 80), height = items + 2 (borders)
-    let width = (term_area.width * 45 / 100).clamp(40, 80);
-    let max_visible = (term_area.height as usize).saturating_sub(4).min(20);
-    let visible = item_count.min(max_visible);
-    let height = visible as u16 + 2; // top + bottom border
-
-    // Centered
-    let x = (term_area.width.saturating_sub(width)) / 2;
-    let y = (term_area.height.saturating_sub(height)) / 2;
-
-    let bg = rc(theme.fuzzy_bg);
-    let fg = rc(theme.fuzzy_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    // Top border
-    if y < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╭'
-                } else if col == width - 1 {
-                    '╮'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, y, ch, border_fg, bg);
-            }
-        }
-        // Title overlay
-        let title = " Open Tabs ";
-        for (i, ch) in title.chars().enumerate() {
-            let cx = x + 2 + i as u16;
-            if cx + 1 < x + width && cx < term_area.width {
-                set_cell(buf, cx, y, ch, title_fg, bg);
-            }
-        }
-    }
-
-    // Scroll offset so selected item is always visible
-    let scroll = if ts.selected_idx >= visible {
-        ts.selected_idx - visible + 1
-    } else {
-        0
-    };
-
-    // Items
-    let inner_w = (width - 2) as usize;
-    for i in 0..visible {
-        let item_idx = scroll + i;
-        if item_idx >= item_count {
-            break;
-        }
-        let ry = y + 1 + i as u16;
-        if ry >= term_area.height {
-            break;
-        }
-        let is_selected = item_idx == ts.selected_idx;
-        let row_bg = if is_selected { sel_bg } else { bg };
-
-        // Clear row
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 || col == width - 1 {
-                    '│'
-                } else {
-                    ' '
-                };
-                let c = if col == 0 || col == width - 1 {
-                    border_fg
-                } else {
-                    fg
-                };
-                set_cell(
-                    buf,
-                    cx,
-                    ry,
-                    ch,
-                    c,
-                    if col == 0 || col == width - 1 {
-                        bg
-                    } else {
-                        row_bg
-                    },
-                );
-            }
-        }
-
-        let (name, path, dirty) = &ts.items[item_idx];
-        let dirty_mark = if *dirty { " ●" } else { "" };
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let label = format!("{}{}{}", prefix, name, dirty_mark);
-
-        // Draw label
-        for (j, ch) in label.chars().enumerate() {
-            let cx = x + 1 + j as u16;
-            if cx + 1 < x + width && cx < term_area.width {
-                set_cell(buf, cx, ry, ch, fg, row_bg);
-            }
-        }
-
-        // Draw path right-aligned (dimmed)
-        if !path.is_empty() && inner_w > label.chars().count() + 4 {
-            let available = inner_w - label.chars().count() - 2;
-            let display_path = if path.len() > available {
-                &path[path.len() - available..]
-            } else {
-                path.as_str()
-            };
-            let path_start = inner_w - display_path.len();
-            for (j, ch) in display_path.chars().enumerate() {
-                let cx = x + 1 + (path_start + j) as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, ry, ch, border_fg, row_bg);
-                }
-            }
-        }
-    }
-
-    // Bottom border
-    let bottom = y + height - 1;
-    if bottom < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╰'
-                } else if col == width - 1 {
-                    '╯'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, bottom, ch, border_fg, bg);
             }
         }
     }

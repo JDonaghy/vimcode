@@ -785,10 +785,16 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
     let hdr_bg = rc(theme.status_bg);
     let fg = rc(theme.fuzzy_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
-    let row_bg = rc(theme.background);
+    let row_bg = if list.bordered {
+        rc(theme.fuzzy_bg)
+    } else {
+        rc(theme.background)
+    };
     let dim_fg = rc(theme.line_number_fg);
     let error_fg = rc(theme.diagnostic_error);
     let warn_fg = rc(theme.diagnostic_warning);
+    let border_fg = rc(theme.fuzzy_border);
+    let title_fg = rc(theme.fuzzy_title_fg);
 
     // Per D6: ask the primitive for a layout. Title row is 1 cell if
     // present; items are 1 cell each. Layout resolves which items are
@@ -798,8 +804,60 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
         quadraui::ListItemMeasure::new(1.0)
     });
 
-    // Draw title header (if present).
-    if let Some(title_bounds) = layout.title_bounds {
+    if list.bordered {
+        // Top border row with optional title overlay.
+        let top_y = area.y;
+        for col in 0..area.width {
+            let cx = area.x + col;
+            let ch = if col == 0 {
+                '╭'
+            } else if col + 1 == area.width {
+                '╮'
+            } else {
+                '─'
+            };
+            set_cell(buf, cx, top_y, ch, border_fg, row_bg);
+        }
+        if let Some(ref title) = list.title {
+            let title_text: String = title.spans.iter().map(|s| s.text.as_str()).collect();
+            let label = format!(" {} ", title_text.trim());
+            for (i, ch) in label.chars().enumerate() {
+                let cx = area.x + 2 + i as u16;
+                if cx + 1 >= area.x + area.width {
+                    break;
+                }
+                set_cell(buf, cx, top_y, ch, title_fg, row_bg);
+            }
+        }
+        // Bottom border row.
+        if area.height >= 2 {
+            let bot_y = area.y + area.height - 1;
+            for col in 0..area.width {
+                let cx = area.x + col;
+                let ch = if col == 0 {
+                    '╰'
+                } else if col + 1 == area.width {
+                    '╯'
+                } else {
+                    '─'
+                };
+                set_cell(buf, cx, bot_y, ch, border_fg, row_bg);
+            }
+        }
+        // Left + right borders for rows in between (background fill
+        // for those interior rows happens in the item loop below; here
+        // we just paint the side-bar glyphs in case there are fewer
+        // items than rows).
+        for row in (area.y + 1)..(area.y + area.height - 1) {
+            set_cell(buf, area.x, row, '│', border_fg, row_bg);
+            set_cell(buf, area.x + area.width - 1, row, '│', border_fg, row_bg);
+            // Fill interior with background.
+            for col in 1..(area.width - 1) {
+                set_cell(buf, area.x + col, row, ' ', fg, row_bg);
+            }
+        }
+    } else if let Some(title_bounds) = layout.title_bounds {
+        // Flat (non-bordered) header strip.
         if let Some(ref title) = list.title {
             let y = area.y + title_bounds.y.round() as u16;
             for x in area.x..area.x + area.width {
@@ -822,6 +880,17 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
     for visible_item in &layout.visible_items {
         let item = &list.items[visible_item.item_idx];
         let y = area.y + visible_item.bounds.y.round() as u16;
+        // In bordered mode, items are inset by 1 cell on each side.
+        // The layout has already applied this; use the resolved
+        // per-item bounds so the item area never overlaps the borders.
+        let item_x = area.x + visible_item.bounds.x.round() as u16;
+        let item_w = visible_item.bounds.width.round() as u16;
+        let item_area = Rect {
+            x: item_x,
+            y,
+            width: item_w,
+            height: 1,
+        };
         let is_selected = visible_item.item_idx == list.selected_idx && list.has_focus;
         let bg = if is_selected { sel_bg } else { row_bg };
         let decoration_fg = match item.decoration {
@@ -831,8 +900,8 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
             _ => fg,
         };
 
-        // Fill row background.
-        for x in area.x..area.x + area.width {
+        // Fill row background within the item region only.
+        for x in item_x..item_x + item_w {
             set_cell(buf, x, y, ' ', decoration_fg, bg);
         }
 
@@ -841,10 +910,10 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
         // Selection indicator.
         let prefix = if is_selected { "▶ " } else { "  " };
         for ch in prefix.chars() {
-            if col >= area.width {
+            if col >= item_w {
                 break;
             }
-            set_cell(buf, area.x + col, y, ch, decoration_fg, bg);
+            set_cell(buf, item_x + col, y, ch, decoration_fg, bg);
             col += 1;
         }
 
@@ -856,14 +925,14 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
                 icon.fallback.as_str()
             };
             for ch in glyph.chars() {
-                if col >= area.width {
+                if col >= item_w {
                     break;
                 }
-                set_cell(buf, area.x + col, y, ch, decoration_fg, bg);
+                set_cell(buf, item_x + col, y, ch, decoration_fg, bg);
                 col += 1;
             }
-            if col < area.width {
-                set_cell(buf, area.x + col, y, ' ', decoration_fg, bg);
+            if col < item_w {
+                set_cell(buf, item_x + col, y, ' ', decoration_fg, bg);
                 col += 1;
             }
         }
@@ -871,7 +940,7 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
         // Text.
         let text_end_col = draw_styled_text(
             buf,
-            area,
+            item_area,
             y,
             col as usize,
             &item.text,
@@ -884,11 +953,11 @@ pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView,
         // Detail (right-aligned, dimmed).
         if let Some(ref detail) = item.detail {
             let detail_w: usize = detail.spans.iter().map(|s| s.text.chars().count()).sum();
-            let start = (area.width as usize).saturating_sub(detail_w + 1);
+            let start = (item_w as usize).saturating_sub(detail_w + 1);
             if start > text_end_col + 1 {
                 draw_styled_text(
                     buf,
-                    area,
+                    item_area,
                     y,
                     start,
                     detail,

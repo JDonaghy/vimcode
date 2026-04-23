@@ -985,6 +985,60 @@ pub struct TabSwitcherPanel {
     pub selected_idx: usize,
 }
 
+/// Convert a `TabSwitcherPanel` into a bordered `quadraui::ListView`.
+///
+/// Each item carries the filename (with a trailing `●` when dirty)
+/// and uses the full path as the right-aligned `detail`. The list is
+/// bordered with the title `" Open Tabs "` overlayed on the top
+/// border. `scroll_offset` is set so the selected item is always
+/// visible inside `max_visible` rows.
+pub fn tab_switcher_to_quadraui_list_view(
+    ts: &TabSwitcherPanel,
+    max_visible: usize,
+) -> quadraui::ListView {
+    use quadraui::{ListItem, ListView, StyledText, WidgetId};
+
+    let items: Vec<ListItem> = ts
+        .items
+        .iter()
+        .map(|(name, path, dirty)| {
+            let label = if *dirty {
+                format!("{} ●", name)
+            } else {
+                name.clone()
+            };
+            ListItem {
+                text: StyledText::plain(label),
+                icon: None,
+                detail: if path.is_empty() {
+                    None
+                } else {
+                    Some(StyledText::plain(path.clone()))
+                },
+                decoration: quadraui::Decoration::Normal,
+            }
+        })
+        .collect();
+
+    // Scroll so the selected item is on screen. Window is `max_visible`
+    // items tall; scroll forward by enough to keep selected_idx in view.
+    let scroll_offset = if ts.selected_idx >= max_visible {
+        ts.selected_idx + 1 - max_visible
+    } else {
+        0
+    };
+
+    ListView {
+        id: WidgetId::new("tab_switcher"),
+        title: Some(StyledText::plain("Open Tabs")),
+        items,
+        selected_idx: ts.selected_idx,
+        scroll_offset,
+        has_focus: true,
+        bordered: true,
+    }
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
@@ -6059,6 +6113,7 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
         selected_idx: qf.selected_idx,
         scroll_offset: 0, // set by caller from local scroll_top
         has_focus: qf.has_focus,
+        bordered: false,
     }
 }
 
@@ -11083,6 +11138,55 @@ mod tests {
         // Everything uses hover_fg (no keyword highlight).
         let fg = to_q_color(theme.hover_fg);
         assert_eq!(styled.spans[1].fg, Some(fg));
+    }
+
+    #[test]
+    fn test_tab_switcher_to_list_view_dirty_and_scroll() {
+        let ts = TabSwitcherPanel {
+            items: vec![
+                ("main.rs".to_string(), "/src/main.rs".to_string(), false),
+                ("lib.rs".to_string(), "/src/lib.rs".to_string(), true),
+                (
+                    "keys.rs".to_string(),
+                    "/src/core/keys.rs".to_string(),
+                    false,
+                ),
+                ("tests.rs".to_string(), "/src/tests.rs".to_string(), false),
+                ("todo.md".to_string(), "".to_string(), false),
+            ],
+            selected_idx: 4,
+        };
+        let list = tab_switcher_to_quadraui_list_view(&ts, 3);
+
+        // Bordered modal with title overlay.
+        assert!(list.bordered);
+        assert!(list.title.is_some());
+        // 5 items, all present.
+        assert_eq!(list.items.len(), 5);
+        // Dirty marker appended to filename label (rendered as text,
+        // not detail — matches legacy behavior).
+        let lib_text: String = list.items[1]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(lib_text.contains("●"));
+        let main_text: String = list.items[0]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(!main_text.contains("●"));
+        // Paths appear as detail (right-aligned dimmed in the rasteriser).
+        assert!(list.items[0].detail.is_some());
+        // Empty path → no detail (avoids rendering a lone trailing space).
+        assert!(list.items[4].detail.is_none());
+        // Scroll so selected (idx=4) is visible inside max_visible=3:
+        // offset = 4 + 1 - 3 = 2.
+        assert_eq!(list.scroll_offset, 2);
+        assert_eq!(list.selected_idx, 4);
     }
 
     #[test]
