@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 326 — all 9 existing primitives have D6 `layout()` + `hit_test()`; TUI fully consumes TabBar + StatusBar layouts; 5361 tests, 0 failed)
+> **Last updated:** 2026-04-23 (Session 327 — readiness gate clear: all primitives shipped with D6 `layout()` + `hit_test()`; 5406 tests, 0 failed; **ready for TUI rewrite (Phase B.4)**)
 
 ---
 
@@ -72,27 +72,48 @@ primitives). Phase A complete except optional Win-GUI parity stages
 - ✅ D1–D7 all resolved (event/dispatch + render/layout + focus).
 - §6.3 / §6.5 / §6.6 deferred — don't block.
 
-*Primitives that need `layout()` method (per D6):*
-- ✅ **All 9 existing primitives have `layout()` + `hit_test()`:**
-  `TabBar`, `StatusBar`, `TreeView`, `ListView`, `ActivityBar`,
-  `Form`, `Palette`, `TextDisplay`, `Terminal`. Reference pattern
-  established.
-- ⬜ New for B.3 (container primitives): `Panel`, `Split`, `Tabs`,
-  `Stack`, `MenuBar`, `Modal`, `Dialog`.
-- ⬜ New for vimcode's actual surface: `ContextMenu`, `Completions`,
-  `Tooltip`, `Toast` (#141), `Spinner` + `ProgressBar` (#142),
-  form field primitives (#143: Slider, ColorPicker, Dropdown).
+*Existing primitives with `layout()` + `hit_test()`:*
+- ✅ All 9 shipped: `TabBar`, `StatusBar`, `TreeView`, `ListView`,
+  `ActivityBar`, `Form`, `Palette`, `TextDisplay`, `Terminal`.
+
+*New B.3 container primitives:*
+- ✅ `Panel` (chrome + content_bounds)
+- ✅ `Split` (two-pane draggable divider)
+- ✅ `Modal` (backdrop + centered content)
+- ✅ `Dialog` (title + body + buttons)
+- ✅ `MenuBar` (top-level menu strip with Alt-nav)
+- ⬜ `Tabs` — **skipped** as redundant with `TabBar` + app-owned
+  content. Apps use `TabBar` for navigation and swap their content
+  region based on `active_idx`; no composition primitive needed.
+- ⬜ `Stack` — **skipped** as redundant with app rendering order
+  (render overlays last). Z-stacking is trivially expressible in
+  render order without a dedicated primitive.
+
+*New B.3 surface primitives:*
+- ✅ `ContextMenu`
+- ✅ `Completions` (LSP-style autocomplete)
+- ✅ `Tooltip` (anchor-relative placement)
+- ✅ `Toast` (#141)
+- ✅ `Spinner` + `ProgressBar` (#142)
+- ✅ Form field primitives (#143): `Slider`, `ColorPicker`, `Dropdown`
+  as `FieldKind` variants.
 
 *TUI consumer migration (vimcode consumes layout() in real render paths):*
 - ✅ `TabBar` (commits `ebe0eec` hit-test + `713f071` draw)
 - ✅ `StatusBar` (commit `f263765` draw + hit-test)
 - ⬜ `TreeView`, `ListView`, `ActivityBar`, `Palette`, `Form`,
-  `TextDisplay`, `Terminal` — still on pre-D6 draw paths, which is
-  fine (layout() is additive).
+  `TextDisplay`, `Terminal` — still on pre-D6 draw paths; migrations
+  land during the B.4 TUI rewrite.
 
 *Backend trait final shape:*
-- `Backend::draw_*(&Layout)` throughout (mechanical migration once
-  each primitive's `layout()` lands — now unblocked for all 9).
+- ⬜ `Backend::draw_*(&Layout)` throughout — mechanical rewrite that
+  happens during B.4 when backends are touched anyway.
+
+**🎯 Readiness gate status: CLEAR for Phase B.4 (TUI rewrite).** All
+primitives shipped with D6 `layout()` + `hit_test()`. TabBar +
+StatusBar already consume layouts in TUI as proof of the pattern.
+The remaining TUI consumer migrations are mechanical and can happen
+incrementally during the rewrite.
 
 *TBD:* `TextEditor` / `BufferView` — Phase A.9 was marked deferred
 because vimcode's existing engine-owned text rendering path is still
