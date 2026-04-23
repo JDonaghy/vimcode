@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 325 — D7 focus model resolved; §5 migration strategy rewritten for backend-by-backend rewrite; all design-axis blockers for B.3 now clear)
+> **Last updated:** 2026-04-23 (Session 326 — all 9 existing primitives have D6 `layout()` + `hit_test()`; TUI fully consumes TabBar + StatusBar layouts; 5361 tests, 0 failed)
 
 ---
 
@@ -73,19 +73,26 @@ primitives). Phase A complete except optional Win-GUI parity stages
 - §6.3 / §6.5 / §6.6 deferred — don't block.
 
 *Primitives that need `layout()` method (per D6):*
-- Existing with stable shape, gain `layout()`: `TabBar`, `StatusBar`,
-  `TreeView`, `ListView`, `ActivityBar`, `Form`, `Palette`,
-  `TextDisplay`. `TabBar::layout()` is the **reference
-  implementation** to build first (also closes #179).
-- New for B.3 (container primitives): `Panel`, `Split`, `Tabs`,
+- ✅ **All 9 existing primitives have `layout()` + `hit_test()`:**
+  `TabBar`, `StatusBar`, `TreeView`, `ListView`, `ActivityBar`,
+  `Form`, `Palette`, `TextDisplay`, `Terminal`. Reference pattern
+  established.
+- ⬜ New for B.3 (container primitives): `Panel`, `Split`, `Tabs`,
   `Stack`, `MenuBar`, `Modal`, `Dialog`.
-- New for vimcode's actual surface: `ContextMenu`, `Completions`,
+- ⬜ New for vimcode's actual surface: `ContextMenu`, `Completions`,
   `Tooltip`, `Toast` (#141), `Spinner` + `ProgressBar` (#142),
   form field primitives (#143: Slider, ColorPicker, Dropdown).
 
+*TUI consumer migration (vimcode consumes layout() in real render paths):*
+- ✅ `TabBar` (commits `ebe0eec` hit-test + `713f071` draw)
+- ✅ `StatusBar` (commit `f263765` draw + hit-test)
+- ⬜ `TreeView`, `ListView`, `ActivityBar`, `Palette`, `Form`,
+  `TextDisplay`, `Terminal` — still on pre-D6 draw paths, which is
+  fine (layout() is additive).
+
 *Backend trait final shape:*
 - `Backend::draw_*(&Layout)` throughout (mechanical migration once
-  each primitive's `layout()` lands).
+  each primitive's `layout()` lands — now unblocked for all 9).
 
 *TBD:* `TextEditor` / `BufferView` — Phase A.9 was marked deferred
 because vimcode's existing engine-owned text rendering path is still
@@ -111,7 +118,7 @@ toward keeping engine-owned for TUI; revisit when GTK rewrite starts.
 1. This section (you're reading it).
 2. [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md) — primitive-distinctness principles (~140 lines).
 3. [`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md) §6 + §7 — backend responsibilities + key decisions.
-4. [`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md`](quadraui/docs/BACKEND_TRAIT_PROPOSAL.md) §9 — resolved decisions D1–D6 with full rationale.
+4. [`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md`](quadraui/docs/BACKEND_TRAIT_PROPOSAL.md) §9 — resolved decisions D1–D7 with full rationale.
 5. The PLAN.md stage table below — what's shipped, what's next.
 
 Skip steps 2–4 only if the work is purely within an already-migrated
