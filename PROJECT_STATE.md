@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 22, 2026 (Session 323 — §6.2 resolved A; layout-axis decision logged as D6 in BACKEND_TRAIT_PROPOSAL.md §9; PLAN.md gains "Architectural focus" header; CLAUDE.md session-start protocol points at quadraui docs) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
+**Last updated:** Apr 23, 2026 (Session 325 — D7 focus model resolved; §5 migration strategy rewritten backend-by-backend; all design-axis blockers for B.3 clear) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,62 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 325 — D7 focus model resolved + §5 migration strategy inverted:**
+
+1. **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §6.4 marked
+   RESOLVED**, pointing to §9 D7 for the five sub-decisions.
+2. **D7 marked RESOLVED** with all five recommendations accepted
+   as-drafted:
+   - D7a (transitions): **A** — click + Tab + programmatic, all
+     funnelled through `set_focus(id)`.
+   - D7b (destruction fallback): **B+C hybrid** — app-designated
+     default, else null; next input re-establishes.
+   - D7c (focusable declaration): **C** — property of the
+     primitive type (`TextInput`/`ListView`/`TreeView` always
+     focusable; `Toast`/`Tooltip`/`StatusBar` never; `Dialog`
+     when modal).
+   - D7d (modal interaction): **A** — backend-owned focus stack;
+     push on modal open, pop on close.
+   - D7e (native focus bridging): **C** — native focus at the
+     top-level surface; simulate widget focus within.
+   User explicitly noted iteration is expected on edge cases —
+   the top-level shape is what's being committed to, not the
+   fine-grained semantics. Marked authoritative with iteration
+   allowance.
+3. **§5 "Migration" entirely rewritten** for the backend-by-
+   backend rewrite strategy (user flagged the "Non-negotiable:
+   this must not break vimcode" language as obsolete). New
+   structure: B.1 ✅ + B.2 ✅ + B.3 (ready-state quadraui) + B.4
+   (TUI rewrite) + B.5 (GTK rewrite) + B.6 (Win-GUI rewrite) +
+   B.7 (macOS native) + B.8 (Postman validation). Phase B.3
+   builds every primitive with `layout()`; nothing in vimcode
+   gets rewritten until B.3 ends. During B.4, GTK and Win-GUI
+   are broken; no external users to worry about.
+4. **"All decisions resolved" footer updated** — D1–D7 all
+   green; next code work enumerated (TabBar::layout first, then
+   Backend trait reshape, then focus-model surface, then layout
+   primitives, then remaining primitives).
+5. **PLAN.md updated** — D7 added to resolved list; §6.4 removed
+   from open questions; readiness gate marks all design axes ✅.
+6. **What this unblocks.** Phase B.3 code work starts next
+   session. First move: `quadraui/src/tab_bar.rs` grows a
+   `layout(viewport, measure) -> TabBarLayout` method + a
+   `TabBarLayout::hit_test()` — reference implementation for
+   the D6 Layout-returning shape, also closes #179.
+
+---
+
+**Session 324 — north-star goal + quadraui readiness gate:**
+
+Documented the strategic inversion: coexistence rule dropped,
+backend-by-backend rewrite adopted, TUI → GTK → Win-GUI → macOS
+order. PLAN.md gains the north-star goal statement, backend-
+state-going-in summary (TUI best, GTK/Win-GUI bug-ridden from
+the coexistence-era band-aid cycle), readiness-gate checklist,
+and backend rewrite order. Commit `47ab97d`.
+
+---
 
 **Session 323 — §6.2 resolved (Decision D6) + onboarding hooks:**
 

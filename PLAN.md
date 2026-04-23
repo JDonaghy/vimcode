@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 324 — north-star goal + quadraui readiness gate added; strategy inverted from coexistence to backend-by-backend rewrite)
+> **Last updated:** 2026-04-23 (Session 325 — D7 focus model resolved; §5 migration strategy rewritten for backend-by-backend rewrite; all design-axis blockers for B.3 now clear)
 
 ---
 
@@ -49,25 +49,28 @@ primitives). Phase A complete except optional Win-GUI parity stages
   verbatim. `Backend::draw_*` methods take `&Layout`, not
   `&Primitive`. Closes the structural gap that produced #178 and
   #179. Unblocks Phase B.3.
+- **D7** (2026-04-23): focus model settled (five sub-decisions).
+  Click+Tab+programmatic transitions; destruction falls back to
+  app-designated default; focusability is a property of the
+  primitive type; modal interactions use a backend-owned focus
+  stack; native focus stays at the top-level with in-app simulation
+  below. Iteration expected on edge cases. **All design-axis
+  blockers for B.3 (ready-state quadraui) are now clear.**
 
-**Open architectural questions:**
+**Open architectural questions (non-blocking):**
 - §6.3 multi-window — defer to v1.x (vimcode + Postman are
   single-window).
-- **§6.4 focus model — blocks `Panel` / `Tabs` / `Dialog` in B.3;
-  needs its own proposal pass. This is the single remaining design
-  blocker before B.3 primitives can land.**
 - §6.5 IME — defer to v1.1.
 - §6.6 performance — profile after first backend rewrite (TUI).
+
+*Previously-blocking §6.4 focus model was resolved as D7 on
+2026-04-23.*
 
 **Quadraui readiness gate — what unblocks the TUI rewrite:**
 
 *Design axes:*
-- ✅ D1–D6 (event/dispatch + render/layout axes).
-- ⬜ **§6.4 focus model** — next proposal pass (D7), in the D1–D6
-  style. Sub-questions: transitions (click/Tab/programmatic?),
-  destruction fallback, explicit-vs-implicit focusable, modal
-  interaction, native focus bridging.
-- §6.5 / §6.6 deferred — don't block.
+- ✅ D1–D7 all resolved (event/dispatch + render/layout + focus).
+- §6.3 / §6.5 / §6.6 deferred — don't block.
 
 *Primitives that need `layout()` method (per D6):*
 - Existing with stable shape, gain `layout()`: `TabBar`, `StatusBar`,
