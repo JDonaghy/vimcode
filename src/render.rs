@@ -2920,6 +2920,72 @@ pub fn context_menu_panel_to_quadraui_context_menu(
     }
 }
 
+/// Convert the menu-bar dropdown state into a `quadraui::ContextMenu`.
+///
+/// Returns `None` when no menu is open (caller should suppress the
+/// popup entirely). Each `MenuItemData` maps to a `ContextMenuItem`
+/// with the shortcut placed in `detail` (right-aligned by the
+/// rasteriser). In VSCode mode, `vscode_shortcut` is preferred when
+/// non-empty.
+///
+/// `selected_idx` is translated from the engine's
+/// `open_items`-relative `highlighted_item_idx` into the quadraui
+/// item list (which includes separator rows as their own entries, so
+/// indices would otherwise drift when separators appear before the
+/// highlighted row).
+pub fn menu_dropdown_to_quadraui_context_menu(data: &MenuBarData) -> Option<quadraui::ContextMenu> {
+    if data.open_menu_idx.is_none() || data.open_items.is_empty() {
+        return None;
+    }
+
+    let mut items: Vec<quadraui::ContextMenuItem> = Vec::new();
+    // engine_to_quadraui[engine_idx] = quadraui index of the same item.
+    let mut engine_to_quadraui: Vec<usize> = Vec::with_capacity(data.open_items.len());
+
+    for (i, item) in data.open_items.iter().enumerate() {
+        engine_to_quadraui.push(items.len());
+        if item.separator {
+            // Engine models the separator as its own entry, so mirror
+            // that: a single separator item. Shortcut / label are
+            // ignored on separator rows by the rasteriser.
+            items.push(quadraui::ContextMenuItem {
+                id: None,
+                label: quadraui::StyledText::default(),
+                detail: None,
+                disabled: false,
+            });
+            continue;
+        }
+        let shortcut = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
+            item.vscode_shortcut
+        } else {
+            item.shortcut
+        };
+        items.push(quadraui::ContextMenuItem {
+            id: Some(quadraui::WidgetId::new(format!("menu:{i}"))),
+            label: quadraui::StyledText::plain(item.label.to_string()),
+            detail: if shortcut.is_empty() {
+                None
+            } else {
+                Some(quadraui::StyledText::plain(shortcut.to_string()))
+            },
+            disabled: false,
+        });
+    }
+
+    let selected_idx = data
+        .highlighted_item_idx
+        .and_then(|eng| engine_to_quadraui.get(eng).copied())
+        .unwrap_or(0);
+
+    Some(quadraui::ContextMenu {
+        id: quadraui::WidgetId::new("menu_dropdown"),
+        items,
+        selected_idx,
+        bg: None,
+    })
+}
+
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {

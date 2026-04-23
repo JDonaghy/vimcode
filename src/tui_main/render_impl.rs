@@ -848,8 +848,48 @@ pub(super) fn draw_frame(
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
     if let Some(ref menu_data) = screen.menu_bar {
-        if menu_data.open_menu_idx.is_some() {
-            render_menu_dropdown(frame.buffer_mut(), area, menu_data, theme);
+        if let Some(menu) = render::menu_dropdown_to_quadraui_context_menu(menu_data) {
+            // Sizing matches legacy: max(label) + max(shortcut) + 6 padding,
+            // clamped to [20, 50]. Inner width = outer - 2 for borders.
+            let max_label = menu_data
+                .open_items
+                .iter()
+                .map(|i| i.label.len())
+                .max()
+                .unwrap_or(4);
+            let max_shortcut = menu_data
+                .open_items
+                .iter()
+                .map(|i| {
+                    if menu_data.is_vscode_mode && !i.vscode_shortcut.is_empty() {
+                        i.vscode_shortcut.len()
+                    } else {
+                        i.shortcut.len()
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+            let outer_width = (max_label + max_shortcut + 6).clamp(20, 50) as f32;
+            let inner_width = (outer_width - 2.0).max(1.0);
+            // The inner anchor sits 1 cell inside the outer box. Outer box
+            // starts at column `open_menu_col` (under the menu label) on
+            // the row directly below the menu-bar strip.
+            let anchor_x = menu_data.open_menu_col as f32 + 1.0;
+            let menu_bar_bottom = menu_bar_area.y + menu_bar_area.height;
+            let anchor_y = menu_bar_bottom as f32 + 1.0;
+            // Shrink the viewport by 1 on each side so layout clamping
+            // accounts for the 1-cell border chrome the rasteriser draws
+            // outside layout.bounds.
+            let inner_viewport = quadraui::Rect::new(
+                (area.x + 1) as f32,
+                (area.y + 1) as f32,
+                area.width.saturating_sub(2) as f32,
+                area.height.saturating_sub(2) as f32,
+            );
+            let layout = menu.layout(anchor_x, anchor_y, inner_viewport, inner_width, |_| {
+                quadraui::ContextMenuItemMeasure::new(1.0)
+            });
+            super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
         }
     }
 
@@ -2958,145 +2998,6 @@ pub(super) fn render_menu_bar(
             }
         }
     }
-}
-
-pub(super) fn render_menu_dropdown(
-    buf: &mut ratatui::buffer::Buffer,
-    full_area: Rect,
-    data: &render::MenuBarData,
-    theme: &Theme,
-) {
-    let Some(midx) = data.open_menu_idx else {
-        return;
-    };
-    if data.open_items.is_empty() {
-        return;
-    }
-
-    let popup_bg = rc(theme.tab_bar_bg);
-    let popup_fg = rc(theme.foreground);
-    let sep_fg = rc(theme.line_number_fg);
-    let shortcut_fg = rc(theme.line_number_fg);
-
-    let total_rows = data.open_items.len() as u16 + 2; // border top/bottom
-    let max_label = data
-        .open_items
-        .iter()
-        .map(|i| i.label.len())
-        .max()
-        .unwrap_or(4);
-    let max_shortcut = data
-        .open_items
-        .iter()
-        .map(|i| {
-            if data.is_vscode_mode && !i.vscode_shortcut.is_empty() {
-                i.vscode_shortcut.len()
-            } else {
-                i.shortcut.len()
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
-    let anchor_col = data.open_menu_col + full_area.x;
-    let popup_x = anchor_col.min(full_area.x + full_area.width.saturating_sub(popup_width));
-    // Dropdown appears just below the menu bar row (y=1)
-    let popup_y = full_area.y + 1;
-    let popup_height = total_rows.min(full_area.height.saturating_sub(popup_y));
-
-    // Draw border + background
-    for dy in 0..popup_height {
-        for dx in 0..popup_width {
-            let x = popup_x + dx;
-            let y = popup_y + dy;
-            if x >= full_area.x + full_area.width || y >= full_area.y + full_area.height {
-                continue;
-            }
-            let ch = if dy == 0 {
-                if dx == 0 {
-                    '\u{250c}'
-                } else if dx == popup_width - 1 {
-                    '\u{2510}'
-                } else {
-                    '\u{2500}'
-                }
-            } else if dy == popup_height - 1 {
-                if dx == 0 {
-                    '\u{2514}'
-                } else if dx == popup_width - 1 {
-                    '\u{2518}'
-                } else {
-                    '\u{2500}'
-                }
-            } else if dx == 0 || dx == popup_width - 1 {
-                '\u{2502}'
-            } else {
-                ' '
-            };
-            set_cell(buf, x, y, ch, popup_fg, popup_bg);
-        }
-    }
-
-    // Draw items
-    let mut row: u16 = popup_y + 1;
-    for (item_idx, item) in data.open_items.iter().enumerate() {
-        if row >= popup_y + popup_height - 1 {
-            break;
-        }
-        let is_highlighted = data.highlighted_item_idx == Some(item_idx);
-        let (item_fg, item_bg) = if is_highlighted {
-            (popup_bg, popup_fg) // invert for highlighted row
-        } else {
-            (popup_fg, popup_bg)
-        };
-        if item.separator {
-            // Separator line (never highlighted)
-            for dx in 1..popup_width - 1 {
-                let x = popup_x + dx;
-                if x < full_area.x + full_area.width {
-                    set_cell(buf, x, row, '\u{2500}', sep_fg, popup_bg);
-                }
-            }
-        } else {
-            // Fill highlighted row background
-            if is_highlighted {
-                for dx in 1..popup_width - 1 {
-                    let x = popup_x + dx;
-                    if x < full_area.x + full_area.width {
-                        set_cell(buf, x, row, ' ', item_fg, item_bg);
-                    }
-                }
-            }
-            // Label
-            let label_x = popup_x + 2;
-            for (i, ch) in item.label.chars().enumerate() {
-                let x = label_x + i as u16;
-                if x >= popup_x + popup_width - 1 {
-                    break;
-                }
-                set_cell(buf, x, row, ch, item_fg, item_bg);
-            }
-            // Right-aligned shortcut (use VSCode variant when in VSCode mode)
-            let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
-                item.vscode_shortcut
-            } else {
-                item.shortcut
-            };
-            if !sc.is_empty() {
-                let sc_fg = if is_highlighted { item_fg } else { shortcut_fg };
-                let sc_len = sc.len() as u16;
-                let sc_x = popup_x + popup_width - 1 - sc_len - 1;
-                for (i, ch) in sc.chars().enumerate() {
-                    let x = sc_x + i as u16;
-                    if x < full_area.x + full_area.width {
-                        set_cell(buf, x, row, ch, sc_fg, item_bg);
-                    }
-                }
-            }
-        }
-        row += 1;
-    }
-    let _ = midx; // suppress unused warning
 }
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────
