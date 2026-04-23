@@ -3745,6 +3745,11 @@ fn event_loop(
                                 engine.settings.show_hidden_files,
                             ));
                             needs_redraw = true;
+                        } else if action == EngineAction::OpenRecentDialog {
+                            folder_picker = Some(FolderPickerState::new_recent(
+                                &engine.session.recent_workspaces,
+                            ));
+                            needs_redraw = true;
                         } else if action == EngineAction::OpenWorkspaceDialog {
                             // open_workspace_from_file() already ran in the engine;
                             // just refresh the sidebar to reflect the new cwd.
