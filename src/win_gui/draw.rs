@@ -261,17 +261,25 @@ impl<'a> DrawContext<'a> {
             self.rt.FillRectangle(&rect_f(x, y, width - x, h), &tab_bg);
         }
         let text_y = y + (h - self.line_height) / 2.0; // vertically center text
-                                                       // Reserve space for diff toolbar so tabs don't extend under it
+                                                       // Reserve space for diff toolbar so tabs don't extend under it.
+                                                       // Mirrors the legacy width estimation (3 symbols × 3 cells + 4
+                                                       // separator cells + optional change-label) — A.6d-win v2 will
+                                                       // unify this into the quadraui::TabBar primitive's right_segments.
         let dt_reserve = layout.diff_toolbar.as_ref().map_or(0.0, |dt| {
             let cw = self.char_width;
             let mut parts_len: usize = 0;
             if let Some(ref label) = dt.change_label {
                 parts_len += label.len() + 2;
             }
-            parts_len += 3 * 3 + 4; // 3 symbols + separators
+            parts_len += 3 * 3 + 4;
             parts_len as f32 * cw + cw * 2.0
         });
-        self.draw_tabs(&layout.tab_bar, x, text_y, width - x - dt_reserve, true);
+        // A.6d-win v1: build the quadraui::TabBar primitive (no diff/split/
+        // scroll yet — those land in v2) and rasterise the tabs through
+        // quadraui_win::draw_tab_bar. The diff toolbar continues to render
+        // separately via the legacy path below.
+        let bar = crate::render::build_tab_bar_primitive(&layout.tab_bar, false, None, 0, None);
+        super::quadraui_win::draw_tab_bar(self, &bar, x, text_y, width - x - dt_reserve, true);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = layout.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, width - x, h);
@@ -301,103 +309,21 @@ impl<'a> DrawContext<'a> {
             self.rt.FillRectangle(&rect_f(x, y, w, h), &bg);
         }
         let text_y = y + (h - self.line_height) / 2.0;
-        // Reserve space for diff toolbar so tabs don't extend under it
         let dt_reserve = gtb.diff_toolbar.as_ref().map_or(0.0, |dt| {
             let cw = self.char_width;
             let mut parts_len: usize = 0;
             if let Some(ref label) = dt.change_label {
                 parts_len += label.len() + 2;
             }
-            parts_len += 3 * 3 + 4; // 3 symbols + separators
+            parts_len += 3 * 3 + 4;
             parts_len as f32 * cw + cw * 2.0
         });
-        self.draw_tabs(&gtb.tabs, x, text_y, w - dt_reserve, is_active_group);
+        // A.6d-win v1: same migration as the single-group bar above.
+        let bar = crate::render::build_tab_bar_primitive(&gtb.tabs, false, None, 0, None);
+        super::quadraui_win::draw_tab_bar(self, &bar, x, text_y, w - dt_reserve, is_active_group);
         // Diff toolbar (change nav buttons) at right edge
         if let Some(ref dt) = &gtb.diff_toolbar {
             self.draw_diff_toolbar_in_tab_bar(dt, x, y, w, h);
-        }
-    }
-
-    fn draw_tabs(
-        &self,
-        tabs: &[crate::render::TabInfo],
-        x_origin: f32,
-        y: f32,
-        max_width: f32,
-        show_accent: bool,
-    ) {
-        let tab_h = self.line_height * super::TAB_BAR_HEIGHT_MULT;
-        let mut x = x_origin;
-        let pad = 12.0; // horizontal padding inside each tab
-        let x_limit = x_origin + max_width;
-
-        for tab in tabs {
-            let bg = if tab.active {
-                self.solid_brush(self.theme.active_background)
-            } else {
-                self.solid_brush(self.theme.tab_bar_bg)
-            };
-            let fg_color = if tab.active {
-                if tab.preview {
-                    self.theme.line_number_fg // dimmer for preview tabs
-                } else {
-                    self.theme.foreground
-                }
-            } else {
-                self.theme.line_number_fg
-            };
-
-            let name_w = self.measure_ui_text(&tab.name);
-            let close_w = self.char_width; // close button width
-            let tab_w = pad + name_w + pad + close_w + pad * 0.5;
-
-            // Stop drawing tabs that would extend past the available width
-            // (leaves room for diff toolbar at the right edge)
-            if x + tab_w > x_limit {
-                break;
-            }
-
-            unsafe {
-                self.rt.FillRectangle(&rect_f(x, y, tab_w, tab_h), &bg);
-            }
-
-            // Tab name (UI font, vertically centered)
-            self.draw_ui_text(&tab.name, x + pad, y, tab_h, fg_color);
-
-            // Dirty indicator (dot) or close button (x)
-            let close_x = x + tab_w - close_w - pad * 0.5;
-            if tab.dirty {
-                self.draw_text(
-                    "\u{25CF}",
-                    close_x,
-                    y + (tab_h - self.line_height) / 2.0,
-                    self.theme.git_modified,
-                );
-            } else {
-                self.draw_text(
-                    "\u{00D7}",
-                    close_x,
-                    y + (tab_h - self.line_height) / 2.0,
-                    self.theme.line_number_fg,
-                );
-            }
-
-            // Active tab accent bar (2px at top) — only in the focused group
-            if tab.active && show_accent {
-                let accent = self.solid_brush(self.theme.tab_active_accent);
-                unsafe {
-                    self.rt.FillRectangle(&rect_f(x, y, tab_w, 2.0), &accent);
-                }
-            }
-
-            // Tab separator
-            unsafe {
-                let sep = self.solid_brush(self.theme.separator);
-                self.rt
-                    .FillRectangle(&rect_f(x + tab_w - 1.0, y + 4.0, 1.0, tab_h - 8.0), &sep);
-            }
-
-            x += tab_w;
         }
     }
 
@@ -4528,7 +4454,7 @@ impl<'a> DrawContext<'a> {
     }
 
     /// Draw text using the proportional UI font (Segoe UI) for menus and tabs.
-    fn draw_ui_text(&self, text: &str, x: f32, y: f32, height: f32, color: Color) {
+    pub(super) fn draw_ui_text(&self, text: &str, x: f32, y: f32, height: f32, color: Color) {
         if text.is_empty() {
             return;
         }
@@ -4566,7 +4492,7 @@ impl<'a> DrawContext<'a> {
     }
 
     /// Measure text width using the UI font.
-    fn measure_ui_text(&self, text: &str) -> f32 {
+    pub(super) fn measure_ui_text(&self, text: &str) -> f32 {
         if text.is_empty() {
             return 0.0;
         }

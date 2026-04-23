@@ -1,8 +1,9 @@
 //! Win-GUI (Direct2D / DirectWrite) backend for `quadraui` primitives.
 //!
 //! Direct2D counterpart to `src/tui_main/quadraui_tui.rs` and
-//! `src/gtk/quadraui_gtk.rs`. Currently supports `TreeView` (A.1c) and
-//! `StatusBar` (A.6b-win).
+//! `src/gtk/quadraui_gtk.rs`. Currently supports `TreeView` (A.1c),
+//! `StatusBar` (A.6b-win), and `TabBar` (A.6d-win v1: tabs only;
+//! right-segments / scroll / hover come in A.6d-win v2).
 
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
@@ -283,5 +284,118 @@ pub(super) fn draw_status_bar(
         }
         ctx.draw_text(&seg.text, rx, y, qc_to_color(seg.fg));
         rx += seg_w;
+    }
+}
+
+// ─── TabBar (A.6d-win v1: tabs only) ─────────────────────────────────────────
+
+/// Horizontal padding inside each tab cell. Matches the legacy `draw_tabs`
+/// constant so the existing `state.tab_slots` click cache (populated in
+/// `cache_layout`) stays valid bit-for-bit during the v1 migration.
+pub(super) const TAB_PAD_PX: f32 = 12.0;
+
+/// Draw a `quadraui::TabBar`'s tabs into `(x, text_y, max_width, ctx.line_height * TAB_BAR_HEIGHT_MULT)`
+/// on `ctx.rt`, using the proportional UI font for tab labels.
+///
+/// **v1 scope (A.6d-win):** renders only `bar.tabs` (the left side). The
+/// `right_segments` stream — diff toolbar buttons, split buttons, action
+/// menu — is ignored; callers continue to invoke
+/// `draw_diff_toolbar_in_tab_bar` directly until v2 unifies the right side.
+/// `bar.scroll_offset` is also ignored: the v1 rasteriser iterates from
+/// the start and breaks on overflow, matching the pre-migration behaviour
+/// (Win-GUI has no tab scrolling yet — v2 work).
+///
+/// `text_y` is the vertically-centered text origin (not the bar's top
+/// edge), matching the pre-migration `draw_tabs` call shape so wrappers
+/// and the tab-slot cache don't have to change. Per-tab background fills
+/// extend `tab_h` pixels down from `text_y`, leaving a ~0.25 line-height
+/// sliver under the bar — pre-existing visual quirk worth fixing in v2
+/// alongside the wrapper restructure.
+///
+/// `show_accent` toggles the 2 px accent bar across the active tab's top
+/// edge. Set to `true` for the focused group's tab bar, `false` for
+/// inactive groups in a multi-group split.
+///
+/// **Italic preview tabs are not rendered.** Win-GUI's UI font path uses
+/// a single non-italic `IDWriteTextFormat`; preview tabs render with the
+/// same weight as normal tabs but with a dimmer foreground colour (the
+/// pre-migration behaviour). Adding italic would require a second format
+/// and a second measurement path.
+pub(super) fn draw_tab_bar(
+    ctx: &DrawContext,
+    bar: &quadraui::TabBar,
+    x_origin: f32,
+    text_y: f32,
+    max_width: f32,
+    show_accent: bool,
+) {
+    let cw = ctx.char_width;
+    let lh = ctx.line_height;
+    let tab_h = lh * super::TAB_BAR_HEIGHT_MULT;
+    let pad = TAB_PAD_PX;
+    let close_w = cw;
+    let mut x = x_origin;
+    let x_limit = x_origin + max_width;
+
+    for tab in &bar.tabs {
+        let bg_color = if tab.is_active {
+            ctx.theme.active_background
+        } else {
+            ctx.theme.tab_bar_bg
+        };
+        // Preview tabs use a dimmer foreground; non-preview active tabs use
+        // the full foreground; inactive tabs use the line-number dim colour.
+        let fg_color = if tab.is_active {
+            if tab.is_preview {
+                ctx.theme.line_number_fg
+            } else {
+                ctx.theme.foreground
+            }
+        } else {
+            ctx.theme.line_number_fg
+        };
+
+        let name_w = ctx.measure_ui_text(&tab.label);
+        let tab_w = pad + name_w + pad + close_w + pad * 0.5;
+
+        // Stop when the next tab would overflow the available area
+        // (which the caller has already shrunk to leave room for the diff
+        // toolbar). Matches the v0 `break` behaviour — v2 will replace
+        // this with `quadraui::TabBar::fit_active_scroll_offset`.
+        if x + tab_w > x_limit {
+            break;
+        }
+
+        unsafe {
+            let bg = ctx.solid_brush(bg_color);
+            ctx.rt.FillRectangle(&rect(x, text_y, tab_w, tab_h), &bg);
+        }
+
+        ctx.draw_ui_text(&tab.label, x + pad, text_y, tab_h, fg_color);
+
+        // Dirty (●) or close (×) glyph at the right edge of the tab.
+        let close_x = x + tab_w - close_w - pad * 0.5;
+        let close_y = text_y + (tab_h - lh) / 2.0;
+        if tab.is_dirty {
+            ctx.draw_text("\u{25CF}", close_x, close_y, ctx.theme.git_modified);
+        } else {
+            ctx.draw_text("\u{00D7}", close_x, close_y, ctx.theme.line_number_fg);
+        }
+
+        if tab.is_active && show_accent {
+            unsafe {
+                let accent = ctx.solid_brush(ctx.theme.tab_active_accent);
+                ctx.rt.FillRectangle(&rect(x, text_y, tab_w, 2.0), &accent);
+            }
+        }
+
+        // Per-tab right separator (1 px tall slim line).
+        unsafe {
+            let sep = ctx.solid_brush(ctx.theme.separator);
+            ctx.rt
+                .FillRectangle(&rect(x + tab_w - 1.0, text_y + 4.0, 1.0, tab_h - 8.0), &sep);
+        }
+
+        x += tab_w;
     }
 }
