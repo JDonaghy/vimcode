@@ -91,7 +91,7 @@ use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
 use crate::icons;
 use crate::render::{
-    self, build_screen_layout, Color, CompletionMenu, CursorShape, RenderedLine, RenderedWindow,
+    self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow,
     SelectionKind, Theme, WildmenuData,
 };
 

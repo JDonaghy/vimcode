@@ -758,7 +758,57 @@ pub(super) fn draw_frame(
 
     // ── Close-tab confirm overlay ──────────────────────────────────────────────
     if close_tab_confirm {
-        render_close_tab_confirm_overlay(frame.buffer_mut(), area, theme);
+        // Build a Dialog primitive so the rendering goes through the
+        // shared D6 path — horizontal buttons, click interception.
+        let dialog = quadraui::Dialog {
+            id: quadraui::WidgetId::new("close_tab_confirm"),
+            title: quadraui::StyledText::plain("Unsaved Changes"),
+            body: quadraui::StyledText::plain("This file has unsaved changes."),
+            buttons: vec![
+                quadraui::DialogButton {
+                    id: quadraui::WidgetId::new("close_tab:save"),
+                    label: "Save".to_string(),
+                    is_default: true,
+                    is_cancel: false,
+                    tint: None,
+                },
+                quadraui::DialogButton {
+                    id: quadraui::WidgetId::new("close_tab:discard"),
+                    label: "Discard".to_string(),
+                    is_default: false,
+                    is_cancel: false,
+                    tint: None,
+                },
+                quadraui::DialogButton {
+                    id: quadraui::WidgetId::new("close_tab:cancel"),
+                    label: "Cancel".to_string(),
+                    is_default: false,
+                    is_cancel: true,
+                    tint: None,
+                },
+            ],
+            severity: Some(quadraui::DialogSeverity::Warning),
+            vertical_buttons: false,
+            input: None,
+        };
+        let viewport = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        let measure = quadraui::DialogMeasure {
+            width: 48.0,
+            title_height: 1.0,
+            body_height: 1.0,
+            input_height: 0.0,
+            button_row_height: 1.0,
+            button_width: 11.0,
+            button_gap: 2.0,
+            padding: 1.0,
+        };
+        let layout = dialog.layout(viewport, measure);
+        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
     }
 }
 
@@ -2243,124 +2293,6 @@ pub(super) fn render_quit_confirm_overlay(
     }
 }
 
-pub(super) fn render_close_tab_confirm_overlay(
-    buf: &mut ratatui::buffer::Buffer,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let lines: &[(&str, bool)] = &[
-        ("  This file has unsaved changes.", false),
-        ("", false),
-        ("  [S]   Save & Close Tab", true),
-        ("  [D]   Discard & Close Tab", true),
-        ("  [Esc] Cancel", true),
-    ];
-    let title = " Unsaved Changes ";
-    let width: u16 = 42;
-    let height: u16 = 2 + 1 + lines.len() as u16 + 1;
-
-    let x = (term_area.width.saturating_sub(width)) / 2;
-    let y = (term_area.height.saturating_sub(height)) / 2;
-
-    let bg_color = rc(theme.fuzzy_bg);
-    let fg_color = rc(theme.fuzzy_fg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-    let key_fg = rc(theme.fuzzy_query_fg);
-
-    // Top border row
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 {
-            '╭'
-        } else if col == width - 1 {
-            '╮'
-        } else {
-            '─'
-        };
-        set_cell(buf, cx, y, ch, border_fg, bg_color);
-    }
-    for (i, ch) in title.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width {
-            set_cell(buf, cx, y, ch, title_fg, bg_color);
-        }
-    }
-
-    // Blank row after title
-    let blank_row = y + 1;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 || col == width - 1 {
-            '│'
-        } else {
-            ' '
-        };
-        let fg = if col == 0 || col == width - 1 {
-            border_fg
-        } else {
-            fg_color
-        };
-        set_cell(buf, cx, blank_row, ch, fg, bg_color);
-    }
-
-    // Content rows
-    for (row_i, (text, is_key_row)) in lines.iter().enumerate() {
-        let ry = y + 2 + row_i as u16;
-        for col in 0..width {
-            let cx = x + col;
-            let ch = if col == 0 || col == width - 1 {
-                '│'
-            } else {
-                ' '
-            };
-            let fg = if col == 0 || col == width - 1 {
-                border_fg
-            } else {
-                fg_color
-            };
-            set_cell(buf, cx, ry, ch, fg, bg_color);
-        }
-        let row_fg = if *is_key_row { key_fg } else { fg_color };
-        for (j, ch) in text.chars().enumerate() {
-            let cx = x + 1 + j as u16;
-            if cx + 1 < x + width {
-                set_cell(buf, cx, ry, ch, row_fg, bg_color);
-            }
-        }
-    }
-
-    // Blank row before bottom border
-    let pre_bottom = y + 2 + lines.len() as u16;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 || col == width - 1 {
-            '│'
-        } else {
-            ' '
-        };
-        let fg = if col == 0 || col == width - 1 {
-            border_fg
-        } else {
-            fg_color
-        };
-        set_cell(buf, cx, pre_bottom, ch, fg, bg_color);
-    }
-
-    // Bottom border
-    let bottom = y + height - 1;
-    for col in 0..width {
-        let cx = x + col;
-        let ch = if col == 0 {
-            '╰'
-        } else if col == width - 1 {
-            '╯'
-        } else {
-            '─'
-        };
-        set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-    }
-}
 
 pub(super) fn render_window(
     frame: &mut ratatui::Frame,
