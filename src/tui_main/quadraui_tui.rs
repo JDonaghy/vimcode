@@ -218,21 +218,15 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
     let dim_fg = rc(theme.line_number_fg);
     let accent_fg = rc(theme.cursor);
 
-    // Field row height in cells. TUI keeps it compact at 1; GTK will use
-    // taller rows (item_height-style) when A.3b/c land.
-    let row_h: u16 = 1;
+    // Per D6: ask the primitive for a layout. TUI keeps rows compact
+    // at 1 cell each; GTK uses taller rows.
+    let layout = form.layout(area.width as f32, area.height as f32, |_| {
+        quadraui::FormFieldMeasure::new(1.0)
+    });
 
-    let visible = form
-        .fields
-        .iter()
-        .skip(form.scroll_offset)
-        .take(area.height as usize);
-
-    for (vis_i, field) in visible.enumerate() {
-        let y = area.y + (vis_i as u16) * row_h;
-        if y >= area.y + area.height {
-            break;
-        }
+    for visible_field in &layout.visible_fields {
+        let field = &form.fields[visible_field.field_idx];
+        let y = area.y + visible_field.bounds.y.round() as u16;
 
         let is_focused = form.has_focus
             && form
