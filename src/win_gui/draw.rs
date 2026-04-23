@@ -693,46 +693,18 @@ impl<'a> DrawContext<'a> {
             }
         }
 
-        // Per-window status line (with per-segment background colors)
+        // Per-window status line — A.6b-win: route through quadraui::StatusBar.
+        // Right-segment fit policy (#159) drops low-priority segments when the
+        // bar is narrow; `win_status_segment_hit_test` applies the same policy
+        // so clicks stay aligned with what's actually drawn.
         if let Some(ref status) = rw.status_line {
             let status_y = ry + rw.rect.height as f32 - self.line_height;
             let bar_w = rw.rect.width as f32;
-            // Base background for the whole bar
-            let base_bg = self.solid_brush(self.theme.background.lighten(0.10));
-            unsafe {
-                self.rt
-                    .FillRectangle(&rect_f(rx, status_y, bar_w, self.line_height), &base_bg);
-            }
-            // Left segments with per-segment background
-            let mut sx = rx;
-            for seg in &status.left_segments {
-                let seg_w = seg.text.chars().count() as f32 * self.char_width;
-                let seg_bg = self.solid_brush(seg.bg);
-                unsafe {
-                    self.rt
-                        .FillRectangle(&rect_f(sx, status_y, seg_w, self.line_height), &seg_bg);
-                }
-                self.draw_text(&seg.text, sx, status_y, seg.fg);
-                sx += seg_w;
-            }
-            // Right segments with per-segment background
-            let right_text: String = status
-                .right_segments
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect();
-            let right_w = right_text.chars().count() as f32 * self.char_width;
-            let mut sx = rx + bar_w - right_w;
-            for seg in &status.right_segments {
-                let seg_w = seg.text.chars().count() as f32 * self.char_width;
-                let seg_bg = self.solid_brush(seg.bg);
-                unsafe {
-                    self.rt
-                        .FillRectangle(&rect_f(sx, status_y, seg_w, self.line_height), &seg_bg);
-                }
-                self.draw_text(&seg.text, sx, status_y, seg.fg);
-                sx += seg_w;
-            }
+            let bar = crate::render::window_status_line_to_status_bar(
+                status,
+                quadraui::WidgetId::new("status:window"),
+            );
+            super::quadraui_win::draw_status_bar(self, rx, status_y, bar_w, &bar);
         }
 
         // Pop editor window clip
@@ -926,40 +898,22 @@ impl<'a> DrawContext<'a> {
         let x0 = self.editor_left;
         // The separated status sits just above the terminal panel.
         // Layout: editor | sep_status | terminal | status_bar | cmd_line
-        // The terminal panel content row count tells us how much space it uses.
         let terminal_px = _layout
             .bottom_tabs
             .terminal
             .as_ref()
             .map(|t| (t.content_rows as f32 + 2.0) * self.line_height)
             .unwrap_or(0.0);
-        // Layout when above: [editor][sep_status][cmd][terminal]
-        // sep_y = height - terminal - cmd - sep_status
         let sep_y = height - terminal_px - 2.0 * self.line_height;
         let bar_width = width - x0;
-        let bg = self.solid_brush(self.theme.status_bg);
-        unsafe {
-            self.rt
-                .FillRectangle(&rect_f(x0, sep_y, bar_width, self.line_height), &bg);
-        }
-        // Left segments
-        let mut sx = x0 + self.char_width * 0.5;
-        for seg in &status.left_segments {
-            self.draw_text(&seg.text, sx, sep_y, seg.fg);
-            sx += seg.text.chars().count() as f32 * self.char_width;
-        }
-        // Right segments
-        let right_text: String = status
-            .right_segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
-        let right_w = right_text.chars().count() as f32 * self.char_width;
-        let mut sx2 = x0 + bar_width - right_w - self.char_width * 0.5;
-        for seg in &status.right_segments {
-            self.draw_text(&seg.text, sx2, sep_y, seg.fg);
-            sx2 += seg.text.chars().count() as f32 * self.char_width;
-        }
+        // A.6b-win: route through quadraui::StatusBar so #159 fit policy +
+        // per-segment background fills + future bold/click-region work all
+        // share the same code path with the per-window status bar.
+        let bar = crate::render::window_status_line_to_status_bar(
+            status,
+            quadraui::WidgetId::new("status:separated"),
+        );
+        super::quadraui_win::draw_status_bar(self, x0, sep_y, bar_width, &bar);
     }
 
     // ─── Command line ────────────────────────────────────────────────────────
