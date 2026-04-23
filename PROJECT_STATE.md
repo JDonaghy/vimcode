@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 322 — A.6b-win + A.6d-win v1 shipped; A.6d-win v2a attempted+reverted, blocked on #178) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
+**Last updated:** Apr 22, 2026 (Session 323 — §6.2 resolved A; layout-axis decision logged as D6 in BACKEND_TRAIT_PROPOSAL.md §9; PLAN.md gains "Architectural focus" header; CLAUDE.md session-start protocol points at quadraui docs) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,44 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 323 — §6.2 resolved (Decision D6) + onboarding hooks:**
+
+1. **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §6.2 marked
+   RESOLVED A** (primitives return fully-resolved `Layout`;
+   backends rasterise verbatim). Earlier proposal (single global
+   `quadraui::layout::compute` pass) is superseded — layout is
+   per-primitive.
+2. **§9 gains Decision D6** with the three options considered
+   (A: per-primitive `layout()`; B: behavioural primitives like
+   `ScrollableTabBar`; C: required-field augmentation), why A
+   won (D-001 cuts against B; C doesn't actually force backends;
+   A makes wrong rendering loud, not silently wrong on platform N),
+   and what lands (`TabBar::layout()` + `TabBarLayout::hit_test()`
+   closes #179; `StatusBar::layout()` migration; trait reshape
+   to `draw_*(&Layout)`; ~−100 LOC per backend on existing
+   primitives).
+3. **`PLAN.md` gains an "Architectural focus" header** at the
+   top — names the active wave, lists resolved decisions
+   (D1–D6), open questions (§6.3 / §6.4 / §6.5 / §6.6), and the
+   ordered reading list for new sessions touching `quadraui/`.
+   Solves the gap that produced today's "are you aware of the
+   morning's decisions?" question.
+4. **`CLAUDE.md` session-start protocol gains a quadraui step**
+   — when the work touches `quadraui/`, also read
+   `quadraui/docs/DECISIONS.md` and `BACKEND_TRAIT_PROPOSAL.md`
+   §9. Justification: "ignoring them produces bandaid fixes that
+   recur in the next backend."
+5. **Doc-only commit, straight to develop** per CLAUDE.md
+   workflow. No code changes; no smoke test required.
+6. **What this enables.** Phase B.3 (layout primitives — `Panel`,
+   `Split`, `Tabs`, `Stack`, `MenuBar`, `Modal`, `Dialog`) is
+   unblocked. #178 / #179 land as part of B.3 — `TabBar::layout()`
+   becomes the reference impl for the new shape. Existing
+   primitives gain `layout()` incrementally as their backends
+   are touched.
+
+---
 
 **Session 322 (cont.) — A.6d-win v2a attempted, reverted, blocked on #178:**
 

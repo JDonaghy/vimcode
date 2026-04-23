@@ -6,7 +6,45 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 322 — A.6b-win + A.6d-win v1 shipped; A.6d-win v2a reverted, blocked on #178)
+> **Last updated:** 2026-04-22 (Session 323 — §6.2 resolved A; layout-axis decision added as D6 in BACKEND_TRAIT_PROPOSAL.md §9)
+
+---
+
+## Architectural focus
+
+**Wave:** quadraui Phase B (Backend trait + UiEvent + layout-owning
+primitives). Phase A complete except optional Win-GUI parity stages.
+
+**Resolved this cycle (`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §9):**
+- **D1–D5** (2026-04-22 morning): event/dispatch axis settled —
+  ship `UiEvent` + `Accelerator` + `Backend` together; per-method
+  draw (no `AnyPrimitive` enum); B.1 = scaffolding alone; B.2 pilot
+  = terminal maximize; accept both vim-style and plus-style
+  keybinding formats.
+- **D6** (2026-04-22 evening): render/layout axis settled —
+  primitives return fully-resolved `Layout`; backends rasterise
+  verbatim. `Backend::draw_*` methods take `&Layout`, not
+  `&Primitive`. Closes the structural gap that produced #178 and
+  #179. Unblocks Phase B.3.
+
+**Open architectural questions:**
+- §6.3 multi-window — defer to v1.x (vimcode + Postman are
+  single-window).
+- §6.4 focus model — blocks `Panel` / `Tabs` / `Dialog` in B.3;
+  needs its own proposal pass.
+- §6.5 IME — defer to v1.1.
+- §6.6 performance — profile after B.5.
+
+**If you're new here, read in order before touching `quadraui/`:**
+1. This section (you're reading it).
+2. [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md) — primitive-distinctness principles (~140 lines).
+3. [`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md) §6 + §7 — backend responsibilities + key decisions.
+4. [`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md`](quadraui/docs/BACKEND_TRAIT_PROPOSAL.md) §9 — resolved decisions D1–D6 with full rationale.
+5. The PLAN.md stage table below — what's shipped, what's next.
+
+Skip steps 2–4 only if the work is purely within an already-migrated
+backend draw function (no primitive contract changes, no new
+primitives, no cross-backend behaviour).
 
 ---
 

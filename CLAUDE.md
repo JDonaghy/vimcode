@@ -1,9 +1,10 @@
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
-2. Read `PLAN.md` if present — it is the pickup doc for any in-flight multi-stage feature (e.g. the current `quadraui` wave). Follow its stage map and branch-pattern hints.
-3. Check `.opencode/specs/` for detailed feature specs before starting
-4. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
-5. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
+2. Read `PLAN.md` if present — it is the pickup doc for any in-flight multi-stage feature (e.g. the current `quadraui` wave). The "Architectural focus" header at the top names the active design axis, lists resolved/open architectural questions, and points at the deeper docs; the stage map below tracks shipped/next work. Read both.
+3. **If the work touches `quadraui/`** — also read `quadraui/docs/DECISIONS.md` (primitive-distinctness principles) and `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §9 (resolved decisions log). These define the architectural contract; ignoring them produces bandaid fixes that recur in the next backend.
+4. Check `.opencode/specs/` for detailed feature specs before starting
+5. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
+6. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
 ## Development Workflow
 
