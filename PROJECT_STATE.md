@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 322 — Phase A.6b-win Win-GUI status bar via quadraui) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
+**Last updated:** Apr 23, 2026 (Session 322 — Phase A.6b-win + A.6d-win v1: Win-GUI status bar & tab bar via quadraui) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,38 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 322 (cont.) — Phase A.6d-win v1 Win-GUI tab bar (tabs only):**
+
+1. **`quadraui_win::draw_tab_bar` rasteriser** (`src/win_gui/quadraui_win.rs:+110`).
+   Renders the tabs portion of a `quadraui::TabBar` primitive — per-tab
+   background fill, dirty (●) / close (×) glyph, top accent strip on the
+   active tab in focused groups, vertical separator. Italic preview tabs
+   not supported (Win-GUI text path is single-format); preview tabs render
+   with a dimmer foreground colour, matching pre-migration behaviour.
+2. **Two wrappers refactored.** `draw_tab_bar` (single-group) and
+   `draw_group_tab_bar` (per-group split) in `src/win_gui/draw.rs` now
+   build the primitive via `render::build_tab_bar_primitive` (with no
+   diff toolbar / no split buttons / scroll_offset = 0 for v1) and call
+   the rasteriser. The legacy `draw_tabs` method (~80 lines) deleted.
+3. **`draw_ui_text` and `measure_ui_text` exposed as `pub(super)`** so
+   the rasteriser can render the proportional UI font (Segoe UI) for
+   tab labels, matching the pre-migration look.
+4. **Tab dimensions match exactly** (`TAB_PAD_PX = 12`) so the existing
+   `state.tab_slots` click-cache populated in `cache_layout` stays valid
+   bit-for-bit. Tab clicks and dirty-or-close glyph clicks unchanged.
+5. **v2 scope deferred** (separate PR): right-segments stream
+   (diff toolbar / split buttons / action menu unified into
+   `bar.right_segments`), `fit_active_scroll_offset` for proper tab
+   scrolling, close-button hover state, `TabBarHitInfo` return value to
+   replace the parallel cache pipeline. ~250 LOC.
+6. **Three smoke-test paper-cuts surfaced, filed as separate issues:**
+   #176 (cmd window flashes briefly on file open — full audit attached;
+   no obvious missing `CREATE_NO_WINDOW`), #177 (diff toolbar prev/next/
+   fold buttons have a 1-cell hit zone but render with 3-cell visual
+   stride — one-line fix specified; will be obviated by v2's
+   right-segments unification), and a vague z-order issue noted but not
+   filed pending specifics from user.
 
 **Session 322 — Phase A.6b-win Win-GUI status bar via quadraui:**
 

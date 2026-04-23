@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 322 — Phase A.6b-win shipped: Win-GUI status bar via quadraui)
+> **Last updated:** 2026-04-23 (Session 322 — Phase A.6b-win shipped, Phase A.6d-win v1 in flight)
 
 ---
 
@@ -805,7 +805,8 @@ work across all three rendering backends (Direct2D, Cairo, ratatui).
 | Optional stage | Status | Adds | Linux reference | Estimated size |
 |----------------|--------|------|-----------------|----------------|
 | **A.6b-win** | ✅ Done | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines (actual: +135/-76) |
-| A.6d-win | ⬜ Next | Win-GUI `quadraui_win::draw_tab_bar` | `src/gtk/quadraui_gtk.rs::draw_tab_bar` (~340 lines) | ~400 lines |
+| **A.6d-win v1** | ✅ Done | Win-GUI `quadraui_win::draw_tab_bar` (tabs only — left side) | `src/gtk/quadraui_gtk.rs::draw_tab_bar` tabs portion (~150 of ~340 lines) | ~200 lines (actual: +133/-93) |
+| A.6d-win v2 | ⬜ Next | Right-segments unification (diff toolbar + split + action menu) + `fit_active_scroll_offset` scrolling + close-button hover + `TabBarHitInfo` return | remaining ~190 lines of GTK reference | ~250 lines |
 | A.6f-win | ⬜ Pending | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
 | A.7-win | ⬜ Pending | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
 
