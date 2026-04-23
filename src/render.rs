@@ -450,6 +450,14 @@ const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 /// `[tab0][tab1]...[tabN]  [diff_toolbar?] [split_btns?] [action_btn]`
 ///
 /// All positions are in char-cell columns relative to the tab bar left edge.
+///
+/// Per D6: layout math lives in `quadraui::TabBar::layout()`. This
+/// function builds the TabBar primitive, asks it for a layout, and
+/// converts the layout's `hit_regions` into the engine's legacy
+/// `(TabBarHitRegion, TabBarClickTarget)` shape. Until TUI / GTK /
+/// Win-GUI migrate to consume `TabBarLayout` directly, this shim
+/// is the bridge — but the layout math itself has only one
+/// source of truth now.
 pub fn compute_tab_bar_hit_regions(
     tabs: &[TabInfo],
     tab_scroll_offset: usize,
@@ -463,102 +471,85 @@ pub fn compute_tab_bar_hit_regions(
 )> {
     use crate::core::engine::{TabBarClickTarget, TabBarHitRegion};
 
-    let mut regions = Vec::new();
-
-    // ── Right-side buttons (from right edge inward) ─────────────
-
-    // Action menu button at far right
-    let action_start = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
-    regions.push((
-        TabBarHitRegion {
-            col: action_start,
-            width: TAB_ACTION_BTN_COLS,
-        },
-        TabBarClickTarget::ActionMenu,
-    ));
-
-    // Split buttons (left of action menu)
-    let split_cols = if has_split_buttons {
-        TAB_SPLIT_BOTH_COLS
+    // Synthesise a DiffToolbarData shaped to match diff_label_cols so
+    // build_tab_bar_primitive emits the right segments. The primitive's
+    // diff segments are fixed 3-cell widths each, so we just need a
+    // label whose .chars().count() + 1 (for the leading space) equals
+    // diff_label_cols.
+    let synth_diff = if has_diff_toolbar {
+        let label = if diff_label_cols > 1 {
+            // Space padding so the resulting segment width matches.
+            Some(" ".repeat((diff_label_cols - 1) as usize))
+        } else {
+            None
+        };
+        Some(DiffToolbarData {
+            change_label: label,
+            total_changes: 1,
+            unchanged_hidden: false,
+        })
     } else {
-        0
+        None
     };
-    let split_end = action_start;
-    let split_start = split_end.saturating_sub(split_cols);
-    if has_split_buttons {
-        regions.push((
-            TabBarHitRegion {
-                col: split_start,
-                width: TAB_SPLIT_BTN_COLS,
-            },
-            TabBarClickTarget::SplitRight,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: split_start + TAB_SPLIT_BTN_COLS,
-                width: TAB_SPLIT_BTN_COLS,
-            },
-            TabBarClickTarget::SplitDown,
-        ));
-    }
 
-    // Diff toolbar (left of split buttons)
-    if has_diff_toolbar {
-        let diff_total = DIFF_TOOLBAR_BTN_COLS + diff_label_cols;
-        let diff_end = split_start;
-        let diff_start = diff_end.saturating_sub(diff_total);
-        let btn_start = diff_start + diff_label_cols;
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffPrev,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start + DIFF_BTN_COLS,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffNext,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start + DIFF_BTN_COLS * 2,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffToggle,
-        ));
-    }
+    let primitive = build_tab_bar_primitive(
+        tabs,
+        has_split_buttons,
+        synth_diff.as_ref(),
+        tab_scroll_offset,
+        None,
+    );
 
-    // ── Tab slots (from left edge) ─────────────────────────────
+    // Per-tab width: name chars + TAB_CLOSE_COLS for the close-and-sep glyph.
+    // Close hit region is the trailing 2 cells (matches legacy behaviour:
+    // clicks on × or the trailing separator count as close).
+    let tab_widths: Vec<usize> = tabs
+        .iter()
+        .map(|t| t.name.chars().count() + TAB_CLOSE_COLS as usize)
+        .collect();
 
-    let mut x: u16 = 0;
-    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
-        let name_width = tab.name.chars().count() as u16;
-        let tab_width = name_width + TAB_CLOSE_COLS;
-        if x + tab_width > bar_width {
-            break; // Overflow — remaining tabs are hidden
+    let layout = primitive.layout(
+        bar_width as f32,
+        1.0,
+        0.0, // scroll arrows disabled — matches existing TUI behaviour
+        |i| {
+            quadraui::TabMeasure::new(tab_widths[i] as f32, TAB_CLOSE_COLS as f32)
+        },
+        |i| {
+            // TabBarSegment.width_cells is pre-computed by build_tab_bar_primitive
+            // in legacy char-cell units, which is exactly what we want here.
+            quadraui::SegmentMeasure::new(primitive.right_segments[i].width_cells as f32)
+        },
+    );
+
+    // Convert layout hit regions → legacy (TabBarHitRegion, TabBarClickTarget).
+    // Order preserved from the layout: close regions before tab bodies,
+    // and segments (which are disjoint from tab regions) appended at the end.
+    let mut regions = Vec::new();
+    for (rect, hit) in &layout.hit_regions {
+        let col = rect.x.round() as u16;
+        let width = rect.width.round() as u16;
+        let target = match hit {
+            quadraui::TabBarHit::Tab(i) => Some(TabBarClickTarget::Tab(*i)),
+            quadraui::TabBarHit::TabClose(i) => Some(TabBarClickTarget::CloseTab(*i)),
+            quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
+                "tab:split_right" => Some(TabBarClickTarget::SplitRight),
+                "tab:split_down" => Some(TabBarClickTarget::SplitDown),
+                "tab:diff_prev" => Some(TabBarClickTarget::DiffPrev),
+                "tab:diff_next" => Some(TabBarClickTarget::DiffNext),
+                "tab:diff_toggle" => Some(TabBarClickTarget::DiffToggle),
+                "tab:action_menu" => Some(TabBarClickTarget::ActionMenu),
+                _ => None,
+            },
+            // Scroll arrows / Empty don't exist in the legacy enum — skipped.
+            quadraui::TabBarHit::ScrollLeft
+            | quadraui::TabBarHit::ScrollRight
+            | quadraui::TabBarHit::Empty => None,
+        };
+        if let Some(t) = target {
+            regions.push((TabBarHitRegion { col, width }, t));
         }
-        // Tab body (click to switch)
-        regions.push((
-            TabBarHitRegion {
-                col: x,
-                width: name_width,
-            },
-            TabBarClickTarget::Tab(i),
-        ));
-        // Close button
-        regions.push((
-            TabBarHitRegion {
-                col: x + name_width,
-                width: TAB_CLOSE_COLS,
-            },
-            TabBarClickTarget::CloseTab(i),
-        ));
-        x += tab_width;
     }
-
     regions
 }
 
