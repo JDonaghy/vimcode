@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 322 — Phase A.6b-win + A.6d-win v1: Win-GUI status bar & tab bar via quadraui) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
+**Last updated:** Apr 23, 2026 (Session 322 — A.6b-win + A.6d-win v1 shipped; A.6d-win v2a attempted+reverted, blocked on #178) | **Tests:** 5291 total (full `cargo test --workspace --no-default-features`); vimcode 5241 + quadraui 50
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,32 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 322 (cont.) — A.6d-win v2a attempted, reverted, blocked on #178:**
+
+1. **Migration attempt** (branch `quadraui-phase-a6d-tab-bar-win-v2`,
+   commit `1c052c0`): routed Win-GUI's diff toolbar through
+   `quadraui::TabBar.right_segments`, deleted the bespoke
+   `draw_diff_toolbar_in_tab_bar`, replaced the cached-button-positions
+   pipeline with `quadraui_win::compute_diff_toolbar_positions`.
+   Originally meant to close #177 (1-cell hit zones).
+2. **Regression discovered during smoke test**: the prev/next arrow
+   glyphs render as `?` in Win-GUI. Root cause: `build_tab_bar_primitive`
+   uses Material Design Icon PUA codepoints (`U+F0143` ↑, `U+F0140` ↓,
+   `U+F0233` ≡); pre-migration code hardcoded BMP fallbacks (`U+2191`,
+   `U+2193`, `U+2261`) which Consolas can render. Win-GUI's mono
+   DirectWrite path has no font fallback configured — GTK only "works"
+   because Pango falls back to Symbols Nerd Font automatically.
+3. **Reverted, branch discarded** — never merged to develop. #177 stays
+   open. Filed #178 for the Nerd Font cross-backend design issue and
+   #179 for the related tab-bar-overflow parity gap (both backends drop
+   tabs silently when bar is too narrow).
+4. **Lesson** (broader than this stage): the quadraui crate's promise
+   is "test in one backend, ship everywhere" — but primitives that
+   emit codepoints implicitly assume a Nerd-Font-capable rendering
+   layer that not every backend provides. Future right-segment
+   migrations should wait for #178's design conversation before
+   reattempting v2.
 
 **Session 322 (cont.) — Phase A.6d-win v1 Win-GUI tab bar (tabs only):**
 

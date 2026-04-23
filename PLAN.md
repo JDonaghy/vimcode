@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 322 — Phase A.6b-win shipped, Phase A.6d-win v1 in flight)
+> **Last updated:** 2026-04-23 (Session 322 — A.6b-win + A.6d-win v1 shipped; A.6d-win v2a reverted, blocked on #178)
 
 ---
 
@@ -806,7 +806,9 @@ work across all three rendering backends (Direct2D, Cairo, ratatui).
 |----------------|--------|------|-----------------|----------------|
 | **A.6b-win** | ✅ Done | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines (actual: +135/-76) |
 | **A.6d-win v1** | ✅ Done | Win-GUI `quadraui_win::draw_tab_bar` (tabs only — left side) | `src/gtk/quadraui_gtk.rs::draw_tab_bar` tabs portion (~150 of ~340 lines) | ~200 lines (actual: +133/-93) |
-| A.6d-win v2 | ⬜ Next | Right-segments unification (diff toolbar + split + action menu) + `fit_active_scroll_offset` scrolling + close-button hover + `TabBarHitInfo` return | remaining ~190 lines of GTK reference | ~250 lines |
+| A.6d-win v2 | 🚫 Blocked | Right-segments unification (diff toolbar + split + action menu) + `fit_active_scroll_offset` scrolling + close-button hover + `TabBarHitInfo` return | remaining ~190 lines of GTK reference | ~250 lines |
+
+**A.6d-win v2 status — blocked on cross-backend Nerd Font story.** A first attempt (v2a, branch `quadraui-phase-a6d-tab-bar-win-v2`, commit `1c052c0`) migrated the diff toolbar through `quadraui::TabBar.right_segments`. It rendered correctly in measurement but the prev/next arrow glyphs (PUA codepoints `U+F0143` / `U+F0140` from `build_tab_bar_primitive`) showed as `?` in Win-GUI because the mono editor font (Consolas) doesn't have them and Win-GUI's DirectWrite path has no font fallback configured. GTK only "works" because Pango falls back to Symbols Nerd Font automatically. Branch was reverted (never merged) — see issue [#178](https://github.com/JDonaghy/vimcode/issues/178). Sibling issue [#179](https://github.com/JDonaghy/vimcode/issues/179) tracks the related tab-bar-overflow parity gap (both backends drop tabs silently). **Reattempt v2 after the design conversation in #178 lands.**
 | A.6f-win | ⬜ Pending | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
 | A.7-win | ⬜ Pending | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
 
