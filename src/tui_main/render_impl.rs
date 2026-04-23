@@ -104,6 +104,7 @@ pub(super) fn draw_frame(
     folder_picker: Option<&FolderPickerState>,
     quit_confirm: bool,
     close_tab_confirm: bool,
+    close_tab_confirm_focus: usize,
     cmd_sel: Option<(usize, usize)>,
     explorer_drop_target: Option<usize>,
     hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
@@ -758,7 +759,7 @@ pub(super) fn draw_frame(
 
     // ── Close-tab confirm overlay ──────────────────────────────────────────────
     if close_tab_confirm {
-        let (dialog, layout) = build_close_tab_dialog(area);
+        let (dialog, layout) = build_close_tab_dialog(area, close_tab_confirm_focus);
         super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
     }
 }
@@ -767,7 +768,15 @@ pub(super) fn draw_frame(
 /// Shared between the draw site (`render_window` above) and the mouse
 /// hit-test site (`mouse.rs`) so a button's visual rect and its click
 /// rect are identical by construction.
-pub(super) fn build_close_tab_dialog(area: Rect) -> (quadraui::Dialog, quadraui::DialogLayout) {
+/// Button indices in the close-tab confirm dialog. Tab / arrow keys
+/// cycle `focus_idx` through these in order.
+pub(super) const CLOSE_TAB_BTN_COUNT: usize = 3;
+
+pub(super) fn build_close_tab_dialog(
+    area: Rect,
+    focus_idx: usize,
+) -> (quadraui::Dialog, quadraui::DialogLayout) {
+    let focus = focus_idx.min(CLOSE_TAB_BTN_COUNT - 1);
     let dialog = quadraui::Dialog {
         id: quadraui::WidgetId::new("close_tab_confirm"),
         title: quadraui::StyledText::plain("Unsaved Changes"),
@@ -776,21 +785,21 @@ pub(super) fn build_close_tab_dialog(area: Rect) -> (quadraui::Dialog, quadraui:
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:save"),
                 label: "[S] Save".to_string(),
-                is_default: true,
+                is_default: focus == 0,
                 is_cancel: false,
                 tint: None,
             },
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:discard"),
                 label: "[D] Discard".to_string(),
-                is_default: false,
+                is_default: focus == 1,
                 is_cancel: false,
                 tint: None,
             },
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:cancel"),
                 label: "[Esc] Cancel".to_string(),
-                is_default: false,
+                is_default: focus == 2,
                 is_cancel: true,
                 tint: None,
             },
@@ -3928,6 +3937,7 @@ mod tests {
                     None, // folder_picker
                     false,
                     false,
+                    0,    // close_tab_confirm_focus
                     None, // cmd_sel
                     None, // explorer_drop_target
                     &mut hover_link_rects,

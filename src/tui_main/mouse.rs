@@ -29,6 +29,7 @@ pub(super) fn handle_mouse(
     folder_picker: &mut Option<FolderPickerState>,
     quit_confirm: &mut bool,
     close_tab_confirm: &mut bool,
+    close_tab_confirm_focus: &mut usize,
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
     should_quit: &mut bool,
@@ -61,7 +62,9 @@ pub(super) fn handle_mouse(
                 width: term_size.width,
                 height: term_size.height,
             };
-            let (_dialog, layout) = super::render_impl::build_close_tab_dialog(area);
+            // Focus index doesn't matter for hit-testing (button positions
+            // don't depend on which one is focused); pass 0.
+            let (_dialog, layout) = super::render_impl::build_close_tab_dialog(area, 0);
             match layout.hit_test(col as f32, row as f32) {
                 quadraui::DialogHit::Button(id) => match id.as_str() {
                     "close_tab:save" => {
@@ -2641,6 +2644,7 @@ pub(super) fn handle_mouse(
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
                                 *close_tab_confirm = true;
+                                *close_tab_confirm_focus = 0;
                             }
                             *tab_drag_start = Some((col, row));
                             if let Some(path) = engine.file_path().cloned() {
@@ -2651,6 +2655,7 @@ pub(super) fn handle_mouse(
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
                                 *close_tab_confirm = true;
+                                *close_tab_confirm_focus = 0;
                             }
                         }
                         TabBarClickTarget::ActionMenu => {
@@ -2692,6 +2697,7 @@ pub(super) fn handle_mouse(
                             engine.line_annotations.clear();
                             if engine.dirty() {
                                 *close_tab_confirm = true;
+                                *close_tab_confirm_focus = 0;
                             } else {
                                 engine.close_tab();
                             }
