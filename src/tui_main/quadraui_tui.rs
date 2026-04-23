@@ -1162,6 +1162,118 @@ pub(super) fn draw_tab_bar(
 /// Keyboard-selected items get a full-row selection-bg fill; active
 /// items get a left-edge accent bar (unless keyboard-selected, where
 /// the selection bg takes precedence).
+/// Draw a `quadraui::ContextMenu` popup via its D6 `ContextMenuLayout`.
+/// Matches the pre-migration chrome: thin box border, selected item
+/// rendered inverted, separators as a horizontal dash line, disabled
+/// items dimmed. Shortcut (from item.detail) is right-aligned.
+pub(super) fn draw_context_menu(
+    buf: &mut Buffer,
+    menu: &quadraui::ContextMenu,
+    layout: &quadraui::ContextMenuLayout,
+    theme: &Theme,
+) {
+    let bg = rc(theme.tab_bar_bg);
+    let fg = rc(theme.foreground);
+    let sep_fg = rc(theme.line_number_fg);
+    let dim_fg = rc(theme.line_number_fg);
+
+    // layout.bounds is the INNER items region; the border is chrome
+    // drawn one cell outside on every side.
+    let inner_x = layout.bounds.x.round() as u16;
+    let inner_y = layout.bounds.y.round() as u16;
+    let inner_w = layout.bounds.width.round() as u16;
+    let inner_h = layout.bounds.height.round() as u16;
+    if inner_w == 0 || inner_h == 0 {
+        return;
+    }
+    let bx = inner_x.saturating_sub(1);
+    let by = inner_y.saturating_sub(1);
+    let bw = inner_w + 2;
+    let bh = inner_h + 2;
+
+    // Draw the border box.
+    for dy in 0..bh {
+        for dx in 0..bw {
+            let cx = bx + dx;
+            let cy = by + dy;
+            let ch = if dy == 0 {
+                if dx == 0 {
+                    '┌'
+                } else if dx == bw - 1 {
+                    '┐'
+                } else {
+                    '─'
+                }
+            } else if dy == bh - 1 {
+                if dx == 0 {
+                    '└'
+                } else if dx == bw - 1 {
+                    '┘'
+                } else {
+                    '─'
+                }
+            } else if dx == 0 || dx == bw - 1 {
+                '│'
+            } else {
+                ' '
+            };
+            set_cell(buf, cx, cy, ch, fg, bg);
+        }
+    }
+
+    // Draw items. layout.visible_items includes both actions and separators.
+    for vis in &layout.visible_items {
+        let item = &menu.items[vis.item_idx];
+        let row_y = vis.bounds.y.round() as u16;
+        if vis.is_separator {
+            // Horizontal dash across the inner width.
+            for dx in 0..inner_w {
+                set_cell(buf, inner_x + dx, row_y, '─', sep_fg, bg);
+            }
+            continue;
+        }
+        let is_selected = vis.item_idx == menu.selected_idx;
+        let (item_fg, item_bg) = if is_selected && vis.clickable {
+            (bg, fg) // inverted
+        } else if !vis.clickable {
+            (dim_fg, bg)
+        } else {
+            (fg, bg)
+        };
+        // Fill row bg across inner_w.
+        for dx in 0..inner_w {
+            set_cell(buf, inner_x + dx, row_y, ' ', item_fg, item_bg);
+        }
+        // Label at col +1 (small inset from border).
+        let label = item.label.spans.first().map(|s| s.text.as_str()).unwrap_or("");
+        for (i, ch) in label.chars().enumerate() {
+            let col = inner_x + 1 + i as u16;
+            if col >= inner_x + inner_w {
+                break;
+            }
+            set_cell(buf, col, row_y, ch, item_fg, item_bg);
+        }
+        // Shortcut right-aligned (from item.detail).
+        if let Some(ref det) = item.detail {
+            let shortcut = det.spans.first().map(|s| s.text.as_str()).unwrap_or("");
+            let sc_w = shortcut.chars().count() as u16;
+            let sc_start = inner_x + inner_w.saturating_sub(sc_w + 1);
+            let sc_fg = if is_selected && vis.clickable {
+                item_fg
+            } else {
+                dim_fg
+            };
+            for (i, ch) in shortcut.chars().enumerate() {
+                let col = sc_start + i as u16;
+                if col >= inner_x + inner_w {
+                    break;
+                }
+                set_cell(buf, col, row_y, ch, sc_fg, item_bg);
+            }
+        }
+    }
+}
+
 /// Draw a `quadraui::Completions` popup via its D6 `CompletionsLayout`.
 /// Thin vertical list with side borders, matching the pre-migration
 /// `render_completion_popup` chrome.

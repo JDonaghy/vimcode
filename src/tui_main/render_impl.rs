@@ -692,7 +692,38 @@ pub(super) fn draw_frame(
 
     // ── Context menu popup (above status/command line) ─────────────────────
     if let Some(ref ctx_menu) = screen.context_menu {
-        render_context_menu(frame.buffer_mut(), area, ctx_menu, theme);
+        // Per D6: build quadraui::ContextMenu, ask for layout, rasterise.
+        // The layout describes the INNER items region; the rasteriser
+        // draws a 1-cell box border around it, so we inset the anchor
+        // by (1, 1) and shrink the menu_width by 2.
+        let menu = render::context_menu_panel_to_quadraui_context_menu(ctx_menu);
+        // Shrink the viewport by 1 on each side so layout clamping
+        // accounts for the 1-cell border chrome the rasteriser draws
+        // outside layout.bounds — otherwise the right/bottom border
+        // can extend past the screen on narrow windows.
+        let inner_viewport = quadraui::Rect::new(
+            (area.x + 1) as f32,
+            (area.y + 1) as f32,
+            area.width.saturating_sub(2) as f32,
+            area.height.saturating_sub(2) as f32,
+        );
+        let max_label = ctx_menu.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+        let max_shortcut = ctx_menu
+            .items
+            .iter()
+            .map(|i| i.shortcut.len())
+            .max()
+            .unwrap_or(0);
+        let outer_width = (max_label + max_shortcut + 6).clamp(20, 50) as f32;
+        let inner_width = (outer_width - 2.0).max(1.0);
+        let layout = menu.layout(
+            ctx_menu.screen_col as f32 + 1.0,
+            ctx_menu.screen_row as f32 + 1.0,
+            inner_viewport,
+            inner_width,
+            |_| quadraui::ContextMenuItemMeasure::new(1.0),
+        );
+        super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
     }
 
     // ── Modal dialog (highest z-order after quit confirm) ────────────────────
@@ -3441,140 +3472,6 @@ pub(super) fn render_menu_dropdown(
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────
 
-pub(super) fn render_context_menu(
-    buf: &mut ratatui::buffer::Buffer,
-    full_area: Rect,
-    data: &render::ContextMenuPanel,
-    theme: &Theme,
-) {
-    if data.items.is_empty() {
-        return;
-    }
-
-    let popup_bg = rc(theme.tab_bar_bg);
-    let popup_fg = rc(theme.foreground);
-    let sep_fg = rc(theme.line_number_fg);
-    let shortcut_fg = rc(theme.line_number_fg);
-    let disabled_fg = rc(theme.line_number_fg);
-
-    // Count visual rows: items + separator lines after items that have separator_after
-    let separator_count = data.items.iter().filter(|i| i.separator_after).count() as u16;
-    let total_rows = data.items.len() as u16 + separator_count + 2; // +2 for borders
-
-    let max_label = data.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-    let max_shortcut = data
-        .items
-        .iter()
-        .map(|i| i.shortcut.len())
-        .max()
-        .unwrap_or(0);
-    let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
-
-    // Clamp position to stay within terminal
-    let popup_x = data
-        .screen_col
-        .min(full_area.x + full_area.width.saturating_sub(popup_width));
-    let popup_y = data
-        .screen_row
-        .min(full_area.y + full_area.height.saturating_sub(total_rows));
-    let popup_height = total_rows.min(full_area.y + full_area.height - popup_y);
-
-    // Draw border + background
-    for dy in 0..popup_height {
-        for dx in 0..popup_width {
-            let x = popup_x + dx;
-            let y = popup_y + dy;
-            if x >= full_area.x + full_area.width || y >= full_area.y + full_area.height {
-                continue;
-            }
-            let ch = if dy == 0 {
-                if dx == 0 {
-                    '\u{250c}'
-                } else if dx == popup_width - 1 {
-                    '\u{2510}'
-                } else {
-                    '\u{2500}'
-                }
-            } else if dy == popup_height - 1 {
-                if dx == 0 {
-                    '\u{2514}'
-                } else if dx == popup_width - 1 {
-                    '\u{2518}'
-                } else {
-                    '\u{2500}'
-                }
-            } else if dx == 0 || dx == popup_width - 1 {
-                '\u{2502}'
-            } else {
-                ' '
-            };
-            set_cell(buf, x, y, ch, popup_fg, popup_bg);
-        }
-    }
-
-    // Draw items
-    let mut row: u16 = popup_y + 1;
-    for (item_idx, item) in data.items.iter().enumerate() {
-        if row >= popup_y + popup_height - 1 {
-            break;
-        }
-        let is_selected = item_idx == data.selected_idx;
-        let (item_fg, item_bg) = if is_selected && item.enabled {
-            (popup_bg, popup_fg) // invert for selected row
-        } else if !item.enabled {
-            (disabled_fg, popup_bg)
-        } else {
-            (popup_fg, popup_bg)
-        };
-
-        // Fill row background
-        if is_selected && item.enabled {
-            for dx in 1..popup_width - 1 {
-                let x = popup_x + dx;
-                if x < full_area.x + full_area.width {
-                    set_cell(buf, x, row, ' ', item_fg, item_bg);
-                }
-            }
-        }
-        // Label
-        let label_x = popup_x + 2;
-        for (i, ch) in item.label.chars().enumerate() {
-            let x = label_x + i as u16;
-            if x >= popup_x + popup_width - 1 {
-                break;
-            }
-            set_cell(buf, x, row, ch, item_fg, item_bg);
-        }
-        // Right-aligned shortcut
-        if !item.shortcut.is_empty() {
-            let sc_fg = if is_selected && item.enabled {
-                item_fg
-            } else {
-                shortcut_fg
-            };
-            let sc_len = item.shortcut.len() as u16;
-            let sc_x = popup_x + popup_width - 1 - sc_len - 1;
-            for (i, ch) in item.shortcut.chars().enumerate() {
-                let x = sc_x + i as u16;
-                if x < full_area.x + full_area.width {
-                    set_cell(buf, x, row, ch, sc_fg, item_bg);
-                }
-            }
-        }
-        row += 1;
-
-        // Draw separator after this item if needed
-        if item.separator_after && row < popup_y + popup_height - 1 {
-            for dx in 1..popup_width - 1 {
-                let x = popup_x + dx;
-                if x < full_area.x + full_area.width {
-                    set_cell(buf, x, row, '\u{2500}', sep_fg, popup_bg);
-                }
-            }
-            row += 1;
-        }
-    }
-}
 
 // ─── Debug toolbar rendering ────────────────────────────────────────────────────────────
 

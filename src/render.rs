@@ -2697,6 +2697,55 @@ pub struct ContextMenuRenderItem {
     pub enabled: bool,
 }
 
+/// Convert a render-side `ContextMenuPanel` into a `quadraui::ContextMenu`
+/// for D6 rasterisation. `separator_after` on an item becomes a separator
+/// row (`id: None`) inserted immediately after that item in the
+/// quadraui items list. Item ids are synthesised as `context:N` where
+/// N is the original engine-side item index.
+///
+/// `selected_idx` is translated from engine-index (0..panel.items.len())
+/// to quadraui-index (which includes separator rows) so the selection
+/// highlight lines up visually when separators appear before the
+/// selected item.
+pub fn context_menu_panel_to_quadraui_context_menu(
+    panel: &ContextMenuPanel,
+) -> quadraui::ContextMenu {
+    let mut items: Vec<quadraui::ContextMenuItem> = Vec::new();
+    // engine_to_quadraui[engine_idx] = quadraui index of the same item.
+    let mut engine_to_quadraui: Vec<usize> = Vec::with_capacity(panel.items.len());
+    for (i, item) in panel.items.iter().enumerate() {
+        engine_to_quadraui.push(items.len());
+        items.push(quadraui::ContextMenuItem {
+            id: Some(quadraui::WidgetId::new(format!("context:{i}"))),
+            label: quadraui::StyledText::plain(item.label.clone()),
+            detail: if item.shortcut.is_empty() {
+                None
+            } else {
+                Some(quadraui::StyledText::plain(item.shortcut.clone()))
+            },
+            disabled: !item.enabled,
+        });
+        if item.separator_after {
+            items.push(quadraui::ContextMenuItem {
+                id: None,
+                label: quadraui::StyledText::default(),
+                detail: None,
+                disabled: false,
+            });
+        }
+    }
+    let selected_idx = engine_to_quadraui
+        .get(panel.selected_idx)
+        .copied()
+        .unwrap_or(0);
+    quadraui::ContextMenu {
+        id: quadraui::WidgetId::new("context_menu"),
+        items,
+        selected_idx,
+        bg: None,
+    }
+}
+
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {
