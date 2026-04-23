@@ -512,9 +512,7 @@ pub fn compute_tab_bar_hit_regions(
         bar_width as f32,
         1.0,
         0.0, // scroll arrows disabled — matches existing TUI behaviour
-        |i| {
-            quadraui::TabMeasure::new(tab_widths[i] as f32, TAB_CLOSE_COLS as f32)
-        },
+        |i| quadraui::TabMeasure::new(tab_widths[i] as f32, TAB_CLOSE_COLS as f32),
         |i| {
             // TabBarSegment.width_cells is pre-computed by build_tab_bar_primitive
             // in legacy char-cell units, which is exactly what we want here.
