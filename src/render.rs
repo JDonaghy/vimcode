@@ -729,6 +729,34 @@ pub struct CompletionMenu {
     pub max_width: usize,
 }
 
+/// Convert a render-side `CompletionMenu` into a `quadraui::Completions`
+/// for backend rasterisation via the D6 layout pipeline.
+///
+/// vimcode's completion menu is string-only at this stage — no LSP
+/// `CompletionKind` metadata — so every item ships as
+/// `CompletionKind::Text`. A richer adapter lands when LSP
+/// `CompletionItemKind` threads through the engine.
+pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadraui::Completions {
+    let items = menu
+        .candidates
+        .iter()
+        .map(|c| quadraui::CompletionItem {
+            label: quadraui::StyledText::plain(c.clone()),
+            detail: None,
+            documentation: None,
+            kind: quadraui::CompletionKind::Text,
+            icon: None,
+        })
+        .collect();
+    quadraui::Completions {
+        id: quadraui::WidgetId::new("completions"),
+        items,
+        selected_idx: menu.selected_idx,
+        scroll_offset: 0,
+        has_focus: true,
+    }
+}
+
 // ─── HoverPopup ──────────────────────────────────────────────────────────────
 
 /// Data needed to render the LSP hover popup.

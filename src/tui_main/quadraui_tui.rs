@@ -1162,6 +1162,54 @@ pub(super) fn draw_tab_bar(
 /// Keyboard-selected items get a full-row selection-bg fill; active
 /// items get a left-edge accent bar (unless keyboard-selected, where
 /// the selection bg takes precedence).
+/// Draw a `quadraui::Completions` popup via its D6 `CompletionsLayout`.
+/// Thin vertical list with side borders, matching the pre-migration
+/// `render_completion_popup` chrome.
+pub(super) fn draw_completions(
+    buf: &mut Buffer,
+    completions: &quadraui::Completions,
+    layout: &quadraui::CompletionsLayout,
+    theme: &Theme,
+) {
+    let bg = rc(theme.completion_bg);
+    let sel_bg = rc(theme.completion_selected_bg);
+    let fg = rc(theme.completion_fg);
+    let border = rc(theme.completion_border);
+
+    let x = layout.bounds.x.round() as u16;
+    let y = layout.bounds.y.round() as u16;
+    let w = layout.bounds.width.round() as u16;
+    if w < 3 {
+        return;
+    }
+
+    for vis in &layout.visible_items {
+        let item = &completions.items[vis.item_idx];
+        let row_y = y + (vis.bounds.y - layout.bounds.y).round() as u16;
+        let is_selected = vis.item_idx == completions.selected_idx;
+        let row_bg = if is_selected { sel_bg } else { bg };
+
+        // Fill the row background.
+        for col in 0..w {
+            set_cell(buf, x + col, row_y, ' ', fg, row_bg);
+        }
+        // Left + right borders.
+        set_cell(buf, x, row_y, '│', border, bg);
+        set_cell(buf, x + w - 1, row_y, '│', border, bg);
+
+        // Render the candidate text starting at col 2 (after border + space).
+        let label = item.label.spans.first().map(|s| s.text.as_str()).unwrap_or("");
+        let display = format!(" {label}");
+        for (j, ch) in display.chars().enumerate() {
+            let col = x + 1 + j as u16;
+            if col + 1 >= x + w {
+                break;
+            }
+            set_cell(buf, col, row_y, ch, fg, row_bg);
+        }
+    }
+}
+
 /// Draw a `quadraui::Dialog` via its D6 `DialogLayout`. Handles the
 /// rounded-border chrome the TUI has always drawn and respects
 /// horizontal vs. vertical button layout.
