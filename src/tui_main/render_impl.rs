@@ -671,7 +671,52 @@ pub(super) fn draw_frame(
 
     // ── Modal dialog (highest z-order after quit confirm) ────────────────────
     if let Some(ref dialog) = screen.dialog {
-        render_dialog_popup(frame.buffer_mut(), area, dialog, theme);
+        // Per D6: build quadraui::Dialog primitive, ask it for a layout,
+        // then hand both to the rasteriser.
+        let q_dialog = render::dialog_panel_to_quadraui_dialog(dialog);
+        let viewport = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        // Compute dimensions the same way the legacy draw did.
+        let body_max = dialog.body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let btn_max_label = dialog
+            .buttons
+            .iter()
+            .map(|(lbl, _)| lbl.chars().count() + 4)
+            .max()
+            .unwrap_or(0);
+        let btn_row_len: usize = if dialog.vertical_buttons {
+            btn_max_label + 2
+        } else {
+            dialog
+                .buttons
+                .iter()
+                .map(|(lbl, _)| lbl.chars().count() + 4)
+                .sum::<usize>()
+                + 2
+        };
+        let content_width = body_max.max(dialog.title.chars().count() + 4).max(btn_row_len);
+        let width =
+            (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
+        let measure = quadraui::DialogMeasure {
+            width,
+            title_height: 1.0,
+            body_height: dialog.body.len() as f32,
+            input_height: if dialog.input.is_some() { 2.0 } else { 0.0 },
+            button_row_height: if dialog.vertical_buttons {
+                dialog.buttons.len() as f32
+            } else {
+                1.0
+            },
+            button_width: btn_max_label as f32,
+            button_gap: 0.0,
+            padding: 1.0,
+        };
+        let layout = q_dialog.layout(viewport, measure);
+        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &q_dialog, &layout, theme);
     }
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
@@ -2346,191 +2391,6 @@ pub(super) fn render_close_tab_confirm_overlay(
             '─'
         };
         set_cell(buf, cx, bottom, ch, border_fg, bg_color);
-    }
-}
-
-pub(super) fn render_dialog_popup(
-    buf: &mut ratatui::buffer::Buffer,
-    term_area: Rect,
-    dialog: &render::DialogPanel,
-    theme: &Theme,
-) {
-    let bg = rc(theme.fuzzy_bg);
-    let fg = rc(theme.fuzzy_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    // Compute dimensions: widest line of body or title, at least 40.
-    let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
-    let btn_max_label = dialog
-        .buttons
-        .iter()
-        .map(|(lbl, _)| lbl.len() + 4)
-        .max()
-        .unwrap_or(0);
-    let btn_row_len: usize = if dialog.vertical_buttons {
-        btn_max_label + 2
-    } else {
-        dialog
-            .buttons
-            .iter()
-            .map(|(lbl, _)| lbl.len() + 4)
-            .sum::<usize>()
-            + 2
-    };
-    let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
-    let width = (content_width as u16 + 4).clamp(40, term_area.width.saturating_sub(4));
-    let has_input = dialog.input.is_some();
-    let input_rows: u16 = if has_input { 1 } else { 0 };
-    let btn_rows: u16 = if dialog.vertical_buttons {
-        dialog.buttons.len() as u16
-    } else {
-        1
-    };
-    // Height: top border + title + blank + body lines + input + blank + button rows + bottom border.
-    let height = (3 + dialog.body.len() as u16 + input_rows + 1 + btn_rows + 1)
-        .min(term_area.height.saturating_sub(4));
-
-    let x = (term_area.width.saturating_sub(width)) / 2;
-    let y = (term_area.height.saturating_sub(height)) / 2;
-
-    // Clear background.
-    for row in y..y + height {
-        for col in x..x + width {
-            if col < term_area.width && row < term_area.height {
-                set_cell(buf, col, row, ' ', fg, bg);
-            }
-        }
-    }
-
-    // Top border.
-    for col in 0..width {
-        let cx = x + col;
-        if cx < term_area.width {
-            let ch = if col == 0 {
-                '╭'
-            } else if col == width - 1 {
-                '╮'
-            } else {
-                '─'
-            };
-            set_cell(buf, cx, y, ch, border_fg, bg);
-        }
-    }
-    // Title overlay.
-    let title = format!(" {} ", dialog.title);
-    for (i, ch) in title.chars().enumerate() {
-        let cx = x + 2 + i as u16;
-        if cx + 1 < x + width && cx < term_area.width {
-            set_cell(buf, cx, y, ch, title_fg, bg);
-        }
-    }
-
-    // Left/right borders for content rows.
-    for row in (y + 1)..(y + height - 1) {
-        if row < term_area.height {
-            if x < term_area.width {
-                set_cell(buf, x, row, '│', border_fg, bg);
-            }
-            let rx = x + width - 1;
-            if rx < term_area.width {
-                set_cell(buf, rx, row, '│', border_fg, bg);
-            }
-        }
-    }
-
-    // Body lines.
-    let body_y = y + 2;
-    for (i, line) in dialog.body.iter().enumerate() {
-        let row = body_y + i as u16;
-        if row >= y + height - 2 {
-            break;
-        }
-        for (j, ch) in line.chars().enumerate() {
-            let cx = x + 2 + j as u16;
-            if cx + 1 < x + width && cx < term_area.width && row < term_area.height {
-                set_cell(buf, cx, row, ch, fg, bg);
-            }
-        }
-    }
-
-    // Input field (if present) — between body and buttons.
-    if let Some(ref input) = dialog.input {
-        let input_y = body_y + dialog.body.len() as u16 + 1;
-        if input_y < y + height - 2 && input_y < term_area.height {
-            // Draw input background.
-            let inp_bg = rc(theme.completion_bg);
-            for col_i in (x + 2)..(x + width - 1).min(term_area.width) {
-                set_cell(buf, col_i, input_y, ' ', fg, inp_bg);
-            }
-            // Draw input text.
-            let display = format!(" {}", input.display);
-            for (j, ch) in display.chars().enumerate() {
-                let cx = x + 2 + j as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, input_y, ch, fg, inp_bg);
-                }
-            }
-        }
-    }
-
-    // Buttons — vertical list or horizontal row depending on mode.
-    if dialog.vertical_buttons {
-        let btn_start_y = y + height - 1 - btn_rows;
-        for (i, (label, is_selected)) in dialog.buttons.iter().enumerate() {
-            let row = btn_start_y + i as u16;
-            if row >= y + height - 1 || row >= term_area.height {
-                break;
-            }
-            let btn_bg = if *is_selected { sel_bg } else { bg };
-            // Clear the row background for selection highlight.
-            for col_i in (x + 1)..(x + width - 1).min(term_area.width) {
-                set_cell(buf, col_i, row, ' ', fg, btn_bg);
-            }
-            let prefix = if *is_selected { "▸ " } else { "  " };
-            let btn_text = format!("{}{}", prefix, label);
-            for (j, ch) in btn_text.chars().enumerate() {
-                let cx = x + 2 + j as u16;
-                if cx + 1 < x + width && cx < term_area.width {
-                    set_cell(buf, cx, row, ch, fg, btn_bg);
-                }
-            }
-        }
-    } else {
-        let btn_y = y + height - 2;
-        if btn_y < term_area.height {
-            let mut col_offset = 2u16;
-            for (label, is_selected) in &dialog.buttons {
-                let btn_text = format!("  {}  ", label);
-                let btn_bg = if *is_selected { sel_bg } else { bg };
-                for ch in btn_text.chars() {
-                    let cx = x + col_offset;
-                    if cx + 1 < x + width && cx < term_area.width {
-                        set_cell(buf, cx, btn_y, ch, fg, btn_bg);
-                    }
-                    col_offset += 1;
-                }
-            }
-        }
-    }
-
-    // Bottom border.
-    let bottom = y + height - 1;
-    if bottom < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx < term_area.width {
-                let ch = if col == 0 {
-                    '╰'
-                } else if col == width - 1 {
-                    '╯'
-                } else {
-                    '─'
-                };
-                set_cell(buf, cx, bottom, ch, border_fg, bg);
-            }
-        }
     }
 }
 

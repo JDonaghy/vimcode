@@ -2682,6 +2682,45 @@ pub struct DialogPanel {
     pub vertical_buttons: bool,
 }
 
+/// Convert a render-side `DialogPanel` into a `quadraui::Dialog` for
+/// backend rasterisation via the D6 layout pipeline.
+///
+/// Button ids are synthesised from their index (`"dialog:btn:N"`)
+/// since `DialogPanel.buttons` doesn't carry engine-side ids —
+/// backends dispatch clicks by index via
+/// `Engine::dialog_click_button(idx)`. The `is_selected` flag on each
+/// button maps to `is_default` on the quadraui button, used by
+/// backends to style the primary / focused button.
+pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog {
+    let buttons: Vec<quadraui::DialogButton> = panel
+        .buttons
+        .iter()
+        .enumerate()
+        .map(|(i, (label, is_selected))| quadraui::DialogButton {
+            id: quadraui::WidgetId::new(format!("dialog:btn:{i}")),
+            label: label.clone(),
+            is_default: *is_selected,
+            is_cancel: false,
+            tint: None,
+        })
+        .collect();
+    quadraui::Dialog {
+        id: quadraui::WidgetId::new("dialog"),
+        title: quadraui::StyledText::plain(panel.title.clone()),
+        // Body is multi-line — join with newlines. Backends split on
+        // `\n` when rendering.
+        body: quadraui::StyledText::plain(panel.body.join("\n")),
+        buttons,
+        severity: None,
+        vertical_buttons: panel.vertical_buttons,
+        input: panel.input.as_ref().map(|inp| quadraui::DialogInput {
+            value: inp.display.clone(),
+            placeholder: String::new(),
+            cursor: None,
+        }),
+    }
+}
+
 /// Render data for a dialog text input field.
 #[derive(Debug, Clone)]
 pub struct DialogInputPanel {
