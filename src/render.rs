@@ -6105,6 +6105,7 @@ pub fn explorer_to_tree_view(
     selected: usize,
     has_focus: bool,
     engine: &Engine,
+    theme: &Theme,
 ) -> quadraui::TreeView {
     use quadraui::{
         Badge, Decoration, Icon as QIcon, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
@@ -6112,6 +6113,11 @@ pub fn explorer_to_tree_view(
     };
 
     let (git_statuses, diag_counts) = engine.explorer_indicators();
+    // #186: error/warning badges must colour-code. Git-status badges
+    // (M, A, D, ?) stay on the rasteriser's dim fallback since they're
+    // status labels rather than severity indicators.
+    let err_fg = to_quadraui_color(theme.diagnostic_error);
+    let warn_fg = to_quadraui_color(theme.diagnostic_warning);
 
     let mut out: Vec<TreeRow> = Vec::with_capacity(rows.len());
     for (row_idx, row) in rows.iter().enumerate() {
@@ -6129,17 +6135,23 @@ pub fn explorer_to_tree_view(
 
         let badge = if let Some((errors, warnings)) = diag {
             if errors > 0 {
-                Some(Badge::plain(if errors > 9 {
-                    "9+".to_string()
-                } else {
-                    errors.to_string()
-                }))
+                Some(Badge::colored(
+                    if errors > 9 {
+                        "9+".to_string()
+                    } else {
+                        errors.to_string()
+                    },
+                    err_fg,
+                ))
             } else if warnings > 0 {
-                Some(Badge::plain(if warnings > 9 {
-                    "9+".to_string()
-                } else {
-                    warnings.to_string()
-                }))
+                Some(Badge::colored(
+                    if warnings > 9 {
+                        "9+".to_string()
+                    } else {
+                        warnings.to_string()
+                    },
+                    warn_fg,
+                ))
             } else {
                 git_label.map(|label| Badge::plain(label.to_string()))
             }

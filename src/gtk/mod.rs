@@ -2167,6 +2167,7 @@ impl SimpleComponent for App {
                     state.selected,
                     has_focus,
                     &engine,
+                    &theme,
                 );
                 let sb_rect =
                     draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);

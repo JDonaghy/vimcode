@@ -12,13 +12,22 @@ use super::*;
 /// remain the responsibility of the legacy rendering path in `render_sidebar`
 /// until future primitives (`Form`, `TextInput`) or `TreeView` extensions
 /// cover them.
-pub(super) fn explorer_to_tree_view(sidebar: &TuiSidebar, engine: &Engine) -> quadraui::TreeView {
+pub(super) fn explorer_to_tree_view(
+    sidebar: &TuiSidebar,
+    engine: &Engine,
+    theme: &Theme,
+) -> quadraui::TreeView {
     use quadraui::{
         Badge, Decoration, Icon as QIcon, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
         WidgetId,
     };
 
     let (git_statuses, diag_counts) = engine.explorer_indicators();
+    // #186: colour-code diagnostic badges (errors red, warnings yellow).
+    // Git-status letter badges (M/A/D/?) stay on the rasteriser's dim
+    // fallback — they're status labels, not severity indicators.
+    let err_fg = render::to_quadraui_color(theme.diagnostic_error);
+    let warn_fg = render::to_quadraui_color(theme.diagnostic_warning);
 
     let mut rows: Vec<TreeRow> = Vec::with_capacity(sidebar.rows.len());
     for (row_idx, row) in sidebar.rows.iter().enumerate() {
@@ -41,17 +50,23 @@ pub(super) fn explorer_to_tree_view(sidebar: &TuiSidebar, engine: &Engine) -> qu
         // follow-up when the primitive gains that capability.)
         let badge = if let Some((errors, warnings)) = diag {
             if errors > 0 {
-                Some(Badge::plain(if errors > 9 {
-                    "9+".to_string()
-                } else {
-                    errors.to_string()
-                }))
+                Some(Badge::colored(
+                    if errors > 9 {
+                        "9+".to_string()
+                    } else {
+                        errors.to_string()
+                    },
+                    err_fg,
+                ))
             } else if warnings > 0 {
-                Some(Badge::plain(if warnings > 9 {
-                    "9+".to_string()
-                } else {
-                    warnings.to_string()
-                }))
+                Some(Badge::colored(
+                    if warnings > 9 {
+                        "9+".to_string()
+                    } else {
+                        warnings.to_string()
+                    },
+                    warn_fg,
+                ))
             } else {
                 git_label.map(|label| Badge::plain(label.to_string()))
             }
@@ -312,7 +327,7 @@ pub(super) fn render_sidebar(
     // input UI on specific rows.
     let has_special_mode = engine.explorer_rename.is_some() || engine.explorer_new_entry.is_some();
     if !has_special_mode {
-        let tree = explorer_to_tree_view(sidebar, engine);
+        let tree = explorer_to_tree_view(sidebar, engine, theme);
         let tree_area = Rect {
             x: area.x,
             y: area.y,
