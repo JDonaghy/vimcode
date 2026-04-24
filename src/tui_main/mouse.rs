@@ -2410,10 +2410,16 @@ pub(super) fn handle_mouse(
                 // Sections area — map to flat index.
                 // sc_visual_row_to_flat expects: 0=header,1=commit,2=buttons,3+=sections.
                 let adjusted = sidebar_row - section_start + 3;
-                // TUI shows a "(no changes)" hint for expanded-but-empty sections
-                // (extra visual row with no flat-index entry), so empty_section_hint = true.
+                // The SC panel stopped rendering a "(no changes)" placeholder
+                // row for expanded-but-empty sections when the section
+                // rendering migrated to the TreeView primitive (see the
+                // NOTE in `render::source_control_to_tree_view`). Pass
+                // `empty_section_hint: false` so the click math matches
+                // the actual render — otherwise every row after an
+                // expanded-but-empty section is off by +1 and clicking
+                // any row highlights the one above it (#184).
                 if let Some((flat_idx, is_header)) =
-                    engine.sc_visual_row_to_flat(adjusted as usize, true)
+                    engine.sc_visual_row_to_flat(adjusted as usize, false)
                 {
                     engine.sc_selected = flat_idx;
                     if is_header {
