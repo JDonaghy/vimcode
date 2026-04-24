@@ -27,6 +27,30 @@ quadraui out for reuse (Postman-class app #169, k8s dashboard #145,
 SQL client #46) — follows naturally once vimcode is landed cleanly
 on top of it.
 
+**Longer-horizon vision: vim-motion tool suite.** Once quadraui is
+proven out and vimcode is solidly on top of it, the natural extension
+is a **family of developer tools that share vim-motion editing + LSP
+integration**. The SQL client (#46) is the first concrete instance,
+but the pattern generalises: any tool with a text-editable field
+(query editor, config editor, API request body, k8s manifest editor,
+terraform planner, etc.) should feel like vim to someone who wants
+it to. Architecturally this means:
+
+- `vimcode-core` (Buffer + View + Engine modes + motion handlers +
+  LSP client) extracted as a reusable library dependency
+- Each app (SQL client, API client, k8s dashboard, …) reuses
+  vimcode-core for its editable text regions and quadraui for
+  everything else
+- Shared modal-editing identity across the suite — learn once, use
+  everywhere
+
+This is explicitly **not a priority before B.5 (GTK rewrite)**; it's
+captured here so the longer-term "why" stays in front of anyone
+making scope decisions during the rewrites. When trade-offs appear
+between "optimise for vimcode-the-editor" and "keep vimcode-core
+extractable as a library," lean toward extractability — that's
+where the compounding value is.
+
 **State of the backends going in:** TUI is the most complete and
 usable today; GTK and Win-GUI are full of bugs accumulated from the
 coexistence-era band-aid cycle. All three get rebuilt on quadraui
