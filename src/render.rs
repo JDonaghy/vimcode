@@ -591,6 +591,80 @@ pub struct BreadcrumbBar {
     pub bounds: WindowRect,
 }
 
+/// Convert a slice of `BreadcrumbSegment` plus the focus state into a
+/// `quadraui::StatusBar` whose left segments alternate clickable
+/// labels with non-clickable `" › "` separators. The leading 1-cell
+/// pad matches the legacy renderer.
+///
+/// Each clickable label segment carries `action_id = "bc:N"` where N
+/// is the engine-side segment index — paired with
+/// [`breadcrumb_action_index`] for click resolution. The last segment
+/// uses `breadcrumb_active_fg`; other segments use `breadcrumb_fg`.
+/// When `focus_active && i == focus_selected`, the focused segment
+/// inverts (bg = `breadcrumb_active_fg`, fg = `breadcrumb_bg`) — same
+/// visual as the legacy renderer.
+pub fn breadcrumbs_to_quadraui_status_bar(
+    segments: &[BreadcrumbSegment],
+    theme: &Theme,
+    focus_active: bool,
+    focus_selected: usize,
+) -> quadraui::StatusBar {
+    let bg = to_quadraui_color(theme.breadcrumb_bg);
+    let normal_fg = to_quadraui_color(theme.breadcrumb_fg);
+    let active_fg = to_quadraui_color(theme.breadcrumb_active_fg);
+
+    let mut left: Vec<quadraui::StatusBarSegment> = Vec::new();
+
+    // 1-cell leading pad so the first label doesn't touch the left edge.
+    left.push(quadraui::StatusBarSegment {
+        text: " ".to_string(),
+        fg: normal_fg,
+        bg,
+        bold: false,
+        action_id: None,
+    });
+
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            left.push(quadraui::StatusBarSegment {
+                text: " \u{203A} ".to_string(),
+                fg: normal_fg,
+                bg,
+                bold: false,
+                action_id: None,
+            });
+        }
+        let is_focused = focus_active && i == focus_selected;
+        let (fg, seg_bg) = if is_focused {
+            (bg, active_fg)
+        } else if seg.is_last {
+            (active_fg, bg)
+        } else {
+            (normal_fg, bg)
+        };
+        left.push(quadraui::StatusBarSegment {
+            text: seg.label.clone(),
+            fg,
+            bg: seg_bg,
+            bold: false,
+            action_id: Some(quadraui::WidgetId::new(format!("bc:{i}"))),
+        });
+    }
+
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("breadcrumbs"),
+        left_segments: left,
+        right_segments: Vec::new(),
+    }
+}
+
+/// Resolve a `WidgetId` produced by `breadcrumbs_to_quadraui_status_bar`
+/// back to a `BreadcrumbSegment` index. Returns `None` if the id
+/// doesn't match the `bc:N` pattern.
+pub fn breadcrumb_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+    id.as_str().strip_prefix("bc:")?.parse().ok()
+}
+
 /// Present when the editor area is split into two or more independent groups.
 /// `ScreenLayout.tab_bar` always contains the first group's tab bar for
 /// backward compat in single-group mode.

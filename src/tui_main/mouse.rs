@@ -2655,18 +2655,22 @@ pub(super) fn handle_mouse(
                     if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                         return sidebar_width; // consume non-click events on breadcrumb row
                     }
-                    let local_col = (col - bc_x) as usize;
-                    let sep_len = 3; // " › "
-                    let mut x = 1usize; // match left padding in renderer
-                    engine.rebuild_breadcrumb_segments();
-                    for (i, seg) in bc.segments.iter().enumerate() {
-                        let label_len = seg.label.chars().count();
-                        if local_col >= x && local_col < x + label_len {
-                            engine.breadcrumb_selected = i;
+                    // Theme only feeds segment fg/bg here, which resolve_click
+                    // ignores — onedark stand-in is fine for hit-test only.
+                    let theme = Theme::onedark();
+                    let bar = render::breadcrumbs_to_quadraui_status_bar(
+                        &bc.segments,
+                        &theme,
+                        engine.breadcrumb_focus,
+                        engine.breadcrumb_selected,
+                    );
+                    let local_col = col - bc_x;
+                    if let Some(id) = bar.resolve_click(local_col, bc_w as usize) {
+                        if let Some(idx) = render::breadcrumb_action_index(&id) {
+                            engine.rebuild_breadcrumb_segments();
+                            engine.breadcrumb_selected = idx;
                             engine.breadcrumb_open_scoped();
-                            return sidebar_width;
                         }
-                        x += label_len + sep_len;
                     }
                     return sidebar_width;
                 }

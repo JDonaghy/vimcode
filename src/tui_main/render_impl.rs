@@ -327,7 +327,7 @@ pub(super) fn draw_frame(
                     width: bc_w,
                     height: 1,
                 };
-                render_breadcrumb_bar(
+                draw_breadcrumb_bar(
                     frame.buffer_mut(),
                     bc_rect,
                     &bc.segments,
@@ -388,7 +388,7 @@ pub(super) fn draw_frame(
                     width: editor_area.width,
                     height: 1,
                 };
-                render_breadcrumb_bar(
+                draw_breadcrumb_bar(
                     frame.buffer_mut(),
                     bc_rect,
                     &bc.segments,
@@ -1520,7 +1520,8 @@ pub(super) fn render_tab_bar(
     super::quadraui_tui::draw_tab_bar(buf, area, &bar, &layout, theme)
 }
 
-pub(super) fn render_breadcrumb_bar(
+/// Draw the breadcrumb bar via the D6 StatusBar pipeline.
+pub(super) fn draw_breadcrumb_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     segments: &[render::BreadcrumbSegment],
@@ -1528,46 +1529,15 @@ pub(super) fn render_breadcrumb_bar(
     focus_active: bool,
     focus_selected: usize,
 ) {
-    let bg = rc(theme.breadcrumb_bg);
-    let sel_bg = rc(theme.breadcrumb_active_fg);
-    // Fill the row with breadcrumb bg
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', bg, bg);
-    }
-
-    let separator = " \u{203A} "; // " › "
-    let mut x = area.x + 1; // small left padding
-
-    for (i, seg) in segments.iter().enumerate() {
-        // Separator before all but the first
-        if x > area.x + 2 {
-            let sep_fg = rc(theme.breadcrumb_fg);
-            for ch in separator.chars() {
-                if x >= area.x + area.width {
-                    return;
-                }
-                set_cell(buf, x, area.y, ch, sep_fg, bg);
-                x += 1;
-            }
-        }
-
-        // Segment label — highlight selected segment in focus mode
-        let is_focused = focus_active && i == focus_selected;
-        let (fg, segment_bg) = if is_focused {
-            (rc(theme.breadcrumb_bg), sel_bg)
-        } else if seg.is_last {
-            (rc(theme.breadcrumb_active_fg), bg)
-        } else {
-            (rc(theme.breadcrumb_fg), bg)
-        };
-        for ch in seg.label.chars() {
-            if x >= area.x + area.width {
-                return;
-            }
-            set_cell(buf, x, area.y, ch, fg, segment_bg);
-            x += 1;
-        }
-    }
+    let bar =
+        render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
+    let layout = bar.layout(
+        area.width as f32,
+        1.0,
+        0.0, // no right segments → no gap needed
+        |seg| quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32),
+    );
+    super::quadraui_tui::draw_status_bar(buf, area, &bar, &layout, theme);
 }
 
 // ─── Editor windows ───────────────────────────────────────────────────────────
