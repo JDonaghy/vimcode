@@ -1077,6 +1077,12 @@ fn event_loop(
     // still use their own `dragging_*_sb: Option<SidebarScrollDrag>`
     // locals above/below until they migrate in follow-up commits.
     let mut drag_state = quadraui::DragState::new();
+    // Phase B.4: cross-backend modal stack. Used by
+    // `dispatch_mouse_down` to decide modal-vs-base precedence.
+    // Currently only tracks the picker popup; other modals (tab
+    // switcher, dialogs, context menu) migrate as their surfaces
+    // get touched.
+    let mut modal_stack = quadraui::ModalStack::new();
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -3895,6 +3901,7 @@ fn event_loop(
                                 &mut dragging_settings_sb,
                                 &mut dragging_generic_sb,
                                 &mut drag_state,
+                                &mut modal_stack,
                                 last_layout.as_ref(),
                                 &mut last_click_time,
                                 &mut last_click_pos,
@@ -3949,6 +3956,7 @@ fn event_loop(
                     &mut dragging_settings_sb,
                     &mut dragging_generic_sb,
                     &mut drag_state,
+                    &mut modal_stack,
                     last_layout.as_ref(),
                     &mut last_click_time,
                     &mut last_click_pos,

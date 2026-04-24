@@ -22,6 +22,7 @@ pub(super) fn handle_mouse(
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     dragging_generic_sb: &mut Option<SidebarScrollDrag>,
     drag_state: &mut quadraui::DragState,
+    modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
@@ -533,72 +534,108 @@ pub(super) fn handle_mouse(
                 let visible_rows = results_end.saturating_sub(results_start) as usize;
                 let total_items = engine.picker_items.len();
 
-                // Scrollbar hit-test — flat palette and legacy single-pane
-                // pickers both render a scrollbar at `popup_w - 2` when the
-                // list overflows. Clicking the track (or the 1-column right
-                // border next to it) jumps to that row and starts a thumb
-                // drag. Including the border column avoids surprise
-                // item-selection clicks on the popup's right edge.
-                let has_scrollbar = !has_preview && total_items > visible_rows && popup_w >= 2;
-                let sb_col = popup_x + popup_w - 2;
-                if has_scrollbar
-                    && col >= sb_col
-                    && col < popup_x + popup_w
-                    && row >= results_start
-                    && row < results_end
-                    && visible_rows > 0
-                {
-                    let rel = (row - results_start) as f64;
-                    let ratio = rel / visible_rows as f64;
-                    let max_scroll = total_items.saturating_sub(visible_rows);
-                    let new_top = (ratio * max_scroll as f64).round() as usize;
-                    engine.picker_scroll_top = new_top;
-                    // Nudge selection into the new viewport so the renderer's
-                    // selection-anchored clamp doesn't snap the scroll back.
-                    if engine.picker_selected < new_top {
-                        engine.picker_selected = new_top;
-                    } else if engine.picker_selected >= new_top + visible_rows {
-                        engine.picker_selected = new_top + visible_rows - 1;
+                // Phase B.4: route the click through quadraui's modal
+                // stack + dispatcher to decide in-modal vs backdrop.
+                // Same shape GTK uses (0f3e0d0 + a02eff9): push the
+                // popup's bounds, call `dispatch_mouse_down`, branch
+                // on the returned `UiEvent`s. TUI uses whole cells as
+                // the unit; GTK uses pixels; the dispatcher doesn't
+                // care — it works in whichever f32 space the backend
+                // supplies.
+                let picker_id = quadraui::WidgetId::new("picker");
+                modal_stack.push(
+                    picker_id.clone(),
+                    quadraui::Rect {
+                        x: popup_x as f32,
+                        y: popup_y as f32,
+                        width: popup_w as f32,
+                        height: popup_h as f32,
+                    },
+                );
+                let events = quadraui::dispatch_mouse_down(
+                    modal_stack,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                let mut hit_modal = false;
+                let mut dismiss_modal = false;
+                for ev in &events {
+                    match ev {
+                        quadraui::UiEvent::MouseDown {
+                            widget: Some(wid), ..
+                        } if *wid == picker_id => {
+                            hit_modal = true;
+                        }
+                        quadraui::UiEvent::Palette(
+                            _,
+                            quadraui::PaletteEvent::Closed,
+                        ) => {
+                            dismiss_modal = true;
+                        }
+                        _ => {}
                     }
-                    engine.picker_load_preview();
-                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new("picker"),
-                        track_start: results_start as f32,
-                        track_length: visible_rows as f32,
-                        visible_rows,
-                        total_items,
-                    });
-                    return sidebar_width;
                 }
 
-                if col >= popup_x
-                    && col < popup_x + popup_w
-                    && row >= results_start
-                    && row < results_end
-                {
-                    let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
-                    if clicked_idx < engine.picker_items.len() {
-                        if engine.picker_selected == clicked_idx {
-                            // Second click on same item — toggle expand or confirm
-                            let in_tree_mode = engine.picker_source
-                                == crate::core::engine::PickerSource::CommandCenter
-                                && engine.picker_query == "@";
-                            if in_tree_mode && engine.picker_toggle_expand() {
-                                engine.picker_load_preview();
+                if hit_modal {
+                    // Click inside popup — inner hit-test (scrollbar,
+                    // then result row) drives what the click does.
+                    let has_scrollbar =
+                        !has_preview && total_items > visible_rows && popup_w >= 2;
+                    let sb_col = popup_x + popup_w - 2;
+                    let on_scrollbar = has_scrollbar
+                        && col >= sb_col
+                        && col < popup_x + popup_w
+                        && row >= results_start
+                        && row < results_end
+                        && visible_rows > 0;
+
+                    if on_scrollbar {
+                        let rel = (row - results_start) as f64;
+                        let ratio = rel / visible_rows as f64;
+                        let max_scroll = total_items.saturating_sub(visible_rows);
+                        let new_top = (ratio * max_scroll as f64).round() as usize;
+                        engine.picker_scroll_top = new_top;
+                        if engine.picker_selected < new_top {
+                            engine.picker_selected = new_top;
+                        } else if engine.picker_selected >= new_top + visible_rows {
+                            engine.picker_selected = new_top + visible_rows - 1;
+                        }
+                        engine.picker_load_preview();
+                        drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                            widget: picker_id.clone(),
+                            track_start: results_start as f32,
+                            track_length: visible_rows as f32,
+                            visible_rows,
+                            total_items,
+                        });
+                    } else if row >= results_start && row < results_end {
+                        let clicked_idx =
+                            engine.picker_scroll_top + (row - results_start) as usize;
+                        if clicked_idx < engine.picker_items.len() {
+                            if engine.picker_selected == clicked_idx {
+                                // Second click on same item — toggle expand or confirm
+                                let in_tree_mode = engine.picker_source
+                                    == crate::core::engine::PickerSource::CommandCenter
+                                    && engine.picker_query == "@";
+                                if in_tree_mode && engine.picker_toggle_expand() {
+                                    engine.picker_load_preview();
+                                } else {
+                                    engine.picker_confirm();
+                                }
                             } else {
-                                engine.picker_confirm();
+                                engine.picker_selected = clicked_idx;
+                                engine.picker_load_preview();
                             }
-                        } else {
-                            engine.picker_selected = clicked_idx;
-                            engine.picker_load_preview();
                         }
                     }
-                } else if col < popup_x
-                    || col >= popup_x + popup_w
-                    || row < popup_y
-                    || row >= popup_y + popup_h
-                {
+                }
+                if dismiss_modal {
                     engine.close_picker();
+                    modal_stack.pop(&picker_id);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
@@ -668,6 +705,12 @@ pub(super) fn handle_mouse(
             _ => {} // consume all other events
         }
         return sidebar_width;
+    } else {
+        // Picker isn't open but the modal stack may carry a stale
+        // entry if the picker closed via keyboard (Esc / Enter) or
+        // programmatic close_picker() without the mouse path knowing.
+        // Keep them consistent.
+        modal_stack.pop(&quadraui::WidgetId::new("picker"));
     }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
