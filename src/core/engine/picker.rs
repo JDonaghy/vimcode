@@ -1695,7 +1695,13 @@ impl Engine {
                         EngineAction::None
                     }
                     "goto_line" => {
-                        self.message = "Use :N to go to line N".to_string();
+                        // #193: open Command mode so the user can type a
+                        // line number directly. Previously printed a
+                        // status message suggesting `:N` — unhelpful as
+                        // a first-class palette action.
+                        self.mode = Mode::Command;
+                        self.command_buffer.clear();
+                        self.command_cursor = 0;
                         EngineAction::None
                     }
                     "undo" => {
@@ -1709,7 +1715,14 @@ impl Engine {
                         EngineAction::None
                     }
                     "substitute" => {
-                        self.message = "Use :%s/old/new/g for find & replace".to_string();
+                        // #193: open the find/replace overlay directly
+                        // (same as the Ctrl+H binding) rather than
+                        // printing a tip about :%s/...
+                        self.open_find_replace();
+                        // Ensure the replace row is visible so "Find and
+                        // Replace" actually lands on a replace-capable UI
+                        // and not just the find-only overlay.
+                        self.find_replace_show_replace = true;
                         EngineAction::None
                     }
                     "jump_back" => {
