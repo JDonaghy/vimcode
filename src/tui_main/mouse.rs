@@ -1825,13 +1825,29 @@ pub(super) fn handle_mouse(
     // walk over DEBUG_BUTTONS that re-derived per-button widths and
     // separator gaps).
     if engine.debug_toolbar_visible {
-        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open {
-            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
+        // Below the debug toolbar in the v_chunks layout (see
+        // render_impl::draw_frame): sep_status, wildmenu,
+        // global_status, cmd. Quickfix and bottom_panel are ABOVE
+        // the toolbar, so they don't count here. (Legacy formula
+        // mistakenly subtracted them and missed the row entirely
+        // whenever a terminal/debug panel was open.)
+        let wildmenu_rows: u16 = if !engine.wildmenu_items.is_empty() {
+            1
         } else {
             0
         };
-        let toolbar_row = term_height.saturating_sub(3 + qf_rows + strip_rows);
+        let global_status_rows: u16 = if engine.settings.window_status_line {
+            0
+        } else {
+            1
+        };
+        let toolbar_row = term_height.saturating_sub(
+            1 // cmd
+                + global_status_rows
+                + wildmenu_rows
+                + sep_status_rows
+                + 1, // the toolbar row itself
+        );
         if row == toolbar_row && col >= editor_left {
             let toolbar = render::DebugToolbarData {
                 buttons: render::DEBUG_BUTTONS.to_vec(),
