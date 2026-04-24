@@ -5661,6 +5661,12 @@ impl App {
         }
 
         // ── Find/replace overlay click handling (using shared hit regions) ──
+        //
+        // #196: must use the SAME cell-unit layout as the renderer in
+        // `draw.rs::draw_find_replace_popup`. Pixel → cell conversion
+        // uses `char_width` + `line_height`; the popup origin is
+        // derived the same way the renderer computes it from the
+        // active editor group's bounds.
         if self.engine.borrow().find_replace_open {
             let cw = self.cached_char_width.max(1.0);
             let lh = self.cached_line_height.max(1.0);
@@ -5668,7 +5674,7 @@ impl App {
             let (hit_regions, on_panel, rel_col, rel_row) = {
                 let engine = self.engine.borrow();
 
-                // Build match_info (same logic as build_screen_layout)
+                // Build match_info (same logic as build_screen_layout).
                 let match_info = if engine.search_matches.is_empty() {
                     if engine.find_replace_query.is_empty() {
                         String::new()
@@ -5684,45 +5690,49 @@ impl App {
                     }
                 };
 
-                let panel_w = render::FR_PANEL_WIDTH;
+                let panel_w_cells = render::FR_PANEL_WIDTH;
                 let (hit_regions, _) = render::compute_find_replace_hit_regions(
-                    panel_w,
+                    panel_w_cells,
                     engine.find_replace_show_replace,
                     &match_info,
                 );
 
-                // Replicate draw.rs pixel layout for panel bounding box
-                let pad = 6.0;
-                let input_w_px = 200.0;
-                let btn_s = lh;
-                let chevron_w = 16.0;
-                let toggles_w = 3.0 * (btn_s + 4.0);
-                let info_w = 80.0;
-                let nav_w = 4.0 * (btn_s + 2.0);
-                let popup_w = chevron_w + input_w_px + pad + toggles_w + info_w + nav_w + pad;
+                // Popup bounds — mirror exactly what `draw_find_replace_popup`
+                // computes. panel_w is in cells; scale via `cw`.
+                // +2 rows in height for top/bottom border.
+                let popup_w = panel_w_cells as f64 * cw;
                 let row_count_f = if engine.find_replace_show_replace {
                     2.0
                 } else {
                     1.0
                 };
-                let popup_h = lh * row_count_f + pad * (row_count_f + 1.0);
+                let popup_h = (row_count_f + 2.0) * lh;
+                // Renderer uses the active group's bounds to compute
+                // popup_x; we don't have that here, so approximate from
+                // the DA width the same way the renderer does in the
+                // typical single-group case.
                 let popup_x = (width - popup_w - 10.0).max(0.0);
-                let popup_y = lh * 2.5 + 2.0; // approximate position
+                let popup_y = lh * 2.5 + 2.0;
 
-                let on_panel =
-                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
+                let on_panel = x >= popup_x
+                    && x < popup_x + popup_w
+                    && y >= popup_y
+                    && y < popup_y + popup_h;
 
-                // Translate pixel to panel-relative row + char column
-                let row_y = popup_y + pad;
-                let rel_row = if y >= row_y && y < row_y + lh {
-                    0u16
-                } else if y >= row_y + lh + pad && y < row_y + lh + pad + lh {
-                    1u16
+                // Content origin — 1 cell inside the borders, same as
+                // `draw_find_replace_popup`. Pixel → cell.
+                let content_x = popup_x + cw;
+                let content_y = popup_y + lh;
+                let rel_col = if x >= content_x {
+                    ((x - content_x) / cw) as u16
                 } else {
                     u16::MAX
                 };
-                let content_px = popup_x + chevron_w; // content starts after chevron
-                let rel_col = ((x - content_px) / cw).max(0.0) as u16;
+                let rel_row = if y >= content_y {
+                    ((y - content_y) / lh) as u16
+                } else {
+                    u16::MAX
+                };
 
                 (hit_regions, on_panel, rel_col, rel_row)
             };
