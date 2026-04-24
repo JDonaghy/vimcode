@@ -730,86 +730,16 @@ pub(super) fn draw_palette(
 
     layout.set_attributes(None);
 
-    // ── Title row ─────────────────────────────────────────────────────
-    let title_text = if palette.total_count > 0 {
-        format!(
-            " {}  {}/{} ",
-            palette.title,
-            palette.items.len(),
-            palette.total_count
-        )
-    } else {
-        format!(" {} ", palette.title)
-    };
-    cr.set_source_rgb(title_r, title_g, title_b);
-    layout.set_text(&title_text);
-    let (_, th) = layout.pixel_size();
-    cr.move_to(x + 8.0, y + (line_height - th as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    // ── Query row ─────────────────────────────────────────────────────
-    let query_y = y + line_height;
-    let prompt = "> ";
-    cr.set_source_rgb(query_r, query_g, query_b);
-    layout.set_text(prompt);
-    let (prompt_w, qh) = layout.pixel_size();
-    cr.move_to(x + 8.0, query_y + (line_height - qh as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    let query_text_x = x + 8.0 + prompt_w as f64;
-    layout.set_text(&palette.query);
-    let (query_w, _) = layout.pixel_size();
-    cr.move_to(query_text_x, query_y + (line_height - qh as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    // Cursor block at the byte offset `query_cursor`.
-    let cursor_prefix: &str = if palette.query_cursor >= palette.query.len() {
-        palette.query.as_str()
-    } else {
-        &palette.query[..palette.query_cursor]
-    };
-    layout.set_text(cursor_prefix);
-    let (cursor_prefix_w, _) = layout.pixel_size();
-    let cursor_x = query_text_x + cursor_prefix_w as f64;
-    let cursor_char: String = palette
-        .query
-        .get(palette.query_cursor..)
-        .and_then(|s| s.chars().next())
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| " ".to_string());
-    layout.set_text(&cursor_char);
-    let (cursor_w, _) = layout.pixel_size();
-    let cursor_w = (cursor_w as f64).max(line_height * 0.45);
-    // Fill cursor block with query_fg and re-draw the covered char in bg.
-    cr.set_source_rgb(query_r, query_g, query_b);
-    cr.rectangle(cursor_x, query_y, cursor_w, line_height);
-    cr.fill().ok();
-    if !cursor_char.trim().is_empty() {
-        cr.set_source_rgb(bg_r, bg_g, bg_b);
-        cr.move_to(cursor_x, query_y + (line_height - qh as f64) / 2.0);
-        layout.set_text(&cursor_char);
-        pangocairo::show_layout(cr, layout);
-    }
-    let _ = query_w; // currently unused; keep measurement for future right-edge clipping
-
-    // ── Separator row ─────────────────────────────────────────────────
-    let sep_y = y + 2.0 * line_height;
-    cr.set_source_rgb(border_r, border_g, border_b);
-    cr.set_line_width(1.0);
-    cr.move_to(x, sep_y);
-    cr.line_to(x + w, sep_y);
-    cr.stroke().ok();
-
-    // ── Result rows ───────────────────────────────────────────────────
-    // Leave a small inset above the popup's bottom border so neither the
-    // item-row backgrounds nor the scrollbar thumb bleed into/through the
-    // border stroke line.
+    // Items region sizing: leave room for title + query + separator at the
+    // top and a small inset above the bottom border. `Palette::layout` owns
+    // the title/query row bounds; the separator and scrollbar stay as
+    // rasteriser chrome. Snap items height to a whole multiple of
+    // line_height so the last row occupies a full cell.
     const BOTTOM_INSET: f64 = 4.0;
+    let sep_y = y + 2.0 * line_height; // rendered below
     let rows_y = sep_y + 1.0;
-    let rows_h = ((y + h) - rows_y - BOTTOM_INSET).max(0.0);
-    let visible_rows = (rows_h / line_height) as usize;
-    // Snap the usable row area to a whole number of rows so the last item
-    // always occupies a full line_height cell.
+    let rows_h_raw = ((y + h) - rows_y - BOTTOM_INSET).max(0.0);
+    let visible_rows = (rows_h_raw / line_height) as usize;
     let rows_h = visible_rows as f64 * line_height;
     let total = palette.items.len();
     let has_scrollbar = total > visible_rows;
@@ -829,24 +759,116 @@ pub(super) fn draw_palette(
         palette.scroll_offset
     };
 
+    // Per D6: let `Palette::layout` resolve the title + query bounds and
+    // the visible item window. The rasteriser then paints at the returned
+    // coordinates — no per-row y-stepping math here. We shallow-clone the
+    // palette so we can give `scroll_offset` the visibility-clamped
+    // effective value without mutating the caller's state.
+    let mut palette_local = palette.clone();
+    palette_local.scroll_offset = effective_offset;
+    let palette_layout = palette_local.layout(
+        w as f32,
+        (rows_y + rows_h - y) as f32, // title + query + separator + items region
+        line_height as f32,            // title_height
+        line_height as f32,            // query_height
+        |_| quadraui::PaletteItemMeasure::new(line_height as f32),
+    );
+
+    // ── Title row ─────────────────────────────────────────────────────
+    if let Some(title_bounds) = palette_layout.title_bounds {
+        let ty = y + title_bounds.y as f64;
+        let th_px = title_bounds.height as f64;
+        let title_text = if palette.total_count > 0 {
+            format!(
+                " {}  {}/{} ",
+                palette.title,
+                palette.items.len(),
+                palette.total_count
+            )
+        } else {
+            format!(" {} ", palette.title)
+        };
+        cr.set_source_rgb(title_r, title_g, title_b);
+        layout.set_text(&title_text);
+        let (_, text_h) = layout.pixel_size();
+        cr.move_to(x + 8.0, ty + (th_px - text_h as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    // ── Query row ─────────────────────────────────────────────────────
+    if let Some(query_bounds) = palette_layout.query_bounds {
+        let query_y = y + query_bounds.y as f64;
+        let qh_px = query_bounds.height as f64;
+        let prompt = "> ";
+        cr.set_source_rgb(query_r, query_g, query_b);
+        layout.set_text(prompt);
+        let (prompt_w, qh) = layout.pixel_size();
+        cr.move_to(x + 8.0, query_y + (qh_px - qh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+
+        let query_text_x = x + 8.0 + prompt_w as f64;
+        layout.set_text(&palette.query);
+        cr.move_to(query_text_x, query_y + (qh_px - qh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+
+        // Cursor block at the byte offset `query_cursor`.
+        let cursor_prefix: &str = if palette.query_cursor >= palette.query.len() {
+            palette.query.as_str()
+        } else {
+            &palette.query[..palette.query_cursor]
+        };
+        layout.set_text(cursor_prefix);
+        let (cursor_prefix_w, _) = layout.pixel_size();
+        let cursor_x = query_text_x + cursor_prefix_w as f64;
+        let cursor_char: String = palette
+            .query
+            .get(palette.query_cursor..)
+            .and_then(|s| s.chars().next())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".to_string());
+        layout.set_text(&cursor_char);
+        let (cursor_w, _) = layout.pixel_size();
+        let cursor_w = (cursor_w as f64).max(line_height * 0.45);
+        cr.set_source_rgb(query_r, query_g, query_b);
+        cr.rectangle(cursor_x, query_y, cursor_w, qh_px);
+        cr.fill().ok();
+        if !cursor_char.trim().is_empty() {
+            cr.set_source_rgb(bg_r, bg_g, bg_b);
+            cr.move_to(cursor_x, query_y + (qh_px - qh as f64) / 2.0);
+            layout.set_text(&cursor_char);
+            pangocairo::show_layout(cr, layout);
+        }
+    }
+
+    // ── Separator row ─────────────────────────────────────────────────
+    cr.set_source_rgb(border_r, border_g, border_b);
+    cr.set_line_width(1.0);
+    cr.move_to(x, sep_y);
+    cr.line_to(x + w, sep_y);
+    cr.stroke().ok();
+
+    // ── Result rows ───────────────────────────────────────────────────
     cr.save().ok();
     cr.rectangle(x, rows_y, content_w, rows_h);
     cr.clip();
 
-    for (vis_i, item) in palette
-        .items
-        .iter()
-        .enumerate()
-        .skip(effective_offset)
-        .take(visible_rows)
-    {
-        let row_i = vis_i - effective_offset;
-        let row_y = rows_y + row_i as f64 * line_height;
-        let is_selected = vis_i == palette.selected_idx && palette.has_focus;
+    // The primitive's item bounds sit immediately below the query
+    // region at `y + title_height + query_height`; our rasteriser
+    // reserves an extra 1px for the separator line beneath the query,
+    // so we stack items at `rows_y + i * line_height` instead of
+    // reusing `vis_item.bounds.y` directly. The primitive still
+    // decides which items are visible (via `resolved_scroll_offset`
+    // + the clipping heuristics inside `layout()`), which is the
+    // important part — row counts and indices stay authoritative.
+    for (render_i, vis_item) in palette_layout.visible_items.iter().enumerate() {
+        let item = &palette.items[vis_item.item_idx];
+        let row_y = rows_y + render_i as f64 * line_height;
+        let row_h = line_height;
+        let is_selected = vis_item.item_idx == palette.selected_idx && palette.has_focus;
 
         if is_selected {
             cr.set_source_rgb(sel_r, sel_g, sel_b);
-            cr.rectangle(x, row_y, content_w, line_height);
+            cr.rectangle(x, row_y, content_w, row_h);
             cr.fill().ok();
         }
 
@@ -900,7 +922,7 @@ pub(super) fn draw_palette(
             cr.set_source_rgb(fg_r, fg_g, fg_b);
             layout.set_text(glyph);
             let (iw, ih) = layout.pixel_size();
-            cr.move_to(cursor, row_y + (line_height - ih as f64) / 2.0);
+            cr.move_to(cursor, row_y + (row_h - ih as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
             cursor += iw as f64 + 6.0;
         }
@@ -923,7 +945,7 @@ pub(super) fn draw_palette(
         layout.set_text(&full_text);
         layout.set_attributes(Some(&attr_list));
         let (_, lh) = layout.pixel_size();
-        cr.move_to(cursor, row_y + (line_height - lh as f64) / 2.0);
+        cr.move_to(cursor, row_y + (row_h - lh as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
 
         // Detail (right-aligned, dimmed).
@@ -933,7 +955,7 @@ pub(super) fn draw_palette(
             layout.set_attributes(None);
             layout.set_text(&detail_text);
             let (_, dh) = layout.pixel_size();
-            cr.move_to(dx, row_y + (line_height - dh as f64) / 2.0);
+            cr.move_to(dx, row_y + (row_h - dh as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
         }
     }
