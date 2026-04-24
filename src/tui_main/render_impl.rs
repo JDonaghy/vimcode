@@ -535,8 +535,20 @@ pub(super) fn draw_frame(
             let win_y = editor_area.y + active_win.rect.y as u16;
             let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
             let popup_x = win_x + gutter_w;
-            let popup_y = win_y + anchor_view + 1; // below anchor line
-            render_diff_peek_popup(frame, peek, popup_x, popup_y, frame.area(), theme);
+            // anchor at the cursor's own row; placement=Bottom (with
+            // primitive fallback to Top) puts the popup just below it.
+            let popup_y = win_y + anchor_view;
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let area = frame.area();
+            let viewport = quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            );
+            let (tooltip, layout) =
+                render::diff_peek_to_quadraui_tooltip(peek, popup_x, popup_y, viewport, theme);
+            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
         }
     }
 
@@ -1558,108 +1570,6 @@ pub(super) fn render_all_windows(
         render_window(frame, win_rect, window, theme);
     }
     render_separators(frame.buffer_mut(), editor_area, windows, theme);
-}
-
-pub(super) fn render_diff_peek_popup(
-    frame: &mut ratatui::Frame,
-    peek: &render::DiffPeekPopup,
-    popup_x: u16,
-    popup_y: u16,
-    term_area: Rect,
-    theme: &Theme,
-) {
-    let action_bar_lines = 1_u16;
-    let num_lines = (peek.hunk_lines.len() as u16 + action_bar_lines).min(30);
-    if num_lines == 0 {
-        return;
-    }
-    let max_len = peek.hunk_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let width = (max_len as u16 + 4).max(20);
-
-    // Clamp to screen bounds.
-    let x = popup_x.min(term_area.width.saturating_sub(width));
-    let y = popup_y.min(term_area.height.saturating_sub(num_lines));
-
-    let bg_color = rc(theme.hover_bg);
-    let fg_color = rc(theme.hover_fg);
-    let border_color = rc(theme.hover_border);
-    let added_fg = rc(theme.git_added);
-    let deleted_fg = rc(theme.git_deleted);
-
-    let buf = frame.buffer_mut();
-
-    // Draw diff lines.
-    for (i, hline) in peek.hunk_lines.iter().enumerate().take(29) {
-        let row_y = y + i as u16;
-        if row_y >= term_area.height {
-            break;
-        }
-        // Fill background.
-        for col in 0..width {
-            let cell_x = x + col;
-            if cell_x < term_area.width {
-                let cell = &mut buf[(cell_x, row_y)];
-                cell.set_bg(bg_color);
-                let ch = if col == 0 || col == width - 1 {
-                    '│'
-                } else {
-                    ' '
-                };
-                cell.set_char(ch).set_fg(border_color);
-            }
-        }
-        // Render text.
-        let line_fg = if hline.starts_with('+') {
-            added_fg
-        } else if hline.starts_with('-') {
-            deleted_fg
-        } else {
-            fg_color
-        };
-        let display = format!(" {}", hline);
-        for (j, ch) in display.chars().enumerate() {
-            let cell_x = x + 1 + j as u16;
-            if cell_x + 1 < x + width && cell_x < term_area.width {
-                buf[(cell_x, row_y)]
-                    .set_char(ch)
-                    .set_fg(line_fg)
-                    .set_bg(bg_color);
-            }
-        }
-    }
-
-    // Action bar at bottom.
-    let action_row = y + peek.hunk_lines.len().min(29) as u16;
-    if action_row < term_area.height {
-        // Fill background.
-        for col in 0..width {
-            let cell_x = x + col;
-            if cell_x < term_area.width {
-                let cell = &mut buf[(cell_x, action_row)];
-                cell.set_bg(bg_color);
-                let ch = if col == 0 || col == width - 1 {
-                    '│'
-                } else {
-                    ' '
-                };
-                cell.set_char(ch).set_fg(border_color);
-            }
-        }
-        let labels = ["[s] Stage", "[r] Revert", "[q] Close"];
-        let mut cx = x + 2;
-        for label in &labels {
-            for ch in label.chars() {
-                if cx + 1 < x + width && cx < term_area.width {
-                    buf[(cx, action_row)]
-                        .set_char(ch)
-                        .set_fg(fg_color)
-                        .set_bg(bg_color);
-                }
-                cx += 1;
-            }
-            cx += 2; // spacing between labels
-        }
-    }
 }
 
 /// Render the unified picker popup. Supports single-pane (no preview) and

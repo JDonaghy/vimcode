@@ -865,7 +865,7 @@ pub fn hover_popup_to_quadraui_tooltip(
     let tooltip = quadraui::Tooltip {
         id: quadraui::WidgetId::new("lsp_hover"),
         text: hover.text.clone(),
-        styled: None,
+        styled_lines: None,
         placement: quadraui::TooltipPlacement::Top,
         bg: None,
         fg: None,
@@ -994,7 +994,7 @@ pub fn signature_help_to_quadraui_tooltip(
     let tooltip = quadraui::Tooltip {
         id: quadraui::WidgetId::new("lsp_signature_help"),
         text: String::new(),
-        styled: Some(quadraui::StyledText { spans }),
+        styled_lines: Some(vec![quadraui::StyledText { spans }]),
         placement: quadraui::TooltipPlacement::Top,
         bg: None,
         fg: None,
@@ -3267,6 +3267,78 @@ pub struct DiffPeekPopup {
     pub anchor_line: usize,
     /// Raw diff hunk lines (with +/-/space prefix) to display.
     pub hunk_lines: Vec<String>,
+}
+
+/// Convert a `DiffPeekPopup` into a multi-line `quadraui::Tooltip`.
+///
+/// Each diff hunk line becomes one styled row inside `styled_lines`,
+/// with per-prefix colouring: `+` lines use `theme.git_added`, `-`
+/// lines use `theme.git_deleted`, context lines use `theme.hover_fg`.
+/// A trailing action-bar row (`"[s] Stage  [r] Revert  [q] Close"`)
+/// is appended in the default fg.
+///
+/// Layout: width sized to the longest line + padding, capped at 30
+/// rows total (action bar included). Placement `Top` with fallback
+/// `Bottom`. Anchor width set to popup width so the centering math
+/// left-aligns with the cursor cell — matches the legacy popup.
+pub fn diff_peek_to_quadraui_tooltip(
+    peek: &DiffPeekPopup,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let fg = to_q_color(theme.hover_fg);
+    let added = to_q_color(theme.git_added);
+    let deleted = to_q_color(theme.git_deleted);
+
+    // Cap at 29 hunk rows so the action bar (1 row) fits inside the
+    // legacy 30-line ceiling.
+    let visible: Vec<&String> = peek.hunk_lines.iter().take(29).collect();
+    let max_len = visible.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let action_text = "[s] Stage  [r] Revert  [q] Close";
+    let max_len = max_len.max(action_text.chars().count());
+    // +4 = 1 left border + 1 left pad + 1 right pad + 1 right border.
+    let width = ((max_len + 4) as f32).max(20.0);
+
+    let mut styled_lines: Vec<quadraui::StyledText> = Vec::with_capacity(visible.len() + 1);
+    for hline in &visible {
+        let line_fg = if hline.starts_with('+') {
+            added
+        } else if hline.starts_with('-') {
+            deleted
+        } else {
+            fg
+        };
+        styled_lines.push(quadraui::StyledText {
+            spans: vec![quadraui::StyledSpan::with_fg(hline.as_str(), line_fg)],
+        });
+    }
+    // Action bar row in default fg.
+    styled_lines.push(quadraui::StyledText {
+        spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
+    });
+
+    let height = styled_lines.len() as f32;
+
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("diff_peek"),
+        text: String::new(),
+        styled_lines: Some(styled_lines),
+        // Legacy diff peek always rendered below the anchor line —
+        // mirror that with placement=Bottom (with primitive fallback
+        // to Top when there's no room below).
+        placement: quadraui::TooltipPlacement::Bottom,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so the centering math left-aligns
+    // the popup with the cursor cell (matches legacy + hover popup
+    // + sig help adapters).
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, height);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -11287,8 +11359,8 @@ mod tests {
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
         let (tooltip, layout) = hover_popup_to_quadraui_tooltip(&hover, 30, 20, viewport);
 
-        // Plain multi-line path: styled is None, text carries newlines.
-        assert!(tooltip.styled.is_none());
+        // Plain multi-line path: styled_lines is None, text carries newlines.
+        assert!(tooltip.styled_lines.is_none());
         assert!(tooltip.text.contains('\n'));
         // Placement preferred Top — layout resolves to Top because there's
         // room (anchor_y=20, height=2 → fits above).
@@ -11314,7 +11386,9 @@ mod tests {
         let (tooltip, layout) = signature_help_to_quadraui_tooltip(&sig, 40, 15, viewport, &theme);
 
         // Styled path is active.
-        let styled = tooltip.styled.as_ref().expect("styled spans");
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
         // 5 spans: leading " ", pre, active, post, trailing " ".
         assert_eq!(styled.spans.len(), 5);
         assert_eq!(styled.spans[0].text, " ");
@@ -11348,7 +11422,9 @@ mod tests {
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
         let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
 
-        let styled = tooltip.styled.as_ref().expect("styled spans");
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
         // Without active param: leading " ", full label as one span, trailing " ".
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[1].text, "fn noop()");
@@ -11407,6 +11483,53 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_peek_to_tooltip_per_line_colors_and_action_bar() {
+        let theme = Theme::onedark();
+        let peek = DiffPeekPopup {
+            anchor_line: 5,
+            hunk_lines: vec![
+                " let x = 1;".to_string(),
+                "-old line".to_string(),
+                "+new line".to_string(),
+            ],
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = diff_peek_to_quadraui_tooltip(&peek, 30, 10, viewport, &theme);
+
+        // Multi-line styled path active.
+        let lines = tooltip.styled_lines.as_ref().expect("styled_lines");
+        // 3 hunk lines + 1 action bar = 4 rows.
+        assert_eq!(lines.len(), 4);
+
+        let added = to_q_color(theme.git_added);
+        let deleted = to_q_color(theme.git_deleted);
+        let fg = to_q_color(theme.hover_fg);
+
+        // Context line: hover_fg.
+        assert_eq!(lines[0].spans[0].fg, Some(fg));
+        // Deleted line: git_deleted.
+        assert_eq!(lines[1].spans[0].fg, Some(deleted));
+        // Added line: git_added.
+        assert_eq!(lines[2].spans[0].fg, Some(added));
+        // Action bar: default fg, contains hotkey labels.
+        let action: String = lines[3].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(action.contains("[s] Stage"));
+        assert!(action.contains("[r] Revert"));
+        assert!(action.contains("[q] Close"));
+        assert_eq!(lines[3].spans[0].fg, Some(fg));
+
+        // Placement: prefers Bottom (legacy diff peek always rendered below).
+        // Anchor at y=10 with viewport height 50 → fits below → Bottom resolved.
+        assert_eq!(
+            layout.resolved_placement,
+            quadraui::ResolvedPlacement::Bottom
+        );
+        assert!(layout.bounds.y > 10.0);
+        // Multi-row height (4 rows).
+        assert_eq!(layout.bounds.height, 4.0);
+    }
+
+    #[test]
     fn test_signature_help_active_param_out_of_range_falls_back() {
         let theme = Theme::onedark();
         // active_param index points past end of params list — adapter falls
@@ -11420,7 +11543,9 @@ mod tests {
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
         let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
-        let styled = tooltip.styled.as_ref().expect("styled spans");
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
         // Fallback: 3 spans (leading-pad, whole-label, trailing-pad).
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[1].text, "fn foo(x: i32)");

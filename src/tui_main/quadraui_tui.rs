@@ -1581,20 +1581,24 @@ pub(super) fn draw_tooltip(
         }
     };
 
-    if let Some(ref styled) = tooltip.styled {
-        // Single-line styled path. Fill row 0 and render spans left-to-right.
-        paint_row_background(buf, y);
-        let mut col_off: u16 = 2; // skip border + 1 pad
-        for span in &styled.spans {
-            let span_fg = span.fg.map(qc).unwrap_or(fg);
-            let span_bg = span.bg.map(qc).unwrap_or(bg);
-            for ch in span.text.chars() {
-                let col = x + col_off;
-                if col + 1 >= x + w {
-                    return;
+    if let Some(ref styled_lines) = tooltip.styled_lines {
+        // Multi-line styled path. Each entry renders as one row of
+        // styled spans with side-bar borders + background fill.
+        for (i, styled) in styled_lines.iter().enumerate().take(h as usize) {
+            let row = y + i as u16;
+            paint_row_background(buf, row);
+            let mut col_off: u16 = 2; // skip border + 1 pad
+            for span in &styled.spans {
+                let span_fg = span.fg.map(qc).unwrap_or(fg);
+                let span_bg = span.bg.map(qc).unwrap_or(bg);
+                for ch in span.text.chars() {
+                    let col = x + col_off;
+                    if col + 1 >= x + w {
+                        break;
+                    }
+                    set_cell(buf, col, row, ch, span_fg, span_bg);
+                    col_off += 1;
                 }
-                set_cell(buf, col, y, ch, span_fg, span_bg);
-                col_off += 1;
             }
         }
         return;
