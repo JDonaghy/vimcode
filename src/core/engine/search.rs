@@ -64,24 +64,75 @@ impl Engine {
     }
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
+    ///
+    /// #185: `view.viewport_lines` is updated by the backends on the next
+    /// draw pass, but engine-side operations (e.g. `quickfix_jump`)
+    /// may call this synchronously BEFORE the next draw — at which
+    /// point the cached `viewport_lines` reflects the previous chrome
+    /// configuration. If a panel (quickfix, terminal, debug output,
+    /// wildmenu, debug toolbar) just opened, the cursor can be
+    /// positioned into what used to be the visible area but is now
+    /// hidden behind the new panel. Compute an effective viewport
+    /// that subtracts the currently-visible bottom chrome here.
+    fn effective_viewport_lines(&self) -> usize {
+        let cached = self.view().viewport_lines;
+        let bottom_chrome = self.bottom_chrome_rows_since_last_draw();
+        cached.saturating_sub(bottom_chrome)
+    }
+
+    /// Rows of bottom-of-editor chrome that may have been added since
+    /// the last draw refreshed `view.viewport_lines`. Used to keep
+    /// `ensure_cursor_visible` from scrolling the cursor into a newly
+    /// opened quickfix / terminal / wildmenu panel's area.
+    ///
+    /// Backends are the source of truth for chrome heights and
+    /// normally keep `viewport_lines` fresh — this helper is the
+    /// safety-net for the "state changed in the current tick, draw
+    /// hasn't happened yet" window.
+    fn bottom_chrome_rows_since_last_draw(&self) -> usize {
+        // Quickfix panel. Fixed 6-row height in both backends when open.
+        let qf = if self.quickfix_open && !self.quickfix_items.is_empty() {
+            6
+        } else {
+            0
+        };
+        // Terminal / bottom panel. `effective_terminal_panel_rows` +
+        // 2 (1 for the tab bar, 1 for the panel header) matches what
+        // both backends reserve.
+        let term = if self.terminal_open || self.bottom_panel_open {
+            // `0` as the `target` argument gives the current effective
+            // size — we're not in a maximize transition here, just
+            // reading the steady-state row count.
+            self.effective_terminal_panel_rows(0).saturating_add(2) as usize
+        } else {
+            0
+        };
+        // Wildmenu row (command-line Tab-complete).
+        let wildmenu = if !self.wildmenu_items.is_empty() { 1 } else { 0 };
+        // Debug toolbar row (F5 / F6 / F9 / F10 / F11 buttons).
+        let dbg = if self.debug_toolbar_visible { 1 } else { 0 };
+        qf + term + wildmenu + dbg
+    }
+
+    /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     pub fn ensure_cursor_visible(&mut self) {
         if self.settings.wrap && self.view().viewport_cols > 0 {
             self.ensure_cursor_visible_wrap();
         } else {
             let scrolloff = self.settings.scrolloff;
-            if scrolloff == 0 {
-                self.view_mut().ensure_cursor_visible();
-            } else {
-                let cursor_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines;
-                let scroll_top = self.view().scroll_top;
-                if cursor_line < scroll_top + scrolloff {
-                    self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
-                } else if viewport_lines > 0
-                    && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
-                {
-                    self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
-                }
+            let viewport_lines = self.effective_viewport_lines();
+            let cursor_line = self.view().cursor.line;
+            let scroll_top = self.view().scroll_top;
+            // Unified path: handle both scrolloff=0 and scrolloff>0 cases
+            // using the effective viewport (#185). Previously the scrolloff=0
+            // branch delegated to `view_mut().ensure_cursor_visible()` which
+            // read the stale `view.viewport_lines` directly.
+            if cursor_line < scroll_top + scrolloff {
+                self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
+            } else if viewport_lines > 0
+                && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
+            {
+                self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
             }
         }
     }
@@ -90,7 +141,9 @@ impl Engine {
     /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
         let viewport_cols = self.view().viewport_cols;
-        let viewport_lines = self.view().viewport_lines;
+        // #185: use effective viewport (accounts for bottom chrome like
+        // the quickfix panel that may have opened in the current tick).
+        let viewport_lines = self.effective_viewport_lines();
         let cursor_line = self.view().cursor.line;
         let cursor_col = self.view().cursor.col;
         let scroll_top = self.view().scroll_top;

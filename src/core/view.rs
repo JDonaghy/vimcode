@@ -136,6 +136,12 @@ impl View {
     }
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
+    ///
+    /// Production code uses `Engine::ensure_cursor_visible` instead,
+    /// which accounts for bottom-chrome rows (quickfix, terminal,
+    /// etc.) that may have opened in the current tick. This method
+    /// stays on `View` for test ergonomics.
+    #[allow(dead_code)]
     pub fn ensure_cursor_visible(&mut self) {
         if self.cursor.line < self.scroll_top {
             self.scroll_top = self.cursor.line;
