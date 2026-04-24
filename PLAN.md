@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 328 — **B.4 chrome migration substantially complete**: 22 commits on develop, every major TUI overlay rendered through quadraui primitives or shared hit-region data; tests still green; chrome-only scope wrapping up)
+> **Last updated:** 2026-04-24 (Session 329 — **Phase B.4 extends from rendering to events**: 4 GTK D6 migrations + 4 cross-backend event-routing commits; `quadraui::ModalStack` + `DragState` + `dispatch_mouse_*` now drive picker events on both GTK and TUI from a single code path)
 
 ---
 
@@ -138,6 +138,26 @@ primitives shipped with D6 `layout()` + `hit_test()`. TabBar +
 StatusBar already consume layouts in TUI as proof of the pattern.
 The remaining TUI consumer migrations are mechanical and can happen
 incrementally during the rewrite.
+
+**🎯 Phase B.4 event-routing status: PICKER SURFACE PROVEN
+(Session 329).** The first cross-platform event-routing
+infrastructure ships. `quadraui::ModalStack` + `dispatch_mouse_down`
+arbitrates modal-vs-backdrop clicks; `DragState` +
+`dispatch_mouse_drag` + `dispatch_mouse_up` handle drag translations
+to primitive-specific events (e.g. `PaletteEvent::ScrollOffsetChanged`).
+Both GTK and TUI route the picker modal's events through this
+single code path; adding a third backend means consuming the same
+dispatcher, not reimplementing it. Closes #190 (GTK palette
+scrollbar was painted but not draggable) and #192 (GTK palette
+click-drag leaked to editor). Follow-up commits extend the pattern
+off the picker onto tab switcher, sidebar scrollbars, dialogs — each
+a per-surface commit with zero quadraui changes.
+
+**🎯 GTK rendering status: FOUR PRIMITIVES ON D6 (Session 329).**
+`draw_status_bar`, `draw_list`, `draw_tree`, `draw_palette` all
+consume their respective `*Layout` structs. Proves the D6 contract
+works across char-cell (TUI) and pixel + Pango (GTK) coordinate
+systems.
 
 **🎯 Phase B.4 chrome status: SUBSTANTIALLY DONE (Session 328).**
 Every major TUI overlay now renders through a quadraui primitive or

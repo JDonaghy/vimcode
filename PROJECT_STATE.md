@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 328 — **B.4 chrome migration substantially complete**; every major TUI overlay now renders through quadraui primitives or shared hit-region data; 22 commits landed on `develop` after Session 327)
+**Last updated:** Apr 24, 2026 (Session 329 — **Phase B.4 extends from rendering to events**: 4 GTK-rendering D6 migrations + 4 cross-backend event-routing commits; GTK + TUI picker events now flow through the same quadraui code)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,134 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 329 — Phase B.4 arc extends into event routing (8 substantive commits + 1 fix + 1 doc + 5 issues filed):**
+
+Session 328 landed every major TUI overlay on quadraui *rendering*
+primitives. Session 329 opens the second half of B.4 — the *event*
+half — and proves it works. Eight substantive commits land on
+develop. Order intentional: GTK catches up on D6 rendering first so
+two backends share primitive consumption; then event routing builds
+on top of shared contracts.
+
+**GTK rendering — 4 D6 migrations (proves primitive set works across
+coordinate systems — char cells on TUI, pixels + Pango on GTK):**
+
+1. `31ebdc4` — `draw_status_bar` consumes `StatusBarLayout`. Pilot
+   commit for the GTK D6 migration wave; replaces hand-rolled
+   left-accumulate + right-fit loop with a single `bar.layout()` call.
+2. `b0215e2` — `draw_list` consumes `ListViewLayout`. Scroll
+   clamping + title-row handling now live in the primitive.
+3. `89d54ae` — `draw_tree` consumes `TreeViewLayout`. Per-row
+   heights (header `line_height` vs items `line_height * 1.4`)
+   supplied via the measurement closure.
+4. `8ccea7e` — `draw_palette` consumes `PaletteLayout`. Shallow-
+   clones the palette locally to inject the effective scroll offset
+   without mutating caller state.
+
+**Cross-backend event routing — 4 commits (the infrastructure that
+actually earns "cross-platform without knowing GTK"):**
+
+5. `a02eff9` — **B.4 event-routing pilot**. New `quadraui::ModalStack`
+   + `dispatch_mouse_down` free function. Fixes #192 (GTK palette
+   click-drag leaked to editor). Infrastructure: `Backend::modal_stack_mut()`
+   trait method (additive); `ModalEntry { id, bounds }`; `push / pop /
+   top / hit_test / iter_top_down`. 7 unit tests in `modal_stack.rs`
+   + 5 in `dispatch.rs`.
+6. `0f3e0d0` — `DragState` + `dispatch_mouse_drag` + `dispatch_mouse_up`.
+   `DragTarget::ScrollbarY` carries track geometry + visible/total
+   row counts; dispatcher does linear-interpolation math. Fixes
+   #190 (GTK palette scrollbar was painted but not draggable). 6
+   new unit tests. New `PaletteEvent::ScrollOffsetChanged { new_offset }`
+   variant.
+7. `b169ca4` — **TUI palette scrollbar drag migrated** onto the
+   same `DragState` + `dispatch_mouse_drag` code GTK uses. This is
+   the payoff commit — one quadraui code path now drives both
+   backends' scroll math, not two parallel implementations. Legacy
+   `dragging_picker_sb: Option<SidebarScrollDrag>` removed.
+8. `bad14f0` — **TUI picker modal dismiss migrated** onto
+   `ModalStack` + `dispatch_mouse_down`. Both GTK and TUI now
+   arbitrate click-inside-modal vs click-outside-to-close through
+   the same dispatcher. Completes the picker-surface
+   cross-backend story.
+
+**Pre-existing fixes surfaced during smoke testing:**
+
+- `6f26ec7` — TUI source control panel click off-by-one (#184, closed).
+  After the SC TreeView migration the renderer stopped emitting a
+  "(no changes)" placeholder row for empty expanded sections; the
+  click handler was still passing `empty_section_hint: true` and
+  every row after an expanded-but-empty section was off by +1.
+
+**Docs:**
+
+- `729c988` — `quadraui/docs/TUI_CONSUMER_TOUR.md` (Session 328
+  wrap-up). Reading guide walking through five progressive examples
+  from simplest D6 primitive (Tooltip + hover popup) through the
+  `hit_regions` escape-hatch pattern (find/replace). Intended as
+  orientation for Phase B.5+ (GTK / Win-GUI / macOS rewrites).
+
+**Issues filed during smoke testing (pre-existing bugs, not
+regressions):**
+
+- #185 — Quickfix jump scrolls cursor under the quickfix panel
+  (engine `ensure_cursor_visible` doesn't subtract qf_height).
+- #186 — Explorer diagnostic-count badges show count but lack red
+  coloring (severity fg not set in adapter).
+- #187 — GTK git panel text-clipping / chevron-overlap on Recent
+  Commits (likely `source_control_to_tree_view` indent / leaf
+  math).
+- #188 — Settings panel needs double-click to expand sections
+  (pre-existing; handler guards on n_press>=2).
+- #189 — Git panel discard leaves editor view showing stale diff
+  state (buffer not reloaded after `git checkout`).
+- #191 — GTK palette scrollwheel scrolls 1 row per event (GTK event
+  controller flags, no quadraui change needed).
+- #192 — **Closed** by `a02eff9`.
+- #193 — Palette entries like "Find and Replace" show status-message
+  placeholders instead of invoking the action.
+- #194 — Status-bar messages aren't mouse-selectable (GTK) / have
+  offset-by-sidebar-width selection bug (TUI).
+
+**Quadraui API additions during the arc:**
+
+- `ModalStack`, `ModalEntry` (new module `modal_stack.rs`)
+- `DragState`, `DragTarget` (additions to `dispatch.rs`)
+- `dispatch_mouse_down`, `dispatch_mouse_drag`, `dispatch_mouse_up`
+- `PaletteEvent::ScrollOffsetChanged { new_offset: usize }`
+- `Backend::modal_stack_mut()` trait method (additive)
+
+**Architectural framing:** the user's north-star question driving
+this session — "can a developer write a cross-platform app on
+quadraui without knowing GTK / Cocoa / crossterm?" — is now
+genuinely answered "yes, for the picker surface." The proof: the
+four event-routing commits ship a loop where identical `quadraui::
+dispatch_*` calls service two coordinate systems (char cells on TUI,
+pixels on GTK) with zero backend-specific logic in the dispatcher
+itself. Adding a third backend (Win-GUI, macOS) means holding a
+`ModalStack` + `DragState`, routing raw events through the
+dispatcher, and matching on the returned `UiEvent`s. No new math,
+no new precedence logic.
+
+**What's next:** generalize the pattern off of the picker. Each of
+these is a per-surface commit that reuses the same infrastructure
+with zero quadraui changes:
+
+- Tab switcher modal (TUI + GTK) — new modal shape (centered list,
+  no scrollbar), proves `ModalStack` extends beyond the picker.
+- Sidebar scrollbars (explorer, SC, debug, settings) — each migrates
+  from its own `SidebarScrollDrag` Option to a `DragState::ScrollbarY`.
+- Dialogs (quit confirm, close-tab confirm, etc.) — backdrop dismiss
+  via a new `ModalDismissed(WidgetId)` variant (currently
+  `PaletteEvent::Closed` is the universal dismiss event; generalize
+  when the second modal type arrives).
+
+The alternative sequence is to close out issue backlog (#185–#194)
+before expanding the event-routing surface. Either order works;
+depends on whether daily-driver quality or architectural completion
+is the higher priority.
+
+---
 
 **Session 328 — B.4 chrome migration substantially complete (22 commits on develop):**
 
