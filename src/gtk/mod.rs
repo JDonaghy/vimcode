@@ -3969,9 +3969,16 @@ impl SimpleComponent for App {
             }
             Msg::MouseScroll { delta_x, delta_y } => {
                 let mut engine = self.engine.borrow_mut();
-                // Picker open: scroll the picker results
+                // Picker open: scroll the picker results.
+                //
+                // #191: previously used `(delta_y * 3.0).round()`, which
+                // rounded small trackpad deltas (dy<0.17) down to 0 and
+                // made scrolling feel dead. `.ceil()` on the absolute
+                // value guarantees every non-zero event advances at
+                // least one row, and the `5.0` amplification is closer
+                // to native-app conventions for wheel notches.
                 if engine.picker_open && delta_y.abs() > 0.01 {
-                    let step = (delta_y * 3.0).round().abs() as usize;
+                    let step = (delta_y.abs() * 5.0).ceil() as usize;
                     let max = engine.picker_items.len().saturating_sub(1);
                     if delta_y > 0.0 {
                         engine.picker_selected = (engine.picker_selected + step).min(max);
