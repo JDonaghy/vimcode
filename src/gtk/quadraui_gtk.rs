@@ -23,9 +23,19 @@ fn qc_to_cairo(c: quadraui::Color) -> (f64, f64, f64) {
 /// Draw a `quadraui::TreeView` into `(x, y, w, h)` on `cr`, using `layout`
 /// for text measurement and `theme` for default colours.
 ///
-/// Row heights match the existing GTK SC panel: branches use `line_height`,
-/// leaves use `(line_height * 1.4).round()` (kept in sync with the click
-/// handler in `src/gtk/mod.rs` that maps mouse positions to flat indices).
+/// Per D6: `TreeView::layout()` owns the row-stacking math — this
+/// rasteriser supplies a per-row height measurer (header rows use
+/// `line_height`; everything else uses `(line_height * 1.4).round()`,
+/// matching the item-height convention shared with the mouse click
+/// handlers in `src/gtk/mod.rs`), calls `tree.layout()`, and paints
+/// the resolved `visible_rows` verbatim.
+///
+/// Row-type styling:
+/// - Header rows (SC section titles) get status-bar bg + fg, shorter height.
+/// - Selected rows get `fuzzy_selected_bg` + header fg (tall highlight).
+/// - Muted rows render dim on the default tree bg.
+/// - Other branches render like leaves so folders don't visually separate
+///   from sibling files in a recursive tree.
 ///
 /// Does not draw a scrollbar. Scrollbars are a later primitive stage.
 #[allow(clippy::too_many_arguments)]
@@ -60,24 +70,27 @@ pub(super) fn draw_tree(
 
     let item_height = (line_height * 1.4).round();
     let indent_px = (line_height * 0.9).round();
-    let mut y_off = y;
-    let y_end = y + h;
-
     let use_nerd = icons::nerd_fonts_enabled();
 
-    for row in tree.rows.iter().skip(tree.scroll_offset) {
-        if y_off >= y_end {
-            break;
-        }
+    // Resolve the layout once per frame. Header rows are shorter than
+    // item rows; the measurer returns each row's height so the
+    // primitive can stack them accurately without the rasteriser
+    // tracking its own `y_off` cursor.
+    let tree_layout = tree.layout(w as f32, h as f32, |i| {
+        let is_header = matches!(tree.rows[i].decoration, quadraui::Decoration::Header);
+        quadraui::TreeRowMeasure::new(if is_header {
+            line_height as f32
+        } else {
+            item_height as f32
+        })
+    });
 
-        let is_branch = row.is_expanded.is_some();
+    for vis_row in &tree_layout.visible_rows {
+        let row = &tree.rows[vis_row.row_idx];
+        let row_y = y + vis_row.bounds.y as f64;
+        let row_h = vis_row.bounds.height as f64;
+
         let is_header = matches!(row.decoration, quadraui::Decoration::Header);
-        // Header rows get the tall row-height used by SC section titles;
-        // regular branches (like explorer folders) and leaves use `item_height`
-        // so dirs don't jump vertically relative to siblings.
-        let row_h = if is_header { line_height } else { item_height };
-        let _ = is_branch;
-
         let is_selected =
             tree.has_focus && tree.selected_path.as_ref().is_some_and(|p| p == &row.path);
 
@@ -96,7 +109,7 @@ pub(super) fn draw_tree(
 
         // Fill row background.
         cr.set_source_rgb(row_bg.0, row_bg.1, row_bg.2);
-        cr.rectangle(x, y_off, w, row_h);
+        cr.rectangle(x, row_y, w, row_h);
         cr.fill().ok();
 
         // Leading horizontal offset: indent + chevron + icon.
@@ -113,7 +126,7 @@ pub(super) fn draw_tree(
                 cr.set_source_rgb(def_fg.0, def_fg.1, def_fg.2);
                 layout.set_text(chevron);
                 let (cw, ch) = layout.pixel_size();
-                cr.move_to(cursor_x, y_off + (row_h - ch as f64) / 2.0);
+                cr.move_to(cursor_x, row_y + (row_h - ch as f64) / 2.0);
                 pangocairo::show_layout(cr, layout);
                 cursor_x += cw as f64 + 4.0;
             }
@@ -132,7 +145,7 @@ pub(super) fn draw_tree(
             cr.set_source_rgb(def_fg.0, def_fg.1, def_fg.2);
             layout.set_text(glyph);
             let (iw, ih) = layout.pixel_size();
-            cr.move_to(cursor_x, y_off + (row_h - ih as f64) / 2.0);
+            cr.move_to(cursor_x, row_y + (row_h - ih as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
             cursor_x += iw as f64 + 6.0;
         }
@@ -172,7 +185,7 @@ pub(super) fn draw_tree(
                 cr.set_source_rgb(sbr, sbg_, sbb);
                 cr.rectangle(
                     cursor_x,
-                    y_off,
+                    row_y,
                     (sw as f64).min(text_right_limit - cursor_x),
                     row_h,
                 );
@@ -181,7 +194,7 @@ pub(super) fn draw_tree(
             cr.set_source_rgb(span_fg.0, span_fg.1, span_fg.2);
             layout.set_text(&span.text);
             let (sw, sh) = layout.pixel_size();
-            cr.move_to(cursor_x, y_off + (row_h - sh as f64) / 2.0);
+            cr.move_to(cursor_x, row_y + (row_h - sh as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
             cursor_x += sw as f64;
         }
@@ -193,18 +206,16 @@ pub(super) fn draw_tree(
                 // Paint badge background if distinct from row background.
                 if bbg != row_bg {
                     cr.set_source_rgb(bbg.0, bbg.1, bbg.2);
-                    cr.rectangle(bx - 2.0, y_off, bw + 4.0, row_h);
+                    cr.rectangle(bx - 2.0, row_y, bw + 4.0, row_h);
                     cr.fill().ok();
                 }
                 cr.set_source_rgb(bfg.0, bfg.1, bfg.2);
                 layout.set_text(&btext);
                 let (_, bh) = layout.pixel_size();
-                cr.move_to(bx, y_off + (row_h - bh as f64) / 2.0);
+                cr.move_to(bx, row_y + (row_h - bh as f64) / 2.0);
                 pangocairo::show_layout(cr, layout);
             }
         }
-
-        y_off += row_h;
     }
 
     // Reset Pango attributes so subsequent draw calls don't inherit state.
