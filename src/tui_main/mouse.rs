@@ -1832,7 +1832,7 @@ pub(super) fn handle_mouse(
             0
         };
         let toolbar_row = term_height.saturating_sub(3 + qf_rows + strip_rows);
-        if row == toolbar_row {
+        if row == toolbar_row && col >= editor_left {
             let toolbar = render::DebugToolbarData {
                 buttons: render::DEBUG_BUTTONS.to_vec(),
                 session_active: engine.dap_session_active,
@@ -1841,8 +1841,14 @@ pub(super) fn handle_mouse(
             // ignores — onedark stand-in is fine for hit-test only.
             let theme = Theme::onedark();
             let bar = render::debug_toolbar_to_quadraui_status_bar(&toolbar, &theme);
+            // The toolbar is rendered into the right-column rect starting
+            // at editor_left, so its local x=0 corresponds to that
+            // absolute column. Convert the click into bar-local space
+            // before resolving.
             let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            if let Some(id) = bar.resolve_click(col, term_w as usize) {
+            let bar_w = term_w.saturating_sub(editor_left) as usize;
+            let local_col = col - editor_left;
+            if let Some(id) = bar.resolve_click(local_col, bar_w) {
                 if let Some(idx) = render::debug_toolbar_action_index(&id) {
                     if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
                         let _ = engine.execute_command(btn.action);
