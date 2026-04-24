@@ -944,10 +944,12 @@ pub(super) fn draw_palette(
 
 /// Draw a `quadraui::StatusBar` as a single row `line_height` tall.
 ///
-/// Layout matches the TUI backend: left segments accumulate from the left
-/// edge, right segments are right-aligned inside `width`. When the two
-/// halves would collide, the left half wins up to where it meets the
-/// right (Cairo just clips at the segment boundary).
+/// Per D6: the `StatusBar::layout()` primitive owns the layout math
+/// (left-accumulate, right-align, fit-drop). This rasteriser supplies
+/// a Pango pixel-width measurement closure, calls `bar.layout()`, and
+/// paints the returned `visible_segments` verbatim. No positional
+/// math lives here — any layout policy change (e.g. the #159 priority
+/// drop) happens once in quadraui and applies to TUI + GTK together.
 ///
 /// Returns hit regions in local coordinates (relative to `x`) — caller
 /// pushes them into the per-window segment map for click resolution.
@@ -986,10 +988,7 @@ pub(super) fn draw_status_bar(
     cr.rectangle(x, y, width, line_height);
     cr.fill().ok();
 
-    let mut regions: Vec<quadraui::StatusBarHitRegion> = Vec::new();
-
     // Helper: apply bold attribute to the shared layout if the segment wants it.
-    // Returns true when a bold attribute was installed, so the caller can clear afterwards.
     let apply_bold = |layout: &pango::Layout, bold: bool| {
         if bold {
             let attrs = pango::AttrList::new();
@@ -1000,95 +999,62 @@ pub(super) fn draw_status_bar(
         }
     };
 
-    // ── Left segments — accumulate from x ────────────────────────────────
-    let mut cx = x;
-    for seg in &bar.left_segments {
+    // Pango pixel-width measurer. `pango::Layout` uses GObject interior
+    // mutability, so `set_text` / `set_attributes` take `&self` and
+    // compose fine inside a `Fn` closure.
+    //
+    // #159: `StatusBar::layout` applies a `min_gap` priority-drop to
+    // right segments — ~16 px here (vs 2 cells in TUI). Right segments
+    // are ordered least-important first.
+    const MIN_GAP_PX: f32 = 16.0;
+    let measure = |seg: &quadraui::StatusBarSegment| -> quadraui::StatusSegmentMeasure {
         layout.set_text(&seg.text);
         apply_bold(layout, seg.bold);
-        let (seg_w_px, _) = layout.pixel_size();
-        let seg_w = seg_w_px as f64;
-
-        if let Some(ref id) = seg.action_id {
-            // Hit region widths use px (StatusBarHitRegion stores u16),
-            // but for Cairo we need f64. We keep the primitive's u16 shape
-            // by saturating; the real-world bar is far under u16::MAX px.
-            regions.push(quadraui::StatusBarHitRegion {
-                col: ((cx - x).round() as i64).clamp(0, u16::MAX as i64) as u16,
-                width: (seg_w.round() as i64).clamp(0, u16::MAX as i64) as u16,
-                id: id.clone(),
-            });
-        }
-
-        let (sr, sg, sb) = qc_to_cairo(seg.bg);
-        cr.set_source_rgb(sr, sg, sb);
-        cr.rectangle(cx, y, seg_w, line_height);
-        cr.fill().ok();
-
-        let (fr, fg, fb) = qc_to_cairo(seg.fg);
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(cx, y);
-        pangocairo::show_layout(cr, layout);
-
-        cx += seg_w;
-        if cx >= x + width {
-            break;
-        }
-    }
-
-    // ── Right segments — right-aligned ──────────────────────────────────
-    //
-    // #159: drop low-priority right segments from the front until they fit
-    // with a ~16 px gap after the rightmost left segment. `right_segments`
-    // is ordered least-important first, most-important (cursor position)
-    // last — see `render::build_window_status_line`. The highest-priority
-    // segment is always kept, even if it alone overflows; #157's clip
-    // truncates visually in that edge case.
-    //
-    // The drop *policy* lives in `quadraui::StatusBar::fit_right_start`;
-    // we just supply a Pango pixel measurer. Same code path as the TUI
-    // backend uses (with a char-count measurer), so any policy tweak
-    // applies to both — and to Win-GUI / macOS once they migrate.
-    const MIN_GAP_PX: usize = 16;
-    let measure_px = |seg: &quadraui::StatusBarSegment| -> usize {
-        layout.set_text(&seg.text);
-        apply_bold(layout, seg.bold);
-        layout.pixel_size().0.max(0) as usize
+        let w_px = layout.pixel_size().0.max(0) as f32;
+        quadraui::StatusSegmentMeasure::new(w_px)
     };
-    let bar_w_px = width.round().max(0.0) as usize;
-    let start_idx = bar.fit_right_start(bar_w_px, MIN_GAP_PX, measure_px);
+    let bar_layout = bar.layout(width as f32, line_height as f32, MIN_GAP_PX, measure);
 
-    // Re-measure visible widths after fit (the layout's last-set state is
-    // not guaranteed to be the segment we want to draw next).
-    let visible_widths_px: Vec<f64> = bar.right_segments[start_idx..]
-        .iter()
-        .map(|seg| measure_px(seg) as f64)
-        .collect();
-    let visible_total_w: f64 = visible_widths_px.iter().sum();
-    let mut rx = (x + width - visible_total_w).max(cx);
-    for (offset, seg) in bar.right_segments[start_idx..].iter().enumerate() {
+    // Paint visible segments + build hit regions in a single pass.
+    let mut regions: Vec<quadraui::StatusBarHitRegion> = Vec::new();
+    for vs in &bar_layout.visible_segments {
+        let seg = match vs.side {
+            quadraui::StatusSegmentSide::Left => &bar.left_segments[vs.segment_idx],
+            quadraui::StatusSegmentSide::Right => &bar.right_segments[vs.segment_idx],
+        };
         layout.set_text(&seg.text);
         apply_bold(layout, seg.bold);
-        let seg_w = visible_widths_px[offset];
 
+        // `vs.bounds` is in bar-local coordinates (x=0 at the bar's left
+        // edge); translate to absolute Cairo coordinates for drawing,
+        // but keep the local form for the hit region (caller expects
+        // `col` relative to `x`).
+        let seg_x = x + vs.bounds.x as f64;
+        let seg_w = vs.bounds.width as f64;
+
+        // Segment background fill.
+        let (sr, sg, sb) = qc_to_cairo(seg.bg);
+        cr.set_source_rgb(sr, sg, sb);
+        cr.rectangle(seg_x, y, seg_w, line_height);
+        cr.fill().ok();
+
+        // Segment foreground text.
+        let (fr, fg, fb) = qc_to_cairo(seg.fg);
+        cr.set_source_rgb(fr, fg, fb);
+        cr.move_to(seg_x, y);
+        pangocairo::show_layout(cr, layout);
+
+        // Hit region for clickable segments. Widths still saturate at
+        // u16::MAX to preserve the existing `StatusBarHitRegion` shape
+        // that the GTK click handler consumes — real status bars are
+        // far under that.
         if let Some(ref id) = seg.action_id {
             regions.push(quadraui::StatusBarHitRegion {
-                col: ((rx - x).round() as i64).clamp(0, u16::MAX as i64) as u16,
-                width: (seg_w.round() as i64).clamp(0, u16::MAX as i64) as u16,
+                col: (vs.bounds.x.round() as i64).clamp(0, u16::MAX as i64) as u16,
+                width: (vs.bounds.width.round() as i64).clamp(0, u16::MAX as i64) as u16,
                 id: id.clone(),
             });
         }
-
-        let (sr, sg, sb) = qc_to_cairo(seg.bg);
-        cr.set_source_rgb(sr, sg, sb);
-        cr.rectangle(rx, y, seg_w, line_height);
-        cr.fill().ok();
-
-        let (fr, fg, fb) = qc_to_cairo(seg.fg);
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(rx, y);
-        pangocairo::show_layout(cr, layout);
-
-        rx += seg_w;
     }
 
     layout.set_attributes(None);
