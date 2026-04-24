@@ -259,6 +259,15 @@ struct App {
     /// Active context-menu popover (explorer or tab). Kept alive so we can
     /// unparent it before creating a new one (avoids GTK CSS node assertions).
     active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
+    /// Cross-backend modal-overlay tracking. Pushed to when a palette /
+    /// dialog / context-menu opens, popped when it closes; consulted by
+    /// `quadraui::dispatch_mouse_down` + the drag-guard check in
+    /// `handle_mouse_drag_msg` so events inside a modal can't fall
+    /// through to the editor behind it (#192).
+    ///
+    /// `Rc<RefCell<_>>` because the draw path is already full of
+    /// borrow_mut() on self.engine and widgets need shared access.
+    modal_stack: Rc<RefCell<quadraui::ModalStack>>,
 }
 
 /// Map GDK key names to the engine's expected key names.
@@ -2049,6 +2058,7 @@ impl SimpleComponent for App {
             last_colorscheme,
             settings_self_save: false,
             active_ctx_popover: active_ctx_popover_ref.clone(),
+            modal_stack: Rc::new(RefCell::new(quadraui::ModalStack::new())),
         };
         let widgets = view_output!();
 
@@ -5738,45 +5748,95 @@ impl App {
             }
         }
 
-        // Picker popup: intercept all clicks when picker is open
+        // Picker popup: route the click through quadraui's modal-stack
+        // dispatcher (Phase B.4 pilot). Before this refactor, the click
+        // was gated by an inline popup-bounds check; the *drag* gesture
+        // on the same DrawingArea had no equivalent check and leaked
+        // through to the editor behind the modal (#192). The drag guard
+        // now lives in `handle_mouse_drag_msg` and consults the same
+        // modal stack this branch pushes to.
+        //
+        // Inner hit refinement (which result row) still lives here
+        // because the palette primitive's result-row hit math hasn't
+        // been lifted into quadraui yet — that's a separate follow-up
+        // once we generalise beyond the pilot.
         {
             let engine = self.engine.borrow();
             if engine.picker_open {
-                let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (width * 0.8).max(600.0)
-                } else {
-                    (width * 0.55).max(500.0)
-                };
-                let popup_h = if has_preview {
-                    (height * 0.65).max(400.0)
-                } else {
-                    (height * 0.60).max(350.0)
-                };
-                let popup_x = (width - popup_w) / 2.0;
-                let popup_y = (height - popup_h) / 2.0;
-                let lh = self.cached_line_height.max(1.0);
-                // Results start below separator: popup_y + 2*lh + 1px padding
-                let results_top = popup_y + lh * 2.0 + 1.0;
-                let results_bottom = popup_y + popup_h;
-
-                let on_popup =
-                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
-                let on_results = on_popup && y >= results_top && y < results_bottom;
-
                 drop(engine);
-                if on_results {
-                    let mut engine = self.engine.borrow_mut();
-                    let clicked_idx = engine.picker_scroll_top + ((y - results_top) / lh) as usize;
-                    if clicked_idx < engine.picker_items.len() {
-                        engine.picker_selected = clicked_idx;
-                        engine.picker_load_preview();
+                // Keep the modal stack in sync with engine state. Safe
+                // to call repeatedly — push() dedupes on id.
+                let (popup_x, popup_y, popup_w, popup_h) =
+                    self.compute_picker_popup_bounds(width, height);
+                let picker_id = quadraui::WidgetId::new("picker");
+                self.modal_stack.borrow_mut().push(
+                    picker_id.clone(),
+                    quadraui::Rect {
+                        x: popup_x as f32,
+                        y: popup_y as f32,
+                        width: popup_w as f32,
+                        height: popup_h as f32,
+                    },
+                );
+
+                let stack = self.modal_stack.borrow();
+                let events = quadraui::dispatch_mouse_down(
+                    &stack,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                drop(stack);
+
+                // Inspect the dispatcher's verdict.
+                let mut hit_modal = false;
+                let mut dismiss_modal = false;
+                for ev in &events {
+                    match ev {
+                        quadraui::UiEvent::MouseDown {
+                            widget: Some(id), ..
+                        } if *id == picker_id => {
+                            hit_modal = true;
+                        }
+                        quadraui::UiEvent::Palette(_, _) => {
+                            dismiss_modal = true;
+                        }
+                        _ => {}
                     }
-                } else if !on_popup {
-                    self.engine.borrow_mut().close_picker();
                 }
-                // Consume click — don't fall through to editor
+
+                if hit_modal {
+                    // Click inside picker: drive inner hit math (which
+                    // result row). Results region starts below title +
+                    // query + separator.
+                    let lh = self.cached_line_height.max(1.0);
+                    let results_top = popup_y + lh * 2.0 + 1.0;
+                    let results_bottom = popup_y + popup_h;
+                    if y >= results_top && y < results_bottom {
+                        let mut engine = self.engine.borrow_mut();
+                        let clicked_idx =
+                            engine.picker_scroll_top + ((y - results_top) / lh) as usize;
+                        if clicked_idx < engine.picker_items.len() {
+                            engine.picker_selected = clicked_idx;
+                            engine.picker_load_preview();
+                        }
+                    }
+                }
+                if dismiss_modal {
+                    self.engine.borrow_mut().close_picker();
+                    self.modal_stack.borrow_mut().pop(&picker_id);
+                }
+                // Consume click — don't fall through to editor.
                 return;
+            } else {
+                // Picker isn't open but the stack might hold a stale
+                // entry (engine closed it via Esc or Enter while the
+                // stack still has the id). Keep them consistent.
+                let picker_id = quadraui::WidgetId::new("picker");
+                self.modal_stack.borrow_mut().pop(&picker_id);
             }
         }
 
@@ -6378,7 +6438,70 @@ impl App {
         } // close else (dialog not open)
     }
 
+    /// Compute the picker popup's bounds in DA-local pixels. Shared by
+    /// the click handler (to push into the modal stack) and the drag
+    /// guard (to decide if a drag started inside the popup).
+    fn compute_picker_popup_bounds(&self, width: f64, height: f64) -> (f64, f64, f64, f64) {
+        let engine = self.engine.borrow();
+        let has_preview = engine.picker_preview.is_some();
+        drop(engine);
+        let popup_w = if has_preview {
+            (width * 0.8).max(600.0)
+        } else {
+            (width * 0.55).max(500.0)
+        };
+        let popup_h = if has_preview {
+            (height * 0.65).max(400.0)
+        } else {
+            (height * 0.60).max(350.0)
+        };
+        let popup_x = (width - popup_w) / 2.0;
+        let popup_y = (height - popup_h) / 2.0;
+        (popup_x, popup_y, popup_w, popup_h)
+    }
+
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        // Phase B.4 drag guard: if a modal is on the stack and the drag
+        // point is inside it, swallow the drag event. Without this,
+        // click-inside-palette + drag-out would leak into the editor's
+        // selection drag (#192). This is the cross-backend complement
+        // to the `dispatch_mouse_down` call in the click handler —
+        // both consult the same modal_stack, so the "drag doesn't
+        // leak" property derives from a single piece of state.
+        //
+        // Keep the stack fresh: if the picker is open, ensure its
+        // current bounds are recorded (popup size depends on
+        // has_preview which can change mid-picker).
+        {
+            let engine = self.engine.borrow();
+            let picker_open = engine.picker_open;
+            drop(engine);
+            let picker_id = quadraui::WidgetId::new("picker");
+            if picker_open {
+                let (px, py, pw, ph) = self.compute_picker_popup_bounds(width, height);
+                self.modal_stack.borrow_mut().push(
+                    picker_id.clone(),
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
+            } else {
+                self.modal_stack.borrow_mut().pop(&picker_id);
+            }
+            let stack = self.modal_stack.borrow();
+            let hit_point = quadraui::Point {
+                x: x as f32,
+                y: y as f32,
+            };
+            if stack.hit_test(hit_point).is_some() {
+                // Drag landed inside an open modal — swallow.
+                return;
+            }
+        }
+
         // Editor hover popup text selection drag
         {
             let engine = self.engine.borrow();
