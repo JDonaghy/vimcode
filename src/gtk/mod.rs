@@ -6576,15 +6576,16 @@ impl App {
                     Default::default(),
                 );
                 drop(drag);
-                // Apply each primitive-specific event. Today only
-                // Palette::ScrollOffsetChanged is produced; future
-                // drag targets will add arms here.
+                // Apply each scroll event by widget id.
                 for ev in &events {
-                    if let quadraui::UiEvent::Palette(
-                        _,
-                        quadraui::PaletteEvent::ScrollOffsetChanged { new_offset },
-                    ) = ev
+                    if let quadraui::UiEvent::ScrollOffsetChanged {
+                        widget,
+                        new_offset,
+                    } = ev
                     {
+                        if widget.as_str() != "picker" {
+                            continue;
+                        }
                         let mut engine = self.engine.borrow_mut();
                         engine.picker_scroll_top = *new_offset;
                         // Nudge selection into view so the renderer's

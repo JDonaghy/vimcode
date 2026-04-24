@@ -1071,7 +1071,6 @@ fn event_loop(
     let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
     // Non-None while user is dragging a sidebar scrollbar that has no dedicated drag state.
     // Used for explorer and ext panel scrollbars to prevent text selection leaking.
-    let mut dragging_generic_sb: Option<SidebarScrollDrag> = None;
     // Phase B.4: cross-backend drag-state. Currently tracks only the
     // picker scrollbar (#190 sibling for TUI); other sidebar scrollbars
     // still use their own `dragging_*_sb: Option<SidebarScrollDrag>`
@@ -3911,7 +3910,6 @@ fn event_loop(
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
                                 &mut dragging_settings_sb,
-                                &mut dragging_generic_sb,
                                 &mut drag_state,
                                 &mut modal_stack,
                                 last_layout.as_ref(),
@@ -3966,7 +3964,6 @@ fn event_loop(
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,
                     &mut dragging_settings_sb,
-                    &mut dragging_generic_sb,
                     &mut drag_state,
                     &mut modal_stack,
                     last_layout.as_ref(),

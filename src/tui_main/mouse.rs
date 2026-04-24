@@ -20,7 +20,6 @@ pub(super) fn handle_mouse(
     dragging_terminal_split: &mut bool,
     dragging_group_divider: &mut Option<usize>,
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
-    dragging_generic_sb: &mut Option<SidebarScrollDrag>,
     drag_state: &mut quadraui::DragState,
     modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
@@ -488,11 +487,7 @@ pub(super) fn handle_mouse(
                     Default::default(),
                 );
                 for ev in &events {
-                    if let quadraui::UiEvent::Palette(
-                        _,
-                        quadraui::PaletteEvent::ScrollOffsetChanged { new_offset },
-                    ) = ev
-                    {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
                         engine.picker_scroll_top = *new_offset;
                         // `draw_palette` clamps its effective scroll
                         // offset to keep `picker_selected` on-screen, so
@@ -836,22 +831,45 @@ pub(super) fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            // Generic sidebar scrollbar drag (explorer, ext panel, etc.)
-            if let Some(ref drag) = *dragging_generic_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let new_scroll = (ratio * drag.total as f64) as usize;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    // Route to the right panel's scroll state
-                    if sidebar.ext_panel_name.is_some() {
-                        engine.ext_panel_scroll_top = new_scroll.min(drag.total.saturating_sub(1));
-                    } else if sidebar.active_panel == TuiPanel::Explorer {
-                        sidebar.scroll_top = new_scroll.min(max_scroll);
+            // Phase B.4: explorer + ext-panel scrollbar drag now goes
+            // through the shared `quadraui::DragState::ScrollbarY` +
+            // `dispatch_mouse_drag`. Widget id ("explorer:sb" vs
+            // "ext_panel:sb") routes the resulting `ScrollOffsetChanged`
+            // event to the correct scroll-state field. Same dispatcher
+            // + math used by the picker scrollbar (b169ca4) and GTK
+            // palette scrollbar (0f3e0d0).
+            if drag_state.is_active() {
+                let events = quadraui::dispatch_mouse_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    Default::default(),
+                );
+                let mut handled = false;
+                for ev in &events {
+                    if let quadraui::UiEvent::ScrollOffsetChanged {
+                        widget,
+                        new_offset,
+                    } = ev
+                    {
+                        match widget.as_str() {
+                            "explorer:sb" => {
+                                sidebar.scroll_top = *new_offset;
+                                handled = true;
+                            }
+                            "ext_panel:sb" => {
+                                engine.ext_panel_scroll_top = *new_offset;
+                                handled = true;
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                return sidebar_width;
+                if handled {
+                    return sidebar_width;
+                }
             }
             // Settings panel scrollbar drag
             if let Some(ref drag) = *dragging_settings_sb {
@@ -1065,7 +1083,6 @@ pub(super) fn handle_mouse(
             *dragging_terminal_sb = None;
             *dragging_debug_output_sb = None;
             *dragging_settings_sb = None;
-            *dragging_generic_sb = None;
             drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
@@ -2288,13 +2305,16 @@ pub(super) fn handle_mouse(
                 term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
             if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
                 let rel_row = (sidebar_row - content_start) as usize;
+                let max_scroll = flat_len.saturating_sub(content_h);
                 let ratio = rel_row as f64 / content_h as f64;
-                let new_top = (ratio * flat_len as f64) as usize;
-                engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
-                *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: content_start + menu_rows,
-                    track_len: content_h as u16,
-                    total: flat_len,
+                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
+                engine.ext_panel_scroll_top = new_top;
+                drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("ext_panel:sb"),
+                    track_start: (content_start + menu_rows) as f32,
+                    track_length: content_h as f32,
+                    visible_rows: content_h,
+                    total_items: flat_len,
                 });
                 return sidebar_width;
             }
@@ -2330,14 +2350,17 @@ pub(super) fn handle_mouse(
             // Click on the scrollbar column → jump-scroll + arm drag
             if col == sb_col && total_rows > tree_height {
                 let rel_row = sidebar_row as usize;
+                let max_scroll = total_rows.saturating_sub(tree_height);
                 let ratio = rel_row as f64 / tree_height as f64;
-                let new_top = (ratio * total_rows as f64) as usize;
-                sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
+                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
+                sidebar.scroll_top = new_top;
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: menu_rows,
-                    track_len: tree_height as u16,
-                    total: total_rows,
+                drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("explorer:sb"),
+                    track_start: menu_rows as f32,
+                    track_length: tree_height as f32,
+                    visible_rows: tree_height,
+                    total_items: total_rows,
                 });
                 return sidebar_width;
             }
