@@ -471,10 +471,22 @@ pub(super) fn draw_form(
 /// Draw a `quadraui::ListView` into `(x, y, w, h)` on `cr`, using `layout`
 /// for text measurement and `theme` for default colours.
 ///
-/// Layout: optional title header (status-bar styling) at the top, then
-/// one `line_height`-tall row per item. Selected row gets a `▶ ` prefix
-/// and `fuzzy_selected_bg` background. Optional icon sits left of the
-/// text; optional detail is right-aligned and dimmed.
+/// Per D6: `ListView::layout()` owns the row positioning math — this
+/// rasteriser supplies a constant per-item height measurer and a
+/// `title_height` (`line_height` when `list.title.is_some()`, else 0),
+/// then paints the returned `visible_items` and `title_bounds` verbatim.
+/// Scroll math lives in the primitive; callers set `list.scroll_offset`
+/// and the layout clamps it to the item count.
+///
+/// Decoration-driven: per-row fg colour derives from `item.decoration`
+/// (Error / Warning / Muted / Header / Normal). Header rows get a
+/// status-bar-style background so SC section headers stand out.
+/// Selected row gets a `▶ ` prefix and `fuzzy_selected_bg` background.
+///
+/// Note: `list.bordered` is not yet honoured by this backend — no
+/// GTK consumer currently sets `bordered = true`. If that changes, add
+/// border drawing here and respect the inset bounds that
+/// `ListView::layout` already returns when `bordered` is set.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_list(
     cr: &Context,
@@ -506,35 +518,43 @@ pub(super) fn draw_list(
     cr.fill().ok();
 
     layout.set_attributes(None);
-
-    let mut y_off = y;
-    let y_end = y + h;
     let use_nerd = icons::nerd_fonts_enabled();
 
+    // Resolve the layout once per frame. Per-item heights are uniform
+    // (`line_height` each); the primitive handles scroll-clipping and
+    // the optional title row at the top.
+    let title_h = if list.title.is_some() {
+        line_height as f32
+    } else {
+        0.0
+    };
+    let list_layout = list.layout(w as f32, h as f32, title_h, |_| {
+        quadraui::ListItemMeasure::new(line_height as f32)
+    });
+
     // Title header (optional). Rendered as a single full-width status-bar row.
-    if let Some(ref title) = list.title {
-        if y_off + line_height > y_end {
-            return;
-        }
+    if let (Some(title_bounds), Some(title)) = (list_layout.title_bounds, list.title.as_ref()) {
+        let ty = y + title_bounds.y as f64;
+        let th_px = title_bounds.height as f64;
         cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, y_off, w, line_height);
+        cr.rectangle(x, ty, w, th_px);
         cr.fill().ok();
 
         cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
         let title_text: String = title.spans.iter().map(|s| s.text.as_str()).collect();
         layout.set_text(&title_text);
-        let (_, th) = layout.pixel_size();
-        cr.move_to(x + 2.0, y_off + (line_height - th as f64) / 2.0);
+        let (_, text_h) = layout.pixel_size();
+        cr.move_to(x + 2.0, ty + (th_px - text_h as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
-        y_off += line_height;
     }
 
-    for (vis_i, item) in list.items.iter().enumerate().skip(list.scroll_offset) {
-        if y_off + line_height > y_end {
-            break;
-        }
+    for vis_item in &list_layout.visible_items {
+        let item = &list.items[vis_item.item_idx];
+        let row_y = y + vis_item.bounds.y as f64;
+        let row_w = vis_item.bounds.width as f64;
+        let row_h = vis_item.bounds.height as f64;
 
-        let is_selected = vis_i == list.selected_idx && list.has_focus;
+        let is_selected = vis_item.item_idx == list.selected_idx && list.has_focus;
 
         // Decoration → foreground colour.
         let decoration_fg = match item.decoration {
@@ -554,7 +574,7 @@ pub(super) fn draw_list(
 
         // Fill row background.
         cr.set_source_rgb(row_bg.0, row_bg.1, row_bg.2);
-        cr.rectangle(x, y_off, w, line_height);
+        cr.rectangle(x, row_y, row_w, row_h);
         cr.fill().ok();
 
         let mut cursor_x = x + 2.0;
@@ -565,7 +585,7 @@ pub(super) fn draw_list(
         cr.set_source_rgb(decoration_fg.0, decoration_fg.1, decoration_fg.2);
         layout.set_text(prefix);
         let (pw, ph) = layout.pixel_size();
-        cr.move_to(cursor_x, y_off + (line_height - ph as f64) / 2.0);
+        cr.move_to(cursor_x, row_y + (row_h - ph as f64) / 2.0);
         pangocairo::show_layout(cr, layout);
         cursor_x += pw as f64;
 
@@ -579,7 +599,7 @@ pub(super) fn draw_list(
             cr.set_source_rgb(decoration_fg.0, decoration_fg.1, decoration_fg.2);
             layout.set_text(glyph);
             let (iw, ih) = layout.pixel_size();
-            cr.move_to(cursor_x, y_off + (line_height - ih as f64) / 2.0);
+            cr.move_to(cursor_x, row_y + (row_h - ih as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
             cursor_x += iw as f64 + 6.0;
         }
@@ -592,7 +612,7 @@ pub(super) fn draw_list(
             (detail_text, dw as f64)
         });
         let detail_reserve = detail_info.as_ref().map(|(_, dw)| *dw + 8.0).unwrap_or(0.0);
-        let text_right_limit = x + w - detail_reserve - 4.0;
+        let text_right_limit = x + row_w - detail_reserve - 4.0;
 
         // Text spans.
         for span in &item.text.spans {
@@ -611,33 +631,31 @@ pub(super) fn draw_list(
                 cr.set_source_rgb(sbr, sbg_, sbb);
                 cr.rectangle(
                     cursor_x,
-                    y_off,
+                    row_y,
                     (sw as f64).min(text_right_limit - cursor_x),
-                    line_height,
+                    row_h,
                 );
                 cr.fill().ok();
             }
             cr.set_source_rgb(span_fg.0, span_fg.1, span_fg.2);
             layout.set_text(&span.text);
             let (sw, sh) = layout.pixel_size();
-            cr.move_to(cursor_x, y_off + (line_height - sh as f64) / 2.0);
+            cr.move_to(cursor_x, row_y + (row_h - sh as f64) / 2.0);
             pangocairo::show_layout(cr, layout);
             cursor_x += sw as f64;
         }
 
         // Detail (right-aligned, dimmed).
         if let Some((detail_text, dw)) = detail_info {
-            let dx = x + w - dw - 4.0;
+            let dx = x + row_w - dw - 4.0;
             if dx > cursor_x {
                 cr.set_source_rgb(dim_r, dim_g, dim_b);
                 layout.set_text(&detail_text);
                 let (_, dh) = layout.pixel_size();
-                cr.move_to(dx, y_off + (line_height - dh as f64) / 2.0);
+                cr.move_to(dx, row_y + (row_h - dh as f64) / 2.0);
                 pangocairo::show_layout(cr, layout);
             }
         }
-
-        y_off += line_height;
     }
 
     layout.set_attributes(None);
