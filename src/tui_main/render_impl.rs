@@ -634,7 +634,21 @@ pub(super) fn draw_frame(
 
     // ── Debug toolbar strip (if visible) ────────────────────────────────────
     if let Some(ref toolbar) = screen.debug_toolbar {
-        render_debug_toolbar(frame.buffer_mut(), debug_toolbar_area, toolbar, theme);
+        // Per D6: build quadraui::StatusBar + draw_status_bar.
+        let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
+        let layout = bar.layout(
+            debug_toolbar_area.width as f32,
+            1.0,
+            0.0, // no right segments → no left/right gap needed
+            |seg| quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32),
+        );
+        super::quadraui_tui::draw_status_bar(
+            frame.buffer_mut(),
+            debug_toolbar_area,
+            &bar,
+            &layout,
+            theme,
+        );
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -3003,75 +3017,6 @@ pub(super) fn render_menu_bar(
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────
 
 // ─── Debug toolbar rendering ────────────────────────────────────────────────────────────
-
-pub(super) fn render_debug_toolbar(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    toolbar: &render::DebugToolbarData,
-    theme: &Theme,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let bar_bg = rc(theme.status_bg);
-    let bar_fg = rc(theme.status_fg);
-    let dim_fg = rc(theme.line_number_fg);
-    let y = area.y;
-
-    // Fill background
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, y, ' ', bar_fg, bar_bg);
-    }
-
-    let mut col = area.x + 1;
-    for (idx, btn) in toolbar.buttons.iter().enumerate() {
-        // Separator between index 3 and 4
-        if idx == 4 {
-            if col < area.x + area.width {
-                set_cell(buf, col, y, '\u{2502}', dim_fg, bar_bg);
-                col += 1;
-            }
-            if col < area.x + area.width {
-                set_cell(buf, col, y, ' ', bar_fg, bar_bg);
-                col += 1;
-            }
-        }
-        let fg = if toolbar.session_active {
-            bar_fg
-        } else {
-            dim_fg
-        };
-        // Icon
-        for ch in btn.icon.chars() {
-            if col >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, col, y, ch, fg, bar_bg);
-            col += 1;
-        }
-        // Key hint in parens
-        if col < area.x + area.width {
-            set_cell(buf, col, y, '(', dim_fg, bar_bg);
-            col += 1;
-        }
-        for ch in btn.key_hint.chars() {
-            if col >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, col, y, ch, dim_fg, bar_bg);
-            col += 1;
-        }
-        if col < area.x + area.width {
-            set_cell(buf, col, y, ')', dim_fg, bar_bg);
-            col += 1;
-        }
-        // Space separator
-        if col < area.x + area.width {
-            set_cell(buf, col, y, ' ', bar_fg, bar_bg);
-            col += 1;
-        }
-    }
-}
 
 // ─── Find/replace overlay ────────────────────────────────────────────────────
 

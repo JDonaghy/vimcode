@@ -1443,6 +1443,83 @@ pub struct DebugToolbarData {
     pub session_active: bool,
 }
 
+/// Convert a `DebugToolbarData` into a `quadraui::StatusBar`. Each
+/// debug button becomes two adjacent left-segments — the icon (in
+/// the active fg) and the parenthesised key hint (dimmed) — sharing
+/// a `debug:btn:N` action_id so a click on either resolves to the
+/// same button. A non-clickable separator segment (`"│ "` in dim_fg)
+/// sits between buttons 3 and 4.
+///
+/// `bg` is the toolbar background; the rasteriser auto-fills with the
+/// first segment's bg for any cells not covered by an explicit segment.
+pub fn debug_toolbar_to_quadraui_status_bar(
+    toolbar: &DebugToolbarData,
+    theme: &Theme,
+) -> quadraui::StatusBar {
+    let bg = to_quadraui_color(theme.status_bg);
+    let primary_fg = if toolbar.session_active {
+        to_quadraui_color(theme.status_fg)
+    } else {
+        to_quadraui_color(theme.line_number_fg)
+    };
+    let dim_fg = to_quadraui_color(theme.line_number_fg);
+
+    let mut left: Vec<quadraui::StatusBarSegment> = Vec::new();
+
+    // 1-cell leading pad so the first button doesn't touch the left edge.
+    left.push(quadraui::StatusBarSegment {
+        text: " ".to_string(),
+        fg: primary_fg,
+        bg,
+        bold: false,
+        action_id: None,
+    });
+
+    for (idx, btn) in toolbar.buttons.iter().enumerate() {
+        // Insert "│ " between buttons 3 and 4 (matches legacy grouping
+        // of step controls vs other actions).
+        if idx == 4 {
+            left.push(quadraui::StatusBarSegment {
+                text: "\u{2502} ".to_string(),
+                fg: dim_fg,
+                bg,
+                bold: false,
+                action_id: None,
+            });
+        }
+        let action_id = quadraui::WidgetId::new(format!("debug:btn:{idx}"));
+        // Icon segment — primary colour.
+        left.push(quadraui::StatusBarSegment {
+            text: btn.icon.to_string(),
+            fg: primary_fg,
+            bg,
+            bold: false,
+            action_id: Some(action_id.clone()),
+        });
+        // Parenthesised key hint + trailing space — dimmed, same action.
+        left.push(quadraui::StatusBarSegment {
+            text: format!("({}) ", btn.key_hint),
+            fg: dim_fg,
+            bg,
+            bold: false,
+            action_id: Some(action_id),
+        });
+    }
+
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("debug_toolbar"),
+        left_segments: left,
+        right_segments: Vec::new(),
+    }
+}
+
+/// Resolve a `WidgetId` produced by `debug_toolbar_to_quadraui_status_bar`
+/// back to a `DEBUG_BUTTONS` index. Returns `None` if the id doesn't
+/// match the `debug:btn:N` pattern.
+pub fn debug_toolbar_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+    id.as_str().strip_prefix("debug:btn:")?.parse().ok()
+}
+
 // ─── Static menu structure ────────────────────────────────────────────────────
 
 /// Static description of every top-level menu and its items.

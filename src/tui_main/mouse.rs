@@ -1820,6 +1820,10 @@ pub(super) fn handle_mouse(
     }
 
     // ── Debug toolbar row click ────────────────────────────────────────────────
+    // Resolve via the same StatusBar adapter the renderer uses, so the
+    // hit math can never drift from the visible layout (was: duplicated
+    // walk over DEBUG_BUTTONS that re-derived per-button widths and
+    // separator gaps).
     if engine.debug_toolbar_visible {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
@@ -1829,17 +1833,21 @@ pub(super) fn handle_mouse(
         };
         let toolbar_row = term_height.saturating_sub(3 + qf_rows + strip_rows);
         if row == toolbar_row {
-            let mut col_pos: u16 = 1;
-            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
-                if idx == 4 {
-                    col_pos += 2; // separator gap
+            let toolbar = render::DebugToolbarData {
+                buttons: render::DEBUG_BUTTONS.to_vec(),
+                session_active: engine.dap_session_active,
+            };
+            // Theme only feeds segment fg/bg here, which resolve_click
+            // ignores — onedark stand-in is fine for hit-test only.
+            let theme = Theme::onedark();
+            let bar = render::debug_toolbar_to_quadraui_status_bar(&toolbar, &theme);
+            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
+            if let Some(id) = bar.resolve_click(col, term_w as usize) {
+                if let Some(idx) = render::debug_toolbar_action_index(&id) {
+                    if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
+                        let _ = engine.execute_command(btn.action);
+                    }
                 }
-                let btn_w = (btn.icon.chars().count() + btn.key_hint.chars().count() + 4) as u16;
-                if col >= col_pos && col < col_pos + btn_w {
-                    let _ = engine.execute_command(btn.action);
-                    return sidebar_width;
-                }
-                col_pos += btn_w;
             }
             return sidebar_width; // click in toolbar row, consume event
         }
