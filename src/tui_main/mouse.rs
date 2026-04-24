@@ -21,7 +21,7 @@ pub(super) fn handle_mouse(
     dragging_group_divider: &mut Option<usize>,
     dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     dragging_generic_sb: &mut Option<SidebarScrollDrag>,
-    dragging_picker_sb: &mut Option<SidebarScrollDrag>,
+    drag_state: &mut quadraui::DragState,
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
@@ -463,28 +463,50 @@ pub(super) fn handle_mouse(
 
     // ── Unified picker mouse handling ────────────────────────────────────────
     if engine.picker_open {
-        // Active scrollbar drag — update scroll_top from the mouse row and
-        // short-circuit the rest of picker mouse routing for this event.
+        // Active scrollbar drag — feed through the cross-backend
+        // dispatcher. Same math GTK uses (0f3e0d0), same primitive
+        // event type; TUI just supplies cell-unit track geometry
+        // instead of pixels.
         if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
-            if let Some(ref drag) = *dragging_picker_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    let new_top = (ratio * max_scroll as f64).round() as usize;
-                    engine.picker_scroll_top = new_top;
-                    // `draw_palette` clamps its effective scroll offset to
-                    // keep `picker_selected` on-screen, so a drag that leaves
-                    // selection outside the new viewport would snap back
-                    // visually. Pull selection to the nearest visible edge.
-                    let visible = drag.track_len as usize;
-                    if engine.picker_selected < new_top {
-                        engine.picker_selected = new_top;
-                    } else if engine.picker_selected >= new_top + visible {
-                        engine.picker_selected = new_top + visible - 1;
+            if drag_state.is_active() {
+                // Capture visible_rows before drop for the selection-clamp below.
+                let visible_rows =
+                    if let Some(quadraui::DragTarget::ScrollbarY { visible_rows, .. }) =
+                        drag_state.target()
+                    {
+                        *visible_rows
+                    } else {
+                        0
+                    };
+                let events = quadraui::dispatch_mouse_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    Default::default(),
+                );
+                for ev in &events {
+                    if let quadraui::UiEvent::Palette(
+                        _,
+                        quadraui::PaletteEvent::ScrollOffsetChanged { new_offset },
+                    ) = ev
+                    {
+                        engine.picker_scroll_top = *new_offset;
+                        // `draw_palette` clamps its effective scroll
+                        // offset to keep `picker_selected` on-screen, so
+                        // a drag that leaves selection outside the new
+                        // viewport would snap back visually. Pull
+                        // selection to the nearest visible edge.
+                        if engine.picker_selected < *new_offset {
+                            engine.picker_selected = *new_offset;
+                        } else if visible_rows > 0
+                            && engine.picker_selected >= *new_offset + visible_rows
+                        {
+                            engine.picker_selected = *new_offset + visible_rows - 1;
+                        }
+                        engine.picker_load_preview();
                     }
-                    engine.picker_load_preview();
                 }
                 return sidebar_width;
             }
@@ -539,10 +561,12 @@ pub(super) fn handle_mouse(
                         engine.picker_selected = new_top + visible_rows - 1;
                     }
                     engine.picker_load_preview();
-                    *dragging_picker_sb = Some(SidebarScrollDrag {
-                        track_abs_start: results_start,
-                        track_len: visible_rows as u16,
-                        total: total_items,
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new("picker"),
+                        track_start: results_start as f32,
+                        track_length: visible_rows as f32,
+                        visible_rows,
+                        total_items,
                     });
                     return sidebar_width;
                 }
@@ -578,7 +602,7 @@ pub(super) fn handle_mouse(
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                *dragging_picker_sb = None;
+                drag_state.end();
             }
             MouseEventKind::ScrollDown => {
                 // Check if scroll is over the preview pane (right side).
@@ -999,7 +1023,7 @@ pub(super) fn handle_mouse(
             *dragging_debug_output_sb = None;
             *dragging_settings_sb = None;
             *dragging_generic_sb = None;
-            *dragging_picker_sb = None;
+            drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
             *hover_selecting = false;
