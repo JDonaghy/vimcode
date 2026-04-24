@@ -268,6 +268,11 @@ struct App {
     /// `Rc<RefCell<_>>` because the draw path is already full of
     /// borrow_mut() on self.engine and widgets need shared access.
     modal_stack: Rc<RefCell<quadraui::ModalStack>>,
+    /// Cross-backend drag state. Non-None while the user is mid-drag
+    /// on a scrollbar / handle / resize edge the dispatcher recognises.
+    /// Set on mouse-down, read on mouse-move (drag update), cleared on
+    /// mouse-up. Fixes #190 (palette scrollbar wasn't draggable).
+    drag_state: Rc<RefCell<quadraui::DragState>>,
 }
 
 /// Map GDK key names to the engine's expected key names.
@@ -2059,6 +2064,7 @@ impl SimpleComponent for App {
             settings_self_save: false,
             active_ctx_popover: active_ctx_popover_ref.clone(),
             modal_stack: Rc::new(RefCell::new(quadraui::ModalStack::new())),
+            drag_state: Rc::new(RefCell::new(quadraui::DragState::new())),
         };
         let widgets = view_output!();
 
@@ -5809,13 +5815,63 @@ impl App {
                 }
 
                 if hit_modal {
-                    // Click inside picker: drive inner hit math (which
-                    // result row). Results region starts below title +
-                    // query + separator.
+                    // Click inside picker: drive inner hit math.
+                    // Results region starts below title + query + separator.
                     let lh = self.cached_line_height.max(1.0);
                     let results_top = popup_y + lh * 2.0 + 1.0;
                     let results_bottom = popup_y + popup_h;
-                    if y >= results_top && y < results_bottom {
+
+                    // Scrollbar hit-test (right-edge column, same as
+                    // `draw_palette`). When overflowing rows exist,
+                    // clicking the track jump-scrolls and begins a
+                    // drag so mouse-move updates the offset. Fixes #190.
+                    const BOTTOM_INSET: f64 = 4.0;
+                    let rows_h_raw = (results_bottom - results_top - BOTTOM_INSET).max(0.0);
+                    let visible_rows = (rows_h_raw / lh) as usize;
+                    let rows_h = visible_rows as f64 * lh;
+                    let (total, has_scrollbar) = {
+                        let engine = self.engine.borrow();
+                        let t = engine.picker_items.len();
+                        (t, t > visible_rows)
+                    };
+                    const SB_W: f64 = 6.0;
+                    let sb_x = popup_x + popup_w - SB_W;
+                    let on_scrollbar = has_scrollbar
+                        && visible_rows > 0
+                        && x >= sb_x
+                        && x < popup_x + popup_w
+                        && y >= results_top
+                        && y < results_top + rows_h;
+
+                    if on_scrollbar {
+                        // Jump-scroll to clicked position AND begin
+                        // drag so mouse-move updates offset live.
+                        let rel = ((y - results_top) / rows_h).clamp(0.0, 1.0);
+                        let max_scroll = total.saturating_sub(visible_rows);
+                        let new_offset = (rel * max_scroll as f64).round() as usize;
+                        {
+                            let mut engine = self.engine.borrow_mut();
+                            engine.picker_scroll_top = new_offset;
+                            // Nudge selection into the new viewport so
+                            // the renderer's selection-anchored clamp
+                            // doesn't snap the scroll back.
+                            if engine.picker_selected < new_offset {
+                                engine.picker_selected = new_offset;
+                            } else if engine.picker_selected >= new_offset + visible_rows {
+                                engine.picker_selected = new_offset + visible_rows - 1;
+                            }
+                            engine.picker_load_preview();
+                        }
+                        self.drag_state
+                            .borrow_mut()
+                            .begin(quadraui::DragTarget::ScrollbarY {
+                                widget: picker_id.clone(),
+                                track_start: results_top as f32,
+                                track_length: rows_h as f32,
+                                visible_rows,
+                                total_items: total,
+                            });
+                    } else if y >= results_top && y < results_bottom {
                         let mut engine = self.engine.borrow_mut();
                         let clicked_idx =
                             engine.picker_scroll_top + ((y - results_top) / lh) as usize;
@@ -6461,13 +6517,11 @@ impl App {
     }
 
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        // Phase B.4 drag guard: if a modal is on the stack and the drag
-        // point is inside it, swallow the drag event. Without this,
-        // click-inside-palette + drag-out would leak into the editor's
-        // selection drag (#192). This is the cross-backend complement
-        // to the `dispatch_mouse_down` call in the click handler —
-        // both consult the same modal_stack, so the "drag doesn't
-        // leak" property derives from a single piece of state.
+        // Phase B.4 drag dispatch: feed the move through quadraui's
+        // dispatcher so an active drag (scrollbar, handle, etc.)
+        // translates into primitive-specific events, then guard
+        // against drag-events-inside-modal leaking through to the
+        // base layer (#192).
         //
         // Keep the stack fresh: if the picker is open, ensure its
         // current bounds are recorded (popup size depends on
@@ -6491,13 +6545,68 @@ impl App {
             } else {
                 self.modal_stack.borrow_mut().pop(&picker_id);
             }
+
+            let drag = self.drag_state.borrow();
+            let drag_active = drag.is_active();
+            if drag_active {
+                // Run dispatch_mouse_drag: emits MouseMoved + any
+                // primitive-specific drag-update events.
+                let events = quadraui::dispatch_mouse_drag(
+                    &drag,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    Default::default(),
+                );
+                drop(drag);
+                // Apply each primitive-specific event. Today only
+                // Palette::ScrollOffsetChanged is produced; future
+                // drag targets will add arms here.
+                for ev in &events {
+                    if let quadraui::UiEvent::Palette(
+                        _,
+                        quadraui::PaletteEvent::ScrollOffsetChanged { new_offset },
+                    ) = ev
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.picker_scroll_top = *new_offset;
+                        // Nudge selection into view so the renderer's
+                        // selection-anchored clamp doesn't snap back.
+                        let vis = {
+                            let drag = self.drag_state.borrow();
+                            if let Some(quadraui::DragTarget::ScrollbarY {
+                                visible_rows, ..
+                            }) = drag.target()
+                            {
+                                *visible_rows
+                            } else {
+                                0
+                            }
+                        };
+                        if engine.picker_selected < *new_offset {
+                            engine.picker_selected = *new_offset;
+                        } else if vis > 0 && engine.picker_selected >= *new_offset + vis {
+                            engine.picker_selected = *new_offset + vis - 1;
+                        }
+                        engine.picker_load_preview();
+                        self.draw_needed.set(true);
+                    }
+                }
+                return;
+            }
+            drop(drag);
+
             let stack = self.modal_stack.borrow();
             let hit_point = quadraui::Point {
                 x: x as f32,
                 y: y as f32,
             };
             if stack.hit_test(hit_point).is_some() {
-                // Drag landed inside an open modal — swallow.
+                // Drag landed inside an open modal but there's no
+                // active drag target — swallow so it doesn't leak to
+                // the editor (#192). Active modal drags have already
+                // been handled above.
                 return;
             }
         }
@@ -6777,6 +6886,23 @@ impl App {
     }
 
     fn handle_mouse_up_msg(&mut self) {
+        // Phase B.4: clear any active cross-backend drag state. The
+        // dispatcher returns a MouseUp event we could forward to the
+        // engine later, but today no consumer cares about mouse-up
+        // beyond clearing drag state.
+        {
+            let mut drag = self.drag_state.borrow_mut();
+            if drag.is_active() {
+                let stack = self.modal_stack.borrow();
+                let _events = quadraui::dispatch_mouse_up(
+                    &stack,
+                    &mut drag,
+                    quadraui::Point { x: 0.0, y: 0.0 },
+                    quadraui::MouseButton::Left,
+                );
+            }
+        }
+
         // Tab drag drop.
         if self.tab_dragging {
             self.tab_dragging = false;
