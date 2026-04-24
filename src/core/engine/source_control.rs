@@ -147,6 +147,14 @@ impl Engine {
     pub fn sc_discard_all_unstaged(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let _ = git::discard_all(&dir);
+        // #189: reload any open buffer whose file just got discarded on
+        // disk. Without this the editor keeps showing the pre-discard
+        // rope contents + stale `git_diff` hunks, so the diff-peek
+        // popup offers to stage changes that no longer exist. Iterate
+        // every buffer with a file_path — `git discard_all` doesn't
+        // tell us which files actually changed, so reload them all
+        // and let `refresh_git_diff` no-op on unchanged ones.
+        self.reload_all_buffers_from_disk();
         self.sc_refresh();
     }
 
@@ -549,10 +557,66 @@ impl Engine {
     pub fn sc_discard_file(&mut self, path: &str) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::discard_path(&dir, path) {
-            Ok(()) => {}
+            Ok(()) => {
+                // #189: if this file is currently open in a buffer,
+                // reload from disk so the editor reflects the post-
+                // discard state. Without the reload, the buffer keeps
+                // the pre-discard content + stale git_diff hunks and
+                // the diff-peek popup offers to stage changes that no
+                // longer exist. Mirrors the pattern in
+                // `Engine::diff_peek_revert`.
+                if let Some(bid) = self.buffer_manager.find_by_path(path) {
+                    self.reload_buffer_from_disk(bid);
+                }
+            }
             Err(e) => self.message = format!("discard: {e}"),
         }
         self.sc_refresh();
+    }
+
+    /// Reload a single buffer's contents from disk and refresh its
+    /// git-diff cache. Silent no-op if the buffer has no file path or
+    /// the read fails (the caller typically logs its own message).
+    fn reload_buffer_from_disk(&mut self, bid: crate::core::engine::BufferId) {
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(state) = self.buffer_manager.get_mut(bid) {
+                state.buffer.content = ropey::Rope::from_str(&contents);
+            }
+            self.refresh_git_diff(bid);
+            // Notify the LSP that the buffer contents changed — without
+            // this, the server keeps the pre-discard text in its
+            // internal model and the gutter keeps showing stale
+            // diagnostics even though the buffer rope + file on disk
+            // both no longer have the offending code. `lsp_flush_changes`
+            // (driven from the UI poll loop) picks this up and sends
+            // `textDocument/didChange` + clears cached diagnostics.
+            self.lsp_dirty_buffers.insert(bid, true);
+            // Also send `didSave`: rust-analyzer (and other servers
+            // configured with `check on save`) won't re-run diagnostics
+            // until they see a save. Discard IS effectively a save
+            // from disk's perspective, so synthesising one here makes
+            // the stale-error clear immediately instead of waiting for
+            // the user's next real save.
+            self.lsp_did_save(bid);
+        }
+    }
+
+    /// Reload every open buffer from disk + refresh git diffs. Used
+    /// after bulk git operations (discard-all) where we don't know
+    /// which files changed.
+    fn reload_all_buffers_from_disk(&mut self) {
+        let ids: Vec<_> = self.buffer_manager.list();
+        for bid in ids {
+            self.reload_buffer_from_disk(bid);
+        }
     }
 
     /// Show a confirmation dialog before discarding changes for the selected file.
