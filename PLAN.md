@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-23 (Session 327 — readiness gate clear: all primitives shipped with D6 `layout()` + `hit_test()`; 5406 tests, 0 failed; **ready for TUI rewrite (Phase B.4)**)
+> **Last updated:** 2026-04-23 (Session 328 — **B.4 chrome migration substantially complete**: 22 commits on develop, every major TUI overlay rendered through quadraui primitives or shared hit-region data; tests still green; chrome-only scope wrapping up)
 
 ---
 
@@ -115,6 +115,30 @@ StatusBar already consume layouts in TUI as proof of the pattern.
 The remaining TUI consumer migrations are mechanical and can happen
 incrementally during the rewrite.
 
+**🎯 Phase B.4 chrome status: SUBSTANTIALLY DONE (Session 328).**
+Every major TUI overlay now renders through a quadraui primitive or
+through shared cross-backend hit-region data:
+
+- **Tooltip-backed:** LSP hover, signature help, diff peek (multi-line
+  styled extension landed)
+- **Dialog-backed:** modal dialogs, quit-confirm, close-tab confirm
+- **ContextMenu-backed:** tab action menu, menu dropdown
+- **ListView-backed (bordered):** tab switcher (`bordered: bool`
+  extension landed)
+- **Palette-backed:** folder picker, command palette (and quickfix
+  panel via the flat ListView path)
+- **StatusBar-backed:** debug toolbar, breadcrumb bar, editor status
+  line
+- **Shared hit_regions:** find/replace overlay (no primitive — the
+  data shape itself IS the cross-backend contract)
+
+Deferred for B.4 chrome (out of scope, see Session 328 notes):
+- Tab drag overlay (doesn't fit primitive model; backend-specific)
+- Menu bar row (composite chrome — labels + nav arrows + search;
+  MenuBar primitive only covers the labels strip)
+- Picker preview pane / tree-indented variant (needs Palette
+  preview-pane support added)
+
 *TBD:* `TextEditor` / `BufferView` — Phase A.9 was marked deferred
 because vimcode's existing engine-owned text rendering path is still
 adequate. Decide at TUI-rewrite-start whether the rewrite needs a
@@ -192,9 +216,13 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
 | **Phase B.1** — `UiEvent` + `Accelerator` + `Backend` trait scaffolding | ✅ Done | _tbd_ | `quadraui-phase-b1-backend-trait` | any |
 | **Phase B.2** — pilot migration: terminal maximize to `Accelerator::Global` | ✅ Done | _tbd_ | `quadraui-phase-b2-maximize-pilot` | any |
-| Phase B.3 — layout primitives (`Panel`, `Split`, `Tabs`, `MenuBar`, `Modal`) | ⬜ After B.2 | — | `quadraui-phase-b3-layout` | any |
-| Phase B.4+ — migrate remaining vimcode subsystems to UiEvent | ⬜ After B.3 | — | `quadraui-phase-b4-*` | any |
-| Phase B.5 — Postman-class validation app (#169) | ⬜ After B.3/B.4 | — | _new workspace member_ | any |
+| **Phase B.3** — layout primitives (`Panel`, `Split`, `MenuBar`, `Modal`, `Dialog`, `ContextMenu`, `Completions`, `Tooltip`, `Toast`, `Spinner`, `ProgressBar`) + D6 retrofit on all 9 existing primitives | ✅ Done | (Session 327, ~25 commits) | `quadraui-phase-b3-*` | any |
+| **Phase B.4 chrome (TUI)** — every major TUI overlay migrated to a quadraui primitive or shared hit-region data | ✅ Substantially done (Session 328) | `4eacaa0` | `quadraui-{popup}-*` | any (TUI) |
+| Phase B.4 editor viewport (TUI) | ⬜ Deferred — chrome-only scope chose to leave `render::build_rendered_window` in place | — | `quadraui-phase-b4-editor-*` | any (TUI) |
+| Phase B.5 — GTK rewrite (chrome → editor) | ⬜ Next natural wave | — | `quadraui-phase-b5-*` | Linux / macOS with GTK4 |
+| Phase B.6 — Win-GUI rewrite | ⬜ After B.5 | — | `quadraui-phase-b6-*` | Windows |
+| Phase B.7 — macOS native rewrite | ⬜ After B.6 | — | `quadraui-phase-b7-*` | macOS |
+| Phase B.8 — Postman-class validation app (#169) | ⬜ After B.4 | — | _new workspace member_ | any |
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app (#145) | ⬜ Later | — | — | any |
 

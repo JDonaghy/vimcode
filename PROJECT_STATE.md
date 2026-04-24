@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 23, 2026 (Session 327 — **B.3 readiness gate CLEAR**; B.4 chrome-only scope picked; Dialog primitive extended with optional input field; 6 of 9 TUI consumers migrated) | **Tests:** 5407 total (full `cargo test --workspace --no-default-features`); vimcode 5244 + quadraui 163
+**Last updated:** Apr 23, 2026 (Session 328 — **B.4 chrome migration substantially complete**; every major TUI overlay now renders through quadraui primitives or shared hit-region data; 22 commits landed on `develop` after Session 327)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,128 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 328 — B.4 chrome migration substantially complete (22 commits on develop):**
+
+Every major TUI chrome popup / strip now renders through a quadraui
+primitive or — for find/replace specifically — through shared
+cross-backend hit-region data. Each migration shipped as a focused
+commit, smoke-tested in TUI, and Path-A landed (ff-merge + push
+develop) after `cargo fmt` + `cargo clippy --no-default-features
+-- -D warnings` + full test suite green. No test regressions
+across the arc.
+
+**Migrations landed (in chronological order):**
+
+1. **Dialog** rendering migrated to `DialogLayout` (`83974fe`).
+   Includes optional `DialogInput` extension (commit `9f24313`).
+2. **Completion popup** consumes `CompletionsLayout` (`afa14d9`).
+3. **Close-tab confirm overlay** → Dialog primitive
+   (`71a0d02` + `19b08ca` click intercept + `fade4e7` `:quit`/`:quit!`
+   semantics + `34e4a24` Tab/arrow nav).
+4. **Context menu** (tab action menu) → `ContextMenuLayout` (`9a52fd7`).
+5. **Quit-confirm overlay** → Dialog (`93fbd4b`).
+6. **LSP hover popup** → Tooltip (`0dbbf70`).
+7. **Signature help popup** → Tooltip with `styled_lines` extension
+   (`e6048d8` + `38a79fc` adapter unit tests + `signatureHelp`
+   client-capability fix in LSP init params).
+8. **Tab switcher popup** → bordered `ListView` (new `bordered: bool`
+   field on ListView; `85841d2`).
+9. **Folder picker modal** → `Palette` (`4e470f8` + `eae455c`
+   `:OpenRecent` ex-command dispatch fix).
+10. **Menu dropdown** → `ContextMenu` (`c6c0718`).
+11. **Debug toolbar** → `StatusBar` with `bar.resolve_click` for hit
+    testing (`f84c3c2` + `408a326` local-col fix + `de8d7e2`
+    toolbar-row math fix).
+12. **Breadcrumb bar** → `StatusBar` with `bar.resolve_click` for
+    hit testing (`553b207`).
+13. **Diff peek popup** → multi-line styled Tooltip (rename Tooltip
+    `styled` → `styled_lines: Option<Vec<StyledText>>`; `e4ae90e` +
+    `1c6af39` `revert_hunk` `--index` fix so reverting a staged hunk
+    also unstages it).
+14. **Find/replace overlay** → consolidated TUI rasteriser that walks
+    `panel.hit_regions` instead of re-deriving column math
+    (`4eacaa0`). No new quadraui primitive (find/replace doesn't fit
+    Form / Dialog / StatusBar / Palette cleanly, and a speculative
+    `Toolbar` primitive isn't justified yet — no second consumer).
+
+**Quadraui API extensions during the arc:**
+- `ListView.bordered: bool` (#[serde(default)]) for modal-style
+  bordered lists; layout insets items by 1 cell on each side and
+  reserves rows 0 + N-1 for ╭─╮ ╰─╯ borders. Title (when present)
+  overlays the top border.
+- `Tooltip.styled` (`Option<StyledText>`, single-line) renamed to
+  `Tooltip.styled_lines` (`Option<Vec<StyledText>>`, multi-line)
+  for consumers that need per-row styled spans (signature help,
+  diff peek). Single-line consumers wrap their styled line in a
+  1-element vec.
+- New `Tooltip` field `styled_lines` documented as multi-line styled
+  override; rasteriser dispatches text → styled_lines → plain text.
+
+**Engine bugs surfaced during smoke testing (fixed in same branch):**
+- `revert_hunk` ran `git apply --reverse` against the working tree
+  only, leaving any staged copy of the hunk in the index. Fixed
+  with `--index` flag.
+- `:OpenRecent` ex command silently fell through — handler was
+  present in menu-click path but missing from command-execution
+  dispatch in `mod.rs:3741`.
+- Debug toolbar `toolbar_row` math wrongly subtracted `qf_rows +
+  strip_rows` (rows above the toolbar, not below); never matched
+  when terminal/debug panel was open. Recomputed from below using
+  actual layout chunks.
+- Debug toolbar click hit-test passed absolute screen col + full
+  terminal width to `bar.resolve_click()`; the bar starts at
+  `editor_left` so absolute clicks resolved past the last segment.
+  Fixed by converting to bar-local space.
+
+**Follow-up issues filed (out-of-scope for the migration arc):**
+- #180 — LSP signature help popup never shows data (engine-side
+  data pipeline bug; render path is unit-tested correct).
+- #181 — Menu dropdown items don't highlight on mouse hover
+  (pre-existing TUI mouse-event-handling gap).
+- #182 — Debug toolbar icons render as wrong/missing glyphs in
+  some terminals (suggested fallback char improvements in
+  `src/icons.rs`).
+- #183 — Debug toolbar visibility tied to active DAP session;
+  proposes a "always show" setting + menu entry.
+- #184 — Source control panel: clicking a row highlights the row
+  ABOVE the clicked row (off-by-one in TUI mouse handler;
+  GTK already uses accumulator walk per Session 197).
+
+**Out of scope for B.4 chrome (deferred):**
+- **Tab drag overlay** — three-piece visual (drop-zone highlight
+  + insertion bar + ghost label). Doesn't fit any primitive
+  cleanly and a future backend will paint each piece its own way
+  (different drag conventions per platform). Migration would gain
+  nothing real and constrain future backends.
+- **Menu bar row** (labels strip + nav arrows + search box) —
+  composite chrome. MenuBar primitive only covers the labels
+  strip; the rest is bespoke. Revisit when a fuller composite
+  primitive lands or when the GTK rewrite forces the issue.
+- **Picker popup with preview pane / tree-indented variants** —
+  flat-list pickers already migrated to Palette; the preview
+  variant needs preview-pane support added to Palette first.
+
+**Net result:** Phase B.4 chrome arc landed 22 commits on develop
+covering ~10 substantive migrations + ~6 fixes. Tests still green
+end-to-end. Click resolution for the toolbar / breadcrumb /
+find-replace overlays now derives from the same data structure as
+paint, eliminating the entire "paint and hit-test drift apart" bug
+class on those surfaces. Pattern is established for future GTK /
+Win-GUI / macOS rewrites: each primitive's rasteriser lives in
+`{backend}_quadraui.rs`; engine-side adapter functions in
+`render.rs` build the primitive; backend-specific call site
+threads the area + theme. No engine logic changed except for the
+4 fixes listed above.
+
+**What's next:** Phase B.4 chrome can be considered substantially
+done; the remaining TUI work is the editor viewport itself (which
+the chrome-only scope explicitly defers — see Session 327 for the
+scope decision). Phase B.5 (GTK rewrite) is the natural next wave;
+or revisit the deferred picker preview pane / menu bar / tab drag
+items first if their lack is felt during day-to-day use.
+
+---
 
 **Session 327 — B.3 readiness gate CLEAR (all primitives on D6):**
 
