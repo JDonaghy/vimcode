@@ -1072,7 +1072,20 @@ impl Settings {
                 self.use_nerd_fonts = enable;
                 crate::icons::set_nerd_fonts(enable);
             }
-            _ => return Err(format!("Unknown option: {opt}")),
+            _ => {
+                // Settings panel shows snake_case keys (e.g. `window_status_line`)
+                // but `:set` historically uses vim-style packed names
+                // (`windowstatusline` / `wsl`). If the input contains an
+                // underscore, retry once with all underscores stripped so
+                // the user can paste the panel key directly.
+                if opt.contains('_') {
+                    let normalized = opt.replace('_', "");
+                    if normalized != opt {
+                        return self.set_bool_option(&normalized, enable);
+                    }
+                }
+                return Err(format!("Unknown option: {opt}"));
+            }
         }
         Ok(())
     }
@@ -1149,7 +1162,16 @@ impl Settings {
                 self.syntax_max_lines = n;
                 crate::core::buffer_manager::set_syntax_max_lines(n);
             }
-            _ => return Err(format!("Unknown option: {name}")),
+            _ => {
+                // Snake_case → packed-name fallback (see `set_bool_option`).
+                if name.contains('_') {
+                    let normalized = name.replace('_', "");
+                    if normalized != name {
+                        return self.set_value_option(&normalized, value);
+                    }
+                }
+                return Err(format!("Unknown option: {name}"));
+            }
         }
         Ok(())
     }
@@ -1325,7 +1347,16 @@ impl Settings {
             "syntax_max_lines" | "syntaxmaxlines" => {
                 Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
             }
-            _ => Err(format!("Unknown option: {opt}")),
+            _ => {
+                // Snake_case → packed-name fallback (see `set_bool_option`).
+                if opt.contains('_') {
+                    let normalized = opt.replace('_', "");
+                    if normalized != opt {
+                        return self.query_option(&normalized);
+                    }
+                }
+                Err(format!("Unknown option: {opt}"))
+            }
         }
     }
 
@@ -2270,6 +2301,43 @@ mod tests {
         assert!(s.parse_set_option("unknownoption").is_err());
         assert!(s.parse_set_option("nounknown").is_err());
         assert!(s.parse_set_option("foo=42").is_err());
+    }
+
+    #[test]
+    fn test_set_accepts_snake_case_aliases() {
+        // The Settings panel displays snake_case keys, and the `:set` command
+        // historically used vim-style packed names. Underscored aliases must
+        // work so users can paste the panel key directly.
+        let mut s = Settings::default();
+
+        // Bool setting by its snake_case name.
+        s.parse_set_option("window_status_line").unwrap();
+        assert!(s.window_status_line);
+        s.parse_set_option("nowindow_status_line").unwrap();
+        assert!(!s.window_status_line);
+
+        // Query form with snake_case.
+        let msg = s.parse_set_option("window_status_line?").unwrap();
+        assert_eq!(msg, "nowindowstatusline");
+
+        // Toggle form with snake_case.
+        s.window_status_line = false;
+        s.parse_set_option("window_status_line!").unwrap();
+        assert!(s.window_status_line);
+
+        // #174 reproducer: :set status_line_above_terminal.
+        s.parse_set_option("status_line_above_terminal").unwrap();
+        assert!(s.status_line_above_terminal);
+        s.parse_set_option("nostatus_line_above_terminal").unwrap();
+        assert!(!s.status_line_above_terminal);
+
+        // Settings whose canonical arm is already underscored still work as
+        // exact matches (the fallback should not shadow them).
+        s.parse_set_option("font_size=18").unwrap();
+        assert_eq!(s.font_size, 18);
+
+        // Unknown keys with underscores still error.
+        assert!(s.parse_set_option("not_a_real_setting").is_err());
     }
 
     #[test]
