@@ -25,6 +25,53 @@ When implementing a new key/command, add tests covering:
 
 ---
 
+## Cross-backend coverage (chrome only — editor viewport excluded)
+
+Snapshot of where each chrome surface stands on its quadraui primitive.
+TUI is the reference implementation; GTK has been catching up. Numbers
+update with each Path-A landing — read this to find the next slice.
+
+**Status:** TUI chrome is **~95%** on quadraui; GTK chrome is **~65%**.
+Closing the gap is **Phase B.5** — tracked as umbrella issue **#205**.
+
+| Surface | Primitive | TUI | GTK | Notes |
+|---|---|---|---|---|
+| Status bar (per-window + global) | `StatusBar` | ✅ | ✅ | layout via `StatusBarLayout` |
+| Tab bar | `TabBar` | ✅ | ✅ | |
+| Activity bar | `ActivityBar` | ✅ | ✅ | |
+| Tree view (explorer + SC) | `TreeView` | ✅ | ✅ | layout via `TreeViewLayout` |
+| List view (quickfix + tab switcher) | `ListView` | ✅ | ✅ | layout via `ListViewLayout` |
+| Form (settings) | `Form` | ✅ | ✅ | hint field exists but unrendered (#202) |
+| Palette (cmd palette + folder picker) | `Palette` | ✅ | ✅ | layout via `PaletteLayout` |
+| Find/replace overlay | shared hit-regions | ✅ | ✅ | engine-side `compute_find_replace_hit_regions` |
+| Terminal cells | `Terminal` | ✅ | ✅ | |
+| Tooltip (hover, signature, diff peek, panel hover) | `Tooltip` | ✅ | ❌ bespoke | 4 GTK popups → 1 primitive (#205) |
+| Dialog (quit/close confirm) | `Dialog` | ✅ | ❌ bespoke | `draw_dialog_popup` (#205) |
+| Context menu | `ContextMenu` | ✅ | ❌ bespoke | `draw_context_menu_popup` (#205) |
+| Menu dropdown (top menu bar) | `ContextMenu` | ✅ | ❌ bespoke | `draw_menu_dropdown` (#205, also closes #181) |
+| Completion popup | `Completions` | ✅ | ❌ bespoke | `draw_completion_popup` (#205) |
+| Debug toolbar | `StatusBar` | ✅ | ❌ bespoke | `draw_debug_toolbar` (#205) |
+| Breadcrumb bar | `StatusBar` | ✅ | ❌ bespoke | `draw_breadcrumb_bar` (#205) |
+| Ext-panel scrollbar (drag + render) | shared dispatch | ✅ drag | ❌ neither | #205 + #200 |
+
+**Cross-backend logic-sharing** (where one implementation drives both backends):
+
+- All primitive `Layout` algorithms (`StatusBarLayout`, `PaletteLayout`, etc.) — single implementation, both backends consume.
+- `quadraui::dispatch_mouse_down/drag/up` + `ModalStack` + `DragState` — drives palette drag, picker drag, TUI sidebar scrollbar drag, and GTK explorer scrollbar drag (as of `3e5d7d3`).
+- Engine-side hit-region builders (`compute_find_replace_hit_regions`) and cell-unit fit algorithms (`StatusBar::fit_right_start`, `TabBar::fit_active_scroll_offset`) — parameterised over a measurement closure so each backend supplies its native unit.
+- `core::settings::SAVE_REVISION` — one source of truth both file watchers consult (#201).
+- All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
+
+**North-star ("developer doesn't need to know the backend") status:**
+
+- ✅ True for picker-shaped, status-bar-shaped, tree-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
+- ❌ Not yet true for dialog / tooltip / completion-shaped surfaces — GTK still bespoke. Phase B.5 / #205 closes this.
+- ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO, future Win-GUI `ReadDirectoryChangesW`). Suppress decision is shared (#201) but not the watcher invocation. **Filed as gap to revisit; not blocking B.5.**
+- ⏭️ Editor viewport explicitly out of scope (deferred A.9 / B.4-editor) — vimcode-the-editor still hand-renders text per-backend, which is fine for vimcode but means the vim-motion-suite vision (PLAN.md) needs A.9 before it can launch.
+- ⏭️ Win-GUI has TreeView / Explorer / StatusBar / TabBar but most of B.3+ hasn't reached Windows. "Cross-platform" currently means ~1.5 platforms.
+
+---
+
 ## Recent Work
 
 **Session 330 (cont.) — GTK explorer scrollbar migrated to `dispatch_mouse_drag` (closes #204 + #199):**
