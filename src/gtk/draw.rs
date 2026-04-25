@@ -346,7 +346,16 @@ pub(super) fn draw_editor(
     );
 
     // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
-    draw_signature_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_signature_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c3. Draw diff peek popup (inline git hunk preview)
     draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
@@ -2268,6 +2277,7 @@ pub(super) fn draw_diff_peek_popup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_signature_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -2275,6 +2285,8 @@ pub(super) fn draw_signature_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(sig) = &screen.signature_help else {
         return;
@@ -2290,58 +2302,56 @@ pub(super) fn draw_signature_popup(
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
     let anchor_view_line = sig.anchor_line.saturating_sub(active_win.scroll_top);
-    let popup_x =
+    let anchor_x =
         active_win.rect.x + gutter_width + sig.anchor_col as f64 * char_width - h_scroll_offset;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    let popup_w = ((sig.label.len() + 4) as f64 * char_width).max(120.0);
-    let popup_h = line_height + 4.0;
+    let measured_w = ((sig.label.len() + 4) as f64 * char_width).max(120.0);
+    let measured_h = line_height + 4.0;
 
-    // Place above the cursor if space allows, otherwise below.
-    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-    };
-
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Build Pango attr list: active parameter in keyword color, rest in hover_fg.
-    let display = format!(" {}", sig.label);
-    let offset = 1usize; // accounts for the leading space
-
-    let attrs = AttrList::new();
-    let (fr, fg_g, fb) = theme.hover_fg.to_pango_u16();
-    let mut base_attr = AttrColor::new_foreground(fr, fg_g, fb);
-    base_attr.set_start_index(0);
-    base_attr.set_end_index(display.len() as u32);
-    attrs.insert(base_attr);
-
-    if let Some(idx) = sig.active_param {
-        if let Some(&(start, end)) = sig.params.get(idx) {
-            let (kr, kg, kb) = theme.keyword.to_pango_u16();
-            let mut kw_attr = AttrColor::new_foreground(kr, kg, kb);
-            kw_attr.set_start_index((offset + start) as u32);
-            kw_attr.set_end_index((offset + end) as u32);
-            attrs.insert(kw_attr);
+    // Build a single styled line: pre-active text, active parameter (in
+    // keyword colour), post-active text. The active parameter byte range
+    // is in `sig.params[active_param]` and indexes into `sig.label`.
+    let kw_color = render::to_quadraui_color(theme.keyword);
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    let active_range = sig
+        .active_param
+        .and_then(|idx| sig.params.get(idx).copied());
+    if let Some((start, end)) = active_range {
+        if start < sig.label.len() && end <= sig.label.len() && start < end {
+            if start > 0 {
+                spans.push(quadraui::StyledSpan::plain(sig.label[..start].to_string()));
+            }
+            spans.push(quadraui::StyledSpan::with_fg(
+                sig.label[start..end].to_string(),
+                kw_color,
+            ));
+            if end < sig.label.len() {
+                spans.push(quadraui::StyledSpan::plain(sig.label[end..].to_string()));
+            }
         }
     }
+    if spans.is_empty() {
+        spans.push(quadraui::StyledSpan::plain(sig.label.clone()));
+    }
+    let styled_line = quadraui::StyledText { spans };
 
-    layout.set_text(&display);
-    layout.set_attributes(Some(&attrs));
-    cr.move_to(popup_x, popup_y + 2.0);
-    pangocairo::show_layout(cr, layout);
-    layout.set_attributes(None);
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp:signature"),
+        text: String::new(),
+        styled_lines: Some(vec![styled_line]),
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(anchor_x as f32, anchor_y as f32, char_width as f32, line_height as f32),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
+
+    super::quadraui_gtk::draw_tooltip(cr, layout, &tooltip, &tip_layout, line_height, char_width, theme);
 }
 
 /// Draw the inline find/replace overlay at the top-right of the editor.
