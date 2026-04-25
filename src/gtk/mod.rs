@@ -1878,7 +1878,6 @@ impl SimpleComponent for App {
         #[allow(clippy::type_complexity)]
         let explorer_scrollbar_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
-        let explorer_scrollbar_drag_from: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
@@ -2229,63 +2228,98 @@ impl SimpleComponent for App {
         // `GestureDrag` on `main_hbox` from interpreting a thumb drag as
         // a panel-width resize (the scrollbar lives right at the sidebar
         // edge, so the ambiguity is real).
+        //
+        // Drag math goes through `quadraui::dispatch_mouse_drag` (same code
+        // path TUI uses) — this gives correct thumb-length compensation
+        // (#204) so the thumb tracks 1:1 with the mouse instead of feeling
+        // sluggish, and makes the picker / sidebar / palette scrollbars all
+        // share one math implementation. Click-on-track jump-scroll happens
+        // here in `connect_drag_begin` rather than in the click handler so
+        // it fires reliably even when GTK claims the drag sequence and
+        // suppresses the click (#199).
         {
-            let sb_rect_cell = explorer_scrollbar_rect.clone();
-            let drag_from = explorer_scrollbar_drag_from.clone();
-            let state_d = explorer_state.clone();
-            let row_h_cell = explorer_row_height_cell.clone();
-            let da_for_draw = widgets.explorer_da.clone();
-            let da_for_update = widgets.explorer_da.clone();
-            let drag_from_update = drag_from.clone();
-            let sb_rect_update = sb_rect_cell.clone();
-            let state_update = state_d.clone();
-            let row_h_update = row_h_cell.clone();
-            let drag_from_end = drag_from.clone();
+            let sb_rect_begin = explorer_scrollbar_rect.clone();
+            let state_begin = explorer_state.clone();
+            let row_h_begin = explorer_row_height_cell.clone();
+            let da_begin = widgets.explorer_da.clone();
+            let drag_state_begin = model.drag_state.clone();
+
+            let state_update = explorer_state.clone();
+            let da_update = widgets.explorer_da.clone();
+            let drag_state_update = model.drag_state.clone();
+
+            let drag_state_end = model.drag_state.clone();
+            let da_end = widgets.explorer_da.clone();
+
             let gesture = gtk4::GestureDrag::new();
             gesture.set_button(1);
-            gesture.connect_drag_begin(move |g, x_start, _y_start| {
-                let Some((sb_x, _sb_y, sb_w, _sb_h)) = sb_rect_cell.get() else {
-                    drag_from.set(None);
+            gesture.connect_drag_begin(move |g, x_start, y_start| {
+                let Some((sb_x, sb_y, sb_w, sb_h)) = sb_rect_begin.get() else {
                     return;
                 };
                 if x_start < sb_x || x_start > sb_x + sb_w {
-                    drag_from.set(None);
                     return;
                 }
-                // Started on scrollbar — claim so sibling/parent drags
-                // (sidebar resize) don't also fire.
                 g.set_state(gtk4::EventSequenceState::Claimed);
-                let st = state_d.borrow();
-                drag_from.set(Some(st.scroll_top));
-                // A press on the track has already jump-scrolled via the
-                // click gesture; the drag-begin fires AFTER click-press,
-                // so `st.scroll_top` already reflects the jump. Subsequent
-                // drag_update deltas fine-tune from there.
-                da_for_draw.queue_draw();
-            });
-            gesture.connect_drag_update(move |_, _dx, dy| {
-                let Some(start_top) = drag_from_update.get() else {
-                    return;
-                };
-                let Some((_sb_x, _sb_y, _sb_w, sb_h)) = sb_rect_update.get() else {
-                    return;
-                };
-                let total = state_update.borrow().rows.len();
-                let item_h = row_h_update.get().max(1.0);
-                let viewport = (da_for_update.height() as f64 / item_h).floor().max(0.0) as usize;
+
+                let total = state_begin.borrow().rows.len();
+                let item_h = row_h_begin.get().max(1.0);
+                let viewport = (da_begin.height() as f64 / item_h).floor().max(0.0) as usize;
                 let max_scroll = total.saturating_sub(viewport);
                 if max_scroll == 0 || sb_h <= 0.0 {
                     return;
                 }
-                // `dy` is pixels on the track; convert to a row offset
-                // using the same ratio the draw uses to place the thumb.
-                let delta_rows = (dy / sb_h * max_scroll as f64).round() as isize;
-                let new_top = (start_top as isize + delta_rows).max(0) as usize;
-                state_update.borrow_mut().scroll_top = new_top.min(max_scroll);
-                da_for_update.queue_draw();
+
+                // Jump-scroll to click position so a click without a
+                // following drag still moves the bar. Mirrors what the
+                // click gesture's handler would do, but fires here too
+                // because GTK suppresses the click handler once we
+                // claim the sequence.
+                let ratio = ((y_start - sb_y) / sb_h).clamp(0.0, 1.0);
+                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
+                state_begin.borrow_mut().scroll_top = new_top;
+
+                drag_state_begin
+                    .borrow_mut()
+                    .begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new("explorer:sb"),
+                        track_start: sb_y as f32,
+                        track_length: sb_h as f32,
+                        visible_rows: viewport,
+                        total_items: total,
+                    });
+
+                da_begin.queue_draw();
+            });
+            gesture.connect_drag_update(move |g, dx, dy| {
+                let Some((start_x, start_y)) = g.start_point() else {
+                    return;
+                };
+                let drag = drag_state_update.borrow();
+                if !drag.is_active() {
+                    return;
+                }
+                let events = quadraui::dispatch_mouse_drag(
+                    &drag,
+                    quadraui::Point {
+                        x: (start_x + dx) as f32,
+                        y: (start_y + dy) as f32,
+                    },
+                    Default::default(),
+                );
+                drop(drag);
+                for ev in &events {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
+                        if widget.as_str() == "explorer:sb" {
+                            state_update.borrow_mut().scroll_top = *new_offset;
+                            da_update.queue_draw();
+                        }
+                    }
+                }
             });
             gesture.connect_drag_end(move |_, _, _| {
-                drag_from_end.set(None);
+                drag_state_end.borrow_mut().end();
+                da_end.queue_draw();
             });
             widgets.explorer_da.add_controller(gesture);
         }
