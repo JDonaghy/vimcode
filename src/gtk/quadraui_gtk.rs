@@ -1836,3 +1836,138 @@ pub(super) fn draw_tooltip(
         pangocairo::show_layout(cr, layout);
     }
 }
+
+/// Flatten a `quadraui::StyledText` to a plain `String`. Dialog title +
+/// body don't currently carry per-span style overrides, so plain text
+/// suffices on GTK; mirrors the TUI helper of the same name.
+fn styled_text_plain(text: &quadraui::StyledText) -> String {
+    text.spans.iter().map(|s| s.text.as_str()).collect::<String>()
+}
+
+/// Draw a `quadraui::Dialog` at its resolved layout. Returns the button
+/// hit-rectangles (in the same `(x, y, w, h)` shape the legacy renderer
+/// returned) so the caller's click handler keeps working unchanged.
+///
+/// Per D6, the caller measures title/body/buttons in pixels and asks
+/// `dialog.layout()` for the resolved sub-bounds; this rasteriser paints
+/// the box (background + 1px border), title bar, body text, optional
+/// input, and buttons (with the default-button highlight on the
+/// primary).
+pub(super) fn draw_dialog(
+    cr: &Context,
+    layout: &pango::Layout,
+    ui_layout: &pango::Layout,
+    dialog: &quadraui::Dialog,
+    dialog_layout: &quadraui::DialogLayout,
+    line_height: f64,
+    theme: &Theme,
+) -> Vec<(f64, f64, f64, f64)> {
+    let bounds = dialog_layout.bounds;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return Vec::new();
+    }
+
+    let (bg_r, bg_g, bg_b) = vc_to_cairo(theme.fuzzy_bg);
+    let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.fuzzy_fg);
+    let (br_r, br_g, br_b) = vc_to_cairo(theme.fuzzy_border);
+    let (sel_r, sel_g, sel_b) = vc_to_cairo(theme.fuzzy_selected_bg);
+    let (input_bg_r, input_bg_g, input_bg_b) = vc_to_cairo(theme.completion_bg);
+
+    let bx = bounds.x as f64;
+    let by = bounds.y as f64;
+    let bw = bounds.width as f64;
+    let bh = bounds.height as f64;
+
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(bx, by, bw, bh);
+    cr.fill().ok();
+
+    cr.set_source_rgb(br_r, br_g, br_b);
+    cr.set_line_width(1.0);
+    cr.rectangle(bx, by, bw, bh);
+    cr.stroke().ok();
+
+    if let Some(title_rect) = dialog_layout.title_bounds {
+        let (tr, tg, tb) = vc_to_cairo(theme.fuzzy_title_fg);
+        cr.set_source_rgb(tr, tg, tb);
+        ui_layout.set_text(&styled_text_plain(&dialog.title));
+        ui_layout.set_attributes(None);
+        cr.move_to(title_rect.x as f64, title_rect.y as f64);
+        pangocairo::show_layout(cr, ui_layout);
+    }
+
+    let body_b = dialog_layout.body_bounds;
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    for (i, line) in styled_text_plain(&dialog.body).split('\n').enumerate() {
+        let row_y = body_b.y as f64 + i as f64 * line_height;
+        if row_y + line_height > body_b.y as f64 + body_b.height as f64 {
+            break;
+        }
+        layout.set_text(line);
+        layout.set_attributes(None);
+        cr.move_to(body_b.x as f64, row_y);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    if let (Some(input_b), Some(input)) = (dialog_layout.input_bounds, dialog.input.as_ref()) {
+        let ix = input_b.x as f64;
+        let iy = input_b.y as f64;
+        let iw = input_b.width as f64;
+        let ih = input_b.height as f64;
+        cr.set_source_rgb(input_bg_r, input_bg_g, input_bg_b);
+        cr.rectangle(ix, iy, iw, ih);
+        cr.fill().ok();
+        cr.set_source_rgb(br_r, br_g, br_b);
+        cr.rectangle(ix, iy, iw, ih);
+        cr.stroke().ok();
+        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        let display = if input.value.is_empty() {
+            format!(" {}", input.placeholder)
+        } else {
+            format!(" {}", input.value)
+        };
+        layout.set_text(&display);
+        layout.set_attributes(None);
+        let (_, ilh) = layout.pixel_size();
+        cr.move_to(ix + 2.0, iy + (ih - ilh as f64) / 2.0);
+        pangocairo::show_layout(cr, layout);
+    }
+
+    let mut rects = Vec::with_capacity(dialog_layout.visible_buttons.len());
+    for vis in &dialog_layout.visible_buttons {
+        let btn = &dialog.buttons[vis.button_idx];
+        let bx = vis.bounds.x as f64;
+        let by = vis.bounds.y as f64;
+        let bw = vis.bounds.width as f64;
+        let bh = vis.bounds.height as f64;
+        rects.push((bx, by, bw, bh));
+
+        if btn.is_default {
+            cr.set_source_rgb(sel_r, sel_g, sel_b);
+            cr.rectangle(bx, by, bw, bh);
+            cr.fill().ok();
+        }
+
+        let label = if dialog.vertical_buttons {
+            let prefix = if btn.is_default { "▸ " } else { "  " };
+            format!("{}{}", prefix, btn.label)
+        } else {
+            format!("  {}  ", btn.label)
+        };
+        cr.set_source_rgb(fg_r, fg_g, fg_b);
+        ui_layout.set_text(&label);
+        ui_layout.set_attributes(None);
+        let (lw, lh) = ui_layout.pixel_size();
+        let lw = lw as f64;
+        let lh = lh as f64;
+        let label_x = if dialog.vertical_buttons {
+            bx + 4.0
+        } else {
+            bx + (bw - lw) / 2.0
+        };
+        let label_y = by + (bh - lh) / 2.0;
+        cr.move_to(label_x, label_y);
+        pangocairo::show_layout(cr, ui_layout);
+    }
+    rects
+}

@@ -3070,7 +3070,7 @@ pub(super) fn draw_dialog_popup(
     editor_height: f64,
     line_height: f64,
 ) -> Vec<(f64, f64, f64, f64)> {
-    let Some(dialog) = &screen.dialog else {
+    let Some(panel) = &screen.dialog else {
         return Vec::new();
     };
 
@@ -3079,157 +3079,88 @@ pub(super) fn draw_dialog_popup(
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
-    // Measure button widths.
-    let mut btn_total_w = 8.0; // padding
-    let mut btn_max_w = 0.0f64;
-    for (label, _) in &dialog.buttons {
-        ui_layout.set_text(&format!("  {}  ", label));
-        let (w, _) = ui_layout.pixel_size();
-        btn_total_w += w as f64 + 4.0;
-        btn_max_w = btn_max_w.max(w as f64 + 4.0);
-    }
+    // Convert engine-side panel → quadraui::Dialog (synthesises button
+    // ids, lifts is_selected → is_default). Same adapter TUI uses.
+    let dialog = render::dialog_panel_to_quadraui_dialog(panel);
 
-    // Measure body width.
+    // Measure each region in pixels so the primitive's `layout()` can
+    // place sub-bounds without owning Pango itself.
+    let title_text = dialog
+        .title
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<String>();
+    ui_layout.set_text(&title_text);
+    let (title_w, _) = ui_layout.pixel_size();
+
+    let body_text = dialog
+        .body
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<String>();
     let mut body_max_w = 0.0f64;
-    for line in &dialog.body {
+    for line in body_text.split('\n') {
         layout.set_text(line);
         let (w, _) = layout.pixel_size();
         body_max_w = body_max_w.max(w as f64);
     }
+    let body_lines = body_text.split('\n').count();
 
-    // Title width.
-    ui_layout.set_text(&dialog.title);
-    let (title_w, _) = ui_layout.pixel_size();
+    // Measure horizontal-button widths uniformly (max of formatted
+    // labels) so layout's `button_width` is consistent.
+    let mut btn_max_w = 0.0f64;
+    for btn in &dialog.buttons {
+        ui_layout.set_text(&format!("  {}  ", btn.label));
+        let (w, _) = ui_layout.pixel_size();
+        btn_max_w = btn_max_w.max(w as f64);
+    }
 
-    let has_input = dialog.input.is_some();
-    let input_rows = if has_input { 1.0 } else { 0.0 };
-    let effective_btn_w = if dialog.vertical_buttons {
+    let padding = 12.0;
+    let button_gap = 4.0;
+    let button_row_height = if dialog.vertical_buttons {
+        line_height * dialog.buttons.len() as f64
+    } else {
+        line_height * 1.5
+    };
+    let title_height = if title_text.is_empty() {
+        0.0
+    } else {
+        line_height * 1.5
+    };
+    let body_height = body_lines as f64 * line_height;
+    let input_height = if dialog.input.is_some() {
+        line_height + 4.0
+    } else {
+        0.0
+    };
+
+    let total_btns_w = if dialog.vertical_buttons {
         btn_max_w + 24.0
     } else {
-        btn_total_w
+        dialog.buttons.len() as f64 * btn_max_w
+            + (dialog.buttons.len().saturating_sub(1)) as f64 * button_gap
     };
-    let content_w = body_max_w.max(title_w as f64 + 16.0).max(effective_btn_w);
-    let popup_w = (content_w + 32.0).clamp(350.0, editor_width - 40.0);
-    let btn_rows = if dialog.vertical_buttons {
-        dialog.buttons.len() as f64
-    } else {
-        1.0
+    let content_w = body_max_w
+        .max(title_w as f64 + 16.0)
+        .max(total_btns_w);
+    let popup_w = (content_w + padding * 2.0).clamp(350.0, editor_width - 40.0);
+
+    let measure = quadraui::DialogMeasure {
+        width: popup_w as f32,
+        title_height: title_height as f32,
+        body_height: body_height as f32,
+        input_height: input_height as f32,
+        button_row_height: button_row_height as f32,
+        button_width: btn_max_w as f32,
+        button_gap: button_gap as f32,
+        padding: padding as f32,
     };
-    let popup_h = ((3.0 + dialog.body.len() as f64 + input_rows + btn_rows + 1.0) * line_height)
-        .min(editor_height - 40.0);
+    let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    let dialog_layout = dialog.layout(viewport, measure);
 
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
-
-    // Background.
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border.
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Title.
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    ui_layout.set_text(&dialog.title);
-    ui_layout.set_attributes(None);
-    cr.move_to(popup_x + 12.0, popup_y + line_height * 0.3);
-    pangocairo::show_layout(cr, &ui_layout);
-
-    // Body lines.
-    let body_y = popup_y + line_height * 1.8;
-    let (r, g, b) = theme.fuzzy_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    for (i, line) in dialog.body.iter().enumerate() {
-        layout.set_text(line);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + 12.0, body_y + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Input field (if present).
-    if let Some(ref input) = dialog.input {
-        let input_y = body_y + dialog.body.len() as f64 * line_height + line_height * 0.3;
-        // Draw input background.
-        let (ibg_r, ibg_g, ibg_b) = theme.completion_bg.to_cairo();
-        cr.set_source_rgb(ibg_r, ibg_g, ibg_b);
-        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
-        cr.fill().ok();
-        // Draw input border.
-        let (br_r, br_g, br_b) = theme.fuzzy_border.to_cairo();
-        cr.set_source_rgb(br_r, br_g, br_b);
-        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
-        cr.stroke().ok();
-        // Draw input text.
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&format!(" {}", input.display));
-        layout.set_attributes(None);
-        let (_, ilh) = layout.pixel_size();
-        cr.move_to(popup_x + 14.0, input_y + (line_height - ilh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Buttons — vertical list or horizontal row.
-    let mut rects = Vec::with_capacity(dialog.buttons.len());
-    if dialog.vertical_buttons {
-        let btn_start_y = popup_y + popup_h - (btn_rows + 0.5) * line_height;
-        for (i, (label, is_selected)) in dialog.buttons.iter().enumerate() {
-            let by = btn_start_y + i as f64 * line_height;
-            let row_w = popup_w - 24.0;
-            rects.push((popup_x + 12.0, by, row_w, line_height));
-
-            if *is_selected {
-                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(popup_x + 12.0, by, row_w, line_height);
-                cr.fill().ok();
-            }
-
-            let prefix = if *is_selected { "▸ " } else { "  " };
-            let btn_text = format!("{}{}", prefix, label);
-            let (r, g, b) = theme.fuzzy_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            ui_layout.set_text(&btn_text);
-            ui_layout.set_attributes(None);
-            cr.move_to(popup_x + 14.0, by);
-            pangocairo::show_layout(cr, &ui_layout);
-        }
-    } else {
-        let btn_y = popup_y + popup_h - line_height * 1.5;
-        let mut bx = popup_x + 12.0;
-        for (label, is_selected) in &dialog.buttons {
-            let btn_text = format!("  {}  ", label);
-            ui_layout.set_text(&btn_text);
-            let (bw, bh) = ui_layout.pixel_size();
-            let bw = bw as f64;
-            let bh = bh as f64;
-
-            rects.push((bx, btn_y, bw, bh));
-
-            if *is_selected {
-                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(bx, btn_y, bw, bh);
-                cr.fill().ok();
-            }
-
-            let (r, g, b) = theme.fuzzy_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            ui_layout.set_attributes(None);
-            cr.move_to(bx, btn_y);
-            pangocairo::show_layout(cr, &ui_layout);
-
-            bx += bw + 4.0;
-        }
-    }
-    rects
+    super::quadraui_gtk::draw_dialog(cr, layout, &ui_layout, &dialog, &dialog_layout, line_height, theme)
 }
 
 /// Draw an engine-driven context menu popup on the DrawingArea.
