@@ -358,7 +358,16 @@ pub(super) fn draw_editor(
     );
 
     // 5c3. Draw diff peek popup (inline git hunk preview)
-    draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_diff_peek_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
     let (eh_rect, eh_links) =
@@ -2199,6 +2208,7 @@ pub(super) fn draw_editor_hover_popup(
     (Some((popup_x, popup_y, popup_w, popup_h)), link_rects)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_diff_peek_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -2206,6 +2216,8 @@ pub(super) fn draw_diff_peek_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(peek) = &screen.diff_peek else {
         return;
@@ -2220,61 +2232,76 @@ pub(super) fn draw_diff_peek_popup(
 
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let anchor_view_line = peek.anchor_line.saturating_sub(active_win.scroll_top);
+    let anchor_x = active_win.rect.x + gutter_width;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    // Dimensions.
-    let max_line_len = peek.hunk_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let action_bar_lines = 1;
-    let num_lines = (peek.hunk_lines.len() + action_bar_lines).min(30);
-    let popup_w = ((max_line_len + 4) as f64 * char_width).max(200.0);
-    let popup_h = num_lines as f64 * line_height + 6.0;
+    let visible: Vec<&String> = peek.hunk_lines.iter().take(29).collect();
+    let action_text = "[s] Stage  [r] Revert  [q] Close";
+    let max_chars = visible
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(action_text.chars().count());
+    let measured_w = ((max_chars + 4) as f64 * char_width).max(200.0);
+    let measured_h = (visible.len() + 1) as f64 * line_height + 6.0;
 
-    // Position below the anchor line.
-    let popup_x = active_win.rect.x + gutter_width;
-    let popup_y = active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height;
+    // Build styled rows: per-line +/- colour for diff content, default fg
+    // for context and the action bar. Same colour logic as the legacy
+    // renderer; same as the TUI adapter at `render::diff_peek_to_quadraui_tooltip`.
+    let added = render::to_quadraui_color(theme.git_added);
+    let deleted = render::to_quadraui_color(theme.git_deleted);
+    let fg = render::to_quadraui_color(theme.hover_fg);
 
-    // Background.
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border.
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Diff lines with color coding.
-    for (i, hline) in peek.hunk_lines.iter().enumerate().take(29) {
-        let (r, g, b) = if hline.starts_with('+') {
-            theme.git_added.to_cairo()
+    let mut styled_lines: Vec<quadraui::StyledText> = Vec::with_capacity(visible.len() + 1);
+    for hline in &visible {
+        let line_fg = if hline.starts_with('+') {
+            added
         } else if hline.starts_with('-') {
-            theme.git_deleted.to_cairo()
+            deleted
         } else {
-            theme.hover_fg.to_cairo()
+            fg
         };
-        cr.set_source_rgb(r, g, b);
-        let display = format!(" {}", hline);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
+        styled_lines.push(quadraui::StyledText {
+            spans: vec![quadraui::StyledSpan::with_fg(hline.as_str(), line_fg)],
+        });
     }
+    styled_lines.push(quadraui::StyledText {
+        spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
+    });
 
-    // Action bar at bottom.
-    let action_y = popup_y + 2.0 + peek.hunk_lines.len().min(29) as f64 * line_height;
-    let labels = ["[s] Stage", "[r] Revert", "[q] Close"];
-    let mut ax = popup_x + char_width;
-    let (r, g, b) = theme.hover_fg.to_cairo();
-    for label in &labels {
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(label);
-        layout.set_attributes(None);
-        cr.move_to(ax, action_y);
-        pangocairo::show_layout(cr, layout);
-        ax += (label.len() as f64 + 2.0) * char_width;
-    }
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("diff_peek"),
+        text: String::new(),
+        styled_lines: Some(styled_lines),
+        // Legacy diff peek always rendered below the anchor line —
+        // mirror that with placement=Bottom (with primitive fallback
+        // to Top when there's no room below).
+        placement: quadraui::TooltipPlacement::Bottom,
+        bg: None,
+        fg: None,
+    };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            measured_w as f32,
+            line_height as f32,
+        ),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
+
+    super::quadraui_gtk::draw_tooltip(
+        cr,
+        layout,
+        &tooltip,
+        &tip_layout,
+        line_height,
+        char_width,
+        theme,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
