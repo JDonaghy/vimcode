@@ -1674,6 +1674,17 @@ impl Engine {
         if !self.settings.lsp_enabled {
             return;
         }
+        // Signature help fires from `handle_insert_key` (`(` / `,` keystrokes)
+        // BEFORE `handle_key` reaches the line that marks the buffer dirty,
+        // and well before the UI loop's normal `lsp_flush_changes` poll. So
+        // the LSP server's view of the buffer is stale at this point: the
+        // request would point past a character the server doesn't yet know
+        // about, and rust-analyzer would respond with no signatures.
+        // Mark the active buffer dirty ourselves and flush synchronously so
+        // the server sees the current text + cursor position together.
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.lsp_flush_changes();
         let (path, line, col_utf16) = match self.lsp_cursor_position() {
             Some(v) => v,
             None => return,
