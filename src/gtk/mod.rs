@@ -8509,11 +8509,15 @@ impl App {
                     let flat_idx = scroll + local;
                     if flat_idx < total {
                         engine.settings_selected = flat_idx;
-                        if n_press >= 2 {
-                            // Double-click = act on the row (toggle, expand,
-                            // open editor for Integer/StringVal — same as Enter
-                            // in keyboard nav).
-                            let row = engine.settings_flat_list()[flat_idx].clone();
+                        let row = engine.settings_flat_list()[flat_idx].clone();
+                        let is_category = matches!(
+                            row,
+                            SettingsRow::CoreCategory(_) | SettingsRow::ExtCategory(_)
+                        );
+                        // Section headers activate on single-click (matches
+                        // explorer folders + SC section headers). Settings
+                        // require double-click to avoid surprise edits.
+                        if is_category || n_press >= 2 {
                             match row {
                                 SettingsRow::CoreSetting(idx) => {
                                     let def = &SETTING_DEFS[idx];
