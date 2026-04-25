@@ -251,11 +251,13 @@ struct App {
     css_provider: gtk4::CssProvider,
     /// Colorscheme name at the time the CSS was last applied.
     last_colorscheme: String,
-    /// Set to true when VimCode writes settings.json itself (via SettingChanged or :set).
-    /// SettingsFileChanged skips the reload if this flag is true (we already have the
-    /// correct in-memory state) and clears the flag.  Prevents the GIO file watcher from
-    /// redundantly reloading settings that VimCode just saved.
-    settings_self_save: bool,
+    /// Save-revision of `settings.json` at the last GIO file-watcher event.
+    /// Compared against `core::settings::save_revision()` to tell self-saves
+    /// (SettingChanged from the panel, `:set` from the command line, anything
+    /// that calls `Settings::save`) apart from external edits. Self-saves
+    /// refresh the cached revision silently; external edits trigger reload +
+    /// the "Settings reloaded from disk" message.
+    settings_save_revision: u64,
     /// Active context-menu popover (explorer or tab). Kept alive so we can
     /// unparent it before creating a new one (avoids GTK CSS node assertions).
     active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
@@ -2061,7 +2063,7 @@ impl SimpleComponent for App {
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
-            settings_self_save: false,
+            settings_save_revision: core::settings::save_revision(),
             active_ctx_popover: active_ctx_popover_ref.clone(),
             modal_stack: Rc::new(RefCell::new(quadraui::ModalStack::new())),
             drag_state: Rc::new(RefCell::new(quadraui::DragState::new())),
@@ -4088,12 +4090,13 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SettingsFileChanged => {
-                // If VimCode itself just saved the file, skip the reload — we already
-                // have the correct in-memory state and the file contains exactly what
-                // we wrote.  This prevents the GIO file watcher from firing an extra
-                // (redundant) Settings::load_with_validation() after every SettingChanged.
-                if self.settings_self_save {
-                    self.settings_self_save = false;
+                // If the save revision advanced since our last check, the
+                // file change came from us (SettingChanged, `:set`, etc.) —
+                // we already have the correct in-memory state. Refresh the
+                // cached revision and skip the reload + message.
+                let cur_rev = core::settings::save_revision();
+                if cur_rev != self.settings_save_revision {
+                    self.settings_save_revision = cur_rev;
                     return;
                 }
 
@@ -4119,16 +4122,11 @@ impl SimpleComponent for App {
             Msg::SettingChanged { key, value } => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.settings.set_value_str(&key, &value).is_ok() {
-                    match engine.settings.save() {
-                        Ok(()) => {
-                            // Mark that WE wrote the file so SettingsFileChanged can skip
-                            // the redundant reload (we already have the correct in-memory state).
-                            self.settings_self_save = true;
-                        }
-                        Err(e) => {
-                            engine.message = format!("Warning: setting changed but not saved: {e}");
-                        }
+                    if let Err(e) = engine.settings.save() {
+                        engine.message = format!("Warning: setting changed but not saved: {e}");
                     }
+                    // No flag to set — `Settings::save` bumps the global save
+                    // revision; SettingsFileChanged consults it directly.
                 }
                 drop(engine);
                 if key == "show_hidden_files" {

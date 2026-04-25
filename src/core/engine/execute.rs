@@ -1095,10 +1095,18 @@ impl Engine {
             }
 
             let prev_syntax_max_lines = self.settings.syntax_max_lines;
+            // Queries (`:set foo?`) don't mutate, so skip the disk save —
+            // both to avoid the unnecessary I/O and so the TUI mtime watcher
+            // doesn't trigger and clobber the query's result message.
+            let is_query = trimmed.ends_with('?');
             match self.settings.parse_set_option(trimmed) {
                 Ok(msg) => {
-                    if let Err(e) = self.settings.save() {
-                        self.message = format!("Setting changed but failed to save: {e}");
+                    if !is_query {
+                        if let Err(e) = self.settings.save() {
+                            self.message = format!("Setting changed but failed to save: {e}");
+                        } else {
+                            self.message = msg;
+                        }
                     } else {
                         self.message = msg;
                     }

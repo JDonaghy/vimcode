@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Bumped every time `Settings::save` writes to disk. Lets the TUI's
+/// settings.json mtime watcher distinguish self-saves (silent reload) from
+/// external edits (show "Settings reloaded" + apply).
+static SAVE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current save revision. Watchers cache this and compare on
+/// each poll; an unchanged revision means any mtime bump came from outside.
+pub fn save_revision() -> u64 {
+    SAVE_REVISION.load(Ordering::Acquire)
+}
 
 /// Which editing paradigm the editor uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1339,6 +1351,10 @@ impl Settings {
 
         let contents = serde_json::to_string_pretty(self)?;
         fs::write(&path, contents)?;
+
+        // Bump the save revision so the TUI mtime watcher knows this write
+        // came from us and can suppress its "Settings reloaded" message.
+        SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
 
         Ok(())
     }

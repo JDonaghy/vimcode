@@ -1156,6 +1156,9 @@ fn event_loop(
         let path = crate::core::settings::Settings::settings_file_path();
         fs::metadata(&path).ok().and_then(|m| m.modified().ok())
     };
+    // Save-revision at last check — distinguishes self-saves (e.g. :set) from
+    // external edits, so the watcher doesn't overwrite :set's result message.
+    let mut settings_save_revision: u64 = crate::core::settings::save_revision();
     // Deadline to clear the yank highlight flash.
     let mut yank_hl_deadline: Option<Instant> = None;
     // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
@@ -1519,20 +1522,29 @@ fn event_loop(
                 }
             }
             // Auto-reload settings.json when its mtime changes (e.g. after :w in the editor).
+            // Use the save-revision counter to tell external edits from self-saves
+            // (e.g. `:set`): self-saves keep settings already in sync, so we just
+            // refresh our cached mtime silently — no reload, no "Settings reloaded"
+            // message that would clobber `:set`'s own confirmation.
             {
                 let path = crate::core::settings::Settings::settings_file_path();
                 if let Ok(meta) = fs::metadata(&path) {
                     if let Ok(mtime) = meta.modified() {
-                        let changed = settings_mtime != Some(mtime);
-                        if changed {
+                        let mtime_changed = settings_mtime != Some(mtime);
+                        if mtime_changed {
                             settings_mtime = Some(mtime);
-                            if let Ok(new_settings) =
-                                crate::core::settings::Settings::load_with_validation()
-                            {
-                                engine.settings = new_settings;
-                                engine.ensure_spell_checker();
-                                engine.message = "Settings reloaded".to_string();
-                                needs_redraw = true;
+                            let cur_rev = crate::core::settings::save_revision();
+                            let self_save = cur_rev != settings_save_revision;
+                            settings_save_revision = cur_rev;
+                            if !self_save {
+                                if let Ok(new_settings) =
+                                    crate::core::settings::Settings::load_with_validation()
+                                {
+                                    engine.settings = new_settings;
+                                    engine.ensure_spell_checker();
+                                    engine.message = "Settings reloaded".to_string();
+                                    needs_redraw = true;
+                                }
                             }
                         }
                     }
