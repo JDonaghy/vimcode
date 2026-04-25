@@ -217,6 +217,14 @@ struct App {
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
     debug_toolbar_height: Rc<Cell<f64>>,
+    /// Cached menu-dropdown hit regions from the last draw of the
+    /// dropdown overlay. Each entry is `(x, y, w, h, action_id)`
+    /// where `action_id` is e.g. `menu:7`. Click + motion handlers
+    /// walk this list to map (x, y) → engine-side
+    /// `MENU_STRUCTURE.items` index instead of computing row indices
+    /// by hand. Eliminates the row-height-drift bug class (#210).
+    #[allow(clippy::type_complexity)]
+    menu_dropdown_hit_regions: Rc<RefCell<Vec<(f64, f64, f64, f64, quadraui::WidgetId)>>>,
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
@@ -2060,6 +2068,7 @@ impl SimpleComponent for App {
             debug_toolbar_hit_regions: Rc::new(RefCell::new(Vec::new())),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
+            menu_dropdown_hit_regions: Rc::new(RefCell::new(Vec::new())),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
@@ -2425,6 +2434,7 @@ impl SimpleComponent for App {
             {
                 let engine = engine.clone();
                 let lh = menu_dd_lh.clone();
+                let menu_dd_hits_for_draw = model.menu_dropdown_hit_regions.clone();
                 menu_dd_da.set_draw_func(move |_, cr, da_w, da_h| {
                     let engine = engine.borrow();
                     let Some(midx) = engine.menu_open_idx else {
@@ -2471,111 +2481,85 @@ impl SimpleComponent for App {
                         da_w as f64,
                         da_h as f64,
                         line_height,
+                        &menu_dd_hits_for_draw,
                     );
                 });
             }
 
-            // Click handler — routes clicks to menu items or closes the menu.
+            // Click handler — walks the cached hit-region list (populated
+            // by `draw_menu_dropdown` via the shared rasteriser). Each
+            // entry is `(x, y, w, h, action_id)` where `action_id` is
+            // `menu:N` and N is the engine-side `MENU_STRUCTURE.items`
+            // index. Eliminates the row-height-drift bug class (#210).
             {
                 let sender_dd = sender.input_sender().clone();
                 let engine_dd = engine.clone();
-                let lh_dd = menu_dd_lh.clone();
+                let hits_dd = model.menu_dropdown_hit_regions.clone();
                 let gesture = gtk4::GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |_, _, x, y| {
                     let engine = engine_dd.borrow();
-                    let line_height = lh_dd.get();
                     let Some(open_idx) = engine.menu_open_idx else {
                         return;
                     };
-                    // Menu bar is now the titlebar — the overlay starts below it.
-                    // The dropdown draws at y=0 in the overlay.
-                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-                        // Click in the dropdown area.
-                        // Use ~7px per char as a rough approximation matching draw_menu_bar.
-                        let mut popup_x = 8.0_f64;
-                        for i in 0..open_idx {
-                            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                                popup_x += name.len() as f64 * 7.0 + 10.0;
+                    let regions = hits_dd.borrow();
+                    for (rx, ry, rw, rh, id) in regions.iter() {
+                        if x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh {
+                            if let Some(item_idx) = render::menu_dropdown_action_index(id) {
+                                if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                                    if let Some(item) = items.get(item_idx) {
+                                        let action = item.action.to_string();
+                                        drop(regions);
+                                        drop(engine);
+                                        sender_dd
+                                            .send(Msg::MenuActivateItem(
+                                                open_idx, item_idx, action,
+                                            ))
+                                            .ok();
+                                        return;
+                                    }
+                                }
                             }
                         }
-                        let popup_w = 220.0_f64;
-                        let popup_y = 0.0;
-                        let menu_pad = 4.0;
-                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
-                        if y >= popup_y
-                            && y < popup_y + popup_h
-                            && x >= popup_x
-                            && x < popup_x + popup_w
-                        {
-                            let item_idx =
-                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
-                            if item_idx < items.len() && !items[item_idx].separator {
-                                let action = items[item_idx].action.to_string();
-                                drop(engine);
-                                sender_dd
-                                    .send(Msg::MenuActivateItem(open_idx, item_idx, action))
-                                    .ok();
-                            } else {
-                                drop(engine);
-                                sender_dd.send(Msg::CloseMenu).ok();
-                            }
-                        } else {
-                            // Click outside the dropdown → close it.
-                            drop(engine);
-                            sender_dd.send(Msg::CloseMenu).ok();
-                        }
-                    } else {
-                        drop(engine);
-                        sender_dd.send(Msg::CloseMenu).ok();
                     }
+                    // Click outside any item — close the menu.
+                    drop(regions);
+                    drop(engine);
+                    sender_dd.send(Msg::CloseMenu).ok();
                 });
                 menu_dd_da.add_controller(gesture);
             }
 
-            // Motion handler — highlight menu items on hover.
+            // Motion handler — walks the cached hit-region list to map
+            // (x, y) → item idx, then sends `Msg::MenuHighlight`. Same
+            // source-of-truth as the click handler and the rasteriser.
             {
                 let sender_motion = sender.input_sender().clone();
                 let engine_motion = engine.clone();
-                let lh_motion = menu_dd_lh.clone();
+                let hits_motion = model.menu_dropdown_hit_regions.clone();
                 let motion = gtk4::EventControllerMotion::new();
                 motion.connect_motion(move |_, x, y| {
                     let engine = engine_motion.borrow();
-                    let line_height = lh_motion.get();
-                    let Some(open_idx) = engine.menu_open_idx else {
+                    if engine.menu_open_idx.is_none() {
                         return;
-                    };
-                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-                        let mut popup_x = 8.0_f64;
-                        for i in 0..open_idx {
-                            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                                popup_x += name.len() as f64 * 7.0 + 10.0;
-                            }
+                    }
+                    let regions = hits_motion.borrow();
+                    let mut hit: Option<usize> = None;
+                    for (rx, ry, rw, rh, id) in regions.iter() {
+                        if x >= *rx && x < *rx + *rw && y >= *ry && y < *ry + *rh {
+                            hit = render::menu_dropdown_action_index(id);
+                            break;
                         }
-                        let popup_w = 220.0_f64;
-                        let popup_y = 0.0;
-                        let menu_pad = 4.0;
-                        let popup_h = items.len() as f64 * line_height + menu_pad * 2.0;
-                        if y >= popup_y
-                            && y < popup_y + popup_h
-                            && x >= popup_x
-                            && x < popup_x + popup_w
-                        {
-                            let item_idx =
-                                ((y - popup_y - menu_pad) / line_height).floor() as usize;
-                            if item_idx < items.len() && !items[item_idx].separator {
-                                if engine.menu_highlighted_item != Some(item_idx) {
-                                    drop(engine);
-                                    sender_motion.send(Msg::MenuHighlight(Some(item_idx))).ok();
-                                }
-                            } else if engine.menu_highlighted_item.is_some() {
-                                drop(engine);
-                                sender_motion.send(Msg::MenuHighlight(None)).ok();
-                            }
-                        } else if engine.menu_highlighted_item.is_some() {
+                    }
+                    drop(regions);
+                    if hit.is_some() {
+                        if engine.menu_highlighted_item != hit {
                             drop(engine);
-                            sender_motion.send(Msg::MenuHighlight(None)).ok();
+                            sender_motion.send(Msg::MenuHighlight(hit)).ok();
                         }
+                    } else if engine.menu_highlighted_item.is_some() {
+                        drop(engine);
+                        sender_motion.send(Msg::MenuHighlight(None)).ok();
                     }
                 });
                 menu_dd_da.add_controller(motion);

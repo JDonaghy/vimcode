@@ -1987,7 +1987,7 @@ pub(super) fn draw_context_menu(
     menu_layout: &quadraui::ContextMenuLayout,
     line_height: f64,
     theme: &Theme,
-) -> Vec<(f64, f64, f64, f64, usize)> {
+) -> Vec<(f64, f64, f64, f64, quadraui::WidgetId)> {
     let bounds = menu_layout.bounds;
     if bounds.width <= 0.0 || bounds.height <= 0.0 {
         return Vec::new();
@@ -2014,7 +2014,7 @@ pub(super) fn draw_context_menu(
     cr.rectangle(bx, by, bw, bh);
     cr.stroke().ok();
 
-    let mut rects: Vec<(f64, f64, f64, f64, usize)> = Vec::new();
+    let mut rects: Vec<(f64, f64, f64, f64, quadraui::WidgetId)> = Vec::new();
 
     for vis in &menu_layout.visible_items {
         let item = &menu.items[vis.item_idx];
@@ -2075,7 +2075,9 @@ pub(super) fn draw_context_menu(
         }
 
         if vis.clickable {
-            rects.push((row_x, row_y, row_w, row_h, vis.item_idx));
+            if let Some(ref id) = item.id {
+                rects.push((row_x, row_y, row_w, row_h, id.clone()));
+            }
         }
     }
     let _ = line_height;

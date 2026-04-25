@@ -3143,6 +3143,13 @@ pub fn menu_dropdown_to_quadraui_context_menu(data: &MenuBarData) -> Option<quad
     })
 }
 
+/// Resolve a `WidgetId` produced by `menu_dropdown_to_quadraui_context_menu`
+/// back to the engine-side `MENU_STRUCTURE.items` index. Returns `None`
+/// if the id doesn't match the `menu:N` pattern.
+pub fn menu_dropdown_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+    id.as_str().strip_prefix("menu:")?.parse().ok()
+}
+
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {

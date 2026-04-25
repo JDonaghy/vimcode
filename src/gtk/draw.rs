@@ -4187,7 +4187,7 @@ pub(super) fn draw_menu_bar(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_menu_dropdown(
     cr: &Context,
     data: &render::MenuBarData,
@@ -4197,8 +4197,10 @@ pub(super) fn draw_menu_dropdown(
     width: f64,
     height: f64,
     line_height: f64,
+    hit_regions_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, quadraui::WidgetId)>>>,
 ) {
     let Some(menu) = render::menu_dropdown_to_quadraui_context_menu(data) else {
+        hit_regions_out.borrow_mut().clear();
         return;
     };
 
@@ -4218,11 +4220,8 @@ pub(super) fn draw_menu_dropdown(
         }
     }
 
-    // Each non-separator row gets a full line, separators get half a
-    // line so they render as a thin rule.
-    // Uniform `line_height` per row (separators included) so the row
-    // index a backend mouse-handler computes from `(y / line_height)`
-    // matches the row index this layout produces. Separator rendering
+    // Uniform `line_height` per row (separators included) so the
+    // primitive's row positions are predictable. Separator rendering
     // (a thin rule centred in the row) happens inside `draw_context_menu`.
     let item_height =
         |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
@@ -4237,7 +4236,15 @@ pub(super) fn draw_menu_dropdown(
         item_height,
     );
 
-    super::quadraui_gtk::draw_context_menu(cr, &layout, &menu, &menu_layout, line_height, theme);
+    let hits = super::quadraui_gtk::draw_context_menu(
+        cr,
+        &layout,
+        &menu,
+        &menu_layout,
+        line_height,
+        theme,
+    );
+    *hit_regions_out.borrow_mut() = hits;
 }
 
 #[allow(clippy::too_many_arguments)]
