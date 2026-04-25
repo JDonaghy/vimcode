@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 24, 2026 (Session 329 — **Phase B.4 extends from rendering to events**: 4 GTK-rendering D6 migrations + 4 cross-backend event-routing commits; GTK + TUI picker events now flow through the same quadraui code)
+**Last updated:** Apr 24, 2026 (Session 330 — Smoke-test sweep of the Session 329 backlog: 6 fixes landed via Path A across both backends, 3 follow-up issues filed)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 279 are in **SESSION_HISTORY.md**.
@@ -26,6 +26,81 @@ When implementing a new key/command, add tests covering:
 ---
 
 ## Recent Work
+
+**Session 330 — Smoke-test sweep of Session 329 backlog (6 commits landed via Path A, 3 issues filed):**
+
+Branch-per-issue workflow: each fix on its own local branch, full
+`fmt + clippy -D warnings + test --no-default-features` gate before
+commit, smoke-tested in TUI + GTK as applicable, then ff-merged to
+develop and pushed. Five Session-329-filed issues closed; one new
+issue (#201) filed and fixed in the same session because it blocked
+verification of #174.
+
+**Landed fixes (chronological order on develop):**
+
+1. `cb84f82` — **TUI sidebar scrollbar pilot** (no issue#).
+   Migrates explorer + ext-panel scrollbar drag onto
+   `quadraui::DragState` + `dispatch_mouse_drag`. Adds `thumb_length`
+   adjustment to the dispatcher's pixel-to-rows math so the thumb
+   tracks 1:1 with mouse motion. Adds new generic
+   `UiEvent::ScrollOffsetChanged { widget, new_offset }` (replaces
+   per-primitive `PaletteEvent::ScrollOffsetChanged`).
+2. `9334686` — fix(gtk): settings panel **section headers toggle on
+   single-click** (#188). Setting rows still need double-click to
+   avoid surprise edits.
+3. `4142561` — fix(lsp): **`…` pending indicator restored** until
+   semantic tokens arrive (#195). Entirely shared-code fix:
+   `LspManager::language_supports_semantic_tokens` + downgrade in
+   `Engine::lsp_status_for_buffer`. Both backends pick it up via the
+   already-shared status-bar adapter — zero per-backend changes.
+4. `9a2271a` — fix(settings): **"Status Line Above Terminal" relabel**
+   to "Status Line Inside Window" (#173). Cheapest of the four options
+   on the issue: no key change, no settings.json migration, just label
+   + description text on the SettingDef.
+5. `a8cb6ee` — fix(settings): **`:set` accepts snake_case names**
+   shown in the Settings panel (#174). Snake_case→packed-name
+   fallback in `set_bool_option`, `set_value_option`, `query_option`
+   — backwards-compatible. Includes new unit test.
+6. `7f9af22` — fix(gtk,tui): **`:set` output no longer overwritten
+   by "Settings reloaded"** (#201). Process-global `SAVE_REVISION`
+   atomic in `Settings`; both watchers (TUI mtime poll, GTK GIO
+   `FileMonitor`) consult the revision counter to tell self-saves
+   from external edits. Replaced GTK's per-instance
+   `settings_self_save: bool` flag (which only caught the Settings
+   panel path, not `:set` from the command line). Also skips disk
+   save on query-form `:set foo?`.
+
+**Issues filed during the sweep:**
+
+- #201 — `:set` message clobber (filed + closed in-session).
+- #202 — Settings descriptions never rendered. The `description`
+  field on `SettingDef` exists but no backend's `draw_form` reads
+  `FormField.hint`. Real fix needs adapter (1 line) + Form layout
+  reservation + per-backend hint-row rendering. Out of scope for #173.
+- #203 — TUI crash on terminal resize: indent guide bounds check
+  uses window-area instead of frame-area (`render_impl.rs:2097`).
+  Pre-existing — surfaced during #cb84f82 smoke test, not caused by
+  it. Crash is recoverable (panic hook flushes swap files).
+- #204 — GTK explorer scrollbar should migrate to
+  `dispatch_mouse_drag` (cross-references #199, #200). User noticed
+  the same drag-feel bug after the TUI pilot fixed it. The math
+  fix exists in `dispatch_mouse_drag` already; the migration is
+  re-plumbing the GTK gesture handler to use shared `DragState`
+  instead of its own private `explorer_scrollbar_drag_from` cell.
+
+**Cross-backend wins worth noting:**
+
+- The #195 LSP indicator fix is the cleanest example of B.4's payoff
+  yet — one core change in `lsp_ops.rs`, both backends correct
+  immediately, *zero* per-backend code touched. The status-bar
+  adapter that renders `name…` in dim colour was already shared.
+- The #201 watcher-clobber fix uses the shared `SAVE_REVISION` atomic
+  so both the TUI poll and the GTK GIO monitor consult one source of
+  truth. The watching *mechanism* stays per-backend (necessarily —
+  GIO vs poll vs Win-GUI's future `ReadDirectoryChangesW`), but the
+  *suppress decision* is now shared.
+
+---
 
 **Session 329 — Phase B.4 arc extends into event routing (8 substantive commits + 1 fix + 1 doc + 5 issues filed):**
 

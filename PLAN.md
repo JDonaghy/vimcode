@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-24 (Session 329 — **Phase B.4 extends from rendering to events**: 4 GTK D6 migrations + 4 cross-backend event-routing commits; `quadraui::ModalStack` + `DragState` + `dispatch_mouse_*` now drive picker events on both GTK and TUI from a single code path)
+> **Last updated:** 2026-04-24 (Session 330 — Smoke-test sweep landed 6 fixes from the Session 329 backlog; #195 is the cleanest cross-backend example so far, fixing both backends from a single `src/core/` change)
 
 ---
 
