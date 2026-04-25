@@ -729,19 +729,33 @@ impl Engine {
         buffer_id: crate::core::buffer::BufferId,
     ) -> crate::core::lsp_manager::LspStatus {
         use crate::core::lsp_manager::LspStatus;
-        let lang = match self.buffer_manager.get(buffer_id) {
-            Some(s) => match s.lsp_language_id.as_deref() {
-                Some(l) => l,
-                None => return LspStatus::None,
-            },
+        let buf = match self.buffer_manager.get(buffer_id) {
+            Some(s) => s,
+            None => return LspStatus::None,
+        };
+        let lang = match buf.lsp_language_id.as_deref() {
+            Some(l) => l,
             None => return LspStatus::None,
         };
         if self.lsp_installing.contains(lang) {
             return LspStatus::Installing;
         }
-        match &self.lsp_manager {
-            Some(mgr) => mgr.lsp_status_for_language(lang),
-            None => LspStatus::None,
+        let mgr = match &self.lsp_manager {
+            Some(m) => m,
+            None => return LspStatus::None,
+        };
+        let status = mgr.lsp_status_for_language(lang);
+        // The `Initialized` LSP event marks the server as "responded" so that
+        // servers without semantic tokens (e.g. marksman) can leave the
+        // pending state immediately. For servers that DO support semantic
+        // tokens (rust-analyzer, gopls, etc.), keep the bar showing
+        // `name…` until tokens actually arrive — that's a better proxy for
+        // "workspace indexing complete" than handshake completion.
+        if let LspStatus::Running(name) = &status {
+            if buf.semantic_tokens.is_empty() && mgr.language_supports_semantic_tokens(lang) {
+                return LspStatus::Initializing(name.clone());
+            }
         }
+        status
     }
 }

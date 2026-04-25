@@ -972,6 +972,18 @@ impl LspManager {
         self.semantic_legends.get(&server_id)
     }
 
+    /// Whether the server handling `lang` advertised semanticTokens support
+    /// in its `Initialized` capabilities. Used by the per-window status bar
+    /// to keep the "…" pending indicator visible until tokens actually
+    /// arrive (workspace indexing complete) for token-supporting servers.
+    pub fn language_supports_semantic_tokens(&self, lang: &str) -> bool {
+        self.language_to_server
+            .get(lang)
+            .and_then(|sid| self.servers.get(*sid))
+            .map(|s| s.supports_semantic_tokens())
+            .unwrap_or(false)
+    }
+
     /// Find which server is handling a given file path.
     #[allow(dead_code)]
     pub fn server_id_for_path(&self, path: &Path) -> Option<LspServerId> {
