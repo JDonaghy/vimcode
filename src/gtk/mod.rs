@@ -2512,9 +2512,7 @@ impl SimpleComponent for App {
                                         drop(regions);
                                         drop(engine);
                                         sender_dd
-                                            .send(Msg::MenuActivateItem(
-                                                open_idx, item_idx, action,
-                                            ))
+                                            .send(Msg::MenuActivateItem(open_idx, item_idx, action))
                                             .ok();
                                         return;
                                     }
@@ -3859,6 +3857,20 @@ impl SimpleComponent for App {
                 // Kept as a no-op for exhaustive match.
             }
             Msg::EditorRightClick { x, y } => {
+                // Swallow if the click landed on a focused modal that
+                // wants to consume it (#216 — editor hover popup).
+                self.reconcile_editor_hover_modal();
+                let in_modal = self
+                    .modal_stack
+                    .borrow()
+                    .hit_test(quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    })
+                    .is_some();
+                if in_modal {
+                    return;
+                }
                 let cw = self.cached_char_width.max(1.0);
                 let lh = self.cached_line_height.max(1.0);
                 let cx = (x / cw) as u16;
@@ -5651,6 +5663,38 @@ impl App {
         self.window.set_title(Some(&win_title));
     }
 
+    /// Push or pop the editor hover popup on the modal stack so
+    /// click dispatch can decide modal-vs-base for both left- and
+    /// right-clicks (#216). The popup is registered whenever it's
+    /// visible (focused or not) so right-clicks anywhere inside it
+    /// stop falling through to the editor's context menu. Picker-
+    /// style reconcile: `push` dedupes on id, so calling this every
+    /// click is safe.
+    fn reconcile_editor_hover_modal(&self) {
+        let editor_hover_id = quadraui::WidgetId::new("editor_hover");
+        let engine = self.engine.borrow();
+        let visible = engine.editor_hover.is_some();
+        let rect = self.editor_hover_popup_rect.get();
+        drop(engine);
+        let mut stack = self.modal_stack.borrow_mut();
+        match (visible, rect) {
+            (true, Some((px, py, pw, ph))) => {
+                stack.push(
+                    editor_hover_id,
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
+            }
+            _ => {
+                stack.pop(&editor_hover_id);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(
         &mut self,
@@ -5661,6 +5705,7 @@ impl App {
         alt: bool,
         sender: &ComponentSender<Self>,
     ) {
+        self.reconcile_editor_hover_modal();
         // ── Context menu click handling (engine-drawn) ──
         if self.engine.borrow().context_menu.is_some() {
             let cw = self.cached_char_width.max(1.0);
@@ -5766,10 +5811,8 @@ impl App {
                 let popup_x = (width - popup_w - 10.0).max(0.0);
                 let popup_y = lh * 2.5 + 2.0;
 
-                let on_panel = x >= popup_x
-                    && x < popup_x + popup_w
-                    && y >= popup_y
-                    && y < popup_y + popup_h;
+                let on_panel =
+                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
 
                 // Content origin — 1 cell inside the borders, same as
                 // `draw_find_replace_popup`. Pixel → cell.
@@ -6659,11 +6702,7 @@ impl App {
                 drop(drag);
                 // Apply each scroll event by widget id.
                 for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged {
-                        widget,
-                        new_offset,
-                    } = ev
-                    {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
                         if widget.as_str() != "picker" {
                             continue;
                         }
@@ -6673,9 +6712,8 @@ impl App {
                         // selection-anchored clamp doesn't snap back.
                         let vis = {
                             let drag = self.drag_state.borrow();
-                            if let Some(quadraui::DragTarget::ScrollbarY {
-                                visible_rows, ..
-                            }) = drag.target()
+                            if let Some(quadraui::DragTarget::ScrollbarY { visible_rows, .. }) =
+                                drag.target()
                             {
                                 *visible_rows
                             } else {
@@ -6695,6 +6733,41 @@ impl App {
             }
             drop(drag);
 
+            // Editor hover popup text selection drag (#216). Must run
+            // BEFORE the modal-stack-swallow guard below so an
+            // in-progress selection drag inside the popup (which is
+            // now on the modal stack) doesn't get short-circuited.
+            {
+                let engine = self.engine.borrow();
+                if engine.editor_hover_has_focus
+                    && engine
+                        .editor_hover
+                        .as_ref()
+                        .is_some_and(|h| h.selection.is_some())
+                {
+                    if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
+                        let padding = 4.0;
+                        let cw = self.cached_char_width.max(1.0);
+                        let lh = self.cached_line_height.max(1.0);
+                        let scroll = engine
+                            .editor_hover
+                            .as_ref()
+                            .map(|h| h.scroll_top)
+                            .unwrap_or(0);
+                        drop(engine);
+                        let rel_x = x - px - padding;
+                        let rel_y = y - py - padding;
+                        let content_line = (rel_y / lh).max(0.0) as usize + scroll;
+                        let content_col = (rel_x / cw).max(0.0) as usize;
+                        self.engine
+                            .borrow_mut()
+                            .editor_hover_extend_selection(content_line, content_col);
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                }
+            }
+
             let stack = self.modal_stack.borrow();
             let hit_point = quadraui::Point {
                 x: x as f32,
@@ -6706,38 +6779,6 @@ impl App {
                 // the editor (#192). Active modal drags have already
                 // been handled above.
                 return;
-            }
-        }
-
-        // Editor hover popup text selection drag
-        {
-            let engine = self.engine.borrow();
-            if engine.editor_hover_has_focus
-                && engine
-                    .editor_hover
-                    .as_ref()
-                    .is_some_and(|h| h.selection.is_some())
-            {
-                if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
-                    let padding = 4.0;
-                    let cw = self.cached_char_width.max(1.0);
-                    let lh = self.cached_line_height.max(1.0);
-                    let scroll = engine
-                        .editor_hover
-                        .as_ref()
-                        .map(|h| h.scroll_top)
-                        .unwrap_or(0);
-                    drop(engine);
-                    let rel_x = x - px - padding;
-                    let rel_y = y - py - padding;
-                    let content_line = (rel_y / lh).max(0.0) as usize + scroll;
-                    let content_col = (rel_x / cw).max(0.0) as usize;
-                    self.engine
-                        .borrow_mut()
-                        .editor_hover_extend_selection(content_line, content_col);
-                    self.draw_needed.set(true);
-                    return;
-                }
             }
         }
         // Tab drag-and-drop handling.

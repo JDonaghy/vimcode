@@ -205,6 +205,30 @@ pub(super) fn handle_mouse(
     let mouse_on_editor_hover = editor_hover_popup_rect
         .is_some_and(|(px, py, pw, ph)| col >= px && col < px + pw && row >= py && row < py + ph);
 
+    // Reconcile the editor hover popup with the modal stack (#216).
+    // Push whenever the popup is visible — even unfocused. Right-click
+    // dispatch consults the stack's hit_test below so the editor's
+    // context menu can't steal events from the popup.
+    {
+        let editor_hover_id = quadraui::WidgetId::new("editor_hover");
+        match (engine.editor_hover.is_some(), editor_hover_popup_rect) {
+            (true, Some((px, py, pw, ph))) => {
+                modal_stack.push(
+                    editor_hover_id,
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
+            }
+            _ => {
+                modal_stack.pop(&editor_hover_id);
+            }
+        }
+    }
+
     // ── Hover link click-to-copy ────────────────────────────────────────────────
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
@@ -565,10 +589,7 @@ pub(super) fn handle_mouse(
                         } if *wid == picker_id => {
                             hit_modal = true;
                         }
-                        quadraui::UiEvent::Palette(
-                            _,
-                            quadraui::PaletteEvent::Closed,
-                        ) => {
+                        quadraui::UiEvent::Palette(_, quadraui::PaletteEvent::Closed) => {
                             dismiss_modal = true;
                         }
                         _ => {}
@@ -578,8 +599,7 @@ pub(super) fn handle_mouse(
                 if hit_modal {
                     // Click inside popup — inner hit-test (scrollbar,
                     // then result row) drives what the click does.
-                    let has_scrollbar =
-                        !has_preview && total_items > visible_rows && popup_w >= 2;
+                    let has_scrollbar = !has_preview && total_items > visible_rows && popup_w >= 2;
                     let sb_col = popup_x + popup_w - 2;
                     let on_scrollbar = has_scrollbar
                         && col >= sb_col
@@ -608,8 +628,7 @@ pub(super) fn handle_mouse(
                             total_items,
                         });
                     } else if row >= results_start && row < results_end {
-                        let clicked_idx =
-                            engine.picker_scroll_top + (row - results_start) as usize;
+                        let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
                         if clicked_idx < engine.picker_items.len() {
                             if engine.picker_selected == clicked_idx {
                                 // Second click on same item — toggle expand or confirm
@@ -849,11 +868,7 @@ pub(super) fn handle_mouse(
                 );
                 let mut handled = false;
                 for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged {
-                        widget,
-                        new_offset,
-                    } = ev
-                    {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
                         match widget.as_str() {
                             "explorer:sb" => {
                                 sidebar.scroll_top = *new_offset;
@@ -1317,6 +1332,19 @@ pub(super) fn handle_mouse(
 
     // ── Right-click: open context menus ────────────────────────────────────────
     if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+        // Swallow if the click landed on a focused modal that wants
+        // to consume it (#216 — editor hover popup). The modal stack
+        // was reconciled at the top of this function.
+        if modal_stack
+            .hit_test(quadraui::Point {
+                x: col as f32,
+                y: row as f32,
+            })
+            .is_some()
+        {
+            return sidebar_width;
+        }
+
         // Close any existing context menu first.
         engine.close_context_menu();
 
