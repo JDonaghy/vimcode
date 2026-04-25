@@ -1733,8 +1733,8 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     },
     SettingDef {
         key: "status_line_above_terminal",
-        label: "Status Line Above Terminal",
-        description: "Show the active window's status line as a dedicated row above the terminal panel",
+        label: "Status Line Inside Window",
+        description: "Keep each window's status line inside that window. When off and the terminal panel is open, a separated status row is shown above the terminal instead.",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },

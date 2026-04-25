@@ -2997,10 +2997,12 @@ pub struct ScreenLayout {
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
     pub tab_scroll_offset: usize,
-    /// When `status_line_above_terminal` is active AND the terminal panel is open,
+    /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
     /// above the terminal panel. When `Some`, per-window `status_line` fields on
     /// individual `RenderedWindow`s are `None`.
+    /// (Setting name is historical — the UI labels it "Status Line Inside Window";
+    /// `true` keeps the bar inside each editor window, `false` extracts it.)
     pub separated_status_line: Option<WindowStatusLine>,
 }
 
@@ -5014,7 +5016,7 @@ pub fn build_screen_layout(
     let per_window_status = engine.settings.window_status_line;
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     // When status_line_above_terminal is OFF and the terminal is open, extract the
-    // active window's status into a separated bar rendered below the terminal.
+    // active window's status into a separated bar rendered above the terminal.
     // When the setting is ON (default), per-window status bars stay inside each
     // window — they're naturally above the terminal by being part of the editor area.
     let separate_status =
