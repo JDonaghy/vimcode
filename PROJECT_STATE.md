@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 24, 2026 (Session 330 — Smoke-test sweep + GTK explorer scrollbar migration: 7 fixes landed via Path A across both backends, 7 issues closed, 3 follow-up issues filed)
+**Last updated:** Apr 25, 2026 (Session 331 — Phase B.5 GTK chrome catch-up: umbrella #205 closed substantially-complete, 7/8 slices landed, 8 issues filed, GTK chrome ~65% → ~85% on quadraui)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -31,8 +31,9 @@ Snapshot of where each chrome surface stands on its quadraui primitive.
 TUI is the reference implementation; GTK has been catching up. Numbers
 update with each Path-A landing — read this to find the next slice.
 
-**Status:** TUI chrome is **~95%** on quadraui; GTK chrome is **~65%**.
-Closing the gap is **Phase B.5** — tracked as umbrella issue **#205**.
+**Status:** TUI chrome ~95% on quadraui; GTK chrome ~85% after the
+Phase B.5 wave (#205 closed substantially-complete: 7/8 slices
+landed). One large surface deferred — see #214.
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -45,14 +46,18 @@ Closing the gap is **Phase B.5** — tracked as umbrella issue **#205**.
 | Palette (cmd palette + folder picker) | `Palette` | ✅ | ✅ | layout via `PaletteLayout` |
 | Find/replace overlay | shared hit-regions | ✅ | ✅ | engine-side `compute_find_replace_hit_regions` |
 | Terminal cells | `Terminal` | ✅ | ✅ | |
-| Tooltip (hover, signature, diff peek, panel hover) | `Tooltip` | ✅ | ❌ bespoke | 4 GTK popups → 1 primitive (#205) |
-| Dialog (quit/close confirm) | `Dialog` | ✅ | ❌ bespoke | `draw_dialog_popup` (#205) |
-| Context menu | `ContextMenu` | ✅ | ❌ bespoke | `draw_context_menu_popup` (#205) |
-| Menu dropdown (top menu bar) | `ContextMenu` | ✅ | ❌ bespoke | `draw_menu_dropdown` (#205, also closes #181) |
-| Completion popup | `Completions` | ✅ | ❌ bespoke | `draw_completion_popup` (#205) |
-| Debug toolbar | `StatusBar` | ✅ | ❌ bespoke | `draw_debug_toolbar` (#205) |
-| Breadcrumb bar | `StatusBar` | ✅ | ❌ bespoke | `draw_breadcrumb_bar` (#205) |
-| Ext-panel scrollbar (drag + render) | shared dispatch | ✅ drag | ❌ neither | #205 + #200 |
+| LSP hover popup (simple) | `Tooltip` | ✅ | ✅ | slice 1, `e1e76cd` |
+| Signature help popup | `Tooltip{styled_lines}` | ✅ | ✅ | slice 2, `aaa9a3c` |
+| Diff peek popup | `Tooltip{styled_lines}` | ✅ | ✅ | slice 3, `e6650fa` |
+| Dialog (quit/close confirm) | `Dialog` | ✅ | ✅ | slice 5, `7768a25` |
+| Context menu (right-click) | `ContextMenu` | ✅ | ✅ | slice 6, `7ce0f5d` |
+| Menu dropdown (top menu bar) | `ContextMenu` | ✅ | ✅ | slice 6 (closed #181) |
+| Debug toolbar | `StatusBar` | ✅ | ✅ | slice 8, `caf62a8` |
+| Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
+| Editor hover popup (markdown + code-hl + selection + scroll + links) | _RichTextPopup TBD_ | ❌ bespoke | ❌ bespoke | deferred — needs new primitive (#214) |
+| Completion popup | `Completions` | ✅ | ❌ bespoke | not yet migrated on GTK (separate slice when convenient) |
+| Ext-panel scrollbar (drag + render) | shared dispatch | ✅ drag | ❌ neither | #200 + GTK migration deferred |
+| Debug sidebar (variables tree, breakpoints, watch) | _none yet_ | ❌ bespoke | ❌ bespoke | hand-rolled hit math (#211) — candidates for TreeView extension |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
@@ -62,17 +67,97 @@ Closing the gap is **Phase B.5** — tracked as umbrella issue **#205**.
 - `core::settings::SAVE_REVISION` — one source of truth both file watchers consult (#201).
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
 
-**North-star ("developer doesn't need to know the backend") status:**
+**North-star ("developer doesn't need to know the backend") status after B.5:**
 
-- ✅ True for picker-shaped, status-bar-shaped, tree-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
-- ❌ Not yet true for dialog / tooltip / completion-shaped surfaces — GTK still bespoke. Phase B.5 / #205 closes this.
-- ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO, future Win-GUI `ReadDirectoryChangesW`). Suppress decision is shared (#201) but not the watcher invocation. **Filed as gap to revisit; not blocking B.5.**
-- ⏭️ Editor viewport explicitly out of scope (deferred A.9 / B.4-editor) — vimcode-the-editor still hand-renders text per-backend, which is fine for vimcode but means the vim-motion-suite vision (PLAN.md) needs A.9 before it can launch.
+- ✅ True for picker / status-bar / tree / dialog / context-menu / tooltip-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
+- ⏭️ Not yet true for **rich-document** popups (LSP hover with markdown + code highlighting + selection + scroll + links) — needs **#214 RichTextPopup** primitive, then both backends get migrated together.
+- ⚠️ **Hit-test glue still per-backend** (#210) — primitive layouts and `hit_test` methods are shared, but the wires from "mouse moved" → "selected_idx changed" are still hand-rolled in each backend's motion handler. Several bugs across the B.5 wave traced back to this (slice 6 row-height drift, slice 8 hand-rolled char-width math). Structural fix: motion handlers should call `layout.hit_test()` directly. The same shape exists in #211 (debug sidebar) and likely a few other surfaces.
+- ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO, future Win-GUI `ReadDirectoryChangesW`). Suppress decision is shared (#201) but not the watcher invocation.
+- ⏭️ Editor viewport explicitly out of scope (deferred A.9 / B.4-editor). Vimcode-the-editor still hand-renders text per-backend, which is fine for vimcode but means the vim-motion-suite vision (PLAN.md) needs A.9 before it can launch.
 - ⏭️ Win-GUI has TreeView / Explorer / StatusBar / TabBar but most of B.3+ hasn't reached Windows. "Cross-platform" currently means ~1.5 platforms.
 
 ---
 
 ## Recent Work
+
+**Session 331 — Phase B.5 GTK chrome catch-up (umbrella #205 closed, 7/8 slices landed, 8 issues filed, 1 crash fixed):**
+
+Moved GTK chrome from ~65% → ~85% on quadraui primitives. Each
+slice was its own branch, smoke-tested in GTK, then Path-A landed.
+The wave's defining feature: every smoke test surfaced one or more
+pre-existing or freshly-uncovered bugs that the migration had to
+either fix in scope or file for follow-up — making the migration's
+end state honest about what's left.
+
+**Slices landed (chronological):**
+
+1. `e1e76cd` — slice 1 — \`draw_hover_popup\` → \`Tooltip\`. New
+   \`quadraui_gtk::draw_tooltip\` rasteriser (reused by slices 2 + 3).
+2. `aaa9a3c` — slice 2 — \`draw_signature_popup\` →
+   \`Tooltip{styled_lines}\` (highlighted active param via per-span fg).
+   Live-test gated on **#180 fix** because signature help didn't
+   render server data.
+3. `ead8b56` — fix(lsp) **#180**: flush dirty buffers in
+   \`lsp_request_signature_help\` so server has the post-\`(\`-keystroke
+   buffer state when computing the cursor position. Same #189-style
+   pattern.
+4. `e6650fa` — slice 3 — \`draw_diff_peek_popup\` →
+   \`Tooltip{styled_lines}\` (per-line +/- colouring + action bar).
+5. `7768a25` — slice 5 — \`draw_dialog_popup\` → \`Dialog\`. New
+   \`quadraui_gtk::draw_dialog\` rasteriser. Returns the same
+   button-rect Vec the legacy click handler consumed.
+6. `7ce0f5d` — slice 6 — \`draw_context_menu_popup\` +
+   \`draw_menu_dropdown\` → \`ContextMenu\`. Closes **#181**. Also fixes
+   shared \`menu_dropdown_to_quadraui_context_menu\` adapter to use
+   \`usize::MAX\` sentinel instead of \`unwrap_or(0)\` — affected both
+   backends.
+7. `caf62a8` — slice 8 — \`draw_breadcrumb_bar\` +
+   \`draw_debug_toolbar\` → \`StatusBar\`. GTK debug toolbar buttons
+   are clickable for the first time (legacy code only painted, no hit
+   zones).
+8. `6bd2039` — fix **#213**: \`Tooltip::layout\` clamped with
+   \`viewport.width - vw\` as max — panicked when \`vw > viewport.width\`
+   (long LSP hover content in narrow editor). Pin to viewport edge
+   instead. Two regression tests in \`quadraui/src/lib.rs\`.
+
+**Slice 4 (editor hover popup) deferred** to **#214** — needs a new
+\`RichTextPopup\` primitive (markdown + tree-sitter syntax highlighting
+in fenced code blocks + text selection + scroll + clickable links).
+Building it correctly is its own focused wave; piecemeal-migrating
+the existing renderer would split responsibility. Honest scope call.
+
+**Issues filed during the wave** (all independent of #205, all live
+for follow-up):
+
+- #181 — closed (slice 6 fix)
+- #200 — TUI ext-panel scrollbar not drawn
+- #207 — GTK Shift-key in dialog activates default button
+- #208 — Stale gutter diagnostics after \`git checkout\` revert
+- #209 — Native-look styling for Dialog primitive
+- **#210 — Motion handlers should use primitive's hit_test, not
+  hand-rolled row math.** This is the structural class that caused
+  multiple slice-6/8 bugs and the #211 debug-sidebar bug. Worth
+  prioritising — it eliminates a whole class of "row positions
+  drift between rasteriser and click handler" bugs.
+- #211 — GTK debug variable tree click off-by-2
+- #212 — TUI debug variables non-expandable after step
+- #213 — closed (\`6bd2039\`)
+- #214 — RichTextPopup primitive (deferred slice 4)
+
+**Cross-backend wins worth noting:**
+
+- The shared adapter sentinel fix in slice 6 affects both backends
+  from one diff in \`render.rs\`.
+- The Tooltip clamp fix in #213 lives entirely in
+  \`quadraui/src/primitives/tooltip.rs\` — both backends benefit
+  immediately.
+- Five of the seven landed slices use the **same**
+  \`quadraui_gtk::draw_tooltip\` / \`draw_dialog\` /
+  \`draw_context_menu\` / \`draw_status_bar\` rasterisers as their
+  TUI counterparts use \`quadraui_tui::draw_*\`. Bug fixes in those
+  rasterisers go to one place; both backends pick them up.
+
+---
 
 **Session 330 (cont.) — GTK explorer scrollbar migrated to `dispatch_mouse_drag` (closes #204 + #199):**
 
