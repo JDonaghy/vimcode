@@ -25,6 +25,11 @@ pub(super) fn draw_editor(
     mouse_pos: (f64, f64),
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
+    breadcrumb_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    breadcrumb_y_offset_out: &Rc<Cell<f64>>,
+    debug_toolbar_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    debug_toolbar_y_offset_out: &Rc<Cell<f64>>,
+    debug_toolbar_height_out: &Rc<Cell<f64>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -312,8 +317,13 @@ pub(super) fn draw_editor(
             bc_y,
             engine.breadcrumb_focus,
             engine.breadcrumb_selected,
+            breadcrumb_hit_regions_out,
         );
         cr.restore().ok();
+        // Cache the y-offset (in DA-coords, accounting for the bc_x translate
+        // we just did — y_offset is a pure y, x is captured via the
+        // hit_regions' col).
+        breadcrumb_y_offset_out.set(bc_y);
     }
 
     // 5. Draw tab drag overlay (drop zone highlight + ghost label).
@@ -521,7 +531,13 @@ pub(super) fn draw_editor(
             toolbar_y,
             width as f64,
             line_height,
+            debug_toolbar_hit_regions_out,
         );
+        debug_toolbar_y_offset_out.set(toolbar_y);
+        debug_toolbar_height_out.set(line_height);
+    } else {
+        debug_toolbar_y_offset_out.set(0.0);
+        debug_toolbar_height_out.set(0.0);
     }
 
     // 5i. Draw horizontal scrollbars in Cairo (VSCode-style overlay on window bottom)
@@ -930,59 +946,25 @@ pub(super) fn draw_breadcrumb_bar(
     y_offset: f64,
     focus_active: bool,
     focus_selected: usize,
+    hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
 ) {
-    // Background
-    let (r, g, b) = theme.breadcrumb_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, line_height);
-    cr.fill().ok();
-
-    let separator = " \u{203A} "; // " › "
-    let mut x = 4.0; // small left padding
-
-    for (i, seg) in segments.iter().enumerate() {
-        // Separator before all but the first
-        if x > 5.0 {
-            let (sr, sg, sb) = theme.breadcrumb_fg.to_cairo();
-            cr.set_source_rgb(sr, sg, sb);
-            layout.set_text(separator);
-            cr.move_to(x, y_offset);
-            pangocairo::show_layout(cr, layout);
-            let (sw, _) = layout.pixel_size();
-            x += sw as f64;
-        }
-
-        // Measure label width for highlight rect
-        layout.set_text(&seg.label);
-        let (lw, _) = layout.pixel_size();
-
-        // Draw highlight background for focused segment
-        let is_focused = focus_active && i == focus_selected;
-        if is_focused {
-            let (hr, hg, hb) = theme.breadcrumb_active_fg.to_cairo();
-            cr.set_source_rgb(hr, hg, hb);
-            cr.rectangle(x - 2.0, y_offset, lw as f64 + 4.0, line_height);
-            cr.fill().ok();
-        }
-
-        // Segment label
-        let fg = if is_focused {
-            theme.breadcrumb_bg
-        } else if seg.is_last {
-            theme.breadcrumb_active_fg
-        } else {
-            theme.breadcrumb_fg
-        };
-        let (fr, fg_g, fb) = fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        cr.move_to(x, y_offset);
-        pangocairo::show_layout(cr, layout);
-        x += lw as f64;
-
-        if x > width {
-            break;
-        }
-    }
+    let bar = render::breadcrumbs_to_quadraui_status_bar(
+        segments,
+        theme,
+        focus_active,
+        focus_selected,
+    );
+    let hits = super::quadraui_gtk::draw_status_bar(
+        cr,
+        layout,
+        0.0,
+        y_offset,
+        width,
+        line_height,
+        &bar,
+        theme,
+    );
+    *hit_regions_out.borrow_mut() = hits;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6109,6 +6091,7 @@ pub(super) fn draw_ai_sidebar(
     let _ = row;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_debug_toolbar(
     cr: &Context,
     toolbar: &render::DebugToolbarData,
@@ -6117,34 +6100,23 @@ pub(super) fn draw_debug_toolbar(
     y: f64,
     width: f64,
     height: f64,
+    hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
 ) {
-    let (r, g, b) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(x, y, width, height);
-    let _ = cr.fill();
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
 
-    let (fr, fg_c, fb) = if toolbar.session_active {
-        theme.status_fg.to_cairo()
-    } else {
-        theme.line_number_fg.to_cairo()
-    };
-    cr.set_source_rgb(fr, fg_c, fb);
-
-    let mut cursor_x = x + 8.0;
-    for (idx, btn) in toolbar.buttons.iter().enumerate() {
-        if idx == 4 {
-            // Separator
-            let (dr, dg, db) = theme.line_number_fg.to_cairo();
-            cr.set_source_rgb(dr, dg, db);
-            cr.move_to(cursor_x, y + 2.0);
-            cr.line_to(cursor_x, y + height - 2.0);
-            let _ = cr.stroke();
-            cr.set_source_rgb(fr, fg_c, fb);
-            cursor_x += 8.0;
-        }
-        cr.move_to(cursor_x, y + height * 0.7);
-        let text = format!("{} ({}) ", btn.label, btn.key_hint);
-        let _ = cr.show_text(&text);
-        cursor_x += text.len() as f64 * 7.0;
-    }
+    let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
+    let hits = super::quadraui_gtk::draw_status_bar(
+        cr,
+        &ui_layout,
+        x,
+        y,
+        width,
+        height,
+        &bar,
+        theme,
+    );
+    *hit_regions_out.borrow_mut() = hits;
 }

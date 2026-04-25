@@ -205,6 +205,18 @@ struct App {
     action_btn_map: Rc<RefCell<ActionBtnMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     status_segment_map: Rc<RefCell<StatusSegmentMap>>,
+    /// Cached breadcrumb segment pixel hit regions from `draw_breadcrumb_bar`.
+    /// Click handler walks this list to translate (x, y) → segment index.
+    breadcrumb_hit_regions: Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    /// Pixel y-offset where the breadcrumb bar was last drawn.
+    /// Click handler uses this with `breadcrumb_hit_regions` for hit-test.
+    breadcrumb_y_offset: Rc<Cell<f64>>,
+    /// Cached debug toolbar button hit regions from `draw_debug_toolbar`.
+    debug_toolbar_hit_regions: Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    /// Pixel y-offset where the debug toolbar was last drawn.
+    debug_toolbar_y_offset: Rc<Cell<f64>>,
+    /// Pixel height of the debug toolbar (last draw).
+    debug_toolbar_height: Rc<Cell<f64>>,
     /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
     #[allow(dead_code, clippy::type_complexity)]
     nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
@@ -2043,6 +2055,11 @@ impl SimpleComponent for App {
             split_btn_map: split_btn_map_cell.clone(),
             action_btn_map: action_btn_map_cell.clone(),
             status_segment_map: status_segment_map_cell.clone(),
+            breadcrumb_hit_regions: Rc::new(RefCell::new(Vec::new())),
+            breadcrumb_y_offset: Rc::new(Cell::new(0.0)),
+            debug_toolbar_hit_regions: Rc::new(RefCell::new(Vec::new())),
+            debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
+            debug_toolbar_height: Rc::new(Cell::new(0.0)),
             nav_arrow_rects: nav_arrow_rects_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
@@ -3539,6 +3556,11 @@ impl SimpleComponent for App {
         let mouse_pos_for_draw = mouse_pos_cell.clone();
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
         let status_seg_for_draw = model.status_segment_map.clone();
+        let bc_hits_for_draw = model.breadcrumb_hit_regions.clone();
+        let bc_y_for_draw = model.breadcrumb_y_offset.clone();
+        let dbg_hits_for_draw = model.debug_toolbar_hit_regions.clone();
+        let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
+        let dbg_h_for_draw = model.debug_toolbar_height.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3568,6 +3590,11 @@ impl SimpleComponent for App {
                             mouse_pos_for_draw.get(),
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
+                            &bc_hits_for_draw,
+                            &bc_y_for_draw,
+                            &dbg_hits_for_draw,
+                            &dbg_y_for_draw,
+                            &dbg_h_for_draw,
                         );
                     };
 
@@ -5955,35 +5982,62 @@ impl App {
             }
         }
 
-        // Breadcrumb click: the breadcrumb row sits at y = line_height (below tab bar).
-        // Use char_width to approximate segment positions.
+        // Breadcrumb click: walk the cached `StatusBarHitRegion` list
+        // (populated by `draw_breadcrumb_bar` via the shared
+        // `quadraui_gtk::draw_status_bar`). Each region's `id` is
+        // `bc:N` — translated back to the segment index via
+        // `render::breadcrumb_action_index`.
         {
             let engine = self.engine.borrow();
             if engine.settings.breadcrumbs {
                 let lh = self.cached_line_height.max(1.0);
-                let cw = self.cached_char_width.max(1.0);
-                // Breadcrumb row spans y ∈ [lh, 2*lh)
-                if y >= lh && y < lh * 2.0 {
-                    // Build segments to find what was clicked.
-                    // Also rebuild engine-side segments so scoped filtering works.
-                    let segments = crate::render::build_breadcrumbs_for_active_group(&engine);
+                let bc_y = self.breadcrumb_y_offset.get();
+                if y >= bc_y && y < bc_y + lh {
                     drop(engine);
                     self.engine.borrow_mut().rebuild_breadcrumb_segments();
-                    let sep_w = " › ".chars().count() as f64 * cw;
-                    let pad = cw; // left padding
-                    let mut seg_x = pad;
-                    for (i, seg) in segments.iter().enumerate() {
-                        let label_w = seg.label.chars().count() as f64 * cw;
-                        if x >= seg_x && x < seg_x + label_w {
-                            let mut engine = self.engine.borrow_mut();
-                            engine.breadcrumb_selected = i;
-                            engine.breadcrumb_open_scoped();
-                            return;
+                    let regions = self.breadcrumb_hit_regions.borrow();
+                    for region in regions.iter() {
+                        let r_x = region.col as f64;
+                        let r_w = region.width as f64;
+                        if x >= r_x && x < r_x + r_w {
+                            if let Some(idx) = render::breadcrumb_action_index(&region.id) {
+                                drop(regions);
+                                let mut engine = self.engine.borrow_mut();
+                                engine.breadcrumb_selected = idx;
+                                engine.breadcrumb_open_scoped();
+                                return;
+                            }
                         }
-                        seg_x += label_w + sep_w;
                     }
                     return; // clicked on breadcrumb row but not a segment
                 }
+            }
+        }
+
+        // Debug toolbar click: walk the cached `StatusBarHitRegion` list
+        // (populated by `draw_debug_toolbar`). Each region's `id` is
+        // `debug:btn:N` — translated to the action via
+        // `render::debug_toolbar_action_index`, then dispatched to the
+        // engine via the same path the keyboard hotkey uses.
+        {
+            let dbg_y = self.debug_toolbar_y_offset.get();
+            let dbg_h = self.debug_toolbar_height.get();
+            if dbg_h > 0.0 && y >= dbg_y && y < dbg_y + dbg_h {
+                let regions = self.debug_toolbar_hit_regions.borrow();
+                for region in regions.iter() {
+                    let r_x = region.col as f64;
+                    let r_w = region.width as f64;
+                    if x >= r_x && x < r_x + r_w {
+                        if let Some(idx) = render::debug_toolbar_action_index(&region.id) {
+                            if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
+                                drop(regions);
+                                let _ = self.engine.borrow_mut().execute_command(btn.action);
+                                return;
+                            }
+                        }
+                    }
+                }
+                return;
             }
         }
 
