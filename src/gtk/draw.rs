@@ -334,7 +334,16 @@ pub(super) fn draw_editor(
     draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
     // 5c. Draw hover popup (on top of everything else)
-    draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_hover_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
     draw_signature_popup(cr, &layout, &screen, &theme, line_height, char_width);
@@ -1794,6 +1803,7 @@ pub(super) fn draw_completion_popup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_hover_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -1801,6 +1811,8 @@ pub(super) fn draw_hover_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(hover) = &screen.hover else {
         return;
@@ -1813,50 +1825,35 @@ pub(super) fn draw_hover_popup(
         return;
     };
 
-    // Position above the anchor line
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
     let anchor_view_line = hover.anchor_line.saturating_sub(active_win.scroll_top);
-    let popup_x =
+    let anchor_x =
         active_win.rect.x + gutter_width + hover.anchor_col as f64 * char_width - h_scroll_offset;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    // Split text into lines and measure
-    let text_lines: Vec<&str> = hover.text.lines().collect();
-    let num_lines = text_lines.len().min(20) as f64;
+    let text_lines: Vec<&str> = hover.text.lines().take(20).collect();
+    let num_lines = text_lines.len() as f64;
     let max_line_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let popup_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
-    let popup_h = num_lines * line_height + 4.0;
+    let measured_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
+    let measured_h = num_lines * line_height + 4.0;
 
-    // Place above cursor if possible, otherwise below
-    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp:hover"),
+        text: text_lines.join("\n"),
+        styled_lines: None,
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
     };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(anchor_x as f32, anchor_y as f32, char_width as f32, line_height as f32),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
 
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Text
-    let (r, g, b) = theme.hover_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    for (i, text_line) in text_lines.iter().enumerate().take(20) {
-        let display = format!(" {}", text_line);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
-    }
+    super::quadraui_gtk::draw_tooltip(cr, layout, &tooltip, &tip_layout, line_height, char_width, theme);
 }
 
 #[allow(clippy::type_complexity)]

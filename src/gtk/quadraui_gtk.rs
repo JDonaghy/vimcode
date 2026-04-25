@@ -1742,3 +1742,97 @@ pub(super) fn draw_terminal_cells(
         }
     }
 }
+
+/// Draw a `quadraui::Tooltip` at its resolved layout position.
+///
+/// Per D6, the caller computes anchor + viewport + content measurement
+/// and asks `tooltip.layout()` for the resolved bounds; this rasteriser
+/// paints the box (background + 1px border) plus either the plain
+/// `text` or per-row `styled_lines`.
+///
+/// `padding_x` is the horizontal padding (in pixels) from the left
+/// border to the start of text — consumers typically pass the same
+/// `char_width` they used when computing the tooltip's measured width.
+pub(super) fn draw_tooltip(
+    cr: &Context,
+    layout: &pango::Layout,
+    tooltip: &quadraui::Tooltip,
+    tooltip_layout: &quadraui::TooltipLayout,
+    line_height: f64,
+    padding_x: f64,
+    theme: &Theme,
+) {
+    let bounds = tooltip_layout.bounds;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return;
+    }
+
+    let (bg_r, bg_g, bg_b) = tooltip
+        .bg
+        .map(qc_to_cairo)
+        .unwrap_or_else(|| vc_to_cairo(theme.hover_bg));
+    let (fg_r, fg_g, fg_b) = tooltip
+        .fg
+        .map(qc_to_cairo)
+        .unwrap_or_else(|| vc_to_cairo(theme.hover_fg));
+    let (br, bg, bb) = vc_to_cairo(theme.hover_border);
+
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        bounds.height as f64,
+    );
+    cr.fill().ok();
+
+    cr.set_source_rgb(br, bg, bb);
+    cr.set_line_width(1.0);
+    cr.rectangle(
+        bounds.x as f64,
+        bounds.y as f64,
+        bounds.width as f64,
+        bounds.height as f64,
+    );
+    cr.stroke().ok();
+
+    let text_x = bounds.x as f64 + padding_x;
+    let text_top = bounds.y as f64 + 2.0;
+
+    if let Some(ref styled_lines) = tooltip.styled_lines {
+        // Multi-line styled path. Each `StyledText` is one row.
+        // Per-span fg overrides the tooltip default; bg defaults to
+        // tooltip bg (no per-span bg highlighting on GTK yet).
+        for (i, styled) in styled_lines.iter().enumerate() {
+            let row_y = text_top + i as f64 * line_height;
+            if row_y + line_height > bounds.y as f64 + bounds.height as f64 {
+                break;
+            }
+            cr.move_to(text_x, row_y);
+            let mut x_off = text_x;
+            for span in &styled.spans {
+                let (sr, sg, sb) = span.fg.map(qc_to_cairo).unwrap_or((fg_r, fg_g, fg_b));
+                cr.set_source_rgb(sr, sg, sb);
+                layout.set_text(&span.text);
+                layout.set_attributes(None);
+                cr.move_to(x_off, row_y);
+                pangocairo::show_layout(cr, layout);
+                let (text_w, _) = layout.pixel_size();
+                x_off += text_w as f64;
+            }
+        }
+        return;
+    }
+
+    cr.set_source_rgb(fg_r, fg_g, fg_b);
+    for (i, text_line) in tooltip.text.lines().enumerate() {
+        let row_y = text_top + i as f64 * line_height;
+        if row_y + line_height > bounds.y as f64 + bounds.height as f64 {
+            break;
+        }
+        layout.set_text(text_line);
+        layout.set_attributes(None);
+        cr.move_to(text_x, row_y);
+        pangocairo::show_layout(cr, layout);
+    }
+}
