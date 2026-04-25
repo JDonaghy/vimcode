@@ -2083,3 +2083,284 @@ pub(super) fn draw_context_menu(
     let _ = line_height;
     rects
 }
+/// Draw a `quadraui::RichTextPopup` at its resolved layout. Returns
+/// per-link hit regions in `(x, y, w, h, url)` form. Each visible
+/// line is rendered as a SINGLE Pango call with an `AttrList` —
+/// per-span fg/bold/italic + per-character selection bg become
+/// attribute ranges. This avoids the per-span manual-advance bug
+/// where proportional Pango widths drift from monospace
+/// `char_width * char_count` math (#214 first-cut regression).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_rich_text_popup(
+    cr: &Context,
+    pango_layout: &pango::Layout,
+    popup: &quadraui::RichTextPopup,
+    layout: &quadraui::RichTextPopupLayout,
+    line_height: f64,
+    char_width: f64,
+    theme: &Theme,
+) -> Vec<(f64, f64, f64, f64, String)> {
+    let _ = char_width;
+    let _ = line_height;
+    let bx = layout.bounds.x as f64;
+    let by = layout.bounds.y as f64;
+    let bw = layout.bounds.width as f64;
+    let bh = layout.bounds.height as f64;
+    if bw <= 0.0 || bh <= 0.0 {
+        return Vec::new();
+    }
+
+    let (bg_r, bg_g, bg_b) = popup
+        .bg
+        .map(qc_to_cairo)
+        .unwrap_or_else(|| vc_to_cairo(theme.hover_bg));
+    let (fg_r, fg_g, fg_b) = popup
+        .fg
+        .map(qc_to_cairo)
+        .unwrap_or_else(|| vc_to_cairo(theme.hover_fg));
+    let (border_r, border_g, border_b) = if popup.has_focus {
+        vc_to_cairo(theme.md_link)
+    } else {
+        vc_to_cairo(theme.hover_border)
+    };
+
+    // Background.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(bx, by, bw, bh);
+    cr.fill().ok();
+    // Border.
+    cr.set_source_rgb(border_r, border_g, border_b);
+    cr.set_line_width(1.0);
+    cr.rectangle(bx, by, bw, bh);
+    cr.stroke().ok();
+
+    let ui_font_desc = pango::FontDescription::from_string(UI_FONT);
+
+    // Clip text rendering to the content area so long lines (Pango is
+    // unbounded) and selection rectangles don't bleed past the popup
+    // boundary into the editor area behind. Restored at end of draw.
+    let content = layout.content_bounds;
+    cr.save().ok();
+    cr.rectangle(
+        content.x as f64,
+        content.y as f64,
+        content.width as f64,
+        content.height as f64,
+    );
+    cr.clip();
+
+    for vis in &layout.visible_lines {
+        let row_y = vis.bounds.y as f64;
+        let line_x = vis.bounds.x as f64;
+        let line_idx = vis.line_idx;
+        let raw_text = popup
+            .line_text
+            .get(line_idx)
+            .map(String::as_str)
+            .unwrap_or("");
+
+        // Single-Pango-call render with per-span AttrList.
+        if let Some(styled) = popup.lines.get(line_idx) {
+            pango_layout.set_text(raw_text);
+            pango_layout.set_font_description(Some(&ui_font_desc));
+            let attrs = pango::AttrList::new();
+            // Per-line font scale (markdown headings render larger).
+            let line_scale = popup.line_scales.get(line_idx).copied().unwrap_or(1.0);
+            if (line_scale - 1.0).abs() > 0.01 {
+                let mut a = pango::AttrFloat::new_scale(line_scale as f64);
+                a.set_start_index(0);
+                a.set_end_index(raw_text.len() as u32);
+                attrs.insert(a);
+            }
+            // Compute selection byte range once for this line.
+            let (sel_start_byte, sel_end_byte) = popup
+                .selection
+                .map(|sel| selection_byte_range(sel, line_idx, raw_text))
+                .unwrap_or((0, 0));
+            let in_selection = |byte_start: usize, byte_end: usize| -> bool {
+                sel_end_byte > sel_start_byte
+                    && byte_start >= sel_start_byte
+                    && byte_end <= sel_end_byte
+            };
+            let to_u16 = |c: u8| ((c as u16) << 8) | c as u16;
+            let bg_color = popup.bg.unwrap_or(quadraui::Color::rgb(0, 0, 0));
+
+            // Selection bg attr (single attr for whole selection range)
+            // — bg attrs don't conflict with fg attrs so this is safe to
+            // add once.
+            if sel_end_byte > sel_start_byte {
+                let fg_color = popup
+                    .fg
+                    .unwrap_or_else(|| quadraui::Color::rgb(255, 255, 255));
+                let mut inv_bg = pango::AttrColor::new_background(
+                    to_u16(fg_color.r),
+                    to_u16(fg_color.g),
+                    to_u16(fg_color.b),
+                );
+                inv_bg.set_start_index(sel_start_byte as u32);
+                inv_bg.set_end_index(sel_end_byte as u32);
+                attrs.insert(inv_bg);
+            }
+
+            // Per-span fg + bold + italic. Each span is split by the
+            // selection boundary so we can swap the fg colour to the
+            // inverted (popup bg) for the in-selection chunk without
+            // an attr-override conflict.
+            let push_fg_attr = |attrs: &pango::AttrList, start: usize, end: usize, fg: quadraui::Color| {
+                let mut a = pango::AttrColor::new_foreground(
+                    to_u16(fg.r),
+                    to_u16(fg.g),
+                    to_u16(fg.b),
+                );
+                a.set_start_index(start as u32);
+                a.set_end_index(end as u32);
+                attrs.insert(a);
+            };
+            let push_bold = |attrs: &pango::AttrList, start: usize, end: usize| {
+                let mut a = pango::AttrInt::new_weight(pango::Weight::Bold);
+                a.set_start_index(start as u32);
+                a.set_end_index(end as u32);
+                attrs.insert(a);
+            };
+            let push_italic = |attrs: &pango::AttrList, start: usize, end: usize| {
+                let mut a = pango::AttrInt::new_style(pango::Style::Italic);
+                a.set_start_index(start as u32);
+                a.set_end_index(end as u32);
+                attrs.insert(a);
+            };
+            let mut byte_pos: usize = 0;
+            for span in &styled.spans {
+                let len = span.text.len();
+                let start = byte_pos;
+                let end = byte_pos + len;
+
+                // Split the span into up-to-three chunks based on
+                // selection boundary: pre-selection / in-selection /
+                // post-selection. Each chunk gets its own fg attr
+                // (with inverted colour for the in-selection chunk).
+                let span_fg = span.fg.unwrap_or(bg_color);
+                let inv_fg = bg_color;
+
+                let chunk_start_pre = start;
+                let chunk_end_pre = end.min(sel_start_byte).max(start);
+                let chunk_start_in = start.max(sel_start_byte).min(end);
+                let chunk_end_in = end.min(sel_end_byte).max(chunk_start_in);
+                let chunk_start_post = end.min(sel_end_byte).max(start);
+                let chunk_end_post = end.max(chunk_start_post);
+
+                if span.fg.is_some() && chunk_end_pre > chunk_start_pre {
+                    push_fg_attr(&attrs, chunk_start_pre, chunk_end_pre, span_fg);
+                }
+                if chunk_end_in > chunk_start_in
+                    && in_selection(chunk_start_in, chunk_end_in)
+                {
+                    push_fg_attr(&attrs, chunk_start_in, chunk_end_in, inv_fg);
+                }
+                if span.fg.is_some() && chunk_end_post > chunk_start_post {
+                    push_fg_attr(&attrs, chunk_start_post, chunk_end_post, span_fg);
+                }
+                if span.bold {
+                    push_bold(&attrs, start, end);
+                }
+                if span.italic {
+                    push_italic(&attrs, start, end);
+                }
+                byte_pos += len;
+            }
+            // Focused-link underline.
+            if popup.has_focus {
+                if let Some(focused) = popup.focused_link {
+                    if let Some(link) = popup.links.get(focused) {
+                        if link.line == line_idx {
+                            let mut ul =
+                                pango::AttrInt::new_underline(pango::Underline::Single);
+                            ul.set_start_index(link.start_byte as u32);
+                            ul.set_end_index(link.end_byte as u32);
+                            attrs.insert(ul);
+                        }
+                    }
+                }
+            }
+            pango_layout.set_attributes(Some(&attrs));
+            cr.set_source_rgb(fg_r, fg_g, fg_b);
+            cr.move_to(line_x, row_y);
+            pangocairo::show_layout(cr, pango_layout);
+            pango_layout.set_attributes(None);
+        }
+    }
+
+    cr.restore().ok(); // pop the content clip
+
+    // Scrollbar — wider than the 1px border so it's visually + clickably
+    // present. Draw at the right inside edge of the popup.
+    if let Some(sb) = layout.scrollbar {
+        let sb_w = 8.0_f64;
+        let sb_x = bx + bw - sb_w - 1.0;
+        let track_y = sb.track.y as f64;
+        let track_h = sb.track.height as f64;
+        // Track background.
+        let (sr, sg, sbb) = vc_to_cairo(theme.line_number_fg);
+        cr.set_source_rgba(sr, sg, sbb, 0.3);
+        cr.rectangle(sb_x, track_y, sb_w, track_h);
+        cr.fill().ok();
+        // Thumb.
+        let thumb_top_off = (sb.thumb.y - sb.track.y) as f64;
+        let thumb_h = sb.thumb.height as f64;
+        cr.set_source_rgb(border_r, border_g, border_b);
+        cr.rectangle(sb_x + 1.0, track_y + thumb_top_off, sb_w - 2.0, thumb_h);
+        cr.fill().ok();
+    }
+
+    // Link hit regions in (x, y, w, h, url) form.
+    layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (
+                rect.x as f64,
+                rect.y as f64,
+                rect.width as f64,
+                rect.height as f64,
+                url,
+            )
+        })
+        .collect()
+}
+
+/// Translate a `TextSelection` (in char columns) into the byte range
+/// that this line contributes to the selection. Returns `(0, 0)` when
+/// the line is outside the selection.
+fn selection_byte_range(
+    sel: quadraui::TextSelection,
+    line_idx: usize,
+    line_text: &str,
+) -> (usize, usize) {
+    if line_idx < sel.start_line || line_idx > sel.end_line {
+        return (0, 0);
+    }
+    let char_to_byte = |col: usize| -> usize {
+        line_text
+            .char_indices()
+            .nth(col)
+            .map(|(b, _)| b)
+            .unwrap_or(line_text.len())
+    };
+    let (start_col, end_col) = if sel.start_line == sel.end_line {
+        (sel.start_col, sel.end_col)
+    } else if line_idx == sel.start_line {
+        (sel.start_col, line_text.chars().count())
+    } else if line_idx == sel.end_line {
+        (0, sel.end_col)
+    } else {
+        (0, line_text.chars().count())
+    };
+    if end_col <= start_col {
+        return (0, 0);
+    }
+    (char_to_byte(start_col), char_to_byte(end_col))
+}

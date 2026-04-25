@@ -1856,6 +1856,10 @@ pub(super) fn draw_hover_popup(
     super::quadraui_gtk::draw_tooltip(cr, layout, &tooltip, &tip_layout, line_height, char_width, theme);
 }
 
+/// Draw the LSP/editor hover popup via the `quadraui::RichTextPopup`
+/// primitive. Returns `(popup_bounds, link_rects)` where `link_rects`
+/// is `(x, y, w, h, url)` per clickable span — same shape the legacy
+/// renderer returned.
 #[allow(clippy::type_complexity)]
 pub(super) fn draw_editor_hover_popup(
     cr: &Context,
@@ -1868,8 +1872,6 @@ pub(super) fn draw_editor_hover_popup(
     Option<(f64, f64, f64, f64)>,
     Vec<(f64, f64, f64, f64, String)>,
 ) {
-    use crate::core::markdown::MdStyle;
-
     let empty = (None, Vec::new());
     let Some(eh) = screen.editor_hover.as_ref() else {
         return empty;
@@ -1881,313 +1883,65 @@ pub(super) fn draw_editor_hover_popup(
     else {
         return empty;
     };
-    let lines = &eh.rendered.lines;
-    if lines.is_empty() {
+    if eh.rendered.lines.is_empty() {
         return empty;
     }
 
-    let padding = 4.0;
-    let scroll = eh.scroll_top;
+    // Anchor in pixels from window origin + frozen scroll.
+    let gutter_w = active_win.gutter_char_width as f64 * char_width;
+    let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
+    let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
+    let anchor_x = active_win.rect.x + gutter_w + vis_col * char_width;
+    let anchor_y = active_win.rect.y + anchor_view * line_height;
 
-    // Popup width: use a comfortable reading width, clamped to editor area
+    // Content width — clamp to a comfortable reading width inside the window.
     let da_width = active_win.rect.x + active_win.rect.width;
     let popup_w = ((eh.popup_width + 2) as f64 * char_width)
         .clamp(100.0, (da_width - active_win.rect.x) * 0.9)
         .min(80.0 * char_width);
-    let text_w = popup_w - padding * 2.0;
-    let pango_text_w = (text_w * pango::SCALE as f64) as i32;
+    let content_w = popup_w - 2.0;
 
-    // Pre-compute wrapped height of each logical line using Pango word wrap
-    let mut line_heights: Vec<f64> = Vec::with_capacity(lines.len());
-    for text_line in lines {
-        let display = format!(" {}", text_line);
-        layout.set_text(&display);
-        layout.set_width(pango_text_w);
-        layout.set_wrap(pango::WrapMode::WordChar);
-        let (_pw, ph) = layout.pixel_size();
-        line_heights.push(ph as f64);
-    }
-    layout.set_width(-1); // reset for later use
+    let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);
+    let viewport = quadraui::Rect::new(
+        active_win.rect.x as f32,
+        active_win.rect.y as f32,
+        active_win.rect.width as f32,
+        active_win.rect.height as f32,
+    );
+    let measure = quadraui::RichTextPopupMeasure::new(content_w as f32, line_height as f32);
+    let cw = char_width as f32;
+    let popup_layout = popup.layout(
+        anchor_x as f32,
+        anchor_y as f32,
+        viewport,
+        measure,
+        |line_idx, start_byte, end_byte| {
+            popup
+                .line_text
+                .get(line_idx)
+                .map(|t| {
+                    t[start_byte.min(t.len())..end_byte.min(t.len())].chars().count() as f32 * cw
+                })
+                .unwrap_or(0.0)
+        },
+    );
 
-    // Determine which lines are visible within a max pixel height
-    let max_popup_content_h = 20.0 * line_height;
-    let total_content_h: f64 = line_heights.iter().sum();
-    let can_scroll = total_content_h > max_popup_content_h;
-    let scrollbar_w = if can_scroll { char_width } else { 0.0 };
-    let popup_w = popup_w + scrollbar_w;
-
-    // Calculate visible content height (lines from scroll onward, capped)
-    let mut visible_content_h = 0.0;
-    let mut visible_end = scroll;
-    for (i, h) in line_heights.iter().enumerate().skip(scroll) {
-        let h = *h;
-        if visible_content_h + h > max_popup_content_h && visible_end > scroll {
-            break;
-        }
-        visible_content_h += h;
-        visible_end = i + 1;
-    }
-    visible_content_h = visible_content_h.min(max_popup_content_h);
-
-    let focus_bar_h = if eh.has_focus { line_height } else { 0.0 };
-    let popup_h = visible_content_h + padding * 2.0 + focus_bar_h;
-
-    let gutter_width = active_win.gutter_char_width as f64 * char_width;
-    // Use frozen scroll offsets so the popup stays fixed on screen
-    let h_scroll_offset = eh.frozen_scroll_left as f64 * char_width;
-    let anchor_view_line = eh.anchor_line.saturating_sub(eh.frozen_scroll_top);
-    let mut popup_x =
-        active_win.rect.x + gutter_width + eh.anchor_col as f64 * char_width - h_scroll_offset;
-
-    // Prefer above the word (like VSCode); below only near the top
-    let space_above = anchor_view_line as f64 * line_height;
-    let space_below = active_win.rect.height - (anchor_view_line as f64 + 1.0) * line_height;
-    let popup_y = if space_above >= popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else if space_below >= popup_h {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-    } else {
-        // Neither fits perfectly — use the larger space
-        if space_above >= space_below {
-            (active_win.rect.y + anchor_view_line as f64 * line_height - popup_h).max(0.0)
-        } else {
-            active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-        }
-    };
-    // Keep popup on-screen horizontally
-    if popup_x + popup_w > da_width {
-        popup_x = (da_width - popup_w).max(active_win.rect.x);
-    }
-
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border — use link color when focused to indicate keyboard mode
-    let border_color = if eh.has_focus {
-        theme.md_link
-    } else {
-        theme.hover_border
-    };
-    let (r, g, b) = border_color.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(if eh.has_focus { 2.0 } else { 1.0 });
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Clip rendering to popup bounds so text doesn't spill outside
-    cr.save().ok();
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.clip();
-
-    // Render styled markdown lines with word wrapping
-    let mut link_rects: Vec<(f64, f64, f64, f64, String)> = Vec::new();
-    let mut y_offset = 0.0;
-    for (li, text_line) in lines.iter().enumerate().take(visible_end).skip(scroll) {
-        let display = format!(" {}", text_line);
-        let actual_line = li;
-        let line_spans = eh.rendered.spans.get(actual_line);
-        let code_hl = eh.rendered.code_highlights.get(actual_line);
-        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
-
-        let attrs = pango::AttrList::new();
-        if has_code_hl {
-            // Use tree-sitter syntax highlighting for code block lines.
-            for hl in code_hl.unwrap() {
-                let start = hl.start_byte as u32 + 1; // +1 for leading space
-                let end = hl.end_byte as u32 + 1;
-                let color = theme.scope_color(&hl.scope);
-                let (r, g, b) = color.to_pango_u16();
-                let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                attr.set_start_index(start);
-                attr.set_end_index(end);
-                attrs.insert(attr);
-            }
-        } else if let Some(spans) = line_spans {
-            for sp in spans {
-                let start = sp.start_byte as u32 + 1; // +1 for leading space
-                let end = sp.end_byte as u32 + 1;
-                match sp.style {
-                    MdStyle::Heading(1) => {
-                        let (r, g, b) = theme.md_heading1.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Heading(2) => {
-                        let (r, g, b) = theme.md_heading2.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Heading(_) => {
-                        let (r, g, b) = theme.md_heading3.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Bold | MdStyle::BoldItalic => {
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Code | MdStyle::CodeBlock => {
-                        let (r, g, b) = theme.md_code.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Link | MdStyle::LinkUrl => {
-                        let (r, g, b) = theme.md_link.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        // Underline focused link
-                        if eh.has_focus {
-                            if let Some(focused) = eh.focused_link {
-                                if let Some(&(link_line, sb, eb, _)) = eh.links.get(focused) {
-                                    if link_line == actual_line
-                                        && sp.start_byte >= sb
-                                        && sp.end_byte <= eb
-                                    {
-                                        let mut attr =
-                                            pango::AttrInt::new_underline(pango::Underline::Single);
-                                        attr.set_start_index(start);
-                                        attr.set_end_index(end);
-                                        attrs.insert(attr);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Selection highlight via Pango background attribute
-        if let Some((sl, sc, el, ec)) = eh.selection {
-            let line_chars: Vec<char> = text_line.chars().collect();
-            let in_sel = if sl == el {
-                actual_line == sl
-            } else {
-                actual_line >= sl && actual_line <= el
-            };
-            if in_sel {
-                let sel_start_char = if actual_line == sl { sc } else { 0 };
-                let sel_end_char = if actual_line == el {
-                    ec
-                } else {
-                    line_chars.len()
-                };
-                if sel_start_char < sel_end_char && sel_start_char < line_chars.len() {
-                    // Convert char offsets to byte offsets in text_line
-                    let byte_start: usize = line_chars[..sel_start_char]
-                        .iter()
-                        .map(|c| c.len_utf8())
-                        .sum();
-                    let byte_end: usize = line_chars[..sel_end_char.min(line_chars.len())]
-                        .iter()
-                        .map(|c| c.len_utf8())
-                        .sum();
-                    // +1 for the leading space in `display`
-                    let (sr, sg, sb) = theme.selection.to_pango_u16();
-                    let mut bg_attr = pango::AttrColor::new_background(sr, sg, sb);
-                    bg_attr.set_start_index((byte_start + 1) as u32);
-                    bg_attr.set_end_index((byte_end + 1) as u32);
-                    attrs.insert(bg_attr);
-                }
-            }
-        }
-
-        layout.set_text(&display);
-        layout.set_attributes(Some(&attrs));
-        layout.set_width(pango_text_w);
-        layout.set_wrap(pango::WrapMode::WordChar);
-        let (r, g, b) = theme.hover_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        let line_draw_x = popup_x + padding;
-        let line_draw_y = popup_y + padding + y_offset;
-        cr.move_to(line_draw_x, line_draw_y);
-        pangocairo::show_layout(cr, layout);
-
-        // Compute pixel rects for any clickable links on this line.
-        for (link_line, sb, eb, url) in &eh.links {
-            if *link_line == actual_line {
-                // +1 for the leading space added to `display`
-                let start_idx = (*sb + 1) as i32;
-                let end_idx = (*eb + 1) as i32;
-                let start_rect = layout.index_to_pos(start_idx);
-                let end_rect = layout.index_to_pos(end_idx.saturating_sub(1));
-                let lx = line_draw_x + start_rect.x() as f64 / pango::SCALE as f64;
-                let ly = line_draw_y + start_rect.y() as f64 / pango::SCALE as f64;
-                let lw =
-                    (end_rect.x() + end_rect.width() - start_rect.x()) as f64 / pango::SCALE as f64;
-                let lh = start_rect.height() as f64 / pango::SCALE as f64;
-                link_rects.push((lx, ly, lw.max(char_width), lh, url.clone()));
-            }
-        }
-
-        let (_pw, ph) = layout.pixel_size();
-        y_offset += ph as f64;
-    }
-    layout.set_width(-1);
-    layout.set_attributes(None);
-
-    // Scrollbar when content overflows
-    if can_scroll {
-        let track_h = visible_content_h;
-        let visible_ratio = visible_content_h / total_content_h;
-        let thumb_h = (track_h * visible_ratio).max(line_height);
-        let scroll_range_h: f64 = line_heights.iter().take(scroll).sum();
-        let thumb_top = if total_content_h > visible_content_h {
-            scroll_range_h / (total_content_h - visible_content_h) * (track_h - thumb_h)
-        } else {
-            0.0
-        };
-        let sb_x = popup_x + popup_w - char_width;
-        // Track background
-        let (r, g, b) = theme.hover_border.to_cairo();
-        cr.set_source_rgba(r, g, b, 0.2);
-        cr.rectangle(sb_x, popup_y + padding, char_width, track_h);
-        cr.fill().ok();
-        // Thumb
-        cr.set_source_rgba(r, g, b, 0.6);
-        cr.rectangle(sb_x, popup_y + padding + thumb_top, char_width, thumb_h);
-        cr.fill().ok();
-    }
-
-    // Focus indicator
-    if eh.has_focus {
-        let indicator = "y:copy  Tab:links  Esc:close";
-        let (r, g, b) = theme.line_number_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(indicator);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + padding, popup_y + popup_h - line_height - 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Restore clip
-    cr.restore().ok();
-
-    (Some((popup_x, popup_y, popup_w, popup_h)), link_rects)
+    let link_rects = super::quadraui_gtk::draw_rich_text_popup(
+        cr,
+        layout,
+        &popup,
+        &popup_layout,
+        line_height,
+        char_width,
+        theme,
+    );
+    let popup_rect = Some((
+        popup_layout.bounds.x as f64,
+        popup_layout.bounds.y as f64,
+        popup_layout.bounds.width as f64,
+        popup_layout.bounds.height as f64,
+    ));
+    (popup_rect, link_rects)
 }
 
 #[allow(clippy::too_many_arguments)]

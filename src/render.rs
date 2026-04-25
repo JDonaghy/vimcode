@@ -915,6 +915,181 @@ pub struct EditorHoverPopupData {
     pub selection: Option<(usize, usize, usize, usize)>,
 }
 
+/// Maximum number of editor hover popup rows shown at once. Both the
+/// TUI and GTK rasterisers obey this cap (longer content scrolls).
+pub const EDITOR_HOVER_MAX_ROWS: usize = 20;
+
+/// Convert an `EditorHoverPopupData` into a `quadraui::RichTextPopup`
+/// for the D6 layout pipeline. Markdown style spans + tree-sitter code
+/// highlights collapse into per-character `StyledSpan`s in
+/// `quadraui::StyledText`; selection, focus, scroll, and link state
+/// transfer 1:1.
+pub fn editor_hover_to_quadraui_rich_text(
+    eh: &EditorHoverPopupData,
+    theme: &Theme,
+) -> quadraui::RichTextPopup {
+    let mut q_lines: Vec<quadraui::StyledText> =
+        Vec::with_capacity(eh.rendered.lines.len());
+    let mut line_scales: Vec<f32> = Vec::with_capacity(eh.rendered.lines.len());
+    for (line_idx, line_text) in eh.rendered.lines.iter().enumerate() {
+        let md_spans = eh.rendered.spans.get(line_idx);
+        let code_hl = eh.rendered.code_highlights.get(line_idx);
+        q_lines.push(hover_line_to_styled_text(
+            line_text,
+            md_spans.map(|v| v.as_slice()).unwrap_or(&[]),
+            code_hl.map(|v| v.as_slice()).unwrap_or(&[]),
+            theme,
+        ));
+        // Heading rows render at a larger font scale (matches the
+        // legacy `font_scale` on the render-side StyledSpan).
+        let heading_level = md_spans
+            .and_then(|spans| {
+                spans.iter().find_map(|s| match s.style {
+                    crate::core::markdown::MdStyle::Heading(n) => Some(n),
+                    _ => None,
+                })
+            })
+            .unwrap_or(0);
+        let scale = match heading_level {
+            1 => 1.4,
+            2 => 1.2,
+            3..=6 => 1.1,
+            _ => 1.0,
+        };
+        line_scales.push(scale);
+    }
+
+    let q_links: Vec<quadraui::RichTextLink> = eh
+        .links
+        .iter()
+        .map(|(line, s, e, url)| quadraui::RichTextLink {
+            line: *line,
+            start_byte: *s,
+            end_byte: *e,
+            url: url.clone(),
+        })
+        .collect();
+
+    let q_selection = eh.selection.map(|(sl, sc, el, ec)| quadraui::TextSelection {
+        start_line: sl,
+        start_col: sc,
+        end_line: el,
+        end_col: ec,
+    });
+
+    quadraui::RichTextPopup {
+        id: quadraui::WidgetId::new("editor_hover"),
+        lines: q_lines,
+        line_text: eh.rendered.lines.clone(),
+        line_scales,
+        scroll_top: eh.scroll_top,
+        max_visible_rows: EDITOR_HOVER_MAX_ROWS,
+        has_focus: eh.has_focus,
+        selection: q_selection,
+        links: q_links,
+        focused_link: eh.focused_link,
+        placement: quadraui::PopupPlacement::Above,
+        padding: 0.0,
+        fg: Some(to_quadraui_color(theme.hover_fg)),
+        bg: Some(to_quadraui_color(theme.hover_bg)),
+    }
+}
+
+/// Flatten one rendered hover line (text + markdown spans + tree-sitter
+/// code highlights) into a `quadraui::StyledText` whose spans correspond
+/// to contiguous runs sharing fg/bold/italic.
+fn hover_line_to_styled_text(
+    line_text: &str,
+    md_spans: &[crate::core::markdown::MdSpan],
+    code_highlights: &[crate::core::markdown::MdCodeHighlight],
+    theme: &Theme,
+) -> quadraui::StyledText {
+    use crate::core::markdown::MdStyle;
+    if line_text.is_empty() {
+        return quadraui::StyledText::default();
+    }
+
+    let default_fg = to_quadraui_color(theme.hover_fg);
+    let h1_fg = to_quadraui_color(theme.md_heading1);
+    let h2_fg = to_quadraui_color(theme.md_heading2);
+    let h3_fg = to_quadraui_color(theme.md_heading3);
+    let code_fg = to_quadraui_color(theme.md_code);
+    let link_fg = to_quadraui_color(theme.md_link);
+
+    // Style at byte position. Code highlights take priority on lines
+    // that have any (matching the TUI rasteriser's behaviour).
+    let style_at = |byte_pos: usize| -> (quadraui::Color, bool, bool) {
+        if !code_highlights.is_empty() {
+            for h in code_highlights {
+                if byte_pos >= h.start_byte && byte_pos < h.end_byte {
+                    return (to_quadraui_color(theme.scope_color(&h.scope)), false, false);
+                }
+            }
+            return (code_fg, false, false);
+        }
+        for span in md_spans {
+            if byte_pos >= span.start_byte && byte_pos < span.end_byte {
+                return match span.style {
+                    MdStyle::Heading(1) => (h1_fg, true, false),
+                    MdStyle::Heading(2) => (h2_fg, true, false),
+                    MdStyle::Heading(_) => (h3_fg, true, false),
+                    MdStyle::Bold => (default_fg, true, false),
+                    MdStyle::Italic => (default_fg, false, true),
+                    MdStyle::BoldItalic => (default_fg, true, true),
+                    MdStyle::Code | MdStyle::CodeBlock => (code_fg, false, false),
+                    MdStyle::Link | MdStyle::LinkUrl => (link_fg, false, false),
+                    MdStyle::BlockQuote => (h3_fg, false, true),
+                    MdStyle::ListBullet => (h1_fg, true, false),
+                    MdStyle::HorizontalRule | MdStyle::Image => (link_fg, false, true),
+                };
+            }
+        }
+        (default_fg, false, false)
+    };
+
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    let mut byte_pos: usize = 0;
+    let mut current_text = String::new();
+    let mut current_style: Option<(quadraui::Color, bool, bool)> = None;
+
+    for ch in line_text.chars() {
+        let s = style_at(byte_pos);
+        match current_style {
+            Some(prev) if prev == s => {
+                current_text.push(ch);
+            }
+            _ => {
+                if !current_text.is_empty() {
+                    let st = current_style.unwrap();
+                    spans.push(quadraui::StyledSpan {
+                        text: std::mem::take(&mut current_text),
+                        fg: Some(st.0),
+                        bg: None,
+                        bold: st.1,
+                        italic: st.2,
+                        underline: false,
+                    });
+                }
+                current_text.push(ch);
+                current_style = Some(s);
+            }
+        }
+        byte_pos += ch.len_utf8();
+    }
+    if !current_text.is_empty() {
+        let st = current_style.unwrap_or((default_fg, false, false));
+        spans.push(quadraui::StyledSpan {
+            text: current_text,
+            fg: Some(st.0),
+            bg: None,
+            bold: st.1,
+            italic: st.2,
+            underline: false,
+        });
+    }
+    quadraui::StyledText { spans }
+}
+
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
 
 /// Data needed to render the signature help popup (shown above cursor in insert mode).
