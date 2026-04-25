@@ -3126,10 +3126,14 @@ pub fn menu_dropdown_to_quadraui_context_menu(data: &MenuBarData) -> Option<quad
         });
     }
 
+    // `usize::MAX` sentinel means "no row selected" — neither rasteriser
+    // matches it, so nothing is highlighted. This matters for hover-over-
+    // separator, where the GTK motion handler clears `highlighted_item_idx`
+    // to None; the OLD `unwrap_or(0)` would then highlight the first item.
     let selected_idx = data
         .highlighted_item_idx
         .and_then(|eng| engine_to_quadraui.get(eng).copied())
-        .unwrap_or(0);
+        .unwrap_or(usize::MAX);
 
     Some(quadraui::ContextMenu {
         id: quadraui::WidgetId::new("menu_dropdown"),

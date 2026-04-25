@@ -3189,119 +3189,54 @@ pub(super) fn draw_context_menu_popup(
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
-    // Calculate popup dimensions.
-    let sep_count = cm.items.iter().filter(|i| i.separator_after).count();
+    // Convert engine-side panel → quadraui::ContextMenu (synthesises
+    // `context:N` ids, lifts separator_after into separator rows). Same
+    // adapter TUI uses.
+    let mut menu = render::context_menu_panel_to_quadraui_context_menu(cm);
+
+    // Each non-separator row is `line_height`; separators get a
+    // half-line slot to render as a thin rule.
+    // Uniform `line_height` per row (separators included) so the row
+    // index a backend mouse-handler computes from `(y / line_height)`
+    // matches the row index this layout produces. Separator rendering
+    // (a thin rule centred in the row) happens inside `draw_context_menu`.
+    let item_height =
+        |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+
+    // Width: budget to fit longest label + longest shortcut + padding.
     let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
     let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
     let content_cols = (max_label + max_sc + 6).clamp(20, 50);
-    let popup_w = content_cols as f64 * char_width;
-    let popup_h = (cm.items.len() + sep_count + 2) as f64 * line_height;
+    let menu_w = content_cols as f64 * char_width;
 
-    // Position: use char-cell coordinates from engine, scaled to pixels.
-    let raw_x = cm.screen_col as f64 * char_width;
-    let raw_y = cm.screen_row as f64 * line_height;
-    let px = raw_x.min(editor_width - popup_w);
-    let py = raw_y.min(editor_height - popup_h);
+    let anchor_x = cm.screen_col as f64 * char_width;
+    let anchor_y = cm.screen_row as f64 * line_height;
+    let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    let menu_layout = menu.layout(
+        anchor_x as f32,
+        anchor_y as f32,
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
 
-    // Background.
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(px, py, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border.
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(px, py, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Compute hovered item from mouse position (avoids engine borrow in motion callback).
-    let hover_idx: Option<usize> = if mouse_pos.0 >= 0.0 {
-        let mcol = (mouse_pos.0 / char_width) as u16;
-        let mrow = (mouse_pos.1 / line_height) as u16;
-        let tw = (editor_width / char_width) as u16;
-        let th = (editor_height / line_height) as u16;
-        match crate::core::engine::resolve_context_menu_click(
-            &cm.items
-                .iter()
-                .map(|i| crate::core::engine::ContextMenuItem {
-                    label: i.label.clone(),
-                    action: String::new(),
-                    shortcut: i.shortcut.clone(),
-                    separator_after: i.separator_after,
-                    enabled: i.enabled,
-                })
-                .collect::<Vec<_>>(),
-            cm.screen_col,
-            cm.screen_row,
-            tw,
-            th,
-            mcol,
-            mrow,
-        ) {
-            crate::core::engine::ContextMenuClickResult::Item(idx) => Some(idx),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    // Use hover index if mouse is over an item; otherwise keep engine selection
-    // (preserves last-hovered or keyboard-navigated item when mouse leaves).
-    let selected = hover_idx.unwrap_or(cm.selected_idx);
-
-    // Items.
-    let mut visual_row: usize = 0;
-    let item_x = px + char_width;
-    for (i, item) in cm.items.iter().enumerate() {
-        let item_y = py + (visual_row + 1) as f64 * line_height;
-
-        // Selection highlight.
-        if i == selected && item.enabled {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(px + 1.0, item_y, popup_w - 2.0, line_height);
-            cr.fill().ok();
-        }
-
-        // Label — disabled items heavily darkened for obvious visual distinction.
-        let fg = if item.enabled {
-            theme.fuzzy_fg
-        } else {
-            theme.fuzzy_fg.darken(0.5)
-        };
-        let (r, g, b) = fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        ui_layout.set_text(&item.label);
-        ui_layout.set_attributes(None);
-        cr.move_to(item_x, item_y);
-        pangocairo::show_layout(cr, &ui_layout);
-
-        // Shortcut (right-aligned).
-        if !item.shortcut.is_empty() {
-            ui_layout.set_text(&item.shortcut);
-            let (sw, _) = ui_layout.pixel_size();
-            let sc_x = px + popup_w - sw as f64 - char_width;
-            let (r, g, b) = theme.line_number_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.move_to(sc_x, item_y);
-            pangocairo::show_layout(cr, &ui_layout);
-        }
-
-        visual_row += 1;
-
-        // Separator line.
-        if item.separator_after {
-            let sep_y = py + (visual_row + 1) as f64 * line_height + line_height / 2.0;
-            let (r, g, b) = theme.fuzzy_border.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.set_line_width(0.5);
-            cr.move_to(px + 4.0, sep_y);
-            cr.line_to(px + popup_w - 4.0, sep_y);
-            cr.stroke().ok();
-            visual_row += 1;
+    // Hover from mouse position via the primitive's own hit-test, then
+    // walk visible_items to find the matching idx. This eliminates the
+    // off-by-one we'd hit using the legacy `resolve_context_menu_click`
+    // (which assumed the old +1 row top-padding).
+    if mouse_pos.0 >= 0.0 {
+        let hit = menu_layout.hit_test(mouse_pos.0 as f32, mouse_pos.1 as f32);
+        if let quadraui::ContextMenuHit::Item(id) = hit {
+            for vis in &menu_layout.visible_items {
+                if menu.items[vis.item_idx].id.as_ref() == Some(&id) {
+                    menu.selected_idx = vis.item_idx;
+                    break;
+                }
+            }
         }
     }
+
+    super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
 }
 
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output).
@@ -4277,88 +4212,50 @@ pub(super) fn draw_menu_dropdown(
     theme: &Theme,
     x: f64,
     anchor_y: f64,
-    _width: f64,
-    _height: f64,
+    width: f64,
+    height: f64,
     line_height: f64,
 ) {
-    if data.open_items.is_empty() {
+    let Some(menu) = render::menu_dropdown_to_quadraui_context_menu(data) else {
         return;
-    }
+    };
 
     let pango_ctx = pangocairo::create_context(cr);
     let font_desc = pango::FontDescription::from_string(UI_FONT);
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
-    // Compute popup_x using the same metric as the click/hover handlers.
-    let mut popup_x = x + 8.0;
+    // Compute anchor_x using the same per-menu offset the click/hover
+    // handlers use (matches `MENU_STRUCTURE` label widths + spacing).
+    let mut anchor_x = x + 8.0;
     if let Some(midx) = data.open_menu_idx {
         for i in 0..midx {
             if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                popup_x += name.len() as f64 * 7.0 + 10.0;
+                anchor_x += name.len() as f64 * 7.0 + 10.0;
             }
         }
     }
-    let item_count = data.open_items.len() as f64;
-    let popup_width = 220.0_f64;
-    let pad = 4.0; // small top/bottom padding
-    let popup_height = item_count * line_height + pad * 2.0;
-    let popup_y = anchor_y;
 
-    // Background — use hover_bg (adapts to light/dark themes).
-    let (hbr, hbg, hbb) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(hbr, hbg, hbb);
-    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
-    let _ = cr.fill();
+    // Each non-separator row gets a full line, separators get half a
+    // line so they render as a thin rule.
+    // Uniform `line_height` per row (separators included) so the row
+    // index a backend mouse-handler computes from `(y / line_height)`
+    // matches the row index this layout produces. Separator rendering
+    // (a thin rule centred in the row) happens inside `draw_context_menu`.
+    let item_height =
+        |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
 
-    // Border
-    let (bdr, bdg, bdb) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(bdr, bdg, bdb);
-    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
-    let _ = cr.stroke();
+    let menu_w = 220.0_f64;
+    let viewport = quadraui::Rect::new(0.0, 0.0, width as f32, height as f32);
+    let menu_layout = menu.layout(
+        anchor_x as f32,
+        anchor_y as f32,
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
 
-    // Items — each occupies one line_height row starting at popup_y + pad.
-    let (fr, fg_c, fb) = theme.foreground.to_cairo();
-    let (sr, sg, sb) = theme.line_number_fg.to_cairo();
-    cr.set_source_rgb(fr, fg_c, fb);
-    for (i, item) in data.open_items.iter().enumerate() {
-        let row_top = popup_y + pad + i as f64 * line_height;
-        if item.separator {
-            cr.set_source_rgb(sr, sg, sb);
-            let sep_y = row_top + line_height * 0.5;
-            cr.move_to(popup_x + 4.0, sep_y);
-            cr.line_to(popup_x + popup_width - 4.0, sep_y);
-            let _ = cr.stroke();
-            cr.set_source_rgb(fr, fg_c, fb);
-        } else {
-            // Draw highlight bar for hovered/keyboard-selected item.
-            if data.highlighted_item_idx == Some(i) {
-                let (slr, slg, slb) = theme.sidebar_sel_bg.to_cairo();
-                cr.set_source_rgb(slr, slg, slb);
-                cr.rectangle(popup_x + 1.0, row_top, popup_width - 2.0, line_height);
-                let _ = cr.fill();
-            }
-            layout.set_text(item.label);
-            let (_, lh) = layout.pixel_size();
-            let text_y = row_top + (line_height - lh as f64) * 0.5;
-            cr.set_source_rgb(fr, fg_c, fb);
-            cr.move_to(popup_x + 8.0, text_y);
-            pangocairo::show_layout(cr, &layout);
-            let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
-                item.vscode_shortcut
-            } else {
-                item.shortcut
-            };
-            if !sc.is_empty() {
-                layout.set_text(sc);
-                let (sc_w, _) = layout.pixel_size();
-                cr.set_source_rgb(sr, sg, sb);
-                cr.move_to(popup_x + popup_width - sc_w as f64 - 8.0, text_y);
-                pangocairo::show_layout(cr, &layout);
-                cr.set_source_rgb(fr, fg_c, fb);
-            }
-        }
-    }
+    super::quadraui_gtk::draw_context_menu(cr, &layout, &menu, &menu_layout, line_height, theme);
 }
 
 #[allow(clippy::too_many_arguments)]

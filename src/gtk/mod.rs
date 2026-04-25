@@ -2408,7 +2408,7 @@ impl SimpleComponent for App {
             {
                 let engine = engine.clone();
                 let lh = menu_dd_lh.clone();
-                menu_dd_da.set_draw_func(move |_, cr, _, _| {
+                menu_dd_da.set_draw_func(move |_, cr, da_w, da_h| {
                     let engine = engine.borrow();
                     let Some(midx) = engine.menu_open_idx else {
                         return;
@@ -2445,7 +2445,16 @@ impl SimpleComponent for App {
                     // Draw the dropdown at window-level coordinates.
                     // anchor_y = 0: menu bar is now the titlebar, so the overlay
                     // content starts right below it.
-                    draw_menu_dropdown(cr, &data, &theme, 0.0, 0.0, 0.0, 0.0, line_height);
+                    draw_menu_dropdown(
+                        cr,
+                        &data,
+                        &theme,
+                        0.0,
+                        0.0,
+                        da_w as f64,
+                        da_h as f64,
+                        line_height,
+                    );
                 });
             }
 

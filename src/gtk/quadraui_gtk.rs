@@ -1971,3 +1971,113 @@ pub(super) fn draw_dialog(
     }
     rects
 }
+
+/// Draw a `quadraui::ContextMenu` at its resolved layout. Returns the
+/// per-clickable-item hit-rectangles `(x, y, w, h, item_idx)` so the
+/// caller's click handler can map a click to the original
+/// `ContextMenuItem` index without re-running layout. Hover state is
+/// owned by the primitive (`menu.selected_idx`) — the highlight
+/// follows whatever the app sets, so callers update `selected_idx`
+/// from mouse motion before invoking this rasteriser.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_context_menu(
+    cr: &Context,
+    layout: &pango::Layout,
+    menu: &quadraui::ContextMenu,
+    menu_layout: &quadraui::ContextMenuLayout,
+    line_height: f64,
+    theme: &Theme,
+) -> Vec<(f64, f64, f64, f64, usize)> {
+    let bounds = menu_layout.bounds;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return Vec::new();
+    }
+
+    let bx = bounds.x as f64;
+    let by = bounds.y as f64;
+    let bw = bounds.width as f64;
+    let bh = bounds.height as f64;
+
+    let bg = menu.bg.map(qc_to_cairo).unwrap_or_else(|| vc_to_cairo(theme.hover_bg));
+    let (br, bg_g, bb) = vc_to_cairo(theme.hover_border);
+    let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.foreground);
+    let (sel_r, sel_g, sel_b) = vc_to_cairo(theme.sidebar_sel_bg);
+    let (sep_r, sep_g, sep_b) = vc_to_cairo(theme.line_number_fg);
+    let (dim_r, dim_g, dim_b) = vc_to_cairo(theme.foreground.darken(0.5));
+
+    cr.set_source_rgb(bg.0, bg.1, bg.2);
+    cr.rectangle(bx, by, bw, bh);
+    cr.fill().ok();
+
+    cr.set_source_rgb(br, bg_g, bb);
+    cr.set_line_width(1.0);
+    cr.rectangle(bx, by, bw, bh);
+    cr.stroke().ok();
+
+    let mut rects: Vec<(f64, f64, f64, f64, usize)> = Vec::new();
+
+    for vis in &menu_layout.visible_items {
+        let item = &menu.items[vis.item_idx];
+        let row_x = vis.bounds.x as f64;
+        let row_y = vis.bounds.y as f64;
+        let row_w = vis.bounds.width as f64;
+        let row_h = vis.bounds.height as f64;
+
+        if vis.is_separator {
+            cr.set_source_rgb(sep_r, sep_g, sep_b);
+            cr.set_line_width(0.5);
+            let sep_y = row_y + row_h * 0.5;
+            cr.move_to(row_x + 4.0, sep_y);
+            cr.line_to(row_x + row_w - 4.0, sep_y);
+            cr.stroke().ok();
+            continue;
+        }
+
+        let is_selected = vis.item_idx == menu.selected_idx && vis.clickable;
+        if is_selected {
+            cr.set_source_rgb(sel_r, sel_g, sel_b);
+            cr.rectangle(row_x + 1.0, row_y, row_w - 2.0, row_h);
+            cr.fill().ok();
+        }
+
+        let label_text = item
+            .label
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>();
+        let (lr, lg, lb) = if vis.clickable {
+            (fg_r, fg_g, fg_b)
+        } else {
+            (dim_r, dim_g, dim_b)
+        };
+        cr.set_source_rgb(lr, lg, lb);
+        layout.set_text(&label_text);
+        layout.set_attributes(None);
+        let (_, lh) = layout.pixel_size();
+        let text_y = row_y + (row_h - lh as f64) * 0.5;
+        cr.move_to(row_x + 8.0, text_y);
+        pangocairo::show_layout(cr, layout);
+
+        if let Some(ref det) = item.detail {
+            let det_text = det
+                .spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>();
+            if !det_text.is_empty() {
+                layout.set_text(&det_text);
+                let (sw, _) = layout.pixel_size();
+                cr.set_source_rgb(sep_r, sep_g, sep_b);
+                cr.move_to(row_x + row_w - sw as f64 - 8.0, text_y);
+                pangocairo::show_layout(cr, layout);
+            }
+        }
+
+        if vis.clickable {
+            rects.push((row_x, row_y, row_w, row_h, vis.item_idx));
+        }
+    }
+    let _ = line_height;
+    rects
+}
