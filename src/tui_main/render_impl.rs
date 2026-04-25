@@ -112,6 +112,7 @@ pub(super) fn draw_frame(
     hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
+    editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
 ) {
     let area = frame.area();
@@ -502,6 +503,7 @@ pub(super) fn draw_frame(
 
     // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
     *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
+    *editor_hover_scrollbar_out = None;
     if let Some(ref eh) = screen.editor_hover {
         if let Some(active_win) = screen
             .windows
@@ -516,10 +518,11 @@ pub(super) fn draw_frame(
             let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            let (eh_links, eh_rect) =
+            let (eh_links, eh_rect, eh_sb) =
                 render_editor_hover_popup(frame, eh, popup_x, popup_y, frame.area(), theme);
             *editor_hover_link_rects_out = eh_links;
             *editor_hover_popup_rect_out = eh_rect;
+            *editor_hover_scrollbar_out = eh_sb;
         }
     }
 
@@ -2966,6 +2969,7 @@ mod tests {
         let mut hover_popup_rect = None;
         let mut editor_hover_popup_rect = None;
         let mut editor_hover_link_rects = Vec::new();
+        let mut editor_hover_scrollbar = None;
         let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
 
         terminal
@@ -2990,6 +2994,7 @@ mod tests {
                     &mut hover_popup_rect,
                     &mut editor_hover_popup_rect,
                     &mut editor_hover_link_rects,
+                    &mut editor_hover_scrollbar,
                     &mut tab_visible_counts,
                 );
             })

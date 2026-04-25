@@ -919,6 +919,21 @@ pub struct EditorHoverPopupData {
 /// TUI and GTK rasterisers obey this cap (longer content scrolls).
 pub const EDITOR_HOVER_MAX_ROWS: usize = 20;
 
+/// Geometry + drag-math inputs for a popup's scrollbar, captured by
+/// the renderer so click/drag handlers don't have to recompute the
+/// layout. Used by both backends for #215. Native units: cells (TUI)
+/// or pixels (GTK) — matches whatever `RichTextPopupLayout` was built
+/// with.
+#[derive(Debug, Clone, Copy)]
+pub struct PopupScrollbarHit {
+    pub track: quadraui::Rect,
+    pub thumb: quadraui::Rect,
+    /// Number of content rows fitting in the viewport.
+    pub visible_rows: usize,
+    /// Total number of content rows in the popup.
+    pub total: usize,
+}
+
 /// Convert an `EditorHoverPopupData` into a `quadraui::RichTextPopup`
 /// for the D6 layout pipeline. Markdown style spans + tree-sitter code
 /// highlights collapse into per-character `StyledSpan`s in
@@ -928,8 +943,7 @@ pub fn editor_hover_to_quadraui_rich_text(
     eh: &EditorHoverPopupData,
     theme: &Theme,
 ) -> quadraui::RichTextPopup {
-    let mut q_lines: Vec<quadraui::StyledText> =
-        Vec::with_capacity(eh.rendered.lines.len());
+    let mut q_lines: Vec<quadraui::StyledText> = Vec::with_capacity(eh.rendered.lines.len());
     let mut line_scales: Vec<f32> = Vec::with_capacity(eh.rendered.lines.len());
     for (line_idx, line_text) in eh.rendered.lines.iter().enumerate() {
         let md_spans = eh.rendered.spans.get(line_idx);
@@ -970,12 +984,14 @@ pub fn editor_hover_to_quadraui_rich_text(
         })
         .collect();
 
-    let q_selection = eh.selection.map(|(sl, sc, el, ec)| quadraui::TextSelection {
-        start_line: sl,
-        start_col: sc,
-        end_line: el,
-        end_col: ec,
-    });
+    let q_selection = eh
+        .selection
+        .map(|(sl, sc, el, ec)| quadraui::TextSelection {
+            start_line: sl,
+            start_col: sc,
+            end_line: el,
+            end_col: ec,
+        });
 
     quadraui::RichTextPopup {
         id: quadraui::WidgetId::new("editor_hover"),

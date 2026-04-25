@@ -1384,6 +1384,22 @@ impl Engine {
         false
     }
 
+    /// Set the editor hover popup scroll offset directly (clamped to
+    /// valid range). Used by scrollbar drag / track-click handlers
+    /// in both backends — they translate a `UiEvent::ScrollOffsetChanged`
+    /// from `quadraui::dispatch_mouse_drag` into this call (#215).
+    pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
+        if let Some(hover) = &mut self.editor_hover {
+            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let clamped = new_offset.min(max_scroll);
+            if clamped != hover.scroll_top {
+                hover.scroll_top = clamped;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Give the editor hover popup keyboard focus (e.g. on click).
     pub fn editor_hover_focus(&mut self) {
         if self.editor_hover.is_some() {

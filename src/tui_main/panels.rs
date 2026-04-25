@@ -2708,9 +2708,8 @@ pub(super) fn render_panel_hover_popup(
 // ─── Editor hover popup ─────────────────────────────────────────────────────
 
 /// Render an editor hover popup via the `quadraui::RichTextPopup`
-/// primitive. Returns `(link_rects, popup_bounds)` for mouse hit-testing
-/// — same shape the legacy renderer returned, derived from the primitive's
-/// resolved layout instead of computed by hand.
+/// primitive. Returns `(link_rects, popup_bounds, scrollbar_hit)` for
+/// mouse hit-testing — derived from the primitive's resolved layout.
 #[allow(clippy::type_complexity)]
 pub(super) fn render_editor_hover_popup(
     frame: &mut ratatui::Frame,
@@ -2722,9 +2721,10 @@ pub(super) fn render_editor_hover_popup(
 ) -> (
     Vec<(u16, u16, u16, u16, String)>,
     Option<(u16, u16, u16, u16)>,
+    Option<render::PopupScrollbarHit>,
 ) {
     if eh.rendered.lines.is_empty() {
-        return (vec![], None);
+        return (vec![], None, None);
     }
     let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);
     // Content width: precomputed by engine (popup_width chars) clamped to
@@ -2749,7 +2749,11 @@ pub(super) fn render_editor_hover_popup(
             popup
                 .line_text
                 .get(line_idx)
-                .map(|t| t[start_byte.min(t.len())..end_byte.min(t.len())].chars().count() as f32)
+                .map(|t| {
+                    t[start_byte.min(t.len())..end_byte.min(t.len())]
+                        .chars()
+                        .count() as f32
+                })
                 .unwrap_or(0.0)
         },
     );
@@ -2781,7 +2785,13 @@ pub(super) fn render_editor_hover_popup(
         layout.bounds.width.round() as u16,
         layout.bounds.height.round() as u16,
     ));
-    (link_rects, popup_rect)
+    let scrollbar_hit = layout.scrollbar.map(|sb| render::PopupScrollbarHit {
+        track: sb.track,
+        thumb: sb.thumb,
+        visible_rows: render::EDITOR_HOVER_MAX_ROWS,
+        total: popup.lines.len(),
+    });
+    (link_rects, popup_rect, scrollbar_hit)
 }
 
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────

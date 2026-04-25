@@ -2083,6 +2083,15 @@ pub(super) fn draw_context_menu(
     let _ = line_height;
     rects
 }
+/// Visible width of the rich-text-popup scrollbar in pixels. Wider
+/// than the layout's 1px border so the bar is paint+click-friendly.
+/// Shared with `draw_editor_hover_popup` so paint and hit-test
+/// geometry stay in sync (#215).
+pub(super) const RICH_TEXT_POPUP_SB_WIDTH: f64 = 8.0;
+/// Pixels of inset between the scrollbar's right edge and the popup's
+/// right border. Same role as `RICH_TEXT_POPUP_SB_WIDTH`.
+pub(super) const RICH_TEXT_POPUP_SB_INSET: f64 = 1.0;
+
 /// Draw a `quadraui::RichTextPopup` at its resolved layout. Returns
 /// per-link hit regions in `(x, y, w, h, url)` form. Each visible
 /// line is rendered as a SINGLE Pango call with an `AttrList` —
@@ -2292,10 +2301,12 @@ pub(super) fn draw_rich_text_popup(
     cr.restore().ok(); // pop the content clip
 
     // Scrollbar — wider than the 1px border so it's visually + clickably
-    // present. Draw at the right inside edge of the popup.
+    // present. Draw at the right inside edge of the popup. Constants
+    // shared with `draw_editor_hover_popup` so click hit-test matches
+    // what's painted (#215).
     if let Some(sb) = layout.scrollbar {
-        let sb_w = 8.0_f64;
-        let sb_x = bx + bw - sb_w - 1.0;
+        let sb_w = RICH_TEXT_POPUP_SB_WIDTH;
+        let sb_x = bx + bw - sb_w - RICH_TEXT_POPUP_SB_INSET;
         let track_y = sb.track.y as f64;
         let track_h = sb.track.height as f64;
         // Track background.

@@ -22,6 +22,7 @@ pub(super) fn draw_editor(
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
+    editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
     mouse_pos: (f64, f64),
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
@@ -380,10 +381,11 @@ pub(super) fn draw_editor(
     );
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
-    let (eh_rect, eh_links) =
+    let (eh_rect, eh_links, eh_sb) =
         draw_editor_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
     editor_hover_rect_out.set(eh_rect);
     *editor_hover_link_rects_out.borrow_mut() = eh_links;
+    editor_hover_scrollbar_out.set(eh_sb);
 
     // 5c5. Draw tab hover tooltip (small popup below hovered tab).
     if let Some(ref tooltip_text) = screen.tab_tooltip {
@@ -1857,9 +1859,9 @@ pub(super) fn draw_hover_popup(
 }
 
 /// Draw the LSP/editor hover popup via the `quadraui::RichTextPopup`
-/// primitive. Returns `(popup_bounds, link_rects)` where `link_rects`
-/// is `(x, y, w, h, url)` per clickable span — same shape the legacy
-/// renderer returned.
+/// primitive. Returns `(popup_bounds, link_rects, scrollbar_hit)` —
+/// scrollbar geometry feeds the click + drag handlers in `mod.rs`
+/// (#215).
 #[allow(clippy::type_complexity)]
 pub(super) fn draw_editor_hover_popup(
     cr: &Context,
@@ -1871,8 +1873,9 @@ pub(super) fn draw_editor_hover_popup(
 ) -> (
     Option<(f64, f64, f64, f64)>,
     Vec<(f64, f64, f64, f64, String)>,
+    Option<render::PopupScrollbarHit>,
 ) {
-    let empty = (None, Vec::new());
+    let empty = (None, Vec::new(), None);
     let Some(eh) = screen.editor_hover.as_ref() else {
         return empty;
     };
@@ -1941,7 +1944,26 @@ pub(super) fn draw_editor_hover_popup(
         popup_layout.bounds.width as f64,
         popup_layout.bounds.height as f64,
     ));
-    (popup_rect, link_rects)
+    // The GTK rasteriser paints the scrollbar wider than the layout's
+    // 1px border (so it's actually visible + clickable). Mirror that
+    // geometry here so hit-test matches what the user sees (#215).
+    let scrollbar_hit = popup_layout.scrollbar.map(|sb| {
+        let sb_w = super::quadraui_gtk::RICH_TEXT_POPUP_SB_WIDTH as f32;
+        let inset = super::quadraui_gtk::RICH_TEXT_POPUP_SB_INSET as f32;
+        let bw = popup_layout.bounds.width;
+        let bx = popup_layout.bounds.x;
+        let track_x = bx + bw - sb_w - inset;
+        // Thumb: rasteriser fills `(sb_x + 1, ..., sb_w - 2, ...)`.
+        let thumb_x = track_x + 1.0;
+        let thumb_w = (sb_w - 2.0).max(1.0);
+        render::PopupScrollbarHit {
+            track: quadraui::Rect::new(track_x, sb.track.y, sb_w, sb.track.height),
+            thumb: quadraui::Rect::new(thumb_x, sb.thumb.y, thumb_w, sb.thumb.height),
+            visible_rows: render::EDITOR_HOVER_MAX_ROWS,
+            total: popup.lines.len(),
+        }
+    });
+    (popup_rect, link_rects, scrollbar_hit)
 }
 
 #[allow(clippy::too_many_arguments)]

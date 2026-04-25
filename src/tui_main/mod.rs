@@ -1141,6 +1141,8 @@ fn event_loop(
     let mut editor_hover_popup_rect: Option<(u16, u16, u16, u16)> = None;
     // Link hit rects from the editor hover popup: (x, y, w, h, url).
     let mut editor_hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
+    // Scrollbar geometry for the editor hover popup (#215).
+    let mut editor_hover_scrollbar: Option<render::PopupScrollbarHit> = None;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
     let min_frame = Duration::from_millis(16);
     let mut last_draw = Instant::now()
@@ -1333,6 +1335,7 @@ fn event_loop(
                             &mut hover_popup_rect,
                             &mut editor_hover_popup_rect,
                             &mut editor_hover_link_rects,
+                            &mut editor_hover_scrollbar,
                             &mut tab_visible_counts,
                         );
                     }
@@ -1384,6 +1387,7 @@ fn event_loop(
                                     &mut hover_popup_rect,
                                     &mut editor_hover_popup_rect,
                                     &mut editor_hover_link_rects,
+                                    &mut editor_hover_scrollbar,
                                     &mut tab_visible_counts2,
                                 );
                             }
@@ -3932,6 +3936,7 @@ fn event_loop(
                                 hover_popup_rect,
                                 editor_hover_popup_rect,
                                 &editor_hover_link_rects,
+                                editor_hover_scrollbar,
                                 &mut hover_selecting,
                                 &mut fr_input_dragging,
                             );
@@ -3986,6 +3991,7 @@ fn event_loop(
                     hover_popup_rect,
                     editor_hover_popup_rect,
                     &editor_hover_link_rects,
+                    editor_hover_scrollbar,
                     &mut hover_selecting,
                     &mut fr_input_dragging,
                 );

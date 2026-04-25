@@ -265,6 +265,10 @@ struct App {
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
+    /// Editor hover popup scrollbar geometry (#215). Populated by
+    /// `draw_editor_hover_popup`; consumed by click + drag handlers
+    /// in this file.
+    editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>>,
     /// Cached line height shared with menu_dropdown_da draw/click closures.
     menu_dd_line_height: Rc<Cell<f64>>,
     /// CSS provider registered with the GTK display — updated when colorscheme changes.
@@ -1918,6 +1922,8 @@ impl SimpleComponent for App {
         #[allow(clippy::type_complexity)]
         let editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>> =
             Rc::new(RefCell::new(Vec::new()));
+        let editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>> =
+            Rc::new(Cell::new(None));
         let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
@@ -2085,6 +2091,7 @@ impl SimpleComponent for App {
             panel_hover_popup_rect: panel_hover_popup_rect.clone(),
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
             editor_hover_link_rects: editor_hover_link_rects.clone(),
+            editor_hover_scrollbar: editor_hover_scrollbar.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
@@ -3535,6 +3542,7 @@ impl SimpleComponent for App {
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
+        let editor_hover_sb_for_draw = model.editor_hover_scrollbar.clone();
         let mouse_pos_for_draw = mouse_pos_cell.clone();
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
         let status_seg_for_draw = model.status_segment_map.clone();
@@ -3569,6 +3577,7 @@ impl SimpleComponent for App {
                             &dialog_btn_for_draw,
                             &editor_hover_rect_for_draw,
                             &editor_hover_links_for_draw,
+                            &editor_hover_sb_for_draw,
                             mouse_pos_for_draw.get(),
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
@@ -6081,6 +6090,42 @@ impl App {
                 let has_focus = engine.editor_hover_has_focus;
                 drop(engine);
                 if on_popup {
+                    // Scrollbar hit-test (#215). Track click jumps to that
+                    // offset and arms a drag so mouse-move updates the
+                    // offset live; thumb click just begins the drag.
+                    if let Some(sb_hit) = self.editor_hover_scrollbar.get() {
+                        let cx = x as f32;
+                        let cy = y as f32;
+                        let on_thumb = cx >= sb_hit.thumb.x
+                            && cx < sb_hit.thumb.x + sb_hit.thumb.width
+                            && cy >= sb_hit.thumb.y
+                            && cy < sb_hit.thumb.y + sb_hit.thumb.height;
+                        let on_track = !on_thumb
+                            && cx >= sb_hit.track.x
+                            && cx < sb_hit.track.x + sb_hit.track.width
+                            && cy >= sb_hit.track.y
+                            && cy < sb_hit.track.y + sb_hit.track.height;
+                        if on_track || on_thumb {
+                            if on_track {
+                                let max_scroll = sb_hit.total.saturating_sub(sb_hit.visible_rows);
+                                let rel = ((cy - sb_hit.track.y) / sb_hit.track.height.max(1.0))
+                                    .clamp(0.0, 1.0);
+                                let new_offset = (rel * max_scroll as f32).round() as usize;
+                                self.engine.borrow_mut().editor_hover_set_scroll(new_offset);
+                            }
+                            self.drag_state
+                                .borrow_mut()
+                                .begin(quadraui::DragTarget::ScrollbarY {
+                                    widget: quadraui::WidgetId::new("editor_hover"),
+                                    track_start: sb_hit.track.y,
+                                    track_length: sb_hit.track.height,
+                                    visible_rows: sb_hit.visible_rows,
+                                    total_items: sb_hit.total,
+                                });
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                    }
                     // Check if click hit a link rect.
                     let link_hit = self
                         .editor_hover_link_rects
@@ -6703,30 +6748,41 @@ impl App {
                 // Apply each scroll event by widget id.
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        if widget.as_str() != "picker" {
-                            continue;
-                        }
-                        let mut engine = self.engine.borrow_mut();
-                        engine.picker_scroll_top = *new_offset;
-                        // Nudge selection into view so the renderer's
-                        // selection-anchored clamp doesn't snap back.
-                        let vis = {
-                            let drag = self.drag_state.borrow();
-                            if let Some(quadraui::DragTarget::ScrollbarY { visible_rows, .. }) =
-                                drag.target()
-                            {
-                                *visible_rows
-                            } else {
-                                0
+                        match widget.as_str() {
+                            "picker" => {
+                                let mut engine = self.engine.borrow_mut();
+                                engine.picker_scroll_top = *new_offset;
+                                // Nudge selection into view so the
+                                // renderer's selection-anchored clamp
+                                // doesn't snap back.
+                                let vis = {
+                                    let drag = self.drag_state.borrow();
+                                    if let Some(quadraui::DragTarget::ScrollbarY {
+                                        visible_rows,
+                                        ..
+                                    }) = drag.target()
+                                    {
+                                        *visible_rows
+                                    } else {
+                                        0
+                                    }
+                                };
+                                if engine.picker_selected < *new_offset {
+                                    engine.picker_selected = *new_offset;
+                                } else if vis > 0 && engine.picker_selected >= *new_offset + vis {
+                                    engine.picker_selected = *new_offset + vis - 1;
+                                }
+                                engine.picker_load_preview();
+                                self.draw_needed.set(true);
                             }
-                        };
-                        if engine.picker_selected < *new_offset {
-                            engine.picker_selected = *new_offset;
-                        } else if vis > 0 && engine.picker_selected >= *new_offset + vis {
-                            engine.picker_selected = *new_offset + vis - 1;
+                            "editor_hover" => {
+                                self.engine
+                                    .borrow_mut()
+                                    .editor_hover_set_scroll(*new_offset);
+                                self.draw_needed.set(true);
+                            }
+                            _ => {}
                         }
-                        engine.picker_load_preview();
-                        self.draw_needed.set(true);
                     }
                 }
                 return;

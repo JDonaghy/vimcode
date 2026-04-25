@@ -42,6 +42,7 @@ pub(super) fn handle_mouse(
     hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
+    editor_hover_scrollbar: Option<crate::render::PopupScrollbarHit>,
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
 ) -> u16 {
@@ -876,6 +877,10 @@ pub(super) fn handle_mouse(
                             }
                             "ext_panel:sb" => {
                                 engine.ext_panel_scroll_top = *new_offset;
+                                handled = true;
+                            }
+                            "editor_hover" => {
+                                engine.editor_hover_set_scroll(*new_offset);
                                 handled = true;
                             }
                             _ => {}
@@ -1717,6 +1722,42 @@ pub(super) fn handle_mouse(
                     tui_copy_to_clipboard(url, engine);
                     engine.dismiss_editor_hover();
                 }
+                return sidebar_width;
+            }
+        }
+    }
+    // ── Click on editor hover popup scrollbar → jump-scroll or arm drag ────
+    // Same pattern as picker/explorer scrollbars (#215). Track click jumps
+    // to that offset and begins a drag so the mouse-move dispatcher
+    // updates the offset live; thumb click just begins the drag.
+    if mouse_on_editor_hover {
+        if let Some(sb_hit) = editor_hover_scrollbar {
+            let cx = col as f32;
+            let cy = row as f32;
+            let on_thumb = cx >= sb_hit.thumb.x
+                && cx < sb_hit.thumb.x + sb_hit.thumb.width
+                && cy >= sb_hit.thumb.y
+                && cy < sb_hit.thumb.y + sb_hit.thumb.height;
+            let on_track = !on_thumb
+                && cx >= sb_hit.track.x
+                && cx < sb_hit.track.x + sb_hit.track.width
+                && cy >= sb_hit.track.y
+                && cy < sb_hit.track.y + sb_hit.track.height;
+            if on_track || on_thumb {
+                if on_track {
+                    let max_scroll = sb_hit.total.saturating_sub(sb_hit.visible_rows);
+                    let rel =
+                        ((cy - sb_hit.track.y) / sb_hit.track.height.max(1.0)).clamp(0.0, 1.0);
+                    let new_offset = (rel * max_scroll as f32).round() as usize;
+                    engine.editor_hover_set_scroll(new_offset);
+                }
+                drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("editor_hover"),
+                    track_start: sb_hit.track.y,
+                    track_length: sb_hit.track.height,
+                    visible_rows: sb_hit.visible_rows,
+                    total_items: sb_hit.total,
+                });
                 return sidebar_width;
             }
         }
