@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 7 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 8 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0. ContextMenu wraps the arc next.)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,46 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 Dialog rasteriser pilot:**
+
+Eighth primitive lifted. Vimcode uses `Dialog` for the quit-confirm,
+close-tab-confirm, and rename-input prompts.
+
+**What shipped:**
+
+- `quadraui/src/tui/dialog.rs` —
+  `pub fn quadraui::tui::draw_dialog(buf, dialog, layout, theme)`.
+  Rounded `╭─╮ ╰─╯` border + title overlay + body text + optional
+  input field + button row. 4 unit tests cover: corner glyphs,
+  default button uses `selected_bg`, input field gets `input_bg`
+  when present, zero-size guard.
+- `quadraui/src/gtk/dialog.rs` —
+  `pub fn quadraui::gtk::draw_dialog(cr, body_layout, ui_layout, dialog, dialog_layout, line_height, theme) -> Vec<(f64, f64, f64, f64)>`.
+  Returns the per-button hit-rectangles so vimcode's click handler
+  keeps working unchanged.
+- `quadraui::Theme` adds 1 field: `input_bg` (background of the
+  embedded text input — distinct from `surface_bg` so the input
+  reads as a separate sub-region).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_dialog` collapses to a
+  delegation. Vimcode-private `title_as_plain` helper deleted with
+  it. ~125 lines removed.
+- `src/gtk/quadraui_gtk.rs::draw_dialog` collapses to a delegation.
+  Vimcode-private `styled_text_plain` helper deleted with it (was
+  shared with the now-lifted dialog). ~120 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+215/215 (4 new dialog tests on top of 211); clippy clean across all
+crate × feature combinations.
+
+**What's next:** **ContextMenu** — last primitive in the per-primitive
+arc for #223. Vimcode uses it for right-click menus and the menu-bar
+dropdowns.
+
+---
 
 **Session 332 (cont.) — #223 Tooltip rasteriser pilot:**
 

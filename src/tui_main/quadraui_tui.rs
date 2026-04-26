@@ -151,6 +151,7 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         hover_bg: q(theme.hover_bg),
         hover_fg: q(theme.hover_fg),
         hover_border: q(theme.hover_border),
+        input_bg: q(theme.completion_bg),
     }
 }
 
@@ -358,136 +359,7 @@ pub(super) fn draw_dialog(
     layout: &quadraui::DialogLayout,
     theme: &Theme,
 ) {
-    let bg = rc(theme.fuzzy_bg);
-    let fg = rc(theme.fuzzy_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let border_fg = rc(theme.fuzzy_border);
-    let title_fg = rc(theme.fuzzy_title_fg);
-
-    let x = layout.bounds.x.round() as u16;
-    let y = layout.bounds.y.round() as u16;
-    let w = layout.bounds.width.round() as u16;
-    let h = layout.bounds.height.round() as u16;
-    if w == 0 || h == 0 {
-        return;
-    }
-
-    // Clear the box area.
-    for row in y..y + h {
-        for col in x..x + w {
-            set_cell(buf, col, row, ' ', fg, bg);
-        }
-    }
-
-    // Top border with title overlay.
-    for col in 0..w {
-        let ch = if col == 0 {
-            '╭'
-        } else if col == w - 1 {
-            '╮'
-        } else {
-            '─'
-        };
-        set_cell(buf, x + col, y, ch, border_fg, bg);
-    }
-    let title_text = format!(" {} ", title_as_plain(&dialog.title));
-    for (i, ch) in title_text.chars().enumerate() {
-        let col = 2 + i as u16;
-        if col + 1 >= w {
-            break;
-        }
-        set_cell(buf, x + col, y, ch, title_fg, bg);
-    }
-
-    // Left/right borders for content rows.
-    for row in (y + 1)..(y + h - 1) {
-        set_cell(buf, x, row, '│', border_fg, bg);
-        set_cell(buf, x + w - 1, row, '│', border_fg, bg);
-    }
-    // Bottom border.
-    for col in 0..w {
-        let ch = if col == 0 {
-            '╰'
-        } else if col == w - 1 {
-            '╯'
-        } else {
-            '─'
-        };
-        set_cell(buf, x + col, y + h - 1, ch, border_fg, bg);
-    }
-
-    // Body — split on \n so each line renders on its own row.
-    let body_x = layout.body_bounds.x.round() as u16;
-    let body_y = layout.body_bounds.y.round() as u16;
-    let body_w = layout.body_bounds.width.round() as u16;
-    let body_text = title_as_plain(&dialog.body);
-    for (i, line) in body_text.split('\n').enumerate() {
-        let row = body_y + i as u16;
-        if row >= body_y + layout.body_bounds.height.round() as u16 {
-            break;
-        }
-        for (j, ch) in line.chars().enumerate() {
-            let col = body_x + j as u16;
-            if col >= body_x + body_w {
-                break;
-            }
-            set_cell(buf, col, row, ch, fg, bg);
-        }
-    }
-
-    // Input field (if present).
-    if let (Some(input_bounds), Some(input)) = (layout.input_bounds, &dialog.input) {
-        let ix = input_bounds.x.round() as u16;
-        let iy = input_bounds.y.round() as u16;
-        let iw = input_bounds.width.round() as u16;
-        let inp_bg = rc(theme.completion_bg);
-        // Fill input background.
-        for col in ix..ix + iw {
-            set_cell(buf, col, iy, ' ', fg, inp_bg);
-        }
-        // Draw the input value with a leading space.
-        let display = format!(" {}", input.value);
-        for (i, ch) in display.chars().enumerate() {
-            let col = ix + i as u16;
-            if col >= ix + iw {
-                break;
-            }
-            set_cell(buf, col, iy, ch, fg, inp_bg);
-        }
-    }
-
-    // Buttons — iterate visible_buttons; highlight default one.
-    for vis in &layout.visible_buttons {
-        let btn = &dialog.buttons[vis.button_idx];
-        let bx = vis.bounds.x.round() as u16;
-        let by = vis.bounds.y.round() as u16;
-        let bw = vis.bounds.width.round() as u16;
-        let btn_bg = if btn.is_default { sel_bg } else { bg };
-        for col in bx..bx + bw {
-            set_cell(buf, col, by, ' ', fg, btn_bg);
-        }
-        // Center the label inside the button area.
-        let label_w = btn.label.chars().count() as u16;
-        let start = bx + (bw.saturating_sub(label_w)) / 2;
-        for (i, ch) in btn.label.chars().enumerate() {
-            let col = start + i as u16;
-            if col >= bx + bw {
-                break;
-            }
-            set_cell(buf, col, by, ch, fg, btn_bg);
-        }
-    }
-}
-
-/// Flatten a `StyledText` to a plain `String` for simple single-span
-/// rendering paths that don't use colour overrides. For now dialog
-/// title + body never carry style overrides — `StyledText::plain`
-/// constructs them.
-fn title_as_plain(text: &quadraui::StyledText) -> String {
-    text.spans
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<String>()
+    quadraui::tui::draw_dialog(buf, dialog, layout, &q_theme(theme));
 }
 
 /// Draw a `quadraui::Tooltip` into `layout.bounds` on `buf`. Renders a
