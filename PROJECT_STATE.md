@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 25, 2026 (Session 331 — Phase B.5 GTK chrome catch-up: umbrella #205 closed substantially-complete, 7/8 slices landed, 8 issues filed, GTK chrome ~65% → ~85% on quadraui)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar rasteriser pilot landed: public `quadraui::tui::draw_status_bar` + `quadraui::gtk::draw_status_bar` behind `tui` / `gtk` feature gates, vimcode + kubeui + kubeui-gtk all delegate, -169 net lines)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,34 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 — #223 StatusBar rasteriser pilot landed (lift TUI + GTK rasterisers into quadraui):**
+
+The kubeui validation spike (Session 331-end) measured 65% code sharing between vimcode-the-editor and kubeui-the-app, with ~90% achievable if rasterisers move from vimcode-private into the public quadraui crate. This session landed the StatusBar pilot — the smallest possible end-to-end proof of the lift.
+
+**What shipped:**
+
+- `quadraui/src/theme.rs` — minimal backend-agnostic `Theme { background, foreground }`. Apps with rich theme systems (vimcode's `render::Theme`, kubeui's hardcoded palette) build one at the rasteriser call site. Field set grows as more primitives migrate.
+- `quadraui/src/tui/{mod,status_bar}.rs` — `pub fn quadraui::tui::draw_status_bar(buf, area, bar, layout, theme)`. Self-contained: includes `set_cell` + `ratatui_color` helpers (lifted from vimcode's `src/tui_main/mod.rs`). 4 unit tests cover paint order, empty-bar fallback, bold modifier, zero-size guard.
+- `quadraui/src/gtk/{mod,status_bar}.rs` — `pub fn quadraui::gtk::draw_status_bar(cr, layout, x, y, w, line_height, bar, theme) -> Vec<StatusBarHitRegion>`. Self-contained: includes `cairo_rgb` + `set_source` helpers; computes `StatusBarLayout` internally with Pango pixel measurement (16 px min gap).
+- `quadraui/Cargo.toml` — new feature gates: `tui = ["dep:ratatui"]`, `gtk = ["dep:gtk4", "dep:pangocairo"]`. The legacy `gtk-example` now depends on `gtk`. Feature gates keep the data layer dep-free (apps that consume `Theme` / `StatusBar` etc. without painting don't pay for ratatui or gtk4).
+
+**Adoption (vimcode + kubeui in the same diff):**
+
+- `src/tui_main/quadraui_tui.rs::draw_status_bar` and `src/gtk/quadraui_gtk.rs::draw_status_bar` collapse to ~10-line wrappers that build a `quadraui::Theme` from `render::Theme` (via `to_quadraui_color`) and delegate. Caller signatures unchanged — three call sites in `src/tui_main/render_impl.rs` and three in `src/gtk/draw.rs` continue to work.
+- `kubeui/src/main.rs` and `kubeui-gtk/src/main.rs` drop their private `draw_status_bar` (~25 + ~50 lines respectively) and call `quadraui::tui::draw_status_bar` / `quadraui::gtk::draw_status_bar` directly. Theme adapter is a tiny `fn theme() -> quadraui::Theme` returning the kubeui palette.
+
+**Behavioural delta:** kubeui's old hardcoded gray-fill becomes "first segment's bg" (per the public rasteriser's contract). Visual is identical because `kubeui-core::build_status_bar` sets every segment's bg to the same gray. Vimcode behaviour is unchanged — its private rasteriser already used the same fill rule.
+
+**Diff:** -169 net lines (108 added, 266 removed from vimcode + kubeui; 4 new files in quadraui). Kept `src/gtk/quadraui_gtk.rs::vc_to_cairo` / `qc_to_cairo` because 60+ other GTK draw functions still use them — those helpers move into quadraui as more primitives migrate.
+
+**Quality checks:** `cargo test --no-default-features` passes; `cargo test -p quadraui --features tui` 184/184 (4 new); `cargo clippy -- -D warnings` clean across vimcode (default + no-default-features), quadraui (`tui` + `gtk`), kubeui, kubeui-gtk.
+
+**What's next** — same per-primitive arc, with TabBar as the natural follow-up: both backends already consume `TabBarLayout` per Phase B.4, both already use the same right-segment width-fit logic, lift is mostly mechanical. After TabBar: ListView → TreeView → Palette → Form → Tooltip → Dialog → ContextMenu. Each migration is a per-primitive commit; vimcode + kubeui both adopt at the same time.
+
+**Friction surfaced for #224 (companion follow-up):** the `gtk` feature gate adds a 3-minute first build (gtk4 / pango / cairo deps) for anyone who didn't have them cached. Not a blocker, but worth noting — apps that consume only the data layer should default to `default-features = false` once we expose one.
+
+---
 
 **Session 331 — Phase B.5 GTK chrome catch-up (umbrella #205 closed, 7/8 slices landed, 8 issues filed, 1 crash fixed):**
 

@@ -1016,102 +1016,15 @@ pub(super) fn draw_status_bar(
     bar: &quadraui::StatusBar,
     theme: &Theme,
 ) -> Vec<quadraui::StatusBarHitRegion> {
-    // Reset layout state the same way the legacy renderer did.
-    layout.set_attributes(None);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    // #157: clip to the bar's rect so right-aligned segments that overflow
-    // the available width are truncated at the right edge instead of
-    // painting past it into the next window's tab bar / status row.
-    cr.save().ok();
-    cr.rectangle(x, y, width, line_height);
-    cr.clip();
-
-    // Background fill: first segment's bg, else theme bg.
-    let fill = bar
-        .left_segments
-        .first()
-        .or(bar.right_segments.first())
-        .map(|s| qc_to_cairo(s.bg))
-        .unwrap_or_else(|| vc_to_cairo(theme.background));
-    cr.set_source_rgb(fill.0, fill.1, fill.2);
-    cr.rectangle(x, y, width, line_height);
-    cr.fill().ok();
-
-    // Helper: apply bold attribute to the shared layout if the segment wants it.
-    let apply_bold = |layout: &pango::Layout, bold: bool| {
-        if bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
+    // Public rasteriser in `quadraui::gtk` consumes a backend-agnostic
+    // `quadraui::Theme`. Build one from the rich vimcode theme — the
+    // status bar reads only `background` (fallback fill when bar has
+    // no segments) but `foreground` is populated for symmetry.
+    let q_theme = quadraui::Theme {
+        background: render::to_quadraui_color(theme.background),
+        foreground: render::to_quadraui_color(theme.foreground),
     };
-
-    // Pango pixel-width measurer. `pango::Layout` uses GObject interior
-    // mutability, so `set_text` / `set_attributes` take `&self` and
-    // compose fine inside a `Fn` closure.
-    //
-    // #159: `StatusBar::layout` applies a `min_gap` priority-drop to
-    // right segments — ~16 px here (vs 2 cells in TUI). Right segments
-    // are ordered least-important first.
-    const MIN_GAP_PX: f32 = 16.0;
-    let measure = |seg: &quadraui::StatusBarSegment| -> quadraui::StatusSegmentMeasure {
-        layout.set_text(&seg.text);
-        apply_bold(layout, seg.bold);
-        let w_px = layout.pixel_size().0.max(0) as f32;
-        quadraui::StatusSegmentMeasure::new(w_px)
-    };
-    let bar_layout = bar.layout(width as f32, line_height as f32, MIN_GAP_PX, measure);
-
-    // Paint visible segments + build hit regions in a single pass.
-    let mut regions: Vec<quadraui::StatusBarHitRegion> = Vec::new();
-    for vs in &bar_layout.visible_segments {
-        let seg = match vs.side {
-            quadraui::StatusSegmentSide::Left => &bar.left_segments[vs.segment_idx],
-            quadraui::StatusSegmentSide::Right => &bar.right_segments[vs.segment_idx],
-        };
-        layout.set_text(&seg.text);
-        apply_bold(layout, seg.bold);
-
-        // `vs.bounds` is in bar-local coordinates (x=0 at the bar's left
-        // edge); translate to absolute Cairo coordinates for drawing,
-        // but keep the local form for the hit region (caller expects
-        // `col` relative to `x`).
-        let seg_x = x + vs.bounds.x as f64;
-        let seg_w = vs.bounds.width as f64;
-
-        // Segment background fill.
-        let (sr, sg, sb) = qc_to_cairo(seg.bg);
-        cr.set_source_rgb(sr, sg, sb);
-        cr.rectangle(seg_x, y, seg_w, line_height);
-        cr.fill().ok();
-
-        // Segment foreground text.
-        let (fr, fg, fb) = qc_to_cairo(seg.fg);
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(seg_x, y);
-        pangocairo::show_layout(cr, layout);
-
-        // Hit region for clickable segments. Widths still saturate at
-        // u16::MAX to preserve the existing `StatusBarHitRegion` shape
-        // that the GTK click handler consumes — real status bars are
-        // far under that.
-        if let Some(ref id) = seg.action_id {
-            regions.push(quadraui::StatusBarHitRegion {
-                col: (vs.bounds.x.round() as i64).clamp(0, u16::MAX as i64) as u16,
-                width: (vs.bounds.width.round() as i64).clamp(0, u16::MAX as i64) as u16,
-                id: id.clone(),
-            });
-        }
-    }
-
-    layout.set_attributes(None);
-    cr.restore().ok();
-
-    regions
+    quadraui::gtk::draw_status_bar(cr, layout, x, y, width, line_height, bar, &q_theme)
 }
 
 // ─── Tab bar (A.6d) ──────────────────────────────────────────────────────────

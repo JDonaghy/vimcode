@@ -42,11 +42,18 @@ members = ["quadraui", "kubeui-core", "kubeui", "kubeui-gtk"]
 
 [features]
 default = ["gui"]
-gui = ["gtk4", "relm4", "pangocairo", "gio"]
+# `quadraui/gtk` enables the public `quadraui::gtk::draw_*` rasterisers
+# (#223). vimcode adopts them one primitive at a time inside
+# `src/gtk/quadraui_gtk.rs`.
+gui = ["gtk4", "relm4", "pangocairo", "gio", "quadraui/gtk"]
 win-gui = ["windows"]
 
 [dependencies]
-quadraui = { path = "quadraui" }
+# `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
+# (#223). vimcode's TUI binary always builds, so the feature is on by
+# default in the dependency line; the GTK feature ships gated behind
+# vimcode's own `gui` feature above.
+quadraui = { path = "quadraui", features = ["tui"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }

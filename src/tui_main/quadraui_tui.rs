@@ -987,54 +987,15 @@ pub(super) fn draw_status_bar(
     layout: &quadraui::StatusBarLayout,
     theme: &Theme,
 ) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let y = area.y;
-
-    let fallback_bg = theme.background;
-    let fill_bg = bar
-        .left_segments
-        .first()
-        .or(bar.right_segments.first())
-        .map(|s| qc(s.bg))
-        .unwrap_or(RatatuiColor::Rgb(
-            fallback_bg.r,
-            fallback_bg.g,
-            fallback_bg.b,
-        ));
-    for col in 0..area.width {
-        set_cell(buf, area.x + col, y, ' ', fill_bg, fill_bg);
-    }
-
-    // Iterate layout.visible_segments — positions are already resolved by
-    // quadraui::StatusBar::layout() per D6. The rasteriser just paints.
-    for vs in &layout.visible_segments {
-        let seg = match vs.side {
-            quadraui::StatusSegmentSide::Left => &bar.left_segments[vs.segment_idx],
-            quadraui::StatusSegmentSide::Right => &bar.right_segments[vs.segment_idx],
-        };
-        let fg = qc(seg.fg);
-        let bg = qc(seg.bg);
-        let start_x = area.x + vs.bounds.x.round() as u16;
-        let bar_end = area.x + area.width;
-        let mut cx = start_x;
-        for ch in seg.text.chars() {
-            if cx >= bar_end {
-                break;
-            }
-            set_cell(buf, cx, y, ch, fg, bg);
-            if seg.bold {
-                if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(cx, y)) {
-                    cell.set_style(
-                        ratatui::style::Style::default()
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    );
-                }
-            }
-            cx += 1;
-        }
-    }
+    // Public rasteriser in `quadraui::tui` consumes a backend-agnostic
+    // `quadraui::Theme`. Build one from the rich vimcode theme — the
+    // status bar reads only `background` (fallback fill when bar has
+    // no segments) but `foreground` is populated for symmetry.
+    let q_theme = quadraui::Theme {
+        background: render::to_quadraui_color(theme.background),
+        foreground: render::to_quadraui_color(theme.foreground),
+    };
+    quadraui::tui::draw_status_bar(buf, area, bar, layout, &q_theme);
 }
 
 /// Narrow hardcoded set of PUA glyphs that render as 2 cells in terminals
