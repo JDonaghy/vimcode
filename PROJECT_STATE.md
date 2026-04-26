@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates, vimcode + kubeui all delegate, ~19 fields on `quadraui::Theme`. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 4 of its big-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,57 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 TreeView rasteriser pilot:**
+
+Fourth primitive lifted following the StatusBar / TabBar / ListView
+template. TreeView is the most complex of the four because GTK has
+**variable per-row heights** (header rows 1× line_height, leaves
+1.4×) that the rasteriser supplies via the primitive's measurement
+closure — the primitive itself doesn't know about font metrics.
+
+**What shipped:**
+
+- `quadraui/src/tui/tree.rs` —
+  `pub fn quadraui::tui::draw_tree(buf, area, tree, theme, nerd_fonts_enabled)`.
+  Uniform 1-cell-per-row measurer (TUI rows are always 1 cell tall).
+  Reuses `draw_styled_text` lifted in pilot 3. 4 unit tests cover
+  paint output with branch chevron + indented leaves, selected row
+  uses `selected_bg`, header row uses `header_bg`, zero-size guard.
+- `quadraui/src/gtk/tree.rs` —
+  `pub fn quadraui::gtk::draw_tree(cr, layout, x, y, w, h, tree, theme, line_height, nerd_fonts_enabled)`.
+  Per-row heights split at the measurer: `Decoration::Header` rows
+  get `line_height`, others get `(line_height * 1.4).round()`.
+  Vimcode's GTK click handlers walk the layout's per-row bounds
+  (already correct from `TreeViewLayout.visible_rows`) — no click
+  drift expected from the lift.
+- No new `quadraui::Theme` fields needed. The TreeView rasterisers
+  consume the same set ListView added (`header_bg`, `selected_bg`,
+  `muted_fg`).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tree` collapses to a 1-line
+  delegation. ~135 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_tree` collapses to a 12-line
+  delegation. ~180 lines of GTK-private rasterisation removed.
+- Kubeui doesn't have a tree today; its `theme()` adapters
+  populated the relevant Theme fields back in the ListView pilot,
+  so adding a kubeui tree later means data + handlers, no
+  rasteriser code.
+
+**Quality:** `cargo test -p quadraui --features tui` 199/199 (4 new
+tui::tree tests); full `cargo test --no-default-features` green;
+clippy clean across vimcode (default + no-default-features) and
+quadraui (`tui` + `gtk`).
+
+**What's next:** **Palette**. Vimcode uses it for the command
+palette and folder picker; kubeui has its own picker that's a
+likely adoption candidate (it's a bordered modal with query +
+items, exactly Palette's shape). After Palette: Form → Tooltip →
+Dialog → ContextMenu.
+
+---
 
 **Session 332 (cont.) — #223 ListView rasteriser pilot:**
 

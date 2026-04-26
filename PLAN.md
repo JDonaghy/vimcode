@@ -6,16 +6,16 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView rasteriser pilots landed; kubeui (TUI + GTK) now consumes the public `quadraui::*::draw_list` rasterisers — first primitive that hits both kubeui binaries head-on, ~110 lines of duplicate rasterisation removed from kubeui. Next pilot: TreeView)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView rasteriser pilots landed; vimcode now delegates 4 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Palette)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), TreeView next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Palette next
 
-**Three pilots shipped (Session 332).** StatusBar + TabBar + ListView
-rasterisers now live in `quadraui::{tui,gtk}::draw_*` behind `tui` /
-`gtk` feature gates. vimcode (TUI + GTK) and kubeui (TUI + GTK) all
-delegate.
+**Four pilots shipped (Session 332).** StatusBar + TabBar + ListView
++ TreeView rasterisers now live in `quadraui::{tui,gtk}::draw_*`
+behind `tui` / `gtk` feature gates. vimcode (TUI + GTK) and kubeui
+(TUI + GTK, where applicable) all delegate.
 
 The pilots proved out:
 
@@ -39,24 +39,20 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: TreeView.** vimcode uses it for the file explorer
-+ git source-control panel. Both backends already consume
-`TreeViewLayout` per Phase B.4. The lift is the most complex of the
-remaining primitives because **per-row heights vary on GTK** —
-header rows use 1× `line_height`, leaves use 1.4× — and the click
-hit-test (in `src/gtk/mod.rs`) walks an accumulator to map mouse y
-to row index. The public `quadraui::gtk::draw_tree` should keep that
-contract by accepting a measurement closure (or returning per-row
-y-bounds); the TUI version is uniform 1 cell per row and simpler.
+**Next primitive: Palette.** vimcode uses it for the command
+palette and folder picker. kubeui has its own picker (bordered
+modal with query + items) that's a clear adoption target. Both
+backends already consume `PaletteLayout` per Phase B.4.
 
-kubeui doesn't have a tree today, but adding one is a likely
-follow-on (resources-by-namespace hierarchy, drill-into-pod-events,
-etc.) — having the rasteriser ready means kubeui gets it for free
-when the use case lands.
+The lift is similar shape to ListView but adds the query-input
+row + scrollbar + match-highlighting. Theme fields likely needed:
+nothing new — the ListView lift already added the modal-surface
+fields (`surface_bg`, `border_fg`, `title_fg`, `selected_bg`,
+`muted_fg`).
 
-**Order after TreeView:** Palette → Form → Tooltip → Dialog →
-ContextMenu. Each is a per-primitive commit; vimcode + kubeui adopt
-at the same time.
+**Order after Palette:** Form → Tooltip → Dialog → ContextMenu.
+Each is a per-primitive commit; vimcode + kubeui adopt at the same
+time.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all
