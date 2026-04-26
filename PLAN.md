@@ -6,16 +6,18 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog rasteriser pilots landed; vimcode now delegates 8 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: ContextMenu — wraps the per-primitive arc.)
+> **Last updated:** 2026-04-26 (#223 ARC COMPLETE — all 9 primitives lifted: StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog + ContextMenu. vimcode delegates every big-rasteriser surface; ~2,400 net lines removed. Next focus: cleanup, smoke-test follow-ups, and kubeui adoption of the remaining primitives.)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), ContextMenu wraps arc
+## 🎯 NEXT SESSION PRIORITY — #223 arc complete; cleanup + smoke-test follow-ups
 
-**Eight pilots shipped (Session 332).** StatusBar + TabBar + ListView
-+ TreeView + Palette + Form + Tooltip + Dialog rasterisers now live in
-`quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
-vimcode (TUI + GTK) and kubeui (where applicable) all delegate.
+**All 9 pilots shipped (Session 332).** StatusBar + TabBar + ListView
++ TreeView + Palette + Form + Tooltip + Dialog + ContextMenu
+rasterisers now live in `quadraui::{tui,gtk}::draw_*` behind `tui` /
+`gtk` feature gates. vimcode (TUI + GTK) delegates every big-rasteriser
+surface; kubeui adopted ListView (others are vimcode-only consumers
+today but ready for external use).
 
 The pilots proved out:
 
@@ -39,23 +41,45 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: ContextMenu — last in the per-primitive arc.**
-Vimcode uses it for right-click menus (file explorer, tab action
-menu) and the menu-bar dropdowns (File / Edit / View / etc.). Both
-backends already consume `ContextMenuLayout` per Phase B.4. GTK
-rasteriser returns per-clickable-item hit rectangles `(x, y, w, h,
-WidgetId)` — same shape pattern Dialog already uses.
+**No more primitives to lift.** The per-primitive arc is done. Focus
+shifts to downstream work — pick whatever feels highest leverage:
 
-**After ContextMenu** the lift is infrastructure-complete. Focus
-shifts to downstream cleanup:
-- File the GTK font flicker fix (#227) — set the editor monospace
-  font explicitly in vimcode's GTK wrappers so popups never inherit
-  stale UI font from a prior chrome paint.
-- Address #225 (GTK tab switcher rounded corners + bordered ListView).
-- Address #228 / #229 (RichTextPopup heading bg / scrollbar leak).
-- Optionally clean up `quadraui::Theme` field naming (some are
-  prefixed `tab_` / `hover_` / `surface_` / `header_` — could be
-  unified into a smaller, more orthogonal palette).
+**Smoke-test follow-ups filed during the arc** (all pre-existing or
+unrelated to the rasteriser lifts):
+
+- **#225** — GTK tab switcher: rounded corners + bordered ListView support
+- **#226** — Right-click "Open to the Side" v-splits current tab
+- **#227** — GTK palette font flicker on first open (caller-set editor font)
+- **#228** — GTK editor hover: heading bg incomplete
+- **#229** — GTK editor hover: scrollbar leak (right-edge specific)
+- **#230** — LSP "rust-analyzer..." indicator stuck
+- **#231** — TUI rename: tree row stale tinting
+- **#232** — Tab-click no longer highlights tree row (TUI + GTK regression)
+- **#233** — GTK Dialog square corners (cross-backend visual divergence)
+
+**Cleanup / polish:**
+- `quadraui::Theme` field naming — some are still vimcode-flavoured
+  (`tab_*`, `hover_*`, `surface_*`, `header_*`). Could be unified
+  into a smaller orthogonal palette in a future cleanup pass.
+- Retire the few remaining `vc_to_cairo` / `qc_to_cairo` helpers in
+  `src/gtk/quadraui_gtk.rs` once the last vimcode-internal callers
+  are gone (some still live for other surfaces — activity bar,
+  terminal cells, completion popup, rich text popup).
+
+**External consumer expansion** (the original payoff #223 was named
+for):
+- kubeui adoption of Palette / Tooltip / Dialog if those use cases
+  appear (kubeui currently has its own picker shape; restructuring
+  to use Palette is the cleanest follow-up).
+- Document the public rasteriser API in
+  `quadraui/docs/TUI_CONSUMER_TOUR.md` + a parallel GTK tour.
+- Retire #224's API friction items now that the arc has hands-on
+  feedback from each primitive.
+
+The kubeui validation spike's promise (#145, "65% sharing today,
+~90% with rasterisers in quadraui") is structurally delivered. The
+next external app (Postman, SQL client, k8s dashboard) starts at
+the higher number.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all

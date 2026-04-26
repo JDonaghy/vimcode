@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 8 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0. ContextMenu wraps the arc next.)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 per-primitive rasteriser arc COMPLETE: all 9 primitives shipped — StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog + ContextMenu. Public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates all big-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0.)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,85 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 ContextMenu rasteriser pilot — ARC COMPLETE:**
+
+Ninth and final primitive in the per-primitive arc for #223. Vimcode
+uses `ContextMenu` for right-click menus (file explorer, tab action
+menu) and the menu-bar dropdowns (File / Edit / View / etc.).
+
+**What shipped:**
+
+- `quadraui/src/tui/context_menu.rs` —
+  `pub fn quadraui::tui::draw_context_menu(buf, menu, layout, theme)`.
+  Box-bordered popup, selected item rendered inverted (fg/bg swap),
+  separator as horizontal `─` dashes, disabled items dimmed,
+  shortcut text right-aligned. 4 unit tests.
+- `quadraui/src/gtk/context_menu.rs` —
+  `pub fn quadraui::gtk::draw_context_menu(cr, layout, menu, menu_layout, line_height, theme) -> Vec<(f64, f64, f64, f64, WidgetId)>`.
+  Returns the per-clickable-item hit-rectangles + their `WidgetId`s
+  so the caller's click handler can resolve mouse events without
+  re-running layout. No new theme fields.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_context_menu` collapses to a
+  delegation. ~115 lines removed.
+- `src/gtk/quadraui_gtk.rs::draw_context_menu` collapses to a
+  delegation. ~110 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+219/219 (4 new context_menu tests on top of 215); clippy clean.
+
+---
+
+## #223 ARC COMPLETE — what landed today (Session 332)
+
+**9 pilots in one session**, plus 1 pre-existing layout-regression fix:
+
+| # | Primitive | Net lines | Theme fields added |
+|---|-----------|-----------|---------------------|
+| 1 | StatusBar | -169 | `background`, `foreground` (initial set) |
+| 2 | TabBar    | -371 | 7 tab fields + `separator` |
+| 2½ | (TabBar layout fix) | n/a | — (regression fix in primitive) |
+| 3 | ListView  | -249 | 10 modal/list fields |
+| 4 | TreeView  | -279 | (no new fields) |
+| 5 | Palette   | -467 | `query_fg`, `match_fg` |
+| 6 | Form      | -506 | `accent_fg` |
+| 7 | Tooltip   | -52  | `hover_bg`, `hover_fg`, `hover_border` |
+| 8 | Dialog    | -182 | `input_bg` |
+| 9 | ContextMenu | -188 | (no new fields) |
+
+**Total: 24 fields on `quadraui::Theme`. ~2,400 net lines removed
+from vimcode + kubeui.** Public rasterisers in
+`quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
+
+**Cross-app payoff:** kubeui adopted ListView; remaining primitives
+are vimcode-only consumers today but the rasterisers are ready for
+external apps (Postman / SQL client / k8s dashboard / etc.) the
+moment they need them.
+
+**Issues filed during smoke-testing the arc** (all pre-existing or
+out-of-scope, none introduced by the pilots):
+
+- #225 — GTK tab switcher: rounded corners + bordered ListView support
+- #226 — Right-click "Open to the Side" v-splits current tab
+- #227 — GTK palette font flicker on first open
+- #228 — GTK editor hover: heading bg incomplete
+- #229 — GTK editor hover: scrollbar leak (right-edge specific)
+- #230 — LSP "rust-analyzer..." indicator stuck
+- #231 — TUI rename: tree row stale tinting after dialog closes
+- #232 — Tab-click no longer highlights tree row (TUI + GTK)
+- #233 — GTK Dialog square corners (cross-backend visual divergence)
+
+**What's next** — the per-primitive arc for #223 is done. Focus
+shifts to:
+- Cleanup of `quadraui::Theme` field names (some are still vimcode-flavoured: `tab_*`, `hover_*`).
+- File the GTK font flicker fix (#227) by setting editor monospace explicitly in vimcode wrappers.
+- The smoke-test follow-up issues above.
+- Optionally: kubeui adoption of more primitives (Palette / Tooltip / Dialog) if those use cases appear.
+
+---
 
 **Session 332 (cont.) — #223 Dialog rasteriser pilot:**
 
