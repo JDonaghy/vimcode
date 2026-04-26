@@ -2194,22 +2194,13 @@ pub(super) fn draw_rich_text_popup(
             let to_u16 = |c: u8| ((c as u16) << 8) | c as u16;
             let bg_color = popup.bg.unwrap_or(quadraui::Color::rgb(0, 0, 0));
 
-            // Selection bg attr (single attr for whole selection range)
-            // — bg attrs don't conflict with fg attrs so this is safe to
-            // add once.
-            if sel_end_byte > sel_start_byte {
-                let fg_color = popup
-                    .fg
-                    .unwrap_or_else(|| quadraui::Color::rgb(255, 255, 255));
-                let mut inv_bg = pango::AttrColor::new_background(
-                    to_u16(fg_color.r),
-                    to_u16(fg_color.g),
-                    to_u16(fg_color.b),
-                );
-                inv_bg.set_start_index(sel_start_byte as u32);
-                inv_bg.set_end_index(sel_end_byte as u32);
-                attrs.insert(inv_bg);
-            }
+            // Selection bg used to be a single Pango background attr, but
+            // adjacent text runs (one per fg colour change) produced
+            // hairline antialiasing gaps where the per-run rects met
+            // (#219). The fix paints the selection rect once in Cairo
+            // BEFORE the Pango render so the bg is a single solid fill.
+            // The Pango call below still inverts fg per-character within
+            // the selected range so the text remains legible.
 
             // Per-span fg + bold + italic. Each span is split by the
             // selection boundary so we can swap the fg colour to the
@@ -2291,6 +2282,30 @@ pub(super) fn draw_rich_text_popup(
                 }
             }
             pango_layout.set_attributes(Some(&attrs));
+
+            // Selection bg fill (Cairo rect underneath the text). With
+            // attrs applied so `index_to_pos` honours the font scale on
+            // heading rows. Pango byte indices clamp to text length, so
+            // a sel_end_byte at end-of-line maps to the line's right
+            // edge correctly.
+            if sel_end_byte > sel_start_byte {
+                let fg_color = popup
+                    .fg
+                    .unwrap_or_else(|| quadraui::Color::rgb(255, 255, 255));
+                let start_pos = pango_layout.index_to_pos(sel_start_byte as i32);
+                let end_pos = pango_layout.index_to_pos(sel_end_byte as i32);
+                let x0 = line_x + start_pos.x() as f64 / pango::SCALE as f64;
+                let x1 = line_x + end_pos.x() as f64 / pango::SCALE as f64;
+                let row_h = vis.bounds.height as f64;
+                cr.set_source_rgb(
+                    fg_color.r as f64 / 255.0,
+                    fg_color.g as f64 / 255.0,
+                    fg_color.b as f64 / 255.0,
+                );
+                cr.rectangle(x0.min(x1), row_y, (x1 - x0).abs(), row_h);
+                cr.fill().ok();
+            }
+
             cr.set_source_rgb(fg_r, fg_g, fg_b);
             cr.move_to(line_x, row_y);
             pangocairo::show_layout(cr, pango_layout);
