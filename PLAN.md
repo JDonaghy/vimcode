@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 ARC COMPLETE — all 9 primitives lifted: StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog + ContextMenu. vimcode delegates every big-rasteriser surface; ~2,400 net lines removed. Next focus: cleanup, smoke-test follow-ups, and kubeui adoption of the remaining primitives.)
+> **Last updated:** 2026-04-26 (#223 ARC COMPLETE plus a 10th lift: 9 primitives + TextDisplay. kubeui YAML pane now flows through the same kubeui-core view-builder → quadraui rasteriser pattern as the other surfaces. Next focus: kubeui Palette adoption + cleanup + smoke-test follow-ups.)
 
 ---
 

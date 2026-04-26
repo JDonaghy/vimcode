@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 per-primitive rasteriser arc COMPLETE: all 9 primitives shipped — StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip + Dialog + ContextMenu. Public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates all big-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0.)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 per-primitive rasteriser arc COMPLETE plus a 10th lift: 9 primitives + TextDisplay-with-kubeui-yaml-adoption shipped. All public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates all big-rasteriser surfaces; kubeui adopted ListView + TextDisplay (via new `kubeui_core::build_yaml_view` view-builder). Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0.)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,58 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 TextDisplay rasteriser pilot + kubeui YAML pane adoption:**
+
+Tenth lift, sequenced after the per-primitive arc wrapped. This one
+proves out the **kubeui-core view-builder pattern** end-to-end: the
+YAML-key/value parsing logic moves into `kubeui_core::build_yaml_view`,
+both kubeui binaries shrink to a bespoke title row + delegated body,
+and the next external app gets the same machinery for free.
+
+**What shipped:**
+
+- `quadraui/src/tui/text_display.rs` —
+  `pub fn quadraui::tui::draw_text_display(buf, area, display, theme)`.
+  Generic per-line styled-text rasteriser; respects per-line
+  `decoration` (`Error`/`Warning`/`Muted`) and per-span `fg`/`bg`
+  overrides; optional `timestamp` prefix in `muted_fg`. 4 unit tests
+  cover top-to-bottom paint, span fg override, auto-scroll pinning
+  to bottom, zero-size guard.
+- `quadraui/src/gtk/text_display.rs` —
+  `pub fn quadraui::gtk::draw_text_display(cr, layout, x, y, w, h, display, theme, line_height)`.
+  Mirrors the visual contract.
+- `kubeui-core::build_yaml_view(state) -> TextDisplay` —
+  YAML-key/value parsing extracted from both kubeui binaries into
+  the shared core. Each line becomes a `TextDisplayLine` with two
+  styled spans (`key:` in blue + value in default fg) or a single
+  plain span when no `:` is present.
+- No new `quadraui::Theme` fields needed.
+
+**Adoption:**
+
+- `kubeui/src/main.rs::draw_yaml` collapses to ~25 lines: bespoke
+  title row (focus-dependent " YAML" / " YAML  ◀ j/k") + 1-line
+  delegate to `quadraui::tui::draw_text_display` for the body.
+  YAML-pane-specific `bg = (16, 18, 24)` preserved via a one-off
+  `quadraui::Theme { background: bg, ..theme() }` override.
+- `kubeui-gtk/src/main.rs::draw_yaml` collapses similarly. ~95 lines
+  removed from kubeui binaries combined; +56 lines in kubeui-core.
+  Net: shared logic moves where it belongs, binaries shrink to
+  paint glue.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+223/223 (4 new text_display tests on top of 219); kubeui (TUI + GTK)
+build clean; clippy clean across the workspace.
+
+**What's next:** kubeui's picker → `Palette` adoption is the
+remaining same-shape lift (the picker has its own ListView shape
+today; restructuring to use `Palette` is a kubeui-core view-builder
+change). After that the kubeui binaries are at the irreducible
+event-loop floor (~150-200 lines each) — further reduction needs
+the Phase B `Backend` trait.
+
+---
 
 **Session 332 (cont.) — #223 ContextMenu rasteriser pilot — ARC COMPLETE:**
 
