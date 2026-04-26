@@ -6,16 +6,16 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView rasteriser pilots landed; vimcode now delegates 4 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Palette)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette rasteriser pilots landed; vimcode now delegates 5 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Form)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Palette next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Form next
 
-**Four pilots shipped (Session 332).** StatusBar + TabBar + ListView
-+ TreeView rasterisers now live in `quadraui::{tui,gtk}::draw_*`
-behind `tui` / `gtk` feature gates. vimcode (TUI + GTK) and kubeui
-(TUI + GTK, where applicable) all delegate.
+**Five pilots shipped (Session 332).** StatusBar + TabBar + ListView
++ TreeView + Palette rasterisers now live in
+`quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
+vimcode (TUI + GTK) and kubeui (where applicable) all delegate.
 
 The pilots proved out:
 
@@ -39,20 +39,16 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: Palette.** vimcode uses it for the command
-palette and folder picker. kubeui has its own picker (bordered
-modal with query + items) that's a clear adoption target. Both
-backends already consume `PaletteLayout` per Phase B.4.
+**Next primitive: Form.** Vimcode uses it for the TUI settings
+panel; the GTK settings panel is still on native widgets but the
+GTK `draw_form` rasteriser exists for the eventual DrawingArea
+migration. Theme fields likely needed: an accent foreground for
+the toggle "[x]" + maybe an input bracket fg. Lift is similar
+shape to ListView; per-row heights uniform on TUI, 1.4×
+line_height on GTK (same convention as TreeView leaves).
 
-The lift is similar shape to ListView but adds the query-input
-row + scrollbar + match-highlighting. Theme fields likely needed:
-nothing new — the ListView lift already added the modal-surface
-fields (`surface_bg`, `border_fg`, `title_fg`, `selected_bg`,
-`muted_fg`).
-
-**Order after Palette:** Form → Tooltip → Dialog → ContextMenu.
-Each is a per-primitive commit; vimcode + kubeui adopt at the same
-time.
+**Order after Form:** Tooltip → Dialog → ContextMenu. Each is a
+per-primitive commit; vimcode + kubeui adopt at the same time.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all

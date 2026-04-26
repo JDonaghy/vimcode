@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 4 of its big-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 5 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,53 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 Palette rasteriser pilot:**
+
+Fifth primitive lifted. Palette is the vimcode command palette + folder
+picker (TUI + GTK). Most visually rich of the lifts so far: bordered
+modal with title bar, query-input row with cursor block, separator,
+scrollable item list with per-character fuzzy-match highlighting, and
+a thumb scrollbar.
+
+**What shipped:**
+
+- `quadraui/src/tui/palette.rs` —
+  `pub fn quadraui::tui::draw_palette(buf, area, palette, theme, nerd_fonts_enabled)`.
+  4 unit tests cover: corner glyphs, query+prompt row layout,
+  match_positions painting in `match_fg`, too-small-area no-op.
+- `quadraui/src/gtk/palette.rs` —
+  `pub fn quadraui::gtk::draw_palette(cr, layout, x, y, w, h, palette, theme, line_height, nerd_fonts_enabled)`.
+  Cairo + Pango with per-character `AttrColor` foreground spans for
+  match highlighting.
+- `quadraui::Theme` adds 2 fields: `query_fg` (query text + cursor
+  block fg, distinct from `surface_fg`) and `match_fg` (highlight
+  colour for fuzzy-match positions).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_palette` collapses to a
+  delegation. ~250 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_palette` collapses to a delegation.
+  ~280 lines removed.
+
+**Kubeui not adopted yet.** kubeui has its own picker but it builds
+a `ListView` (not a `Palette`); migrating kubeui to Palette would
+require restructuring the kubeui-core picker view-builder to emit
+the richer `Palette` shape (with query + total_count + match
+positions). Reasonable follow-up; the rasterisers are ready when
+kubeui wants them.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+203/203 (4 new palette tests on top of 199); full
+`cargo test --no-default-features` green; clippy clean across all
+combinations.
+
+**What's next:** **Form**. Vimcode's settings panel (TUI; GTK still
+on native widgets but the rasteriser exists for the eventual GTK
+DrawingArea migration). Then Tooltip → Dialog → ContextMenu.
+
+---
 
 **Session 332 (cont.) — #223 TreeView rasteriser pilot:**
 
