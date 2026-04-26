@@ -38,7 +38,7 @@ path = "src/win_gui_bin.rs"
 required-features = ["win-gui"]
 
 [workspace]
-members = ["quadraui"]
+members = ["quadraui", "kubeui-core", "kubeui", "kubeui-gtk"]
 
 [features]
 default = ["gui"]
