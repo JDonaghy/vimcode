@@ -2106,7 +2106,11 @@ pub(super) fn draw_rich_text_popup(
             .unwrap_or("");
 
         let focused_link_range = popup.focused_link.and_then(|fi| {
-            popup.links.get(fi).filter(|l| l.line == line_idx).map(|l| (l.start_byte, l.end_byte))
+            popup
+                .links
+                .get(fi)
+                .filter(|l| l.line == line_idx)
+                .map(|l| (l.start_byte, l.end_byte))
         });
 
         let mut col_off: u16 = 0;
@@ -2141,12 +2145,12 @@ pub(super) fn draw_rich_text_popup(
                             .map(|(s, e)| byte_pos >= s && byte_pos < e)
                             .unwrap_or(false)
                     {
-                        if let Some(cell) = buf.cell_mut(ratatui::prelude::Position {
-                            x: cx,
-                            y: row_y,
-                        }) {
+                        if let Some(cell) =
+                            buf.cell_mut(ratatui::prelude::Position { x: cx, y: row_y })
+                        {
                             cell.set_style(
-                                cell.style().add_modifier(ratatui::style::Modifier::UNDERLINED),
+                                cell.style()
+                                    .add_modifier(ratatui::style::Modifier::UNDERLINED),
                             );
                         }
                     }

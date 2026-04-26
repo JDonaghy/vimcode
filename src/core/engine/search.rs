@@ -108,7 +108,11 @@ impl Engine {
             0
         };
         // Wildmenu row (command-line Tab-complete).
-        let wildmenu = if !self.wildmenu_items.is_empty() { 1 } else { 0 };
+        let wildmenu = if !self.wildmenu_items.is_empty() {
+            1
+        } else {
+            0
+        };
         // Debug toolbar row (F5 / F6 / F9 / F10 / F11 buttons).
         let dbg = if self.debug_toolbar_visible { 1 } else { 0 };
         qf + term + wildmenu + dbg

@@ -769,8 +769,8 @@ pub(super) fn draw_palette(
     let palette_layout = palette_local.layout(
         w as f32,
         (rows_y + rows_h - y) as f32, // title + query + separator + items region
-        line_height as f32,            // title_height
-        line_height as f32,            // query_height
+        line_height as f32,           // title_height
+        line_height as f32,           // query_height
         |_| quadraui::PaletteItemMeasure::new(line_height as f32),
     );
 
@@ -1841,7 +1841,10 @@ pub(super) fn draw_tooltip(
 /// body don't currently carry per-span style overrides, so plain text
 /// suffices on GTK; mirrors the TUI helper of the same name.
 fn styled_text_plain(text: &quadraui::StyledText) -> String {
-    text.spans.iter().map(|s| s.text.as_str()).collect::<String>()
+    text.spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<String>()
 }
 
 /// Draw a `quadraui::Dialog` at its resolved layout. Returns the button
@@ -1998,7 +2001,10 @@ pub(super) fn draw_context_menu(
     let bw = bounds.width as f64;
     let bh = bounds.height as f64;
 
-    let bg = menu.bg.map(qc_to_cairo).unwrap_or_else(|| vc_to_cairo(theme.hover_bg));
+    let bg = menu
+        .bg
+        .map(qc_to_cairo)
+        .unwrap_or_else(|| vc_to_cairo(theme.hover_bg));
     let (br, bg_g, bb) = vc_to_cairo(theme.hover_border);
     let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.foreground);
     let (sel_r, sel_g, sel_b) = vc_to_cairo(theme.sidebar_sel_bg);
@@ -2206,16 +2212,14 @@ pub(super) fn draw_rich_text_popup(
             // selection boundary so we can swap the fg colour to the
             // inverted (popup bg) for the in-selection chunk without
             // an attr-override conflict.
-            let push_fg_attr = |attrs: &pango::AttrList, start: usize, end: usize, fg: quadraui::Color| {
-                let mut a = pango::AttrColor::new_foreground(
-                    to_u16(fg.r),
-                    to_u16(fg.g),
-                    to_u16(fg.b),
-                );
-                a.set_start_index(start as u32);
-                a.set_end_index(end as u32);
-                attrs.insert(a);
-            };
+            let push_fg_attr =
+                |attrs: &pango::AttrList, start: usize, end: usize, fg: quadraui::Color| {
+                    let mut a =
+                        pango::AttrColor::new_foreground(to_u16(fg.r), to_u16(fg.g), to_u16(fg.b));
+                    a.set_start_index(start as u32);
+                    a.set_end_index(end as u32);
+                    attrs.insert(a);
+                };
             let push_bold = |attrs: &pango::AttrList, start: usize, end: usize| {
                 let mut a = pango::AttrInt::new_weight(pango::Weight::Bold);
                 a.set_start_index(start as u32);
@@ -2251,9 +2255,7 @@ pub(super) fn draw_rich_text_popup(
                 if span.fg.is_some() && chunk_end_pre > chunk_start_pre {
                     push_fg_attr(&attrs, chunk_start_pre, chunk_end_pre, span_fg);
                 }
-                if chunk_end_in > chunk_start_in
-                    && in_selection(chunk_start_in, chunk_end_in)
-                {
+                if chunk_end_in > chunk_start_in && in_selection(chunk_start_in, chunk_end_in) {
                     push_fg_attr(&attrs, chunk_start_in, chunk_end_in, inv_fg);
                 }
                 if span.fg.is_some() && chunk_end_post > chunk_start_post {
@@ -2272,8 +2274,7 @@ pub(super) fn draw_rich_text_popup(
                 if let Some(focused) = popup.focused_link {
                     if let Some(link) = popup.links.get(focused) {
                         if link.line == line_idx {
-                            let mut ul =
-                                pango::AttrInt::new_underline(pango::Underline::Single);
+                            let mut ul = pango::AttrInt::new_underline(pango::Underline::Single);
                             ul.set_start_index(link.start_byte as u32);
                             ul.set_end_index(link.end_byte as u32);
                             attrs.insert(ul);

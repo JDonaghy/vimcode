@@ -5672,6 +5672,69 @@ impl App {
         self.window.set_title(Some(&win_title));
     }
 
+    /// Map a pixel x-offset within the editor hover popup's content
+    /// area to a character column on `content_line`, using Pango to
+    /// measure proportional UI-font widths (#218). The legacy code
+    /// did `(rel_x / cached_char_width)` which drifts as the column
+    /// index grows because UI_FONT is proportional. Heading rows
+    /// (font scale > 1.0) need the scale applied to the layout so
+    /// `xy_to_index` returns the right position.
+    fn pixel_to_editor_hover_col(&self, rel_x: f64, content_line: usize) -> usize {
+        let da = match self.drawing_area.borrow().as_ref() {
+            Some(da) => da.clone(),
+            None => return rel_x.max(0.0) as usize,
+        };
+        let engine = self.engine.borrow();
+        let Some(eh) = engine.editor_hover.as_ref() else {
+            return 0;
+        };
+        let Some(line_text) = eh.rendered.lines.get(content_line).cloned() else {
+            return 0;
+        };
+        let heading_level = eh
+            .rendered
+            .spans
+            .get(content_line)
+            .and_then(|spans| {
+                spans.iter().find_map(|s| match s.style {
+                    core::markdown::MdStyle::Heading(n) => Some(n),
+                    _ => None,
+                })
+            })
+            .unwrap_or(0);
+        let scale = match heading_level {
+            1 => 1.4,
+            2 => 1.2,
+            3..=6 => 1.1,
+            _ => 1.0,
+        };
+        drop(engine);
+
+        let pango_ctx = da.pango_context();
+        let layout = pango::Layout::new(&pango_ctx);
+        let font_desc = FontDescription::from_string(UI_FONT);
+        layout.set_font_description(Some(&font_desc));
+        layout.set_text(&line_text);
+        if (scale - 1.0_f64).abs() > 0.01 {
+            let attrs = pango::AttrList::new();
+            let mut a = pango::AttrFloat::new_scale(scale);
+            a.set_start_index(0);
+            a.set_end_index(line_text.len() as u32);
+            attrs.insert(a);
+            layout.set_attributes(Some(&attrs));
+        }
+
+        let x_pango = (rel_x.max(0.0) * pango::SCALE as f64) as i32;
+        // y=0 → first (and only) line of the layout. xy_to_index returns
+        // (inside, byte_index, trailing). When the click is past the
+        // line's last char `inside` is false but `byte_index + trailing`
+        // points at the trailing edge, which is what we want.
+        let (_inside, byte_index, trailing) = layout.xy_to_index(x_pango, 0);
+        let byte_pos = (byte_index as usize).saturating_add(trailing as usize);
+        let clamped = byte_pos.min(line_text.len());
+        line_text[..clamped].chars().count()
+    }
+
     /// Push or pop the editor hover popup on the modal stack so
     /// click dispatch can decide modal-vs-base for both left- and
     /// right-clicks (#216). The popup is registered whenever it's
@@ -6146,7 +6209,6 @@ impl App {
                         self.engine.borrow_mut().editor_hover_has_focus = true;
                     } else {
                         // Focused, no link hit — start text selection
-                        let cw = self.cached_char_width.max(1.0);
                         let lh = self.cached_line_height.max(1.0);
                         if let Some((px, py, _pw, _ph)) = rect {
                             let padding = 4.0;
@@ -6160,7 +6222,7 @@ impl App {
                                 .unwrap_or(0);
                             drop(engine_ref);
                             let content_line = (rel_y / lh).max(0.0) as usize + scroll;
-                            let content_col = (rel_x / cw).max(0.0) as usize;
+                            let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
                             self.engine
                                 .borrow_mut()
                                 .editor_hover_start_selection(content_line, content_col);
@@ -6803,7 +6865,6 @@ impl App {
                 {
                     if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
                         let padding = 4.0;
-                        let cw = self.cached_char_width.max(1.0);
                         let lh = self.cached_line_height.max(1.0);
                         let scroll = engine
                             .editor_hover
@@ -6814,7 +6875,7 @@ impl App {
                         let rel_x = x - px - padding;
                         let rel_y = y - py - padding;
                         let content_line = (rel_y / lh).max(0.0) as usize + scroll;
-                        let content_col = (rel_x / cw).max(0.0) as usize;
+                        let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
                         self.engine
                             .borrow_mut()
                             .editor_hover_extend_selection(content_line, content_col);

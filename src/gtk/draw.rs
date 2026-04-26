@@ -950,12 +950,8 @@ pub(super) fn draw_breadcrumb_bar(
     focus_selected: usize,
     hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
 ) {
-    let bar = render::breadcrumbs_to_quadraui_status_bar(
-        segments,
-        theme,
-        focus_active,
-        focus_selected,
-    );
+    let bar =
+        render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
     let hits = super::quadraui_gtk::draw_status_bar(
         cr,
         layout,
@@ -1849,13 +1845,26 @@ pub(super) fn draw_hover_popup(
         fg: None,
     };
     let tip_layout = tooltip.layout(
-        quadraui::Rect::new(anchor_x as f32, anchor_y as f32, char_width as f32, line_height as f32),
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            char_width as f32,
+            line_height as f32,
+        ),
         quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
         quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
         0.0,
     );
 
-    super::quadraui_gtk::draw_tooltip(cr, layout, &tooltip, &tip_layout, line_height, char_width, theme);
+    super::quadraui_gtk::draw_tooltip(
+        cr,
+        layout,
+        &tooltip,
+        &tip_layout,
+        line_height,
+        char_width,
+        theme,
+    );
 }
 
 /// Draw the LSP/editor hover popup via the `quadraui::RichTextPopup`
@@ -1923,7 +1932,10 @@ pub(super) fn draw_editor_hover_popup(
                 .line_text
                 .get(line_idx)
                 .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())].chars().count() as f32 * cw
+                    t[start_byte.min(t.len())..end_byte.min(t.len())]
+                        .chars()
+                        .count() as f32
+                        * cw
                 })
                 .unwrap_or(0.0)
         },
@@ -2130,13 +2142,26 @@ pub(super) fn draw_signature_popup(
         fg: None,
     };
     let tip_layout = tooltip.layout(
-        quadraui::Rect::new(anchor_x as f32, anchor_y as f32, char_width as f32, line_height as f32),
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            char_width as f32,
+            line_height as f32,
+        ),
         quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
         quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
         0.0,
     );
 
-    super::quadraui_gtk::draw_tooltip(cr, layout, &tooltip, &tip_layout, line_height, char_width, theme);
+    super::quadraui_gtk::draw_tooltip(
+        cr,
+        layout,
+        &tooltip,
+        &tip_layout,
+        line_height,
+        char_width,
+        theme,
+    );
 }
 
 /// Draw the inline find/replace overlay at the top-right of the editor.
@@ -2290,25 +2315,32 @@ pub(super) fn draw_find_replace_popup(
             let s = anchor.min(cursor);
             let e = anchor.max(cursor);
             if s != e {
-                let s_prefix = &text[..text.char_indices().nth(s).map(|(i, _)| i).unwrap_or(text.len())];
-                let e_prefix = &text[..text.char_indices().nth(e).map(|(i, _)| i).unwrap_or(text.len())];
+                let s_prefix = &text[..text
+                    .char_indices()
+                    .nth(s)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len())];
+                let e_prefix = &text[..text
+                    .char_indices()
+                    .nth(e)
+                    .map(|(i, _)| i)
+                    .unwrap_or(text.len())];
                 layout.set_text(s_prefix);
                 let (sx, _) = layout.pixel_size();
                 layout.set_text(e_prefix);
                 let (ex, _) = layout.pixel_size();
                 let (sr, sg, sb) = theme.selection.to_cairo();
                 cr.set_source_rgba(sr, sg, sb, 0.5);
-                cr.rectangle(
-                    bx + 4.0 + sx as f64,
-                    by,
-                    (ex - sx) as f64,
-                    lh,
-                );
+                cr.rectangle(bx + 4.0 + sx as f64, by, (ex - sx) as f64, lh);
                 let _ = cr.fill();
             }
         }
         // Cursor — 2-px-wide vertical bar.
-        let prefix = &text[..text.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(text.len())];
+        let prefix = &text[..text
+            .char_indices()
+            .nth(cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len())];
         layout.set_text(prefix);
         let (cpx, _) = layout.pixel_size();
         cr.set_source_rgb(fg_r, fg_g, fg_b);
@@ -2354,7 +2386,13 @@ pub(super) fn draw_find_replace_popup(
                 );
             }
             T::ToggleCase => {
-                paint_toggle(region.col, region.row, region.width, "Aa", panel.case_sensitive);
+                paint_toggle(
+                    region.col,
+                    region.row,
+                    region.width,
+                    "Aa",
+                    panel.case_sensitive,
+                );
             }
             T::ToggleWholeWord => {
                 paint_toggle(region.col, region.row, region.width, "ab", panel.whole_word);
@@ -2386,10 +2424,22 @@ pub(super) fn draw_find_replace_popup(
                 );
             }
             T::Close => {
-                paint_glyph(region.col, region.row, region.width, icons::FIND_CLOSE.s(), false);
+                paint_glyph(
+                    region.col,
+                    region.row,
+                    region.width,
+                    icons::FIND_CLOSE.s(),
+                    false,
+                );
             }
             T::TogglePreserveCase => {
-                paint_toggle(region.col, region.row, region.width, "AB", panel.preserve_case);
+                paint_toggle(
+                    region.col,
+                    region.row,
+                    region.width,
+                    "AB",
+                    panel.preserve_case,
+                );
             }
             T::ReplaceCurrent => {
                 paint_glyph(
@@ -2900,9 +2950,7 @@ pub(super) fn draw_dialog_popup(
         dialog.buttons.len() as f64 * btn_max_w
             + (dialog.buttons.len().saturating_sub(1)) as f64 * button_gap
     };
-    let content_w = body_max_w
-        .max(title_w as f64 + 16.0)
-        .max(total_btns_w);
+    let content_w = body_max_w.max(title_w as f64 + 16.0).max(total_btns_w);
     let popup_w = (content_w + padding * 2.0).clamp(350.0, editor_width - 40.0);
 
     let measure = quadraui::DialogMeasure {
@@ -2918,7 +2966,15 @@ pub(super) fn draw_dialog_popup(
     let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
     let dialog_layout = dialog.layout(viewport, measure);
 
-    super::quadraui_gtk::draw_dialog(cr, layout, &ui_layout, &dialog, &dialog_layout, line_height, theme)
+    super::quadraui_gtk::draw_dialog(
+        cr,
+        layout,
+        &ui_layout,
+        &dialog,
+        &dialog_layout,
+        line_height,
+        theme,
+    )
 }
 
 /// Draw an engine-driven context menu popup on the DrawingArea.
@@ -2958,8 +3014,7 @@ pub(super) fn draw_context_menu_popup(
     // index a backend mouse-handler computes from `(y / line_height)`
     // matches the row index this layout produces. Separator rendering
     // (a thin rule centred in the row) happens inside `draw_context_menu`.
-    let item_height =
-        |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
 
     // Width: budget to fit longest label + longest shortcut + padding.
     let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
@@ -3999,8 +4054,7 @@ pub(super) fn draw_menu_dropdown(
     // Uniform `line_height` per row (separators included) so the
     // primitive's row positions are predictable. Separator rendering
     // (a thin rule centred in the row) happens inside `draw_context_menu`.
-    let item_height =
-        |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
 
     let menu_w = 220.0_f64;
     let viewport = quadraui::Rect::new(0.0, 0.0, width as f32, height as f32);
@@ -5891,15 +5945,7 @@ pub(super) fn draw_debug_toolbar(
     ui_layout.set_font_description(Some(&ui_font_desc));
 
     let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
-    let hits = super::quadraui_gtk::draw_status_bar(
-        cr,
-        &ui_layout,
-        x,
-        y,
-        width,
-        height,
-        &bar,
-        theme,
-    );
+    let hits =
+        super::quadraui_gtk::draw_status_bar(cr, &ui_layout, x, y, width, height, &bar, theme);
     *hit_regions_out.borrow_mut() = hits;
 }
