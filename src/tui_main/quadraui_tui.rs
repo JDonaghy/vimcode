@@ -148,6 +148,9 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         query_fg: q(theme.fuzzy_query_fg),
         match_fg: q(theme.fuzzy_match_fg),
         accent_fg: q(theme.cursor),
+        hover_bg: q(theme.hover_bg),
+        hover_fg: q(theme.hover_fg),
+        hover_border: q(theme.hover_border),
     }
 }
 
@@ -502,63 +505,7 @@ pub(super) fn draw_tooltip(
     layout: &quadraui::TooltipLayout,
     theme: &Theme,
 ) {
-    let x = layout.bounds.x.round() as u16;
-    let y = layout.bounds.y.round() as u16;
-    let w = layout.bounds.width.round() as u16;
-    let h = layout.bounds.height.round() as u16;
-    if w == 0 || h == 0 {
-        return;
-    }
-
-    let fg = tooltip.fg.map(qc).unwrap_or_else(|| rc(theme.hover_fg));
-    let bg = tooltip.bg.map(qc).unwrap_or_else(|| rc(theme.hover_bg));
-    let border = rc(theme.hover_border);
-
-    // Helper: paint a row's side-bar borders + background fill.
-    let paint_row_background = |buf: &mut Buffer, row: u16| {
-        for col in 0..w {
-            let ch = if col == 0 || col == w - 1 { '│' } else { ' ' };
-            let cell_fg = if col == 0 || col == w - 1 { border } else { fg };
-            set_cell(buf, x + col, row, ch, cell_fg, bg);
-        }
-    };
-
-    if let Some(ref styled_lines) = tooltip.styled_lines {
-        // Multi-line styled path. Each entry renders as one row of
-        // styled spans with side-bar borders + background fill.
-        for (i, styled) in styled_lines.iter().enumerate().take(h as usize) {
-            let row = y + i as u16;
-            paint_row_background(buf, row);
-            let mut col_off: u16 = 2; // skip border + 1 pad
-            for span in &styled.spans {
-                let span_fg = span.fg.map(qc).unwrap_or(fg);
-                let span_bg = span.bg.map(qc).unwrap_or(bg);
-                for ch in span.text.chars() {
-                    let col = x + col_off;
-                    if col + 1 >= x + w {
-                        break;
-                    }
-                    set_cell(buf, col, row, ch, span_fg, span_bg);
-                    col_off += 1;
-                }
-            }
-        }
-        return;
-    }
-
-    let lines: Vec<&str> = tooltip.text.lines().collect();
-    for (i, text_line) in lines.iter().enumerate().take(h as usize) {
-        let row = y + i as u16;
-        paint_row_background(buf, row);
-        // Render text starting at col 2 (skip border + 1 pad).
-        for (j, ch) in text_line.chars().enumerate() {
-            let col = x + 2 + j as u16;
-            if col + 1 >= x + w {
-                break;
-            }
-            set_cell(buf, col, row, ch, fg, bg);
-        }
-    }
+    quadraui::tui::draw_tooltip(buf, tooltip, layout, &q_theme(theme));
 }
 
 pub(super) fn draw_activity_bar(

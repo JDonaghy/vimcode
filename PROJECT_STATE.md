@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 6 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 7 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,46 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 Tooltip rasteriser pilot:**
+
+Seventh primitive lifted. Vimcode uses `Tooltip` for **three** popup
+surfaces: LSP hover popup, signature help, and inline diff peek
+(the last two via the `styled_lines: Some(...)` multi-line styled
+path).
+
+**What shipped:**
+
+- `quadraui/src/tui/tooltip.rs` —
+  `pub fn quadraui::tui::draw_tooltip(buf, tooltip, layout, theme)`.
+  Side-bar borders only (no top/bottom) — matches the visual style
+  of all three vimcode tooltip consumers. 4 unit tests.
+- `quadraui/src/gtk/tooltip.rs` —
+  `pub fn quadraui::gtk::draw_tooltip(cr, layout, tooltip, tooltip_layout, line_height, padding_x, theme)`.
+  Cairo rectangle (background fill + 1 px stroke border) + Pango
+  text rendering with per-span `fg` overrides on the styled path.
+- `quadraui::Theme` adds 3 fields: `hover_bg`, `hover_fg`,
+  `hover_border`. Distinct from the modal-surface fields
+  (`surface_bg` / `surface_fg`) so apps can tint tooltip popups
+  differently from modal lists.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tooltip` collapses to a
+  delegation. ~70 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_tooltip` collapses to a
+  delegation. ~85 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+211/211 (4 new tooltip tests on top of 207); full
+`cargo test --no-default-features` green; clippy clean across all
+crate × feature combinations.
+
+**What's next:** **Dialog**. Vimcode uses it for confirmation popups
+(quit / close-tab / generic). Then **ContextMenu** wraps the
+primitive arc for #223.
+
+---
 
 **Session 332 (cont.) — #223 Form rasteriser pilot:**
 

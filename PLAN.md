@@ -6,14 +6,14 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette + Form rasteriser pilots landed; vimcode now delegates 6 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Tooltip)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette + Form + Tooltip rasteriser pilots landed; vimcode now delegates 7 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Dialog)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Tooltip next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Dialog next
 
-**Six pilots shipped (Session 332).** StatusBar + TabBar + ListView
-+ TreeView + Palette + Form rasterisers now live in
+**Seven pilots shipped (Session 332).** StatusBar + TabBar + ListView
++ TreeView + Palette + Form + Tooltip rasterisers now live in
 `quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
 vimcode (TUI + GTK) and kubeui (where applicable) all delegate.
 
@@ -39,14 +39,19 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: Tooltip.** Vimcode uses it for LSP hover popups,
-signature help, and the diff peek popup (multi-line styled
-variants). Both backends already consume `TooltipLayout` per Phase
-B.4. Theme fields likely needed: a `hover_bg` and `hover_fg` for
-the popup chrome; the existing `border_fg` covers the frame.
+**Next primitive: Dialog.** Vimcode uses it for the quit / close-tab
+confirm popups and a generic alert dialog. Both backends already
+consume `DialogLayout` per Phase B.4. The GTK rasteriser returns a
+button hit-rect list (one tuple per button) so the legacy click
+handler keeps working unchanged — same shape pattern as the TabBar
+pilot's hit reshape.
 
-**Order after Tooltip:** Dialog → ContextMenu. Each is a
-per-primitive commit; vimcode + kubeui adopt at the same time.
+**After Dialog: ContextMenu** — wraps the per-primitive arc for
+#223. After that, the lift becomes infrastructure-complete and the
+next focus is downstream consumers (e.g. extending `quadraui::Theme`
+with cleanup, retiring `vimcode-private` rasteriser helpers, or
+moving rasterisers' fonts under explicit caller control to fix
+#227).
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all
