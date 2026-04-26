@@ -3261,6 +3261,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
         items,
         selected_idx,
         bg: None,
+        placement: quadraui::ContextMenuPlacement::default(),
     }
 }
 
@@ -3331,6 +3332,7 @@ pub fn menu_dropdown_to_quadraui_context_menu(data: &MenuBarData) -> Option<quad
         items,
         selected_idx,
         bg: None,
+        placement: quadraui::ContextMenuPlacement::default(),
     })
 }
 
