@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 5 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView + TreeView + Palette + Form rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates 6 of its biggest-rasteriser surfaces; kubeui adopted ListView. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,48 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 Form rasteriser pilot:**
+
+Sixth primitive lifted. Vimcode uses `Form` for the TUI settings
+panel (the GTK settings panel still uses native widgets — its
+`draw_form` was already `#[allow(dead_code)]` pre-pilot, lifted
+anyway because the next GTK refresh will need it).
+
+**What shipped:**
+
+- `quadraui/src/tui/form.rs` —
+  `pub fn quadraui::tui::draw_form(buf, area, form, theme)`. Uniform
+  1-cell-per-row measurer. Handles all 7 `FieldKind` variants:
+  Label / Toggle / TextInput / Button / ReadOnly / Slider /
+  ColorPicker / Dropdown.
+- `quadraui/src/gtk/form.rs` —
+  `pub fn quadraui::gtk::draw_form(cr, layout, x, y, w, h, form, theme, line_height)`.
+  Per-row height `(line_height * 1.4).round()`. Slider /
+  ColorPicker / Dropdown not yet rendered (matching pre-lift
+  parity — GTK consumer doesn't exist).
+- `quadraui::Theme` adds 1 field: `accent_fg` (active-state visual
+  cue: toggle "[x]" when on, slider filled cells, button frame when
+  focused). Mapped from vimcode's `theme.cursor`.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_form` collapses to a
+  delegation. ~290 lines of vimcode-private rasterisation removed.
+  The vimcode-private `draw_styled_text` helper is now also dead
+  code (form was its last consumer); deleted.
+- `src/gtk/quadraui_gtk.rs::draw_form` collapses to a delegation.
+  ~240 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+207/207 (4 new form tests on top of 203); full
+`cargo test --no-default-features` green; clippy clean across
+all crate × feature combinations.
+
+**What's next:** **Tooltip**. Vimcode uses it for LSP hover popups,
+signature help, and the diff peek popup. Then Dialog → ContextMenu.
+
+---
 
 **Session 332 (cont.) — #223 Palette rasteriser pilot:**
 

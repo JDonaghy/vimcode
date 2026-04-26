@@ -6,14 +6,14 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette rasteriser pilots landed; vimcode now delegates 5 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Form)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView + TreeView + Palette + Form rasteriser pilots landed; vimcode now delegates 6 of its biggest rasteriser surfaces to public `quadraui::*::draw_*`. Next pilot: Tooltip)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Form next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), Tooltip next
 
-**Five pilots shipped (Session 332).** StatusBar + TabBar + ListView
-+ TreeView + Palette rasterisers now live in
+**Six pilots shipped (Session 332).** StatusBar + TabBar + ListView
++ TreeView + Palette + Form rasterisers now live in
 `quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
 vimcode (TUI + GTK) and kubeui (where applicable) all delegate.
 
@@ -39,15 +39,13 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: Form.** Vimcode uses it for the TUI settings
-panel; the GTK settings panel is still on native widgets but the
-GTK `draw_form` rasteriser exists for the eventual DrawingArea
-migration. Theme fields likely needed: an accent foreground for
-the toggle "[x]" + maybe an input bracket fg. Lift is similar
-shape to ListView; per-row heights uniform on TUI, 1.4×
-line_height on GTK (same convention as TreeView leaves).
+**Next primitive: Tooltip.** Vimcode uses it for LSP hover popups,
+signature help, and the diff peek popup (multi-line styled
+variants). Both backends already consume `TooltipLayout` per Phase
+B.4. Theme fields likely needed: a `hover_bg` and `hover_fg` for
+the popup chrome; the existing `border_fg` covers the frame.
 
-**Order after Form:** Tooltip → Dialog → ContextMenu. Each is a
+**Order after Tooltip:** Dialog → ContextMenu. Each is a
 per-primitive commit; vimcode + kubeui adopt at the same time.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
