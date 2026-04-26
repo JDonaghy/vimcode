@@ -6,63 +6,76 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar rasteriser pilot landed — public `quadraui::tui::draw_status_bar` + `quadraui::gtk::draw_status_bar` behind `tui` / `gtk` feature gates; vimcode + kubeui + kubeui-gtk all delegate; -169 net lines; next pilot: TabBar)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar rasteriser pilots landed; pre-existing `TabBar::layout` regression fixed where TUI's scroll-arrow-disabled path was clipping newly-opened tabs from index 0 instead of honouring caller `bar.scroll_offset`; next pilot: ListView)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), TabBar next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), ListView next
 
-**Pilot shipped (Session 332).** StatusBar rasterisers now live in
-`quadraui::tui::draw_status_bar` and `quadraui::gtk::draw_status_bar`,
-gated behind `tui` / `gtk` Cargo features. vimcode (TUI + GTK) and
-kubeui (TUI + GTK) all delegate; net -169 lines. The pilot proved out:
+**Pilots shipped (Session 332).** StatusBar + TabBar rasterisers now
+live in `quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature
+gates. vimcode (TUI + GTK) and kubeui (TUI + GTK) all delegate.
 
-- The shape of `quadraui::Theme` (minimal: `background` + `foreground`
-  for now; field set grows as more primitives migrate).
-- The feature-gate model (`dep:ratatui`, `dep:gtk4`, `dep:pangocairo`
-  optional) — apps consuming only the data layer pay no native deps.
-- The adoption pattern — vimcode keeps its `quadraui_tui.rs` /
-  `quadraui_gtk.rs` wrappers (~10 lines each) that adapt
-  `render::Theme` → `quadraui::Theme` and delegate; kubeui drops its
-  private rasteriser body entirely.
+The pilots proved out:
 
-**Next primitive: TabBar.** Both backends already consume
-`TabBarLayout` (Phase B.4) and both already share the same
-right-segment width-fit / scroll-offset logic from the primitive
-itself, so the lift is mostly mechanical. Order after TabBar:
-**ListView → TreeView → Palette → Form → Tooltip → Dialog →
-ContextMenu**. Each is a per-primitive commit; vimcode + kubeui both
+- **`quadraui::Theme` shape:** `background`, `foreground`, plus 7 tab
+  fields. Each migrated primitive adds the fields it needs; apps
+  spread `..Theme::default()` for the unspecified ones.
+- **Feature gates:** `dep:ratatui`, `dep:gtk4`, `dep:pangocairo`
+  optional — apps consuming only the data layer pay no native deps.
+- **Adoption pattern:** vimcode wraps with ~10 lines that adapt
+  `render::Theme` → `quadraui::Theme` and delegate. GTK wrappers may
+  reshape generic primitive output (`TabBarHits` from
+  `quadraui::gtk::draw_tab_bar`) into app-specific shapes
+  (vimcode's `TabBarHitInfo` with WidgetId-keyed diff/split/action
+  groupings).
+- **A pre-existing `TabBar::layout` regression** caught by smoke-test
+  during the TabBar pilot: when `scroll_arrow_width = 0.0` (TUI's
+  case — engine drives scroll), the layout collapsed
+  `resolved_scroll_offset = 0` and clipped from index 0, dropping
+  newly-opened tabs at the right edge of a narrow bar. Fixed in the
+  pilot 2 commit; the contract is now: scroll-arrows on → primitive
+  computes scroll itself; scroll-arrows off → caller owns scroll
+  via `bar.scroll_offset`.
+
+**Next primitive: ListView.** Both backends already consume
+`ListViewLayout` per Phase B.4 — vimcode uses it for the quickfix
+panel and tab switcher; kubeui has its own `draw_list` for the
+resource list (a clear adoption target). Lift is mostly mechanical;
+no app-specific shapes need preservation (unlike TabBar's
+WidgetId-keyed groupings).
+
+**Order after ListView:** TreeView → Palette → Form → Tooltip →
+Dialog → ContextMenu. Each is a per-primitive commit; vimcode + kubeui
 adopt at the same time.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all
 backends?" with a hard number: **65% today, ~90% if we lift the TUI
-and GTK rasterisers out of vimcode and into quadraui.** The StatusBar
-pilot is the first ~6 percentage points of that delta; remaining
-primitives close the rest.
+and GTK rasterisers out of vimcode and into quadraui.** The two
+shipped pilots have closed the gap by ~10 percentage points;
+remaining primitives finish the lift.
 
 **Read first when you start:**
-- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates, the StatusBar pilot's commit is the canonical template
+- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates. The StatusBar + TabBar pilot commits are canonical templates.
 - [#224](https://github.com/JDonaghy/vimcode/issues/224) — small API friction points captured during the spike (still open; address alongside future migrations as they surface)
 - The kubeui crates (`kubeui-core`, `kubeui`, `kubeui-gtk`) on develop — concrete evidence of what's currently duplicated
 
-**TabBar pilot details:** lift `quadraui_tui::draw_tab_bar` +
-`quadraui_gtk::draw_tab_bar` into `quadraui::tui::draw_tab_bar` /
-`quadraui::gtk::draw_tab_bar`. Per-frame interaction state
-(`hovered_close_tab` on GTK; `TabBarHitInfo` return on GTK) stays as
-function parameters — only the *primitive description* belongs in
-the rasteriser, never backend-owned event state. Theme fields likely
-needed beyond `background`: `tab_bar_bg`, `tab_active_fg`,
-`tab_inactive_fg`, `foreground` (for the `●` dirty marker). Add to
-`quadraui::Theme` as the migration discovers them; vimcode populates
-from `render::Theme`, kubeui doesn't have a tab bar yet so doesn't
-consume.
+**ListView pilot details:** lift `quadraui_tui::draw_list` +
+`quadraui_gtk::draw_list` into `quadraui::{tui,gtk}::draw_list`. Theme
+fields likely needed: a list bg, selected-row bg, regular-row fg,
+muted/dim fg. Add to `quadraui::Theme` as needed. kubeui's
+`draw_list` (in `kubeui/src/main.rs`) is a direct adoption target —
+it currently hardcodes the palette and reimplements scroll-clamping
+via `list.layout()`; after the lift it will use the same code as
+vimcode.
 
 **Why this still beats every other open work item:**
 - It validates externally what we've been building internally (the kubeui spike is the proof point).
 - The vimcode B.5/B.6 backend rewrites get smaller — each backend rewrite stops carrying its own private rasteriser stack.
 - Every external app (k8s dashboard, SQL client, Postman) gets to focus on its domain instead of reimplementing UI primitives.
 - It surfaces the small API friction (#224) while we have a real second consumer to test against — once kubeui is happy, the API is good.
+- Smoke-testing the lifts catches latent layout regressions (see the TabBar fix above) that would otherwise hurt users silently.
 
 ---
 

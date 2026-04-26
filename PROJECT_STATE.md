@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar rasteriser pilot landed: public `quadraui::tui::draw_status_bar` + `quadraui::gtk::draw_status_bar` behind `tui` / `gtk` feature gates, vimcode + kubeui + kubeui-gtk all delegate, -169 net lines)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates, vimcode + kubeui all delegate, ~9 fields on `quadraui::Theme`. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,70 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 TabBar rasteriser pilot + a pre-existing
+layout-regression fix:**
+
+After the StatusBar pilot landed (`develop` `1bed461`), TabBar followed
+the same shape on a second branch. Smoke-testing the branch surfaced
+a pre-existing `quadraui::TabBar::layout` regression — captured as
+the third bullet below.
+
+**What shipped:**
+
+- `quadraui/src/tui/tab_bar.rs` — `pub fn quadraui::tui::draw_tab_bar(buf, area, bar, layout, theme) -> usize`
+  with `pub const TAB_CLOSE_CHAR: char = '×'`. Self-contained: lifted
+  `set_cell_wide` + `set_cell_styled` + `is_nerd_wide` from vimcode's
+  `tui_main/mod.rs`. 4 unit tests cover paint output, return-value
+  contract, segment reservation, zero-size guard.
+- `quadraui/src/gtk/tab_bar.rs` — `pub fn quadraui::gtk::draw_tab_bar(...) -> TabBarHits`.
+  Returns a generic per-tab + per-right-segment bounds list; vimcode's
+  wrapper reshapes those into its app-specific `TabBarHitInfo`
+  (diff-toolbar / split / action-menu groupings keyed by WidgetId
+  strings — those stay vimcode-side, not in quadraui).
+- `quadraui::Theme` extended with 7 tab fields:
+  `tab_bar_bg / tab_active_bg / tab_active_fg / tab_inactive_fg /
+  tab_preview_active_fg / tab_preview_inactive_fg / separator`. Each
+  has a sane dark-palette default; vimcode populates from
+  `render::Theme`, kubeui appends `..Theme::default()` (no tab bar
+  there yet).
+- **Layout regression fix in `quadraui::TabBar::layout`:** when
+  `scroll_arrow_width <= 0.0` (TUI's contract — TUI doesn't paint
+  scroll arrows because the engine already drives scroll via
+  `Engine::ensure_active_tab_visible`), the layout used to collapse
+  `resolved_scroll_offset` to `0` and clip from index 0 — silently
+  dropping newly-opened tabs at the right edge. Now honours
+  `bar.scroll_offset` (clamped to a valid index). Two regression tests
+  added in `quadraui/src/lib.rs`. The bug pre-dated this session
+  (introduced during Phase B.4 D6 migration) and would have continued
+  hurting users — surfaced only because TabBar smoke-test exercised
+  multi-file open in a narrow terminal.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tab_bar` collapses to a 1-line
+  delegation. The vimcode-private `set_cell_wide` and `TAB_CLOSE_CHAR`
+  constant are deleted (helpers moved into quadraui).
+- `src/gtk/quadraui_gtk.rs::draw_tab_bar` collapses to ~50 lines
+  (mostly the WidgetId-based reshape from generic `TabBarHits` →
+  vimcode's `TabBarHitInfo`).
+- Kubeui binaries unchanged for TabBar (no tab bar in kubeui yet);
+  their `theme()` helpers gained `..Default::default()` to cover the
+  new Theme fields.
+
+**Diff:** -371 net lines on adoption sites; ~470 lines added in
+quadraui (the new public rasteriser modules + tests). Quality:
+`cargo test -p quadraui --features tui` 190/190 (4 new TUI tab_bar
++ 2 regression for the layout fix); full `cargo test --no-default-features`
+green; clippy clean across vimcode (default + no-default), quadraui
+(`tui` + `gtk`), kubeui, kubeui-gtk.
+
+**What's next:** **ListView** is the natural follow-up. Both backends
+already consume `ListViewLayout` per Phase B.4. After ListView:
+TreeView → Palette → Form → Tooltip → Dialog → ContextMenu. Same
+per-primitive shape established by these two pilots.
+
+---
 
 **Session 332 — #223 StatusBar rasteriser pilot landed (lift TUI + GTK rasterisers into quadraui):**
 

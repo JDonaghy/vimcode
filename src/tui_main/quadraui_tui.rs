@@ -991,51 +991,27 @@ pub(super) fn draw_status_bar(
     // `quadraui::Theme`. Build one from the rich vimcode theme — the
     // status bar reads only `background` (fallback fill when bar has
     // no segments) but `foreground` is populated for symmetry.
-    let q_theme = quadraui::Theme {
+    quadraui::tui::draw_status_bar(buf, area, bar, layout, &q_theme(theme));
+}
+
+/// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
+/// `render::Theme`. Shared by every public-rasteriser delegate so each
+/// migration adds the field it needs in one place. Lift sequence is
+/// driven by #223.
+pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
+    quadraui::Theme {
         background: render::to_quadraui_color(theme.background),
         foreground: render::to_quadraui_color(theme.foreground),
-    };
-    quadraui::tui::draw_status_bar(buf, area, bar, layout, &q_theme);
+        tab_bar_bg: render::to_quadraui_color(theme.tab_bar_bg),
+        tab_active_bg: render::to_quadraui_color(theme.tab_active_bg),
+        tab_active_fg: render::to_quadraui_color(theme.tab_active_fg),
+        tab_inactive_fg: render::to_quadraui_color(theme.tab_inactive_fg),
+        tab_preview_active_fg: render::to_quadraui_color(theme.tab_preview_active_fg),
+        tab_preview_inactive_fg: render::to_quadraui_color(theme.tab_preview_inactive_fg),
+        separator: render::to_quadraui_color(theme.separator),
+    }
 }
 
-/// Narrow hardcoded set of PUA glyphs that render as 2 cells in terminals
-/// and therefore need `set_cell_wide` (which marks the continuation cell).
-/// Matches the specific icons the old `render_tab_bar` used with
-/// `set_cell_wide` — other PUA chars (e.g. `SPLIT_DOWN` at `\u{f0d7}`)
-/// render as 1 cell in practice and use plain `set_cell`. Extend this list
-/// as new wide glyphs are added to tab bars / status bars.
-fn is_nerd_wide(c: char) -> bool {
-    matches!(
-        c,
-        '\u{F0932}' // SPLIT_RIGHT
-        | '\u{F0143}' // DIFF_PREV
-        | '\u{F0140}' // DIFF_NEXT
-        | '\u{F0233}' // DIFF_FOLD
-    )
-}
-
-/// Draw a `quadraui::TabBar` into `area`, consuming a pre-computed
-/// `TabBarLayout` per D6. Returns the width (in char cells) available
-/// for tab content (`bar_width - reserved_by_right_segments`). The
-/// engine uses this return value to decide how many tabs fit and what
-/// scroll offset to use on the next frame.
-///
-/// # D6 contract
-///
-/// Positions come from `layout.visible_tabs` / `layout.visible_segments`
-/// — this function does not decide placement. It only rasterises what
-/// the layout says. If you see a layout problem here, fix it in
-/// [`quadraui::TabBar::layout`], not in this function.
-///
-/// # Visual details preserved from the pre-layout version
-///
-/// * Active tab: `tab_active_fg` + `tab_active_bg`, optional underline
-///   accent on the filename portion (chars after the last `": "`).
-/// * Dirty tab: close-position shows `●` (theme.foreground) instead of `×`.
-/// * Preview tab: italic text; double-italic-underlined when active+accent.
-/// * Right segments: each segment drawn in its native cell width, with
-///   Nerd Font wide glyphs using `set_cell_wide`. Highlighted segments
-///   (`is_active = true`) use `tab_active_fg` instead of `tab_inactive_fg`.
 pub(super) fn draw_tab_bar(
     buf: &mut Buffer,
     area: Rect,
@@ -1043,141 +1019,7 @@ pub(super) fn draw_tab_bar(
     layout: &quadraui::TabBarLayout,
     theme: &Theme,
 ) -> usize {
-    if area.width == 0 || area.height == 0 {
-        return 0;
-    }
-
-    let bar_bg = rc(theme.tab_bar_bg);
-    let btn_fg = rc(theme.tab_inactive_fg);
-    let btn_fg_active = rc(theme.tab_active_fg);
-    let foreground = rc(theme.foreground);
-
-    // Fill bar background.
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
-    }
-
-    // Tab-content width (engine feedback): bar minus reserved right area.
-    let reserved: u16 = bar.right_segments.iter().map(|s| s.width_cells).sum();
-    let tab_content_width = if area.width >= reserved {
-        (area.width - reserved) as usize
-    } else {
-        area.width as usize
-    };
-
-    // ── Right-aligned segments (from layout) ───────────────────────────
-    for vs in &layout.visible_segments {
-        let seg = &bar.right_segments[vs.segment_idx];
-        let fg = if seg.is_active { btn_fg_active } else { btn_fg };
-        let bx = area.x + vs.bounds.x.round() as u16;
-        let seg_end = bx + seg.width_cells;
-        let mut cx = bx;
-        for ch in seg.text.chars() {
-            if cx >= seg_end {
-                break;
-            }
-            if ch == ' ' {
-                set_cell(buf, cx, area.y, ' ', fg, bar_bg);
-                cx += 1;
-            } else if is_nerd_wide(ch) {
-                if cx + 1 < seg_end + 1 {
-                    super::set_cell_wide(buf, cx, area.y, ch, fg, bar_bg);
-                    cx += 2;
-                } else {
-                    // Not enough room for a 2-cell glyph — skip.
-                    cx += 1;
-                }
-            } else {
-                set_cell(buf, cx, area.y, ch, fg, bar_bg);
-                cx += 1;
-            }
-        }
-    }
-
-    // ── Tabs (from layout) ─────────────────────────────────────────────
-    let accent = bar.active_accent.map(qc);
-    let active_fg = rc(theme.tab_active_fg);
-    let active_bg = rc(theme.tab_active_bg);
-    let preview_active_fg = rc(theme.tab_preview_active_fg);
-    let inactive_fg = rc(theme.tab_inactive_fg);
-    let preview_inactive_fg = rc(theme.tab_preview_inactive_fg);
-    let separator = rc(theme.separator);
-
-    for vt in &layout.visible_tabs {
-        let tab = &bar.tabs[vt.tab_idx];
-        let tab_x = area.x + vt.bounds.x.round() as u16;
-
-        let (fg, bg) = match (tab.is_active, tab.is_preview) {
-            (true, true) => (preview_active_fg, active_bg),
-            (true, false) => (active_fg, active_bg),
-            (false, true) => (preview_inactive_fg, bar_bg),
-            (false, false) => (inactive_fg, bar_bg),
-        };
-
-        let mut modifier = ratatui::style::Modifier::empty();
-        if tab.is_preview {
-            modifier |= ratatui::style::Modifier::ITALIC;
-        }
-        if tab.is_active && accent.is_some() {
-            modifier |= ratatui::style::Modifier::UNDERLINED;
-        }
-        let prefix_mod = if tab.is_preview {
-            ratatui::style::Modifier::ITALIC
-        } else {
-            ratatui::style::Modifier::empty()
-        };
-
-        // The layout carries total width; within that, close_bounds
-        // covers the trailing close-glyph + separator cells (if the tab
-        // has a close button). Label occupies the leading cells up to
-        // close_bounds.x.
-        let tab_width = vt.bounds.width.round() as u16;
-        let label_width = match vt.close_bounds {
-            Some(cb) => (cb.x - vt.bounds.x).round() as u16,
-            None => tab_width,
-        };
-        let tab_end = tab_x + tab_width;
-        let label_end = tab_x + label_width;
-
-        // Filename portion (after the last ": ") carries the underline accent.
-        let prefix_len = tab.label.rfind(": ").map(|p| p + 2).unwrap_or(0);
-
-        let mut x = tab_x;
-        for (ci, ch) in tab.label.chars().enumerate() {
-            if x >= label_end {
-                break;
-            }
-            let in_filename = ci >= prefix_len;
-            let cell_mod = if in_filename { modifier } else { prefix_mod };
-            let ul = if in_filename && tab.is_active {
-                accent
-            } else {
-                None
-            };
-            super::set_cell_styled(buf, x, area.y, ch, fg, bg, cell_mod, ul);
-            x += 1;
-        }
-
-        // Close indicator: ● for dirty, × otherwise. Only if the tab has
-        // a close button (close_bounds is Some).
-        if vt.close_bounds.is_some() && x < tab_end {
-            let (close_ch, close_fg) = if tab.is_dirty {
-                ('●', foreground)
-            } else if tab.is_active {
-                (super::TAB_CLOSE_CHAR, active_fg)
-            } else {
-                (super::TAB_CLOSE_CHAR, separator)
-            };
-            set_cell(buf, x, area.y, close_ch, close_fg, bg);
-            x += 1;
-        }
-        // Trailing separator space (within the tab's bounds, uses bar bg).
-        if x < tab_end {
-            set_cell(buf, x, area.y, ' ', bar_bg, bar_bg);
-        }
-    }
-
-    tab_content_width
+    quadraui::tui::draw_tab_bar(buf, area, bar, layout, &q_theme(theme))
 }
 
 /// Draw a `quadraui::ActivityBar` as a vertical icon strip.

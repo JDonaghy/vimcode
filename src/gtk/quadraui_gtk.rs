@@ -1020,11 +1020,25 @@ pub(super) fn draw_status_bar(
     // `quadraui::Theme`. Build one from the rich vimcode theme — the
     // status bar reads only `background` (fallback fill when bar has
     // no segments) but `foreground` is populated for symmetry.
-    let q_theme = quadraui::Theme {
+    quadraui::gtk::draw_status_bar(cr, layout, x, y, width, line_height, bar, &q_theme(theme))
+}
+
+/// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
+/// `render::Theme`. Shared by every public-rasteriser delegate so each
+/// migration adds the field it needs in one place. Lift sequence is
+/// driven by #223.
+pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
+    quadraui::Theme {
         background: render::to_quadraui_color(theme.background),
         foreground: render::to_quadraui_color(theme.foreground),
-    };
-    quadraui::gtk::draw_status_bar(cr, layout, x, y, width, line_height, bar, &q_theme)
+        tab_bar_bg: render::to_quadraui_color(theme.tab_bar_bg),
+        tab_active_bg: render::to_quadraui_color(theme.tab_active_bg),
+        tab_active_fg: render::to_quadraui_color(theme.tab_active_fg),
+        tab_inactive_fg: render::to_quadraui_color(theme.tab_inactive_fg),
+        tab_preview_active_fg: render::to_quadraui_color(theme.tab_preview_active_fg),
+        tab_preview_inactive_fg: render::to_quadraui_color(theme.tab_preview_inactive_fg),
+        separator: render::to_quadraui_color(theme.separator),
+    }
 }
 
 // ─── Tab bar (A.6d) ──────────────────────────────────────────────────────────
@@ -1061,17 +1075,15 @@ pub(super) struct TabBarHitInfo {
     pub correct_scroll_offset: usize,
 }
 
-/// Draw a `quadraui::TabBar` into `(0, y_offset, width, tab_row_height)`
-/// on `cr`, using a sans-serif UI font for labels (not the editor's
-/// monospace font).
+/// Draw a `quadraui::TabBar` and reshape the public `TabBarHits` into
+/// vimcode's `TabBarHitInfo` (which carries app-specific groupings for
+/// the diff toolbar / split / action-menu buttons keyed by their
+/// `WidgetId` in `bar.right_segments`).
 ///
-/// `hovered_close_tab` is a per-frame interaction override: when `Some(i)`
-/// the primitive's `i`-th visible tab gets a rounded hover background behind
-/// its close button. Part of the GTK-specific draw contract — the primitive
-/// itself has no mouse-state.
-///
-/// Returns per-frame hit regions so the caller can dispatch clicks
-/// (`App::tab_slot_positions_by_group`, etc.).
+/// The actual painting + generic hit-region collection lives in
+/// `quadraui::gtk::draw_tab_bar`; this wrapper only does the
+/// vimcode-side WidgetId lookup. `hovered_close_tab` is forwarded
+/// unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_tab_bar(
     cr: &Context,
@@ -1085,335 +1097,73 @@ pub(super) fn draw_tab_bar(
 ) -> TabBarHitInfo {
     use pango::FontDescription;
 
-    // Tab row is taller than line_height for vertical padding.
-    let tab_row_height = (line_height * 1.6).ceil();
-    let text_y_offset = y_offset + (tab_row_height - line_height) / 2.0;
-
-    // Tab bar background
-    let (r, g, b) = vc_to_cairo(theme.tab_bar_bg);
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, tab_row_height);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
+    // The public rasteriser uses whatever font is on the layout when
+    // it's called. Vimcode renders tabs in a sans-serif UI font (not
+    // the editor's monospace font), so set that before delegating and
+    // restore the caller's font afterwards.
     let saved_font = layout.font_description().unwrap_or_default();
     let ui_font_desc = FontDescription::from_string(&super::UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
 
-    let normal_font = ui_font_desc.clone();
-    let mut italic_font = normal_font.clone();
-    italic_font.set_style(pango::Style::Italic);
-
-    // Measure each right-side segment's pixel width.
-    let mut right_widths: Vec<f64> = Vec::with_capacity(bar.right_segments.len());
-    for seg in &bar.right_segments {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(&seg.text);
-        let (w, _) = layout.pixel_size();
-        right_widths.push(w as f64);
-    }
-    let reserved_px: f64 = right_widths.iter().sum();
-    let effective_tab_area = (width - reserved_px).max(0.0);
-
-    // Per-tab measurement + layout + paint.
-    let mut slot_positions: Vec<(f64, f64)> = Vec::with_capacity(bar.tabs.len());
-    for _ in 0..bar.scroll_offset.min(bar.tabs.len()) {
-        slot_positions.push((0.0, 0.0));
-    }
-
-    let close_w = {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text("×");
-        let (w, _) = layout.pixel_size();
-        w as f64
-    };
-    let tab_pad = 14.0;
-    let tab_inner_gap = 10.0;
-    let tab_outer_gap = 1.0;
-
-    // Pre-measure every tab's full slot width (label + padding + close
-    // button + outer gap) in pixels. We use this for two things: the
-    // per-tab paint loop below, AND for `fit_active_scroll_offset` which
-    // tells the caller whether the engine's `tab_scroll_offset` is
-    // off — see `TabBarHitInfo.correct_scroll_offset`.
-    let tab_slot_widths: Vec<f64> = bar
-        .tabs
-        .iter()
-        .map(|tab| {
-            if tab.is_preview {
-                layout.set_font_description(Some(&italic_font));
-            } else {
-                layout.set_font_description(Some(&normal_font));
-            }
-            layout.set_text(&tab.label);
-            let (name_w, _) = layout.pixel_size();
-            tab_pad + name_w as f64 + tab_inner_gap + close_w + tab_pad + tab_outer_gap
-        })
-        .collect();
-
-    // Compute the scroll offset that would make the active tab visible
-    // given THIS frame's actual pixel widths. The caller compares to
-    // bar.scroll_offset and triggers a repaint if they differ.
-    let active_idx = bar.tabs.iter().position(|t| t.is_active);
-    let correct_scroll_offset = if let Some(active) = active_idx {
-        quadraui::TabBar::fit_active_scroll_offset(
-            active,
-            bar.tabs.len(),
-            effective_tab_area as usize,
-            |i| tab_slot_widths[i] as usize,
-        )
-    } else {
-        bar.scroll_offset
-    };
-
-    let mut x = 0.0_f64;
-    for (tab_idx, tab) in bar.tabs.iter().enumerate().skip(bar.scroll_offset) {
-        if tab.is_preview {
-            layout.set_font_description(Some(&italic_font));
-        } else {
-            layout.set_font_description(Some(&normal_font));
-        }
-        layout.set_text(&tab.label);
-        let (tab_name_w, _) = layout.pixel_size();
-        let tab_w = tab_name_w as f64;
-        let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
-        let slot_w = tab_content_w + tab_outer_gap;
-        if x + slot_w > effective_tab_area {
-            break;
-        }
-        slot_positions.push((x, x + slot_w));
-
-        // Tab background.
-        let bg_col = if tab.is_active {
-            theme.tab_active_bg
-        } else {
-            theme.tab_bar_bg
-        };
-        let (br, bgc, bb) = vc_to_cairo(bg_col);
-        cr.set_source_rgb(br, bgc, bb);
-        cr.rectangle(x, y_offset, tab_content_w, tab_row_height);
-        cr.fill().ok();
-
-        // Top accent bar for active tab in focused group.
-        if tab.is_active {
-            if let Some(accent) = bar.active_accent {
-                let (ar, ag, ab) = qc_to_cairo(accent);
-                cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(x, y_offset, tab_content_w, 2.0);
-                cr.fill().ok();
-            }
-        }
-
-        // Tab text.
-        let fg_col = match (tab.is_active, tab.is_preview) {
-            (true, true) => theme.tab_preview_active_fg,
-            (true, false) => theme.tab_active_fg,
-            (false, true) => theme.tab_preview_inactive_fg,
-            (false, false) => theme.tab_inactive_fg,
-        };
-        let (fr, fgc, fb) = vc_to_cairo(fg_col);
-        cr.set_source_rgb(fr, fgc, fb);
-        layout.set_font_description(Some(if tab.is_preview {
-            &italic_font
-        } else {
-            &normal_font
-        }));
-        cr.move_to(x + tab_pad, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-
-        // Close (×) or dirty (●) button — with optional rounded hover bg.
-        let close_x = x + tab_pad + tab_w + tab_inner_gap;
-        let is_close_hovered = hovered_close_tab == Some(tab_idx);
-        if is_close_hovered {
-            let pad = 2.0;
-            let rx = close_x - pad;
-            let ry = text_y_offset + pad;
-            let rw = close_w + pad * 2.0;
-            let rh = line_height - pad * 2.0;
-            let (hr, hg, hb) = vc_to_cairo(theme.foreground);
-            cr.set_source_rgba(hr, hg, hb, 0.15);
-            let radius = 3.0;
-            cr.new_path();
-            cr.arc(
-                rx + rw - radius,
-                ry + radius,
-                radius,
-                -std::f64::consts::FRAC_PI_2,
-                0.0,
-            );
-            cr.arc(
-                rx + rw - radius,
-                ry + rh - radius,
-                radius,
-                0.0,
-                std::f64::consts::FRAC_PI_2,
-            );
-            cr.arc(
-                rx + radius,
-                ry + rh - radius,
-                radius,
-                std::f64::consts::FRAC_PI_2,
-                std::f64::consts::PI,
-            );
-            cr.arc(
-                rx + radius,
-                ry + radius,
-                radius,
-                std::f64::consts::PI,
-                3.0 * std::f64::consts::FRAC_PI_2,
-            );
-            cr.close_path();
-            cr.fill().ok();
-        }
-        let close_glyph = if tab.is_dirty && !is_close_hovered {
-            "●"
-        } else {
-            "×"
-        };
-        let close_fg = if tab.is_dirty || is_close_hovered {
-            theme.foreground
-        } else if tab.is_active {
-            theme.tab_inactive_fg
-        } else {
-            theme.separator
-        };
-        let (cr_, cg_, cb_) = vc_to_cairo(close_fg);
-        cr.set_source_rgb(cr_, cg_, cb_);
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(close_glyph);
-        cr.move_to(close_x, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-
-        x += slot_w;
-    }
-
-    // ── Right-side segments ─────────────────────────────────────────────
-    //
-    // Each segment has a pre-measured width and is rendered with normal
-    // weight (no bold). Clickable segments' hit regions are derived from
-    // `build_tab_bar_primitive`'s segment order: the adapter emits
-    // [diff_label?] [diff prev] [diff next] [diff fold] [split right]
-    // [split down] [action menu]. We walk the emitted segments and
-    // classify clickable ones by their WidgetId.
-    let mut diff_regions: Option<[f64; 6]> = None;
-    let mut split_info: Option<(f64, f64)> = None;
-    let mut action_info: Option<(f64, f64)> = None;
-
-    // Accumulate segment positions left-to-right, starting at `right_base`.
-    let right_base = width - reserved_px;
-    let mut sx = right_base;
-    let mut prev_x: Option<f64> = None;
-    let mut next_x: Option<f64> = None;
-    let mut fold_x: Option<f64> = None;
-    let mut split_right_x: Option<f64> = None;
-    let mut split_down_x: Option<f64> = None;
-
-    for (i, seg) in bar.right_segments.iter().enumerate() {
-        let seg_w = right_widths[i];
-        let fg_col = if seg.is_active {
-            theme.tab_active_fg
-        } else {
-            theme.tab_inactive_fg
-        };
-        let (fr, fg_, fb) = vc_to_cairo(fg_col);
-        cr.set_source_rgb(fr, fg_, fb);
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(&seg.text);
-        cr.move_to(sx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-
-        if let Some(ref id) = seg.id {
-            match id.as_str() {
-                "tab:diff_prev" => prev_x = Some(sx),
-                "tab:diff_next" => next_x = Some(sx),
-                "tab:diff_toggle" => fold_x = Some(sx),
-                "tab:split_right" => split_right_x = Some(sx),
-                "tab:split_down" => split_down_x = Some(sx),
-                "tab:action_menu" => action_info = Some((sx, sx + seg_w)),
-                _ => {}
-            }
-        }
-        sx += seg_w;
-    }
-
-    // Derive the legacy 6-tuple and 2-tuple shapes the GTK click handler
-    // expects. Missing buttons degrade gracefully — callers already check
-    // `Option::is_some()`.
-    if let (Some(p), Some(n), Some(f)) = (prev_x, next_x, fold_x) {
-        // Need each button's end x; recompute from measured widths.
-        let prev_idx = bar
-            .right_segments
-            .iter()
-            .position(|s| {
-                s.id.as_ref()
-                    .is_some_and(|id| id.as_str() == "tab:diff_prev")
-            })
-            .unwrap();
-        let next_idx = bar
-            .right_segments
-            .iter()
-            .position(|s| {
-                s.id.as_ref()
-                    .is_some_and(|id| id.as_str() == "tab:diff_next")
-            })
-            .unwrap();
-        let fold_idx = bar
-            .right_segments
-            .iter()
-            .position(|s| {
-                s.id.as_ref()
-                    .is_some_and(|id| id.as_str() == "tab:diff_toggle")
-            })
-            .unwrap();
-        diff_regions = Some([
-            p,
-            p + right_widths[prev_idx],
-            n,
-            n + right_widths[next_idx],
-            f,
-            f + right_widths[fold_idx],
-        ]);
-    }
-    if let (Some(sr), Some(_sd)) = (split_right_x, split_down_x) {
-        let sr_idx = bar
-            .right_segments
-            .iter()
-            .position(|s| {
-                s.id.as_ref()
-                    .is_some_and(|id| id.as_str() == "tab:split_right")
-            })
-            .unwrap();
-        let sd_idx = bar
-            .right_segments
-            .iter()
-            .position(|s| {
-                s.id.as_ref()
-                    .is_some_and(|id| id.as_str() == "tab:split_down")
-            })
-            .unwrap();
-        let sr_w = right_widths[sr_idx];
-        let sd_w = right_widths[sd_idx];
-        split_info = Some((sr_w + sd_w, sr_w));
-        // Redundant but preserves the original (both_btns_px, btn_right_px) contract.
-        let _ = sr;
-    }
-
-    // Sample measurement for char-col estimation (shared with old renderer).
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text("ABCDabcd0123.:_");
-    let (sample_px, _) = layout.pixel_size();
-    let char_w = (sample_px as f64 / 15.0).max(1.0);
-    let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
+    let hits = quadraui::gtk::draw_tab_bar(
+        cr,
+        layout,
+        width,
+        line_height,
+        y_offset,
+        bar,
+        &q_theme(theme),
+        hovered_close_tab,
+    );
 
     layout.set_font_description(Some(&saved_font));
 
+    // Reshape `hits.right_segment_bounds` into vimcode's app-specific
+    // (diff_btns, split_btns, action_btn) groupings using the segments'
+    // `WidgetId` strings emitted by `build_tab_bar_primitive`.
+    let mut prev: Option<(f64, f64)> = None;
+    let mut next: Option<(f64, f64)> = None;
+    let mut fold: Option<(f64, f64)> = None;
+    let mut split_right: Option<(f64, f64)> = None;
+    let mut split_down: Option<(f64, f64)> = None;
+    let mut action: Option<(f64, f64)> = None;
+    for (i, seg) in bar.right_segments.iter().enumerate() {
+        let bounds = hits.right_segment_bounds.get(i).copied();
+        let Some(b) = bounds else { continue };
+        if let Some(ref id) = seg.id {
+            match id.as_str() {
+                "tab:diff_prev" => prev = Some(b),
+                "tab:diff_next" => next = Some(b),
+                "tab:diff_toggle" => fold = Some(b),
+                "tab:split_right" => split_right = Some(b),
+                "tab:split_down" => split_down = Some(b),
+                "tab:action_menu" => action = Some(b),
+                _ => {}
+            }
+        }
+    }
+
+    let diff_btns = match (prev, next, fold) {
+        (Some(p), Some(n), Some(f)) => Some((p.0, p.1, n.0, n.1, f.0, f.1)),
+        _ => None,
+    };
+    // Preserve the legacy `(both_btns_px, btn_right_px)` contract.
+    let split_btns = match (split_right, split_down) {
+        (Some(sr), Some(sd)) => {
+            let sr_w = sr.1 - sr.0;
+            let sd_w = sd.1 - sd.0;
+            Some((sr_w + sd_w, sr_w))
+        }
+        _ => None,
+    };
+
     TabBarHitInfo {
-        slot_positions,
-        diff_btns: diff_regions.map(|a| (a[0], a[1], a[2], a[3], a[4], a[5])),
-        split_btns: split_info,
-        action_btn: action_info,
-        available_cols,
-        correct_scroll_offset,
+        slot_positions: hits.slot_positions,
+        diff_btns,
+        split_btns,
+        action_btn: action,
+        available_cols: hits.available_cols,
+        correct_scroll_offset: hits.correct_scroll_offset,
     }
 }
 

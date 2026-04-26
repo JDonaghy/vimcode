@@ -4208,44 +4208,6 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RCo
     }
 }
 
-/// Set a buffer cell with a 2-wide character (e.g. Nerd Font glyph), resetting
-/// the following cell so ratatui knows it's a continuation of the wide char.
-fn set_cell_wide(
-    buf: &mut ratatui::buffer::Buffer,
-    x: u16,
-    y: u16,
-    ch: char,
-    fg: RColor,
-    bg: RColor,
-) {
-    let area = buf.area;
-    if x < area.x + area.width && y < area.y + area.height {
-        // Use set_string which correctly handles double-width characters
-        // (measures width via unicode-segmentation, resets continuation cells).
-        // Private Use Area glyphs (Nerd Font) report width=1 to unicode_width
-        // but render as 2 columns in the terminal, so we write the glyph as a
-        // string and explicitly skip the next cell to prevent ratatui's diff
-        // algorithm from emitting it (which would overwrite the glyph's second
-        // column).
-        let mut s = String::with_capacity(4);
-        s.push(ch);
-        let cell = &mut buf[(x, y)];
-        cell.set_symbol(&s).set_fg(fg).set_bg(bg);
-        cell.modifier = Modifier::empty();
-        cell.underline_color = RColor::Reset;
-        if x + 1 < area.x + area.width {
-            // Mark as wide-char continuation: empty symbol tells ratatui this
-            // cell is the trailing half of a double-width glyph.  Unlike
-            // set_skip(true), ratatui WILL emit the background colour so the
-            // terminal doesn't show a black rectangle.
-            let cont = &mut buf[(x + 1, y)];
-            cont.set_symbol("").set_fg(fg).set_bg(bg);
-            cont.modifier = Modifier::empty();
-            cont.underline_color = RColor::Reset;
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn set_cell_styled(
     buf: &mut ratatui::buffer::Buffer,

@@ -1150,9 +1150,9 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
 
 // ─── Tab bar constants ───────────────────────────────────────────────────────
 
-/// Close-tab × button character (shown on every tab).
-pub(super) const TAB_CLOSE_CHAR: char = '×'; // U+00D7 MULTIPLICATION SIGN
 /// Terminal columns used by each tab's close button (the × itself + trailing space).
+/// The glyph itself lives in `quadraui::tui::TAB_CLOSE_CHAR` since the public
+/// rasteriser owns the painting.
 pub(super) const TAB_CLOSE_COLS: u16 = 2;
 
 // Split button glyphs: \u{F0932} (split-right), \u{f0d7} (caret-down / split-down).
