@@ -6,7 +6,44 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-24 (Session 330 — Smoke-test sweep landed 6 fixes from the Session 329 backlog; #195 is the cleanest cross-backend example so far, fixing both backends from a single `src/core/` change)
+> **Last updated:** 2026-04-25 (kubeui validation spike landed — three workspace crates `kubeui-core` / `kubeui` (TUI) / `kubeui-gtk` (GTK), validated quadraui's external-consumer story, found 65% code sharing today, ~90% achievable via #223 (lift rasterisers into quadraui))
+
+---
+
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223)
+
+The kubeui validation spike (#145, landed `1cbc98b`) answered the
+question "can a developer add a feature once and see it in all
+backends?" with a hard number: **65% today, ~90% if we lift the TUI
+and GTK rasterisers out of vimcode and into quadraui.** That single
+extraction is now the highest-leverage architectural work in the
+project — it's the lever that turns Phase B.5/B.6 (vimcode rewrite)
+into smaller waves AND unblocks every external app (#46 SQL client,
+#145 k8s dashboard, #147 Postman, future Lua-driven plugin UIs)
+from reimplementing the same draw functions.
+
+**Read first when you start:**
+- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates, pilot recommendation
+- [#224](https://github.com/JDonaghy/vimcode/issues/224) — small API friction points captured during the spike
+- The kubeui crates (`kubeui-core`, `kubeui`, `kubeui-gtk`) on develop — concrete evidence of what's currently duplicated
+
+**Recommended pilot:** lift `quadraui_tui::draw_status_bar` +
+`quadraui_gtk::draw_status_bar` into `quadraui::tui::draw_status_bar`
+and `quadraui::gtk::draw_status_bar` behind feature gates (`tui`,
+`gtk`). Both already consume `StatusBarLayout` (Phase B.4) so the
+lift is mostly mechanical — the real design work is the small
+backend-agnostic `Theme` struct (see #223 §"Tradeoffs").
+
+After the StatusBar pilot ships, vimcode adopts via re-export, kubeui
+adopts by deleting its private `draw_status_bar`. That's the
+template; iterate per-primitive (TabBar → ListView → TreeView →
+Palette → Form → Tooltip → Dialog → ContextMenu).
+
+**Why this beats every other open work item:**
+- It validates externally what we've been building internally (the kubeui spike is the proof point).
+- The vimcode B.5/B.6 backend rewrites get smaller — each backend rewrite stops carrying its own private rasteriser stack.
+- Every external app (k8s dashboard, SQL client, Postman) gets to focus on its domain instead of reimplementing UI primitives.
+- It surfaces the small API friction (#224) while we have a real second consumer to test against — once kubeui is happy, the API is good.
 
 ---
 
