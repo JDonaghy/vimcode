@@ -61,6 +61,12 @@ pub struct Settings {
     #[serde(default = "default_font_size")]
     pub font_size: i32,
 
+    /// Font size for UI chrome (menus, sidebars, dialogs, hover popup body).
+    /// Independent of `font_size` (which controls editor text). Lower bound
+    /// is enforced at use to avoid layout breakage.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: u8,
+
     /// Show file explorer sidebar on startup
     #[serde(default = "default_explorer_visible")]
     pub explorer_visible_on_startup: bool,
@@ -716,12 +722,17 @@ fn default_font_size() -> i32 {
     14
 }
 
+fn default_ui_font_size() -> u8 {
+    10
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             line_numbers: LineNumberMode::None,
             font_family: default_font_family(),
             font_size: default_font_size(),
+            ui_font_size: default_ui_font_size(),
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
@@ -1152,6 +1163,12 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.font_size = n.clamp(6, 72);
             }
+            "ui_font_size" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.ui_font_size = n.clamp(6, 32) as u8;
+            }
             "font_family" => {
                 self.font_family = value.to_string();
             }
@@ -1402,6 +1419,7 @@ impl Settings {
             "colorscheme" => self.colorscheme.clone(),
             "font_family" => self.font_family.clone(),
             "font_size" => self.font_size.to_string(),
+            "ui_font_size" => self.ui_font_size.to_string(),
             "line_numbers" => match self.line_numbers {
                 LineNumberMode::None => "none".to_string(),
                 LineNumberMode::Absolute => "absolute".to_string(),
@@ -1474,6 +1492,12 @@ impl Settings {
                 self.font_size = value
                     .parse()
                     .map_err(|_| format!("Invalid font_size: {value}"))?;
+            }
+            "ui_font_size" => {
+                let n: u8 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid ui_font_size: {value}"))?;
+                self.ui_font_size = n;
             }
             "line_numbers" => {
                 self.line_numbers = match value {
@@ -1702,6 +1726,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Editor font size in points",
         category: "Appearance",
         setting_type: SettingType::Integer { min: 6, max: 48 },
+    },
+    SettingDef {
+        key: "ui_font_size",
+        label: "UI Font Size",
+        description: "Font size for menus, sidebars, dialogs, and hover popups",
+        category: "Appearance",
+        setting_type: SettingType::Integer { min: 6, max: 32 },
     },
     SettingDef {
         key: "use_nerd_fonts",

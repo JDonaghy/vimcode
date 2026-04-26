@@ -1,8 +1,37 @@
 use super::*;
 
-/// Pango font description string for UI panels (menu bar, sidebars, dropdown).
-/// Matches VSCode's Linux font stack at 11pt ≈ 13px @ 96 dpi.
-pub(super) const UI_FONT: &str = "Segoe UI, Ubuntu, Droid Sans, Sans 10";
+/// Pango font family for UI panels (menu bar, sidebars, dropdown,
+/// dialogs, hover popups). Size is appended at use via [`UI_FONT`]
+/// from the configured `settings.ui_font_size` (#217).
+pub(super) const UI_FONT_FAMILY: &str = "Segoe UI, Ubuntu, Droid Sans, Sans";
+
+/// Process-global UI font size (points). Synced from
+/// `settings.ui_font_size` at the start of each frame by
+/// [`sync_ui_font_size`]. Read everywhere a Pango font description
+/// is built — avoids threading `&Settings` through ~20 draw
+/// functions for what's effectively one shared knob (#217).
+static UI_FONT_SIZE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(10);
+
+/// Update the process-global UI font size from `settings`. Called
+/// once per frame at the top of [`draw_editor`].
+pub(super) fn sync_ui_font_size(settings: &core::settings::Settings) {
+    UI_FONT_SIZE.store(
+        settings.ui_font_size.max(6),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Pango font description string for UI chrome at the currently
+/// configured size. Drop-in replacement for the legacy `UI_FONT`
+/// const — call sites do `FontDescription::from_string(&UI_FONT())`.
+#[allow(non_snake_case)]
+pub(super) fn UI_FONT() -> String {
+    format!(
+        "{} {}",
+        UI_FONT_FAMILY,
+        UI_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_editor(
@@ -33,6 +62,10 @@ pub(super) fn draw_editor(
     debug_toolbar_height_out: &Rc<Cell<f64>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
+
+    // Sync the UI font size atomic from settings so all
+    // `UI_FONT()` callers below see the configured size (#217).
+    sync_ui_font_size(&engine.settings);
 
     // Clear cached button positions from previous frame.
     diff_btn_map_out.borrow_mut().clear();
@@ -2805,7 +2838,7 @@ pub(super) fn draw_tab_switcher_popup(
 
     // Use sans-serif UI font (same as VSCode tabs)
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&ui_font_desc));
 
@@ -2883,7 +2916,7 @@ pub(super) fn draw_dialog_popup(
     };
 
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
@@ -2999,7 +3032,7 @@ pub(super) fn draw_context_menu_popup(
     }
 
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
@@ -3084,7 +3117,7 @@ pub(super) fn draw_bottom_panel_tabs(
 
     // Use sans-serif UI font (like VSCode panel tabs).
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
     layout.set_attributes(None);
 
@@ -3453,7 +3486,7 @@ pub(super) fn draw_terminal_panel(
 ) {
     // Toolbar row (header) — use sans-serif UI font like VSCode.
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
 
     let (hr, hg, hb) = theme.status_bg.to_cairo();
     cr.set_source_rgb(hr, hg, hb);
@@ -3863,7 +3896,7 @@ pub(super) fn draw_menu_bar(
     let _ = cr.fill();
 
     let pango_ctx = pangocairo::create_context(cr);
-    let font_desc = pango::FontDescription::from_string(UI_FONT);
+    let font_desc = pango::FontDescription::from_string(&UI_FONT());
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
@@ -4036,7 +4069,7 @@ pub(super) fn draw_menu_dropdown(
     };
 
     let pango_ctx = pangocairo::create_context(cr);
-    let font_desc = pango::FontDescription::from_string(UI_FONT);
+    let font_desc = pango::FontDescription::from_string(&UI_FONT());
     let layout = pango::Layout::new(&pango_ctx);
     layout.set_font_description(Some(&font_desc));
 
@@ -5940,7 +5973,7 @@ pub(super) fn draw_debug_toolbar(
     hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
 ) {
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 

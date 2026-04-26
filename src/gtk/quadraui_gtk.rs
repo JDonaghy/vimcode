@@ -1184,7 +1184,7 @@ pub(super) fn draw_tab_bar(
 
     layout.set_attributes(None);
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(super::UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&super::UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
 
     let normal_font = ui_font_desc.clone();
@@ -2149,7 +2149,7 @@ pub(super) fn draw_rich_text_popup(
     cr.rectangle(bx, by, bw, bh);
     cr.stroke().ok();
 
-    let ui_font_desc = pango::FontDescription::from_string(UI_FONT);
+    let ui_font_desc = pango::FontDescription::from_string(&UI_FONT());
 
     // Clip text rendering to the content area so long lines (Pango is
     // unbounded) and selection rectangles don't bleed past the popup

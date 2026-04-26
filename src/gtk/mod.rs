@@ -2125,7 +2125,7 @@ impl SimpleComponent for App {
             widgets.settings_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(UI_FONT);
+                let font_desc = FontDescription::from_string(&UI_FONT());
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 layout.set_font_description(Some(&font_desc));
@@ -2182,7 +2182,7 @@ impl SimpleComponent for App {
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(UI_FONT);
+                let font_desc = FontDescription::from_string(&UI_FONT());
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 layout.set_font_description(Some(&font_desc));
@@ -2596,7 +2596,7 @@ impl SimpleComponent for App {
                         return;
                     }
                     let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let font_desc = FontDescription::from_string(&UI_FONT());
                     let pango_ctx = pangocairo::create_context(cr);
                     let layout = pango::Layout::new(&pango_ctx);
                     layout.set_font_description(Some(&font_desc));
@@ -2812,7 +2812,7 @@ impl SimpleComponent for App {
                 .set_draw_func(move |da, cr, _w, _h| {
                     let engine = engine.borrow();
                     let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let font_desc = FontDescription::from_string(&UI_FONT());
                     let pango_ctx = pangocairo::create_context(cr);
                     let layout = pango::Layout::new(&pango_ctx);
                     layout.set_font_description(Some(&font_desc));
@@ -2873,7 +2873,7 @@ impl SimpleComponent for App {
             widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(UI_FONT);
+                let font_desc = FontDescription::from_string(&UI_FONT());
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 layout.set_font_description(Some(&font_desc));
@@ -2939,7 +2939,7 @@ impl SimpleComponent for App {
             widgets.ext_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(UI_FONT);
+                let font_desc = FontDescription::from_string(&UI_FONT());
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 layout.set_font_description(Some(&font_desc));
@@ -2985,7 +2985,7 @@ impl SimpleComponent for App {
                 .set_draw_func(move |da, cr, _w, _h| {
                     let engine = engine.borrow();
                     let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let font_desc = FontDescription::from_string(&UI_FONT());
                     let pango_ctx = pangocairo::create_context(cr);
                     let layout = pango::Layout::new(&pango_ctx);
                     layout.set_font_description(Some(&font_desc));
@@ -4123,7 +4123,7 @@ impl SimpleComponent for App {
                 self.cached_char_width = char_width;
                 // Compute UI font line height for sidebar click handlers.
                 if let Some(ref da) = *self.drawing_area.borrow() {
-                    let font_desc = FontDescription::from_string(UI_FONT);
+                    let font_desc = FontDescription::from_string(&UI_FONT());
                     let pango_ctx = da.pango_context();
                     let fm = pango_ctx.metrics(Some(&font_desc), None);
                     self.cached_ui_line_height =
@@ -5712,7 +5712,7 @@ impl App {
 
         let pango_ctx = da.pango_context();
         let layout = pango::Layout::new(&pango_ctx);
-        let font_desc = FontDescription::from_string(UI_FONT);
+        let font_desc = FontDescription::from_string(&UI_FONT());
         layout.set_font_description(Some(&font_desc));
         layout.set_text(&line_text);
         if (scale - 1.0_f64).abs() > 0.01 {
