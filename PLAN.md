@@ -6,15 +6,16 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar rasteriser pilots landed; pre-existing `TabBar::layout` regression fixed where TUI's scroll-arrow-disabled path was clipping newly-opened tabs from index 0 instead of honouring caller `bar.scroll_offset`; next pilot: ListView)
+> **Last updated:** 2026-04-26 (#223 StatusBar + TabBar + ListView rasteriser pilots landed; kubeui (TUI + GTK) now consumes the public `quadraui::*::draw_list` rasterisers — first primitive that hits both kubeui binaries head-on, ~110 lines of duplicate rasterisation removed from kubeui. Next pilot: TreeView)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), ListView next
+## 🎯 NEXT SESSION PRIORITY — quadraui rasteriser extraction (#223), TreeView next
 
-**Pilots shipped (Session 332).** StatusBar + TabBar rasterisers now
-live in `quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature
-gates. vimcode (TUI + GTK) and kubeui (TUI + GTK) all delegate.
+**Three pilots shipped (Session 332).** StatusBar + TabBar + ListView
+rasterisers now live in `quadraui::{tui,gtk}::draw_*` behind `tui` /
+`gtk` feature gates. vimcode (TUI + GTK) and kubeui (TUI + GTK) all
+delegate.
 
 The pilots proved out:
 
@@ -38,37 +39,49 @@ The pilots proved out:
   computes scroll itself; scroll-arrows off → caller owns scroll
   via `bar.scroll_offset`.
 
-**Next primitive: ListView.** Both backends already consume
-`ListViewLayout` per Phase B.4 — vimcode uses it for the quickfix
-panel and tab switcher; kubeui has its own `draw_list` for the
-resource list (a clear adoption target). Lift is mostly mechanical;
-no app-specific shapes need preservation (unlike TabBar's
-WidgetId-keyed groupings).
+**Next primitive: TreeView.** vimcode uses it for the file explorer
++ git source-control panel. Both backends already consume
+`TreeViewLayout` per Phase B.4. The lift is the most complex of the
+remaining primitives because **per-row heights vary on GTK** —
+header rows use 1× `line_height`, leaves use 1.4× — and the click
+hit-test (in `src/gtk/mod.rs`) walks an accumulator to map mouse y
+to row index. The public `quadraui::gtk::draw_tree` should keep that
+contract by accepting a measurement closure (or returning per-row
+y-bounds); the TUI version is uniform 1 cell per row and simpler.
 
-**Order after ListView:** TreeView → Palette → Form → Tooltip →
-Dialog → ContextMenu. Each is a per-primitive commit; vimcode + kubeui
-adopt at the same time.
+kubeui doesn't have a tree today, but adding one is a likely
+follow-on (resources-by-namespace hierarchy, drill-into-pod-events,
+etc.) — having the rasteriser ready means kubeui gets it for free
+when the use case lands.
+
+**Order after TreeView:** Palette → Form → Tooltip → Dialog →
+ContextMenu. Each is a per-primitive commit; vimcode + kubeui adopt
+at the same time.
 
 The kubeui validation spike (#145, landed `1cbc98b`) answered the
 question "can a developer add a feature once and see it in all
 backends?" with a hard number: **65% today, ~90% if we lift the TUI
-and GTK rasterisers out of vimcode and into quadraui.** The two
-shipped pilots have closed the gap by ~10 percentage points;
-remaining primitives finish the lift.
+and GTK rasterisers out of vimcode and into quadraui.** The three
+shipped pilots have closed the gap most clearly via the ListView
+lift, which removed ~110 lines of duplicate rasterisation from
+kubeui — proving the cross-app payoff end-to-end.
 
 **Read first when you start:**
-- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates. The StatusBar + TabBar pilot commits are canonical templates.
+- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates. The StatusBar / TabBar / ListView pilot commits are canonical templates.
 - [#224](https://github.com/JDonaghy/vimcode/issues/224) — small API friction points captured during the spike (still open; address alongside future migrations as they surface)
-- The kubeui crates (`kubeui-core`, `kubeui`, `kubeui-gtk`) on develop — concrete evidence of what's currently duplicated
+- The kubeui crates (`kubeui-core`, `kubeui`, `kubeui-gtk`) on develop — concrete evidence of what's currently duplicated, with the ListView pilot serving as a "before / after" reference for tree-shaped surfaces.
 
-**ListView pilot details:** lift `quadraui_tui::draw_list` +
-`quadraui_gtk::draw_list` into `quadraui::{tui,gtk}::draw_list`. Theme
-fields likely needed: a list bg, selected-row bg, regular-row fg,
-muted/dim fg. Add to `quadraui::Theme` as needed. kubeui's
-`draw_list` (in `kubeui/src/main.rs`) is a direct adoption target —
-it currently hardcodes the palette and reimplements scroll-clamping
-via `list.layout()`; after the lift it will use the same code as
-vimcode.
+**TreeView pilot details:** lift `quadraui_tui::draw_tree` +
+`quadraui_gtk::draw_tree` into `quadraui::{tui,gtk}::draw_tree`. The
+GTK version's per-row height policy (`line_height` for header,
+`line_height * 1.4` for leaves) belongs in the rasteriser via a
+measurement closure passed to `tree.layout()` — same pattern
+ListView already uses with its uniform measurer. Vimcode's GTK click
+handler in `src/gtk/mod.rs` walks an accumulator to resolve mouse y
+to a row index; that should keep working unchanged because the
+returned `TreeViewLayout.visible_rows` already carries per-row
+bounds (just verify nothing relies on the rasteriser's *internal*
+height math).
 
 **Why this still beats every other open work item:**
 - It validates externally what we've been building internally (the kubeui spike is the proof point).

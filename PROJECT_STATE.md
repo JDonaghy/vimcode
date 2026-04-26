@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates, vimcode + kubeui all delegate, ~9 fields on `quadraui::Theme`. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
+**Last updated:** Apr 26, 2026 (Session 332 — #223 StatusBar + TabBar + ListView rasteriser pilots landed: public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates, vimcode + kubeui all delegate, ~19 fields on `quadraui::Theme`. Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
@@ -79,6 +79,74 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 332 (cont.) — #223 ListView rasteriser pilot:**
+
+Third primitive lifted following the StatusBar + TabBar pattern. This
+one is the first that hits **kubeui head-on**: kubeui (TUI) and
+kubeui-gtk both have their own `draw_list` for the resource list,
+and both adopt `quadraui::{tui,gtk}::draw_list` in this commit —
+proving the cross-app reuse story end-to-end.
+
+**What shipped:**
+
+- `quadraui/src/tui/list.rs` —
+  `pub fn quadraui::tui::draw_list(buf, area, list, theme, nerd_fonts_enabled)`.
+  5 unit tests cover: paint output with selection marker, selection
+  marker suppressed when unfocused, bordered corner glyphs, error
+  decoration → `error_fg`, zero-size guard.
+- `quadraui/src/gtk/list.rs` —
+  `pub fn quadraui::gtk::draw_list(cr, layout, x, y, w, h, list, theme, line_height, nerd_fonts_enabled)`.
+  Mirrors the TUI rasteriser's visual contract; bordered mode is
+  not yet honoured (no GTK consumer needs it today, deferred as a
+  follow-up).
+- `quadraui::Theme` extends with 10 list-relevant fields:
+  `surface_bg / surface_fg / selected_bg / border_fg / title_fg /
+  header_bg / header_fg / muted_fg / error_fg / warning_fg`. Each
+  has a sensible dark-palette default; vimcode populates from
+  `render::Theme` (mapping `fuzzy_*`, `status_*`, `line_number_fg`,
+  `diagnostic_*`); kubeui populates the subset it cares about and
+  spreads `..Theme::default()` for the rest.
+- `quadraui::tui::draw_styled_text` — generic helper for painting a
+  `StyledText` with optional decoration override. Lifted from
+  vimcode's TUI rasteriser; will be reused by future migrations
+  (form / palette / tooltip).
+
+**Adoption (vimcode + kubeui at the same time):**
+
+- `src/tui_main/quadraui_tui.rs::draw_list` collapses to a
+  delegation. ~200 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_list` collapses to a delegation.
+  ~170 lines removed.
+- `kubeui/src/main.rs::draw_list` collapses to a 1-liner. ~60
+  lines of duplicate rasterisation removed; private `put_styled`
+  helper deleted.
+- `kubeui-gtk/src/main.rs::draw_list` collapses to a 1-liner.
+  ~50 lines of duplicate rasterisation removed; private
+  `draw_styled_text` + `measure_styled` helpers deleted.
+- Both kubeui binaries now have a richer `theme()` helper that
+  populates the relevant new Theme fields (selected_bg,
+  surface_bg, etc.).
+
+**Net diff impact:** kubeui crates lose more lines than vimcode
+because they had less of the rasteriser code already factored —
+exactly the ~25% sharing-delta the kubeui spike measured. Each
+primitive lift moves the percentage closer to the 90% target.
+
+**Quality:** `cargo test -p quadraui --features tui` 195/195 (5
+new tui::list tests on top of 190); full
+`cargo test --no-default-features` green; clippy clean across all
+four crates × both feature combinations.
+
+**What's next:** **TreeView**. vimcode uses it for the file
+explorer + git source-control panel; kubeui doesn't have one
+today but plausibly grows one (e.g. resource-by-namespace
+hierarchy). Tree migration is the most complex of the remaining
+lifts because per-row heights vary on GTK (header rows 1× line
+height, leaves 1.4×). After TreeView: Palette → Form → Tooltip →
+Dialog → ContextMenu.
+
+---
 
 **Session 332 (cont.) — #223 TabBar rasteriser pilot + a pre-existing
 layout-regression fix:**

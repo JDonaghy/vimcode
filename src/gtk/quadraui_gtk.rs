@@ -510,166 +510,18 @@ pub(super) fn draw_list(
     theme: &Theme,
     line_height: f64,
 ) {
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-
-    let (bg_r, bg_g, bg_b) = vc_to_cairo(theme.background);
-    let (hdr_r, hdr_g, hdr_b) = vc_to_cairo(theme.status_bg);
-    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = vc_to_cairo(theme.status_fg);
-    let (fg_r, fg_g, fg_b) = vc_to_cairo(theme.fuzzy_fg);
-    let (dim_r, dim_g, dim_b) = vc_to_cairo(theme.line_number_fg);
-    let (sel_r, sel_g, sel_b) = vc_to_cairo(theme.fuzzy_selected_bg);
-    let (err_r, err_g, err_b) = vc_to_cairo(theme.diagnostic_error);
-    let (warn_r, warn_g, warn_b) = vc_to_cairo(theme.diagnostic_warning);
-
-    // Fill list background.
-    cr.set_source_rgb(bg_r, bg_g, bg_b);
-    cr.rectangle(x, y, w, h);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
-    let use_nerd = icons::nerd_fonts_enabled();
-
-    // Resolve the layout once per frame. Per-item heights are uniform
-    // (`line_height` each); the primitive handles scroll-clipping and
-    // the optional title row at the top.
-    let title_h = if list.title.is_some() {
-        line_height as f32
-    } else {
-        0.0
-    };
-    let list_layout = list.layout(w as f32, h as f32, title_h, |_| {
-        quadraui::ListItemMeasure::new(line_height as f32)
-    });
-
-    // Title header (optional). Rendered as a single full-width status-bar row.
-    if let (Some(title_bounds), Some(title)) = (list_layout.title_bounds, list.title.as_ref()) {
-        let ty = y + title_bounds.y as f64;
-        let th_px = title_bounds.height as f64;
-        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, ty, w, th_px);
-        cr.fill().ok();
-
-        cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-        let title_text: String = title.spans.iter().map(|s| s.text.as_str()).collect();
-        layout.set_text(&title_text);
-        let (_, text_h) = layout.pixel_size();
-        cr.move_to(x + 2.0, ty + (th_px - text_h as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    for vis_item in &list_layout.visible_items {
-        let item = &list.items[vis_item.item_idx];
-        let row_y = y + vis_item.bounds.y as f64;
-        let row_w = vis_item.bounds.width as f64;
-        let row_h = vis_item.bounds.height as f64;
-
-        let is_selected = vis_item.item_idx == list.selected_idx && list.has_focus;
-
-        // Decoration → foreground colour.
-        let decoration_fg = match item.decoration {
-            quadraui::Decoration::Error => (err_r, err_g, err_b),
-            quadraui::Decoration::Warning => (warn_r, warn_g, warn_b),
-            quadraui::Decoration::Muted => (dim_r, dim_g, dim_b),
-            quadraui::Decoration::Header => (hdr_fg_r, hdr_fg_g, hdr_fg_b),
-            _ => (fg_r, fg_g, fg_b),
-        };
-        let row_bg = if is_selected {
-            (sel_r, sel_g, sel_b)
-        } else if matches!(item.decoration, quadraui::Decoration::Header) {
-            (hdr_r, hdr_g, hdr_b)
-        } else {
-            (bg_r, bg_g, bg_b)
-        };
-
-        // Fill row background.
-        cr.set_source_rgb(row_bg.0, row_bg.1, row_bg.2);
-        cr.rectangle(x, row_y, row_w, row_h);
-        cr.fill().ok();
-
-        let mut cursor_x = x + 2.0;
-
-        // Selection indicator (▶ on selection, two spaces otherwise — keeps
-        // non-selected row text aligned with selected row text).
-        let prefix = if is_selected { "▶ " } else { "  " };
-        cr.set_source_rgb(decoration_fg.0, decoration_fg.1, decoration_fg.2);
-        layout.set_text(prefix);
-        let (pw, ph) = layout.pixel_size();
-        cr.move_to(cursor_x, row_y + (row_h - ph as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        cursor_x += pw as f64;
-
-        // Icon (optional).
-        if let Some(ref icon) = item.icon {
-            let glyph = if use_nerd {
-                icon.glyph.as_str()
-            } else {
-                icon.fallback.as_str()
-            };
-            cr.set_source_rgb(decoration_fg.0, decoration_fg.1, decoration_fg.2);
-            layout.set_text(glyph);
-            let (iw, ih) = layout.pixel_size();
-            cr.move_to(cursor_x, row_y + (row_h - ih as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            cursor_x += iw as f64 + 6.0;
-        }
-
-        // Reserve space for the detail (right-aligned, dimmed).
-        let detail_info = item.detail.as_ref().map(|detail| {
-            let detail_text: String = detail.spans.iter().map(|s| s.text.as_str()).collect();
-            layout.set_text(&detail_text);
-            let (dw, _) = layout.pixel_size();
-            (detail_text, dw as f64)
-        });
-        let detail_reserve = detail_info.as_ref().map(|(_, dw)| *dw + 8.0).unwrap_or(0.0);
-        let text_right_limit = x + row_w - detail_reserve - 4.0;
-
-        // Text spans.
-        for span in &item.text.spans {
-            if cursor_x >= text_right_limit {
-                break;
-            }
-            let span_fg = if let Some(c) = span.fg {
-                qc_to_cairo(c)
-            } else {
-                decoration_fg
-            };
-            if let Some(sbg) = span.bg {
-                let (sbr, sbg_, sbb) = qc_to_cairo(sbg);
-                layout.set_text(&span.text);
-                let (sw, _) = layout.pixel_size();
-                cr.set_source_rgb(sbr, sbg_, sbb);
-                cr.rectangle(
-                    cursor_x,
-                    row_y,
-                    (sw as f64).min(text_right_limit - cursor_x),
-                    row_h,
-                );
-                cr.fill().ok();
-            }
-            cr.set_source_rgb(span_fg.0, span_fg.1, span_fg.2);
-            layout.set_text(&span.text);
-            let (sw, sh) = layout.pixel_size();
-            cr.move_to(cursor_x, row_y + (row_h - sh as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            cursor_x += sw as f64;
-        }
-
-        // Detail (right-aligned, dimmed).
-        if let Some((detail_text, dw)) = detail_info {
-            let dx = x + row_w - dw - 4.0;
-            if dx > cursor_x {
-                cr.set_source_rgb(dim_r, dim_g, dim_b);
-                layout.set_text(&detail_text);
-                let (_, dh) = layout.pixel_size();
-                cr.move_to(dx, row_y + (row_h - dh as f64) / 2.0);
-                pangocairo::show_layout(cr, layout);
-            }
-        }
-    }
-
-    layout.set_attributes(None);
+    quadraui::gtk::draw_list(
+        cr,
+        layout,
+        x,
+        y,
+        w,
+        h,
+        list,
+        &q_theme(theme),
+        line_height,
+        icons::nerd_fonts_enabled(),
+    );
 }
 
 /// Draw a `quadraui::Palette` modal into `(x, y, w, h)` on `cr`.
@@ -1028,16 +880,27 @@ pub(super) fn draw_status_bar(
 /// migration adds the field it needs in one place. Lift sequence is
 /// driven by #223.
 pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
+    let q = render::to_quadraui_color;
     quadraui::Theme {
-        background: render::to_quadraui_color(theme.background),
-        foreground: render::to_quadraui_color(theme.foreground),
-        tab_bar_bg: render::to_quadraui_color(theme.tab_bar_bg),
-        tab_active_bg: render::to_quadraui_color(theme.tab_active_bg),
-        tab_active_fg: render::to_quadraui_color(theme.tab_active_fg),
-        tab_inactive_fg: render::to_quadraui_color(theme.tab_inactive_fg),
-        tab_preview_active_fg: render::to_quadraui_color(theme.tab_preview_active_fg),
-        tab_preview_inactive_fg: render::to_quadraui_color(theme.tab_preview_inactive_fg),
-        separator: render::to_quadraui_color(theme.separator),
+        background: q(theme.background),
+        foreground: q(theme.foreground),
+        tab_bar_bg: q(theme.tab_bar_bg),
+        tab_active_bg: q(theme.tab_active_bg),
+        tab_active_fg: q(theme.tab_active_fg),
+        tab_inactive_fg: q(theme.tab_inactive_fg),
+        tab_preview_active_fg: q(theme.tab_preview_active_fg),
+        tab_preview_inactive_fg: q(theme.tab_preview_inactive_fg),
+        separator: q(theme.separator),
+        surface_bg: q(theme.fuzzy_bg),
+        surface_fg: q(theme.fuzzy_fg),
+        selected_bg: q(theme.fuzzy_selected_bg),
+        border_fg: q(theme.fuzzy_border),
+        title_fg: q(theme.fuzzy_title_fg),
+        header_bg: q(theme.status_bg),
+        header_fg: q(theme.status_fg),
+        muted_fg: q(theme.line_number_fg),
+        error_fg: q(theme.diagnostic_error),
+        warning_fg: q(theme.diagnostic_warning),
     }
 }
 
