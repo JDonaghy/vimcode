@@ -2326,14 +2326,27 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                // Jump-scroll to click position so a click without a
-                // following drag still moves the bar. Mirrors what the
-                // click gesture's handler would do, but fires here too
-                // because GTK suppresses the click handler once we
-                // claim the sequence.
-                let ratio = ((y_start - sb_y) / sb_h).clamp(0.0, 1.0);
-                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
-                state_begin.borrow_mut().scroll_top = new_top;
+                // Compute the visible thumb's pixel range using the same
+                // math the renderer uses (Stage 5c parity with TUI). If
+                // the click lands on the thumb, `grab_offset` preserves
+                // the cursor's relative position so the thumb doesn't
+                // jump out from under the user.
+                let thumb_ratio = (viewport as f32 / total as f32).min(1.0);
+                let thumb_length = (sb_h as f32 * thumb_ratio).max(1.0);
+                let effective_track = (sb_h as f32 - thumb_length).max(1.0);
+                let scroll_top = state_begin.borrow().scroll_top;
+                let scroll_ratio = if max_scroll == 0 {
+                    0.0
+                } else {
+                    (scroll_top as f32 / max_scroll as f32).clamp(0.0, 1.0)
+                };
+                let thumb_top = sb_y as f32 + scroll_ratio * effective_track;
+                let dy = y_start as f32 - thumb_top;
+                let grab_offset = if dy >= 0.0 && dy < thumb_length {
+                    dy
+                } else {
+                    0.0
+                };
 
                 drag_state_begin
                     .borrow_mut()
@@ -2343,7 +2356,25 @@ impl SimpleComponent for App {
                         track_length: sb_h as f32,
                         visible_rows: viewport,
                         total_items: total,
+                        grab_offset,
                     });
+
+                // Apply the click-time offset using the same thumb-aware
+                // dispatch path subsequent drags will use, so the thumb
+                // doesn't visually jump on the first drag event.
+                let events = quadraui::dispatch_mouse_drag(
+                    &drag_state_begin.borrow(),
+                    quadraui::Point {
+                        x: x_start as f32,
+                        y: y_start as f32,
+                    },
+                    Default::default(),
+                );
+                for ev in &events {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
+                        state_begin.borrow_mut().scroll_top = *new_offset;
+                    }
+                }
 
                 da_begin.queue_draw();
             });
@@ -6112,6 +6143,7 @@ impl App {
                                 track_length: rows_h as f32,
                                 visible_rows,
                                 total_items: total,
+                                grab_offset: 0.0,
                             });
                     } else if y >= results_top && y < results_bottom {
                         let mut engine = self.engine.borrow_mut();
@@ -6241,6 +6273,7 @@ impl App {
                                     track_length: sb_hit.track.height,
                                     visible_rows: sb_hit.visible_rows,
                                     total_items: sb_hit.total,
+                                    grab_offset: 0.0,
                                 });
                             self.draw_needed.set(true);
                             return;
@@ -10012,8 +10045,14 @@ impl App {
         }
     }
 
-    /// Update `scroll_top` so the clicked y lands at the thumb position.
+    /// Update `scroll_top` so the clicked y lands at the thumb top.
     /// `sb_y` / `sb_h` are the scrollbar track bounds.
+    ///
+    /// Uses the same thumb-aware math as `quadraui::dispatch_mouse_drag`
+    /// so that this single-click jump and a subsequent drag converge
+    /// on the same scroll position. Clicks landing on the visible thumb
+    /// are no-ops — `GestureDrag::drag_begin` arms the drag and the
+    /// thumb stays where the user grabbed it (no visual jump).
     fn explorer_jump_scroll(&self, click_y: f64, sb_y: f64, sb_h: f64) {
         let total = self.explorer_state.borrow().rows.len();
         let viewport = self.explorer_viewport_rows();
@@ -10021,8 +10060,22 @@ impl App {
         if max_scroll == 0 || sb_h <= 0.0 {
             return;
         }
-        let ratio = ((click_y - sb_y) / sb_h).clamp(0.0, 1.0);
-        let new_top = (ratio * max_scroll as f64).round() as usize;
+        // Visible thumb geometry — same formulas dispatch_mouse_drag uses.
+        let thumb_ratio = (viewport as f64 / total as f64).min(1.0);
+        let thumb_h = (sb_h * thumb_ratio).max(1.0);
+        let effective_track = (sb_h - thumb_h).max(1.0);
+        let scroll_top = self.explorer_state.borrow().scroll_top;
+        let scroll_ratio = (scroll_top as f64 / max_scroll.max(1) as f64).clamp(0.0, 1.0);
+        let thumb_top = sb_y + scroll_ratio * effective_track;
+        // Click on the visible thumb → leave scroll alone; GestureDrag
+        // takes over with its own grab_offset calculation.
+        if click_y >= thumb_top && click_y < thumb_top + thumb_h {
+            return;
+        }
+        // Click on the track outside the thumb → jump so the thumb top
+        // lands at the cursor.
+        let rel = ((click_y - sb_y) / effective_track).clamp(0.0, 1.0);
+        let new_top = (rel * max_scroll as f64).round() as usize;
         self.explorer_state.borrow_mut().scroll_top = new_top.min(max_scroll);
     }
 

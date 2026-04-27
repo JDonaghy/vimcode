@@ -596,27 +596,10 @@ struct ScrollDragState {
     total: usize,
 }
 
-/// State for an active drag on the sidebar search-panel vertical scrollbar.
-struct SidebarScrollDrag {
-    /// Absolute terminal row of the first row of the scrollbar track.
-    track_abs_start: u16,
-    /// Height of the track in rows.
-    track_len: u16,
-    /// Total number of display rows in the results list.
-    total: usize,
-}
-
-/// State for an active drag on a debug sidebar section scrollbar.
-struct DebugSidebarScrollDrag {
-    /// Section index (0–3).
-    sec_idx: usize,
-    /// Absolute terminal row of the first content row in this section.
-    track_abs_start: u16,
-    /// Number of content rows in this section.
-    track_len: u16,
-    /// Total number of items in this section.
-    total: usize,
-}
+// `SidebarScrollDrag` and `DebugSidebarScrollDrag` were retired in
+// Phase B.4 Stage 5c — those drags now flow through the shared
+// `quadraui::DragState::ScrollbarY` (widget ids `tui:search_results`,
+// `tui:settings`, `tui:debug_sidebar:N`).
 
 /// What the folder picker should do when the user confirms a selection.
 #[derive(Clone, PartialEq)]
@@ -1246,22 +1229,13 @@ fn event_loop(
     let mut dragging_sidebar = false;
     // Non-None while user is dragging a scrollbar thumb
     let mut dragging_scrollbar: Option<ScrollDragState> = None;
-    // Non-None while user is dragging the search-results scrollbar thumb
-    let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
-    // Non-None while user is dragging a debug sidebar section scrollbar
-    let mut dragging_debug_sb: Option<DebugSidebarScrollDrag> = None;
-    // Non-None while user is dragging the terminal panel's scrollbar thumb.
-    // Stores (track_start_row, track_len, total_scrollback_rows).
-    let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
+    // Stage 5c retired the per-scrollbar `Option<...>` locals (search,
+    // settings, debug-sidebar, terminal-scrollback, debug-output). All
+    // five drags now flow through the single `quadraui::DragState` on
+    // `TuiBackend`, with widget IDs keyed in `mouse.rs`.
+
     // Scroll offset for the debug output panel (0 = newest/bottom, n = n lines up from bottom).
     let mut debug_output_scroll: usize = 0;
-    // Non-None while user is dragging the debug output panel's scrollbar thumb.
-    // Stores (track_start_row, track_len, total_lines).
-    let mut dragging_debug_output_sb: Option<(u16, u16, usize)> = None;
-    // Non-None while user is dragging the settings panel scrollbar.
-    let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
-    // Non-None while user is dragging a sidebar scrollbar that has no dedicated drag state.
-    // Used for explorer and ext panel scrollbars to prevent text selection leaking.
     // Phase B.4: cross-backend drag-state + modal stack now live on
     // `TuiBackend`. Stage 1: `backend.drag_state_mut()` /
     // `backend.modal_stack_mut()` replace the previous `let mut`
@@ -3949,15 +3923,10 @@ fn event_loop(
                                 sidebar_width,
                                 &mut dragging_sidebar,
                                 &mut dragging_scrollbar,
-                                &mut dragging_sidebar_search,
-                                &mut dragging_debug_sb,
-                                &mut dragging_terminal_sb,
                                 &mut debug_output_scroll,
-                                &mut dragging_debug_output_sb,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
-                                &mut dragging_settings_sb,
                                 drag_state_ref,
                                 modal_stack_ref,
                                 last_layout.as_ref(),
@@ -4005,15 +3974,10 @@ fn event_loop(
                     sidebar_width,
                     &mut dragging_sidebar,
                     &mut dragging_scrollbar,
-                    &mut dragging_sidebar_search,
-                    &mut dragging_debug_sb,
-                    &mut dragging_terminal_sb,
                     &mut debug_output_scroll,
-                    &mut dragging_debug_output_sb,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,
-                    &mut dragging_settings_sb,
                     drag_state_ref,
                     modal_stack_ref,
                     last_layout.as_ref(),

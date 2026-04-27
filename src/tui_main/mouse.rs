@@ -1,5 +1,137 @@
 use super::*;
 
+/// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
+/// at click-down time so the thumb doesn't jump out from under the cursor.
+///
+/// Mirrors the thumb math `dispatch_mouse_drag` uses: if `cursor_y` lands
+/// inside the visible thumb (between `thumb_top` and `thumb_top + thumb_length`),
+/// returns the cursor's offset from the thumb top — the cursor stays at
+/// the same relative spot on the thumb during the drag.
+///
+/// If `cursor_y` is on the track outside the thumb (or above/below the
+/// track entirely), returns `0.0` — the standard "click track to jump"
+/// behavior where the thumb hops to put its top at the cursor.
+fn scrollbar_grab_offset(
+    cursor_y: f32,
+    track_start: f32,
+    track_length: f32,
+    visible_rows: usize,
+    total_items: usize,
+    current_scroll: usize,
+) -> f32 {
+    if track_length <= 0.0 || total_items == 0 {
+        return 0.0;
+    }
+    let thumb_ratio = (visible_rows as f32 / total_items as f32).min(1.0);
+    let thumb_length = (track_length * thumb_ratio).max(1.0);
+    let max_scroll = total_items.saturating_sub(visible_rows);
+    let effective_track = (track_length - thumb_length).max(1.0);
+    let scroll_ratio = if max_scroll == 0 {
+        0.0
+    } else {
+        (current_scroll as f32 / max_scroll as f32).clamp(0.0, 1.0)
+    };
+    let thumb_top = track_start + scroll_ratio * effective_track;
+    let dy = cursor_y - thumb_top;
+    if dy >= 0.0 && dy < thumb_length {
+        dy
+    } else {
+        0.0
+    }
+}
+
+/// Look up the `(total_items - visible_rows)` for the currently active
+/// `ScrollbarY` drag. Used by inverted scrollbars (terminal scrollback,
+/// debug output) to flip a forward offset reported by
+/// [`quadraui::dispatch_mouse_drag`] back into the "lines from bottom"
+/// convention those panels store. Returns 0 if no drag is active or
+/// the active drag isn't a `ScrollbarY`.
+fn current_drag_max_scroll(drag_state: &quadraui::DragState) -> usize {
+    if let Some(quadraui::DragTarget::ScrollbarY {
+        total_items,
+        visible_rows,
+        ..
+    }) = drag_state.target()
+    {
+        total_items.saturating_sub(*visible_rows)
+    } else {
+        0
+    }
+}
+
+/// Run [`quadraui::dispatch_mouse_drag`] for an active drag and apply the
+/// resulting `ScrollOffsetChanged` events to the matching scroll-state
+/// fields. Returns `true` if any event was handled (caller can short-circuit).
+///
+/// Used by both the mouse-drag path (to handle continued drags) and the
+/// mouse-down path (to apply the click-time offset using the same
+/// thumb-aware math the drag will use, eliminating the visual "jump and
+/// correct" jankiness when the click-down math differs from drag math).
+fn apply_scrollbar_drag(
+    drag_state: &quadraui::DragState,
+    point: quadraui::Point,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    debug_output_scroll: &mut usize,
+) -> bool {
+    let events = quadraui::dispatch_mouse_drag(drag_state, point, Default::default());
+    let mut handled = false;
+    for ev in &events {
+        if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
+            let key = widget.as_str();
+            match key {
+                "explorer:sb" => {
+                    sidebar.scroll_top = *new_offset;
+                    handled = true;
+                }
+                "ext_panel:sb" => {
+                    engine.ext_panel_scroll_top = *new_offset;
+                    handled = true;
+                }
+                "editor_hover" => {
+                    engine.editor_hover_set_scroll(*new_offset);
+                    handled = true;
+                }
+                "tui:search_results" => {
+                    sidebar.search_scroll_top = *new_offset;
+                    handled = true;
+                }
+                "tui:settings" => {
+                    engine.settings_scroll_top = *new_offset;
+                    handled = true;
+                }
+                // Inverted scrollbars: top of track = max offset (oldest
+                // content), bottom = 0 (newest). dispatch_mouse_drag
+                // reports the raw forward offset; flip it here.
+                "tui:terminal_scrollback" => {
+                    let max = current_drag_max_scroll(drag_state);
+                    if let Some(term) = engine.active_terminal_mut() {
+                        term.set_scroll_offset(max.saturating_sub(*new_offset));
+                    }
+                    handled = true;
+                }
+                "tui:debug_output" => {
+                    let max = current_drag_max_scroll(drag_state);
+                    *debug_output_scroll = max.saturating_sub(*new_offset);
+                    handled = true;
+                }
+                other if other.starts_with("tui:debug_sidebar:") => {
+                    if let Some(idx_str) = other.strip_prefix("tui:debug_sidebar:") {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx < engine.dap_sidebar_scroll.len() {
+                                engine.dap_sidebar_scroll[idx] = *new_offset;
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    handled
+}
+
 // ─── Mouse handling ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -11,15 +143,10 @@ pub(super) fn handle_mouse(
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
     dragging_scrollbar: &mut Option<ScrollDragState>,
-    dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
-    dragging_debug_sb: &mut Option<DebugSidebarScrollDrag>,
-    dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
     debug_output_scroll: &mut usize,
-    dragging_debug_output_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
     dragging_group_divider: &mut Option<usize>,
-    dragging_settings_sb: &mut Option<SidebarScrollDrag>,
     drag_state: &mut quadraui::DragState,
     modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
@@ -610,24 +737,41 @@ pub(super) fn handle_mouse(
                         && visible_rows > 0;
 
                     if on_scrollbar {
-                        let rel = (row - results_start) as f64;
-                        let ratio = rel / visible_rows as f64;
-                        let max_scroll = total_items.saturating_sub(visible_rows);
-                        let new_top = (ratio * max_scroll as f64).round() as usize;
-                        engine.picker_scroll_top = new_top;
-                        if engine.picker_selected < new_top {
-                            engine.picker_selected = new_top;
-                        } else if engine.picker_selected >= new_top + visible_rows {
-                            engine.picker_selected = new_top + visible_rows - 1;
-                        }
-                        engine.picker_load_preview();
+                        let grab_offset = scrollbar_grab_offset(
+                            row as f32,
+                            results_start as f32,
+                            visible_rows as f32,
+                            visible_rows,
+                            total_items,
+                            engine.picker_scroll_top,
+                        );
                         drag_state.begin(quadraui::DragTarget::ScrollbarY {
                             widget: picker_id.clone(),
                             track_start: results_start as f32,
                             track_length: visible_rows as f32,
                             visible_rows,
                             total_items,
+                            grab_offset,
                         });
+                        let events = quadraui::dispatch_mouse_drag(
+                            drag_state,
+                            quadraui::Point {
+                                x: col as f32,
+                                y: row as f32,
+                            },
+                            Default::default(),
+                        );
+                        for ev in &events {
+                            if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
+                                engine.picker_scroll_top = *new_offset;
+                                if engine.picker_selected < *new_offset {
+                                    engine.picker_selected = *new_offset;
+                                } else if engine.picker_selected >= *new_offset + visible_rows {
+                                    engine.picker_selected = *new_offset + visible_rows - 1;
+                                }
+                                engine.picker_load_preview();
+                            }
+                        }
                     } else if row >= results_start && row < results_end {
                         let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
                         if clicked_idx < engine.picker_items.len() {
@@ -827,80 +971,21 @@ pub(super) fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            // Debug sidebar section scrollbar drag
-            if let Some(ref drag) = *dragging_debug_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    engine.dap_sidebar_scroll[drag.sec_idx] =
-                        (ratio * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
-            }
-            // Sidebar search-results scrollbar drag
-            if let Some(ref drag) = *dragging_sidebar_search {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let new_scroll = (ratio * drag.total as f64) as usize;
-                    sidebar.search_scroll_top =
-                        new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
-                }
-                return sidebar_width;
-            }
-            // Phase B.4: explorer + ext-panel scrollbar drag now goes
-            // through the shared `quadraui::DragState::ScrollbarY` +
-            // `dispatch_mouse_drag`. Widget id ("explorer:sb" vs
-            // "ext_panel:sb") routes the resulting `ScrollOffsetChanged`
-            // event to the correct scroll-state field. Same dispatcher
-            // + math used by the picker scrollbar (b169ca4) and GTK
-            // palette scrollbar (0f3e0d0).
+            // Phase B.4 Stage 5c: every scrollbar drag flows through the
+            // shared `quadraui::DragState::ScrollbarY` + `dispatch_mouse_drag`.
+            // Widget id routes the resulting `ScrollOffsetChanged` to the
+            // matching scroll-state field. Sites covered:
+            // - `explorer:sb`, `ext_panel:sb`, `editor_hover` (Stage 5a)
+            // - `tui:search_results`, `tui:settings`, `tui:debug_sidebar:N` (5c)
+            // - `tui:terminal_scrollback`, `tui:debug_output` (5c, inverted)
             if drag_state.is_active() {
-                let events = quadraui::dispatch_mouse_drag(
-                    drag_state,
-                    quadraui::Point {
-                        x: col as f32,
-                        y: row as f32,
-                    },
-                    Default::default(),
-                );
-                let mut handled = false;
-                for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        match widget.as_str() {
-                            "explorer:sb" => {
-                                sidebar.scroll_top = *new_offset;
-                                handled = true;
-                            }
-                            "ext_panel:sb" => {
-                                engine.ext_panel_scroll_top = *new_offset;
-                                handled = true;
-                            }
-                            "editor_hover" => {
-                                engine.editor_hover_set_scroll(*new_offset);
-                                handled = true;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if handled {
+                let point = quadraui::Point {
+                    x: col as f32,
+                    y: row as f32,
+                };
+                if apply_scrollbar_drag(drag_state, point, engine, sidebar, debug_output_scroll) {
                     return sidebar_width;
                 }
-            }
-            // Settings panel scrollbar drag
-            if let Some(ref drag) = *dragging_settings_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
             }
             // Terminal panel resize drag
             if *dragging_terminal_resize {
@@ -944,32 +1029,15 @@ pub(super) fn handle_mouse(
                 engine.terminal_split_set_drag_cols(left_cols);
                 return sidebar_width;
             }
-            // Debug output panel scrollbar drag
-            if let Some((track_start, track_len, total)) = *dragging_debug_output_sb {
-                if track_len > 0 && total > 0 {
-                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
-                    let ratio = offset_in_track / track_len as f64;
-                    // ratio=0 (top) → max scroll (oldest); ratio=1 (bottom) → 0 (newest)
-                    let max_scroll = total.saturating_sub(track_len as usize);
-                    *debug_output_scroll = ((1.0 - ratio) * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
-            }
-            // Terminal scrollbar drag
-            if let Some((track_start, track_len, total)) = *dragging_terminal_sb {
-                if track_len > 0 && total > 0 {
-                    // Use saturating_sub + min(track_len) so ratio reaches exactly 1.0
-                    // at the bottom of the track (allowing scroll_offset to reach 0).
-                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
-                    let ratio = offset_in_track / track_len as f64;
-                    // top (ratio=0) → max offset; bottom (ratio=1) → 0 (live view)
-                    let new_offset = ((1.0 - ratio) * total as f64) as usize;
-                    if let Some(term) = engine.active_terminal_mut() {
-                        term.set_scroll_offset(new_offset);
-                    }
-                }
-                return sidebar_width;
-            }
+            // Phase B.4 Stage 5c: terminal scrollback + debug output
+            // scrollbars are inverted (top of track = oldest content,
+            // bottom = live view). Their drag math now lives in the
+            // shared `if drag_state.is_active()` block above; the
+            // receive site for `tui:terminal_scrollback` /
+            // `tui:debug_output` flips the offset with `max - new_offset`
+            // so `term.set_scroll_offset` / `*debug_output_scroll`
+            // continue to mean "lines from the bottom".
+
             // Scrollbar thumb drag (vertical or horizontal)
             if let Some(ref drag) = *dragging_scrollbar {
                 if drag.track_len > 0 && drag.total > 0 {
@@ -1098,11 +1166,8 @@ pub(super) fn handle_mouse(
             *explorer_drag_active = None;
             *dragging_sidebar = false;
             *dragging_scrollbar = None;
-            *dragging_sidebar_search = None;
-            *dragging_debug_sb = None;
-            *dragging_terminal_sb = None;
-            *dragging_debug_output_sb = None;
-            *dragging_settings_sb = None;
+            // Stage 5c: search/settings/debug-sidebar/terminal/debug-output
+            // drags clear via `drag_state.end()` (single source of truth).
             drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
@@ -1744,20 +1809,22 @@ pub(super) fn handle_mouse(
                 && cy >= sb_hit.track.y
                 && cy < sb_hit.track.y + sb_hit.track.height;
             if on_track || on_thumb {
-                if on_track {
-                    let max_scroll = sb_hit.total.saturating_sub(sb_hit.visible_rows);
-                    let rel =
-                        ((cy - sb_hit.track.y) / sb_hit.track.height.max(1.0)).clamp(0.0, 1.0);
-                    let new_offset = (rel * max_scroll as f32).round() as usize;
-                    engine.editor_hover_set_scroll(new_offset);
-                }
+                let grab_offset = if on_thumb { cy - sb_hit.thumb.y } else { 0.0 };
                 drag_state.begin(quadraui::DragTarget::ScrollbarY {
                     widget: quadraui::WidgetId::new("editor_hover"),
                     track_start: sb_hit.track.y,
                     track_length: sb_hit.track.height,
                     visible_rows: sb_hit.visible_rows,
                     total_items: sb_hit.total,
+                    grab_offset,
                 });
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point { x: cx, y: cy },
+                    engine,
+                    sidebar,
+                    debug_output_scroll,
+                );
                 return sidebar_width;
             }
         }
@@ -2084,10 +2151,34 @@ pub(super) fn handle_mouse(
                 let content_rows =
                     super::effective_terminal_panel_rows_tui(engine, term_height) as usize;
                 if total > content_rows && col == sb_col && row >= panel_y + 2 {
-                    // Click on scrollbar track — start drag.
+                    // Click on scrollbar track — start drag through shared state.
+                    // Inverted scrollbar: keep grab_offset = 0 for now (the
+                    // visual thumb position uses different math than the
+                    // standard renderer, so thumb-grab preservation here
+                    // would require more work).
                     let track_start = panel_y + 2; // after tab-bar row + header row
                     let track_len = super::effective_terminal_panel_rows_tui(engine, term_height);
-                    *dragging_debug_output_sb = Some((track_start, track_len, total));
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new("tui:debug_output"),
+                        track_start: track_start as f32,
+                        track_length: track_len as f32,
+                        visible_rows: track_len as usize,
+                        total_items: total,
+                        grab_offset: 0.0,
+                    });
+                    // Apply the click-time offset using the same thumb-aware
+                    // math the subsequent drags will use, so the thumb
+                    // doesn't visually jump on the first drag event.
+                    apply_scrollbar_drag(
+                        drag_state,
+                        quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                        engine,
+                        sidebar,
+                        debug_output_scroll,
+                    );
                 }
                 return sidebar_width;
             }
@@ -2201,7 +2292,7 @@ pub(super) fn handle_mouse(
                 let sb_col = term_width.saturating_sub(1);
                 engine.terminal_has_focus = true;
                 if col == sb_col {
-                    // Scrollbar column — start drag.
+                    // Scrollbar column — start drag through shared state.
                     let track_start = term_strip_top + 1;
                     let track_len = strip_rows.saturating_sub(1); // content rows
                                                                   // Cap total to one screenful (vt100 API limit) so the drag range
@@ -2210,7 +2301,30 @@ pub(super) fn handle_mouse(
                         .active_terminal()
                         .map(|t| t.history.len())
                         .unwrap_or(0);
-                    *dragging_terminal_sb = Some((track_start, track_len, total));
+                    // visible_rows: 0 — terminal's `set_scroll_offset` clamps
+                    // to `history.len()` (not `history.len() - viewport`),
+                    // and the renderer's thumb math uses `max_off = history.len()`.
+                    // Setting visible_rows = 0 makes dispatch_mouse_drag's
+                    // max_scroll = total, so inverting (`max - new_offset`)
+                    // reaches the very top of scrollback.
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
+                        track_start: track_start as f32,
+                        track_length: track_len as f32,
+                        visible_rows: 0,
+                        total_items: total,
+                        grab_offset: 0.0,
+                    });
+                    apply_scrollbar_drag(
+                        drag_state,
+                        quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                        engine,
+                        sidebar,
+                        debug_output_scroll,
+                    );
                 } else {
                     // Content area — start a selection.
                     let term_row = row - term_strip_top - 1;
@@ -2373,18 +2487,33 @@ pub(super) fn handle_mouse(
             let content_h =
                 term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
             if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
-                let rel_row = (sidebar_row - content_start) as usize;
-                let max_scroll = flat_len.saturating_sub(content_h);
-                let ratio = rel_row as f64 / content_h as f64;
-                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
-                engine.ext_panel_scroll_top = new_top;
+                let track_start = (content_start + menu_rows) as f32;
+                let grab_offset = scrollbar_grab_offset(
+                    row as f32,
+                    track_start,
+                    content_h as f32,
+                    content_h,
+                    flat_len,
+                    engine.ext_panel_scroll_top,
+                );
                 drag_state.begin(quadraui::DragTarget::ScrollbarY {
                     widget: quadraui::WidgetId::new("ext_panel:sb"),
-                    track_start: (content_start + menu_rows) as f32,
+                    track_start,
                     track_length: content_h as f32,
                     visible_rows: content_h,
                     total_items: flat_len,
+                    grab_offset,
                 });
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    engine,
+                    sidebar,
+                    debug_output_scroll,
+                );
                 return sidebar_width;
             }
 
@@ -2416,21 +2545,39 @@ pub(super) fn handle_mouse(
             let tree_height = term_height.saturating_sub(bottom_chrome) as usize;
             let total_rows = sidebar.rows.len();
 
-            // Click on the scrollbar column → jump-scroll + arm drag
+            // Click on the scrollbar column → arm drag, jump via shared dispatch.
+            // Thumb-grab preservation: if cursor lands on the visible thumb,
+            // grab_offset stores the cursor-to-thumb-top offset so the thumb
+            // doesn't snap out from under the user's cursor.
             if col == sb_col && total_rows > tree_height {
-                let rel_row = sidebar_row as usize;
-                let max_scroll = total_rows.saturating_sub(tree_height);
-                let ratio = rel_row as f64 / tree_height as f64;
-                let new_top = ((ratio * max_scroll as f64).round() as usize).min(max_scroll);
-                sidebar.scroll_top = new_top;
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                let track_start = menu_rows as f32;
+                let grab_offset = scrollbar_grab_offset(
+                    row as f32,
+                    track_start,
+                    tree_height as f32,
+                    tree_height,
+                    total_rows,
+                    sidebar.scroll_top,
+                );
                 drag_state.begin(quadraui::DragTarget::ScrollbarY {
                     widget: quadraui::WidgetId::new("explorer:sb"),
-                    track_start: menu_rows as f32,
+                    track_start,
                     track_length: tree_height as f32,
                     visible_rows: tree_height,
                     total_items: total_rows,
+                    grab_offset,
                 });
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    engine,
+                    sidebar,
+                    debug_output_scroll,
+                );
                 return sidebar_width;
             }
 
@@ -2499,19 +2646,43 @@ pub(super) fn handle_mouse(
                         let sb_col = ab_width + sidebar_width - 1;
                         // Scrollbar click: rightmost column when items overflow.
                         if col == sb_col && item_count > height && height > 0 {
-                            let rel_row = (sidebar_row - items_start) as usize;
-                            let ratio = rel_row as f64 / height as f64;
-                            let max_scroll = item_count.saturating_sub(height);
-                            engine.dap_sidebar_scroll[*sec_idx] =
-                                (ratio * max_scroll as f64) as usize;
                             engine.dap_sidebar_section = *section;
-                            // Arm drag state for subsequent Drag events.
-                            *dragging_debug_sb = Some(DebugSidebarScrollDrag {
-                                sec_idx: *sec_idx,
-                                track_abs_start: items_start + menu_rows,
-                                track_len: sec_height,
-                                total: item_count,
+                            // Phase B.4 Stage 5c: shared drag-state.
+                            // Widget id encodes section index so the drag
+                            // handler can route the offset to the right
+                            // `dap_sidebar_scroll[idx]`. apply_scrollbar_drag
+                            // computes the click-time offset using the same
+                            // thumb-aware math as subsequent drags.
+                            let track_start = (items_start + menu_rows) as f32;
+                            let grab_offset = scrollbar_grab_offset(
+                                row as f32,
+                                track_start,
+                                sec_height as f32,
+                                sec_height as usize,
+                                item_count,
+                                engine.dap_sidebar_scroll[*sec_idx],
+                            );
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: quadraui::WidgetId::new(format!(
+                                    "tui:debug_sidebar:{}",
+                                    *sec_idx
+                                )),
+                                track_start,
+                                track_length: sec_height as f32,
+                                visible_rows: sec_height as usize,
+                                total_items: item_count,
+                                grab_offset,
                             });
+                            apply_scrollbar_drag(
+                                drag_state,
+                                quadraui::Point {
+                                    x: col as f32,
+                                    y: row as f32,
+                                },
+                                engine,
+                                sidebar,
+                                debug_output_scroll,
+                            );
                         } else {
                             let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
                             let row_offset = (sidebar_row - items_start) as usize;
@@ -2621,18 +2792,37 @@ pub(super) fn handle_mouse(
                     count
                 };
                 if total_display > results_height {
-                    let rel_row = sidebar_row.saturating_sub(5) as usize;
-                    let ratio = rel_row as f64 / results_height as f64;
-                    let new_scroll = (ratio * total_display as f64) as usize;
-                    sidebar.search_scroll_top =
-                        new_scroll.min(total_display.saturating_sub(results_height));
-                    // Arm drag state so subsequent Drag events continue scrolling.
-                    // track_abs_start is the absolute terminal row of the track top.
-                    *dragging_sidebar_search = Some(SidebarScrollDrag {
-                        track_abs_start: 5 + menu_rows,
-                        track_len: results_height as u16,
-                        total: total_display,
+                    // Phase B.4 Stage 5c: arm drag state via the shared
+                    // `quadraui::DragState`. `apply_scrollbar_drag` runs
+                    // dispatch_mouse_drag at click time so the click-time
+                    // offset matches subsequent drags (no thumb jump).
+                    let track_start = (5 + menu_rows) as f32;
+                    let grab_offset = scrollbar_grab_offset(
+                        row as f32,
+                        track_start,
+                        results_height as f32,
+                        results_height,
+                        total_display,
+                        sidebar.search_scroll_top,
+                    );
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new("tui:search_results"),
+                        track_start,
+                        track_length: results_height as f32,
+                        visible_rows: results_height,
+                        total_items: total_display,
+                        grab_offset,
                     });
+                    apply_scrollbar_drag(
+                        drag_state,
+                        quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                        engine,
+                        sidebar,
+                        debug_output_scroll,
+                    );
                 }
                 return sidebar_width;
             }
@@ -2747,19 +2937,36 @@ pub(super) fn handle_mouse(
             let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
             let flat_total = engine.settings_flat_list().len();
 
-            // Scrollbar column → jump-scroll + start drag
+            // Scrollbar column → arm drag, jump via shared dispatch math
             if col == sb_col && sidebar_row >= 2 && flat_total > content_height {
-                let track_start = row - (sidebar_row - 2);
+                let track_start_row = row - (sidebar_row - 2);
                 let track_len = content_height as u16;
-                let rel = (sidebar_row - 2) as f64;
-                let ratio = rel / track_len as f64;
-                let max_scroll = flat_total.saturating_sub(content_height);
-                engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
-                *dragging_settings_sb = Some(SidebarScrollDrag {
-                    track_abs_start: track_start,
-                    track_len,
-                    total: flat_total,
+                let grab_offset = scrollbar_grab_offset(
+                    row as f32,
+                    track_start_row as f32,
+                    track_len as f32,
+                    content_height,
+                    flat_total,
+                    engine.settings_scroll_top,
+                );
+                drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("tui:settings"),
+                    track_start: track_start_row as f32,
+                    track_length: track_len as f32,
+                    visible_rows: content_height,
+                    total_items: flat_total,
+                    grab_offset,
                 });
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    engine,
+                    sidebar,
+                    debug_output_scroll,
+                );
             } else if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {

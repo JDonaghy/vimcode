@@ -3360,11 +3360,12 @@ pub(super) fn render_debug_sidebar(
             let sb_x = area.x + area.width - 1;
             let sb_start_y = row_y - sec_height as u16;
             let thumb_size = ((sec_height * sec_height) / total_items).max(1);
-            let thumb_pos = if total_items <= sec_height {
-                0
-            } else {
-                (scroll_off * sec_height) / (total_items - sec_height)
-            };
+            // Same shape every other sidebar scrollbar uses
+            // (`scroll * track / total`). Algebraically equivalent to the
+            // `scroll/(total-viewport) * (track - thumb)` formula
+            // `quadraui::dispatch_mouse_drag` uses, so the visible thumb
+            // lines up with the grab_offset hit-test in Stage 5c.
+            let thumb_pos = (scroll_off * sec_height) / total_items;
             let thumb_pos = thumb_pos.min(sec_height.saturating_sub(thumb_size));
             for r in 0..sec_height {
                 let in_thumb = r >= thumb_pos && r < thumb_pos + thumb_size;
