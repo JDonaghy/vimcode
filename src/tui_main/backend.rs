@@ -228,25 +228,23 @@ impl Backend for TuiBackend {
     }
 
     fn wait_events(&mut self, timeout: Duration) -> Vec<UiEvent> {
-        // Block up to `timeout` for at least one event, then drain
-        // anything else queued behind it. Empty `Vec` on timeout.
-        match ratatui::crossterm::event::poll(timeout) {
-            Ok(true) => {
-                let mut out = Vec::new();
-                if let Ok(ev) = ratatui::crossterm::event::read() {
-                    out.extend(super::events::crossterm_to_uievents(ev));
-                }
-                // Drain anything else queued without blocking again.
-                while ratatui::crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
-                    match ratatui::crossterm::event::read() {
-                        Ok(ev) => out.extend(super::events::crossterm_to_uievents(ev)),
-                        Err(_) => break,
-                    }
-                }
-                out
+        // Block up to `timeout` for the next native event, translate it,
+        // and return. Empty `Vec` on timeout. Does **not** drain
+        // additional queued events — callers that want to absorb a
+        // backlog (e.g. coalescing drag motions) call [`Self::poll_events`]
+        // afterwards.
+        //
+        // The "one event per call" shape preserves the existing event
+        // loop's `match` semantics: each iteration handles exactly one
+        // event before checking timing-sensitive state (yank highlight
+        // expiry, notification spinner cadence, etc.). Stage 5b's loop
+        // migration relies on this.
+        if let Ok(true) = ratatui::crossterm::event::poll(timeout) {
+            if let Ok(ev) = ratatui::crossterm::event::read() {
+                return super::events::crossterm_to_uievents(ev);
             }
-            _ => Vec::new(),
         }
+        Vec::new()
     }
 
     fn register_accelerator(&mut self, acc: &Accelerator) {

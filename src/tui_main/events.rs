@@ -175,6 +175,160 @@ fn crossterm_mouse_button_to_quadraui(b: CtMouseButton) -> MouseButton {
     }
 }
 
+// ─── Inverse: UiEvent → crossterm::Event ────────────────────────────────────
+//
+// Stage 5b's loop migration consumes `UiEvent` from `backend.wait_events`
+// but the existing handlers (translate_key, handle_mouse, …) take
+// crossterm types. Rather than duplicate all that decode logic, the
+// migrated loop synthesises a crossterm event from each `UiEvent` and
+// feeds the legacy handler unchanged. The translation is lossy in
+// principle (we don't preserve `KeyEventState` or wide-mouse-button
+// indices) but the existing handlers only consult the fields we
+// faithfully round-trip.
+
+/// Synthesise a crossterm `KeyEvent` from a `UiEvent::KeyPressed`'s
+/// payload. Returns `None` if the `Key` doesn't have a crossterm
+/// equivalent (won't happen for events we translated ourselves —
+/// every variant we emit round-trips).
+pub fn synth_keyevent(key: &Key, modifiers: Modifiers, repeat: bool) -> Option<KeyEvent> {
+    use ratatui::crossterm::event::KeyEventState;
+    let code = match key {
+        Key::Char(c) => KeyCode::Char(*c),
+        Key::Named(n) => match n {
+            NamedKey::Escape => KeyCode::Esc,
+            NamedKey::Tab => KeyCode::Tab,
+            NamedKey::BackTab => KeyCode::BackTab,
+            NamedKey::Enter => KeyCode::Enter,
+            NamedKey::Backspace => KeyCode::Backspace,
+            NamedKey::Delete => KeyCode::Delete,
+            NamedKey::Insert => KeyCode::Insert,
+            NamedKey::Home => KeyCode::Home,
+            NamedKey::End => KeyCode::End,
+            NamedKey::PageUp => KeyCode::PageUp,
+            NamedKey::PageDown => KeyCode::PageDown,
+            NamedKey::Up => KeyCode::Up,
+            NamedKey::Down => KeyCode::Down,
+            NamedKey::Left => KeyCode::Left,
+            NamedKey::Right => KeyCode::Right,
+            NamedKey::F(n) => KeyCode::F(*n),
+            NamedKey::CapsLock => KeyCode::CapsLock,
+            NamedKey::NumLock => KeyCode::NumLock,
+            NamedKey::ScrollLock => KeyCode::ScrollLock,
+            NamedKey::Menu => KeyCode::Menu,
+        },
+    };
+    let mut mods = KeyModifiers::empty();
+    if modifiers.shift {
+        mods |= KeyModifiers::SHIFT;
+    }
+    if modifiers.ctrl {
+        mods |= KeyModifiers::CONTROL;
+    }
+    if modifiers.alt {
+        mods |= KeyModifiers::ALT;
+    }
+    if modifiers.cmd {
+        mods |= KeyModifiers::SUPER;
+    }
+    let kind = if repeat {
+        KeyEventKind::Repeat
+    } else {
+        KeyEventKind::Press
+    };
+    Some(KeyEvent {
+        code,
+        modifiers: mods,
+        kind,
+        state: KeyEventState::empty(),
+    })
+}
+
+/// Synthesise a crossterm `MouseEvent` from any `UiEvent::Mouse*`
+/// variant. Returns `None` for `UiEvent`s that aren't mouse events
+/// (or for `MouseEntered`/`Left`, which crossterm doesn't surface
+/// natively).
+pub fn synth_mouseevent(ev: &UiEvent) -> Option<MouseEvent> {
+    let (kind, position, modifiers) = match ev {
+        UiEvent::MouseDown {
+            button,
+            position,
+            modifiers,
+            ..
+        } => (
+            MouseEventKind::Down(quadraui_button_to_crossterm(*button)?),
+            *position,
+            *modifiers,
+        ),
+        UiEvent::MouseUp {
+            button, position, ..
+        } => (
+            MouseEventKind::Up(quadraui_button_to_crossterm(*button)?),
+            *position,
+            Modifiers::default(),
+        ),
+        UiEvent::MouseMoved { position, buttons } => {
+            let kind = if buttons.left {
+                MouseEventKind::Drag(CtMouseButton::Left)
+            } else if buttons.right {
+                MouseEventKind::Drag(CtMouseButton::Right)
+            } else if buttons.middle {
+                MouseEventKind::Drag(CtMouseButton::Middle)
+            } else {
+                MouseEventKind::Moved
+            };
+            (kind, *position, Modifiers::default())
+        }
+        UiEvent::Scroll {
+            delta, position, ..
+        } => {
+            let kind = if delta.y < 0.0 {
+                MouseEventKind::ScrollUp
+            } else if delta.y > 0.0 {
+                MouseEventKind::ScrollDown
+            } else if delta.x < 0.0 {
+                MouseEventKind::ScrollLeft
+            } else {
+                MouseEventKind::ScrollRight
+            };
+            (kind, *position, Modifiers::default())
+        }
+        _ => return None,
+    };
+    Some(MouseEvent {
+        kind,
+        column: position.x.max(0.0) as u16,
+        row: position.y.max(0.0) as u16,
+        modifiers: quadraui_modifiers_to_crossterm(modifiers),
+    })
+}
+
+fn quadraui_button_to_crossterm(b: MouseButton) -> Option<CtMouseButton> {
+    match b {
+        MouseButton::Left => Some(CtMouseButton::Left),
+        MouseButton::Right => Some(CtMouseButton::Right),
+        MouseButton::Middle => Some(CtMouseButton::Middle),
+        // X1/X2/Other don't have crossterm equivalents.
+        _ => None,
+    }
+}
+
+fn quadraui_modifiers_to_crossterm(m: Modifiers) -> KeyModifiers {
+    let mut out = KeyModifiers::empty();
+    if m.shift {
+        out |= KeyModifiers::SHIFT;
+    }
+    if m.ctrl {
+        out |= KeyModifiers::CONTROL;
+    }
+    if m.alt {
+        out |= KeyModifiers::ALT;
+    }
+    if m.cmd {
+        out |= KeyModifiers::SUPER;
+    }
+    out
+}
+
 /// Crossterm's `MouseEventKind::Drag(b)` carries the held button as
 /// the variant payload; the quadraui `ButtonMask` reflects which
 /// buttons are down at that moment. We only know the *one* button
@@ -400,5 +554,84 @@ mod tests {
     fn super_modifier_maps_to_cmd() {
         let mods = crossterm_modifiers_to_quadraui(KeyModifiers::SUPER);
         assert!(mods.cmd);
+    }
+
+    // ─── Inverse: round-trip tests ──────────────────────────────────────────
+    //
+    // Stage 5b's loop migration relies on `synth_keyevent` /
+    // `synth_mouseevent` giving back a crossterm event the existing
+    // legacy handlers will accept. The round-trip through
+    // `crossterm → UiEvent → synth_*` must preserve the fields
+    // those handlers consult.
+
+    #[test]
+    fn key_roundtrips_through_synth() {
+        for code in &[
+            KeyCode::Char('a'),
+            KeyCode::Char('Z'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Insert,
+            KeyCode::F(7),
+        ] {
+            let original = key(*code, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+            let ui = crossterm_key_to_uievent(original).unwrap();
+            let UiEvent::KeyPressed {
+                key: k,
+                modifiers,
+                repeat,
+            } = ui
+            else {
+                panic!("not a key press for {:?}", code);
+            };
+            let round = synth_keyevent(&k, modifiers, repeat).unwrap();
+            assert_eq!(round.code, *code, "code mismatch for {:?}", code);
+            assert_eq!(round.modifiers, original.modifiers);
+            assert_eq!(round.kind, KeyEventKind::Press);
+        }
+    }
+
+    #[test]
+    fn mouse_down_roundtrips() {
+        let original = mouse(MouseEventKind::Down(CtMouseButton::Left), 7, 12);
+        let ui = crossterm_mouse_to_uievent(original).unwrap();
+        let round = synth_mouseevent(&ui).unwrap();
+        assert!(matches!(
+            round.kind,
+            MouseEventKind::Down(CtMouseButton::Left)
+        ));
+        assert_eq!(round.column, 7);
+        assert_eq!(round.row, 12);
+    }
+
+    #[test]
+    fn mouse_drag_roundtrips() {
+        let original = mouse(MouseEventKind::Drag(CtMouseButton::Right), 30, 5);
+        let ui = crossterm_mouse_to_uievent(original).unwrap();
+        let round = synth_mouseevent(&ui).unwrap();
+        assert!(matches!(
+            round.kind,
+            MouseEventKind::Drag(CtMouseButton::Right)
+        ));
+    }
+
+    #[test]
+    fn scroll_up_roundtrips() {
+        let original = mouse(MouseEventKind::ScrollUp, 0, 0);
+        let ui = crossterm_mouse_to_uievent(original).unwrap();
+        let round = synth_mouseevent(&ui).unwrap();
+        assert!(matches!(round.kind, MouseEventKind::ScrollUp));
     }
 }
