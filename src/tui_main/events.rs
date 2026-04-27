@@ -175,6 +175,37 @@ fn crossterm_mouse_button_to_quadraui(b: CtMouseButton) -> MouseButton {
     }
 }
 
+/// Synthesise a crossterm `Event` from any single `UiEvent` that has
+/// a crossterm equivalent. The migrated event loop in
+/// [`crate::tui_main::event_loop`] uses this to feed `UiEvent`s back
+/// into the existing match-on-`Event::*` dispatch without rewriting
+/// every legacy handler. Returns `None` for `UiEvent` variants that
+/// don't round-trip (`Accelerator`, `Tree(...)`, etc.).
+pub fn uievent_to_crossterm(ev: UiEvent) -> Option<CtEvent> {
+    match ev {
+        UiEvent::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+        } => synth_keyevent(&key, modifiers, repeat).map(CtEvent::Key),
+        UiEvent::CharTyped(_) => None, // crossterm doesn't have a separate variant
+        UiEvent::MouseDown { .. }
+        | UiEvent::MouseUp { .. }
+        | UiEvent::MouseMoved { .. }
+        | UiEvent::Scroll { .. } => synth_mouseevent(&ev).map(CtEvent::Mouse),
+        UiEvent::WindowResized { viewport } => Some(CtEvent::Resize(
+            viewport.width as u16,
+            viewport.height as u16,
+        )),
+        UiEvent::ClipboardPaste(text) => Some(CtEvent::Paste(text)),
+        UiEvent::WindowFocused(true) => Some(CtEvent::FocusGained),
+        UiEvent::WindowFocused(false) => Some(CtEvent::FocusLost),
+        // No equivalent: WindowClose, DpiChanged, FilesDropped, primitive
+        // events (Tree/List/...), Accelerator, etc.
+        _ => None,
+    }
+}
+
 // ─── Inverse: UiEvent → crossterm::Event ────────────────────────────────────
 //
 // Stage 5b's loop migration consumes `UiEvent` from `backend.wait_events`

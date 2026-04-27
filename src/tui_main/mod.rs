@@ -1461,7 +1461,13 @@ fn event_loop(
         } else {
             Duration::from_millis(50)
         };
-        if !ct_event::poll(poll_timeout).expect("poll") {
+        // Phase B.4 Stage 5b: drive the loop through `Backend::wait_events`
+        // instead of crossterm directly. Each `UiEvent` is synthesised
+        // back into a `crossterm::Event` for the existing match arms
+        // (legacy handlers stay unchanged this stage).
+        use quadraui::Backend;
+        let pending_events = backend.wait_events(poll_timeout);
+        if pending_events.is_empty() {
             // Tab switcher auto-confirm: if open and no Alt+t press for 400ms, confirm.
             if engine.tab_switcher_open {
                 if let Some(last) = tab_switcher_last_cycle {
@@ -1649,7 +1655,18 @@ fn event_loop(
             continue;
         }
 
-        match ct_event::read().expect("read event") {
+        let ui_event = pending_events
+            .into_iter()
+            .next()
+            .expect("wait_events returned non-empty Vec but iter was empty");
+        let crossterm_event = match events::uievent_to_crossterm(ui_event) {
+            Some(e) => e,
+            // UiEvent variants without a crossterm equivalent (Accelerator,
+            // primitive events, etc.) — Stage 6 routes Accelerator to the
+            // engine; for now skip and continue the loop.
+            None => continue,
+        };
+        match crossterm_event {
             Event::Key(key_event) => {
                 // ── Quit confirm overlay — intercept all keys ───────────────
                 if quit_confirm && key_event.kind != KeyEventKind::Release {
