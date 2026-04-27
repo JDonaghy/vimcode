@@ -1,27 +1,46 @@
 //! TUI implementation of [`quadraui::Backend`].
 //!
-//! Phase B.4 Stage 1 added the struct + trait shape. Stage 2 wires up
-//! the frame-scope mechanism so trait `draw_*` methods can reach
-//! `&mut Frame` (only valid inside `terminal.draw(|frame| …)`'s
-//! closure), plus implementations for `draw_palette`, `draw_list`,
-//! `draw_tree`, `draw_form` — the four primitives whose existing
-//! `quadraui_tui::draw_*` shims already match the `(buf, area, prim,
-//! theme)` shape and migrate cleanly.
+//! `TuiBackend` owns the persistent UI state the trait requires —
+//! viewport dimensions, modal stack, drag state, accelerator registry,
+//! platform services — plus a transient frame pointer set inside
+//! [`Self::enter_frame_scope`] so trait `draw_*` methods can reach
+//! the ratatui `&mut Frame<'_>` (which only exists inside
+//! `terminal.draw(|frame| …)`'s closure).
 //!
-//! The other 5 trait `draw_*` methods (status_bar, tab_bar,
-//! activity_bar, terminal, text_display) stay stubbed for now because
-//! their existing shims take a pre-computed `*Layout` parameter that
-//! the trait doesn't pass through. Migrating them needs the trait to
-//! gain `&Layout` parameters (per `BACKEND_TRAIT_PROPOSAL.md` §6.2) —
-//! a quadraui-side change, deferred until a later stage when more
-//! call sites benefit at once.
+//! ### Frame-scope mechanism
 //!
-//! Stage 3a migrated the quickfix panel through `Backend::draw_list`.
-//! Stage 3b adds a `MockBackend` test fixture proving the trait is
-//! genuinely consumable by `<B: Backend>` generic code, not just by
-//! `TuiBackend`. See the `tests` module at the bottom.
+//! ratatui's `terminal.draw(|frame| …)` API only yields `&mut Frame`
+//! inside the closure, so `TuiBackend` can't hold one across method
+//! calls. Instead [`Self::enter_frame_scope`] takes the frame, stashes
+//! a type-erased `*mut ()` in `current_frame_ptr`, runs the caller's
+//! closure (where trait `draw_*` methods can reach the frame via
+//! [`Self::current_frame_mut`]), and clears the pointer on exit.
+//! The pointer is null outside the scope, so the safe accessor
+//! returns `None` and `draw_*` methods can detect misuse.
 //!
-//! `poll_events` / `wait_events` are stubs (Stage 4 fills them in).
+//! ### What the trait covers vs. what stays inherent
+//!
+//! Drawing methods for the migrated primitives — `draw_palette`,
+//! `draw_list`, `draw_tree`, `draw_form` — go through the trait so
+//! the same generic `<B: Backend>` paint function works against
+//! `TuiBackend`, `MockBackend` (see the `tests` module), and future
+//! GTK/Win-GUI/macOS backends. The other five `draw_*` methods stay
+//! stubbed pending a quadraui-side trait change to thread
+//! pre-computed `*Layout` parameters (see
+//! `BACKEND_TRAIT_PROPOSAL.md` §6.2).
+//!
+//! Drag-state observation is deliberately not on the trait — only
+//! `quadraui::dispatch::*` needs to inspect it, and the backend keeps
+//! it as a struct field accessed through
+//! [`Self::drag_and_modal_mut`].
+//!
+//! Event flow goes through the trait: [`Self::wait_events`] reads
+//! crossterm events, translates them via
+//! [`super::events::crossterm_to_uievents`], then runs
+//! [`Self::apply_accelerators`] to rewrite registered key bindings as
+//! [`UiEvent::Accelerator`] before returning. The event loop in
+//! [`super::event_loop`] consumes those `UiEvent`s via
+//! [`Backend::wait_events`].
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -149,33 +168,15 @@ impl TuiBackend {
         self.current_theme = theme;
     }
 
-    /// Mutable access to the drag-state. Inherent helper because the
-    /// trait doesn't expose drag state — the existing mouse handler
-    /// in `tui_main/mouse.rs` reads/writes it through this borrow.
-    /// Used once Stage 5 reorganises mouse.rs around the backend.
-    #[allow(dead_code)]
-    pub fn drag_state_mut(&mut self) -> &mut DragState {
-        &mut self.drag_state
-    }
-
-    /// Read-only access to the drag state.
-    #[allow(dead_code)]
-    pub fn drag_state(&self) -> &DragState {
-        &self.drag_state
-    }
-
-    /// Disjoint mutable borrows of drag state and modal stack —
-    /// `mouse.rs::handle_mouse` needs both at the same time.
-    /// Calling `drag_state_mut()` then `modal_stack_mut()` separately
-    /// would conflict; this helper splits the field borrows.
+    /// Disjoint mutable borrows of drag state and modal stack.
+    /// `mouse.rs::handle_mouse` needs both at the same time, and
+    /// borrowing each field through a separate `&mut self` accessor
+    /// would conflict — this helper splits the field borrows in one
+    /// call. The trait deliberately doesn't expose drag state (it's
+    /// a backend implementation detail; only the dispatch helpers
+    /// in `quadraui::dispatch::*` need to observe it).
     pub fn drag_and_modal_mut(&mut self) -> (&mut DragState, &mut ModalStack) {
         (&mut self.drag_state, &mut self.modal_stack)
-    }
-
-    /// Iterate registered accelerators.
-    #[allow(dead_code)]
-    pub(crate) fn accelerators(&self) -> impl Iterator<Item = (&AcceleratorId, &Accelerator)> {
-        self.accelerators.iter()
     }
 
     /// Walk `events` and rewrite any `UiEvent::KeyPressed` whose key +

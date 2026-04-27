@@ -1223,10 +1223,11 @@ fn event_loop(
 
     // Scroll offset for the debug output panel (0 = newest/bottom, n = n lines up from bottom).
     let mut debug_output_scroll: usize = 0;
-    // Phase B.4: cross-backend drag-state + modal stack now live on
-    // `TuiBackend`. Stage 1: `backend.drag_state_mut()` /
-    // `backend.modal_stack_mut()` replace the previous `let mut`
-    // locals; downstream mouse handlers borrow through the backend.
+    // Phase B.4: drag-state, modal stack, accelerator registry, and
+    // platform services live on `TuiBackend`. `backend.drag_and_modal_mut()`
+    // hands the mouse handler disjoint borrows of both at once;
+    // `backend.wait_events()` drives the event loop; accelerators
+    // registered here surface as `UiEvent::Accelerator(id, mods)`.
     let mut backend = backend::TuiBackend::new();
     register_panel_accelerators(&mut backend, &engine.settings.panel_keys);
     // True while user drags the terminal header row to resize the panel.

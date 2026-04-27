@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 — Stages 1–6 + 5c shipped. The Backend trait is load-bearing, panel-key bindings flow through accelerator dispatch, and 5 of the 6 TUI scrollbar drags now share `quadraui::DragState` with thumb-grab preservation. Stage 5d (editor scrollbar `ScrollDragState` migration) and Stage 7 (cleanup + GTK/Win-GUI restore) remain.)
+> **Last updated:** 2026-04-27 (Phase B.4 — **all stages shipped.** Stages 1–7 + 5c + 5d. The `quadraui::Backend` trait is load-bearing in vimcode's TUI, every keystroke / click / drag / scroll routes through it, and `quadraui/docs/BACKEND.md` ships the worked-example a fresh backend uses as its template. Open follow-ups (#242 #243 #245 #246 #200) are scoped scrollbar polish — none block B.5 (GTK rewrite on top of quadraui) starting.)
 
 ---
 
@@ -38,8 +38,8 @@ pickup).
 | **5b** | Event loop flipped to `Backend::wait_events` — **trait now load-bearing** | ✅ | `4016ecc` |
 | **6** | Accelerator registry consolidation for cross-mode global keybindings | ✅ | `b400ce0` |
 | **5c** | Drag-state consolidation: 5 scrollbars (search/settings/debug-sidebar/terminal/debug-output) → `quadraui::DragState`; `grab_offset` field added to `DragTarget::ScrollbarY` | ✅ | `f8d394f` |
-| **5d** | Editor-window scrollbar (`ScrollDragState`) migration — needs `ScrollbarX` variant for horizontal axis | ⬜ | — (issue #244) |
-| **7** | Cleanup + restore GTK / Win-GUI compile + `BACKEND.md` worked example | ⬜ | — |
+| **5d** | Editor-window scrollbar (`ScrollDragState`) migration — `DragTarget::ScrollbarX` variant added for horizontal axis | ✅ | `801ad84` |
+| **7** | Cleanup + GTK + Win-GUI compile verified + `BACKEND.md` worked example | ✅ | (this commit) |
 
 **Architectural milestones:**
 - **5b** — every native event reaches the existing dispatch through
