@@ -6,112 +6,76 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (#223 ARC COMPLETE plus a 10th lift: 9 primitives + TextDisplay. kubeui YAML pane now flows through the same kubeui-core view-builder → quadraui rasteriser pattern as the other surfaces. Next focus: kubeui Palette adoption + cleanup + smoke-test follow-ups.)
+> **Last updated:** 2026-04-26 (Phase B.4 — TUI Backend trait implementation — kicks off. #223 arc and quadraui readiness gate are both complete; everything below shifts to executing the multi-stage TUI rewrite.)
 
 ---
 
-## 🎯 NEXT SESSION PRIORITY — #223 arc complete; cleanup + smoke-test follow-ups
+## 🎯 CURRENT FOCUS — Phase B.4: TUI Backend trait implementation
 
-**All 9 pilots shipped (Session 332).** StatusBar + TabBar + ListView
-+ TreeView + Palette + Form + Tooltip + Dialog + ContextMenu
-rasterisers now live in `quadraui::{tui,gtk}::draw_*` behind `tui` /
-`gtk` feature gates. vimcode (TUI + GTK) delegates every big-rasteriser
-surface; kubeui adopted ListView (others are vimcode-only consumers
-today but ready for external use).
+The quadraui readiness gate is **clear** (all primitives shipped with
+D6 `layout()` + `hit_test()`; cross-backend dispatch infrastructure
+proven). Phase B.4 is the multi-session rewrite of vimcode's TUI
+backend on top of `quadraui::Backend` + `UiEvent` + the dispatch
+infrastructure. Each stage merges to develop on its own — `vcd`
+keeps working at every commit. **No `tui_main_v2/` parallel tree.**
+Refactor in place.
 
-The pilots proved out:
+**Detailed stage-by-stage plan:** `~/.claude/plans/federated-hugging-hinton.md`
+(Claude's planning workspace; copy to repo if needed for off-machine
+pickup).
 
-- **`quadraui::Theme` shape:** `background`, `foreground`, plus 7 tab
-  fields. Each migrated primitive adds the fields it needs; apps
-  spread `..Theme::default()` for the unspecified ones.
-- **Feature gates:** `dep:ratatui`, `dep:gtk4`, `dep:pangocairo`
-  optional — apps consuming only the data layer pay no native deps.
-- **Adoption pattern:** vimcode wraps with ~10 lines that adapt
-  `render::Theme` → `quadraui::Theme` and delegate. GTK wrappers may
-  reshape generic primitive output (`TabBarHits` from
-  `quadraui::gtk::draw_tab_bar`) into app-specific shapes
-  (vimcode's `TabBarHitInfo` with WidgetId-keyed diff/split/action
-  groupings).
-- **A pre-existing `TabBar::layout` regression** caught by smoke-test
-  during the TabBar pilot: when `scroll_arrow_width = 0.0` (TUI's
-  case — engine drives scroll), the layout collapsed
-  `resolved_scroll_offset = 0` and clipped from index 0, dropping
-  newly-opened tabs at the right edge of a narrow bar. Fixed in the
-  pilot 2 commit; the contract is now: scroll-arrows on → primitive
-  computes scroll itself; scroll-arrows off → caller owns scroll
-  via `bar.scroll_offset`.
+### Stage map
 
-**No more primitives to lift.** The per-primitive arc is done. Focus
-shifts to downstream work — pick whatever feels highest leverage:
+| Stage | Goal | Sessions |
+|---|---|---|
+| **1** | `TuiBackend` skeleton + frame ownership; stub `draw_*` delegating to existing free functions | 1–2 |
+| **2** | Drawing methods route through trait; `quadraui_tui.rs` shims fold into backend | 1–2 |
+| **3** | `paint<B: Backend>` extraction; cross-backend draws via trait, TUI helpers for editor / scrollbars | 1–2 |
+| **4** | `poll_events()` / `wait_events()` translating crossterm → `UiEvent` | 2 |
+| **5a** | Modal dispatch through `dispatch_mouse_down/up` (replaces inline modal hit-tests) | 1 |
+| **5b** | Drag-state consolidation into `quadraui::DragState` (extends `DragTarget` enum) | 1 |
+| **6** | Accelerator registry consolidation for cross-mode global keybindings | 1 |
+| **7** | Cleanup + restore GTK / Win-GUI compile + `BACKEND.md` worked example | 0.5–1 |
 
-**Smoke-test follow-ups filed during the arc** (all pre-existing or
-unrelated to the rasteriser lifts):
+**Realistic total:** 9–12 sessions. After Stage 7, the per-feature
+wiring story collapses from "edit one site per backend" to "register
+one accelerator + emit one `UiEvent`."
+
+### What could re-shape the plan
+
+Three discoveries would force re-scoping. **First**, if Stage 1 hits
+borrow-checker pain holding `Terminal<CrosstermBackend<Stdout>>` across
+trait method calls (real risk — `terminal.draw(|frame| { … })` only
+yields `&mut Frame` inside the closure), `Backend` may need a
+callback-style `with_frame` instead of `begin_frame` / `end_frame` —
+that's a quadraui PR first. **Second**, if Stage 4 reveals missing
+`UiEvent` variants (kitty-protocol focus, mouse-move-without-button,
+etc.), each gap is a quadraui PR. **Third**, if Stage 5b's drag
+shapes don't fit `DragTarget::ScrollbarY` (terminal split divider is
+horizontal-axis, group divider is both axes), `DragTarget` needs
+axis-aware variants — split 5b into 5b/5c.
+
+If any fire: pause the stage, file the quadraui PR, land it, resume.
+Don't paper over in TUI code — gaps get worse if patched there.
+
+### Parallel cleanup work (not blockers)
+
+Smoke-test follow-ups filed during the #223 arc — pick up alongside
+B.4 stages when context aligns:
 
 - **#225** — GTK tab switcher: rounded corners + bordered ListView support
 - **#226** — Right-click "Open to the Side" v-splits current tab
-- **#227** — GTK palette font flicker on first open (caller-set editor font)
 - **#228** — GTK editor hover: heading bg incomplete
 - **#229** — GTK editor hover: scrollbar leak (right-edge specific)
 - **#230** — LSP "rust-analyzer..." indicator stuck
 - **#231** — TUI rename: tree row stale tinting
 - **#232** — Tab-click no longer highlights tree row (TUI + GTK regression)
 - **#233** — GTK Dialog square corners (cross-backend visual divergence)
-
-**Cleanup / polish:**
-- `quadraui::Theme` field naming — some are still vimcode-flavoured
-  (`tab_*`, `hover_*`, `surface_*`, `header_*`). Could be unified
-  into a smaller orthogonal palette in a future cleanup pass.
-- Retire the few remaining `vc_to_cairo` / `qc_to_cairo` helpers in
-  `src/gtk/quadraui_gtk.rs` once the last vimcode-internal callers
-  are gone (some still live for other surfaces — activity bar,
-  terminal cells, completion popup, rich text popup).
-
-**External consumer expansion** (the original payoff #223 was named
-for):
-- kubeui adoption of Palette / Tooltip / Dialog if those use cases
-  appear (kubeui currently has its own picker shape; restructuring
-  to use Palette is the cleanest follow-up).
-- Document the public rasteriser API in
-  `quadraui/docs/TUI_CONSUMER_TOUR.md` + a parallel GTK tour.
-- Retire #224's API friction items now that the arc has hands-on
-  feedback from each primitive.
-
-The kubeui validation spike's promise (#145, "65% sharing today,
-~90% with rasterisers in quadraui") is structurally delivered. The
-next external app (Postman, SQL client, k8s dashboard) starts at
-the higher number.
-
-The kubeui validation spike (#145, landed `1cbc98b`) answered the
-question "can a developer add a feature once and see it in all
-backends?" with a hard number: **65% today, ~90% if we lift the TUI
-and GTK rasterisers out of vimcode and into quadraui.** The three
-shipped pilots have closed the gap most clearly via the ListView
-lift, which removed ~110 lines of duplicate rasterisation from
-kubeui — proving the cross-app payoff end-to-end.
-
-**Read first when you start:**
-- [#223](https://github.com/JDonaghy/vimcode/issues/223) — full migration plan, feature gates. The StatusBar / TabBar / ListView pilot commits are canonical templates.
-- [#224](https://github.com/JDonaghy/vimcode/issues/224) — small API friction points captured during the spike (still open; address alongside future migrations as they surface)
-- The kubeui crates (`kubeui-core`, `kubeui`, `kubeui-gtk`) on develop — concrete evidence of what's currently duplicated, with the ListView pilot serving as a "before / after" reference for tree-shaped surfaces.
-
-**TreeView pilot details:** lift `quadraui_tui::draw_tree` +
-`quadraui_gtk::draw_tree` into `quadraui::{tui,gtk}::draw_tree`. The
-GTK version's per-row height policy (`line_height` for header,
-`line_height * 1.4` for leaves) belongs in the rasteriser via a
-measurement closure passed to `tree.layout()` — same pattern
-ListView already uses with its uniform measurer. Vimcode's GTK click
-handler in `src/gtk/mod.rs` walks an accumulator to resolve mouse y
-to a row index; that should keep working unchanged because the
-returned `TreeViewLayout.visible_rows` already carries per-row
-bounds (just verify nothing relies on the rasteriser's *internal*
-height math).
-
-**Why this still beats every other open work item:**
-- It validates externally what we've been building internally (the kubeui spike is the proof point).
-- The vimcode B.5/B.6 backend rewrites get smaller — each backend rewrite stops carrying its own private rasteriser stack.
-- Every external app (k8s dashboard, SQL client, Postman) gets to focus on its domain instead of reimplementing UI primitives.
-- It surfaces the small API friction (#224) while we have a real second consumer to test against — once kubeui is happy, the API is good.
-- Smoke-testing the lifts catches latent layout regressions (see the TabBar fix above) that would otherwise hurt users silently.
+- **#234** — TUI menu-bar dropdown: hover routing gap
+- **#236** — GTK ContextMenu border barely visible
+- **#238** — TUI ContextMenu chrome overlaps trigger row in Above/Below placement
+- **#239** — Anchor vimcode's status-bar pickers to their trigger segment
+- **#241** — `quadraui_<backend>::run()` per-backend runner (post-B.4)
 
 ---
 
@@ -162,6 +126,10 @@ coexistence-era band-aid cycle. All three get rebuilt on quadraui
 during the rewrite; the goal is that after the rewrite, all four
 backends (TUI + GTK + Win-GUI + macOS) have the same feature surface
 and the same bug floor.
+
+The `vimcode -t` flag (TUI mode in the GTK binary) is being retired —
+the TUI binary is `vcd` only. One less entry point to migrate during
+B.4.
 
 **Wave:** quadraui Phase B (Backend trait + UiEvent + layout-owning
 primitives). Phase A complete except optional Win-GUI parity stages
@@ -362,28 +330,23 @@ test app; target downstream apps include a cross-platform k8s dashboard
 | **Phase A.7** — `Terminal` primitive + TUI + GTK cell migration | ✅ Done | `aab8668` | `quadraui-phase-a7-terminal` | any |
 | **Phase A.8** — `TextDisplay` primitive scaffolding (no migration) | ✅ Done | `ff6b13f` | `quadraui-phase-a8-text-display` | any |
 | Phase A.9 — `TextEditor` + `BufferView` adapter | ⬜ Deferred (not needed for vimcode) | — | `quadraui-phase-a9-*` | any — biggest stage |
-| **Optional Win-GUI parity** — see "Win-GUI parity scope" section below | ⬜ Optional | — | `quadraui-phase-a*-win` | Windows |
+| Win-GUI parity (A.6*-win, A.7-win) | 🚫 Abandoned — backend rebuilt in B.6 | — | — | — |
 | **Phase B.1** — `UiEvent` + `Accelerator` + `Backend` trait scaffolding | ✅ Done | _tbd_ | `quadraui-phase-b1-backend-trait` | any |
 | **Phase B.2** — pilot migration: terminal maximize to `Accelerator::Global` | ✅ Done | _tbd_ | `quadraui-phase-b2-maximize-pilot` | any |
 | **Phase B.3** — layout primitives (`Panel`, `Split`, `MenuBar`, `Modal`, `Dialog`, `ContextMenu`, `Completions`, `Tooltip`, `Toast`, `Spinner`, `ProgressBar`) + D6 retrofit on all 9 existing primitives | ✅ Done | (Session 327, ~25 commits) | `quadraui-phase-b3-*` | any |
 | **Phase B.4 chrome (TUI)** — every major TUI overlay migrated to a quadraui primitive or shared hit-region data | ✅ Substantially done (Session 328) | `4eacaa0` | `quadraui-{popup}-*` | any (TUI) |
+| **Phase B.4 trait** — `TuiBackend` impl + `paint<B: Backend>` + `poll_events` translation. **🎯 Active wave** — see "🎯 CURRENT FOCUS" at top for stage breakdown (1–7) | ⬜ Stage 1 next | — | `quadraui-phase-b4-stage-{N}` | any (TUI) |
 | Phase B.4 editor viewport (TUI) | ⬜ Deferred — chrome-only scope chose to leave `render::build_rendered_window` in place | — | `quadraui-phase-b4-editor-*` | any (TUI) |
-| Phase B.5 — GTK rewrite (chrome → editor) | ⬜ Next natural wave | — | `quadraui-phase-b5-*` | Linux / macOS with GTK4 |
+| Phase B.5 — GTK rewrite (chrome → editor) | ⬜ After B.4 | — | `quadraui-phase-b5-*` | Linux / macOS with GTK4 |
 | Phase B.6 — Win-GUI rewrite | ⬜ After B.5 | — | `quadraui-phase-b6-*` | Windows |
 | Phase B.7 — macOS native rewrite | ⬜ After B.6 | — | `quadraui-phase-b7-*` | macOS |
 | Phase B.8 — Postman-class validation app (#169) | ⬜ After B.4 | — | _new workspace member_ | any |
 | Phase C — macOS backend | ⬜ v1.x | — | — | macOS |
 | Phase D — polish + k8s validation app (#145) | ⬜ Later | — | — | any |
 
-**All required platform-specific stages are now done.** A.1b/A.2b/
-A.3c-2/A.4b/A.5b shipped on Linux GTK; A.1c (Session 314) and A.2c
-(Session 315) shipped on Windows. A.2b was split into two sub-phases
-because the atomic switchover was a ~1500-line diff across the view!
-macro, the App struct, ~50 scattered `Msg` handlers, and a context-
-menu rewrite; the split kept smoke-test regressions bisectable. The
-remaining open quadraui stages (A.6–A.9) are platform-neutral, and
-the Win-GUI parity stages (A.6*–A.7 for Windows) are explicitly
-optional — see "Win-GUI parity scope" below.
+**Phase A is complete.** Optional Win-GUI parity stages (A.6*–A.7
+for Windows) are no longer worth chasing — those backends get
+rebuilt during B.5/B.6 anyway. Phase B is the active focus.
 
 Design decisions covering primitive-distinctness (why `ListView` is
 separate from `TreeView`, and how `DataTable` #140 should be scoped)
@@ -550,146 +513,6 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
 
 ---
 
-## Phase B.2 starting notes — terminal-maximize pilot migration
-
-**Status (2026-04-22):** Design sketch landed in
-[`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md`](quadraui/docs/BACKEND_TRAIT_PROPOSAL.md)
-§11. All five PLAN-level questions (Q1–Q5 below) have concrete answers
-grounded in file:line refs from the existing TUI / GTK / Win-GUI
-dispatch paths. **Code work is unblocked**; recommended next step is
-the optional TUI-only spike (~half-day) before going broad — see
-§11's closing subsection.
-
-Branch: `quadraui-phase-b2-maximize-pilot` off develop.
-
-### What gets migrated in B.2
-
-**Just the keybinding path for Ctrl+Shift+T.** Everything else stays
-bespoke for now and migrates later:
-
-- Toolbar button (click hit-test + dispatch) → stays; migrates in B.3
-  when `Panel` primitive owns its click regions.
-- `:TerminalMaximize` ex command → stays on current `EngineAction`
-  path.
-- `PanelChromeDesc` chrome-rows math → stays; that's layout, not
-  dispatch.
-- Window-resize handler → stays; that's layout lifecycle, not
-  keybinding.
-- Per-window status suppression when maximized → stays.
-
-### What B.2 actually requires
-
-Three things, in order:
-
-1. **Real `Backend` impls** — the B.1 scaffolding has types but no
-   working impls yet. Each of `TuiBackend`, `GtkBackend`, `WinBackend`
-   needs:
-   - Struct holding the accelerator registry, event queue, and
-     whatever drawing-context reference is required (ratatui `Frame`,
-     Cairo `Context`, Direct2D `RenderTarget`).
-   - `register_accelerator()` storing registrations for
-     `poll_events()` to match against.
-   - `poll_events()` that drains native events (crossterm / GTK
-     signals / Win32 `WndProc`), compares key events to registered
-     accelerators, emits `UiEvent::Accelerator` on match or
-     `UiEvent::KeyPressed` / other variants for unmatched input.
-   - `draw_*` methods — trivial thin wrappers around the existing
-     free functions (`quadraui_tui::draw_tree`, etc.). No behaviour
-     change; apps that want to keep calling the free functions
-     directly still can.
-2. **Vimcode engine grows a `handle_ui_event(&mut self, UiEvent)`
-   entry point.** Dispatches `UiEvent::Accelerator("terminal.toggle_maximize", _)`
-   to the existing `toggle_terminal_maximize()` method. For B.2 this
-   has exactly one accelerator arm; B.4 adds more.
-3. **Delete** the old per-backend `pk.toggle_terminal_maximize`
-   key-matcher checks + their handlers in TUI `event_loop`, GTK key
-   controller, Win-GUI `on_key_down`. Plus the
-   `EngineAction::ToggleTerminalMaximize` action-dispatch branches
-   in each backend's action handler.
-
-### Realistic LOC delta
-
-The proposal's **aspirational -60 LOC net** is wrong for B.2 specifically.
-First real backend impl is ~150 new lines (struct + registration +
-event translation); old deletions are ~25 lines per backend. Net
-~**+250 / -75** across the three backends + engine dispatch.
-
-Payoff arrives in **Phase B.4** when each subsequent accelerator
-migration is +1 line (a new registration entry) and -20 lines
-(native-key plumbing deleted per backend). That's when the
-per-feature wins from the proposal actually materialise.
-
-### Open design questions — sketch before coding
-
-Spend 15-30 min writing answers into
-`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` as a new §11 "Phase B.2
-implementation notes" **before** touching any code:
-
-1. **TuiBackend struct shape.** Does it own the ratatui `Terminal`
-   end-to-end, or does the app pass a `&mut Frame<'_>` into
-   `begin_frame` via a backend-specific extension trait (violating
-   the clean `Backend` trait shape)? Resolution probably: struct
-   owns the `Terminal`; `begin_frame` gets a frame internally and
-   `draw_*` uses it. Has implications for how apps call `backend.run()`
-   or similar top-level method.
-2. **Native-event → UiEvent translation.** First-match-wins against
-   registered accelerators, else raw `UiEvent::KeyPressed`? What about
-   key events that partially match a binding's scope (widget-scoped
-   accelerator with wrong widget focused)? Translation happens in
-   `poll_events`; spell out the algorithm.
-3. **Main-loop integration.** Does vimcode's `event_loop` in
-   `tui_main/mod.rs` keep its current structure and call
-   `backend.poll_events()` once per tick, or does it invert to
-   `for ev in backend.poll_events() { engine.handle_ui_event(ev) }`?
-   Cleanest cutover vs. minimum-diff. Same question for GTK's Relm4
-   message loop and Win-GUI's message pump.
-4. **GTK event ownership.** GTK4 signals fire into Relm4 message
-   handlers on the main thread. Where does the Relm4 handler push an
-   event onto `GtkBackend`'s queue — is the backend a Relm4
-   component, or does it live as a side-channel the Relm4 handlers
-   write into?
-5. **Win-GUI message-pump integration.** `WndProc` callbacks are
-   synchronous; they can push directly onto the backend's queue.
-   Decide: does `WndProc` call through to the backend synchronously
-   (like `backend.push_native_event(...)`), or does it buffer raw
-   native events and translate later in `poll_events`?
-
-Answers close the only parts of the B.1 design that were sketched
-but not proven. Without them, the first `impl Backend for TuiBackend`
-will reveal the problems midway through, and the fix might involve
-changing the `Backend` trait signature — which blocks GTK/Win-GUI
-impls.
-
-### Do this in a new session
-
-This conversation ran the design through all 5 decisions and landed
-B.1. Fresh session is appropriate for the sketch + code work; all
-the load-bearing artifacts are on develop:
-
-- `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §1–§10 (all 5 decisions
-  resolved); §11 (Phase B.2 implementation notes — answers to the
-  five design questions below, grounded in file:line refs)
-- `quadraui/docs/APP_ARCHITECTURE.md` (app-developer patterns)
-- `docs/NATIVE_GUI_LESSONS.md` (backend-implementer pitfalls)
-- `PLAN.md` § "Lessons learned" (maximize-era rules)
-- This §"Phase B.2 starting notes" (what you're reading)
-- Open issues: #167, #168, #169, #170 merged at `06dec4a`
-
-### Workflow reminders
-
-Per `CLAUDE.md` "Development Workflow":
-
-- Branch off `develop`, not `main`.
-- **Do NOT push until user approves.** Offer smoke tests / ask "ready
-  to push?" before any `git push`.
-- **Ask user which path** (A = local ff-merge + push develop, B = push
-  branch + PR targeting `develop`) — don't infer.
-- When opening a PR, base is `develop`. `gh pr create` defaults to
-  `main`; always pass `--base develop` or `gh pr edit --base develop`
-  after creation.
-
----
-
 ## Picking this up on another machine
 
 ### 1. Initial clone / sync
@@ -765,402 +588,6 @@ Summary:
    explicitly waived smoke testing.
 3. Two landing paths: (A) fast-forward merge + push for small/trivial
    changes; (B) push branch + PR for normal work. Default to B when unsure.
-
----
-
-## Phase A.3 — `Form` primitive + settings panel
-
-**Branch:** `quadraui-phase-a3-form-settings` off `develop`.
-
-**Platform:** any — settings panel exists in TUI and GTK.
-
-**Why this is next (reordered ahead of A.2b):** A.2b (GTK explorer) needs
-a text-input primitive for inline rename / new-entry. Building A.2b
-before Form/TextInput exists would mean dialog fallbacks and re-work
-when the primitive later lands, so we let the catalog catch up first.
-
-**Scope — new primitives in `quadraui`:**
-
-- `Form` — container primitive holding labeled field rows.
-- Field types for v1 baseline: `Toggle` (bool), `TextInput` (string),
-  `Button`. (Richer fields — `Dropdown`, `Slider`, `ColorPicker` —
-  tracked in #143 and defer to a follow-up.)
-- `FormEvent` variants: `ToggleChanged { id, value }`,
-  `TextInputChanged { id, value }`, `ButtonClicked { id }`, plus
-  `KeyPressed { key, modifiers }` for app-level routing.
-- All types owned + serde-compatible per plugin invariants (§10).
-
-**Scope — migration:**
-
-1. Define `quadraui::primitives::form` with the types above.
-2. Add `draw_form()` in each TUI + GTK backend (Win-GUI deferred).
-3. New adapter `settings_to_form()` in `src/render.rs` — converts
-   `Engine.settings` state into a `quadraui::Form` description.
-4. TUI `render_settings_panel()` in `src/tui_main/panels.rs` — replace
-   with `draw_form()` call when no special state is active.
-5. GTK settings panel (it exists imperatively, not via a native widget) —
-   replace with `draw_form()` call.
-6. Keyboard navigation between fields: Tab / arrows / typing for
-   `TextInput` focus; Space to toggle; Enter to activate buttons.
-7. Scroll for long settings lists (primitive-owned? or app-owned as in A.1/A.2).
-
-**Out of scope for A.3:**
-
-- `Dropdown`, `Slider`, `ColorPicker` fields (tracked in #143). Enum-valued
-  settings keep using text-input + validation until #143 lands.
-- Settings search / filter input (can reuse the `TextInput` primitive,
-  though).
-- Win-GUI port (follow-up stage A.3c).
-
-**Reference implementations:** None yet — Form is a brand-new primitive.
-The `TreeView` primitive (`quadraui/src/primitives/tree.rs`) is the
-template for shape (data struct + event enum + backend draw function).
-
-**Smoke test after implementing:**
-
-```bash
-cargo run --bin vcd    # TUI
-cargo run              # GUI
-```
-
-- Settings panel renders with current values
-- Tab / arrow keys move between fields
-- Toggle settings flip with Space
-- Text input fields accept typing, Backspace, Enter commits, Escape cancels
-- Button rows dispatch the expected engine action
-
-**Rough size estimate:** Larger than A.1a/A.1b (~600–900 lines) because
-Form is a new primitive with more event surface than TreeView.
-
----
-
-## Phase A.2b — GTK explorer migration (two sub-phases)
-
-**Split rationale:** the full migration touches the `view!` macro,
-the App struct, ~50 scattered `Msg` handlers that reference
-`file_tree_view` / `tree_store` / `name_cell`, plus a 310-line
-right-click context-menu rewrite. Landing that atomically makes any
-smoke-test regression hard to bisect. Instead we ship the scaffolding
-dead-code-first so the draw pipeline is known-good before flipping
-the wiring.
-
-### Sub-phase A.2b-1 — scaffolding (inert)
-
-**Status:** ✅ Done (`e34a72f`).
-
-**Branch:** `quadraui-phase-a2b-treeview-explorer-gtk` (merged, deleted).
-
-**Platform:** any (no GTK-specific runtime changes; the new code is not
-yet called).
-
-**What lands:**
-
-1. `src/gtk/explorer.rs` — new module with `ExplorerRow`,
-   `ExplorerState { rows, expanded, selected, scroll_top }`,
-   `build_explorer_rows`, and `explorer_to_tree_view` adapter. Mirrors
-   the TUI's `ExplorerRow` / `collect_rows` shape — intentionally
-   duplicated for sub-phase 1, to be unified into `src/render.rs` in a
-   later session once both backends have stabilised on
-   `quadraui::TreeView`.
-2. `draw_explorer_panel` in `src/gtk/draw.rs` — calls
-   `quadraui_gtk::draw_tree` and overlays a scrollbar using the same
-   pattern as `draw_settings_panel` (A.3c-2).
-3. Both pieces are `#[allow(dead_code)]`; the file tree still renders
-   via the native `gtk4::TreeView`.
-
-**Validation:** `cargo fmt`, `cargo clippy` (default + no-default-features),
-`cargo test --no-default-features` — all pass. No behavioural change.
-
-### Sub-phase A.2b-2 — atomic switchover
-
-**Status:** ⬜ Queued. Tracked as [#152](https://github.com/JDonaghy/vimcode/issues/152).
-
-**Branch:** `issue-152-a2b2-switchover-gtk` off `develop`.
-
-**Platform:** Linux or macOS with GTK4 (4.10+).
-
-**Platform:** Linux or macOS with GTK4 (4.10+).
-
-**This is the biggest architectural migration in all of Phase A.** Unlike
-the SC panel (A.1b), which was already rendered into a `DrawingArea`,
-the GTK explorer today uses a **native `gtk4::TreeView` widget with a
-`TreeStore` model**. Migrating means tearing out the native widget
-entirely and rendering the explorer into a `DrawingArea` via
-`quadraui_gtk::draw_tree`.
-
-**What the native widget provides today (that we lose by default):**
-
-- Built-in vertical scrolling with kinetic inertia
-- Native keyboard navigation (Up/Down/Left/Right/Page-Up/Down/Home/End)
-- Right-click context menu integration
-- Accessibility tree exposed to screen readers / AT-SPI
-- Native drag-and-drop handles
-- Row focus outline, hover states
-
-A.2b reimplements **only what's needed right now** on top of the
-primitive. The rest defers to later quadraui stages (context menus,
-a11y, drag-drop).
-
-**Scope (sub-phase 2):**
-
-**Already landed in sub-phase 1** (`e34a72f`):
-
-- `src/gtk/explorer.rs` with `ExplorerRow`, `ExplorerState`,
-  `build_explorer_rows`, `explorer_to_tree_view` adapter.
-- `draw_explorer_panel` in `src/gtk/draw.rs` (calls
-  `quadraui_gtk::draw_tree` + scrollbar overlay).
-
-**Remaining work for sub-phase 2:**
-
-1. Find the GTK explorer widget setup in `src/gtk/mod.rs` (search for
-   `TreeView::new()` or similar) and the associated `TreeStore` /
-   `ListStore` construction. Remove them.
-2. Replace with a `DrawingArea` sized and placed the same way as the
-   SC sidebar panel.
-3. (done in sub-phase 1 — `explorer_to_tree_view` adapter already
-   exists in `src/gtk/explorer.rs`.)
-4. Wire the DrawingArea's draw callback to call
-   `draw_explorer_panel()` with the adapted tree.
-5. Re-wire click handling: the old `TreeView` widget dispatched
-   `row-activated` / `cursor-changed` signals. Now clicks land on the
-   DrawingArea; compute `row = (click_y / item_height)` and update
-   `sidebar.selected`, then call existing engine methods to
-   open/toggle/etc. Use `src/tui_main/mouse.rs` explorer click handling
-   as the reference.
-6. Re-wire keyboard handling: capture Key controller events on the
-   DrawingArea, dispatch `j/k/l/h/Enter/Escape` to the same engine
-   methods the TUI uses. Use `src/tui_main/mod.rs` lines 2640-2760
-   as the reference.
-7. Add a scrollbar overlay (mirror what the TUI does in
-   `render_explorer_scrollbar` — or use a Cairo version of the same
-   thumb-and-track pattern).
-
-**Special-mode handling (rename / new-entry):** same pattern as TUI's
-A.2a: when `engine.explorer_rename.is_some()` or
-`engine.explorer_new_entry.is_some()`, fall through to a legacy path.
-For the GTK migration, the "legacy path" will need to be written
-because the old native-widget code won't exist any more. Options:
-(a) render the edit input as a GTK `Entry` widget overlaid on the
-relevant row, or (b) defer rename/new-entry to a stage after Form
-lands. **Recommendation:** option (b) — keep A.2b focused on baseline
-rendering. Mark rename/new-entry as unavailable in GTK during A.2b
-(the TUI keeps working). Restore them after `Form` / `TextInput`
-primitive lands.
-
-**Reference implementations:**
-- `src/tui_main/panels.rs::explorer_to_tree_view` (adapter)
-- `src/tui_main/panels.rs::render_sidebar` (rendering dispatch, special-mode branch)
-- `src/tui_main/quadraui_tui.rs::draw_tree` (rendering template, TUI)
-- `src/gtk/quadraui_gtk.rs::draw_tree` (rendering template, GTK — already exists for SC)
-
-**Pre-flight reading:**
-- [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) — lessons
-  from the Win-GUI build. Click geometry vs. draw geometry mismatches
-  (§5) are the most likely class of bug when wiring the DrawingArea.
-
-**Smoke test after implementing:**
-
-```bash
-cargo run   # default GUI
-```
-
-1. Explorer panel renders on launch — tree of files and dirs, icons,
-   indent, chevrons.
-2. `j`/`k` moves selection through all visible rows.
-3. `l`/Enter on a file opens it in the editor.
-4. `l`/Enter on a dir toggles expand/collapse.
-5. `h` on an expanded dir collapses it; `h` at root unfocuses (matches
-   TUI behaviour).
-6. Scrollbar updates as selection / content changes.
-7. Git indicators (M/A/D) appear right-aligned on modified files.
-8. Diagnostics: errors/warnings badge on files with LSP diagnostics.
-9. Mouse click on any row selects it.
-10. **Known regressions** vs. old native widget (document clearly if
-    they affect users):
-    - Inline rename (deferred)
-    - Drag-and-drop (deferred — wasn't in TUI either)
-    - Context menus (deferred to A.x)
-    - Accessibility tree (deferred — v1.1 per design §7.6)
-
-**Out of scope for A.2b:**
-
-- `TreeEvent` routing (still direct-to-engine for Phase A)
-- Primitive-owned scroll state
-- Context menus
-- Inline rename (falls under Form primitive)
-- Native drag-and-drop
-
----
-
-## Phase A.1c — Win-GUI `draw_tree`
-
-**Branch:** `quadraui-phase-a1c-treeview-win-gui` off `develop`.
-
-**Platform:** Windows with MSVC build tools + Rust stable. Needed because
-Direct2D/DirectWrite bindings only build under `target_os = "windows"`.
-
-**Setup on Windows:**
-
-```powershell
-# Install Rust via rustup.rs (default toolchain = stable-msvc)
-# Install Git for Windows
-git clone git@github.com:JDonaghy/vimcode.git
-cd vimcode
-git checkout develop
-cargo build --bin vimcode-win --features win-gui --no-default-features
-```
-
-Running: `.\target\debug\vimcode-win.exe` (or use `cargo run --bin vimcode-win --features win-gui --no-default-features`).
-
-**Scope:**
-
-1. Create `src/win_gui/quadraui_win.rs` with a `draw_tree` function that
-   takes a Direct2D render target, area rect, the `TreeView`, and theme.
-2. Port the TUI reference to Direct2D + DirectWrite: row background fill
-   (`FillRectangle`), chevron (`DrawText`), icon, styled spans, badge.
-3. In `src/win_gui/mod.rs` (wherever the SC panel is drawn — search for
-   `draw_source_control_panel` or similar), replace the section loop with
-   a call to `render::source_control_to_tree_view()` + `quadraui_win::draw_tree`.
-4. Click handling stays on the existing path (event routing is later).
-
-**Pre-flight reading (MANDATORY):**
-
-- [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) — every lesson
-  from the initial Win-GUI build. The tab-bar breadcrumb offset bug (§1)
-  and the draw/click geometry mismatch (§5) are classes of bugs likely to
-  recur in TreeView rasterisation.
-- [`src/tui_main/quadraui_tui.rs`](src/tui_main/quadraui_tui.rs) — reference
-  implementation.
-
-**Smoke test after implementing:**
-
-- Launch `vimcode-win.exe`.
-- Open the git panel.
-- Verify sections, chevrons, icons, selection highlight.
-- Verify click-to-open, keyboard nav, Tab expand/collapse, `s` to stage.
-- Multi-group layouts don't break (§2 of NATIVE_GUI_LESSONS).
-
-**Win-GUI-specific constraints:**
-
-- NEVER run `cargo test` with `--features win-gui` (spawns real windows).
-- Clippy: `cargo clippy --features win-gui --no-default-features`.
-- Build the binary: `cargo build --bin vimcode-win --features win-gui --no-default-features`.
-
----
-
-## Phase A.2c — Win-GUI explorer
-
-**Branch:** `quadraui-phase-a2c-explorer-win-gui` off `develop`.
-
-**Platform:** Windows (same toolchain as A.1c).
-
-**Scope:**
-
-1. After A.1c lands `quadraui_win::draw_tree`, the same primitive renders
-   the explorer panel. Pattern mirrors A.2b-1 + A.2b-2 (Linux GTK):
-   - Build an `ExplorerState` (rows + expanded set + selection + scroll
-     offset) on the Win-GUI App. The Linux side put this in
-     `src/gtk/explorer.rs`; the Win-GUI equivalent should live in
-     `src/win_gui/explorer.rs` (or be inlined if the App is small).
-   - Adapter `explorer_to_tree_view(state, has_focus, engine)` — port
-     from `src/gtk/explorer.rs`. The function is platform-agnostic
-     except for the `quadraui::TreeView` it returns; can be largely
-     copied.
-   - Replace whatever the Win-GUI explorer currently renders with a
-     `quadraui_win::draw_tree(...)` call into the shared explorer rect.
-2. Click handling: hit-test by row index (fixed row height per the
-   primitive). Wire to engine's `open_file` / `toggle_dir` etc. Mirror
-   the Linux pattern in `src/gtk/mod.rs::handle_explorer_da_click`.
-3. Keyboard: `j/k/h/l/Enter` → engine. Mirror
-   `src/gtk/mod.rs::handle_explorer_da_key`.
-4. Scroll: mouse wheel → fractional accumulator → row scroll. Mirror
-   Linux's `explorer_scroll_accum`.
-5. Per-row tooltip / right-click context menu: **deferred** (same as
-   the Linux A.2b-2 deferral). Restore later when needed.
-
-**Pre-flight reading (MANDATORY):**
-
-- [`src/gtk/explorer.rs`](src/gtk/explorer.rs) — Linux reference for the
-  state model + adapter. The shape ports near-verbatim.
-- [`src/gtk/draw.rs::draw_explorer_panel`](src/gtk/draw.rs) — Linux
-  reference for the draw-callback structure (build primitive, call
-  `quadraui_gtk::draw_tree`, overlay scrollbar).
-- [`src/gtk/mod.rs`](src/gtk/mod.rs) — search for
-  `handle_explorer_da_click` / `handle_explorer_da_key` /
-  `handle_explorer_da_right_click` for click + key + menu wiring.
-- [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) — §5
-  (click/draw geometry mismatch) is the most likely class of bug.
-
-**Smoke test:**
-
-- Launch `vimcode-win.exe` with the explorer panel open.
-- Tree of files / dirs renders with chevrons + icons + indent.
-- `j`/`k` navigates rows; `l`/Enter opens / toggles.
-- Mouse click selects + opens.
-- Scroll wheel scrolls.
-- Git indicators / diagnostics badges (if Win-GUI has them) render.
-- Multi-group editor layouts don't break.
-
----
-
-## Win-GUI parity scope (optional, post-A.1c / A.2c)
-
-A.6 and A.7 added Linux-side StatusBar / TabBar / ActivityBar / Terminal
-primitives + migrations through quadraui. **Win-GUI was not migrated
-through any of those stages** — its bespoke renderers are unaffected
-and continue to work as before. Win-GUI is the "newest backend" per
-[`CLAUDE.md`](CLAUDE.md) and historically lags features.
-
-**You don't have to do these to "finish" the wave.** A.1c + A.2c are
-the only Windows stages tracked as required. Everything below is
-optional polish — landing them brings Win-GUI up to feature parity
-with the Linux GTK side and demonstrates that the quadraui primitives
-work across all three rendering backends (Direct2D, Cairo, ratatui).
-
-| Optional stage | Status | Adds | Linux reference | Estimated size |
-|----------------|--------|------|-----------------|----------------|
-| **A.6b-win** | ✅ Done | Win-GUI `quadraui_win::draw_status_bar` | `src/gtk/quadraui_gtk.rs::draw_status_bar` (~120 lines) + `src/gtk/draw.rs::draw_window_status_bar` wrapper (~30 lines) | ~200 lines (actual: +135/-76) |
-| **A.6d-win v1** | ✅ Done | Win-GUI `quadraui_win::draw_tab_bar` (tabs only — left side) | `src/gtk/quadraui_gtk.rs::draw_tab_bar` tabs portion (~150 of ~340 lines) | ~200 lines (actual: +133/-93) |
-| A.6d-win v2 | 🚫 Blocked | Right-segments unification (diff toolbar + split + action menu) + `fit_active_scroll_offset` scrolling + close-button hover + `TabBarHitInfo` return | remaining ~190 lines of GTK reference | ~250 lines |
-
-**A.6d-win v2 status — blocked on cross-backend Nerd Font story.** A first attempt (v2a, branch `quadraui-phase-a6d-tab-bar-win-v2`, commit `1c052c0`) migrated the diff toolbar through `quadraui::TabBar.right_segments`. It rendered correctly in measurement but the prev/next arrow glyphs (PUA codepoints `U+F0143` / `U+F0140` from `build_tab_bar_primitive`) showed as `?` in Win-GUI because the mono editor font (Consolas) doesn't have them and Win-GUI's DirectWrite path has no font fallback configured. GTK only "works" because Pango falls back to Symbols Nerd Font automatically. Branch was reverted (never merged) — see issue [#178](https://github.com/JDonaghy/vimcode/issues/178). Sibling issue [#179](https://github.com/JDonaghy/vimcode/issues/179) tracks the related tab-bar-overflow parity gap (both backends drop tabs silently). **Reattempt v2 after the design conversation in #178 lands.**
-| A.6f-win | ⬜ Pending | Win-GUI `quadraui_win::draw_activity_bar` + native→DA atomic switchover | `src/gtk/quadraui_gtk.rs::draw_activity_bar` + `src/gtk/mod.rs` adapter / wiring (~500 lines total) | ~500 lines |
-| A.7-win | ⬜ Pending | Win-GUI `quadraui_win::draw_terminal_cells` | `src/gtk/quadraui_gtk.rs::draw_terminal_cells` (~95 lines) + `src/gtk/draw.rs` wrapper (~25 lines) | ~150 lines |
-
-**Scope each as its own branch** following the established pattern
-(`quadraui-phase-a6b-status-bar-win`, etc.), one stage per commit,
-smoke test before merge.
-
-**Adapters are already shared.** All the `render::*_to_quadraui` builders
-(`window_status_line_to_status_bar`, `build_tab_bar_primitive`,
-`terminal_cells_to_quadraui`) live in `src/render.rs` and are platform-
-agnostic. Win-GUI just needs the `quadraui_win::draw_*` rasterisation
-functions and to call the existing adapters from its own draw paths.
-
-**Lessons learned in A.6 / A.7 that apply to Win-GUI:**
-
-- **Wide-glyph allowlist, not range check.** `is_nerd_wide` started as
-  a PUA range test and broke 6 snapshot tests. Specific glyphs are
-  rendered wide; others aren't. Hardcode the allowlist (currently
-  4 chars: F0932 SPLIT_RIGHT, F0143 DIFF_PREV, F0140 DIFF_NEXT,
-  F0233 DIFF_FOLD). Direct2D's text layout will need the same care —
-  measure each PUA glyph empirically before deciding.
-- **WidgetId-based action dispatch (A.6a precedent).** For StatusBar +
-  TabBar, the engine-side action enums (`StatusAction`,
-  `TabBarClickTarget`) are encoded as opaque `WidgetId` strings in
-  the primitive (e.g. `"status:goto_line"`, `"tab:diff_prev"`).
-  Decoder helpers (`render::status_action_from_id`,
-  `activity_id_to_panel`) live next to the encoders. Follow the same
-  pattern in Win-GUI's click handlers.
-- **Rendering vs interaction state split.** Hover / drag / focus are
-  per-frame backend state, not primitive state. Pass them as extra
-  parameters to the `draw_*` function alongside the primitive (e.g.
-  `hovered_close_tab: Option<usize>`, `hovered_idx: Option<usize>`).
-  Keeps the primitive plugin-friendly without bloating it.
-- **Build the primitive once per frame, not per row.** A.7's first
-  draft built the `quadraui::Terminal` per-row in a loop (huge waste).
-  Build once at the top of the render call, dispatch row-by-row from
-  the owned data. Same applies to `draw_tab_bar` etc.
 
 ---
 

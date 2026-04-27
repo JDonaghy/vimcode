@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 332 — #223 per-primitive rasteriser arc COMPLETE plus a 10th lift: 9 primitives + TextDisplay-with-kubeui-yaml-adoption shipped. All public `quadraui::tui::draw_*` + `quadraui::gtk::draw_*` rasterisers behind `tui` / `gtk` feature gates; vimcode delegates all big-rasteriser surfaces; kubeui adopted ListView + TextDisplay (via new `kubeui_core::build_yaml_view` view-builder). Plus a pre-existing TabBar layout regression fixed: when scroll arrows are disabled (TUI), layout now honours the caller's `bar.scroll_offset` instead of always clipping from index 0.)
+**Last updated:** Apr 26, 2026 (Session 333 — Phase B.4 stage map drafted; PLAN.md trimmed from 1221 → ~648 lines. Completed Phase A.3 / A.2b / A.1c / A.2c / B.2 starting notes / Win-GUI parity sections deleted (git history retains them). PLAN.md top section now points at the 7-stage B.4 TUI Backend trait rewrite, with detailed breakdown in Claude's plan workspace at `~/.claude/plans/federated-hugging-hinton.md`. Also: `vimcode -t` flag is being retired; TUI binary is `vcd` only.)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
