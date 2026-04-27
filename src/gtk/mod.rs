@@ -3632,6 +3632,7 @@ impl SimpleComponent for App {
         let dbg_hits_for_draw = model.debug_toolbar_hit_regions.clone();
         let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
         let dbg_h_for_draw = model.debug_toolbar_height.clone();
+        let backend_for_draw = model.backend.clone();
         widgets
             .drawing_area
             .set_draw_func(move |_, cr, width, height| {
@@ -3667,6 +3668,7 @@ impl SimpleComponent for App {
                             &dbg_hits_for_draw,
                             &dbg_y_for_draw,
                             &dbg_h_for_draw,
+                            &backend_for_draw,
                         );
                     };
 

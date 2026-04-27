@@ -110,7 +110,13 @@ pub(super) fn draw_form(
 /// GTK consumer currently sets `bordered = true`. If that changes, add
 /// border drawing here and respect the inset bounds that
 /// `ListView::layout` already returns when `bordered` is set.
+///
+/// Phase B.5 Stage 3: only caller (quickfix panel) migrated to
+/// `Backend::draw_list`. Kept as `#[allow(dead_code)]` because Stage 4+
+/// may briefly need it before all sites migrate; Stage 7 cleanup
+/// removes any shims still unused at that point.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) fn draw_list(
     cr: &Context,
     layout: &pango::Layout,

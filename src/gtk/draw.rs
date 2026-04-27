@@ -60,6 +60,11 @@ pub(super) fn draw_editor(
     debug_toolbar_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
     debug_toolbar_y_offset_out: &Rc<Cell<f64>>,
     debug_toolbar_height_out: &Rc<Cell<f64>>,
+    // Phase B.5 Stage 3: shared `quadraui::Backend` impl. Routed
+    // through to draw paths that go through the trait. Today only
+    // the quickfix panel uses it as a pilot — the rest still call
+    // `quadraui_gtk::draw_*` shims directly.
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -484,6 +489,7 @@ pub(super) fn draw_editor(
             width as f64,
             qf_px,
             line_height,
+            backend,
         );
     }
 
@@ -3429,6 +3435,7 @@ pub(super) fn draw_quickfix_panel(
     editor_w: f64,
     qf_px: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(qf) = &screen.quickfix else {
         return;
@@ -3436,8 +3443,15 @@ pub(super) fn draw_quickfix_panel(
 
     // Phase A.5b migration: quickfix now renders through the shared
     // `quadraui::ListView` primitive. The adapter produces a ListView
-    // with a `QUICKFIX (N items)` header; `quadraui_gtk::draw_list`
+    // with a `QUICKFIX (N items)` header; `Backend::draw_list`
     // renders header + rows with selection indicator.
+    //
+    // Phase B.5 Stage 3 pilot: this is the first GTK draw site routed
+    // through the `quadraui::Backend` trait — `enter_frame_scope`
+    // stashes the cairo context + pango layout for the closure
+    // duration; `b.draw_list(rect, &list)` reaches them via the
+    // backend's frame-scope accessor. The same generic
+    // `paint::<B: Backend>` shape now drives both backends.
     //
     // Scroll-to-selection: reserve one row for the header, then keep the
     // selected item within the remaining visible rows. Matches prior
@@ -3450,17 +3464,21 @@ pub(super) fn draw_quickfix_panel(
     };
     let mut list = render::quickfix_to_list_view(qf);
     list.scroll_offset = scroll_top;
-    super::quadraui_gtk::draw_list(
-        cr,
-        layout,
-        editor_x,
-        editor_y,
-        editor_w,
-        qf_px,
-        &list,
-        theme,
-        line_height,
-    );
+
+    use quadraui::Backend;
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_list(
+            quadraui::Rect::new(
+                editor_x as f32,
+                editor_y as f32,
+                editor_w as f32,
+                qf_px as f32,
+            ),
+            &list,
+        );
+    });
 }
 
 /// Nerd Font icons for the terminal panel toolbar.
