@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (Phase B.4 — TUI Backend trait implementation — kicks off. #223 arc and quadraui readiness gate are both complete; everything below shifts to executing the multi-stage TUI rewrite.)
+> **Last updated:** 2026-04-26 (Phase B.4 — Stages 1–5b shipped. The Backend trait is now load-bearing in the running editor — every native event flows through `backend.wait_events`. Drag-state consolidation, accelerator consolidation, and final cleanup remain.)
 
 ---
 
@@ -26,37 +26,40 @@ pickup).
 
 ### Stage map
 
-| Stage | Goal | Sessions |
-|---|---|---|
-| **1** | `TuiBackend` skeleton + frame ownership; stub `draw_*` delegating to existing free functions | 1–2 |
-| **2** | Drawing methods route through trait; `quadraui_tui.rs` shims fold into backend | 1–2 |
-| **3** | `paint<B: Backend>` extraction; cross-backend draws via trait, TUI helpers for editor / scrollbars | 1–2 |
-| **4** | `poll_events()` / `wait_events()` translating crossterm → `UiEvent` | 2 |
-| **5a** | Modal dispatch through `dispatch_mouse_down/up` (replaces inline modal hit-tests) | 1 |
-| **5b** | Drag-state consolidation into `quadraui::DragState` (extends `DragTarget` enum) | 1 |
-| **6** | Accelerator registry consolidation for cross-mode global keybindings | 1 |
-| **7** | Cleanup + restore GTK / Win-GUI compile + `BACKEND.md` worked example | 0.5–1 |
+| Stage | Goal | Status | Commit |
+|---|---|---|---|
+| **0** | PLAN.md trim for B.4 focus | ✅ | `b97635d` |
+| **1** | `TuiBackend` skeleton + frame ownership | ✅ | `3a10bdb` |
+| **2** | `palette` / `list` / `tree` / `form` draws via trait + frame-scope mechanism | ✅ | `9c3a681` |
+| **3a** | Quickfix panel via `Backend::draw_list` | ✅ | `3ae3360` |
+| **3b** | `MockBackend` cross-backend test fixture | ✅ | `12fef4a` |
+| **4** | `crossterm → UiEvent` translation + `poll_events`/`wait_events` impls | ✅ | `d5a5159` |
+| **5a** | `wait_events` semantics + inverse `UiEvent → crossterm::Event` helpers | ✅ | `6b7a2e4` |
+| **5b** | Event loop flipped to `Backend::wait_events` — **trait now load-bearing** | ✅ | `4016ecc` |
+| **5c** | Drag-state consolidation into `quadraui::DragState` (needs `DragTarget` extension PR) | ⬜ | — |
+| **6** | Accelerator registry consolidation for cross-mode global keybindings | ⬜ | — |
+| **7** | Cleanup + restore GTK / Win-GUI compile + `BACKEND.md` worked example | ⬜ | — |
 
-**Realistic total:** 9–12 sessions. After Stage 7, the per-feature
-wiring story collapses from "edit one site per backend" to "register
-one accelerator + emit one `UiEvent`."
+**Architectural milestone reached at 5b:** every native event reaches
+the existing dispatch through the `Backend` trait via `wait_events`
++ inverse synth helpers. The remaining stages are consolidation
+(unify drag state, route accelerators) + cleanup.
 
-### What could re-shape the plan
+After Stage 7, the per-feature wiring story collapses from "edit one
+site per backend" to "register one accelerator + emit one `UiEvent`."
 
-Three discoveries would force re-scoping. **First**, if Stage 1 hits
-borrow-checker pain holding `Terminal<CrosstermBackend<Stdout>>` across
-trait method calls (real risk — `terminal.draw(|frame| { … })` only
-yields `&mut Frame` inside the closure), `Backend` may need a
-callback-style `with_frame` instead of `begin_frame` / `end_frame` —
-that's a quadraui PR first. **Second**, if Stage 4 reveals missing
-`UiEvent` variants (kitty-protocol focus, mouse-move-without-button,
-etc.), each gap is a quadraui PR. **Third**, if Stage 5b's drag
-shapes don't fit `DragTarget::ScrollbarY` (terminal split divider is
-horizontal-axis, group divider is both axes), `DragTarget` needs
-axis-aware variants — split 5b into 5b/5c.
+### How the open risks resolved
 
-If any fire: pause the stage, file the quadraui PR, land it, resume.
-Don't paper over in TUI code — gaps get worse if patched there.
+The original plan flagged three discoveries that could reshape the work.
+**First risk** (Terminal/Frame borrow-checker pain) was avoided —
+TuiBackend doesn't own the Terminal (the event loop does). A
+type-erased `current_frame_ptr: Cell<*mut ()>` set inside
+`enter_frame_scope` lets trait `draw_*` methods reach the Frame
+without lifetime parameters on the struct. **Second risk** (missing
+UiEvent variants) didn't fire — the existing variants covered every
+crossterm event we actually surface today. **Third risk** (drag-state
+shapes) is now Stage 5c's open work — extending `DragTarget` is a
+quadraui sub-PR, deferred until 5c starts.
 
 ### Parallel cleanup work (not blockers)
 

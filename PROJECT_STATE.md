@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 26, 2026 (Session 333 — Phase B.4 stage map drafted; PLAN.md trimmed from 1221 → ~648 lines. Completed Phase A.3 / A.2b / A.1c / A.2c / B.2 starting notes / Win-GUI parity sections deleted (git history retains them). PLAN.md top section now points at the 7-stage B.4 TUI Backend trait rewrite, with detailed breakdown in Claude's plan workspace at `~/.claude/plans/federated-hugging-hinton.md`. Also: `vimcode -t` flag is being retired; TUI binary is `vcd` only.)
+**Last updated:** Apr 26, 2026 (Session 334 — Phase B.4 Stages 1–5b shipped. The `quadraui::Backend` trait is now load-bearing in the running editor — every keystroke / click / scroll / resize / paste / focus event flows through `backend.wait_events()` → `synth_*` inverse helpers → existing legacy handlers. New files: `src/tui_main/backend.rs` (`TuiBackend` impl + frame-scope mechanism + 4 working `draw_*` methods + 3 cross-backend tests via `MockBackend`), `src/tui_main/services.rs` (`PlatformServices` impl), `src/tui_main/events.rs` (crossterm↔UiEvent translation, 19 unit tests). Stages 5c (drag-state consolidation, needs `DragTarget` extension), 6 (accelerator registry), 7 (cleanup) remain.)
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 326 are in **SESSION_HISTORY.md**.
