@@ -125,6 +125,30 @@ fn apply_scrollbar_drag(
                         }
                     }
                 }
+                // Editor window scrollbars — widget id format
+                // `tui:editor:<window_id>:<vsb|hsb>`. Apply-side parses the
+                // window id and routes to the per-window scroll setters.
+                other if other.starts_with("tui:editor:") => {
+                    if let Some(rest) = other.strip_prefix("tui:editor:") {
+                        if let Some((wid_str, axis)) = rest.split_once(':') {
+                            if let Ok(wid) = wid_str.parse::<usize>() {
+                                let window_id = crate::core::WindowId(wid);
+                                match axis {
+                                    "vsb" => {
+                                        engine.set_scroll_top_for_window(window_id, *new_offset);
+                                        engine.sync_scroll_binds();
+                                        handled = true;
+                                    }
+                                    "hsb" => {
+                                        engine.set_scroll_left_for_window(window_id, *new_offset);
+                                        handled = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -142,7 +166,6 @@ pub(super) fn handle_mouse(
     terminal_size: &Option<Size>,
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
-    dragging_scrollbar: &mut Option<ScrollDragState>,
     debug_output_scroll: &mut usize,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
@@ -1038,26 +1061,11 @@ pub(super) fn handle_mouse(
             // so `term.set_scroll_offset` / `*debug_output_scroll`
             // continue to mean "lines from the bottom".
 
-            // Scrollbar thumb drag (vertical or horizontal)
-            if let Some(ref drag) = *dragging_scrollbar {
-                if drag.track_len > 0 && drag.total > 0 {
-                    if drag.is_horizontal {
-                        let end = drag.track_abs_start + drag.track_len - 1;
-                        let clamped = col.clamp(drag.track_abs_start, end);
-                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                        let new_left = (ratio * drag.total as f64) as usize;
-                        engine.set_scroll_left_for_window(drag.window_id, new_left);
-                    } else {
-                        let end = drag.track_abs_start + drag.track_len - 1;
-                        let clamped = row.clamp(drag.track_abs_start, end);
-                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                        let new_top = (ratio * drag.total as f64) as usize;
-                        engine.set_scroll_top_for_window(drag.window_id, new_top);
-                        engine.sync_scroll_binds();
-                    }
-                }
-                return sidebar_width;
-            }
+            // Phase B.4 Stage 5d: editor-window scrollbar drag math now
+            // lives in the shared `if drag_state.is_active()` block above
+            // via `tui:editor:N:vsb` / `tui:editor:N:hsb` widget ids. The
+            // legacy `dragging_scrollbar` local + `ScrollDragState` are
+            // gone.
             // Text drag-to-select — find window under cursor and extend visual selection
             if col >= editor_left {
                 if let Some(layout) = last_layout {
@@ -1165,9 +1173,9 @@ pub(super) fn handle_mouse(
             *explorer_drag_src = None;
             *explorer_drag_active = None;
             *dragging_sidebar = false;
-            *dragging_scrollbar = None;
-            // Stage 5c: search/settings/debug-sidebar/terminal/debug-output
-            // drags clear via `drag_state.end()` (single source of truth).
+            // Stage 5c+5d: scrollbar drags (search, settings, debug-sidebar,
+            // terminal, debug-output, editor v/h scrollbars) clear via
+            // `drag_state.end()` — single source of truth.
             drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
@@ -3299,59 +3307,120 @@ pub(super) fn handle_mouse(
                     return sidebar_width;
                 }
 
-                let viewport_lines = wh as usize;
+                // Per-window status line (when enabled) occupies the
+                // bottom row of the window — render_window subtracts it
+                // before computing viewport / scrollbar geometry. Mirror
+                // that here so the click hit-tests match what's actually
+                // drawn.
+                let status_rows: u16 = if rw.status_line.is_some() && wh > 1 {
+                    1
+                } else {
+                    0
+                };
+                let content_height = wh.saturating_sub(status_rows);
+                let viewport_lines = content_height as usize;
                 let has_v_scrollbar = rw.total_lines > viewport_lines;
                 let gutter = rw.gutter_char_width as u16;
                 let viewport_cols = (ww as usize)
                     .saturating_sub(gutter as usize + if has_v_scrollbar { 1 } else { 0 });
-                let has_h_scrollbar = rw.max_col > viewport_cols && wh > 1;
+                let has_h_scrollbar = rw.max_col > viewport_cols && content_height > 1;
 
                 // Vertical scrollbar click/drag-start (rightmost column)
                 if has_v_scrollbar && rel_col == wx + ww - 1 {
                     // menu_rows = menu bar offset; wy already includes tab_bar_height
                     let track_abs_start = menu_rows + wy;
-                    // If there's also a h-scrollbar, v-track is 1 row shorter
-                    let track_len = if has_h_scrollbar {
-                        wh.saturating_sub(1)
-                    } else {
-                        wh
-                    };
-                    *dragging_scrollbar = Some(ScrollDragState {
-                        window_id: rw.window_id,
-                        is_horizontal: false,
-                        track_abs_start,
-                        track_len,
-                        total: rw.total_lines,
-                    });
-                    let track_rel_row = editor_row.saturating_sub(wy);
-                    let viewport_lines = track_len as usize;
-                    let new_top = crate::render::scrollbar_click_to_scroll_top(
-                        track_rel_row as f64,
-                        track_len as f64,
+                    // V-track loses 1 row to each of: per-window status line,
+                    // horizontal scrollbar (if either present).
+                    let track_len =
+                        content_height.saturating_sub(if has_h_scrollbar { 1 } else { 0 });
+                    let track_visible = track_len as usize;
+                    // Phase B.4 Stage 5d: editor scrollbars on the shared
+                    // `quadraui::DragState`. Widget id encodes the window id
+                    // so the apply-side router can call
+                    // `engine.set_scroll_*_for_window(...)` against the
+                    // right window. `grab_offset` preserves cursor position
+                    // on the thumb during drag — same UX every other
+                    // migrated scrollbar gives.
+                    let grab_offset = scrollbar_grab_offset(
+                        row as f32,
+                        track_abs_start as f32,
+                        track_len as f32,
+                        track_visible,
                         rw.total_lines,
-                        viewport_lines,
+                        rw.scroll_top,
                     );
-                    engine.set_scroll_top_for_window(rw.window_id, new_top);
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new(format!(
+                            "tui:editor:{}:vsb",
+                            rw.window_id.0
+                        )),
+                        track_start: track_abs_start as f32,
+                        track_length: track_len as f32,
+                        visible_rows: track_visible,
+                        total_items: rw.total_lines,
+                        grab_offset,
+                    });
+                    apply_scrollbar_drag(
+                        drag_state,
+                        quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                        engine,
+                        sidebar,
+                        debug_output_scroll,
+                    );
                     engine.sync_scroll_binds();
                     return sidebar_width;
                 }
 
-                // Horizontal scrollbar click/drag-start (bottom row)
-                if has_h_scrollbar && editor_row == wy + wh - 1 {
+                // Horizontal scrollbar click/drag-start.
+                // The renderer reserves the bottommost row of the window
+                // for a per-window status line when one is enabled, then
+                // shrinks the content area and draws the h-scrollbar at
+                // the last row of the *shrunken* area. So the h-scrollbar
+                // sits at `wy + wh - 1` when no per-window status line
+                // and `wy + wh - 2` when there is one.
+                let h_sb_row = if rw.status_line.is_some() && wh > 1 {
+                    wy + wh - 2
+                } else {
+                    wy + wh - 1
+                };
+                if has_h_scrollbar && editor_row == h_sb_row {
                     let track_x = wx + gutter;
                     let track_w = ww.saturating_sub(gutter + if has_v_scrollbar { 1 } else { 0 });
                     if rel_col >= track_x && rel_col < track_x + track_w && track_w > 0 {
                         let track_abs_start = editor_left + track_x;
-                        *dragging_scrollbar = Some(ScrollDragState {
-                            window_id: rw.window_id,
-                            is_horizontal: true,
-                            track_abs_start,
-                            track_len: track_w,
-                            total: rw.max_col,
+                        let track_visible = viewport_cols;
+                        let grab_offset = scrollbar_grab_offset(
+                            col as f32,
+                            track_abs_start as f32,
+                            track_w as f32,
+                            track_visible,
+                            rw.max_col,
+                            rw.scroll_left,
+                        );
+                        drag_state.begin(quadraui::DragTarget::ScrollbarX {
+                            widget: quadraui::WidgetId::new(format!(
+                                "tui:editor:{}:hsb",
+                                rw.window_id.0
+                            )),
+                            track_start: track_abs_start as f32,
+                            track_length: track_w as f32,
+                            visible_cols: track_visible,
+                            total_cols: rw.max_col,
+                            grab_offset,
                         });
-                        let ratio = (rel_col - track_x) as f64 / track_w as f64;
-                        let new_left = (ratio * rw.max_col as f64) as usize;
-                        engine.set_scroll_left_for_window(rw.window_id, new_left);
+                        apply_scrollbar_drag(
+                            drag_state,
+                            quadraui::Point {
+                                x: col as f32,
+                                y: row as f32,
+                            },
+                            engine,
+                            sidebar,
+                            debug_output_scroll,
+                        );
                         return sidebar_width;
                     }
                 }

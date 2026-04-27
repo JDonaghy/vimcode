@@ -2317,6 +2317,7 @@ pub(super) fn render_window(
             gutter_w,
             has_scrollbar,
             theme,
+            window_bg,
         );
     }
 
@@ -2486,6 +2487,11 @@ pub(super) fn render_scrollbar(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Render the horizontal scrollbar at the bottom row of `area`. Each
+/// cell uses `window_bg` for its terminal background so the row blends
+/// in with the editor area above (using `theme.background` instead
+/// would make the row look like a dark strip when the active window
+/// uses `theme.active_background`).
 pub(super) fn render_h_scrollbar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -2495,12 +2501,13 @@ pub(super) fn render_h_scrollbar(
     gutter_w: u16,
     has_v_scrollbar: bool,
     theme: &Theme,
+    window_bg: ratatui::style::Color,
 ) {
     if area.height == 0 || max_col == 0 || viewport_cols == 0 {
         return;
     }
     let thumb_fg = rc(theme.scrollbar_thumb);
-    let sb_bg = rc(theme.background);
+    let track_fg = rc(theme.separator);
     let corner_fg = rc(theme.separator);
 
     let sb_y = area.y + area.height - 1;
@@ -2519,16 +2526,32 @@ pub(super) fn render_h_scrollbar(
         .max(1.0) as u16;
     let thumb_left = ((scroll_left as f64 / max_col as f64) * w).floor() as u16;
 
+    // Render strategy: every cell uses `window_bg` as its terminal
+    // background so the top half of the row matches the editor area
+    // above. The track is drawn with `▁` (lower one-eighth block) in
+    // `track_fg` for a thin separator-like line; the thumb is drawn
+    // with `▄` (lower-half block) in `thumb_fg` so it stands out as a
+    // chunkier bar in the same row.
     for dx in 0..track_w {
         let x = track_x + dx;
         let in_thumb = dx >= thumb_left && dx < thumb_left + thumb_size;
-        let ch = if in_thumb { '▄' } else { ' ' };
-        let fg = if in_thumb { thumb_fg } else { sb_bg };
-        set_cell(buf, x, sb_y, ch, fg, sb_bg);
+        let (ch, fg) = if in_thumb {
+            ('▄', thumb_fg)
+        } else {
+            ('▁', track_fg)
+        };
+        set_cell(buf, x, sb_y, ch, fg, window_bg);
     }
     // Corner cell (intersection of v-scrollbar column and h-scrollbar row)
     if has_v_scrollbar {
-        set_cell(buf, area.x + area.width - 1, sb_y, '┘', corner_fg, sb_bg);
+        set_cell(
+            buf,
+            area.x + area.width - 1,
+            sb_y,
+            '┘',
+            corner_fg,
+            window_bg,
+        );
     }
 }
 

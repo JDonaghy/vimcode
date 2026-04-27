@@ -580,26 +580,14 @@ fn collect_rows(
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// State for an active scrollbar drag (vertical or horizontal).
-struct ScrollDragState {
-    window_id: crate::core::WindowId,
-    /// `false` = vertical scrollbar, `true` = horizontal scrollbar.
-    is_horizontal: bool,
-    /// For vertical: absolute terminal row of track top.
-    /// For horizontal: absolute terminal column of track start.
-    track_abs_start: u16,
-    /// For vertical: track height in rows.
-    /// For horizontal: track width in columns.
-    track_len: u16,
-    /// For vertical: total buffer lines.
-    /// For horizontal: max line length (max_col).
-    total: usize,
-}
-
-// `SidebarScrollDrag` and `DebugSidebarScrollDrag` were retired in
-// Phase B.4 Stage 5c — those drags now flow through the shared
-// `quadraui::DragState::ScrollbarY` (widget ids `tui:search_results`,
-// `tui:settings`, `tui:debug_sidebar:N`).
+// `ScrollDragState`, `SidebarScrollDrag`, and `DebugSidebarScrollDrag` were retired
+// across Phase B.4 Stages 5c (sidebar / settings / debug-sidebar /
+// terminal / debug-output) and 5d (editor v/h scrollbars). Every TUI
+// scrollbar drag now flows through the shared `quadraui::DragState`.
+// Widget ids route the dispatched offset to the right scroll-state
+// field: `tui:search_results`, `tui:settings`, `tui:debug_sidebar:N`,
+// `tui:terminal_scrollback`, `tui:debug_output`, and
+// `tui:editor:<window_id>:vsb` / `:hsb`.
 
 /// What the folder picker should do when the user confirms a selection.
 #[derive(Clone, PartialEq)]
@@ -1227,12 +1215,11 @@ fn event_loop(
     let mut quickfix_scroll_top: usize = 0;
     // True while user is dragging the sidebar resize handle
     let mut dragging_sidebar = false;
-    // Non-None while user is dragging a scrollbar thumb
-    let mut dragging_scrollbar: Option<ScrollDragState> = None;
-    // Stage 5c retired the per-scrollbar `Option<...>` locals (search,
-    // settings, debug-sidebar, terminal-scrollback, debug-output). All
-    // five drags now flow through the single `quadraui::DragState` on
-    // `TuiBackend`, with widget IDs keyed in `mouse.rs`.
+    // Stage 5c+5d retired every per-scrollbar `Option<...>` local
+    // (picker, search, settings, debug-sidebar, terminal-scrollback,
+    // debug-output, editor v/h scrollbars). All scrollbar drags now
+    // flow through the single `quadraui::DragState` on `TuiBackend`,
+    // with widget ids keyed in `mouse.rs::apply_scrollbar_drag`.
 
     // Scroll offset for the debug output panel (0 = newest/bottom, n = n lines up from bottom).
     let mut debug_output_scroll: usize = 0;
@@ -3922,7 +3909,6 @@ fn event_loop(
                                 &terminal.size().ok(),
                                 sidebar_width,
                                 &mut dragging_sidebar,
-                                &mut dragging_scrollbar,
                                 &mut debug_output_scroll,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
@@ -3973,7 +3959,6 @@ fn event_loop(
                     &terminal.size().ok(),
                     sidebar_width,
                     &mut dragging_sidebar,
-                    &mut dragging_scrollbar,
                     &mut debug_output_scroll,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
