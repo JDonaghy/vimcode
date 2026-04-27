@@ -36,6 +36,7 @@ mod backend;
 mod click;
 mod css;
 mod draw;
+mod events;
 mod explorer;
 mod quadraui_gtk;
 mod services;

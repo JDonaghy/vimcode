@@ -148,12 +148,24 @@ impl GtkBackend {
         self.drag_state.clone()
     }
 
-    /// Shared handle to the event-queue adapter. Stage 4 will hand
+    /// Shared handle to the event-queue adapter. Stage 5 will hand
     /// this clone to every signal-callback closure so they can push
-    /// translated `UiEvent`s.
+    /// translated `UiEvent`s into the queue. Drained by
+    /// `wait_events` / `poll_events`.
     #[allow(dead_code)]
     pub fn events_handle(&self) -> Rc<std::cell::RefCell<VecDeque<UiEvent>>> {
         self.events.clone()
+    }
+
+    /// Push a single event onto the queue. Convenience for callbacks
+    /// that have a `&GtkBackend` (or `&Rc<RefCell<GtkBackend>>`)
+    /// reference and don't want to clone the events handle. Stage 5
+    /// uses `events_handle()` directly inside captured closures
+    /// because cloning the handle is cheaper than reaching the
+    /// backend through `Rc<RefCell<>>`.
+    #[allow(dead_code)]
+    pub fn push_event(&self, ev: UiEvent) {
+        self.events.borrow_mut().push_back(ev);
     }
 
     /// Update the cached theme. Call once per frame from the App's
