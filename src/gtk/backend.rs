@@ -102,6 +102,11 @@ pub struct GtkBackend {
     /// call so font-metrics setup doesn't repeat per primitive.
     current_layout_ptr: Cell<*const ()>,
     current_theme: quadraui::Theme,
+    /// Per-frame Pango line height in DIPs. Set by the App in its
+    /// draw closure (from font metrics) before any trait `draw_*`
+    /// invocation. Every primitive that uses text metrics passes
+    /// this through.
+    current_line_height: f64,
 }
 
 impl GtkBackend {
@@ -123,6 +128,7 @@ impl GtkBackend {
             current_cr_ptr: Cell::new(std::ptr::null()),
             current_layout_ptr: Cell::new(std::ptr::null()),
             current_theme: quadraui::Theme::default(),
+            current_line_height: 16.0,
         }
     }
 
@@ -155,6 +161,14 @@ impl GtkBackend {
     #[allow(dead_code)]
     pub fn set_current_theme(&mut self, theme: quadraui::Theme) {
         self.current_theme = theme;
+    }
+
+    /// Update the cached Pango line height (in DIPs). Call once per
+    /// frame from the App's draw callback (after measuring font
+    /// metrics), before any trait `draw_*` invocations.
+    #[allow(dead_code)]
+    pub fn set_current_line_height(&mut self, line_height: f64) {
+        self.current_line_height = line_height;
     }
 
     /// Enter the frame-scope: stash the cairo context + pango layout
@@ -192,31 +206,25 @@ impl GtkBackend {
         result
     }
 
-    /// Get the current cairo context inside the frame-scope, or
-    /// `None` outside. Trait `draw_*` methods call this and bail
-    /// (panic in dev) if `None`.
-    #[allow(dead_code)]
-    fn current_cr(&self) -> Option<&Context> {
-        let ptr = self.current_cr_ptr.get();
-        if ptr.is_null() {
-            None
-        } else {
-            // SAFETY: `enter_frame_scope` set this from a real
-            // `&Context` and won't return until the scope ends, at
-            // which point the pointer is cleared.
-            Some(unsafe { &*(ptr as *const Context) })
+    /// Get the current cairo context + pango layout inside the
+    /// frame-scope, or `None` outside. Trait `draw_*` methods call
+    /// this and bail (panic in dev) if the scope isn't active.
+    fn current_frame_refs(&self) -> Option<(&Context, &pango::Layout)> {
+        let cr_ptr = self.current_cr_ptr.get();
+        let layout_ptr = self.current_layout_ptr.get();
+        if cr_ptr.is_null() || layout_ptr.is_null() {
+            return None;
         }
-    }
-
-    /// Get the current pango layout inside the frame-scope.
-    #[allow(dead_code)]
-    fn current_layout(&self) -> Option<&pango::Layout> {
-        let ptr = self.current_layout_ptr.get();
-        if ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { &*(ptr as *const pango::Layout) })
-        }
+        // SAFETY: `enter_frame_scope` set both pointers from real
+        // borrows of `&Context` / `&pango::Layout` and won't return
+        // until the scope ends. Outside the scope both pointers are
+        // null and we returned above.
+        Some(unsafe {
+            (
+                &*(cr_ptr as *const Context),
+                &*(layout_ptr as *const pango::Layout),
+            )
+        })
     }
 
     /// Apply registered accelerators to a slice of UiEvents. Mirrors
@@ -432,39 +440,158 @@ impl Backend for GtkBackend {
     // "deferred" message — the GTK draw path doesn't go through the
     // trait yet, so these are unreachable in practice.
 
-    fn draw_tree(&mut self, _rect: QRect, _tree: &TreeView) {
-        unimplemented!("GtkBackend::draw_tree — Stage 2");
+    fn draw_tree(&mut self, rect: QRect, tree: &TreeView) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_tree called outside enter_frame_scope");
+        quadraui::gtk::draw_tree(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+            tree,
+            &self.current_theme,
+            self.current_line_height,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    fn draw_list(&mut self, _rect: QRect, _list: &ListView) {
-        unimplemented!("GtkBackend::draw_list — Stage 2");
+    fn draw_list(&mut self, rect: QRect, list: &ListView) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_list called outside enter_frame_scope");
+        quadraui::gtk::draw_list(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+            list,
+            &self.current_theme,
+            self.current_line_height,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    fn draw_form(&mut self, _rect: QRect, _form: &Form) {
-        unimplemented!("GtkBackend::draw_form — Stage 2");
+    fn draw_form(&mut self, rect: QRect, form: &Form) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_form called outside enter_frame_scope");
+        quadraui::gtk::draw_form(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+            form,
+            &self.current_theme,
+            self.current_line_height,
+        );
     }
 
-    fn draw_palette(&mut self, _rect: QRect, _palette: &Palette) {
-        unimplemented!("GtkBackend::draw_palette — Stage 2");
+    fn draw_palette(&mut self, rect: QRect, palette: &Palette) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_palette called outside enter_frame_scope");
+        quadraui::gtk::draw_palette(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+            palette,
+            &self.current_theme,
+            self.current_line_height,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
+
+    // ─── Layout-passthrough primitives — deferred to a later stage ─────────
+    //
+    // These take a pre-computed `*Layout` parameter in their existing
+    // `quadraui_gtk::draw_*` shims that the trait doesn't pass through.
+    // Same situation as TUI Stage 2 — folding them needs the trait to
+    // gain `&Layout` parameters (`BACKEND_TRAIT_PROPOSAL.md` §6.2),
+    // which is a quadraui-side change deferred until more call sites
+    // benefit at once.
 
     fn draw_status_bar(&mut self, _rect: QRect, _bar: &StatusBar) {
-        unimplemented!("GtkBackend::draw_status_bar — Stage 2");
+        unimplemented!("GtkBackend::draw_status_bar — needs &Layout in trait");
     }
 
     fn draw_tab_bar(&mut self, _rect: QRect, _bar: &TabBar) {
-        unimplemented!("GtkBackend::draw_tab_bar — Stage 2");
+        unimplemented!("GtkBackend::draw_tab_bar — needs &Layout in trait");
     }
 
     fn draw_activity_bar(&mut self, _rect: QRect, _bar: &ActivityBar) {
-        unimplemented!("GtkBackend::draw_activity_bar — Stage 2");
+        unimplemented!("GtkBackend::draw_activity_bar — needs &Layout in trait");
     }
 
     fn draw_terminal(&mut self, _rect: QRect, _term: &TerminalPrim) {
-        unimplemented!("GtkBackend::draw_terminal — Stage 2");
+        unimplemented!("GtkBackend::draw_terminal — needs &Layout in trait");
     }
 
     fn draw_text_display(&mut self, _rect: QRect, _td: &TextDisplay) {
-        unimplemented!("GtkBackend::draw_text_display — Stage 2");
+        unimplemented!("GtkBackend::draw_text_display — needs &Layout in trait");
+    }
+}
+
+// ─── Cross-backend validation tests ──────────────────────────────────────────
+//
+// Phase B.5 Stage 2: prove the same generic `<B: Backend>` paint
+// helper that's already validated on `TuiBackend` (B.4 Stage 3b)
+// works against `GtkBackend`. This is a compile-only assertion —
+// running the draws would require an active cairo Context, which
+// belongs in a real GTK test harness. The compile-only proof is
+// enough for the trait constraint check.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quadraui::WidgetId;
+
+    /// Generic helper — minimal "app render code" that consumes
+    /// `Backend` through `<B>`. Same shape as the one in
+    /// `tui_main::backend::tests::paint_overlays`.
+    fn paint_overlays<B: Backend>(backend: &mut B, palette: &Palette, list: &ListView) {
+        backend.draw_palette(QRect::new(10.0, 5.0, 60.0, 14.0), palette);
+        backend.draw_list(QRect::new(0.0, 20.0, 80.0, 4.0), list);
+    }
+
+    #[test]
+    fn paint_overlays_compiles_against_gtk_backend() {
+        let _: fn(&mut GtkBackend, &Palette, &ListView) = paint_overlays::<GtkBackend>;
+    }
+
+    #[test]
+    fn gtk_backend_modal_stack_handle_shares_state() {
+        let backend = GtkBackend::new();
+        let h1 = backend.modal_stack_handle();
+        let h2 = backend.modal_stack_handle();
+        // Both handles point at the same `RefCell<ModalStack>`.
+        h1.borrow_mut()
+            .push(WidgetId::new("test:popup"), QRect::new(0.0, 0.0, 10.0, 5.0));
+        assert_eq!(h2.borrow().len(), 1);
+    }
+
+    #[test]
+    fn gtk_backend_register_accelerator_round_trip() {
+        let mut backend = GtkBackend::new();
+        backend.register_accelerator(&Accelerator {
+            id: AcceleratorId::new("test.save"),
+            binding: KeyBinding::Save,
+            scope: AcceleratorScope::Global,
+            label: None,
+        });
+        assert_eq!(backend.accelerators.len(), 1);
+        assert_eq!(backend.parsed_accelerators.len(), 1);
+        backend.unregister_accelerator(&AcceleratorId::new("test.save"));
+        assert!(backend.accelerators.is_empty());
+        assert!(backend.parsed_accelerators.is_empty());
     }
 }
