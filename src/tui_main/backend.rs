@@ -1,54 +1,74 @@
 //! TUI implementation of [`quadraui::Backend`].
 //!
-//! Phase B.4 Stage 1: scaffold the struct + trait impl. `TuiBackend`
-//! holds the persistent UI state the trait requires — modal stack,
-//! drag state, accelerator registry, platform services, cached
-//! viewport. It does **not** own the ratatui `Terminal` for now;
-//! that stays as a local in [`super::event_loop`] and is reached via
-//! `backend.terminal_mut()` once Stage 2 routes draws through trait
-//! methods. Decoupling Terminal ownership from `TuiBackend` keeps
-//! Stage 1's diff small and avoids 80-site mechanical renames.
+//! Phase B.4 Stage 1 added the struct + trait shape. Stage 2 wires up
+//! the frame-scope mechanism so trait `draw_*` methods can reach
+//! `&mut Frame` (only valid inside `terminal.draw(|frame| …)`'s
+//! closure), plus implementations for `draw_palette`, `draw_list`,
+//! `draw_tree`, `draw_form` — the four primitives whose existing
+//! `quadraui_tui::draw_*` shims already match the `(buf, area, prim,
+//! theme)` shape and migrate cleanly.
 //!
-//! The 9 `draw_*` methods are stubbed (`unimplemented!()`) for now —
-//! the existing TUI render path still calls `quadraui::tui::draw_*`
-//! free functions directly via `terminal.draw(|frame| …)`. Stage 2
-//! migrates the render path to call `backend.draw_*` instead.
+//! The other 5 trait `draw_*` methods (status_bar, tab_bar,
+//! activity_bar, terminal, text_display) stay stubbed for now because
+//! their existing shims take a pre-computed `*Layout` parameter that
+//! the trait doesn't pass through. Migrating them needs either the
+//! trait gaining `&Layout` parameters (per
+//! `BACKEND_TRAIT_PROPOSAL.md` §6.2), or the impl recomputing layout
+//! from `&Primitive`. Stage 3 (`paint<B: Backend>` extraction) is the
+//! natural place to resolve that — it has to confront cross-call-site
+//! layout reuse anyway.
 //!
 //! `poll_events` / `wait_events` are stubs (Stage 4 fills them in).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
 use quadraui::{
     Accelerator, AcceleratorId, ActivityBar, Backend, DragState, Form, ListView, ModalStack,
-    Palette, PlatformServices, Rect, StatusBar, TabBar, Terminal as TerminalPrim, TextDisplay,
-    TreeView, UiEvent, Viewport,
+    Palette, PlatformServices, Rect as QRect, StatusBar, TabBar, Terminal as TerminalPrim,
+    TextDisplay, TreeView, UiEvent, Viewport,
 };
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
 use super::services::TuiPlatformServices;
 
 /// TUI backend implementing [`quadraui::Backend`].
 ///
-/// Owns the persistent UI state the trait requires: modal stack,
-/// drag state, accelerator registry, platform services, cached
-/// viewport. The ratatui `Terminal` is **not** owned here — it stays
-/// as a local in [`super::event_loop`] (Stage 1 simplification).
-/// Stage 2 routes draws through the trait's `draw_*` methods, at
-/// which point the Terminal moves into this struct or a sibling.
+/// Owns the persistent UI state the trait requires plus a transient
+/// "current frame" pointer + theme set inside
+/// [`Self::enter_frame_scope`]. The pointer is type-erased
+/// (`*mut ()`) and cleared on scope exit; safe accessors deref it
+/// only while the scope is active.
 ///
-/// Construct with [`TuiBackend::new`].
+/// The ratatui `Terminal` is **not** owned here — it stays as a local
+/// in [`super::event_loop`]. See `BACKEND_TRAIT_PROPOSAL.md` §11 for
+/// rationale and the eventual migration plan.
 pub struct TuiBackend {
     viewport: Viewport,
     modal_stack: ModalStack,
     drag_state: DragState,
     accelerators: HashMap<AcceleratorId, Accelerator>,
     services: TuiPlatformServices,
+    /// Type-erased `&mut Frame<'_>` pointer; non-null only inside
+    /// [`Self::enter_frame_scope`]. `Cell` (not `RefCell`) because
+    /// trait methods borrow `&mut self` already; we only need
+    /// shared-cell semantics for `Copy`-able pointer values.
+    current_frame_ptr: Cell<*mut ()>,
+    /// Theme captured by the most recent
+    /// [`Self::set_current_theme`] call. Defaults to
+    /// `quadraui::Theme::default()` until set.
+    current_theme: quadraui::Theme,
 }
 
 impl TuiBackend {
-    /// Construct the backend with default viewport (80×24). The
-    /// caller calls [`Backend::begin_frame`] each frame (after
-    /// `terminal.size()`) to keep [`Backend::viewport`] in sync.
+    /// Construct the backend with default viewport (80×24) and
+    /// default quadraui theme. The caller calls [`Backend::begin_frame`]
+    /// each frame (after `terminal.size()`) to keep
+    /// [`Backend::viewport`] in sync, and [`Self::set_current_theme`]
+    /// before drawing so the trait `draw_*` methods see the right
+    /// palette.
     pub fn new() -> Self {
         Self {
             viewport: Viewport::default(),
@@ -56,7 +76,67 @@ impl TuiBackend {
             drag_state: DragState::new(),
             accelerators: HashMap::new(),
             services: TuiPlatformServices::new(),
+            current_frame_ptr: Cell::new(std::ptr::null_mut()),
+            current_theme: quadraui::Theme::default(),
         }
+    }
+
+    /// Enter the frame-scope: stash the `&mut Frame<'_>` pointer for
+    /// trait `draw_*` methods to access, run `f`, then clear the
+    /// pointer. **Must** be called from inside a
+    /// `terminal.draw(|frame| …)` closure.
+    ///
+    /// Type-erased through `*mut ()` because `Frame<'a>` carries a
+    /// lifetime parameter we don't want to thread onto `TuiBackend`.
+    /// Safety relies on three invariants enforced by this function's
+    /// shape:
+    ///   1. The pointer is set immediately before running `f` and
+    ///      cleared immediately after, including on panic (via
+    ///      [`scopeguard`]-style restore).
+    ///   2. `f` cannot move the pointer out — it only sees it via
+    ///      [`Self::current_frame_mut`] which returns a fresh
+    ///      `&mut Frame<'_>` borrow scoped to the call.
+    ///   3. `enter_frame_scope` calls don't nest meaningfully —
+    ///      the inner call would overwrite the pointer with the
+    ///      same `&mut` (already aliased) which Rust's borrow-checker
+    ///      forbids at the caller side.
+    pub fn enter_frame_scope<R>(
+        &mut self,
+        frame: &mut Frame<'_>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let ptr = frame as *mut Frame<'_> as *mut ();
+        let prev = self.current_frame_ptr.replace(ptr);
+        let result = f(self);
+        self.current_frame_ptr.set(prev);
+        result
+    }
+
+    /// Get the current frame inside [`Self::enter_frame_scope`], or
+    /// `None` outside it. Trait `draw_*` methods call this and bail
+    /// (panic in dev, silent return otherwise) if `None`.
+    fn current_frame_mut(&mut self) -> Option<&mut Frame<'static>> {
+        let ptr = self.current_frame_ptr.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: `enter_frame_scope` set this from a real
+            // `&mut Frame<'_>` and won't return until the scope
+            // ends, at which point the pointer is cleared. Outside
+            // the scope `ptr` is null and we return `None`.
+            // The `'static` lifetime here is a fiction — the borrow
+            // is actually scoped to the enclosing
+            // `enter_frame_scope` call. Methods using this never let
+            // the borrow escape past their own return.
+            Some(unsafe { &mut *(ptr as *mut Frame<'static>) })
+        }
+    }
+
+    /// Update the cached quadraui theme. Call once per frame from
+    /// `paint`, before any `backend.draw_*` calls. Subsequent
+    /// `draw_*` invocations consume the stored theme.
+    pub fn set_current_theme(&mut self, theme: quadraui::Theme) {
+        self.current_theme = theme;
     }
 
     /// Mutable access to the drag-state. Inherent helper because the
@@ -96,33 +176,39 @@ impl Default for TuiBackend {
     }
 }
 
+/// Convert a [`quadraui::Rect`] (f32 coordinates) to a
+/// [`ratatui::layout::Rect`] (u16). Any negative values clamp to 0;
+/// fractional widths/heights round to nearest. Used by every trait
+/// `draw_*` method to translate the trait's `Rect` argument.
+fn q_rect_to_ratatui(r: QRect) -> Rect {
+    let x = r.x.max(0.0).round() as u16;
+    let y = r.y.max(0.0).round() as u16;
+    let w = r.width.max(0.0).round() as u16;
+    let h = r.height.max(0.0).round() as u16;
+    Rect::new(x, y, w, h)
+}
+
 impl Backend for TuiBackend {
     fn viewport(&self) -> Viewport {
         self.viewport
     }
 
     fn begin_frame(&mut self, viewport: Viewport) {
-        // Stage 1 captures the viewport. Frame setup proper happens
-        // inside ratatui's `terminal.draw(|frame| …)` closure, owned
-        // by the event loop. Stage 2 introduces a `with_frame` inherent
-        // helper and the trait's `draw_*` methods access the frame
-        // through it.
         self.viewport = viewport;
     }
 
     fn end_frame(&mut self) {
-        // Stage 1 no-op. See `begin_frame`.
+        // No-op. The frame's actual flush happens when ratatui's
+        // `terminal.draw(|frame| …)` closure returns; this method
+        // exists for parity with backends that need explicit flush.
     }
 
     fn poll_events(&mut self) -> Vec<UiEvent> {
-        // Stage 4 fills this in. For Stage 1 the existing event loop
-        // still drives crossterm directly.
-        Vec::new()
+        Vec::new() // Stage 4
     }
 
     fn wait_events(&mut self, _timeout: Duration) -> Vec<UiEvent> {
-        // Stage 4 fills this in.
-        Vec::new()
+        Vec::new() // Stage 4
     }
 
     fn register_accelerator(&mut self, acc: &Accelerator) {
@@ -141,46 +227,92 @@ impl Backend for TuiBackend {
         &self.services
     }
 
-    // ─── Drawing — Stage 1 stubs, Stage 2 fills these in ────────────────
+    // ─── Drawing ───────────────────────────────────────────────────────────
     //
-    // The existing event loop calls `quadraui::tui::draw_*` free
-    // functions directly via `terminal.draw(|frame| …)`. These trait
-    // methods aren't reached until Stage 2 routes the render path
-    // through them.
+    // Implementations call into the public `quadraui::tui::draw_*` free
+    // functions; this trait impl is the thin wrapper. The frame is
+    // stashed by `enter_frame_scope`; the theme by `set_current_theme`.
+    // Calling these outside `enter_frame_scope` is a programmer error
+    // and panics in dev (the `expect` makes the boundary loud).
 
-    fn draw_tree(&mut self, _rect: Rect, _tree: &TreeView) {
-        unimplemented!("TuiBackend::draw_tree wired up in B.4 Stage 2")
+    fn draw_tree(&mut self, rect: QRect, tree: &TreeView) {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_tree called outside enter_frame_scope");
+        quadraui::tui::draw_tree(
+            frame.buffer_mut(),
+            area,
+            tree,
+            &theme,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    fn draw_list(&mut self, _rect: Rect, _list: &ListView) {
-        unimplemented!("TuiBackend::draw_list wired up in B.4 Stage 2")
+    fn draw_list(&mut self, rect: QRect, list: &ListView) {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_list called outside enter_frame_scope");
+        quadraui::tui::draw_list(
+            frame.buffer_mut(),
+            area,
+            list,
+            &theme,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    fn draw_form(&mut self, _rect: Rect, _form: &Form) {
-        unimplemented!("TuiBackend::draw_form wired up in B.4 Stage 2")
+    fn draw_form(&mut self, rect: QRect, form: &Form) {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_form called outside enter_frame_scope");
+        quadraui::tui::draw_form(frame.buffer_mut(), area, form, &theme);
     }
 
-    fn draw_palette(&mut self, _rect: Rect, _palette: &Palette) {
-        unimplemented!("TuiBackend::draw_palette wired up in B.4 Stage 2")
+    fn draw_palette(&mut self, rect: QRect, palette: &Palette) {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_palette called outside enter_frame_scope");
+        quadraui::tui::draw_palette(
+            frame.buffer_mut(),
+            area,
+            palette,
+            &theme,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    fn draw_status_bar(&mut self, _rect: Rect, _bar: &StatusBar) {
-        unimplemented!("TuiBackend::draw_status_bar wired up in B.4 Stage 2")
+    // ─── Layout-passthrough primitives — Stage 3 / trait migration ──────
+    //
+    // These take a pre-computed `*Layout` in their existing TUI
+    // shims. Migrating them through the trait needs either the
+    // trait to take `&Layout` (per `BACKEND_TRAIT_PROPOSAL.md` §6.2)
+    // or a per-method recompute. Deferred until Stage 3.
+
+    fn draw_status_bar(&mut self, _rect: QRect, _bar: &StatusBar) {
+        unimplemented!("TuiBackend::draw_status_bar — see Stage 3")
     }
 
-    fn draw_tab_bar(&mut self, _rect: Rect, _bar: &TabBar) {
-        unimplemented!("TuiBackend::draw_tab_bar wired up in B.4 Stage 2")
+    fn draw_tab_bar(&mut self, _rect: QRect, _bar: &TabBar) {
+        unimplemented!("TuiBackend::draw_tab_bar — see Stage 3")
     }
 
-    fn draw_activity_bar(&mut self, _rect: Rect, _bar: &ActivityBar) {
-        unimplemented!("TuiBackend::draw_activity_bar wired up in B.4 Stage 2")
+    fn draw_activity_bar(&mut self, _rect: QRect, _bar: &ActivityBar) {
+        unimplemented!("TuiBackend::draw_activity_bar — see Stage 3")
     }
 
-    fn draw_terminal(&mut self, _rect: Rect, _term: &TerminalPrim) {
-        unimplemented!("TuiBackend::draw_terminal wired up in B.4 Stage 2")
+    fn draw_terminal(&mut self, _rect: QRect, _term: &TerminalPrim) {
+        unimplemented!("TuiBackend::draw_terminal — see Stage 3")
     }
 
-    fn draw_text_display(&mut self, _rect: Rect, _td: &TextDisplay) {
-        unimplemented!("TuiBackend::draw_text_display wired up in B.4 Stage 2")
+    fn draw_text_display(&mut self, _rect: QRect, _td: &TextDisplay) {
+        unimplemented!("TuiBackend::draw_text_display — see Stage 3")
     }
 }

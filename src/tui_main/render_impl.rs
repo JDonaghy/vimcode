@@ -114,6 +114,10 @@ pub(super) fn draw_frame(
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
     editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
+    // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
+    // Set once per frame by the caller (cached theme); the migrated
+    // call sites wrap their access in `backend.enter_frame_scope`.
+    backend: &mut super::backend::TuiBackend,
 ) {
     let area = frame.area();
 
@@ -736,8 +740,19 @@ pub(super) fn draw_frame(
             height,
         };
         // Per D6: build quadraui::Palette + draw_palette.
+        // Phase B.4 Stage 2: route through `Backend::draw_palette`.
         let palette = folder_picker_to_palette(picker, width as usize);
-        super::quadraui_tui::draw_palette(frame.buffer_mut(), popup_area, &palette, theme);
+        let q_rect = quadraui::Rect::new(
+            popup_area.x as f32,
+            popup_area.y as f32,
+            popup_area.width as f32,
+            popup_area.height as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_palette(q_rect, &palette);
+        });
     }
 
     // ── Find/replace overlay (top-right of active group) ───────────────────
@@ -754,7 +769,7 @@ pub(super) fn draw_frame(
 
     // ── Unified picker modal (above terminal/status so it's fully visible) ──
     if let Some(ref picker) = screen.picker {
-        render_picker_popup(frame, picker, area, theme);
+        render_picker_popup(frame, picker, area, theme, backend);
     }
 
     // ── Tab switcher popup ───────────────────────────────────────────────────
@@ -779,8 +794,19 @@ pub(super) fn draw_frame(
                 height,
             };
             // Per D6: build quadraui::ListView (bordered) + draw_list.
+            // Phase B.4 Stage 2: route through `Backend::draw_list`.
             let list = render::tab_switcher_to_quadraui_list_view(ts, max_visible);
-            super::quadraui_tui::draw_list(frame.buffer_mut(), popup_area, &list, theme);
+            let q_rect = quadraui::Rect::new(
+                popup_area.x as f32,
+                popup_area.y as f32,
+                popup_area.width as f32,
+                popup_area.height as f32,
+            );
+            backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+            backend.enter_frame_scope(frame, |b| {
+                use quadraui::Backend;
+                b.draw_list(q_rect, &list);
+            });
         }
     }
 
@@ -1588,6 +1614,7 @@ pub(super) fn render_picker_popup(
     picker: &render::PickerPanel,
     term_area: Rect,
     theme: &Theme,
+    backend: &mut super::backend::TuiBackend,
 ) {
     let term_cols = term_area.width;
     let term_rows = term_area.height;
@@ -1608,7 +1635,18 @@ pub(super) fn render_picker_popup(
             width,
             height,
         };
-        super::quadraui_tui::draw_palette(frame.buffer_mut(), area, &palette, theme);
+        // Phase B.4 Stage 2: route through `Backend::draw_palette`.
+        let q_rect = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_palette(q_rect, &palette);
+        });
         return;
     }
 
@@ -2971,6 +3009,7 @@ mod tests {
         let mut editor_hover_link_rects = Vec::new();
         let mut editor_hover_scrollbar = None;
         let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
+        let mut backend = super::backend::TuiBackend::new();
 
         terminal
             .draw(|frame| {
@@ -2996,6 +3035,7 @@ mod tests {
                     &mut editor_hover_link_rects,
                     &mut editor_hover_scrollbar,
                     &mut tab_visible_counts,
+                    &mut backend,
                 );
             })
             .unwrap();

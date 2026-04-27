@@ -47,39 +47,6 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
     quadraui::tui::draw_form(buf, area, form, &q_theme(theme));
 }
 
-/// Draw a `quadraui::Palette` modal overlay into `area` on `buf`.
-///
-/// Layout (matches the pre-migration picker popup minus the preview
-/// pane and tree-indent rendering — those cases fall through to the
-/// legacy renderer until the primitive carries them):
-///
-/// ```text
-/// ╭─ Title  N/M ──╮
-/// │ > query▌      │
-/// ├───────────────┤
-/// │  Item 1       │
-/// │  Item 2       │
-/// │  Item 3 detail│
-/// ╰───────────────╯
-/// ```
-///
-/// `match_positions` on each item highlight matched characters with
-/// the accent `fuzzy_match_fg` colour.
-pub(super) fn draw_palette(
-    buf: &mut Buffer,
-    area: Rect,
-    palette: &quadraui::Palette,
-    theme: &Theme,
-) {
-    quadraui::tui::draw_palette(
-        buf,
-        area,
-        palette,
-        &q_theme(theme),
-        crate::icons::nerd_fonts_enabled(),
-    );
-}
-
 /// Draw a `quadraui::ListView` into `area` on `buf`.
 ///
 /// Layout: optional title header (if `list.title` is `Some`), then one

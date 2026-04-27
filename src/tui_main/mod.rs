@@ -1342,6 +1342,7 @@ fn event_loop(
                             &mut editor_hover_link_rects,
                             &mut editor_hover_scrollbar,
                             &mut tab_visible_counts,
+                            &mut backend,
                         );
                     }
                 })
@@ -1394,6 +1395,7 @@ fn event_loop(
                                     &mut editor_hover_link_rects,
                                     &mut editor_hover_scrollbar,
                                     &mut tab_visible_counts2,
+                                    &mut backend,
                                 );
                             }
                         })
