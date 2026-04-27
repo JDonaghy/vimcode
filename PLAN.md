@@ -6,23 +6,110 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 — **all stages shipped.** Stages 1–7 + 5c + 5d. The `quadraui::Backend` trait is load-bearing in vimcode's TUI, every keystroke / click / drag / scroll routes through it, and `quadraui/docs/BACKEND.md` ships the worked-example a fresh backend uses as its template. Open follow-ups (#242 #243 #245 #246 #200) are scoped scrollbar polish — none block B.5 (GTK rewrite on top of quadraui) starting.)
+> **Last updated:** 2026-04-27 (Phase B.4 complete; **Phase B.5 starting.** B.4 shipped the `quadraui::Backend` trait load-bearing on TUI (Stages 1–7 + 5c + 5d, `0aa9745`). B.5 is the GTK rewrite: bring `vimcode` (GTK binary) onto the same trait so `paint::<B>` and the event-loop adapter work identically across backends. Option A (event queue) confirmed for the GTK signal → `wait_events` adapter; same pattern will apply to Win-GUI (B.6), macOS (B.7), and any future Android/iOS/WASM backends.)
 
 ---
 
-## 🎯 CURRENT FOCUS — Phase B.4: TUI Backend trait implementation
+## 🎯 CURRENT FOCUS — Phase B.5: GTK Backend trait implementation
 
-The quadraui readiness gate is **clear** (all primitives shipped with
+Bring vimcode's GTK binary onto `quadraui::Backend` so the same
+generic `paint::<B>` and `UiEvent` dispatch code that drives TUI
+drives GTK. Each stage merges to develop on its own — `vimcode`
+keeps working at every commit. Refactor in place; no parallel tree.
+
+### Pinned decisions (locked before Stage 1)
+
+1. **Event-loop shape: option A — event queue.** GtkBackend holds
+   `Rc<RefCell<VecDeque<UiEvent>>>`; GTK signal callbacks push into
+   it; `wait_events(timeout)` drains the queue (using
+   `glib::MainContext::iteration(false)` between checks if empty).
+   This keeps the trait shape uniform with TUI and forward-compatible
+   with all callback-driven backends (Win-GUI, macOS, Android, iOS,
+   web). TUI is **not** inverted — its synchronous loop stays
+   greppable end-to-end.
+2. **Editor primitive stays inherent**, like TUI — `draw.rs::draw_editor`
+   doesn't go through the trait. Per `BACKEND_TRAIT_PROPOSAL.md` §6.2,
+   the editor primitive is deferred until all 4 backends ship.
+3. **Settings panel stays GTK-native** for inputs that are better as
+   native widgets (font picker, color picker, file picker). The Form
+   primitive carries the rest.
+4. **Stage workflow: Path A.** Each stage merges to develop independently.
+   `vimcode` keeps booting and rendering at every commit.
+
+### Stage map
+
+| Stage | Goal | Status | Commit |
+|---|---|---|---|
+| **0** | This proposal — pin scope, decisions, doc the queue pattern | ⬜ | (this commit) |
+| **1** | `GtkBackend` skeleton + frame-scope (`&cairo::Context`). Owns `modal_stack`, `drag_state`, accelerators, viewport, services. Stub `draw_*` delegates to existing `quadraui_gtk::draw_*` shims. App holds it as `Rc<RefCell<GtkBackend>>`. | ⬜ | — |
+| **2** | Trait `draw_*` methods route through `GtkBackend`. Existing 13 shims fold into the trait impl. | ⬜ | — |
+| **3** | Reuse `paint<B: Backend>` from B.4 Stage 3 — same generic function drives both backends inside the native draw closure. | ⬜ | — |
+| **4** | GTK signal → `UiEvent` translation + event-queue adapter. **Highest-risk stage.** | ⬜ | — |
+| **5** | Click + drag dispatch consolidation through `dispatch_mouse_down/drag/up`. Most done already; finish remaining sites. | ⬜ | — |
+| **6** | Accelerator registry — register panel_keys + universal accelerators on GtkBackend. Mirrors B.4 Stage 6. | ⬜ | — |
+| **7** | `PlatformServices` impl — clipboard, file dialogs, notifications, URL opener via GTK APIs. | ⬜ | — |
+| **8** | Cleanup + parity verification with TUI; document the queue pattern in `BACKEND.md`. | ⬜ | — |
+
+**Realistic total:** ~10–12 sessions.
+
+### Forward-compatibility notes (for backends after B.5)
+
+The queue pattern from Stage 4 generalises to every callback-driven
+backend. Concrete plans for later phases (not B.5 scope):
+
+- **B.6 Win-GUI** — `wait_events` calls `MsgWaitForMultipleObjects`
+  with the timeout, then `PeekMessage`/`DispatchMessage`. WindowProc
+  translates messages to `UiEvent` and pushes onto the queue.
+  Win32 is hybrid (poll + callbacks); fits naturally.
+- **B.7 macOS native** — `NSApplication.run()` runs on the main
+  thread; delegate methods push to a `Mutex<VecDeque<UiEvent>>`.
+  `wait_events` polls the queue; if empty, runs one iteration of
+  `NSRunLoop` with a brief timeout.
+- **Future Android (NDK + ALooper)** — `ALooper_pollAll(timeout)` is
+  the natural `wait_events` shape. Touch events would require new
+  `UiEvent::Touch*` variants (additive, doesn't break the trait).
+- **Future iOS (UIKit via objc2)** — same queue pattern as macOS;
+  also needs touch variants.
+- **Future WASM/web** — JS event listeners push to a queue;
+  `requestAnimationFrame` callback drives paint. Single-threaded
+  but doesn't conflict with the queue.
+
+The hard work for mobile/web is **engine-layer** (subprocess
+spawning for LSP / git / terminal panes; sandboxed filesystems; soft
+keyboard / IME; touch primitives), not the Backend trait.
+
+### Critical risks for B.5
+
+1. **Stage 4 — event-queue + Relm4 interplay.** GTK signal callbacks
+   live inside Relm4 widget templates; the queue handle needs to be
+   reachable from every callback. Likely solution: `Rc<RefCell<VecDeque>>`
+   field on `GtkBackend`; each callback closure captures a clone.
+   Risk: if Relm4's actor model fights the shared-state pattern,
+   we may need a different IPC shape (mpsc channel from callbacks
+   to the wait_events drainer).
+2. **Refactoring the 11k-line `mod.rs`.** Some App component fields
+   move to `GtkBackend`; others stay. Stage 1 establishes the
+   boundary; later stages may surface fields that need to move.
+3. **Editor draw stays inherent** but must continue to share data
+   with the trait-driven primitives (e.g. font metrics, theme).
+   Need to thread those through cleanly.
+
+### Open issues B.5 may resolve
+
+- **#229** GTK editor hover: scrollbar leak (right-edge specific) — falls out of dispatch consolidation
+- **#192** GTK palette mouse leak — same
+- **#236** GTK ContextMenu border barely visible — touched in chrome migration but separate
+- **#243** GTK debug sidebar: no GestureDrag (filed during Stage 5c) — Stage 5 directly addresses
+
+---
+
+## ✅ Phase B.4 — TUI Backend trait (shipped)
+
+The quadraui readiness gate cleared (all primitives shipped with
 D6 `layout()` + `hit_test()`; cross-backend dispatch infrastructure
-proven). Phase B.4 is the multi-session rewrite of vimcode's TUI
+proven). Phase B.4 was the multi-session rewrite of vimcode's TUI
 backend on top of `quadraui::Backend` + `UiEvent` + the dispatch
-infrastructure. Each stage merges to develop on its own — `vcd`
-keeps working at every commit. **No `tui_main_v2/` parallel tree.**
-Refactor in place.
-
-**Detailed stage-by-stage plan:** `~/.claude/plans/federated-hugging-hinton.md`
-(Claude's planning workspace; copy to repo if needed for off-machine
-pickup).
+infrastructure.
 
 ### Stage map
 
