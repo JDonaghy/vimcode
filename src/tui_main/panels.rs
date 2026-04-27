@@ -3536,11 +3536,12 @@ pub(super) fn render_debug_output(
 // ─── Quickfix panel ───────────────────────────────────────────────────────────
 
 pub(super) fn render_quickfix_panel(
-    buf: &mut ratatui::buffer::Buffer,
+    frame: &mut ratatui::Frame,
     area: Rect,
     qf: &render::QuickfixPanel,
     scroll_top: usize,
     theme: &Theme,
+    backend: &mut super::backend::TuiBackend,
 ) {
     if area.height == 0 {
         return;
@@ -3549,9 +3550,20 @@ pub(super) fn render_quickfix_panel(
     // shared `quadraui::ListView` primitive. The adapter produces a
     // ListView with a `QUICKFIX (N items)` header; `draw_list` renders
     // header + rows with selection indicator + dimmed detail.
+    // Phase B.4 Stage 3a: route through `Backend::draw_list`.
     let mut list = render::quickfix_to_list_view(qf);
     list.scroll_offset = scroll_top;
-    super::quadraui_tui::draw_list(buf, area, &list, theme);
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_list(q_rect, &list);
+    });
 }
 
 // ─── Terminal panel ───────────────────────────────────────────────────────────

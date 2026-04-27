@@ -47,22 +47,6 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
     quadraui::tui::draw_form(buf, area, form, &q_theme(theme));
 }
 
-/// Draw a `quadraui::ListView` into `area` on `buf`.
-///
-/// Layout: optional title header (if `list.title` is `Some`), then one
-/// row per item. Selected row gets a `▶ ` prefix and `sel_bg`
-/// background. Optional icons sit left of the text; optional detail
-/// text is right-aligned and dimmed.
-pub(super) fn draw_list(buf: &mut Buffer, area: Rect, list: &quadraui::ListView, theme: &Theme) {
-    quadraui::tui::draw_list(
-        buf,
-        area,
-        list,
-        &q_theme(theme),
-        crate::icons::nerd_fonts_enabled(),
-    );
-}
-
 /// Draw a `quadraui::StatusBar` as a single row.
 ///
 /// `area` is the target rect (height is ignored beyond the first row).

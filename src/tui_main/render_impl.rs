@@ -590,11 +590,12 @@ pub(super) fn draw_frame(
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
         render_quickfix_panel(
-            frame.buffer_mut(),
+            frame,
             quickfix_area,
             qf,
             quickfix_scroll_top,
             theme,
+            backend,
         );
     }
 
