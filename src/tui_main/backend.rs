@@ -28,9 +28,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use quadraui::{
-    Accelerator, AcceleratorId, ActivityBar, Backend, DragState, Form, ListView, ModalStack,
-    Palette, PlatformServices, Rect as QRect, StatusBar, TabBar, Terminal as TerminalPrim,
-    TextDisplay, TreeView, UiEvent, Viewport,
+    parse_key_binding, Accelerator, AcceleratorId, AcceleratorScope, ActivityBar, Backend,
+    DragState, Form, KeyBinding, ListView, ModalStack, Palette, ParsedBinding, PlatformServices,
+    Rect as QRect, StatusBar, TabBar, Terminal as TerminalPrim, TextDisplay, TreeView, UiEvent,
+    Viewport,
 };
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -53,6 +54,11 @@ pub struct TuiBackend {
     modal_stack: ModalStack,
     drag_state: DragState,
     accelerators: HashMap<AcceleratorId, Accelerator>,
+    /// Pre-parsed bindings, kept in lock-step with `accelerators`. Stage 6
+    /// uses this for the `wait_events`/`poll_events` matcher to avoid
+    /// re-parsing on every keystroke. First-match-wins iteration order
+    /// matches insertion order (`Vec`, not `HashMap`).
+    parsed_accelerators: Vec<(ParsedBinding, AcceleratorId)>,
     services: TuiPlatformServices,
     /// Type-erased `&mut Frame<'_>` pointer; non-null only inside
     /// [`Self::enter_frame_scope`]. `Cell` (not `RefCell`) because
@@ -78,6 +84,7 @@ impl TuiBackend {
             modal_stack: ModalStack::new(),
             drag_state: DragState::new(),
             accelerators: HashMap::new(),
+            parsed_accelerators: Vec::new(),
             services: TuiPlatformServices::new(),
             current_frame_ptr: Cell::new(std::ptr::null_mut()),
             current_theme: quadraui::Theme::default(),
@@ -165,11 +172,130 @@ impl TuiBackend {
         (&mut self.drag_state, &mut self.modal_stack)
     }
 
-    /// Iterate registered accelerators (Stage 4 will use this in
-    /// `poll_events`).
+    /// Iterate registered accelerators.
     #[allow(dead_code)]
     pub(crate) fn accelerators(&self) -> impl Iterator<Item = (&AcceleratorId, &Accelerator)> {
         self.accelerators.iter()
+    }
+
+    /// Walk `events` and rewrite any `UiEvent::KeyPressed` whose key +
+    /// modifiers match a registered `Global`-scope accelerator into
+    /// `UiEvent::Accelerator(id, modifiers)`. Stage 6's whole point: the
+    /// app dispatches on stable IDs, never on raw key strings, for
+    /// keybindings the user can rebind.
+    ///
+    /// Widget- and Mode-scoped accelerators are skipped here — the
+    /// backend doesn't know which widget has focus or what mode the app
+    /// is in. Apps that want those scopes match against `KeyPressed`
+    /// themselves once they have that context.
+    fn apply_accelerators(&self, events: &mut [UiEvent]) {
+        if self.parsed_accelerators.is_empty() {
+            return;
+        }
+        for ev in events.iter_mut() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = ev {
+                if let Some(id) = self.match_keypress(key, *modifiers) {
+                    *ev = UiEvent::Accelerator(id, *modifiers);
+                }
+            }
+        }
+    }
+
+    fn match_keypress(
+        &self,
+        key: &quadraui::Key,
+        modifiers: quadraui::Modifiers,
+    ) -> Option<AcceleratorId> {
+        let key_name = match key {
+            quadraui::Key::Char(c) => {
+                // Single ASCII letters parse as lowercase in
+                // `parse_key_binding`; mirror that so `<C-S-T>` and
+                // `Ctrl+Shift+t` both match here.
+                if c.is_ascii() {
+                    c.to_ascii_lowercase().to_string()
+                } else {
+                    c.to_string()
+                }
+            }
+            quadraui::Key::Named(named) => named_key_to_binding_name(*named).to_string(),
+        };
+        for (parsed, id) in &self.parsed_accelerators {
+            if parsed.modifiers == modifiers && parsed.key == key_name {
+                // Skip non-Global-scope entries — the backend doesn't
+                // own focus/mode context.
+                if let Some(acc) = self.accelerators.get(id) {
+                    if matches!(acc.scope, AcceleratorScope::Global) {
+                        return Some(id.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Parse a `KeyBinding` (any variant) into a `ParsedBinding`. Returns
+/// `None` for unparseable literals — those silently miss matching, same
+/// as the engine-side B.2 path. The universal arms map to the canonical
+/// vim-style strings the rest of vimcode already uses.
+fn parse_binding(b: &KeyBinding) -> Option<ParsedBinding> {
+    match b {
+        KeyBinding::Literal(s) if s.is_empty() => None,
+        KeyBinding::Literal(s) => parse_key_binding(s),
+        KeyBinding::Save => parse_key_binding("<C-s>"),
+        KeyBinding::Open => parse_key_binding("<C-o>"),
+        KeyBinding::New => parse_key_binding("<C-n>"),
+        KeyBinding::Close => parse_key_binding("<C-w>"),
+        KeyBinding::Copy => parse_key_binding("<C-c>"),
+        KeyBinding::Cut => parse_key_binding("<C-x>"),
+        KeyBinding::Paste => parse_key_binding("<C-v>"),
+        KeyBinding::Undo => parse_key_binding("<C-z>"),
+        KeyBinding::Redo => parse_key_binding("<C-S-z>"),
+        KeyBinding::SelectAll => parse_key_binding("<C-a>"),
+        KeyBinding::Find => parse_key_binding("<C-f>"),
+        KeyBinding::Replace => parse_key_binding("<C-h>"),
+        KeyBinding::Quit => parse_key_binding("<C-q>"),
+    }
+}
+
+/// Map a `quadraui::NamedKey` to the canonical name `parse_key_binding`
+/// produces. Letter case follows `accelerator::normalise_key_name`:
+/// single letters lowercase, named keys TitleCase-preserved.
+fn named_key_to_binding_name(named: quadraui::NamedKey) -> &'static str {
+    use quadraui::NamedKey::*;
+    match named {
+        Escape => "Escape",
+        Tab => "Tab",
+        BackTab => "BackTab",
+        Enter => "Enter",
+        Backspace => "Backspace",
+        Delete => "Delete",
+        Insert => "Insert",
+        Home => "Home",
+        End => "End",
+        PageUp => "PageUp",
+        PageDown => "PageDown",
+        Up => "Up",
+        Down => "Down",
+        Left => "Left",
+        Right => "Right",
+        F(1) => "F1",
+        F(2) => "F2",
+        F(3) => "F3",
+        F(4) => "F4",
+        F(5) => "F5",
+        F(6) => "F6",
+        F(7) => "F7",
+        F(8) => "F8",
+        F(9) => "F9",
+        F(10) => "F10",
+        F(11) => "F11",
+        F(12) => "F12",
+        F(_) => "",
+        CapsLock => "CapsLock",
+        NumLock => "NumLock",
+        ScrollLock => "ScrollLock",
+        Menu => "Menu",
     }
 }
 
@@ -209,14 +335,9 @@ impl Backend for TuiBackend {
     fn poll_events(&mut self) -> Vec<UiEvent> {
         // Drain every queued crossterm event; never blocks. Each
         // native event translates to zero, one, or more `UiEvent`s
-        // via [`super::events::crossterm_to_uievents`].
-        //
-        // NOTE: as of Stage 4 the existing event loop in
-        // [`super::event_loop`] still drives `ratatui::crossterm::event::read`
-        // directly, so this method's return is empty in practice
-        // (the loop drains events first). Stage 5 flips the loop
-        // to consume `backend.wait_events(...)` instead, at which
-        // point this code path becomes the canonical event source.
+        // via [`super::events::crossterm_to_uievents`], then runs
+        // through [`Self::apply_accelerators`] so registered bindings
+        // surface as `UiEvent::Accelerator` instead of `KeyPressed`.
         let mut out = Vec::new();
         while ratatui::crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
             match ratatui::crossterm::event::read() {
@@ -224,35 +345,43 @@ impl Backend for TuiBackend {
                 Err(_) => break,
             }
         }
+        self.apply_accelerators(&mut out);
         out
     }
 
     fn wait_events(&mut self, timeout: Duration) -> Vec<UiEvent> {
         // Block up to `timeout` for the next native event, translate it,
-        // and return. Empty `Vec` on timeout. Does **not** drain
-        // additional queued events — callers that want to absorb a
-        // backlog (e.g. coalescing drag motions) call [`Self::poll_events`]
-        // afterwards.
+        // match against registered accelerators, and return. Empty `Vec`
+        // on timeout.
         //
         // The "one event per call" shape preserves the existing event
         // loop's `match` semantics: each iteration handles exactly one
         // event before checking timing-sensitive state (yank highlight
-        // expiry, notification spinner cadence, etc.). Stage 5b's loop
-        // migration relies on this.
+        // expiry, notification spinner cadence, etc.).
         if let Ok(true) = ratatui::crossterm::event::poll(timeout) {
             if let Ok(ev) = ratatui::crossterm::event::read() {
-                return super::events::crossterm_to_uievents(ev);
+                let mut out = super::events::crossterm_to_uievents(ev);
+                self.apply_accelerators(&mut out);
+                return out;
             }
         }
         Vec::new()
     }
 
     fn register_accelerator(&mut self, acc: &Accelerator) {
+        // Re-registration replaces the prior entry — both in the map and
+        // the parsed list, otherwise stale bindings would shadow the new
+        // one in `match_accelerator`.
         self.accelerators.insert(acc.id.clone(), acc.clone());
+        self.parsed_accelerators.retain(|(_, id)| id != &acc.id);
+        if let Some(parsed) = parse_binding(&acc.binding) {
+            self.parsed_accelerators.push((parsed, acc.id.clone()));
+        }
     }
 
     fn unregister_accelerator(&mut self, id: &AcceleratorId) {
         self.accelerators.remove(id);
+        self.parsed_accelerators.retain(|(_, eid)| eid != id);
     }
 
     fn modal_stack_mut(&mut self) -> &mut ModalStack {
@@ -576,5 +705,181 @@ mod tests {
         mock.modal_stack_mut()
             .push(WidgetId::new("test:popup"), QRect::new(0.0, 0.0, 10.0, 5.0));
         assert_eq!(mock.modal_stack_mut().len(), 1);
+    }
+
+    // ─── Stage 6: accelerator matching ──────────────────────────────────────
+
+    use quadraui::{Key, Modifiers, NamedKey};
+
+    fn ctrl_p_keypress() -> UiEvent {
+        UiEvent::KeyPressed {
+            key: Key::Char('p'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            repeat: false,
+        }
+    }
+
+    fn make_acc(id: &str, binding: &str) -> Accelerator {
+        Accelerator {
+            id: AcceleratorId::new(id),
+            binding: KeyBinding::Literal(binding.to_string()),
+            scope: AcceleratorScope::Global,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn accelerator_match_replaces_keypressed_with_accelerator() {
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("tui.fuzzy_finder", "<C-p>"));
+
+        let mut events = vec![ctrl_p_keypress()];
+        backend.apply_accelerators(&mut events);
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            UiEvent::Accelerator(id, mods) => {
+                assert_eq!(id.as_str(), "tui.fuzzy_finder");
+                assert!(mods.ctrl);
+            }
+            other => panic!("expected Accelerator, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accelerator_match_named_keys() {
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("debug.continue", "<F5>"));
+
+        let mut events = vec![UiEvent::KeyPressed {
+            key: Key::Named(NamedKey::F(5)),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        }];
+        backend.apply_accelerators(&mut events);
+
+        match &events[0] {
+            UiEvent::Accelerator(id, _) => assert_eq!(id.as_str(), "debug.continue"),
+            other => panic!("expected Accelerator, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accelerator_match_uppercase_letter_normalised() {
+        // `<C-S-T>` and a Shift+T keypress (which arrives as Char('T')
+        // from crossterm with SHIFT in modifiers) must match.
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("test.upper", "<C-S-T>"));
+
+        let mut events = vec![UiEvent::KeyPressed {
+            key: Key::Char('T'),
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+            repeat: false,
+        }];
+        backend.apply_accelerators(&mut events);
+
+        match &events[0] {
+            UiEvent::Accelerator(id, _) => assert_eq!(id.as_str(), "test.upper"),
+            other => panic!("expected Accelerator, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn accelerator_no_match_stays_keypressed() {
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("tui.fuzzy_finder", "<C-p>"));
+
+        let mut events = vec![UiEvent::KeyPressed {
+            key: Key::Char('q'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            repeat: false,
+        }];
+        backend.apply_accelerators(&mut events);
+
+        assert!(matches!(events[0], UiEvent::KeyPressed { .. }));
+    }
+
+    #[test]
+    fn accelerator_modifier_mismatch_no_match() {
+        // `<C-p>` should NOT fire on `p` alone (no modifiers).
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("tui.fuzzy_finder", "<C-p>"));
+
+        let mut events = vec![UiEvent::KeyPressed {
+            key: Key::Char('p'),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        }];
+        backend.apply_accelerators(&mut events);
+
+        assert!(matches!(events[0], UiEvent::KeyPressed { .. }));
+    }
+
+    #[test]
+    fn accelerator_unregister_removes_match() {
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("tui.fuzzy_finder", "<C-p>"));
+        backend.unregister_accelerator(&AcceleratorId::new("tui.fuzzy_finder"));
+
+        let mut events = vec![ctrl_p_keypress()];
+        backend.apply_accelerators(&mut events);
+
+        assert!(matches!(events[0], UiEvent::KeyPressed { .. }));
+    }
+
+    #[test]
+    fn accelerator_re_register_replaces_binding() {
+        // Registering the same id twice should swap the binding, not
+        // accumulate stale entries.
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&make_acc("test.toggle", "<C-p>"));
+        backend.register_accelerator(&make_acc("test.toggle", "<C-q>"));
+
+        let mut events = vec![ctrl_p_keypress()];
+        backend.apply_accelerators(&mut events);
+        assert!(
+            matches!(events[0], UiEvent::KeyPressed { .. }),
+            "old binding must not match after re-register"
+        );
+
+        let mut events = vec![UiEvent::KeyPressed {
+            key: Key::Char('q'),
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            repeat: false,
+        }];
+        backend.apply_accelerators(&mut events);
+        assert!(matches!(&events[0], UiEvent::Accelerator(id, _) if id.as_str() == "test.toggle"));
+    }
+
+    #[test]
+    fn accelerator_widget_scope_skipped() {
+        // Backend doesn't know which widget has focus; widget-scoped
+        // accelerators must NOT match here. The app keeps inline
+        // matching for those.
+        let mut backend = TuiBackend::new();
+        backend.register_accelerator(&Accelerator {
+            id: AcceleratorId::new("widget.local"),
+            binding: KeyBinding::Literal("<C-p>".into()),
+            scope: AcceleratorScope::Widget(WidgetId::new("test:input")),
+            label: None,
+        });
+
+        let mut events = vec![ctrl_p_keypress()];
+        backend.apply_accelerators(&mut events);
+
+        assert!(matches!(events[0], UiEvent::KeyPressed { .. }));
     }
 }

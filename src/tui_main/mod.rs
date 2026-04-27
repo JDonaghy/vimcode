@@ -143,21 +143,209 @@ pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) 
     .max_panel_content_rows()
 }
 
-fn matches_tui_key(binding: &str, code: KeyCode, mods: KeyModifiers) -> bool {
-    let key_char = match code {
-        KeyCode::Char(c) => Some(c),
-        _ => None,
-    };
-    crate::render::matches_key_binding(
-        binding,
-        mods.contains(KeyModifiers::CONTROL),
-        mods.contains(KeyModifiers::SHIFT),
-        mods.contains(KeyModifiers::ALT),
-        key_char,
-        matches!(code, KeyCode::Tab),
-        matches!(code, KeyCode::Char(' ')),
-        matches!(code, KeyCode::Esc),
-    )
+// ─── Phase B.4 Stage 6: panel-key accelerator registry ──────────────────────
+//
+// Stable accelerator IDs for the `panel_keys` settings. The TUI event loop
+// matches on these IDs in its `UiEvent::Accelerator` arm so the dispatch
+// is decoupled from the user's chosen key strings.
+
+pub(super) const ACC_TOGGLE_SIDEBAR: &str = "tui.panel.toggle_sidebar";
+pub(super) const ACC_FOCUS_EXPLORER: &str = "tui.panel.focus_explorer";
+pub(super) const ACC_FOCUS_SEARCH: &str = "tui.panel.focus_search";
+pub(super) const ACC_FUZZY_FINDER: &str = "tui.panel.fuzzy_finder";
+pub(super) const ACC_LIVE_GREP: &str = "tui.panel.live_grep";
+pub(super) const ACC_COMMAND_PALETTE: &str = "tui.panel.command_palette";
+pub(super) const ACC_OPEN_TERMINAL: &str = "tui.panel.open_terminal";
+pub(super) const ACC_TERMINAL_TOGGLE_MAX: &str = "terminal.toggle_maximize";
+pub(super) const ACC_ADD_CURSOR: &str = "tui.panel.add_cursor";
+pub(super) const ACC_SELECT_ALL_MATCHES: &str = "tui.panel.select_all_matches";
+pub(super) const ACC_SPLIT_EDITOR_RIGHT: &str = "tui.panel.split_editor_right";
+pub(super) const ACC_SPLIT_EDITOR_DOWN: &str = "tui.panel.split_editor_down";
+pub(super) const ACC_NAV_BACK: &str = "tui.panel.nav_back";
+pub(super) const ACC_NAV_FORWARD: &str = "tui.panel.nav_forward";
+
+/// Dispatch a panel-key accelerator. Returns `true` if the id was handled
+/// (caller should `continue` the event loop), `false` to fall through.
+///
+/// Pre-Stage-6 the actions lived inline as `if matches_tui_key(...)` arms
+/// scattered through `event_loop`. This collapses them into one site so
+/// keybinding routing is no longer mixed with the rest of the legacy key
+/// dispatch.
+fn dispatch_panel_accelerator(
+    id: &str,
+    _mods: quadraui::Modifiers,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    terminal: &Terminal<CrosstermBackend<Stdout>>,
+    needs_redraw: &mut bool,
+) -> bool {
+    match id {
+        ACC_TOGGLE_SIDEBAR => {
+            sidebar.visible = !sidebar.visible;
+            if !sidebar.visible {
+                sidebar.has_focus = false;
+            }
+            engine.session.explorer_visible = sidebar.visible;
+            sync_sidebar_focus(sidebar, engine);
+            let _ = engine.session.save();
+            *needs_redraw = true;
+            true
+        }
+        ACC_FOCUS_EXPLORER => {
+            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Explorer {
+                sidebar.has_focus = false;
+            } else {
+                sidebar.visible = true;
+                sidebar.active_panel = TuiPanel::Explorer;
+                sidebar.has_focus = true;
+            }
+            sync_sidebar_focus(sidebar, engine);
+            *needs_redraw = true;
+            true
+        }
+        ACC_FOCUS_SEARCH => {
+            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Search {
+                sidebar.has_focus = false;
+            } else {
+                sidebar.visible = true;
+                sidebar.active_panel = TuiPanel::Search;
+                sidebar.has_focus = true;
+                sidebar.search_input_mode = true;
+                sidebar.replace_input_focused = false;
+            }
+            sync_sidebar_focus(sidebar, engine);
+            *needs_redraw = true;
+            true
+        }
+        ACC_FUZZY_FINDER => {
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            *needs_redraw = true;
+            true
+        }
+        ACC_LIVE_GREP => {
+            engine.open_picker(crate::core::engine::PickerSource::Grep);
+            *needs_redraw = true;
+            true
+        }
+        ACC_COMMAND_PALETTE => {
+            engine.open_picker(crate::core::engine::PickerSource::Commands);
+            *needs_redraw = true;
+            true
+        }
+        ACC_OPEN_TERMINAL => {
+            if engine.terminal_open && engine.terminal_has_focus {
+                engine.close_terminal();
+            } else if engine.terminal_open {
+                engine.terminal_has_focus = true;
+            } else {
+                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                if engine.terminal_panes.is_empty() {
+                    engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
+                } else {
+                    engine.open_terminal(cols, engine.session.terminal_panel_rows);
+                }
+            }
+            *needs_redraw = true;
+            true
+        }
+        ACC_TERMINAL_TOGGLE_MAX => {
+            // The engine already owns the toggle/resize sequence (Phase B.2).
+            // Re-use that path so the action stays single-source.
+            let size = terminal.size().ok();
+            let ctx = crate::core::engine::UiEventContext {
+                terminal_cols: size.map(|s| s.width).unwrap_or(80),
+                terminal_max_rows: terminal_target_maximize_rows_tui(
+                    engine,
+                    size.map(|s| s.height).unwrap_or(24),
+                ),
+            };
+            engine.handle_ui_event(
+                crate::core::engine::UiEvent::Accelerator(
+                    quadraui::AcceleratorId::new(ACC_TERMINAL_TOGGLE_MAX),
+                    _mods,
+                ),
+                ctx,
+            );
+            *needs_redraw = true;
+            true
+        }
+        ACC_ADD_CURSOR => {
+            engine.add_cursor_at_next_match();
+            *needs_redraw = true;
+            true
+        }
+        ACC_SELECT_ALL_MATCHES => {
+            if engine.is_vscode_mode() {
+                engine.vscode_select_all_occurrences();
+            } else {
+                engine.select_all_word_occurrences();
+            }
+            *needs_redraw = true;
+            true
+        }
+        ACC_SPLIT_EDITOR_RIGHT => {
+            engine.open_editor_group(SplitDirection::Vertical);
+            *needs_redraw = true;
+            true
+        }
+        ACC_SPLIT_EDITOR_DOWN => {
+            engine.open_editor_group(SplitDirection::Horizontal);
+            *needs_redraw = true;
+            true
+        }
+        ACC_NAV_BACK => {
+            engine.tab_nav_back();
+            *needs_redraw = true;
+            true
+        }
+        ACC_NAV_FORWARD => {
+            engine.tab_nav_forward();
+            *needs_redraw = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Register the panel-keys accelerator set on the backend. Re-runs on each
+/// settings reload so live rebinding takes effect.
+fn register_panel_accelerators(
+    backend: &mut backend::TuiBackend,
+    pk: &crate::core::settings::PanelKeys,
+) {
+    use quadraui::Backend;
+    let entries: [(&str, &str); 14] = [
+        (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
+        (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
+        (ACC_FOCUS_SEARCH, &pk.focus_search),
+        (ACC_FUZZY_FINDER, &pk.fuzzy_finder),
+        (ACC_LIVE_GREP, &pk.live_grep),
+        (ACC_COMMAND_PALETTE, &pk.command_palette),
+        (ACC_OPEN_TERMINAL, &pk.open_terminal),
+        (ACC_TERMINAL_TOGGLE_MAX, &pk.toggle_terminal_maximize),
+        (ACC_ADD_CURSOR, &pk.add_cursor),
+        (ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
+        (ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
+        (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
+        (ACC_NAV_BACK, &pk.nav_back),
+        (ACC_NAV_FORWARD, &pk.nav_forward),
+    ];
+    for (id, binding) in entries {
+        let acc_id = quadraui::AcceleratorId::new(id);
+        if binding.is_empty() {
+            // Empty string = unbound (e.g. split_editor_right defaults to ""). Drop
+            // any prior registration so a settings reload removing a binding
+            // doesn't leave a stale entry.
+            backend.unregister_accelerator(&acc_id);
+            continue;
+        }
+        backend.register_accelerator(&quadraui::Accelerator {
+            id: acc_id,
+            binding: quadraui::KeyBinding::Literal(binding.to_string()),
+            scope: quadraui::AcceleratorScope::Global,
+            label: None,
+        });
+    }
 }
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
@@ -1079,6 +1267,7 @@ fn event_loop(
     // `backend.modal_stack_mut()` replace the previous `let mut`
     // locals; downstream mouse handlers borrow through the backend.
     let mut backend = backend::TuiBackend::new();
+    register_panel_accelerators(&mut backend, &engine.settings.panel_keys);
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -1659,11 +1848,30 @@ fn event_loop(
             .into_iter()
             .next()
             .expect("wait_events returned non-empty Vec but iter was empty");
+
+        // Phase B.4 Stage 6: dispatch panel-key accelerators centrally.
+        // Each id corresponds to a `pk.*` setting; the action mirrors what
+        // the legacy `matches_tui_key` arms did. Skipped during the
+        // quit-confirm overlay so the modal keeps its full key intercept.
+        if let quadraui::UiEvent::Accelerator(ref acc_id, acc_mods) = ui_event {
+            if !quit_confirm
+                && dispatch_panel_accelerator(
+                    acc_id.as_str(),
+                    acc_mods,
+                    engine,
+                    &mut sidebar,
+                    terminal,
+                    &mut needs_redraw,
+                )
+            {
+                continue;
+            }
+        }
+
         let crossterm_event = match events::uievent_to_crossterm(ui_event) {
             Some(e) => e,
             // UiEvent variants without a crossterm equivalent (Accelerator,
-            // primitive events, etc.) — Stage 6 routes Accelerator to the
-            // engine; for now skip and continue the loop.
+            // primitive events, etc.) skip the legacy match.
             None => continue,
         };
         match crossterm_event {
@@ -2205,42 +2413,17 @@ fn event_loop(
                 {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
-                    // ── Panel navigation shortcuts work from within sidebar too ─
+                    // Panel navigation shortcuts (toggle_sidebar / focus_explorer
+                    // / focus_search) used to live here; Phase B.4 Stage 6 routes
+                    // them through `dispatch_panel_accelerator` before the legacy
+                    // match arms see the keypress, so they no longer need to be
+                    // duplicated per-context.
+
+                    // Ctrl-W prefix: set pending state for window navigation.
+                    // Vim chord — stays inline (mode-stateful, not an accelerator).
                     {
-                        let pk = &engine.settings.panel_keys;
                         let mods = key_event.modifiers;
                         let code = key_event.code;
-                        if matches_tui_key(&pk.toggle_sidebar, code, mods) {
-                            sidebar.visible = false;
-                            sidebar.has_focus = false;
-                            engine.session.explorer_visible = false;
-                            let _ = engine.session.save();
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if matches_tui_key(&pk.focus_explorer, code, mods) {
-                            if sidebar.active_panel == TuiPanel::Explorer {
-                                // Already in explorer — return focus to editor
-                                sidebar.has_focus = false;
-                            } else {
-                                sidebar.active_panel = TuiPanel::Explorer;
-                            }
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if matches_tui_key(&pk.focus_search, code, mods) {
-                            if sidebar.active_panel == TuiPanel::Search {
-                                // Already in search — return focus to editor
-                                sidebar.has_focus = false;
-                            } else {
-                                sidebar.active_panel = TuiPanel::Search;
-                                sidebar.search_input_mode = true;
-                                sidebar.replace_input_focused = false;
-                            }
-                            needs_redraw = true;
-                            continue;
-                        }
-                        // Ctrl-W prefix: set pending state for window navigation
                         if mods.contains(KeyModifiers::CONTROL)
                             && matches!(code, KeyCode::Char('w') | KeyCode::Char('W'))
                         {
@@ -3007,70 +3190,15 @@ fn event_loop(
                 // ── Editor focused ──────────────────────────────────────────
                 if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced)
                 {
-                    // Panel navigation — all driven by panel_keys settings
+                    // Panel navigation accelerators (Ctrl+P / Ctrl+T / etc.)
+                    // are dispatched centrally before the loop reaches this
+                    // arm — Phase B.4 Stage 6. The legacy
+                    // `engine.match_accelerator` block lived here and is
+                    // also gone; `terminal.toggle_maximize` now flows
+                    // through `dispatch_panel_accelerator`.
                     if key_event.kind != KeyEventKind::Release {
-                        let pk = &engine.settings.panel_keys;
                         let mods = key_event.modifiers;
                         let code = key_event.code;
-
-                        // Ctrl+T: toggle terminal (checked first, works even when terminal focused)
-                        if matches_tui_key(&pk.open_terminal, code, mods) {
-                            if engine.terminal_open && engine.terminal_has_focus {
-                                engine.close_terminal();
-                            } else if engine.terminal_open {
-                                engine.terminal_has_focus = true;
-                            } else {
-                                // Open terminal at full terminal width; create first tab if needed
-                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-                                if engine.terminal_panes.is_empty() {
-                                    engine
-                                        .terminal_new_tab(cols, engine.session.terminal_panel_rows);
-                                } else {
-                                    engine.open_terminal(cols, engine.session.terminal_panel_rows);
-                                }
-                            }
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        // Phase B.2: keybinding accelerator dispatch.
-                        // Engine owns the registry + dispatch. Backends just
-                        // look up + supply native viewport ctx.
-                        if let Some(acc_id) = engine.match_accelerator(
-                            mods.contains(KeyModifiers::CONTROL),
-                            mods.contains(KeyModifiers::SHIFT),
-                            mods.contains(KeyModifiers::ALT),
-                            match code {
-                                KeyCode::Char(c) => Some(c),
-                                _ => None,
-                            },
-                            matches!(code, KeyCode::Tab),
-                            matches!(code, KeyCode::Char(' ')),
-                            matches!(code, KeyCode::Esc),
-                        ) {
-                            let size = terminal.size().ok();
-                            let ctx = crate::core::engine::UiEventContext {
-                                terminal_cols: size.map(|s| s.width).unwrap_or(80),
-                                terminal_max_rows: terminal_target_maximize_rows_tui(
-                                    engine,
-                                    size.map(|s| s.height).unwrap_or(24),
-                                ),
-                            };
-                            engine.handle_ui_event(
-                                crate::core::engine::UiEvent::Accelerator(
-                                    acc_id,
-                                    quadraui::Modifiers {
-                                        ctrl: mods.contains(KeyModifiers::CONTROL),
-                                        shift: mods.contains(KeyModifiers::SHIFT),
-                                        alt: mods.contains(KeyModifiers::ALT),
-                                        cmd: false,
-                                    },
-                                ),
-                                ctx,
-                            );
-                            needs_redraw = true;
-                            continue;
-                        }
 
                         // Ctrl+L: force full screen redraw (clears rendering artifacts)
                         if ctrl && matches!(code, KeyCode::Char('l') | KeyCode::Char('L')) {
@@ -3198,123 +3326,13 @@ fn event_loop(
                             continue;
                         }
 
-                        if matches_tui_key(&pk.toggle_sidebar, code, mods) {
-                            sidebar.visible = !sidebar.visible;
-                            if !sidebar.visible {
-                                sidebar.has_focus = false;
-                            }
-                            engine.session.explorer_visible = sidebar.visible;
-                            let _ = engine.session.save();
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.focus_explorer, code, mods) {
-                            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Explorer {
-                                // Already in explorer — return focus to editor
-                                sidebar.has_focus = false;
-                            } else {
-                                sidebar.visible = true;
-                                sidebar.active_panel = TuiPanel::Explorer;
-                                sidebar.has_focus = true;
-                            }
-                            sync_sidebar_focus(&sidebar, engine);
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.focus_search, code, mods) {
-                            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Search {
-                                sidebar.has_focus = false;
-                            } else {
-                                sidebar.visible = true;
-                                sidebar.active_panel = TuiPanel::Search;
-                                sidebar.has_focus = true;
-                                sidebar.search_input_mode = true;
-                                sidebar.replace_input_focused = false;
-                            }
-                            sync_sidebar_focus(&sidebar, engine);
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.fuzzy_finder, code, mods) {
-                            engine.open_picker(crate::core::engine::PickerSource::Files);
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.live_grep, code, mods) {
-                            engine.open_picker(crate::core::engine::PickerSource::Grep);
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.command_palette, code, mods) {
-                            engine.open_picker(crate::core::engine::PickerSource::Commands);
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if matches_tui_key(&pk.add_cursor, code, mods) {
-                            engine.add_cursor_at_next_match();
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if matches_tui_key(&pk.select_all_matches, code, mods) {
-                            if engine.is_vscode_mode() {
-                                engine.vscode_select_all_occurrences();
-                            } else {
-                                engine.select_all_word_occurrences();
-                            }
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if !pk.split_editor_right.is_empty()
-                            && matches_tui_key(&pk.split_editor_right, code, mods)
-                        {
-                            debug_log!(
-                                "split_editor_right keybinding: groups={} active={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.active_group
-                            );
-                            engine.open_editor_group(SplitDirection::Vertical);
-                            debug_log!(
-                                "  after split: groups={} layout={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.group_layout
-                            );
-                            needs_redraw = true;
-                            continue;
-                        }
-
-                        if !pk.split_editor_down.is_empty()
-                            && matches_tui_key(&pk.split_editor_down, code, mods)
-                        {
-                            debug_log!(
-                                "split_editor_down keybinding: groups={} active={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.active_group
-                            );
-                            engine.open_editor_group(SplitDirection::Horizontal);
-                            debug_log!(
-                                "  after split: groups={} layout={:?}",
-                                engine.group_layout.leaf_count(),
-                                engine.group_layout
-                            );
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if matches_tui_key(&pk.nav_back, code, mods) {
-                            engine.tab_nav_back();
-                            needs_redraw = true;
-                            continue;
-                        }
-                        if matches_tui_key(&pk.nav_forward, code, mods) {
-                            engine.tab_nav_forward();
-                            needs_redraw = true;
-                            continue;
-                        }
+                        // Phase B.4 Stage 6: panel-key bindings (toggle_sidebar,
+                        // focus_explorer, focus_search, fuzzy_finder, live_grep,
+                        // command_palette, add_cursor, select_all_matches,
+                        // split_editor_*, nav_back/forward) flow through
+                        // `dispatch_panel_accelerator` before the loop reaches
+                        // here; the legacy `matches_tui_key` arms used to live
+                        // in this block.
                     }
 
                     // Escape when menu dropdown is open: close it
