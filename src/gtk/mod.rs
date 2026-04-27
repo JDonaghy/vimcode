@@ -157,6 +157,11 @@ struct App {
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
     cached_char_width: f64,
+    /// Last seen pointer position over the editor `DrawingArea`, in
+    /// DA-local pixels. Updated by `EventControllerMotion`; cleared on
+    /// `leave`. Read by the scroll handler to route wheel events to
+    /// the window under the cursor (#240) — matches TUI behaviour.
+    last_editor_pointer: Rc<Cell<Option<(f64, f64)>>>,
     /// Cached line height for the UI font (sidebars, panels).
     /// Computed alongside `cached_line_height` in `CacheFontMetrics`.
     cached_ui_line_height: f64,
@@ -1765,6 +1770,19 @@ impl SimpleComponent for App {
                                 },
                             },
 
+                            // #240: track the editor pointer so the scroll
+                            // handler can route wheel events to the window
+                            // under the cursor (across editor groups), not
+                            // just the active one.
+                            add_controller = gtk4::EventControllerMotion {
+                                connect_motion[last_editor_pointer] => move |_, x, y| {
+                                    last_editor_pointer.set(Some((x, y)));
+                                },
+                                connect_leave[last_editor_pointer] => move |_| {
+                                    last_editor_pointer.set(None);
+                                },
+                            },
+
                             #[watch]
                             set_css_classes: {
                                 // Only queue a draw when explicitly requested by update().
@@ -1905,6 +1923,10 @@ impl SimpleComponent for App {
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
+        // Editor pointer cache (#240): updated by EventControllerMotion on
+        // the editor DA, read by the scroll handler to route wheel events
+        // to the window under the cursor across editor groups.
+        let last_editor_pointer: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
         let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
@@ -2033,6 +2055,7 @@ impl SimpleComponent for App {
             overlay: overlay_ref.clone(),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
+            last_editor_pointer: last_editor_pointer.clone(),
             cached_ui_line_height: 20.0,
             dialog_btn_rects: Rc::new(RefCell::new(Vec::new())),
             line_height_cell: line_height_cell.clone(),
@@ -4084,26 +4107,60 @@ impl SimpleComponent for App {
                         return;
                     }
                 }
-                if delta_y.abs() > 0.01 {
-                    let lines = engine.buffer().len_lines().saturating_sub(1);
-                    let scroll_count = (delta_y * 3.0).round().abs() as usize;
-                    if delta_y > 0.0 {
-                        engine.scroll_down_visible(scroll_count);
+                // #240: route to the window under the pointer, falling back
+                // to the active window when the pointer is missing or over
+                // a non-window region. Hovering an unfocused group's pane
+                // scrolls *that* pane without changing focus or moving its
+                // cursor — matches TUI behaviour.
+                let hovered_window_id = self.last_editor_pointer.get().and_then(|(x, y)| {
+                    if let Some(da) = self.drawing_area.borrow().as_ref() {
+                        let width = da.width() as f64;
+                        let height = da.height() as f64;
+                        let line_height = self.cached_line_height.max(1.0);
+                        let editor_bottom = gtk_editor_bottom(&engine, width, height, line_height);
+                        let tab_bar_height =
+                            render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
+                        let editor_bounds = core::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                        let (rects, _) =
+                            engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
+                        rects
+                            .iter()
+                            .find(|(_, r)| {
+                                x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+                            })
+                            .map(|(id, _)| *id)
                     } else {
-                        engine.scroll_up_visible(scroll_count);
+                        None
                     }
-                    // Move cursor into viewport instead of snapping scroll back.
-                    let scrolloff = engine.settings.scrolloff;
-                    let vp = engine.view().viewport_lines.max(1);
-                    let cur = engine.view().cursor.line;
-                    let new_top = engine.view().scroll_top;
-                    if cur < new_top + scrolloff {
-                        engine.view_mut().cursor.line = (new_top + scrolloff).min(lines);
-                        engine.clamp_cursor_col();
-                    } else if cur >= new_top + vp.saturating_sub(scrolloff) {
-                        engine.view_mut().cursor.line =
-                            (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
-                        engine.clamp_cursor_col();
+                });
+                if delta_y.abs() > 0.01 {
+                    let scroll_count = (delta_y * 3.0).round().abs() as usize;
+                    let active_id = engine.active_window_id();
+                    let target = hovered_window_id.unwrap_or(active_id);
+                    if target == active_id {
+                        let lines = engine.buffer().len_lines().saturating_sub(1);
+                        if delta_y > 0.0 {
+                            engine.scroll_down_visible(scroll_count);
+                        } else {
+                            engine.scroll_up_visible(scroll_count);
+                        }
+                        // Move cursor into viewport instead of snapping scroll back.
+                        let scrolloff = engine.settings.scrolloff;
+                        let vp = engine.view().viewport_lines.max(1);
+                        let cur = engine.view().cursor.line;
+                        let new_top = engine.view().scroll_top;
+                        if cur < new_top + scrolloff {
+                            engine.view_mut().cursor.line = (new_top + scrolloff).min(lines);
+                            engine.clamp_cursor_col();
+                        } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+                            engine.view_mut().cursor.line =
+                                (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
+                            engine.clamp_cursor_col();
+                        }
+                    } else if delta_y > 0.0 {
+                        engine.scroll_down_visible_for_window(target, scroll_count);
+                    } else {
+                        engine.scroll_up_visible_for_window(target, scroll_count);
                     }
                     engine.sync_scroll_binds();
                 }
