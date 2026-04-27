@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod backend;
 mod mouse;
 mod panels;
 mod quadraui_tui;
 mod render_impl;
+mod services;
 
 #[allow(unused_imports)]
 use mouse::*;
@@ -1071,17 +1073,11 @@ fn event_loop(
     let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
     // Non-None while user is dragging a sidebar scrollbar that has no dedicated drag state.
     // Used for explorer and ext panel scrollbars to prevent text selection leaking.
-    // Phase B.4: cross-backend drag-state. Currently tracks only the
-    // picker scrollbar (#190 sibling for TUI); other sidebar scrollbars
-    // still use their own `dragging_*_sb: Option<SidebarScrollDrag>`
-    // locals above/below until they migrate in follow-up commits.
-    let mut drag_state = quadraui::DragState::new();
-    // Phase B.4: cross-backend modal stack. Used by
-    // `dispatch_mouse_down` to decide modal-vs-base precedence.
-    // Currently only tracks the picker popup; other modals (tab
-    // switcher, dialogs, context menu) migrate as their surfaces
-    // get touched.
-    let mut modal_stack = quadraui::ModalStack::new();
+    // Phase B.4: cross-backend drag-state + modal stack now live on
+    // `TuiBackend`. Stage 1: `backend.drag_state_mut()` /
+    // `backend.modal_stack_mut()` replace the previous `let mut`
+    // locals; downstream mouse handlers borrow through the backend.
+    let mut backend = backend::TuiBackend::new();
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -1246,6 +1242,15 @@ fn event_loop(
                     width: size.width,
                     height: size.height,
                 };
+                // Phase B.4 Stage 1: keep `TuiBackend`'s cached viewport
+                // in sync with the terminal each frame. Stage 2 will use
+                // it to drive `Backend::draw_*` dispatch.
+                use quadraui::Backend;
+                backend.begin_frame(quadraui::Viewport::new(
+                    size.width as f32,
+                    size.height as f32,
+                    1.0,
+                ));
                 let s = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
                 last_layout = Some(s);
                 last_layout.as_ref()
@@ -3897,6 +3902,7 @@ fn event_loop(
                             }
                             // Non-drag event: handle the coalesced drag first, then the new event
                             let mut mouse_should_quit = false;
+                            let (drag_state_ref, modal_stack_ref) = backend.drag_and_modal_mut();
                             sidebar_width = handle_mouse(
                                 mouse_event,
                                 &mut sidebar,
@@ -3914,8 +3920,8 @@ fn event_loop(
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
                                 &mut dragging_settings_sb,
-                                &mut drag_state,
-                                &mut modal_stack,
+                                drag_state_ref,
+                                modal_stack_ref,
                                 last_layout.as_ref(),
                                 &mut last_click_time,
                                 &mut last_click_pos,
@@ -3952,6 +3958,7 @@ fn event_loop(
                     }
                 }
                 let mut mouse_should_quit = false;
+                let (drag_state_ref, modal_stack_ref) = backend.drag_and_modal_mut();
                 sidebar_width = handle_mouse(
                     mouse_event,
                     &mut sidebar,
@@ -3969,8 +3976,8 @@ fn event_loop(
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,
                     &mut dragging_settings_sb,
-                    &mut drag_state,
-                    &mut modal_stack,
+                    drag_state_ref,
+                    modal_stack_ref,
                     last_layout.as_ref(),
                     &mut last_click_time,
                     &mut last_click_pos,
