@@ -21,6 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod backend;
+mod events;
 mod mouse;
 mod panels;
 mod quadraui_tui;

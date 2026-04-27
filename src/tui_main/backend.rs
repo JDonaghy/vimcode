@@ -207,11 +207,46 @@ impl Backend for TuiBackend {
     }
 
     fn poll_events(&mut self) -> Vec<UiEvent> {
-        Vec::new() // Stage 4
+        // Drain every queued crossterm event; never blocks. Each
+        // native event translates to zero, one, or more `UiEvent`s
+        // via [`super::events::crossterm_to_uievents`].
+        //
+        // NOTE: as of Stage 4 the existing event loop in
+        // [`super::event_loop`] still drives `ratatui::crossterm::event::read`
+        // directly, so this method's return is empty in practice
+        // (the loop drains events first). Stage 5 flips the loop
+        // to consume `backend.wait_events(...)` instead, at which
+        // point this code path becomes the canonical event source.
+        let mut out = Vec::new();
+        while ratatui::crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+            match ratatui::crossterm::event::read() {
+                Ok(ev) => out.extend(super::events::crossterm_to_uievents(ev)),
+                Err(_) => break,
+            }
+        }
+        out
     }
 
-    fn wait_events(&mut self, _timeout: Duration) -> Vec<UiEvent> {
-        Vec::new() // Stage 4
+    fn wait_events(&mut self, timeout: Duration) -> Vec<UiEvent> {
+        // Block up to `timeout` for at least one event, then drain
+        // anything else queued behind it. Empty `Vec` on timeout.
+        match ratatui::crossterm::event::poll(timeout) {
+            Ok(true) => {
+                let mut out = Vec::new();
+                if let Ok(ev) = ratatui::crossterm::event::read() {
+                    out.extend(super::events::crossterm_to_uievents(ev));
+                }
+                // Drain anything else queued without blocking again.
+                while ratatui::crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+                    match ratatui::crossterm::event::read() {
+                        Ok(ev) => out.extend(super::events::crossterm_to_uievents(ev)),
+                        Err(_) => break,
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn register_accelerator(&mut self, acc: &Accelerator) {
