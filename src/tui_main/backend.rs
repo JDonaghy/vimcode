@@ -11,12 +11,15 @@
 //! The other 5 trait `draw_*` methods (status_bar, tab_bar,
 //! activity_bar, terminal, text_display) stay stubbed for now because
 //! their existing shims take a pre-computed `*Layout` parameter that
-//! the trait doesn't pass through. Migrating them needs either the
-//! trait gaining `&Layout` parameters (per
-//! `BACKEND_TRAIT_PROPOSAL.md` §6.2), or the impl recomputing layout
-//! from `&Primitive`. Stage 3 (`paint<B: Backend>` extraction) is the
-//! natural place to resolve that — it has to confront cross-call-site
-//! layout reuse anyway.
+//! the trait doesn't pass through. Migrating them needs the trait to
+//! gain `&Layout` parameters (per `BACKEND_TRAIT_PROPOSAL.md` §6.2) —
+//! a quadraui-side change, deferred until a later stage when more
+//! call sites benefit at once.
+//!
+//! Stage 3a migrated the quickfix panel through `Backend::draw_list`.
+//! Stage 3b adds a `MockBackend` test fixture proving the trait is
+//! genuinely consumable by `<B: Backend>` generic code, not just by
+//! `TuiBackend`. See the `tests` module at the bottom.
 //!
 //! `poll_events` / `wait_events` are stubs (Stage 4 fills them in).
 
@@ -314,5 +317,231 @@ impl Backend for TuiBackend {
 
     fn draw_text_display(&mut self, _rect: QRect, _td: &TextDisplay) {
         unimplemented!("TuiBackend::draw_text_display — see Stage 3")
+    }
+}
+
+// ─── Cross-backend validation tests ──────────────────────────────────────────
+//
+// Phase B.4 Stage 3b: prove the `Backend` trait is genuinely consumable
+// by app code that's *generic* over the backend, not just by `TuiBackend`
+// specifically. A minimal `MockBackend` records each `draw_*` call into
+// a `Vec<DrawCall>`; a generic `<B: Backend>` helper invokes the trait
+// methods; assertions verify the calls landed.
+//
+// This is the architectural proof point Stage 3 was designed around:
+// once the trait works against TuiBackend AND a foreign mock, future
+// backends (GtkBackend in B.5, WinBackend in B.6, MacOSBackend in B.7)
+// drop in without forking the app's render code.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quadraui::backend::{Clipboard, FileDialogOptions, Notification};
+    use quadraui::{ListItem, ListView, Palette, PaletteItem, StyledSpan, StyledText, WidgetId};
+
+    /// Records every draw call so tests can assert what the trait
+    /// boundary actually delivers.
+    #[derive(Debug, Clone, PartialEq)]
+    enum DrawCall {
+        List { rect: QRect, item_count: usize },
+        Palette { rect: QRect, item_count: usize },
+    }
+
+    struct NoopClipboard;
+    impl Clipboard for NoopClipboard {
+        fn read_text(&self) -> Option<String> {
+            None
+        }
+        fn write_text(&self, _t: &str) {}
+    }
+
+    struct MockServices {
+        clipboard: NoopClipboard,
+    }
+    impl MockServices {
+        fn new() -> Self {
+            Self {
+                clipboard: NoopClipboard,
+            }
+        }
+    }
+    impl PlatformServices for MockServices {
+        fn clipboard(&self) -> &dyn Clipboard {
+            &self.clipboard
+        }
+        fn show_file_open_dialog(&self, _opts: FileDialogOptions) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn show_file_save_dialog(&self, _opts: FileDialogOptions) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn send_notification(&self, _n: Notification) {}
+        fn open_url(&self, _url: &str) {}
+        fn platform_name(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    struct MockBackend {
+        calls: Vec<DrawCall>,
+        modal_stack: ModalStack,
+        services: MockServices,
+        viewport: Viewport,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                modal_stack: ModalStack::new(),
+                services: MockServices::new(),
+                viewport: Viewport::new(80.0, 24.0, 1.0),
+            }
+        }
+    }
+
+    impl Backend for MockBackend {
+        fn viewport(&self) -> Viewport {
+            self.viewport
+        }
+        fn begin_frame(&mut self, viewport: Viewport) {
+            self.viewport = viewport;
+        }
+        fn end_frame(&mut self) {}
+        fn poll_events(&mut self) -> Vec<UiEvent> {
+            Vec::new()
+        }
+        fn wait_events(&mut self, _t: Duration) -> Vec<UiEvent> {
+            Vec::new()
+        }
+        fn register_accelerator(&mut self, _a: &Accelerator) {}
+        fn unregister_accelerator(&mut self, _id: &AcceleratorId) {}
+        fn modal_stack_mut(&mut self) -> &mut ModalStack {
+            &mut self.modal_stack
+        }
+        fn services(&self) -> &dyn PlatformServices {
+            &self.services
+        }
+
+        fn draw_list(&mut self, rect: QRect, list: &ListView) {
+            self.calls.push(DrawCall::List {
+                rect,
+                item_count: list.items.len(),
+            });
+        }
+
+        fn draw_palette(&mut self, rect: QRect, palette: &Palette) {
+            self.calls.push(DrawCall::Palette {
+                rect,
+                item_count: palette.items.len(),
+            });
+        }
+
+        // The other 7 trait methods are unimplemented — this mock only
+        // records the ones the cross-backend test actually exercises.
+        fn draw_tree(&mut self, _r: QRect, _t: &TreeView) {}
+        fn draw_form(&mut self, _r: QRect, _f: &Form) {}
+        fn draw_status_bar(&mut self, _r: QRect, _b: &StatusBar) {}
+        fn draw_tab_bar(&mut self, _r: QRect, _b: &TabBar) {}
+        fn draw_activity_bar(&mut self, _r: QRect, _b: &ActivityBar) {}
+        fn draw_terminal(&mut self, _r: QRect, _t: &TerminalPrim) {}
+        fn draw_text_display(&mut self, _r: QRect, _t: &TextDisplay) {}
+    }
+
+    /// Generic helper — the minimal "app render code" that consumes
+    /// `Backend` through `<B>`. Future backends slot in here without
+    /// changes.
+    fn paint_overlays<B: Backend>(backend: &mut B, palette: &Palette, list: &ListView) {
+        backend.draw_palette(QRect::new(10.0, 5.0, 60.0, 14.0), palette);
+        backend.draw_list(QRect::new(0.0, 20.0, 80.0, 4.0), list);
+    }
+
+    fn sample_palette() -> Palette {
+        Palette {
+            id: WidgetId::new("test:palette"),
+            title: "Pick one".to_string(),
+            query: String::new(),
+            query_cursor: 0,
+            items: vec![
+                PaletteItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::plain("alpha")],
+                    },
+                    detail: None,
+                    icon: None,
+                    match_positions: Vec::new(),
+                },
+                PaletteItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::plain("beta")],
+                    },
+                    detail: None,
+                    icon: None,
+                    match_positions: Vec::new(),
+                },
+            ],
+            selected_idx: 0,
+            scroll_offset: 0,
+            total_count: 2,
+            has_focus: true,
+        }
+    }
+
+    fn sample_list() -> ListView {
+        ListView {
+            id: WidgetId::new("test:list"),
+            title: None,
+            items: vec![ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::plain("only")],
+                },
+                icon: None,
+                detail: None,
+                decoration: quadraui::Decoration::Normal,
+            }],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: false,
+        }
+    }
+
+    #[test]
+    fn paint_overlays_records_through_mock_backend() {
+        let mut mock = MockBackend::new();
+        let palette = sample_palette();
+        let list = sample_list();
+
+        paint_overlays(&mut mock, &palette, &list);
+
+        assert_eq!(mock.calls.len(), 2);
+        assert!(matches!(
+            mock.calls[0],
+            DrawCall::Palette { item_count: 2, .. }
+        ));
+        assert!(matches!(
+            mock.calls[1],
+            DrawCall::List { item_count: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn paint_overlays_compiles_against_tui_backend() {
+        // Compile-only assertion — the same generic function used with
+        // MockBackend above is also valid for TuiBackend. We don't run
+        // the draws (they require an active frame scope) but the type
+        // monomorphisation proves the trait constraint is satisfied
+        // for every backend impl.
+        let _: fn(&mut TuiBackend, &Palette, &ListView) = paint_overlays::<TuiBackend>;
+    }
+
+    #[test]
+    fn mock_backend_modal_stack_routes_through_trait() {
+        // Modal stack is on the trait too — backends that implement it
+        // wire into `quadraui::dispatch::dispatch_mouse_down` automatically.
+        let mut mock = MockBackend::new();
+        mock.modal_stack_mut()
+            .push(WidgetId::new("test:popup"), QRect::new(0.0, 0.0, 10.0, 5.0));
+        assert_eq!(mock.modal_stack_mut().len(), 1);
     }
 }
