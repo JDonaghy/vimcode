@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-26 (Phase B.4 — Stages 1–5b shipped. The Backend trait is now load-bearing in the running editor — every native event flows through `backend.wait_events`. Drag-state consolidation, accelerator consolidation, and final cleanup remain.)
+> **Last updated:** 2026-04-27 (Phase B.4 — Stages 1–6 + 5c shipped. The Backend trait is load-bearing, panel-key bindings flow through accelerator dispatch, and 5 of the 6 TUI scrollbar drags now share `quadraui::DragState` with thumb-grab preservation. Stage 5d (editor scrollbar `ScrollDragState` migration) and Stage 7 (cleanup + GTK/Win-GUI restore) remain.)
 
 ---
 
@@ -36,17 +36,25 @@ pickup).
 | **4** | `crossterm → UiEvent` translation + `poll_events`/`wait_events` impls | ✅ | `d5a5159` |
 | **5a** | `wait_events` semantics + inverse `UiEvent → crossterm::Event` helpers | ✅ | `6b7a2e4` |
 | **5b** | Event loop flipped to `Backend::wait_events` — **trait now load-bearing** | ✅ | `4016ecc` |
-| **5c** | Drag-state consolidation into `quadraui::DragState` (needs `DragTarget` extension PR) | ⬜ | — |
-| **6** | Accelerator registry consolidation for cross-mode global keybindings | ⬜ | — |
+| **6** | Accelerator registry consolidation for cross-mode global keybindings | ✅ | `b400ce0` |
+| **5c** | Drag-state consolidation: 5 scrollbars (search/settings/debug-sidebar/terminal/debug-output) → `quadraui::DragState`; `grab_offset` field added to `DragTarget::ScrollbarY` | ✅ | `f8d394f` |
+| **5d** | Editor-window scrollbar (`ScrollDragState`) migration — needs `ScrollbarX` variant for horizontal axis | ⬜ | — (issue #244) |
 | **7** | Cleanup + restore GTK / Win-GUI compile + `BACKEND.md` worked example | ⬜ | — |
 
-**Architectural milestone reached at 5b:** every native event reaches
-the existing dispatch through the `Backend` trait via `wait_events`
-+ inverse synth helpers. The remaining stages are consolidation
-(unify drag state, route accelerators) + cleanup.
+**Architectural milestones:**
+- **5b** — every native event reaches the existing dispatch through
+  `Backend::wait_events` + inverse synth helpers. Trait load-bearing.
+- **6** — 14 cross-mode keybindings + `terminal.toggle_maximize` route
+  through `UiEvent::Accelerator` dispatch instead of inline
+  `matches_tui_key` arms. Per-feature wiring collapses to "register
+  one accelerator + emit one `UiEvent`" for these bindings.
+- **5c** — 5 of 6 TUI scrollbar drags share `quadraui::DragState`;
+  `DragTarget::ScrollbarY` gained `grab_offset` so cursor preserves
+  its relative position on the thumb during drag.
 
-After Stage 7, the per-feature wiring story collapses from "edit one
-site per backend" to "register one accelerator + emit one `UiEvent`."
+After Stage 5d + 7, the per-feature wiring story collapses fully —
+remaining work is the editor-window scrollbar (needs horizontal axis
+in DragTarget) and cleanup of any cross-backend compile lag.
 
 ### How the open risks resolved
 
@@ -58,8 +66,10 @@ type-erased `current_frame_ptr: Cell<*mut ()>` set inside
 without lifetime parameters on the struct. **Second risk** (missing
 UiEvent variants) didn't fire — the existing variants covered every
 crossterm event we actually surface today. **Third risk** (drag-state
-shapes) is now Stage 5c's open work — extending `DragTarget` is a
-quadraui sub-PR, deferred until 5c starts.
+shapes) split: standard vertical scrollbars unified cleanly into
+`DragTarget::ScrollbarY` with widget-id encoding (Stage 5c shipped).
+The editor scrollbar's horizontal-axis support and per-window-id
+plumbing didn't fit; deferred to Stage 5d (issue #244).
 
 ### Parallel cleanup work (not blockers)
 
@@ -79,6 +89,15 @@ B.4 stages when context aligns:
 - **#238** — TUI ContextMenu chrome overlaps trigger row in Above/Below placement
 - **#239** — Anchor vimcode's status-bar pickers to their trigger segment
 - **#241** — `quadraui_<backend>::run()` per-backend runner (post-B.4)
+
+**Stage 5c smoke-test follow-ups** (filed alongside 5c ship):
+
+- **#200** — TUI ext panel: scrollbar not drawn even when content overflows (pre-existing missing render path)
+- **#242** — TUI debug sidebar: scrollbar click doesn't reach `handle_mouse` (needs investigation — log shows clicks not landing at the rendered scrollbar column)
+- **#243** — GTK debug sidebar: no `GestureDrag` for thumb-grab (mirror the explorer pattern)
+- **#244** — Stage 5d — editor-window scrollbar (`ScrollDragState`) migration (needs `ScrollbarX` variant)
+- **#245** — Inverted scrollbars (terminal scrollback, debug output): thumb-grab not preserved
+- **#246** — TUI explorer scrollbar thumb brighter color than other panels (theme consistency)
 
 ---
 
