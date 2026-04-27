@@ -32,11 +32,13 @@ use render::{
 use copypasta_ext::ClipboardProviderExt;
 use std::collections::HashMap;
 
+mod backend;
 mod click;
 mod css;
 mod draw;
 mod explorer;
 mod quadraui_gtk;
+mod services;
 mod util;
 
 use click::*;
@@ -304,6 +306,14 @@ struct App {
     /// Set on mouse-down, read on mouse-move (drag update), cleared on
     /// mouse-up. Fixes #190 (palette scrollbar wasn't draggable).
     drag_state: Rc<RefCell<quadraui::DragState>>,
+    /// Phase B.5 Stage 1: `quadraui::Backend`-impl handle. Currently
+    /// holds the canonical accelerators / event-queue / viewport /
+    /// services state. The existing `modal_stack` and `drag_state`
+    /// fields above are alias `Rc` clones pointing at the same
+    /// `RefCell`s the backend owns — Stage 4+ migrates call sites
+    /// onto the backend handle and removes the duplicates.
+    #[allow(dead_code)]
+    backend: Rc<RefCell<backend::GtkBackend>>,
 }
 
 /// Map GDK key names to the engine's expected key names.
@@ -2033,6 +2043,17 @@ impl SimpleComponent for App {
             eng.session.explorer_visible || eng.settings.explorer_visible_on_startup
         };
 
+        // Phase B.5 Stage 1: build the `quadraui::Backend` impl now,
+        // before constructing the App. Both the App's modal_stack /
+        // drag_state alias fields and the App's `backend` field share
+        // the same underlying `Rc<RefCell<>>`s — Stage 5 migrates the
+        // alias call sites onto `backend.borrow().*_handle()` and
+        // drops the duplicates.
+        let gtk_backend = backend::GtkBackend::new();
+        let backend_modal_stack = gtk_backend.modal_stack_handle();
+        let backend_drag_state = gtk_backend.drag_state_handle();
+        let backend = Rc::new(RefCell::new(gtk_backend));
+
         let model = App {
             engine: engine.clone(),
             sidebar_visible,
@@ -2120,8 +2141,14 @@ impl SimpleComponent for App {
             last_colorscheme,
             settings_save_revision: core::settings::save_revision(),
             active_ctx_popover: active_ctx_popover_ref.clone(),
-            modal_stack: Rc::new(RefCell::new(quadraui::ModalStack::new())),
-            drag_state: Rc::new(RefCell::new(quadraui::DragState::new())),
+            // Phase B.5 Stage 1: alias `Rc<RefCell<>>` clones from
+            // `gtk_backend` (built above the let) so existing call
+            // sites that read `model.modal_stack` / `model.drag_state`
+            // keep working unchanged. The `backend` field holds the
+            // canonical owner.
+            modal_stack: backend_modal_stack,
+            drag_state: backend_drag_state,
+            backend,
         };
         let widgets = view_output!();
 
