@@ -43,6 +43,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 
 ## Vision
 
+some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
@@ -109,6 +110,7 @@ Download `vcd-windows-x86_64.exe` from the release page (rename to `vcd.exe` for
 
 ### Prerequisites
 
+some more test text
 The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windows GUI** is built separately with a Cargo feature flag.
 
 | Platform | GTK4 GUI deps |
