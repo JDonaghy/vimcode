@@ -28,20 +28,6 @@ pub(super) fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true if `key` + `state` match a panel_keys binding string like `<C-b>`, `<C-S-e>`.
-pub(super) fn matches_gtk_key(binding: &str, key: gdk::Key, state: gdk::ModifierType) -> bool {
-    crate::render::matches_key_binding(
-        binding,
-        state.contains(gdk::ModifierType::CONTROL_MASK),
-        state.contains(gdk::ModifierType::SHIFT_MASK),
-        state.contains(gdk::ModifierType::ALT_MASK),
-        key.to_unicode(),
-        key == gdk::Key::Tab || key == gdk::Key::ISO_Left_Tab,
-        key.to_unicode() == Some(' '),
-        key == gdk::Key::Escape,
-    )
-}
-
 /// Translate a GTK key event to PTY input bytes.
 /// Returns an empty vec for keys that have no PTY mapping.
 pub(super) fn gtk_key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {

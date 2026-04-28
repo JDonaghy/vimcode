@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** B.5b Stage 1 — event-queue producers + drain consumer — shipped this session. The editor DA's key/mouse/scroll callbacks now dual-write translated `UiEvent`s into `GtkBackend::events_handle()` alongside their existing `Msg::*` dispatch; a 16 ms `glib::timeout_add_local` drains the queue. Behavior is unchanged — Relm4 `Msg` flow stays authoritative — but the foundation is now in place for B5b.2 (accelerator dispatch) to start consuming the queue.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1 + 2 shipped this session. Stage 1: event-queue producers (key/mouse/scroll on the editor DA) + 16 ms `glib::timeout_add_local` drain via `Backend::poll_events()`. Stage 2: `dispatch_gtk_panel_accelerator` helper + a single `match_keypress` lookup replaces 13 inline `matches_gtk_key` arms in the editor key handler; `util::matches_gtk_key` removed entirely. Next: B5b.3, modal stack migration starting with the dialog modal.)
 
 ---
 
@@ -41,7 +41,7 @@ dependencies.
 | # | Goal | Status |
 |---|---|---|
 | **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::timeout_add_local` drain (16 ms). Foundation for everything else. **Scope:** editor DA's key + mouse-down + drag-update + drag-end + scroll callbacks. Sidebar / panel callbacks land alongside their respective click migrations in later stages. | ✅ |
-| **B5b.2** | Migrate 16 `matches_gtk_key` arms → `UiEvent::Accelerator(id)` dispatch. Mirrors TUI's `dispatch_panel_accelerator`. | ⬜ |
+| **B5b.2** | `dispatch_gtk_panel_accelerator` helper + single `match_keypress` lookup replace 13 inline `matches_gtk_key` arms in the editor key handler. `util::matches_gtk_key` deleted. Synchronous dispatch (called from the GTK signal handler), not yet via the queue drain — keeps zero-latency for shortcuts. | ✅ |
 | **B5b.3–B5b.7** | Per-modal migration onto `ModalStack` — dialog, context menu, completion popup, hover popup, tab switcher. | ⬜ |
 | **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
 | **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
@@ -64,6 +64,22 @@ Out of scope for B5b.1, deferred:
 - Settings panel callbacks (around lines 2261–2291).
 - Window resize → `UiEvent::WindowResized` — the trait already updates viewport via `begin_frame`, so this is redundant in GTK.
 - Motion events (~100–200 Hz) — not pushed; the drain doesn't need them today and they'd dominate the queue. Add when a consumer needs them.
+
+### Stage 2 ship notes
+
+What changed in B5b.2:
+- `GtkBackend::match_keypress` flipped to `pub` so the GTK key callback can synchronously query the registry.
+- `fn dispatch_gtk_panel_accelerator(id, &ComponentSender<App>, &Rc<RefCell<Engine>>) -> bool` added at module scope. Returns `true` if the id was handled. Mirrors `tui_main::dispatch_panel_accelerator`. Dispatch site: 14 ids (the 12 late panel keys plus `ACC_OPEN_TERMINAL` and `ACC_TERMINAL_TOGGLE_MAX` for completeness — the latter is unreachable today because the engine's accelerator block matches first).
+- The editor key handler does ONE `match_keypress` lookup per keypress and stashes the `Option<AcceleratorId>`:
+  - **Early dispatch**, before the terminal-focus block, only fires for `ACC_OPEN_TERMINAL` so Ctrl+T keeps working when the terminal has focus (matches pre-migration semantics).
+  - **Late dispatch**, after the terminal-focus block, routes any other id through `dispatch_gtk_panel_accelerator`.
+- 13 inline `if matches_gtk_key(&pk.X, key, modifier) { ... }` arms removed from the editor key handler.
+- `util::matches_gtk_key` deleted (only call site was the editor handler; one stale comment in `App::handle_panel_key` now references `render::matches_key_binding` instead).
+- `App.backend` field is now cloned into the model rather than moved, so the `view!` macro can also clone it into the key callback's capture list.
+
+Why this is *not* yet driven by the queue drain:
+- Synchronous dispatch from the GTK signal handler keeps zero-latency on shortcut keys. The drain (16 ms tick) would add up to that interval of latency to "open command palette" — perceptible.
+- The producers from Stage 1 *also* push `UiEvent::KeyPressed` for the same key; the drain rewrites it to `UiEvent::Accelerator(id, mods)` via `apply_accelerators` and discards. So the queue stays consistent with the synchronous path; subsequent stages can move dispatch fully onto the drain when the latency tradeoff is OK.
 
 ### Issues this resolves
 

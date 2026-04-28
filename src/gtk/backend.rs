@@ -271,7 +271,12 @@ impl GtkBackend {
         }
     }
 
-    fn match_keypress(
+    /// Look up a registered Global accelerator for a `(key, modifiers)`
+    /// pair. Returns the matching `AcceleratorId` on first hit, or
+    /// `None`. Used both by `apply_accelerators` (rewriting queue
+    /// events) and by the GTK key callback (synchronous dispatch in
+    /// B.5b Stage 2).
+    pub fn match_keypress(
         &self,
         key: &quadraui::Key,
         modifiers: quadraui::Modifiers,

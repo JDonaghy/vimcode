@@ -96,14 +96,14 @@ type TabBarDrawResult = (
     usize,              // correct_scroll_offset (per-group, in pixels-aware units)
 );
 
-// ─── Phase B.5 Stage 6: panel-key accelerator registry ──────────────────────
+// ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
 // Stable accelerator IDs for the `panel_keys` settings, registered on
-// `GtkBackend` at App startup. Mirrors the TUI Stage 6 pattern
-// (`tui.panel.*`). Dispatch through `UiEvent::Accelerator(id)` is wired
-// iteratively as click sites migrate onto the trait — until then,
-// the existing `matches_gtk_key` arms in the GTK key handler stay
-// authoritative; the registered accelerators are inert.
+// `GtkBackend` at App startup. Mirrors the TUI's `tui.panel.*`
+// registry. As of Phase B.5b Stage 2 the editor key handler runs a
+// single `match_keypress` lookup against this registry and routes
+// matches through `dispatch_gtk_panel_accelerator` — replacing 13
+// inline `matches_gtk_key` arms that used to scan the bindings linearly.
 
 pub(super) const ACC_TOGGLE_SIDEBAR: &str = "gtk.panel.toggle_sidebar";
 pub(super) const ACC_FOCUS_EXPLORER: &str = "gtk.panel.focus_explorer";
@@ -155,6 +155,109 @@ fn register_panel_accelerators(
             scope: quadraui::AcceleratorScope::Global,
             label: None,
         });
+    }
+}
+
+// ─── Phase B.5b Stage 2: panel-key accelerator dispatcher ───────────────────
+//
+// Mirrors `tui_main::dispatch_panel_accelerator`. Replaces 13 inline
+// `if matches_gtk_key(&pk.X, ...)` arms in the editor key handler with
+// a single registry lookup → match-on-id dispatcher. The action set
+// matches what the legacy arms did (Msg dispatch where the existing
+// update() handler runs the side effect; direct engine mutation where
+// the legacy arms also called engine directly).
+//
+// Returns `true` if the id was handled — caller should `return Stop`.
+// Returns `false` for unknown ids so the caller can fall through.
+//
+// `ACC_TERMINAL_TOGGLE_MAX` is included for completeness; the engine's
+// own `match_accelerator` block handles the same key first and
+// returns Stop, so this arm is only reachable if the engine's
+// registration is removed.
+fn dispatch_gtk_panel_accelerator(
+    id: &str,
+    sender: &ComponentSender<App>,
+    engine: &Rc<RefCell<Engine>>,
+) -> bool {
+    match id {
+        ACC_OPEN_TERMINAL => {
+            sender.input(Msg::ToggleTerminal);
+            true
+        }
+        ACC_TOGGLE_SIDEBAR => {
+            sender.input(Msg::ToggleSidebar);
+            true
+        }
+        ACC_FOCUS_EXPLORER => {
+            sender.input(Msg::ToggleFocusExplorer);
+            true
+        }
+        ACC_FOCUS_SEARCH => {
+            sender.input(Msg::ToggleFocusSearch);
+            true
+        }
+        ACC_FUZZY_FINDER => {
+            engine
+                .borrow_mut()
+                .open_picker(core::engine::PickerSource::Files);
+            sender.input(Msg::Resize);
+            true
+        }
+        ACC_LIVE_GREP => {
+            engine
+                .borrow_mut()
+                .open_picker(core::engine::PickerSource::Grep);
+            sender.input(Msg::Resize);
+            true
+        }
+        ACC_COMMAND_PALETTE => {
+            engine
+                .borrow_mut()
+                .open_picker(core::engine::PickerSource::Commands);
+            sender.input(Msg::Resize);
+            true
+        }
+        ACC_TERMINAL_TOGGLE_MAX => {
+            sender.input(Msg::ToggleTerminalMaximize);
+            true
+        }
+        ACC_ADD_CURSOR => {
+            engine.borrow_mut().add_cursor_at_next_match();
+            sender.input(Msg::Resize);
+            true
+        }
+        ACC_SELECT_ALL_MATCHES => {
+            let mut eng = engine.borrow_mut();
+            if eng.is_vscode_mode() {
+                eng.vscode_select_all_occurrences();
+            } else {
+                eng.select_all_word_occurrences();
+            }
+            drop(eng);
+            sender.input(Msg::Resize);
+            true
+        }
+        ACC_SPLIT_EDITOR_RIGHT => {
+            engine
+                .borrow_mut()
+                .open_editor_group(crate::core::window::SplitDirection::Vertical);
+            true
+        }
+        ACC_SPLIT_EDITOR_DOWN => {
+            engine
+                .borrow_mut()
+                .open_editor_group(crate::core::window::SplitDirection::Horizontal);
+            true
+        }
+        ACC_NAV_BACK => {
+            engine.borrow_mut().tab_nav_back();
+            true
+        }
+        ACC_NAV_FORWARD => {
+            engine.borrow_mut().tab_nav_forward();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1329,7 +1432,7 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::EventControllerKey {
                                 set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine, backend_events] => move |ctrl_ref, key, _, modifier| {
+                                connect_key_pressed[sender, engine, backend_events, backend] => move |ctrl_ref, key, _, modifier| {
                                     // Phase B.5b Stage 1: dual-write the
                                     // translated UiEvent into the backend
                                     // queue. The drain timer consumes and
@@ -1504,16 +1607,39 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    // Panel navigation — driven by panel_keys settings
-                                    let pk = engine.borrow().settings.panel_keys.clone();
-                                    // Ctrl+T: toggle terminal (checked first so it works even when terminal has focus)
-                                    if matches_gtk_key(&pk.open_terminal, key, modifier) {
-                                        sender.input(Msg::ToggleTerminal);
-                                        return gtk4::glib::Propagation::Stop;
+                                    // Panel navigation — driven by panel_keys settings.
+                                    //
+                                    // Phase B.5b Stage 2: a single
+                                    // registry lookup against `GtkBackend`'s
+                                    // accelerator table replaces 13 inline
+                                    // `if matches_gtk_key(&pk.X, ...)`
+                                    // arms. The lookup runs once and the
+                                    // result is dispatched in two windows:
+                                    // — early (here) only for
+                                    //   `ACC_OPEN_TERMINAL`, so Ctrl+T
+                                    //   keeps working when the terminal has
+                                    //   focus;
+                                    // — late (after the terminal-focus
+                                    //   block) for every other id.
+                                    let matched_acc_id = events::gdk_key_to_quadraui_key(key)
+                                        .and_then(|qkey| {
+                                            let qmods = events::gdk_modifiers_to_quadraui(modifier);
+                                            backend.borrow().match_keypress(&qkey, qmods)
+                                        });
+                                    if let Some(ref id) = matched_acc_id {
+                                        if id.as_str() == ACC_OPEN_TERMINAL {
+                                            sender.input(Msg::ToggleTerminal);
+                                            return gtk4::glib::Propagation::Stop;
+                                        }
                                     }
-                                    // Phase B.2: accelerator-registry dispatch.
-                                    // Replaces per-binding `matches_gtk_key`
-                                    // checks with a single registry lookup.
+                                    // Phase B.2: engine-side accelerator
+                                    // registry. Currently only carries
+                                    // `terminal.toggle_maximize`. Distinct
+                                    // from `GtkBackend`'s registry; both
+                                    // exist so the engine can register
+                                    // accelerators visible to all backends
+                                    // while the GTK-only panel keys live on
+                                    // the backend.
                                     {
                                         let eng = engine.borrow();
                                         if let Some(id) = eng.match_accelerator(
@@ -1591,76 +1717,23 @@ impl SimpleComponent for App {
                                         }
                                         return gtk4::glib::Propagation::Stop;
                                     }
-                                    if matches_gtk_key(&pk.toggle_sidebar, key, modifier) {
-                                        sender.input(Msg::ToggleSidebar);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.focus_explorer, key, modifier) {
-                                        // Toggle: if tree already focused, go back to editor
-                                        sender.input(Msg::ToggleFocusExplorer);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.focus_search, key, modifier) {
-                                        sender.input(Msg::ToggleFocusSearch);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.fuzzy_finder, key, modifier) {
-                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Files);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.live_grep, key, modifier) {
-                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Grep);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.command_palette, key, modifier) {
-                                        engine.borrow_mut().open_picker(core::engine::PickerSource::Commands);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.add_cursor, key, modifier) {
-                                        engine.borrow_mut().add_cursor_at_next_match();
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.select_all_matches, key, modifier) {
-                                        let mut eng = engine.borrow_mut();
-                                        if eng.is_vscode_mode() {
-                                            eng.vscode_select_all_occurrences();
-                                        } else {
-                                            eng.select_all_word_occurrences();
+                                    // Phase B.5b Stage 2: late panel-key
+                                    // dispatch. The lookup ran once before
+                                    // the engine's accelerator block; if
+                                    // it matched and wasn't the early
+                                    // `ACC_OPEN_TERMINAL` shortcut, the
+                                    // dispatcher routes the action here.
+                                    // Replaces 12 inline `matches_gtk_key`
+                                    // arms (toggle_sidebar / focus_explorer /
+                                    // focus_search / fuzzy_finder / live_grep /
+                                    // command_palette / add_cursor /
+                                    // select_all_matches / split_editor_right /
+                                    // split_editor_down / nav_back /
+                                    // nav_forward).
+                                    if let Some(id) = &matched_acc_id {
+                                        if dispatch_gtk_panel_accelerator(id.as_str(), &sender, &engine) {
+                                            return gtk4::glib::Propagation::Stop;
                                         }
-                                        drop(eng);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    if !pk.split_editor_right.is_empty()
-                                        && matches_gtk_key(&pk.split_editor_right, key, modifier)
-                                    {
-                                        engine.borrow_mut().open_editor_group(
-                                            crate::core::window::SplitDirection::Vertical,
-                                        );
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    if !pk.split_editor_down.is_empty()
-                                        && matches_gtk_key(&pk.split_editor_down, key, modifier)
-                                    {
-                                        engine.borrow_mut().open_editor_group(
-                                            crate::core::window::SplitDirection::Horizontal,
-                                        );
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    if matches_gtk_key(&pk.nav_back, key, modifier) {
-                                        engine.borrow_mut().tab_nav_back();
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if matches_gtk_key(&pk.nav_forward, key, modifier) {
-                                        engine.borrow_mut().tab_nav_forward();
-                                        return gtk4::glib::Propagation::Stop;
                                     }
 
                                     // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
@@ -2169,14 +2242,14 @@ impl SimpleComponent for App {
         // Phase B.5 Stage 1: build the `quadraui::Backend` impl now,
         // before constructing the App. Both the App's modal_stack /
         // drag_state alias fields and the App's `backend` field share
-        // the same underlying `Rc<RefCell<>>`s — Stage 5 migrates the
-        // alias call sites onto `backend.borrow().*_handle()` and
+        // the same underlying `Rc<RefCell<>>`s — B.5b Stage 11 migrates
+        // the alias call sites onto `backend.borrow().*_handle()` and
         // drops the duplicates.
         //
-        // Phase B.5 Stage 6: register panel-key accelerators on the
-        // backend. Dispatch through the registry is iterative — until
-        // it lands, the existing `matches_gtk_key` arms in the key
-        // handler stay authoritative.
+        // Panel-key accelerators are registered here (re-runs on each
+        // settings reload via `register_panel_accelerators`). The
+        // editor key handler dispatches matches through
+        // `dispatch_gtk_panel_accelerator` — see B.5b Stage 2.
         let mut gtk_backend = backend::GtkBackend::new();
         register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
         let backend_modal_stack = gtk_backend.modal_stack_handle();
@@ -2285,7 +2358,7 @@ impl SimpleComponent for App {
             // canonical owner.
             modal_stack: backend_modal_stack,
             drag_state: backend_drag_state,
-            backend,
+            backend: backend.clone(),
         };
         let widgets = view_output!();
 
@@ -9977,9 +10050,10 @@ impl App {
             return;
         }
         // Panel-nav shortcuts (Ctrl-B / Ctrl-Shift-E / Ctrl-Shift-F).
-        // `matches_gtk_key` takes a `gtk4::gdk::Key` — we lost the original
-        // here (it was consumed in the controller callback to build the
-        // String), so dispatch by name for the common cases.
+        // The B.5b Stage 2 dispatcher needs a `gtk4::gdk::Key` — we
+        // lost the original here (it was consumed in the controller
+        // callback to build the String), so dispatch by approximate
+        // string match for the common cases.
         let pk_toggle_sidebar = self
             .engine
             .borrow()
@@ -10002,10 +10076,10 @@ impl App {
             .focus_search
             .clone();
         // Build a printable form of the current key for the settings
-        // string comparison (e.g. "Ctrl-B", "Ctrl-Shift-E"). The settings
-        // format is defined in `util::matches_gtk_key`; we approximate
-        // here and only match exact strings — good enough for the common
-        // defaults.
+        // string comparison (e.g. "Ctrl-B", "Ctrl-Shift-E"). The
+        // canonical binding format is defined in
+        // `render::matches_key_binding`; we approximate here and only
+        // match exact strings — good enough for the common defaults.
         let printable = match (ctrl, unicode) {
             (true, Some(c)) => format!("Ctrl-{}", c.to_ascii_uppercase()),
             (false, Some(c)) => c.to_string(),
