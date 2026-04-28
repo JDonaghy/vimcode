@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1 + 2 shipped this session. Stage 1: event-queue producers (key/mouse/scroll on the editor DA) + 16 ms `glib::timeout_add_local` drain via `Backend::poll_events()`. Stage 2: `dispatch_gtk_panel_accelerator` helper + a single `match_keypress` lookup replaces 13 inline `matches_gtk_key` arms in the editor key handler; `util::matches_gtk_key` removed entirely. Next: B5b.3, modal stack migration starting with the dialog modal.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1 + 2 + 3 shipped this session. Stage 1: event-queue producers + 16 ms drain. Stage 2: `dispatch_gtk_panel_accelerator` + `match_keypress` replace 13 `matches_gtk_key` arms; `util::matches_gtk_key` deleted. Stage 3: dialog modal click hit-test routes through `ModalStack` + `quadraui::dispatch_mouse_down`, mirroring the picker pattern. Next: B5b.4, context menu modal.)
 
 ---
 
@@ -42,7 +42,8 @@ dependencies.
 |---|---|---|
 | **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::timeout_add_local` drain (16 ms). Foundation for everything else. **Scope:** editor DA's key + mouse-down + drag-update + drag-end + scroll callbacks. Sidebar / panel callbacks land alongside their respective click migrations in later stages. | ✅ |
 | **B5b.2** | `dispatch_gtk_panel_accelerator` helper + single `match_keypress` lookup replace 13 inline `matches_gtk_key` arms in the editor key handler. `util::matches_gtk_key` deleted. Synchronous dispatch (called from the GTK signal handler), not yet via the queue drain — keeps zero-latency for shortcuts. | ✅ |
-| **B5b.3–B5b.7** | Per-modal migration onto `ModalStack` — dialog, context menu, completion popup, hover popup, tab switcher. | ⬜ |
+| **B5b.3** | Dialog modal click hit-test routes through `ModalStack::push` + `quadraui::dispatch_mouse_down` (picker-pattern mirror). Push on every frame the dialog is open (idempotent), pop on close. Inner button hit-test still uses GTK pixel rects from the last draw. **Out of scope:** the 9 inline `engine.dialog.is_some()` gates in sidebar key handlers (lines 5464, 5472, 5484, 5490, 5501, 5507, 5518, 5533, 5548) — those gate key routing, not click hit-testing, and are a separate concern from `ModalStack`. | ✅ |
+| **B5b.4–B5b.7** | Per-modal migration onto `ModalStack` — context menu, completion popup, hover popup, tab switcher. | ⬜ |
 | **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
 | **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
 | **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. | ⬜ |

@@ -6588,6 +6588,17 @@ impl App {
             }
         }
         // Dialog button click — highest z-order element.
+        //
+        // Phase B.5b Stage 3: routed through `ModalStack` + the shared
+        // `quadraui::dispatch_mouse_down` arbiter, mirroring the
+        // picker pattern above. The dialog is pushed onto the stack
+        // (idempotently — push() dedupes by id) every time the click
+        // handler runs while the dialog is open, popped when the
+        // dialog closes (here, after a button click or outside-click
+        // dismiss; or in the `else` branch below if the engine
+        // closed it via Esc/Enter without the click handler seeing).
+        // Inner button hit-testing stays per-backend (uses GTK
+        // pixel-level `dialog_btn_rects` from the last draw).
         if self.engine.borrow().dialog.is_some() {
             let lh = self.cached_line_height.max(1.0);
             let btn_rects = self.dialog_btn_rects.borrow().clone();
@@ -6601,27 +6612,60 @@ impl App {
                 }
             }
 
-            // Compute popup bounds for outside-click detection.
-            let engine = self.engine.borrow();
-            let dialog = engine.dialog.as_ref().unwrap();
-            let popup_h = ((3.0 + dialog.body.len() as f64 + 2.0) * lh).min(height - 40.0);
-            // Approximate popup width from button rects span.
-            let (popup_x, popup_w) =
-                if let (Some(first), Some(last)) = (btn_rects.first(), btn_rects.last()) {
-                    // Buttons start at popup_x + 12, so popup_x = first.0 - 12
-                    let px = first.0 - 12.0;
-                    // popup_w is at least wide enough to contain all buttons + padding
-                    let pw = (last.0 + last.2 - px + 12.0).max(350.0);
-                    (px, pw)
-                } else {
-                    ((width - 350.0) / 2.0, 350.0)
-                };
-            let popup_y_pos = (height - popup_h) / 2.0;
-            let outside = x < popup_x
-                || x >= popup_x + popup_w
-                || y < popup_y_pos
-                || y >= popup_y_pos + popup_h;
-            drop(engine);
+            // Compute popup bounds for ModalStack registration.
+            let (popup_x, popup_y_pos, popup_w, popup_h) = {
+                let engine = self.engine.borrow();
+                let dialog = engine.dialog.as_ref().unwrap();
+                let ph = ((3.0 + dialog.body.len() as f64 + 2.0) * lh).min(height - 40.0);
+                let (px, pw) =
+                    if let (Some(first), Some(last)) = (btn_rects.first(), btn_rects.last()) {
+                        // Buttons start at popup_x + 12, so popup_x = first.0 - 12
+                        let px = first.0 - 12.0;
+                        // popup_w is at least wide enough to contain all buttons + padding
+                        let pw = (last.0 + last.2 - px + 12.0).max(350.0);
+                        (px, pw)
+                    } else {
+                        ((width - 350.0) / 2.0, 350.0)
+                    };
+                let py = (height - ph) / 2.0;
+                (px, py, pw, ph)
+            };
+
+            let dialog_id = quadraui::WidgetId::new("dialog");
+            self.modal_stack.borrow_mut().push(
+                dialog_id.clone(),
+                quadraui::Rect {
+                    x: popup_x as f32,
+                    y: popup_y_pos as f32,
+                    width: popup_w as f32,
+                    height: popup_h as f32,
+                },
+            );
+
+            // Run the shared dispatch to learn whether this click
+            // landed inside the dialog or in the backdrop. We don't
+            // strictly need the inside verdict (button hit-test
+            // already drove that) but the outside verdict is what
+            // replaces the inline `outside = x < popup_x || ...`
+            // computation.
+            let outside = {
+                let stack = self.modal_stack.borrow();
+                let events = quadraui::dispatch_mouse_down(
+                    &stack,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                events.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        quadraui::UiEvent::Palette(id, _) if *id == dialog_id
+                    )
+                })
+            };
 
             if let Some(idx) = clicked_btn {
                 let action = self.engine.borrow_mut().dialog_click_button(idx);
@@ -6635,12 +6679,25 @@ impl App {
                     }
                     _ => {}
                 }
+                // dialog_click_button may have closed the dialog; sync
+                // the stack so the next frame doesn't see a stale entry.
+                if self.engine.borrow().dialog.is_none() {
+                    self.modal_stack.borrow_mut().pop(&dialog_id);
+                }
             } else if outside {
                 self.engine.borrow_mut().dialog = None;
                 self.engine.borrow_mut().pending_move = None;
+                self.modal_stack.borrow_mut().pop(&dialog_id);
             }
             self.draw_needed.set(true);
         } else {
+            // Dialog closed (possibly via Esc/Enter while no click was
+            // seen by us). Pop any stale entry so the stack stays in
+            // sync with engine state — same defensive cleanup the
+            // picker block does above.
+            self.modal_stack
+                .borrow_mut()
+                .pop(&quadraui::WidgetId::new("dialog"));
             // ── Status bar branch click — open branch picker ─────────────
             // (only when per-window status is off — global bar exists)
             if self.cached_line_height > 0.0 {
