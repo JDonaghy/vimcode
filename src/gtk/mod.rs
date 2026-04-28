@@ -6762,8 +6762,15 @@ impl App {
             // Snapshot the active file path before processing the click so we
             // can detect tab switches (and only then highlight in the tree).
             let file_before_click = self.engine.borrow().file_path().cloned();
-            // Clicking in the editor clears debug sidebar focus.
-            self.engine.borrow_mut().dap_sidebar_has_focus = false;
+            // Clicking in the editor clears every sidebar's keyboard focus.
+            // Without this, focus stays on whichever sidebar grabbed it last
+            // (Source Control, Extensions, Settings, AI, DAP, …) and the
+            // editor key handler keeps routing keys to that sidebar's
+            // handler — so the editor "can't be interacted with" until the
+            // user explicitly Escapes out of the sidebar. The DAP-only
+            // version of this clear was incomplete; tracked all fields via
+            // `clear_sidebar_focus()` instead.
+            self.engine.borrow_mut().clear_sidebar_focus();
             // Check if click lands in the terminal panel before general handling.
             // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
             let in_terminal = if self.cached_line_height > 0.0 {
