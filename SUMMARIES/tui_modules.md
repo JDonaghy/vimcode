@@ -1,5 +1,25 @@
 # TUI Backend Modules
 
+## src/tui_main/backend.rs — 685 lines
+**Phase B.4: `quadraui::Backend` trait impl for TUI.** Load-bearing — every native event flows through this.
+- `TuiBackend` struct — owns the cached viewport, `ModalStack`, `DragState`, accelerator registry, `TuiPlatformServices`, frame-scope pointer for `&mut Frame<'_>`, current theme
+- `enter_frame_scope(frame, |b| ...)` — stashes type-erased `*mut Frame` for the closure duration so trait `draw_*` methods reach it
+- `wait_events(timeout)` / `poll_events()` — translate crossterm events through `events::crossterm_to_uievents` then run `apply_accelerators` to rewrite registered key bindings as `UiEvent::Accelerator`
+- 4 trait `draw_*` methods (palette/list/tree/form) implemented; 5 stubbed pending quadraui trait extension (status_bar/tab_bar/activity_bar/terminal/text_display)
+- `apply_accelerators` / `match_keypress` / `parse_binding` / `named_key_to_binding_name` — registered binding match against incoming key events
+- 11 unit tests (cross-backend MockBackend `paint_overlays`, modal stack, accelerator round-trip, named keys, modifier matching, widget-scope skip, etc.)
+
+## src/tui_main/services.rs — 76 lines
+**Phase B.4: `quadraui::PlatformServices` impl for TUI** — stub for now. `TuiPlatformServices` + `TuiClipboard` (no-op). Engine clipboard plumbing in `mod.rs::setup_tui_clipboard` still owns the real read/write closures; trait surface is forward-compat.
+
+## src/tui_main/events.rs — 669 lines
+**Phase B.4: crossterm↔`UiEvent` translation.** Every native event reaches the engine through this layer.
+- `crossterm_to_uievents(Event)` — forward translation; `Vec<UiEvent>` for future composite events
+- `crossterm_key_to_uievent`, `crossterm_mouse_to_uievent` — per-event-kind helpers
+- `uievent_to_crossterm()` — inverse synth used by Stage 5b to feed legacy handlers without re-decoding
+- `synth_keyevent`, `synth_mouseevent` — inverse helpers
+- 19 unit tests (15 forward + 4 round-trip)
+
 ## src/tui_main/mod.rs — 4,237 lines
 TUI application shell using ratatui + crossterm. Contains setup, event loop, key translation, clipboard, and cell rendering helpers.
 - `run(file_path, debug_log)` — entry point; sets up terminal, runs event loop, restores terminal on exit

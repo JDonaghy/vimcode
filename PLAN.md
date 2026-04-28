@@ -6,16 +6,66 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 + B.5 both complete. The `quadraui::Backend` trait is implemented on **two backends** — TUI (B.4, `0aa9745`) and GTK (B.5, this commit). Generic `paint::<B>` drives the quickfix panel on both. Forward-compat for B.6 (Win-GUI), B.7 (macOS), and possible Android/iOS/WASM stays sound. Iterative B.5 follow-ups (#247 #248) handle the per-modal `ModalStack` migration; none block starting B.6.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; **Phase B.5 was a plumbing pass — runtime migration is B.5b, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** B.4 made the trait load-bearing on TUI (`0aa9745`). B.5 (`2c8fe7f` … `2d8ef54`) added the trait surface to GTK — `GtkBackend` struct, GDK→`UiEvent` translation helpers, accelerator registry, frame-scope, clipboard write, `is_modal_open` — but **the running GTK app still drives event/click/key dispatch through Relm4 `Msg::*` flow**. Only the quickfix panel actually consumes the trait. **B.5b** is the runtime migration: 13 sub-stages, ~5–8 sessions, gets the GTK app *onto* the infrastructure B.5 built.)
 
 ---
 
-## 🎯 CURRENT FOCUS — Phase B.5: GTK Backend trait implementation
+## 🎯 CURRENT FOCUS — Phase B.5b: GTK runtime migration onto Backend trait
 
-Bring vimcode's GTK binary onto `quadraui::Backend` so the same
-generic `paint::<B>` and `UiEvent` dispatch code that drives TUI
-drives GTK. Each stage merges to develop on its own — `vimcode`
-keeps working at every commit. Refactor in place; no parallel tree.
+**Master tracking issue: [#249](https://github.com/JDonaghy/vimcode/issues/249).** That issue holds the full 13-stage map; this section is a pointer.
+
+### Why this exists separately from B.5
+
+B.5's 9 stages built **the trait surface** on GTK — the struct,
+the trait impl, translation helpers, the accelerator registry, the
+event queue. **All compiled, none consumed at runtime.** The GTK
+app today still routes:
+
+- Mouse / key dispatch through Relm4 `Msg::*` flow (NOT `wait_events`)
+- 22 inline `engine.<modal>.is_some()` modal gates (NOT `ModalStack`)
+- 16 inline `matches_gtk_key` arms in the key handler (NOT `UiEvent::Accelerator`)
+- 24 direct `quadraui_gtk::draw_*` shim calls (NOT `Backend::draw_*` — only the 1 quickfix call goes through the trait)
+- Clipboard via engine-level closures (NOT `PlatformServices`)
+
+`src/gtk/events.rs` carries `#![allow(dead_code)]`. The accelerator
+registry is populated but inert. The trait is real but largely
+unused at runtime.
+
+B.5b is the work that gets the GTK app *onto* the trait. Each
+sub-stage merges to develop independently; `vimcode` keeps booting
+and rendering throughout. See #249 for the stage map and
+dependencies.
+
+### B.5b stage summary (full detail in #249)
+
+| # | Goal |
+|---|---|
+| **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::idle_add_local` drain. Foundation for everything else. |
+| **B5b.2** | Migrate 16 `matches_gtk_key` arms → `UiEvent::Accelerator(id)` dispatch. Mirrors TUI's `dispatch_panel_accelerator`. |
+| **B5b.3–B5b.7** | Per-modal migration onto `ModalStack` — dialog, context menu, completion popup, hover popup, tab switcher. |
+| **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. |
+| **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. |
+| **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. |
+
+### Issues this resolves
+
+- **#192** GTK palette mouse leak → B5b.3
+- **#229** GTK editor hover scrollbar leak → B5b.6
+- **#236** GTK ContextMenu border → folds into B5b.4
+- **#247** GTK modal hover + Pango font swap → B5b.6
+- **#243** GTK debug sidebar GestureDrag → standalone, fits B5b.1 pattern
+
+---
+
+## ✅ Phase B.5 — GTK Backend trait plumbing (shipped)
+
+Bring vimcode's GTK binary onto `quadraui::Backend`. **What B.5
+actually delivered:** the trait surface, the infrastructure, one
+pilot site (quickfix panel through `Backend::draw_list`). Runtime
+migration is B.5b above.
+
+Each stage merges to develop on its own — `vimcode` keeps working
+at every commit. Refactor in place; no parallel tree.
 
 ### Pinned decisions (locked before Stage 1)
 
