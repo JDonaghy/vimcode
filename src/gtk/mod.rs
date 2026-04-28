@@ -369,13 +369,14 @@ struct App {
     /// Set on mouse-down, read on mouse-move (drag update), cleared on
     /// mouse-up. Fixes #190 (palette scrollbar wasn't draggable).
     drag_state: Rc<RefCell<quadraui::DragState>>,
-    /// Phase B.5 Stage 1: `quadraui::Backend`-impl handle. Currently
-    /// holds the canonical accelerators / event-queue / viewport /
-    /// services state. The existing `modal_stack` and `drag_state`
-    /// fields above are alias `Rc` clones pointing at the same
-    /// `RefCell`s the backend owns — Stage 4+ migrates call sites
-    /// onto the backend handle and removes the duplicates.
-    #[allow(dead_code)]
+    /// Phase B.5 Stage 1: `quadraui::Backend`-impl handle. Holds the
+    /// canonical accelerators / event-queue / viewport / services
+    /// state. The existing `modal_stack` and `drag_state` fields
+    /// above are alias `Rc` clones pointing at the same `RefCell`s
+    /// the backend owns — B.5b Stage 11 migrates call sites onto the
+    /// backend handle and removes the duplicates. As of Stage 1 the
+    /// `init` drain timer holds a clone and pumps `poll_events()`
+    /// every 16 ms.
     backend: Rc<RefCell<backend::GtkBackend>>,
 }
 
@@ -1328,7 +1329,17 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::EventControllerKey {
                                 set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine] => move |ctrl_ref, key, _, modifier| {
+                                connect_key_pressed[sender, engine, backend_events] => move |ctrl_ref, key, _, modifier| {
+                                    // Phase B.5b Stage 1: dual-write the
+                                    // translated UiEvent into the backend
+                                    // queue. The drain timer consumes and
+                                    // discards today; B5b.2 routes the
+                                    // accelerator-shaped events back into
+                                    // dispatch.
+                                    if let Some(ev) = events::gdk_key_to_uievent(key, modifier, false) {
+                                        backend_events.borrow_mut().push_back(ev);
+                                    }
+
                                     let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
                                     let unicode = key.to_unicode().filter(|c| !c.is_control());
                                     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
@@ -1792,7 +1803,7 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::GestureClick {
                                 set_button: 1,
-                                connect_pressed[sender, drawing_area] => move |gesture, n_press, x, y| {
+                                connect_pressed[sender, drawing_area, backend_events] => move |gesture, n_press, x, y| {
                                     // Grab focus when clicking in editor
                                     drawing_area.grab_focus();
 
@@ -1803,6 +1814,15 @@ impl SimpleComponent for App {
                                         .current_event()
                                         .map(|ev| ev.modifier_state().contains(gdk::ModifierType::ALT_MASK))
                                         .unwrap_or(false);
+
+                                    // Phase B.5b Stage 1: dual-write
+                                    // `UiEvent::MouseDown`. The trait
+                                    // doesn't carry `n_press`, so consumers
+                                    // detect double-clicks separately.
+                                    backend_events.borrow_mut().push_back(
+                                        events::gdk_button_to_mouse_down(1, x, y, modifier),
+                                    );
+
                                     if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
                                         sender.input(Msg::CtrlMouseClick { x, y, width, height });
                                     } else if n_press >= 2 {
@@ -1815,7 +1835,7 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::GestureDrag {
                                 set_button: 1,
-                                connect_drag_update[sender, drawing_area] => move |gesture, dx, dy| {
+                                connect_drag_update[sender, drawing_area, backend_events] => move |gesture, dx, dy| {
                                     // Dead zone: ignore sub-4px movement to avoid
                                     // accidental visual mode on click jitter.
                                     if dx * dx + dy * dy < 16.0 {
@@ -1826,10 +1846,38 @@ impl SimpleComponent for App {
                                         let y = start_y + dy;
                                         let width = drawing_area.width() as f64;
                                         let height = drawing_area.height() as f64;
+
+                                        // Phase B.5b Stage 1: drag updates
+                                        // surface as `MouseMoved` with a
+                                        // left-button-held mask. Buttons
+                                        // mask matches the gesture's
+                                        // configured button (1 = left).
+                                        let buttons = quadraui::ButtonMask {
+                                            left: true,
+                                            right: false,
+                                            middle: false,
+                                        };
+                                        backend_events.borrow_mut().push_back(
+                                            events::gdk_motion_to_uievent(x, y, buttons),
+                                        );
+
                                         sender.input(Msg::MouseDrag { x, y, width, height });
                                     }
                                 },
-                                connect_drag_end[sender] => move |_, _, _| {
+                                connect_drag_end[sender, backend_events] => move |gesture, dx, dy| {
+                                    // Phase B.5b Stage 1: dual-write
+                                    // `UiEvent::MouseUp`. Reconstruct the
+                                    // release coords from the gesture's
+                                    // start + delta (the existing Msg
+                                    // discards them but the trait carries
+                                    // them through).
+                                    let (rx, ry) = gesture
+                                        .start_point()
+                                        .map(|(sx, sy)| (sx + dx, sy + dy))
+                                        .unwrap_or((0.0, 0.0));
+                                    backend_events.borrow_mut().push_back(
+                                        events::gdk_button_to_mouse_up(1, rx, ry),
+                                    );
                                     sender.input(Msg::MouseUp);
                                 },
                             },
@@ -1837,7 +1885,19 @@ impl SimpleComponent for App {
                             add_controller = gtk4::EventControllerScroll {
                                 set_flags: gtk4::EventControllerScrollFlags::VERTICAL
                                          | gtk4::EventControllerScrollFlags::HORIZONTAL,
-                                connect_scroll[sender] => move |_, dx, dy| {
+                                connect_scroll[sender, backend_events, last_editor_pointer] => move |_, dx, dy| {
+                                    // Phase B.5b Stage 1: dual-write
+                                    // `UiEvent::Scroll`. Use the cached
+                                    // editor-pointer position (#240) so
+                                    // consumers can route the wheel event
+                                    // to the window under the cursor.
+                                    let (px, py) = last_editor_pointer
+                                        .get()
+                                        .unwrap_or((0.0, 0.0));
+                                    backend_events.borrow_mut().push_back(
+                                        events::gdk_scroll_to_uievent(dx, dy, px, py),
+                                    );
+
                                     sender.input(Msg::MouseScroll { delta_x: dx, delta_y: dy });
                                     gtk4::glib::Propagation::Stop
                                 },
@@ -2121,6 +2181,14 @@ impl SimpleComponent for App {
         register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
         let backend_modal_stack = gtk_backend.modal_stack_handle();
         let backend_drag_state = gtk_backend.drag_state_handle();
+        // Phase B.5b Stage 1: shared event-queue handle. Producer-side
+        // signal callbacks (key/mouse/scroll on the editor DA) push
+        // translated `UiEvent`s into this `RefCell<VecDeque>`; the drain
+        // hook installed below polls and discards. Dual-write today —
+        // Relm4 `Msg` flow remains authoritative, the queue just proves
+        // producers + consumer are wired so subsequent stages can route
+        // dispatch off it.
+        let backend_events = gtk_backend.events_handle();
         let backend = Rc::new(RefCell::new(gtk_backend));
 
         let model = App {
@@ -3952,6 +4020,25 @@ impl SimpleComponent for App {
             sender_for_poll.send(Msg::SearchPollTick).ok();
             gtk4::glib::ControlFlow::Continue
         });
+
+        // Phase B.5b Stage 1: drain the backend's `UiEvent` queue.
+        // Producers — the editor DA's key/mouse/scroll signal
+        // callbacks — push translated events into
+        // `GtkBackend::events_handle()`. This consumer drains them
+        // periodically so the queue can't grow unbounded. Today the
+        // events are simply discarded (Relm4 `Msg` flow stays
+        // authoritative); subsequent B.5b stages route specific
+        // event shapes back through `dispatch_*` helpers as each
+        // surface migrates onto the trait. Tick at ~60 Hz so a real
+        // dispatcher introduced later sees no perceptible latency.
+        {
+            use quadraui::Backend;
+            let backend_for_drain = model.backend.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                let _ = backend_for_drain.borrow_mut().poll_events();
+                gtk4::glib::ControlFlow::Continue
+            });
+        }
 
         // ── Disable GTK mnemonic Alt interception ─────────────────────────────
         // GTK4 has a built-in ShortcutController on the window that intercepts

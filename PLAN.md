@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; **Phase B.5 was a plumbing pass — runtime migration is B.5b, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** B.4 made the trait load-bearing on TUI (`0aa9745`). B.5 (`2c8fe7f` … `2d8ef54`) added the trait surface to GTK — `GtkBackend` struct, GDK→`UiEvent` translation helpers, accelerator registry, frame-scope, clipboard write, `is_modal_open` — but **the running GTK app still drives event/click/key dispatch through Relm4 `Msg::*` flow**. Only the quickfix panel actually consumes the trait. **B.5b** is the runtime migration: 13 sub-stages, ~5–8 sessions, gets the GTK app *onto* the infrastructure B.5 built.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** B.5b Stage 1 — event-queue producers + drain consumer — shipped this session. The editor DA's key/mouse/scroll callbacks now dual-write translated `UiEvent`s into `GtkBackend::events_handle()` alongside their existing `Msg::*` dispatch; a 16 ms `glib::timeout_add_local` drains the queue. Behavior is unchanged — Relm4 `Msg` flow stays authoritative — but the foundation is now in place for B5b.2 (accelerator dispatch) to start consuming the queue.)
 
 ---
 
@@ -38,14 +38,32 @@ dependencies.
 
 ### B.5b stage summary (full detail in #249)
 
-| # | Goal |
-|---|---|
-| **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::idle_add_local` drain. Foundation for everything else. |
-| **B5b.2** | Migrate 16 `matches_gtk_key` arms → `UiEvent::Accelerator(id)` dispatch. Mirrors TUI's `dispatch_panel_accelerator`. |
-| **B5b.3–B5b.7** | Per-modal migration onto `ModalStack` — dialog, context menu, completion popup, hover popup, tab switcher. |
-| **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. |
-| **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. |
-| **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. |
+| # | Goal | Status |
+|---|---|---|
+| **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::timeout_add_local` drain (16 ms). Foundation for everything else. **Scope:** editor DA's key + mouse-down + drag-update + drag-end + scroll callbacks. Sidebar / panel callbacks land alongside their respective click migrations in later stages. | ✅ |
+| **B5b.2** | Migrate 16 `matches_gtk_key` arms → `UiEvent::Accelerator(id)` dispatch. Mirrors TUI's `dispatch_panel_accelerator`. | ⬜ |
+| **B5b.3–B5b.7** | Per-modal migration onto `ModalStack` — dialog, context menu, completion popup, hover popup, tab switcher. | ⬜ |
+| **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
+| **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
+| **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. | ⬜ |
+
+### Stage 1 ship notes
+
+What changed in B5b.1:
+- `let backend_events = gtk_backend.events_handle();` exposed in `init()` scope before `view_output!()` so closures inside the `view!` macro can capture it.
+- Editor DA's `EventControllerKey::connect_key_pressed` pushes `UiEvent::KeyPressed` via `events::gdk_key_to_uievent()` at the top of the closure (every keypress translated, even those that early-return through `matches_gtk_key`/`match_accelerator` paths).
+- `GestureClick::connect_pressed` pushes `UiEvent::MouseDown`.
+- `GestureDrag::connect_drag_update` pushes `UiEvent::MouseMoved` with a left-button-held mask.
+- `GestureDrag::connect_drag_end` pushes `UiEvent::MouseUp` (reconstructs release coords from start+delta — the existing `Msg::MouseUp` discards them).
+- `EventControllerScroll::connect_scroll` pushes `UiEvent::Scroll`, using `last_editor_pointer` for the position so the consumer can route to the window under the cursor.
+- `glib::timeout_add_local(16ms)` drains via `Backend::poll_events()` and discards.
+- `#[allow(dead_code)]` removed from `GtkBackend::events_handle()` and `App.backend` — both now live.
+
+Out of scope for B5b.1, deferred:
+- Sidebar callbacks (explorer, debug, git, ext, AI panels) — wired alongside their click migration in B5b.3–B5b.7.
+- Settings panel callbacks (around lines 2261–2291).
+- Window resize → `UiEvent::WindowResized` — the trait already updates viewport via `begin_frame`, so this is redundant in GTK.
+- Motion events (~100–200 Hz) — not pushed; the drain doesn't need them today and they'd dominate the queue. Add when a consumer needs them.
 
 ### Issues this resolves
 

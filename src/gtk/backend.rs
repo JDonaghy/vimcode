@@ -162,11 +162,11 @@ impl GtkBackend {
         self.drag_state.clone()
     }
 
-    /// Shared handle to the event-queue adapter. Stage 5 will hand
-    /// this clone to every signal-callback closure so they can push
+    /// Shared handle to the event-queue adapter. Producer-side
+    /// signal-callback closures (mouse/key/scroll on the editor
+    /// DrawingArea, as of Phase B.5b Stage 1) clone this and push
     /// translated `UiEvent`s into the queue. Drained by
     /// `wait_events` / `poll_events`.
-    #[allow(dead_code)]
     pub fn events_handle(&self) -> Rc<std::cell::RefCell<VecDeque<UiEvent>>> {
         self.events.clone()
     }
