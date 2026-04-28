@@ -6,24 +6,170 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-28 (Phase B.4 done; B.5 plumbing done; **B.5b shipped end-to-end (Stages 1–12)** — [#249](https://github.com/JDonaghy/vimcode/issues/249) closed. Trait is load-bearing on GTK for events + modal arbitration; trait-callable primitives (palette / tree / form / list) all route through `Backend::draw_*`. Trait extended with `&Layout` parameters for the 5 layout-passthrough primitives (status_bar / tab_bar / activity_bar / terminal / text_display); 3 of 5 GTK trait impls are functional, 2 are forward-compat stubs pending a #223 lift of `quadraui_gtk::*` shims into quadraui itself. `App.modal_stack` / `App.drag_state` alias fields dropped; ~30 call sites now go through `self.backend.borrow().*_handle()`. Dead `quadraui_gtk::draw_{tree,form,list,palette}` shims removed; `events.rs` no longer needs `#![allow(dead_code)]`. Smoke-test bugfixes: #247 / #250 / #251 / #252 all closed.)
+> **Last updated:** 2026-04-28 (B.5b shipped — see "✅ Phase B.5b" section below. **Next priority arc set: B.5c → B.5d → B.5e** before B.6 Win-GUI rebuild. B.5c gets TUI + GTK to 100% on the trait (close trait-method-return-type gaps, lift remaining GTK shims, add trait methods for the 6 trait-less primitives). B.5d audits the per-backend setup code into `docs/BACKEND_SETUP_AUDIT.md`. B.5e ships `quadraui_tui::run` / `quadraui_gtk::run` runner crates that hide per-backend boilerplate. Win-GUI rebuild deferred until this arc completes — doing it before would re-create the bandaid pattern that B.5b just unwound. See "🎯 NEXT FOCUS" section below for full breakdown including the parity audit, suggested stage order, pickup files.)
 
 ---
 
-## 🎯 CURRENT FOCUS — Phase B.6: Win-GUI rebuild on quadraui
+## 🎯 NEXT FOCUS — Phase B.5c → B.5d → B.5e (TUI + GTK to 100%, then runner crates)
 
 **B.5b shipped** (see "✅ Phase B.5b" section below). The user-facing
-runtime migration is done: GTK events flow through `quadraui::Backend`,
-modal arbitration goes through `ModalStack` + `dispatch_mouse_down`,
-the hover-trigger gate respects open modals, and per-modal click
-routing is consolidated. Mechanical draw-layer refactors deferred to
-[#254](https://github.com/JDonaghy/vimcode/issues/254) — no behaviour
-change; lands alongside Win-GUI / macOS backend rebuilds.
+runtime migration is done. **However**, both TUI and GTK still have
+known gaps that prevent them from being "100% on the trait" — and
+without that foundation, the boilerplate-elimination story (runner
+crates that hide per-backend setup details from the app developer)
+can't land cleanly.
 
-Next phase is **B.6 — Win-GUI rebuild on quadraui** (and #254 work
-naturally completes alongside it). Win-GUI today is bug-ridden with
-band-aids accumulated from the coexistence-era; like the GTK rebuild,
-it gets rebuilt on top of the trait surface that's now stable.
+**The user-decided priority arc** (set 2026-04-28):
+
+1. **B.5c — Close TUI + GTK trait coverage gaps** so both backends
+   are 100% on `quadraui::Backend`. Specifically: redesign trait
+   methods that need to return hit-region data; lift remaining GTK
+   shims into quadraui itself; add trait methods for the ~6
+   primitives that don't have them yet; migrate every direct
+   rasteriser call site onto the trait.
+2. **B.5d — Setup audit** of TUI vs GTK init code, documenting the
+   differences. The output is a written-up comparison
+   (`docs/BACKEND_SETUP_AUDIT.md`) that informs what the runner-crate
+   API should look like.
+3. **B.5e — Runner crates** (`quadraui_tui::run` / `quadraui_gtk::run`)
+   that hide per-backend boilerplate. After B.5e, an app's `main()`
+   should be ~10 lines of setup, all backend-agnostic.
+
+Only after B.5e do we move onto **B.6 — Win-GUI rebuild on
+quadraui**. Doing Win-GUI before the trait is at 100% would just
+re-create the bandaid pattern that B.5b unwound.
+
+### Phase B.5c — TUI + GTK trait coverage to 100%
+
+**Concrete known gaps (see "Parity audit" table at bottom of this
+section):**
+
+| Gap | Affected backend | Fix |
+|---|---|---|
+| `Backend::draw_status_bar` / `draw_tab_bar` / `draw_text_display` return `()` but call sites need `Vec<HitRegion>` | Both (call sites stay on direct shims) | Redesign trait method return types — either return the hit-region vec, or split into draw + query. |
+| `Backend::draw_activity_bar` / `draw_terminal` GTK impls are forward-compat stubs | GTK | Lift `crate::gtk::quadraui_gtk::draw_activity_bar` + `draw_terminal_cells` into `quadraui::gtk` (with `quadraui::Theme`). Tracked as #223 lift sequence. |
+| TUI's `draw_status_bar` etc. trait impls are `unimplemented!()` because TUI's draw path bypasses the trait | TUI | After the return-type redesign, route TUI's `draw_frame` through the trait method instead of calling `quadraui::tui::draw_*` directly. |
+| `Backend::draw_tree` / `Backend::draw_form` not used through trait by TUI | TUI | Migrate the TUI draw sites onto the trait method (mirrors GTK B5b.8). |
+| 6 primitives have no trait method at all: tooltip, dialog, context_menu, rich_text_popup, completions, find_replace | Both (use direct shims) | Extend the trait per-primitive. Some need return types for hit info (links in rich_text_popup, button rects in dialog). |
+
+**Suggested stage order:**
+- **B5c.1** — Redesign `Backend::draw_status_bar` to return a
+  `Vec<StatusBarHitRegion>`. Update both backend impls. Migrate all
+  GTK + TUI call sites onto the trait. **Validates the return-type
+  pattern** before applying to others.
+- **B5c.2** — Same shape for `draw_tab_bar` (returns `TabBarHits`).
+- **B5c.3** — Same shape for `draw_text_display` (no hit data —
+  straightforward).
+- **B5c.4** — TUI `draw_tree` + `draw_form` migration (no trait
+  change; mechanical).
+- **B5c.5** — Lift `quadraui_gtk::draw_activity_bar` +
+  `draw_terminal_cells` into `quadraui::gtk::*` with
+  `quadraui::Theme`. Wire GTK trait impls to call them.
+- **B5c.6** — Trait extension + impls for the 6 currently-trait-less
+  primitives (tooltip / dialog / context_menu / rich_text_popup /
+  completions / find_replace).
+- **B5c.7** — Final parity sweep + smoke tests on both backends.
+
+**Pickup files:**
+- `quadraui/src/backend.rs` — trait definition.
+- `quadraui/src/gtk/`, `quadraui/src/tui/` — rasterisers.
+- `src/gtk/quadraui_gtk.rs` — in-tree shims to lift.
+- `src/gtk/draw.rs`, `src/gtk/mod.rs`, `src/tui_main/render_impl.rs`
+  — call sites to migrate.
+
+### Phase B.5d — Setup-code audit
+
+**Goal:** a `docs/BACKEND_SETUP_AUDIT.md` that compares:
+- TUI's startup: `src/tui_main/mod.rs::run()` and `event_loop()`.
+- GTK's startup: `src/gtk/mod.rs::App::init()` and the `view!{}`
+  macro expansion.
+
+**Compare:**
+- How each backend builds its event source (crossterm
+  `event::read()` + `wait_events` queue vs Relm4 widget signal
+  callbacks + `glib::timeout_add_local` drain).
+- How each constructs its `Backend` impl (`TuiBackend::new()` +
+  threading vs `GtkBackend::new()` + `Rc<RefCell<>>`).
+- How each runs its frame loop (`terminal.draw(|f| ...)` vs
+  `set_draw_func`).
+- How each handles native services (clipboard, file dialogs).
+- Per-backend signal-callback boilerplate: every `connect_*` in
+  `src/gtk/mod.rs` (key, mouse, scroll, resize, drag, gestures);
+  every `match crossterm_event` arm in `src/tui_main/mod.rs`.
+
+**Output:** the audit doc + a sketch of the runner-crate API for
+B.5e (e.g. `quadraui_tui::run<App: AppLogic>(...)` signature). The
+audit's deliverable feeds directly into B.5e — don't start B.5e
+without it.
+
+### Phase B.5e — Runner crates
+
+Build `quadraui_tui::run()` and `quadraui_gtk::run()` that take an
+app-logic trait and hide everything else. Sample target API
+(refined during B.5d):
+
+```rust
+// User code
+struct MyApp { /* state */ }
+
+impl quadraui::AppLogic for MyApp {
+    fn render(&self, ctx: &mut RenderCtx) { /* paint */ }
+    fn handle(&mut self, event: UiEvent) -> Reaction { /* dispatch */ }
+}
+
+fn main() {
+    let app = MyApp::new();
+    #[cfg(feature = "gui")] quadraui_gtk::run(app);
+    #[cfg(feature = "tui")] quadraui_tui::run(app);
+}
+```
+
+**Pickup files (eventual):**
+- `quadraui/src/tui/run.rs` (new)
+- `quadraui/src/gtk/run.rs` (new)
+- An `AppLogic` trait or similar lifecycle abstraction in
+  `quadraui/src/lib.rs`.
+
+Vimcode's own `src/main.rs` becomes the first migration target. If
+the runner crates are good, vimcode shrinks substantially and the
+backend-specific files (`src/gtk/mod.rs`'s 11k-line `init()` in
+particular) collapse.
+
+**Tracking issues filed:**
+- [#259](https://github.com/JDonaghy/vimcode/issues/259) — B.5c master.
+- [#260](https://github.com/JDonaghy/vimcode/issues/260) — B.5d setup audit.
+- [#261](https://github.com/JDonaghy/vimcode/issues/261) — B.5e runner crates.
+
+[#241](https://github.com/JDonaghy/vimcode/issues/241) (the earlier
+"per-backend `run()` runner crates (boilerplate shell)" placeholder)
+is superseded by #261; close once B.5e ships.
+
+### Why this ordering
+
+Doing B.5e (runner crates) without B.5c (100% trait) would mean
+the runner has to either expose the per-backend direct-shim path
+as a hatch (defeats the boilerplate-elimination goal) OR papers
+over the gaps in a way that re-introduces backend-specific
+knowledge. Doing B.5d before B.5e ensures the runner-crate API is
+informed by what the platforms actually need, not by what's
+convenient to write first. Doing B.6 (Win-GUI) before any of this
+would ship a third backend with the same kind of gaps B.5b just
+unwound — re-creating the problem instead of preventing it.
+
+### Parity audit (current state, as of 2026-04-28)
+
+| Area | TUI | GTK |
+|---|---|---|
+| Event pipeline (`wait_events`, accelerator dispatch) | ✅ Load-bearing | ✅ Load-bearing |
+| Modal arbitration (`ModalStack` + `dispatch_mouse_down`) | ✅ Load-bearing | ✅ Load-bearing |
+| Drag state (`quadraui::DragState`) | ✅ 6 scrollbars | ✅ Multiple scrollbars |
+| `Backend::draw_palette` | ✅ Used | ✅ Used |
+| `Backend::draw_list` | ✅ Used | ✅ Used |
+| `Backend::draw_tree` | ❌ Direct shim (B5c.4) | ✅ Used |
+| `Backend::draw_form` | ❌ Direct shim (B5c.4) | ✅ Used |
+| `Backend::draw_status_bar` / `draw_tab_bar` / `draw_text_display` | `unimplemented!()` (B5c.1–.3) | Functional impl, sites still on direct shim (B5c.1–.3) |
+| `Backend::draw_activity_bar` / `draw_terminal` | `unimplemented!()` (B5c.5) | Forward-compat stub (B5c.5) |
+| Tooltip / dialog / context_menu / rich_text_popup / completions / find_replace trait methods | ❌ Don't exist (B5c.6) | ❌ Don't exist (B5c.6) |
 
 ## ✅ Phase B.5b — GTK runtime migration onto Backend trait
 
