@@ -542,13 +542,13 @@ impl Backend for TuiBackend {
         unimplemented!("TuiBackend::draw_terminal — TUI uses inline draw; trait reserved")
     }
 
-    fn draw_text_display(
-        &mut self,
-        _rect: QRect,
-        _td: &TextDisplay,
-        _layout: &quadraui::primitives::text_display::TextDisplayLayout,
-    ) {
-        unimplemented!("TuiBackend::draw_text_display — TUI uses inline draw; trait reserved")
+    fn draw_text_display(&mut self, rect: QRect, td: &TextDisplay) {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_text_display called outside enter_frame_scope");
+        quadraui::tui::draw_text_display(frame.buffer_mut(), area, td, &theme);
     }
 }
 
@@ -702,13 +702,7 @@ mod tests {
             _l: &quadraui::primitives::terminal::TerminalLayout,
         ) {
         }
-        fn draw_text_display(
-            &mut self,
-            _r: QRect,
-            _t: &TextDisplay,
-            _l: &quadraui::primitives::text_display::TextDisplayLayout,
-        ) {
-        }
+        fn draw_text_display(&mut self, _r: QRect, _t: &TextDisplay) {}
     }
 
     /// Generic helper — the minimal "app render code" that consumes
