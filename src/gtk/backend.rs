@@ -649,4 +649,91 @@ mod tests {
         assert!(backend.accelerators.is_empty());
         assert!(backend.parsed_accelerators.is_empty());
     }
+
+    /// Regression test for B5b.2: parse_key_binding correctness for the
+    /// two terminal-shortcut strings. If `<C-t>` parses to a binding that
+    /// matches Ctrl+Shift+T (or vice versa), the accelerator dispatch
+    /// will flip.
+    #[test]
+    fn parse_binding_terminal_strings_distinct() {
+        let p_ct = quadraui::parse_key_binding("<C-t>").expect("<C-t>");
+        assert!(p_ct.modifiers.ctrl);
+        assert!(
+            !p_ct.modifiers.shift,
+            "<C-t> must NOT have shift, got {:?}",
+            p_ct
+        );
+        assert_eq!(p_ct.key, "t");
+
+        let p_cst = quadraui::parse_key_binding("<C-S-t>").expect("<C-S-t>");
+        assert!(p_cst.modifiers.ctrl);
+        assert!(
+            p_cst.modifiers.shift,
+            "<C-S-t> must have shift, got {:?}",
+            p_cst
+        );
+        assert_eq!(p_cst.key, "t");
+    }
+
+    /// Regression test for B5b.2: the lookup used by the GTK key handler
+    /// must return distinct ids for `<C-t>` vs `<C-S-t>`. Previously the
+    /// inputs were swapped at runtime — Ctrl+T fired the maximize action
+    /// and Ctrl+Shift+T fired the open action.
+    #[test]
+    fn gtk_backend_match_keypress_distinguishes_ctrl_vs_ctrl_shift() {
+        let mut backend = GtkBackend::new();
+        backend.register_accelerator(&Accelerator {
+            id: AcceleratorId::new("gtk.panel.open_terminal"),
+            binding: KeyBinding::Literal("<C-t>".into()),
+            scope: AcceleratorScope::Global,
+            label: None,
+        });
+        backend.register_accelerator(&Accelerator {
+            id: AcceleratorId::new("terminal.toggle_maximize"),
+            binding: KeyBinding::Literal("<C-S-t>".into()),
+            scope: AcceleratorScope::Global,
+            label: None,
+        });
+
+        let ctrl_only = quadraui::Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            cmd: false,
+        };
+        let ctrl_shift = quadraui::Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            cmd: false,
+        };
+
+        // Ctrl+T → open_terminal
+        let open = backend.match_keypress(&quadraui::Key::Char('t'), ctrl_only);
+        assert_eq!(
+            open.as_ref().map(|i| i.as_str()),
+            Some("gtk.panel.open_terminal"),
+            "Ctrl+T should match open_terminal, got {:?}",
+            open
+        );
+
+        // Ctrl+Shift+T → toggle_maximize
+        let max = backend.match_keypress(&quadraui::Key::Char('t'), ctrl_shift);
+        assert_eq!(
+            max.as_ref().map(|i| i.as_str()),
+            Some("terminal.toggle_maximize"),
+            "Ctrl+Shift+T should match terminal.toggle_maximize, got {:?}",
+            max
+        );
+
+        // Also try with the GDK-style uppercase 'T' for the shift case —
+        // gdk_key_to_quadraui_key returns Key::Char('T') when shift is held.
+        let max_upper = backend.match_keypress(&quadraui::Key::Char('T'), ctrl_shift);
+        assert_eq!(
+            max_upper.as_ref().map(|i| i.as_str()),
+            Some("terminal.toggle_maximize"),
+            "Ctrl+Shift+T (with uppercase T) should match terminal.toggle_maximize, got {:?}",
+            max_upper
+        );
+    }
 }
