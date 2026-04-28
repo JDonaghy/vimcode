@@ -50,6 +50,7 @@ pub(super) fn draw_editor(
     action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    completion_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
     mouse_pos: (f64, f64),
@@ -379,8 +380,17 @@ pub(super) fn draw_editor(
         );
     }
 
-    // 5b. Draw completion popup (on top of everything else)
-    draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    // 5b. Draw completion popup (on top of everything else). Cache
+    //     the bounds so the click handler can register the popup on
+    //     the modal stack (B.5b Stage 5).
+    completion_popup_rect_out.set(draw_completion_popup(
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    ));
 
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(
@@ -1771,6 +1781,9 @@ pub(super) fn draw_window_separators(
     }
 }
 
+/// Returns the popup's `(x, y, w, h)` if drawn, `None` otherwise. The
+/// caller writes the rect into `App.completion_popup_rect` so the
+/// click handler can register it on the modal stack (B.5b Stage 5).
 pub(super) fn draw_completion_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -1778,20 +1791,13 @@ pub(super) fn draw_completion_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
-) {
-    let Some(menu) = &screen.completion else {
-        return;
-    };
-    let Some(active_win) = screen
+) -> Option<(f64, f64, f64, f64)> {
+    let menu = screen.completion.as_ref()?;
+    let active_win = screen
         .windows
         .iter()
-        .find(|w| w.window_id == screen.active_window_id)
-    else {
-        return;
-    };
-    let Some((cursor_pos, _)) = &active_win.cursor else {
-        return;
-    };
+        .find(|w| w.window_id == screen.active_window_id)?;
+    let (cursor_pos, _) = active_win.cursor.as_ref()?;
 
     // Anchor popup below the cursor cell, to the right of the gutter.
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
@@ -1838,6 +1844,8 @@ pub(super) fn draw_completion_popup(
         cr.move_to(popup_x, item_y);
         pangocairo::show_layout(cr, layout);
     }
+
+    Some((popup_x, popup_y, popup_w, popup_h))
 }
 
 #[allow(clippy::too_many_arguments)]

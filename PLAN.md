@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1–4 shipped this session, plus a focus-clear bugfix found during smoke-test (#250 closed). Stages 1–3 wired the queue + drain, accelerator dispatch, and dialog modal stack respectively. Stage 4: context-menu click hit-test routes through `ModalStack` + `quadraui::dispatch_mouse_down`; row-level item refinement still uses `resolve_context_menu_click` (cell-unit math). Next: B5b.5, completion popup.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1–5 shipped this session, plus three bugfixes found during smoke-test (#250 / #251 / #252 all closed). Stages 1–4 wired the queue + drain, accelerator dispatch, dialog modal stack, context-menu modal stack. Stage 5: completion popup on `ModalStack`; bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click inside the popup dismisses + consumes (cursor doesn't move) and click outside dismisses + propagates. Next: B5b.6, hover popup.)
 
 ---
 
@@ -43,8 +43,9 @@ dependencies.
 | **B5b.1** | Wire signal callbacks to push `UiEvent`s into `events_handle()`; add `glib::timeout_add_local` drain (16 ms). Foundation for everything else. **Scope:** editor DA's key + mouse-down + drag-update + drag-end + scroll callbacks. Sidebar / panel callbacks land alongside their respective click migrations in later stages. | ✅ |
 | **B5b.2** | `dispatch_gtk_panel_accelerator` helper + single `match_keypress` lookup replace 13 inline `matches_gtk_key` arms in the editor key handler. `util::matches_gtk_key` deleted. Synchronous dispatch (called from the GTK signal handler), not yet via the queue drain — keeps zero-latency for shortcuts. | ✅ |
 | **B5b.3** | Dialog modal click hit-test routes through `ModalStack::push` + `quadraui::dispatch_mouse_down` (picker-pattern mirror). Push on every frame the dialog is open (idempotent), pop on close. Inner button hit-test still uses GTK pixel rects from the last draw. **Out of scope:** the 9 inline `engine.dialog.is_some()` gates in sidebar key handlers (lines 5464, 5472, 5484, 5490, 5501, 5507, 5518, 5533, 5548) — those gate key routing, not click hit-testing, and are a separate concern from `ModalStack`. | ✅ |
-| **B5b.4** | Context menu click hit-test routes through `ModalStack` + `dispatch_mouse_down`. Pixel bounds derived from the cell-unit popup geometry `resolve_context_menu_click` already encodes (popup_w/popup_h derived from item label widths + separator count). Row-level item hit-test still uses `resolve_context_menu_click` because the popup renders in cell coordinates and inner hit refinement is genuine primitive concern, not modal arbitration. | ✅ |
-| **B5b.5–B5b.7** | Per-modal migration onto `ModalStack` — completion popup, hover popup, tab switcher. | ⬜ |
+| **B5b.4** | Context menu click hit-test routes through `ModalStack` + `dispatch_mouse_down`. Inner row hit-test migrated to `quadraui::ContextMenuLayout::hit_test` (matches the renderer; closes #251 off-by-one). | ✅ |
+| **B5b.5** | Completion popup registered on `ModalStack`. Bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click handler pushes them. Click inside the popup dismisses + consumes (cursor doesn't move); click outside dismisses + propagates. | ✅ |
+| **B5b.6–B5b.7** | Per-modal migration onto `ModalStack` — hover popup, tab switcher. | ⬜ |
 | **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
 | **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
 | **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. | ⬜ |
