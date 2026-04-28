@@ -492,15 +492,36 @@ impl Backend for TuiBackend {
 
     fn draw_tab_bar(
         &mut self,
-        _rect: QRect,
-        _bar: &TabBar,
-        _layout: &quadraui::primitives::tab_bar::TabBarLayout,
-    ) {
-        unimplemented!(
-            "TuiBackend::draw_tab_bar — TUI's draw path goes through render_impl::draw_frame; \
-             trait method exists for cross-backend tests / future \
-             generic paint::<B>"
-        )
+        rect: QRect,
+        bar: &TabBar,
+        _hovered_close_tab: Option<usize>,
+    ) -> quadraui::TabBarHits {
+        // TUI doesn't render close-button hover bg; the parameter is
+        // accepted for trait parity with GTK.
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        // Cell-unit measurer mirrors `render_impl::render_tab_bar`.
+        let tab_widths: Vec<usize> = bar
+            .tabs
+            .iter()
+            .map(|t| t.label.chars().count() + crate::render::TAB_CLOSE_COLS as usize)
+            .collect();
+        let layout = bar.layout(
+            area.width as f32,
+            area.height as f32,
+            0.0, // no scroll arrows in TUI
+            |i| {
+                quadraui::TabMeasure::new(
+                    tab_widths[i] as f32,
+                    crate::render::TAB_CLOSE_COLS as f32,
+                )
+            },
+            |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
+        );
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_tab_bar called outside enter_frame_scope");
+        quadraui::tui::draw_tab_bar(frame.buffer_mut(), area, bar, &layout, &theme)
     }
 
     fn draw_activity_bar(
@@ -663,8 +684,9 @@ mod tests {
             &mut self,
             _r: QRect,
             _b: &TabBar,
-            _l: &quadraui::primitives::tab_bar::TabBarLayout,
-        ) {
+            _hovered_close_tab: Option<usize>,
+        ) -> quadraui::TabBarHits {
+            quadraui::TabBarHits::default()
         }
         fn draw_activity_bar(
             &mut self,

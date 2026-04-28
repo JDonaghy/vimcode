@@ -265,6 +265,7 @@ pub(super) fn draw_editor(
                 None
             };
             let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+                backend,
                 cr,
                 &layout,
                 &theme,
@@ -299,6 +300,7 @@ pub(super) fn draw_editor(
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
         let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+            backend,
             cr,
             &layout,
             &theme,
@@ -943,16 +945,18 @@ pub(super) fn draw_tab_drag_overlay(
     }
 }
 
-/// A.6d: GTK tab bar renders via `quadraui_gtk::draw_tab_bar`.
+/// A.6d / B5c.2: GTK tab bar renders via `Backend::draw_tab_bar`.
 ///
 /// Builds the shared `quadraui::TabBar` primitive via
-/// `render::build_tab_bar_primitive`, delegates to the Cairo+Pango
-/// renderer, and flattens the primitive-level `TabBarHitInfo` back into
-/// the legacy tuple the GTK click handler already consumes. External
-/// signature preserved so callers (`draw_window` + multi-group rendering)
-/// remain untouched.
+/// `render::build_tab_bar_primitive`, routes through the trait, and
+/// reshapes `TabBarHits.right_segment_bounds` (keyed by `WidgetId`)
+/// into the vimcode-specific (diff_btns, split_btns, action_btn)
+/// groupings the click handler consumes. The vimcode UI font is set
+/// on the Pango layout before the trait call and restored afterwards
+/// (the rasteriser uses whatever font is on the layout at call time).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_tab_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
@@ -966,6 +970,8 @@ pub(super) fn draw_tab_bar(
     tab_scroll_offset: usize,
     accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
+    use pango::FontDescription;
+
     let accent = accent_color.map(render::to_quadraui_color);
     let bar = render::build_tab_bar_primitive(
         tabs,
@@ -974,23 +980,73 @@ pub(super) fn draw_tab_bar(
         tab_scroll_offset,
         accent,
     );
-    let info = super::quadraui_gtk::draw_tab_bar(
-        cr,
-        layout,
-        width,
-        line_height,
-        y_offset,
-        &bar,
-        theme,
-        hovered_close_tab,
-    );
+
+    // The rasteriser uses whatever font is on the layout. Vimcode renders
+    // tabs in the UI sans-serif, not the editor monospace; set it before
+    // the trait call and restore the caller's font after.
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
+    layout.set_font_description(Some(&ui_font_desc));
+
+    use quadraui::Backend;
+    let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_tab_bar(
+            quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
+            &bar,
+            hovered_close_tab,
+        )
+    });
+
+    layout.set_font_description(Some(&saved_font));
+
+    // Reshape `hits.right_segment_bounds` into vimcode's app-specific
+    // (diff_btns, split_btns, action_btn) groupings using the
+    // `WidgetId`s emitted by `build_tab_bar_primitive`.
+    let mut prev: Option<(f64, f64)> = None;
+    let mut next: Option<(f64, f64)> = None;
+    let mut fold: Option<(f64, f64)> = None;
+    let mut split_right: Option<(f64, f64)> = None;
+    let mut split_down: Option<(f64, f64)> = None;
+    let mut action: Option<(f64, f64)> = None;
+    for (i, seg) in bar.right_segments.iter().enumerate() {
+        let Some(bounds) = hits.right_segment_bounds.get(i).copied() else {
+            continue;
+        };
+        if let Some(ref id) = seg.id {
+            match id.as_str() {
+                "tab:diff_prev" => prev = Some(bounds),
+                "tab:diff_next" => next = Some(bounds),
+                "tab:diff_toggle" => fold = Some(bounds),
+                "tab:split_right" => split_right = Some(bounds),
+                "tab:split_down" => split_down = Some(bounds),
+                "tab:action_menu" => action = Some(bounds),
+                _ => {}
+            }
+        }
+    }
+    let diff_btns = match (prev, next, fold) {
+        (Some(p), Some(n), Some(f)) => Some((p.0, p.1, n.0, n.1, f.0, f.1)),
+        _ => None,
+    };
+    // Preserve the legacy `(both_btns_px, btn_right_px)` contract.
+    let split_btns = match (split_right, split_down) {
+        (Some(sr), Some(sd)) => {
+            let sr_w = sr.1 - sr.0;
+            let sd_w = sd.1 - sd.0;
+            Some((sr_w + sd_w, sr_w))
+        }
+        _ => None,
+    };
+
     (
-        info.slot_positions,
-        info.diff_btns,
-        info.split_btns,
-        info.available_cols,
-        info.action_btn,
-        info.correct_scroll_offset,
+        hits.slot_positions,
+        diff_btns,
+        split_btns,
+        hits.available_cols,
+        action,
+        hits.correct_scroll_offset,
     )
 }
 

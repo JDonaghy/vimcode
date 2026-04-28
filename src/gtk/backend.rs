@@ -599,16 +599,13 @@ impl Backend for GtkBackend {
         &mut self,
         rect: QRect,
         bar: &TabBar,
-        _layout: &quadraui::primitives::tab_bar::TabBarLayout,
-    ) {
+        hovered_close_tab: Option<usize>,
+    ) -> quadraui::TabBarHits {
         let (cr, layout) = self
             .current_frame_refs()
             .expect("GtkBackend::draw_tab_bar called outside enter_frame_scope");
         // The free fn paints from x=0 to x=width; rect.x ignored.
-        // hovered_close_tab defaults to None (no hover); call sites
-        // that need it should call the free fn directly until a
-        // future trait extension carries that state.
-        let _ = quadraui::gtk::draw_tab_bar(
+        quadraui::gtk::draw_tab_bar(
             cr,
             layout,
             rect.width as f64,
@@ -616,8 +613,8 @@ impl Backend for GtkBackend {
             rect.y as f64,
             bar,
             &self.current_theme,
-            None,
-        );
+            hovered_close_tab,
+        )
     }
 
     fn draw_activity_bar(

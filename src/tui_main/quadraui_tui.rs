@@ -83,16 +83,6 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
     }
 }
 
-pub(super) fn draw_tab_bar(
-    buf: &mut Buffer,
-    area: Rect,
-    bar: &quadraui::TabBar,
-    layout: &quadraui::TabBarLayout,
-    theme: &Theme,
-) -> usize {
-    quadraui::tui::draw_tab_bar(buf, area, bar, layout, &q_theme(theme))
-}
-
 /// Draw a `quadraui::ActivityBar` as a vertical icon strip.
 ///
 /// Top items render from the top edge downward, one row per item.

@@ -298,7 +298,8 @@ pub(super) fn draw_frame(
                     None
                 };
                 let vis = render_tab_bar(
-                    frame.buffer_mut(),
+                    backend,
+                    frame,
                     g_tab,
                     &gtb.tabs,
                     theme,
@@ -368,7 +369,8 @@ pub(super) fn draw_frame(
                 height: 1,
             };
             let vis = render_tab_bar(
-                frame.buffer_mut(),
+                backend,
+                frame,
                 tab_rect,
                 &screen.tab_bar,
                 theme,
@@ -1529,11 +1531,18 @@ pub(super) fn compute_tui_tab_drop_zone(
     DropZone::None
 }
 
-/// Render the tab bar.  Returns the number of tabs that were actually drawn
-/// (used to update `EditorGroup::tab_visible_count`).
+/// Render the tab bar via `Backend::draw_tab_bar`. Returns the number
+/// of tabs that were actually drawn (used to update
+/// `EditorGroup::tab_visible_count`).
+///
+/// B5c.2: routes through the trait. The Backend impl computes layout
+/// internally with the cell measurer. `available_cols` from the
+/// returned `TabBarHits` is converted to a tab count by dividing by
+/// the average tab width (cells per tab).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_tab_bar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     tabs: &[render::TabInfo],
     theme: &Theme,
@@ -1542,9 +1551,6 @@ pub(super) fn render_tab_bar(
     tab_scroll_offset: usize,
     focused_accent: Option<ratatui::style::Color>,
 ) -> usize {
-    // Per D6: build the primitive, ask it for a TabBarLayout, then hand
-    // both to the rasteriser. The rasteriser's only job is to turn the
-    // layout's rects into cells — it does not decide placement.
     let accent = focused_accent.and_then(|c| match c {
         ratatui::style::Color::Rgb(r, g, b) => Some(quadraui::Color::rgb(r, g, b)),
         _ => None,
@@ -1556,18 +1562,21 @@ pub(super) fn render_tab_bar(
         tab_scroll_offset,
         accent,
     );
-    let tab_widths: Vec<usize> = tabs
-        .iter()
-        .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
-        .collect();
-    let layout = bar.layout(
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
         area.width as f32,
         area.height as f32,
-        0.0, // no scroll arrows in TUI (engine-side fit has already been applied)
-        |i| quadraui::TabMeasure::new(tab_widths[i] as f32, render::TAB_CLOSE_COLS as f32),
-        |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
     );
-    super::quadraui_tui::draw_tab_bar(buf, area, &bar, &layout, theme)
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    let hits = backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_tab_bar(q_rect, &bar, None)
+    });
+    // `slot_positions` is the per-tab `[(start, end)]` list. Tabs
+    // before `scroll_offset` are zero-width sentinels; visible tabs
+    // have non-zero width. Count the latter.
+    hits.slot_positions.iter().filter(|(s, e)| e > s).count()
 }
 
 /// Draw the breadcrumb bar via the D6 StatusBar pipeline.
