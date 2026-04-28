@@ -45,6 +45,7 @@ pub(super) fn draw_editor(
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
+    tab_close_bounds_out: &Rc<RefCell<TabCloseMap>>,
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
@@ -264,7 +265,7 @@ pub(super) fn draw_editor(
             } else {
                 None
             };
-            let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+            let (positions, close_b, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
                 backend,
                 cr,
                 &layout,
@@ -282,6 +283,9 @@ pub(super) fn draw_editor(
             tab_slot_positions_out
                 .borrow_mut()
                 .insert(gtb.group_id.0, positions);
+            tab_close_bounds_out
+                .borrow_mut()
+                .insert(gtb.group_id.0, close_b);
             if let Some(dp) = dbp {
                 diff_btn_map_out.borrow_mut().insert(gtb.group_id.0, dp);
             }
@@ -299,7 +303,7 @@ pub(super) fn draw_editor(
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+        let (positions, close_b, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
             backend,
             cr,
             &layout,
@@ -318,6 +322,9 @@ pub(super) fn draw_editor(
         tab_slot_positions_out
             .borrow_mut()
             .insert(engine.active_group.0, positions);
+        tab_close_bounds_out
+            .borrow_mut()
+            .insert(engine.active_group.0, close_b);
         if let Some(dp) = dbp {
             diff_btn_map_out
                 .borrow_mut()
@@ -1042,6 +1049,7 @@ pub(super) fn draw_tab_bar(
 
     (
         hits.slot_positions,
+        hits.close_bounds,
         diff_btns,
         split_btns,
         hits.available_cols,

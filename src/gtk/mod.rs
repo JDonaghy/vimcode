@@ -63,6 +63,7 @@ enum SidebarPanel {
 }
 
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
+type TabCloseMap = HashMap<usize, Vec<Option<(f64, f64)>>>;
 
 /// Cached diff toolbar button positions per group: group_id -> (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
 /// Populated during draw_tab_bar, used for click hit-testing.
@@ -82,13 +83,15 @@ type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
 /// Populated by draw_window_status_bar, consumed by click hit-testing.
 type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
 
-/// Return type of draw_tab_bar: (tab_slot_positions, diff_btn_positions,
-/// split_btn_widths, visible_tab_count, action_btn, correct_scroll_offset).
+/// Return type of draw_tab_bar: (tab_slot_positions, close_bounds,
+/// diff_btn_positions, split_btn_widths, visible_tab_count, action_btn,
+/// correct_scroll_offset).
 /// `correct_scroll_offset` is the offset that would make the active tab
 /// visible given THIS frame's pixel measurements; the caller compares to
 /// the engine's stored value and triggers a repaint if they differ.
 type TabBarDrawResult = (
     Vec<(f64, f64)>,
+    Vec<Option<(f64, f64)>>, // per-tab close-button bounds (None for sentinels)
     Option<(f64, f64, f64, f64, f64, f64)>,
     Option<(f64, f64)>,
     usize,
@@ -372,6 +375,9 @@ struct App {
     /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
     /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
     tab_slot_positions: Rc<RefCell<TabSlotMap>>,
+    /// Cached close-button bounds per tab per group, populated during
+    /// draw_tab_bar. Used by `tab_close_hit_test` for hover detection.
+    tab_close_bounds: Rc<RefCell<TabCloseMap>>,
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
@@ -2186,6 +2192,7 @@ impl SimpleComponent for App {
         let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
         let tab_slot_positions_cell: Rc<RefCell<TabSlotMap>> =
             Rc::new(RefCell::new(HashMap::new()));
+        let tab_close_bounds_cell: Rc<RefCell<TabCloseMap>> = Rc::new(RefCell::new(HashMap::new()));
         let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
         let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
@@ -2330,6 +2337,7 @@ impl SimpleComponent for App {
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: tab_slot_positions_cell.clone(),
+            tab_close_bounds: tab_close_bounds_cell.clone(),
             diff_btn_map: diff_btn_map_cell.clone(),
             split_btn_map: split_btn_map_cell.clone(),
             action_btn_map: action_btn_map_cell.clone(),
@@ -3859,6 +3867,7 @@ impl SimpleComponent for App {
         let h_sb_drag_for_draw = h_sb_drag_cell.clone();
         let last_metrics_for_draw = last_metrics_cell.clone();
         let tab_slots_for_draw = tab_slot_positions_cell.clone();
+        let tab_close_bounds_for_draw = tab_close_bounds_cell.clone();
         let diff_btn_for_draw = diff_btn_map_cell.clone();
         let split_btn_for_draw = split_btn_map_cell.clone();
         let action_btn_for_draw = action_btn_map_cell.clone();
@@ -3898,6 +3907,7 @@ impl SimpleComponent for App {
                             h_sb_drag_for_draw.get(),
                             &last_metrics_for_draw,
                             &tab_slots_for_draw,
+                            &tab_close_bounds_for_draw,
                             &diff_btn_for_draw,
                             &split_btn_for_draw,
                             &action_btn_for_draw,
@@ -5731,11 +5741,13 @@ impl App {
 
                 // Tab close button hover detection + tab tooltip.
                 let engine = self.engine.borrow();
+                let close_bounds_map = self.tab_close_bounds.borrow();
                 let tab_hover = if mx >= 0.0 && lh > 0.0 {
-                    tab_close_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
+                    tab_close_hit_test(&engine, &close_bounds_map, mx, my, da_w, da_h, lh)
                 } else {
                     None
                 };
+                drop(close_bounds_map);
                 let tooltip = if mx >= 0.0 && lh > 0.0 {
                     tab_tooltip_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
                 } else {
@@ -11603,14 +11615,20 @@ fn h_scrollbar_hit_test(
 
 /// Hit-test tab close buttons. Returns `Some((group_id.0, tab_idx))` if the
 /// mouse is over a tab's × button, matching the same geometry as the click handler.
+/// Tab-close hover hit-test driven by the rasteriser's cached
+/// `close_bounds`. Each frame the GTK rasteriser publishes the exact
+/// per-tab close-button rectangle (Pango pixel widths, not estimates)
+/// to `App.tab_close_bounds`; this function consults those bounds
+/// rather than re-deriving geometry from `name.chars() * char_width`,
+/// which under-estimates Pango widths and shifts the close zone.
 fn tab_close_hit_test(
     engine: &Engine,
+    close_bounds_map: &TabCloseMap,
     mx: f64,
     my: f64,
     da_w: f64,
     da_h: f64,
     line_height: f64,
-    char_width: f64,
 ) -> Option<(usize, usize)> {
     let tab_row_height = (line_height * 1.6).ceil();
     let tab_bar_height = if engine.settings.breadcrumbs {
@@ -11631,12 +11649,6 @@ fn tab_close_hit_test(
         .calculate_group_rects(content_bounds, tab_bar_height);
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
 
-    let close_w = char_width;
-    let tab_pad = 14.0_f64;
-    let tab_inner_gap = 10.0_f64;
-    let tab_outer_gap = 1.0_f64;
-    let close_pad = char_width;
-
     for (gid, grect) in &group_rects {
         if engine.is_tab_bar_hidden(*gid) {
             continue;
@@ -11647,32 +11659,14 @@ fn tab_close_hit_test(
             continue;
         }
         let local_x = mx - grect.x;
-        if let Some(group) = engine.editor_groups.get(gid) {
-            let mut tab_x = 0.0;
-            for (i, tab) in group.tabs.iter().enumerate() {
-                let wid = tab.active_window;
-                let name = if let Some(window) = engine.windows.get(&wid) {
-                    if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                        let dirty = if state.dirty { "*" } else { "" };
-                        format!(" {}: {}{} ", i + 1, state.display_name(), dirty)
-                    } else {
-                        format!(" {}: [No Name] ", i + 1)
-                    }
-                } else {
-                    format!(" {}: [No Name] ", i + 1)
-                };
-                let tab_w = name.chars().count() as f64 * char_width;
-                let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
-                let slot_w = tab_content_w + tab_outer_gap;
-                if local_x >= tab_x && local_x < tab_x + slot_w {
-                    let close_x_start = tab_x + tab_pad + tab_w + tab_inner_gap - close_pad;
-                    let close_x_end = tab_x + tab_content_w;
-                    if local_x >= close_x_start && local_x < close_x_end {
-                        return Some((gid.0, i));
-                    }
-                    return None; // In this tab, but not on the close button.
+        let Some(close_bounds) = close_bounds_map.get(&gid.0) else {
+            continue;
+        };
+        for (i, cb) in close_bounds.iter().enumerate() {
+            if let Some((cx_start, cx_end)) = cb {
+                if local_x >= *cx_start && local_x < *cx_end {
+                    return Some((gid.0, i));
                 }
-                tab_x += slot_w;
             }
         }
     }
