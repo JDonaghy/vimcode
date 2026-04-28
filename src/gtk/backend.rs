@@ -140,6 +140,20 @@ impl GtkBackend {
         self.modal_stack.clone()
     }
 
+    /// True if any modal is open (palette, dialog, context menu, …).
+    /// Use this to gate hover triggers, focus-stealing animations, and
+    /// other behaviours that should pause while a modal is up.
+    ///
+    /// API surface for issue #248 (Stage 5+ — migrate dialog /
+    /// context-menu / completion popup onto `ModalStack`). Today only
+    /// the picker pushes onto the stack, so this returns true only
+    /// when a picker is open. Each modal migrated by #248 makes
+    /// `is_modal_open()` correctly cover that modal type.
+    #[allow(dead_code)]
+    pub fn is_modal_open(&self) -> bool {
+        !self.modal_stack.borrow().is_empty()
+    }
+
     /// Shared handle to the drag state. Mouse-down on a scrollbar
     /// arms it via `borrow_mut().begin(...)`; mouse-drag-update reads
     /// it via `borrow()` to feed `dispatch::dispatch_mouse_drag`;
@@ -589,6 +603,30 @@ mod tests {
         h1.borrow_mut()
             .push(WidgetId::new("test:popup"), QRect::new(0.0, 0.0, 10.0, 5.0));
         assert_eq!(h2.borrow().len(), 1);
+    }
+
+    #[test]
+    fn gtk_backend_is_modal_open_tracks_stack() {
+        let backend = GtkBackend::new();
+        assert!(!backend.is_modal_open());
+        backend
+            .modal_stack_handle()
+            .borrow_mut()
+            .push(WidgetId::new("test:modal"), QRect::new(0.0, 0.0, 10.0, 5.0));
+        assert!(backend.is_modal_open());
+        backend
+            .modal_stack_handle()
+            .borrow_mut()
+            .pop(&WidgetId::new("test:modal"));
+        assert!(!backend.is_modal_open());
+    }
+
+    #[test]
+    fn gtk_backend_push_event_round_trip() {
+        let backend = GtkBackend::new();
+        backend.push_event(quadraui::UiEvent::WindowFocused(true));
+        let q = backend.events_handle();
+        assert_eq!(q.borrow().len(), 1);
     }
 
     #[test]
