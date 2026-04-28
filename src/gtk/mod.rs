@@ -445,6 +445,14 @@ struct App {
     /// handler. (B.5b Stage 7.)
     #[allow(clippy::type_complexity)]
     tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Dialog popup bounding rect (x, y, w, h) — set during draw
+    /// from the resolved `quadraui::DialogLayout::bounds`. Used for
+    /// `ModalStack` registration in the click handler. The pre-fix
+    /// `dialog_btn_rects`-derived inline calc overshot the actual
+    /// popup width on small dialogs (`:about`), causing
+    /// click-outside-to-dismiss to fail.
+    #[allow(clippy::type_complexity)]
+    dialog_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -2151,6 +2159,8 @@ impl SimpleComponent for App {
         let tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
         #[allow(clippy::type_complexity)]
+        let dialog_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> = Rc::new(Cell::new(None));
+        #[allow(clippy::type_complexity)]
         let editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>> =
             Rc::new(RefCell::new(Vec::new()));
         let editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>> =
@@ -2347,6 +2357,7 @@ impl SimpleComponent for App {
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
             completion_popup_rect: completion_popup_rect.clone(),
             tab_switcher_popup_rect: tab_switcher_popup_rect.clone(),
+            dialog_popup_rect: dialog_popup_rect.clone(),
             editor_hover_link_rects: editor_hover_link_rects.clone(),
             editor_hover_scrollbar: editor_hover_scrollbar.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
@@ -3852,6 +3863,7 @@ impl SimpleComponent for App {
         let split_btn_for_draw = split_btn_map_cell.clone();
         let action_btn_for_draw = action_btn_map_cell.clone();
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
+        let dialog_popup_for_draw = model.dialog_popup_rect.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let completion_rect_for_draw = model.completion_popup_rect.clone();
         let tab_switcher_rect_for_draw = model.tab_switcher_popup_rect.clone();
@@ -3890,6 +3902,7 @@ impl SimpleComponent for App {
                             &split_btn_for_draw,
                             &action_btn_for_draw,
                             &dialog_btn_for_draw,
+                            &dialog_popup_for_draw,
                             &editor_hover_rect_for_draw,
                             &completion_rect_for_draw,
                             &tab_switcher_rect_for_draw,
@@ -6919,7 +6932,6 @@ impl App {
         // Inner button hit-testing stays per-backend (uses GTK
         // pixel-level `dialog_btn_rects` from the last draw).
         if self.engine.borrow().dialog.is_some() {
-            let lh = self.cached_line_height.max(1.0);
             let btn_rects = self.dialog_btn_rects.borrow().clone();
 
             // Use actual button rects from the last draw_dialog_popup call.
@@ -6931,39 +6943,28 @@ impl App {
                 }
             }
 
-            // Compute popup bounds for ModalStack registration.
-            let (popup_x, popup_y_pos, popup_w, popup_h) = {
-                let engine = self.engine.borrow();
-                let dialog = engine.dialog.as_ref().unwrap();
-                let ph = ((3.0 + dialog.body.len() as f64 + 2.0) * lh).min(height - 40.0);
-                let (px, pw) =
-                    if let (Some(first), Some(last)) = (btn_rects.first(), btn_rects.last()) {
-                        // Buttons start at popup_x + 12, so popup_x = first.0 - 12
-                        let px = first.0 - 12.0;
-                        // popup_w is at least wide enough to contain all buttons + padding
-                        let pw = (last.0 + last.2 - px + 12.0).max(350.0);
-                        (px, pw)
-                    } else {
-                        ((width - 350.0) / 2.0, 350.0)
-                    };
-                let py = (height - ph) / 2.0;
-                (px, py, pw, ph)
-            };
-
+            // Pull the resolved popup bounds from the last draw_dialog_popup
+            // call (cached in `dialog_popup_rect`). Earlier the bounds were
+            // derived from `btn_rects` with a 350px-min fudge that overshot
+            // the actual popup width on small dialogs (`:about`), so
+            // `dispatch_mouse_down` would mis-classify outside clicks as
+            // inside and the dismiss path never fired.
             let dialog_id = quadraui::WidgetId::new("dialog");
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .push(
-                    dialog_id.clone(),
-                    quadraui::Rect {
-                        x: popup_x as f32,
-                        y: popup_y_pos as f32,
-                        width: popup_w as f32,
-                        height: popup_h as f32,
-                    },
-                );
+            if let Some((px, py, pw, ph)) = self.dialog_popup_rect.get() {
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .push(
+                        dialog_id.clone(),
+                        quadraui::Rect {
+                            x: px as f32,
+                            y: py as f32,
+                            width: pw as f32,
+                            height: ph as f32,
+                        },
+                    );
+            }
 
             // Run the shared dispatch to learn whether this click
             // landed inside the dialog or in the backdrop. We don't

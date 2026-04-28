@@ -49,6 +49,7 @@ pub(super) fn draw_editor(
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
+    dialog_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     completion_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     tab_switcher_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
@@ -732,7 +733,7 @@ pub(super) fn draw_editor(
         line_height,
     ));
 
-    let btn_rects = draw_dialog_popup(
+    let (btn_rects, popup_rect) = draw_dialog_popup(
         cr,
         &layout,
         &screen,
@@ -742,6 +743,7 @@ pub(super) fn draw_editor(
         line_height,
     );
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
+    dialog_popup_rect_out.set(popup_rect);
 
     draw_context_menu_popup(
         cr,
@@ -2926,8 +2928,18 @@ pub(super) fn draw_tab_switcher_popup(
 }
 
 /// Draw a modal dialog popup centered on the screen.
-#[allow(clippy::too_many_arguments)]
-/// Returns button hit-rects `(x, y, w, h)` for each dialog button.
+///
+/// Returns `(btn_rects, popup_rect)` where:
+/// - `btn_rects` — `(x, y, w, h)` for each dialog button (same as
+///   pre-B5b.13).
+/// - `popup_rect` — the dialog box's resolved bounds in DA-local
+///   pixels, or `None` if no dialog is being drawn. The click
+///   handler caches this in `App.dialog_popup_rect` for `ModalStack`
+///   registration; previously it derived bounds from the button
+///   rects with a fixed-min-width fudge that overshot the actual
+///   popup width on small dialogs (e.g. `:about`), causing
+///   click-outside-to-dismiss to mis-fire.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_dialog_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -2936,9 +2948,9 @@ pub(super) fn draw_dialog_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-) -> Vec<(f64, f64, f64, f64)> {
+) -> (Vec<(f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {
     let Some(panel) = &screen.dialog else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
 
     let pango_ctx = pangocairo::create_context(cr);
@@ -3025,7 +3037,14 @@ pub(super) fn draw_dialog_popup(
     let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
     let dialog_layout = dialog.layout(viewport, measure);
 
-    super::quadraui_gtk::draw_dialog(
+    let popup_rect = (
+        dialog_layout.bounds.x as f64,
+        dialog_layout.bounds.y as f64,
+        dialog_layout.bounds.width as f64,
+        dialog_layout.bounds.height as f64,
+    );
+
+    let btn_rects = super::quadraui_gtk::draw_dialog(
         cr,
         layout,
         &ui_layout,
@@ -3033,7 +3052,8 @@ pub(super) fn draw_dialog_popup(
         &dialog_layout,
         line_height,
         theme,
-    )
+    );
+    (btn_rects, Some(popup_rect))
 }
 
 /// Draw an engine-driven context menu popup on the DrawingArea.
