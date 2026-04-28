@@ -672,6 +672,44 @@ impl Backend for GtkBackend {
             self.current_line_height,
         );
     }
+
+    fn draw_tooltip(&mut self, tooltip: &quadraui::Tooltip, layout_arg: &quadraui::TooltipLayout) {
+        let (cr, pango_layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_tooltip called outside enter_frame_scope");
+        quadraui::gtk::draw_tooltip(
+            cr,
+            pango_layout,
+            tooltip,
+            layout_arg,
+            self.current_line_height,
+            self.current_char_width,
+            &self.current_theme,
+        );
+    }
+
+    fn draw_context_menu(
+        &mut self,
+        menu: &quadraui::ContextMenu,
+        layout_arg: &quadraui::ContextMenuLayout,
+    ) -> Vec<(QRect, quadraui::WidgetId)> {
+        let (cr, pango_layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_context_menu called outside enter_frame_scope");
+        let hits = quadraui::gtk::draw_context_menu(
+            cr,
+            pango_layout,
+            menu,
+            layout_arg,
+            self.current_line_height,
+            &self.current_theme,
+        );
+        // Reshape rasteriser's `(x, y, w, h, id)` tuples into
+        // `(Rect, WidgetId)` for the trait return.
+        hits.into_iter()
+            .map(|(x, y, w, h, id)| (QRect::new(x as f32, y as f32, w as f32, h as f32), id))
+            .collect()
+    }
 }
 
 // ─── Cross-backend validation tests ──────────────────────────────────────────

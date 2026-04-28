@@ -545,6 +545,40 @@ impl Backend for TuiBackend {
             .expect("TuiBackend::draw_text_display called outside enter_frame_scope");
         quadraui::tui::draw_text_display(frame.buffer_mut(), area, td, &theme);
     }
+
+    fn draw_tooltip(&mut self, tooltip: &quadraui::Tooltip, layout: &quadraui::TooltipLayout) {
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_tooltip called outside enter_frame_scope");
+        quadraui::tui::draw_tooltip(frame.buffer_mut(), tooltip, layout, &theme);
+    }
+
+    fn draw_context_menu(
+        &mut self,
+        menu: &quadraui::ContextMenu,
+        layout: &quadraui::ContextMenuLayout,
+    ) -> Vec<(QRect, quadraui::WidgetId)> {
+        let theme = self.current_theme;
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_context_menu called outside enter_frame_scope");
+        quadraui::tui::draw_context_menu(frame.buffer_mut(), menu, layout, &theme);
+        // TUI rasteriser doesn't return hit data — derive from layout.
+        // The primitive's hit_test() is the canonical way; this Vec
+        // is here for trait parity with GTK.
+        let _ = menu;
+        layout
+            .hit_regions
+            .iter()
+            .filter_map(|(rect, hit)| match hit {
+                quadraui::primitives::context_menu::ContextMenuHit::Item(id) => {
+                    Some((*rect, id.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 // ─── Cross-backend validation tests ──────────────────────────────────────────
@@ -693,6 +727,14 @@ mod tests {
         }
         fn draw_terminal(&mut self, _r: QRect, _t: &TerminalPrim) {}
         fn draw_text_display(&mut self, _r: QRect, _t: &TextDisplay) {}
+        fn draw_tooltip(&mut self, _t: &quadraui::Tooltip, _l: &quadraui::TooltipLayout) {}
+        fn draw_context_menu(
+            &mut self,
+            _m: &quadraui::ContextMenu,
+            _l: &quadraui::ContextMenuLayout,
+        ) -> Vec<(QRect, quadraui::WidgetId)> {
+            Vec::new()
+        }
     }
 
     /// Generic helper — the minimal "app render code" that consumes
