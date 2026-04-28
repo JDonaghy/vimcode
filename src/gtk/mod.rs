@@ -6125,6 +6125,16 @@ impl App {
     ) {
         self.reconcile_editor_hover_modal();
         // ── Context menu click handling (engine-drawn) ──
+        //
+        // Phase B.5b Stage 4: routed through `ModalStack` +
+        // `quadraui::dispatch_mouse_down`, mirroring the picker and
+        // dialog patterns. The dispatcher arbitrates inside-vs-outside
+        // (the verdict the inline `Outside` arm of
+        // `resolve_context_menu_click` used to produce); item-level
+        // refinement (which row?) still uses `resolve_context_menu_click`
+        // with its cell-unit math because the popup is rendered in
+        // cell-unit coordinates and the row hit calc is genuine inner
+        // refinement, not modal-vs-base arbitration.
         if self.engine.borrow().context_menu.is_some() {
             let cw = self.cached_char_width.max(1.0);
             let lh = self.cached_line_height.max(1.0);
@@ -6133,47 +6143,116 @@ impl App {
             let term_w = (width / cw) as u16;
             let term_h = (height / lh) as u16;
 
-            let result = {
+            // Compute popup bounds for the modal stack in pixels — same
+            // sizing/clamping logic `resolve_context_menu_click` uses.
+            let cm_id = quadraui::WidgetId::new("context_menu");
+            let popup_pixel_rect = {
                 let engine = self.engine.borrow();
                 let cm = engine.context_menu.as_ref().unwrap();
-                crate::core::engine::resolve_context_menu_click(
-                    &cm.items,
-                    cm.screen_x,
-                    cm.screen_y,
-                    term_w,
-                    term_h,
-                    click_col,
-                    click_row,
-                )
+                let items = &cm.items;
+                if items.is_empty() {
+                    None
+                } else {
+                    let sep_count = items.iter().filter(|i| i.separator_after).count() as u16;
+                    let popup_h = items.len() as u16 + sep_count + 2;
+                    let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+                    let max_sc = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+                    let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
+                    let px = cm.screen_x.min(term_w.saturating_sub(popup_w));
+                    let py = cm.screen_y.min(term_h.saturating_sub(popup_h));
+                    Some(quadraui::Rect {
+                        x: px as f32 * cw as f32,
+                        y: py as f32 * lh as f32,
+                        width: popup_w as f32 * cw as f32,
+                        height: popup_h as f32 * lh as f32,
+                    })
+                }
             };
 
-            use crate::core::engine::ContextMenuClickResult;
-            match result {
-                ContextMenuClickResult::Item(idx) => {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.context_menu.as_mut().unwrap().selected = idx;
-                    // context_menu_confirm() handles the action internally and
-                    // consumes the menu.
-                    let _act = engine.context_menu_confirm();
-                    let needs_tree_refresh = engine.explorer_needs_refresh;
-                    if needs_tree_refresh {
-                        engine.explorer_needs_refresh = false;
+            let dismissed = if let Some(rect) = popup_pixel_rect {
+                self.modal_stack.borrow_mut().push(cm_id.clone(), rect);
+                let stack = self.modal_stack.borrow();
+                let events = quadraui::dispatch_mouse_down(
+                    &stack,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                events.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        quadraui::UiEvent::Palette(id, _) if *id == cm_id
+                    )
+                })
+            } else {
+                // Empty items list — treat as already dismissed.
+                true
+            };
+
+            if dismissed {
+                self.engine.borrow_mut().close_context_menu();
+                self.modal_stack.borrow_mut().pop(&cm_id);
+            } else {
+                // Click landed inside the popup — refine to row-level
+                // hit via the engine helper. `resolve_context_menu_click`
+                // also handles separator rows (returns InsidePopup).
+                let result = {
+                    let engine = self.engine.borrow();
+                    let cm = engine.context_menu.as_ref().unwrap();
+                    crate::core::engine::resolve_context_menu_click(
+                        &cm.items,
+                        cm.screen_x,
+                        cm.screen_y,
+                        term_w,
+                        term_h,
+                        click_col,
+                        click_row,
+                    )
+                };
+
+                use crate::core::engine::ContextMenuClickResult;
+                match result {
+                    ContextMenuClickResult::Item(idx) => {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.context_menu.as_mut().unwrap().selected = idx;
+                        // context_menu_confirm() handles the action
+                        // internally and consumes the menu.
+                        let _act = engine.context_menu_confirm();
+                        let needs_tree_refresh = engine.explorer_needs_refresh;
+                        if needs_tree_refresh {
+                            engine.explorer_needs_refresh = false;
+                        }
+                        drop(engine);
+                        // confirm closed the menu; pop the stack to match.
+                        self.modal_stack.borrow_mut().pop(&cm_id);
+                        if needs_tree_refresh {
+                            sender.input(Msg::RefreshFileTree);
+                        }
                     }
-                    drop(engine);
-                    if needs_tree_refresh {
-                        sender.input(Msg::RefreshFileTree);
+                    ContextMenuClickResult::InsidePopup => {
+                        // Click inside but not on an item (border /
+                        // separator row) — keep the menu open.
                     }
-                }
-                ContextMenuClickResult::InsidePopup => {
-                    // Click inside but not on an item — ignore
-                }
-                ContextMenuClickResult::Outside => {
-                    self.engine.borrow_mut().close_context_menu();
+                    ContextMenuClickResult::Outside => {
+                        // Shouldn't happen — dispatch_mouse_down already
+                        // routed the outside case to `dismissed=true`.
+                        // Defensive: close anyway.
+                        self.engine.borrow_mut().close_context_menu();
+                        self.modal_stack.borrow_mut().pop(&cm_id);
+                    }
                 }
             }
             self.draw_needed.set(true);
             return;
         }
+        // Defensive cleanup: context menu may have closed via Esc/Enter
+        // while no click was seen by us. Pop any stale entry.
+        self.modal_stack
+            .borrow_mut()
+            .pop(&quadraui::WidgetId::new("context_menu"));
 
         // ── Find/replace overlay click handling (using shared hit regions) ──
         //
