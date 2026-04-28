@@ -5151,7 +5151,18 @@ impl App {
         // palette / picker / tab-switcher overlays.
         let visible_ids: std::collections::HashSet<core::WindowId> =
             window_rects.iter().map(|(wid, _)| *wid).collect();
-        let modal_open = engine.picker_open || engine.tab_switcher_open;
+        // Native gtk4::Scrollbar widgets render above the DrawingArea
+        // (they're real GTK widgets, not Cairo paint), so they'd
+        // otherwise poke through every modal popup. Hide them when
+        // any popup is up. (#252.) Adding a new popup kind here is
+        // currently a manual step — once the B.5b modal-stack
+        // migration covers all of them, this can collapse to
+        // `!modal_stack.borrow().is_empty()`.
+        let modal_open = engine.picker_open
+            || engine.tab_switcher_open
+            || engine.context_menu.is_some()
+            || engine.dialog.is_some()
+            || engine.find_replace_open;
         for (wid, ws) in scrollbars.iter() {
             let show = visible_ids.contains(wid) && !modal_open;
             ws.vertical.set_visible(show);
