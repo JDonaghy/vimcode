@@ -96,6 +96,68 @@ type TabBarDrawResult = (
     usize,              // correct_scroll_offset (per-group, in pixels-aware units)
 );
 
+// ─── Phase B.5 Stage 6: panel-key accelerator registry ──────────────────────
+//
+// Stable accelerator IDs for the `panel_keys` settings, registered on
+// `GtkBackend` at App startup. Mirrors the TUI Stage 6 pattern
+// (`tui.panel.*`). Dispatch through `UiEvent::Accelerator(id)` is wired
+// iteratively as click sites migrate onto the trait — until then,
+// the existing `matches_gtk_key` arms in the GTK key handler stay
+// authoritative; the registered accelerators are inert.
+
+pub(super) const ACC_TOGGLE_SIDEBAR: &str = "gtk.panel.toggle_sidebar";
+pub(super) const ACC_FOCUS_EXPLORER: &str = "gtk.panel.focus_explorer";
+pub(super) const ACC_FOCUS_SEARCH: &str = "gtk.panel.focus_search";
+pub(super) const ACC_FUZZY_FINDER: &str = "gtk.panel.fuzzy_finder";
+pub(super) const ACC_LIVE_GREP: &str = "gtk.panel.live_grep";
+pub(super) const ACC_COMMAND_PALETTE: &str = "gtk.panel.command_palette";
+pub(super) const ACC_OPEN_TERMINAL: &str = "gtk.panel.open_terminal";
+pub(super) const ACC_TERMINAL_TOGGLE_MAX: &str = "terminal.toggle_maximize";
+pub(super) const ACC_ADD_CURSOR: &str = "gtk.panel.add_cursor";
+pub(super) const ACC_SELECT_ALL_MATCHES: &str = "gtk.panel.select_all_matches";
+pub(super) const ACC_SPLIT_EDITOR_RIGHT: &str = "gtk.panel.split_editor_right";
+pub(super) const ACC_SPLIT_EDITOR_DOWN: &str = "gtk.panel.split_editor_down";
+pub(super) const ACC_NAV_BACK: &str = "gtk.panel.nav_back";
+pub(super) const ACC_NAV_FORWARD: &str = "gtk.panel.nav_forward";
+
+/// Register the panel-keys accelerator set on the backend. Re-runs on each
+/// settings reload so live rebinding takes effect.
+fn register_panel_accelerators(
+    backend: &mut backend::GtkBackend,
+    pk: &crate::core::settings::PanelKeys,
+) {
+    use quadraui::Backend;
+    let entries: [(&str, &str); 14] = [
+        (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
+        (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
+        (ACC_FOCUS_SEARCH, &pk.focus_search),
+        (ACC_FUZZY_FINDER, &pk.fuzzy_finder),
+        (ACC_LIVE_GREP, &pk.live_grep),
+        (ACC_COMMAND_PALETTE, &pk.command_palette),
+        (ACC_OPEN_TERMINAL, &pk.open_terminal),
+        (ACC_TERMINAL_TOGGLE_MAX, &pk.toggle_terminal_maximize),
+        (ACC_ADD_CURSOR, &pk.add_cursor),
+        (ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
+        (ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
+        (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
+        (ACC_NAV_BACK, &pk.nav_back),
+        (ACC_NAV_FORWARD, &pk.nav_forward),
+    ];
+    for (id, binding) in entries {
+        let acc_id = quadraui::AcceleratorId::new(id);
+        if binding.is_empty() {
+            backend.unregister_accelerator(&acc_id);
+            continue;
+        }
+        backend.register_accelerator(&quadraui::Accelerator {
+            id: acc_id,
+            binding: quadraui::KeyBinding::Literal(binding.to_string()),
+            scope: quadraui::AcceleratorScope::Global,
+            label: None,
+        });
+    }
+}
+
 struct App {
     engine: Rc<RefCell<Engine>>,
     /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
@@ -2050,7 +2112,13 @@ impl SimpleComponent for App {
         // the same underlying `Rc<RefCell<>>`s — Stage 5 migrates the
         // alias call sites onto `backend.borrow().*_handle()` and
         // drops the duplicates.
-        let gtk_backend = backend::GtkBackend::new();
+        //
+        // Phase B.5 Stage 6: register panel-key accelerators on the
+        // backend. Dispatch through the registry is iterative — until
+        // it lands, the existing `matches_gtk_key` arms in the key
+        // handler stay authoritative.
+        let mut gtk_backend = backend::GtkBackend::new();
+        register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
         let backend_modal_stack = gtk_backend.modal_stack_handle();
         let backend_drag_state = gtk_backend.drag_state_handle();
         let backend = Rc::new(RefCell::new(gtk_backend));
