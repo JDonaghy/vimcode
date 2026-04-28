@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 complete; **Phase B.5 starting.** B.4 shipped the `quadraui::Backend` trait load-bearing on TUI (Stages 1–7 + 5c + 5d, `0aa9745`). B.5 is the GTK rewrite: bring `vimcode` (GTK binary) onto the same trait so `paint::<B>` and the event-loop adapter work identically across backends. Option A (event queue) confirmed for the GTK signal → `wait_events` adapter; same pattern will apply to Win-GUI (B.6), macOS (B.7), and any future Android/iOS/WASM backends.)
+> **Last updated:** 2026-04-27 (Phase B.4 + B.5 both complete. The `quadraui::Backend` trait is implemented on **two backends** — TUI (B.4, `0aa9745`) and GTK (B.5, this commit). Generic `paint::<B>` drives the quickfix panel on both. Forward-compat for B.6 (Win-GUI), B.7 (macOS), and possible Android/iOS/WASM stays sound. Iterative B.5 follow-ups (#247 #248) handle the per-modal `ModalStack` migration; none block starting B.6.)
 
 ---
 
@@ -40,17 +40,24 @@ keeps working at every commit. Refactor in place; no parallel tree.
 
 | Stage | Goal | Status | Commit |
 |---|---|---|---|
-| **0** | This proposal — pin scope, decisions, doc the queue pattern | ⬜ | (this commit) |
-| **1** | `GtkBackend` skeleton + frame-scope (`&cairo::Context`). Owns `modal_stack`, `drag_state`, accelerators, viewport, services. Stub `draw_*` delegates to existing `quadraui_gtk::draw_*` shims. App holds it as `Rc<RefCell<GtkBackend>>`. | ⬜ | — |
-| **2** | Trait `draw_*` methods route through `GtkBackend`. Existing 13 shims fold into the trait impl. | ⬜ | — |
-| **3** | Reuse `paint<B: Backend>` from B.4 Stage 3 — same generic function drives both backends inside the native draw closure. | ⬜ | — |
-| **4** | GTK signal → `UiEvent` translation + event-queue adapter. **Highest-risk stage.** | ⬜ | — |
-| **5** | Click + drag dispatch consolidation through `dispatch_mouse_down/drag/up`. Most done already; finish remaining sites. | ⬜ | — |
-| **6** | Accelerator registry — register panel_keys + universal accelerators on GtkBackend. Mirrors B.4 Stage 6. | ⬜ | — |
-| **7** | `PlatformServices` impl — clipboard, file dialogs, notifications, URL opener via GTK APIs. | ⬜ | — |
-| **8** | Cleanup + parity verification with TUI; document the queue pattern in `BACKEND.md`. | ⬜ | — |
+| **0** | Plan + decisions locked | ✅ | `2c8fe7f` |
+| **1** | `GtkBackend` skeleton + frame-scope (`&cairo::Context`). Owns `modal_stack`, `drag_state`, accelerators, viewport, services. Stub `draw_*` delegates to existing `quadraui_gtk::draw_*` shims. App holds it as `Rc<RefCell<GtkBackend>>`. | ✅ | `76be71d` |
+| **2** | Trait `draw_*` methods route through `GtkBackend` for the 4 clean primitives (palette / list / tree / form). Other 5 deferred (need `&Layout` parameter on the trait, same as TUI). | ✅ | `0b209d5` |
+| **3** | Pilot: quickfix panel routes through `Backend::draw_list` via `enter_frame_scope`. Mirrors TUI Stage 3a. | ✅ | `44f4291` |
+| **4** | `src/gtk/events.rs` — GDK → `UiEvent` translation helpers + 10 unit tests. `events_handle()` + `push_event` API on GtkBackend. Producer wiring deferred (issue #248). | ✅ | `a4637b9` |
+| **5** | Reduced scope. Shipped: `is_modal_open()` helper. Bulk migration (dialog / context-menu / completion → `ModalStack` + dispatch through `dispatch_mouse_*`) filed as #248 for iterative work. | ✅ | `3a68a88` |
+| **6** | Panel-key accelerators registered on `GtkBackend` at App init. Dispatch swap (replacing inline `matches_gtk_key` arms) deferred until producers are wired. | ✅ | `c90c85b` |
+| **7** | `GtkPlatformServices` — `write_text` + `open_url` wired through GTK APIs. Async-API methods (clipboard read, file dialogs, notifications) stay stubbed pending a future async-aware trait shape. | ✅ | `73d37d5` |
+| **8** | Cleanup + parity verification: GTK + workspace builds clean, BACKEND.md updated. | ✅ | (this commit) |
 
-**Realistic total:** ~10–12 sessions.
+**Total: 9 stages shipped over 1 session** (faster than the original ~10–12 estimate; many stages were smaller than feared because the chrome work in Phase A had already moved most primitive rendering onto `quadraui_gtk::draw_*` shims).
+
+### B.5 follow-up issues
+
+These were filed during B.5 stages and represent iterative work that lands incrementally:
+
+- **#247** — GTK: LSP hover fires through open modal; modal font swaps. Resolves once Stage 5+ work in #248 puts dialog/completion modals on `ModalStack` and adds an `is_modal_open()` gate to the LSP hover trigger.
+- **#248** — Stage 5+ follow-up: migrate dialog / context-menu / completion modals to `ModalStack`. Each modal is its own focused PR. Closes #192 (palette mouse leak) + partially #229 (hover scrollbar leak) along the way.
 
 ### Forward-compatibility notes (for backends after B.5)
 
