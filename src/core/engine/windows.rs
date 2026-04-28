@@ -1563,6 +1563,10 @@ impl Engine {
 
     /// Open the tab switcher popup, pre-selecting the second MRU entry.
     pub fn open_tab_switcher(&mut self) {
+        // Opening a modal dismisses passive overlays (LSP hover) so
+        // they don't render behind it (#247).
+        self.dismiss_editor_hover();
+
         // Build a clean MRU list: only include entries that still exist
         self.tab_mru.retain(|&(g, idx)| {
             self.editor_groups

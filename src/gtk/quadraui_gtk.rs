@@ -751,6 +751,15 @@ pub(super) fn draw_rich_text_popup(
 
     let ui_font_desc = pango::FontDescription::from_string(&UI_FONT());
 
+    // Save the layout's current font_description before our per-line
+    // `set_font_description(ui_font_desc)` calls inside the loop
+    // below. Without this, the UI font leaks into subsequent draw
+    // calls in the same frame — most visibly: the palette / dialog
+    // / context-menu rendering immediately after the hover popup
+    // would render in the UI font instead of the editor font (#247
+    // second symptom).
+    let saved_font = pango_layout.font_description();
+
     // Clip text rendering to the content area so long lines (Pango is
     // unbounded) and selection rectangles don't bleed past the popup
     // boundary into the editor area behind. Restored at end of draw.
@@ -937,6 +946,11 @@ pub(super) fn draw_rich_text_popup(
         cr.rectangle(sb_x + 1.0, track_y + thumb_top_off, sb_w - 2.0, thumb_h);
         cr.fill().ok();
     }
+
+    // Restore the layout's font_description so subsequent popup /
+    // overlay paints in the same frame use the editor font, not the
+    // UI font we set above. (#247 second symptom.)
+    pango_layout.set_font_description(saved_font.as_ref());
 
     // Link hit regions in (x, y, w, h, url) form.
     layout

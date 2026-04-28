@@ -11,6 +11,11 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
+        // Opening a dialog is a "user is now focused on this modal"
+        // event — dismiss any passive overlays (LSP hover) so they
+        // don't render behind the dialog (#247).
+        self.dismiss_editor_hover();
+
         self.dialog = Some(Dialog {
             title: title.to_string(),
             body,

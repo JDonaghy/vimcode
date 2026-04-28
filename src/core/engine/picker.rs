@@ -79,6 +79,11 @@ impl Engine {
 
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
+        // Opening a picker is a "user is now focused on this modal"
+        // event — dismiss any passive overlays (LSP hover) so they
+        // don't render behind the picker (#247).
+        self.dismiss_editor_hover();
+
         self.picker_query.clear();
         self.picker_selected = 0;
         self.picker_scroll_top = 0;
