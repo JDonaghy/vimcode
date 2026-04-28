@@ -26,6 +26,7 @@ VimCode is currently in **beta**. It is under active development with the assist
 
 For screenshots and more information, visit **[vimcode.org](https://vimcode.org)**.
 
+line1
 ---
 
 ## Documentation
@@ -86,6 +87,7 @@ The Flatpak bundles GTK4 and all dependencies — works on any Linux distro with
 
 > **Note:** Ubuntu 22.04 ships GTK 4.6 which is too old for the `.deb` and raw binary; use the Flatpak or upgrade to 24.04+.
 
+line2
 ### macOS
 
 ```bash
@@ -127,6 +129,7 @@ The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windo
 - **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
 
 ### Build & run
+line3
 
 ```bash
 # Linux / macOS (GTK4 GUI + TUI)

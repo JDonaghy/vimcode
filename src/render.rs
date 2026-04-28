@@ -9500,6 +9500,30 @@ pub fn build_tab_bar_primitive(
 
     let mut right: Vec<quadraui::TabBarSegment> = Vec::new();
 
+    // Build a 3-cell tab-bar button segment from an `Icon`. When nerd
+    // fonts are enabled, the icon glyph is rendered as a 2-cell wide
+    // glyph (` <wide>`); otherwise the fallback ASCII char takes 1
+    // cell, padded with spaces (` <c> `). Either way `width_cells = 3`
+    // matches the rasteriser's per-cell stride so layout positions
+    // line up with what gets painted.
+    fn tab_btn_segment(
+        icon: &crate::icons::Icon,
+        id: &str,
+        is_active: bool,
+    ) -> quadraui::TabBarSegment {
+        let text = if crate::icons::nerd_fonts_enabled() {
+            format!(" {}", icon.s())
+        } else {
+            format!(" {} ", icon.s())
+        };
+        quadraui::TabBarSegment {
+            text,
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new(id)),
+            is_active,
+        }
+    }
+
     if let Some(dt) = diff_toolbar {
         if let Some(label) = &dt.change_label {
             let text = format!(" {label}");
@@ -9511,43 +9535,39 @@ pub fn build_tab_bar_primitive(
                 is_active: false,
             });
         }
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0143}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_prev")),
-            is_active: false,
-        });
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0140}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_next")),
-            is_active: false,
-        });
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0233}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:diff_toggle")),
-            is_active: dt.unchanged_hidden,
-        });
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_PREV,
+            "tab:diff_prev",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_NEXT,
+            "tab:diff_next",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_FOLD,
+            "tab:diff_toggle",
+            dt.unchanged_hidden,
+        ));
     }
 
     if show_split_btns {
-        right.push(quadraui::TabBarSegment {
-            text: " \u{F0932}".to_string(),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:split_right")),
-            is_active: false,
-        });
-        let split_down = crate::icons::SPLIT_DOWN.c();
-        right.push(quadraui::TabBarSegment {
-            text: format!(" {split_down} "),
-            width_cells: 3,
-            id: Some(quadraui::WidgetId::new("tab:split_down")),
-            is_active: false,
-        });
+        right.push(tab_btn_segment(
+            &crate::icons::SPLIT_RIGHT,
+            "tab:split_right",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::SPLIT_DOWN,
+            "tab:split_down",
+            false,
+        ));
     }
 
     right.push(quadraui::TabBarSegment {
+        // Action menu uses U+22EF (HORIZONTAL ELLIPSIS) which is a
+        // standard Unicode glyph, not a Nerd Font codepoint.
         text: " \u{22EF} ".to_string(),
         width_cells: 3,
         id: Some(quadraui::WidgetId::new("tab:action_menu")),
