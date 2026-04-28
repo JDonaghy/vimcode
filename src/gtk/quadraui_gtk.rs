@@ -20,36 +20,6 @@ fn qc_to_cairo(c: quadraui::Color) -> (f64, f64, f64) {
     (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0)
 }
 
-/// Draw a `quadraui::StatusBar` as a single row `line_height` tall.
-///
-/// Per D6: the `StatusBar::layout()` primitive owns the layout math
-/// (left-accumulate, right-align, fit-drop). This rasteriser supplies
-/// a Pango pixel-width measurement closure, calls `bar.layout()`, and
-/// paints the returned `visible_segments` verbatim. No positional
-/// math lives here — any layout policy change (e.g. the #159 priority
-/// drop) happens once in quadraui and applies to TUI + GTK together.
-///
-/// Returns hit regions in local coordinates (relative to `x`) — caller
-/// pushes them into the per-window segment map for click resolution.
-/// Bold segments use Pango's bold weight attribute.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_status_bar(
-    cr: &Context,
-    layout: &pango::Layout,
-    x: f64,
-    y: f64,
-    width: f64,
-    line_height: f64,
-    bar: &quadraui::StatusBar,
-    theme: &Theme,
-) -> Vec<quadraui::StatusBarHitRegion> {
-    // Public rasteriser in `quadraui::gtk` consumes a backend-agnostic
-    // `quadraui::Theme`. Build one from the rich vimcode theme — the
-    // status bar reads only `background` (fallback fill when bar has
-    // no segments) but `foreground` is populated for symmetry.
-    quadraui::gtk::draw_status_bar(cr, layout, x, y, width, line_height, bar, &q_theme(theme))
-}
-
 /// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
 /// `render::Theme`. Shared by every public-rasteriser delegate so each
 /// migration adds the field it needs in one place. Lift sequence is

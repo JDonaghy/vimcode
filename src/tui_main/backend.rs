@@ -57,6 +57,11 @@ use ratatui::Frame;
 
 use super::services::TuiPlatformServices;
 
+/// Minimum gap (in cells) between left and right status-bar halves
+/// before priority drop kicks in. Mirrors `quadraui::gtk::status_bar`'s
+/// `MIN_GAP_PX = 16.0`. Irrelevant for bars without right segments.
+const MIN_GAP_CELLS: f32 = 2.0;
+
 /// TUI backend implementing [`quadraui::Backend`].
 ///
 /// Owns the persistent UI state the trait requires plus a transient
@@ -470,15 +475,19 @@ impl Backend for TuiBackend {
 
     fn draw_status_bar(
         &mut self,
-        _rect: QRect,
-        _bar: &StatusBar,
-        _layout: &quadraui::primitives::status_bar::StatusBarLayout,
-    ) {
-        unimplemented!(
-            "TuiBackend::draw_status_bar — TUI's draw path goes through render_impl::draw_frame; \
-             trait method exists for cross-backend tests / future \
-             generic paint::<B>"
-        )
+        rect: QRect,
+        bar: &StatusBar,
+    ) -> Vec<quadraui::StatusBarHitRegion> {
+        let area = q_rect_to_ratatui(rect);
+        let theme = self.current_theme;
+        // Cell-unit measurer: each char counts as one cell.
+        let layout = bar.layout(area.width as f32, 1.0, MIN_GAP_CELLS, |seg| {
+            quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+        });
+        let frame = self
+            .current_frame_mut()
+            .expect("TuiBackend::draw_status_bar called outside enter_frame_scope");
+        quadraui::tui::draw_status_bar(frame.buffer_mut(), area, bar, &layout, &theme)
     }
 
     fn draw_tab_bar(
@@ -647,8 +656,8 @@ mod tests {
             &mut self,
             _r: QRect,
             _b: &StatusBar,
-            _l: &quadraui::primitives::status_bar::StatusBarLayout,
-        ) {
+        ) -> Vec<quadraui::StatusBarHitRegion> {
+            Vec::new()
         }
         fn draw_tab_bar(
             &mut self,

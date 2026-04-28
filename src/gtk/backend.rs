@@ -579,12 +579,11 @@ impl Backend for GtkBackend {
         &mut self,
         rect: QRect,
         bar: &StatusBar,
-        _layout: &quadraui::primitives::status_bar::StatusBarLayout,
-    ) {
+    ) -> Vec<quadraui::StatusBarHitRegion> {
         let (cr, layout) = self
             .current_frame_refs()
             .expect("GtkBackend::draw_status_bar called outside enter_frame_scope");
-        let _ = quadraui::gtk::draw_status_bar(
+        quadraui::gtk::draw_status_bar(
             cr,
             layout,
             rect.x as f64,
@@ -593,7 +592,7 @@ impl Backend for GtkBackend {
             self.current_line_height,
             bar,
             &self.current_theme,
-        );
+        )
     }
 
     fn draw_tab_bar(

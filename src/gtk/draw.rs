@@ -350,6 +350,7 @@ pub(super) fn draw_editor(
         cr.save().ok();
         cr.translate(bc_x, 0.0);
         draw_breadcrumb_bar(
+            backend,
             cr,
             &layout,
             &theme,
@@ -577,6 +578,7 @@ pub(super) fn draw_editor(
     if let Some(ref toolbar) = screen.debug_toolbar {
         let toolbar_y = height as f64 - status_bar_height - debug_toolbar_px;
         draw_debug_toolbar(
+            backend,
             cr,
             toolbar,
             &theme,
@@ -616,6 +618,7 @@ pub(super) fn draw_editor(
                 let bar_y = wr.y + wr.height - line_height;
                 let mut zones = Vec::new();
                 draw_window_status_bar(
+                    backend,
                     cr,
                     &layout,
                     &theme,
@@ -639,6 +642,7 @@ pub(super) fn draw_editor(
         let status_y = height as f64 - status_bar_height - separated_status_px;
         let mut zones = Vec::new();
         draw_window_status_bar(
+            backend,
             cr,
             &layout,
             &theme,
@@ -992,6 +996,7 @@ pub(super) fn draw_tab_bar(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_breadcrumb_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
@@ -1005,17 +1010,16 @@ pub(super) fn draw_breadcrumb_bar(
 ) {
     let bar =
         render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
-    let hits = super::quadraui_gtk::draw_status_bar(
-        cr,
-        layout,
-        0.0,
-        y_offset,
-        width,
-        line_height,
-        &bar,
-        theme,
-    );
-    *hit_regions_out.borrow_mut() = hits;
+    use quadraui::Backend;
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let hits = b.draw_status_bar(
+            quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
+            &bar,
+        );
+        *hit_regions_out.borrow_mut() = hits;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3814,12 +3818,13 @@ pub(super) fn draw_status_line(
 #[allow(clippy::too_many_arguments)]
 /// Render a per-window / separated status bar row (A.6b).
 ///
-/// Delegates to `quadraui_gtk::draw_status_bar` via the
+/// Routes through `Backend::draw_status_bar` via the
 /// `window_status_line_to_status_bar` adapter. `StatusAction` is decoded from
 /// the primitive's `WidgetId`s so the existing per-window
 /// `status_segment_map` stays on `StatusAction` and the click handler in
 /// `src/gtk/click.rs` is unchanged.
 fn draw_window_status_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
@@ -3832,8 +3837,15 @@ fn draw_window_status_bar(
 ) {
     let bar =
         render::window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
-    let regions =
-        super::quadraui_gtk::draw_status_bar(cr, layout, x, y, width, line_height, &bar, theme);
+    use quadraui::Backend;
+    let regions = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_status_bar(
+            quadraui::Rect::new(x as f32, y as f32, width as f32, line_height as f32),
+            &bar,
+        )
+    });
 
     segment_zones.clear();
     for region in regions {
@@ -6035,6 +6047,7 @@ pub(super) fn draw_ai_sidebar(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_debug_toolbar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     toolbar: &render::DebugToolbarData,
     theme: &Theme,
@@ -6050,7 +6063,14 @@ pub(super) fn draw_debug_toolbar(
     ui_layout.set_font_description(Some(&ui_font_desc));
 
     let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
-    let hits =
-        super::quadraui_gtk::draw_status_bar(cr, &ui_layout, x, y, width, height, &bar, theme);
+    use quadraui::Backend;
+    let hits = backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(height);
+        b.draw_status_bar(
+            quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32),
+            &bar,
+        )
+    });
     *hit_regions_out.borrow_mut() = hits;
 }

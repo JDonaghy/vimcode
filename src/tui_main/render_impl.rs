@@ -268,7 +268,7 @@ pub(super) fn draw_frame(
         }
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
-        render_all_windows(frame, editor_area, &screen.windows, theme);
+        render_all_windows(backend, frame, editor_area, &screen.windows, theme);
         // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
         // the group's window content (bounds.y - tab_bar_height).
         let tui_tbh: u16 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
@@ -333,7 +333,8 @@ pub(super) fn draw_frame(
                     height: 1,
                 };
                 draw_breadcrumb_bar(
-                    frame.buffer_mut(),
+                    backend,
+                    frame,
                     bc_rect,
                     &bc.segments,
                     theme,
@@ -394,7 +395,8 @@ pub(super) fn draw_frame(
                     height: 1,
                 };
                 draw_breadcrumb_bar(
-                    frame.buffer_mut(),
+                    backend,
+                    frame,
                     bc_rect,
                     &bc.segments,
                     theme,
@@ -403,7 +405,7 @@ pub(super) fn draw_frame(
                 );
             }
         }
-        render_all_windows(frame, editor_area, &screen.windows, theme);
+        render_all_windows(backend, frame, editor_area, &screen.windows, theme);
     }
 
     // ── Tab drag overlay ────────────────────────────────────────────────────
@@ -602,7 +604,8 @@ pub(super) fn draw_frame(
     // ── Separated status line (above terminal, when status_line_above_terminal is active) ──
     if let Some(ref status) = screen.separated_status_line {
         render_window_status_line(
-            frame.buffer_mut(),
+            backend,
+            frame,
             separated_status_area.x,
             separated_status_area.y,
             separated_status_area.width,
@@ -654,21 +657,20 @@ pub(super) fn draw_frame(
 
     // ── Debug toolbar strip (if visible) ────────────────────────────────────
     if let Some(ref toolbar) = screen.debug_toolbar {
-        // Per D6: build quadraui::StatusBar + draw_status_bar.
+        // B5c.1: route through the `Backend` trait. `draw_status_bar`
+        // computes layout internally with the cell measurer.
         let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
-        let layout = bar.layout(
+        let q_rect = quadraui::Rect::new(
+            debug_toolbar_area.x as f32,
+            debug_toolbar_area.y as f32,
             debug_toolbar_area.width as f32,
-            1.0,
-            0.0, // no right segments → no left/right gap needed
-            |seg| quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32),
+            debug_toolbar_area.height as f32,
         );
-        super::quadraui_tui::draw_status_bar(
-            frame.buffer_mut(),
-            debug_toolbar_area,
-            &bar,
-            &layout,
-            theme,
-        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            let _ = b.draw_status_bar(q_rect, &bar);
+        });
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -1569,8 +1571,13 @@ pub(super) fn render_tab_bar(
 }
 
 /// Draw the breadcrumb bar via the D6 StatusBar pipeline.
+///
+/// B5c.1: routes through `Backend::draw_status_bar`. Breadcrumbs have
+/// no right segments so the trait method's internal `MIN_GAP_CELLS` is
+/// inert.
 pub(super) fn draw_breadcrumb_bar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     segments: &[render::BreadcrumbSegment],
     theme: &Theme,
@@ -1579,18 +1586,23 @@ pub(super) fn draw_breadcrumb_bar(
 ) {
     let bar =
         render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
-    let layout = bar.layout(
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
         area.width as f32,
-        1.0,
-        0.0, // no right segments → no gap needed
-        |seg| quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32),
+        area.height as f32,
     );
-    super::quadraui_tui::draw_status_bar(buf, area, &bar, &layout, theme);
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        let _ = b.draw_status_bar(q_rect, &bar);
+    });
 }
 
 // ─── Editor windows ───────────────────────────────────────────────────────────
 
 pub(super) fn render_all_windows(
+    backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     editor_area: Rect,
     windows: &[RenderedWindow],
@@ -1603,7 +1615,7 @@ pub(super) fn render_all_windows(
             width: window.rect.width as u16,
             height: window.rect.height as u16,
         };
-        render_window(frame, win_rect, window, theme);
+        render_window(backend, frame, win_rect, window, theme);
     }
     render_separators(frame.buffer_mut(), editor_area, windows, theme);
 }
@@ -1953,6 +1965,7 @@ pub(super) fn render_picker_popup(
 }
 
 pub(super) fn render_window(
+    backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
     window: &RenderedWindow,
@@ -2406,44 +2419,41 @@ pub(super) fn render_window(
 
     // ── Per-window status bar ────────────────────────────────────────────────
     if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
-        render_window_status_line(frame.buffer_mut(), area.x, sy, area.width, status, theme);
+        render_window_status_line(backend, frame, area.x, sy, area.width, status, theme);
     }
 }
 
 /// Draw a per-window status line into the given row.
+///
+/// B5c.1: routes through `Backend::draw_status_bar`. The trait impl
+/// computes layout internally with `MIN_GAP_CELLS = 2.0` so right
+/// segments priority-drop on narrow bars (#159).
+///
+/// `StatusBar` adapter encodes engine-side `StatusAction` values as
+/// opaque `WidgetId` strings; `status_segment_hit_test` (in mouse.rs)
+/// decodes them back to `StatusAction` via `status_action_from_id`
+/// after the layout's hit_test() resolves a click — TUI doesn't
+/// consume the hit regions returned by `draw_status_bar` because the
+/// click handler runs the layout on demand against current bar width.
 fn render_window_status_line(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     x: u16,
     y: u16,
     width: u16,
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
 ) {
-    // Per D6: build the primitive, ask it for a StatusBarLayout, then
-    // hand both to the rasteriser. The rasteriser's only job is to turn
-    // the layout's visible_segments into cells.
-    //
-    // `StatusBar` adapter encodes engine-side `StatusAction` values as
-    // opaque `WidgetId` strings; `status_segment_hit_test` (in mouse.rs)
-    // decodes them back to `StatusAction` via `status_action_from_id`
-    // after the layout's hit_test() resolves a click.
     let bar = crate::render::window_status_line_to_status_bar(
         status,
         quadraui::WidgetId::new("status:window"),
     );
-    // #159: 2-cell gap between left and right halves so right segments
-    // drop from the front when the bar is too narrow.
-    const MIN_GAP_CELLS: f32 = 2.0;
-    let layout = bar.layout(width as f32, 1.0, MIN_GAP_CELLS, |seg| {
-        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+    let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        let _ = b.draw_status_bar(q_rect, &bar);
     });
-    let area = ratatui::layout::Rect {
-        x,
-        y,
-        width,
-        height: 1,
-    };
-    super::quadraui_tui::draw_status_bar(buf, area, &bar, &layout, theme);
 }
 
 pub(super) fn render_scrollbar(

@@ -47,29 +47,6 @@ pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, the
     quadraui::tui::draw_form(buf, area, form, &q_theme(theme));
 }
 
-/// Draw a `quadraui::StatusBar` as a single row.
-///
-/// `area` is the target rect (height is ignored beyond the first row).
-/// Left segments accumulate from the left edge; right segments are
-/// right-aligned inside `area.width`. If the two halves would overlap
-/// (bar too narrow), the right half wins — left segments are truncated.
-///
-/// Background fill uses the first segment's `bg` so the bar looks
-/// continuous even when gaps exist between left and right halves.
-pub(super) fn draw_status_bar(
-    buf: &mut Buffer,
-    area: Rect,
-    bar: &quadraui::StatusBar,
-    layout: &quadraui::StatusBarLayout,
-    theme: &Theme,
-) {
-    // Public rasteriser in `quadraui::tui` consumes a backend-agnostic
-    // `quadraui::Theme`. Build one from the rich vimcode theme — the
-    // status bar reads only `background` (fallback fill when bar has
-    // no segments) but `foreground` is populated for symmetry.
-    quadraui::tui::draw_status_bar(buf, area, bar, layout, &q_theme(theme));
-}
-
 /// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
 /// `render::Theme`. Shared by every public-rasteriser delegate so each
 /// migration adds the field it needs in one place. Lift sequence is
