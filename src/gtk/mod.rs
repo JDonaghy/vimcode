@@ -440,6 +440,11 @@ struct App {
     /// when the popup isn't visible. (B.5b Stage 5.)
     #[allow(clippy::type_complexity)]
     completion_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Tab-switcher popup bounding rect (x, y, w, h) — set during
+    /// draw, used for `ModalStack` registration in the click
+    /// handler. (B.5b Stage 7.)
+    #[allow(clippy::type_complexity)]
+    tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -2156,6 +2161,9 @@ impl SimpleComponent for App {
         let completion_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
         #[allow(clippy::type_complexity)]
+        let tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
+            Rc::new(Cell::new(None));
+        #[allow(clippy::type_complexity)]
         let editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>> =
             Rc::new(RefCell::new(Vec::new()));
         let editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>> =
@@ -2353,6 +2361,7 @@ impl SimpleComponent for App {
             panel_hover_popup_rect: panel_hover_popup_rect.clone(),
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
             completion_popup_rect: completion_popup_rect.clone(),
+            tab_switcher_popup_rect: tab_switcher_popup_rect.clone(),
             editor_hover_link_rects: editor_hover_link_rects.clone(),
             editor_hover_scrollbar: editor_hover_scrollbar.clone(),
             menu_dd_line_height: menu_dd_lh.clone(),
@@ -3842,6 +3851,7 @@ impl SimpleComponent for App {
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let completion_rect_for_draw = model.completion_popup_rect.clone();
+        let tab_switcher_rect_for_draw = model.tab_switcher_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let editor_hover_sb_for_draw = model.editor_hover_scrollbar.clone();
         let mouse_pos_for_draw = mouse_pos_cell.clone();
@@ -3879,6 +3889,7 @@ impl SimpleComponent for App {
                             &dialog_btn_for_draw,
                             &editor_hover_rect_for_draw,
                             &completion_rect_for_draw,
+                            &tab_switcher_rect_for_draw,
                             &editor_hover_links_for_draw,
                             &editor_hover_sb_for_draw,
                             mouse_pos_for_draw.get(),
@@ -6161,6 +6172,59 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         self.reconcile_editor_hover_modal();
+
+        // ── Tab switcher modal arbitration (B.5b Stage 7) ──────────────
+        //
+        // Keyboard-driven popup (Ctrl+Tab cycles, Ctrl release commits,
+        // Esc dismisses). Click anywhere dismisses — inside the popup
+        // also consumes (no editor cursor-move underneath); outside
+        // dismisses + propagates so the editor receives the click.
+        if self.engine.borrow().tab_switcher_open {
+            let switcher_id = quadraui::WidgetId::new("tab_switcher");
+            let inside = if let Some((px, py, pw, ph)) = self.tab_switcher_popup_rect.get() {
+                self.modal_stack.borrow_mut().push(
+                    switcher_id.clone(),
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
+                let stack = self.modal_stack.borrow();
+                let events = quadraui::dispatch_mouse_down(
+                    &stack,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                events.iter().any(|ev| {
+                    matches!(
+                        ev,
+                        quadraui::UiEvent::MouseDown { widget: Some(id), .. }
+                            if *id == switcher_id
+                    )
+                })
+            } else {
+                false
+            };
+
+            self.engine.borrow_mut().tab_switcher_open = false;
+            self.modal_stack.borrow_mut().pop(&switcher_id);
+
+            if inside {
+                self.draw_needed.set(true);
+                return;
+            }
+            // Outside: fall through so editor click proceeds.
+        } else {
+            self.modal_stack
+                .borrow_mut()
+                .pop(&quadraui::WidgetId::new("tab_switcher"));
+        }
 
         // ── Completion popup modal arbitration (B.5b Stage 5) ──────────
         //

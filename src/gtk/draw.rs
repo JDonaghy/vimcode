@@ -51,6 +51,7 @@ pub(super) fn draw_editor(
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     completion_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    tab_switcher_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
     mouse_pos: (f64, f64),
@@ -721,14 +722,14 @@ pub(super) fn draw_editor(
         line_height,
     );
 
-    draw_tab_switcher_popup(
+    tab_switcher_popup_rect_out.set(draw_tab_switcher_popup(
         cr,
         &screen,
         &theme,
         width as f64,
         height as f64,
         line_height,
-    );
+    ));
 
     let btn_rects = draw_dialog_popup(
         cr,
@@ -2811,7 +2812,10 @@ pub(super) fn draw_picker_popup(
     }
 }
 
-/// Draw the tab switcher popup (Ctrl+Tab MRU list).
+/// Draw the tab switcher popup (Ctrl+Tab MRU list). Returns the
+/// popup's `(x, y, w, h)` if drawn, `None` otherwise — the caller
+/// caches this for `ModalStack` registration in the click handler
+/// (B.5b Stage 7).
 pub(super) fn draw_tab_switcher_popup(
     cr: &Context,
     screen: &render::ScreenLayout,
@@ -2819,12 +2823,10 @@ pub(super) fn draw_tab_switcher_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-) {
-    let Some(ts) = &screen.tab_switcher else {
-        return;
-    };
+) -> Option<(f64, f64, f64, f64)> {
+    let ts = screen.tab_switcher.as_ref()?;
     if ts.items.is_empty() {
-        return;
+        return None;
     }
 
     let item_count = ts.items.len();
@@ -2911,6 +2913,8 @@ pub(super) fn draw_tab_switcher_popup(
             pangocairo::show_layout(cr, &layout);
         }
     }
+
+    Some((popup_x, popup_y, popup_w, popup_h))
 }
 
 /// Draw a modal dialog popup centered on the screen.
