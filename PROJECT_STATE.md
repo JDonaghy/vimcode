@@ -1,8 +1,8 @@
 # VimCode Project State
 
-**Last updated:** Apr 28, 2026 (Session 338 — **B.5b shipped end-to-end (Stages 1–13)** — [#249](https://github.com/JDonaghy/vimcode/issues/249) closed. Smoke-test bugfixes: #247 / #250 / #251 / #252 all closed. Smoke-test followups filed: #207 (pre-existing) / #253 (auto-completion popup invisibility) / #255 (settings scrollbar drag) / #256 (scrollbars over maximized terminal) / #257 (gutter button during text-drag) / #258 (extensions sidebar right-click). 4078 lib + integration tests pass; clippy clean.
+**Last updated:** Apr 28, 2026 (Session 339 — **B.5c shipped Stages 1–7** — [#259](https://github.com/JDonaghy/vimcode/issues/259) substantially complete. Trait return-type redesign for hit data (`StatusBarHitRegion`, `TabBarHits`, `ActivityBarRowHit`); lifted `activity_bar` + `terminal` rasterisers from `src/gtk/quadraui_gtk.rs` into `quadraui::gtk::*` (taking `quadraui::Theme`); added trait methods for `tooltip` + `context_menu`. Smoke-test followups filed: #262 (breadcrumb dropdown), #263 (TUI breakpoint dot), #264 (settings panel narrow), #265 (TUI nerd-font wide-glyph predicate), #266 (lift rich_text_popup / completions / find_replace), #267 (Backend::draw_dialog dual-Pango handling). quadraui: 231 tests pass; vimcode `--no-default-features` + clippy clean across all feature combos; kubeui builds clean.
 
-**Next priority arc set 2026-04-28** (full detail in PLAN.md "🎯 NEXT FOCUS" section): **B.5c → B.5d → B.5e** before B.6 Win-GUI rebuild. B.5c closes the remaining trait-coverage gaps so TUI + GTK are 100% on `quadraui::Backend` (trait method return-type redesign for hit-region data; lift remaining GTK shims; add trait methods for the 6 trait-less primitives — tooltip / dialog / context_menu / rich_text_popup / completions / find_replace). B.5d audits TUI + GTK setup code into `docs/BACKEND_SETUP_AUDIT.md`. B.5e ships `quadraui_tui::run` / `quadraui_gtk::run` runner crates that hide per-backend boilerplate so an app's `main()` shrinks to ~10 backend-agnostic lines.
+**Next priority arc set 2026-04-28** (full detail in PLAN.md "🎯 NEXT FOCUS" section): **B.5d → B.5e** next, then B.6 Win-GUI rebuild. B.5c closed the trait-coverage gaps for the 6 originally-trait-less primitives down to 2 deferred ones (#266 + #267). B.5d audits TUI + GTK setup code into `docs/BACKEND_SETUP_AUDIT.md`. B.5e ships `quadraui_tui::run` / `quadraui_gtk::run` runner crates that hide per-backend boilerplate so an app's `main()` shrinks to ~10 backend-agnostic lines.
 
 Prior session (336): B.5 shipped 9 stages of GTK trait plumbing (`2c8fe7f` … `2d8ef54`) — `GtkBackend` struct, `Backend` trait impl, GDK→`UiEvent` translation helpers, accelerator registry, frame-scope, `is_modal_open()`, clipboard write, `open_url`. Only the quickfix panel actually consumed the trait at runtime; B.5b is the actual port.)
 
@@ -83,6 +83,50 @@ landed). One large surface deferred — see #214.
 ---
 
 ## Recent Work
+
+**Session 339 — #259 Phase B.5c stages 1–7 shipped:**
+
+Closed the trait-coverage gap that B.5b surfaced. Six trait-method
+redesigns + two rasteriser lifts + new trait methods for the
+trait-less primitives, landed Path-A in seven discrete commits.
+
+| Stage | Commit | What |
+|-------|--------|------|
+| B5c.1 | `985b087` | `Backend::draw_status_bar(rect, bar) -> Vec<StatusBarHitRegion>`. Drops `&StatusBarLayout` (each backend computes layout internally). TUI rasteriser returns hit regions for trait parity. |
+| B5c.2 | `b3eeadf` … `e32cc8a` | `Backend::draw_tab_bar(rect, bar, hovered_close) -> TabBarHits`. `TabBarHits` lifted to primitives so the trait can name it without feature gates. Adds `close_bounds` to hits so GTK close-hover hit-test consumes rasteriser positions instead of `chars × char_width`. TUI mouse single-group + right-click migrated to `bar.layout(...).hit_test()`. Icon glyphs in `build_tab_bar_primitive` now route through `Icon::c()` (was hardcoded). |
+| B5c.3 | `92722cc` | `Backend::draw_text_display(rect, td)`. Drops `&TextDisplayLayout` (rasterisers manage line layout internally). |
+| B5c.4 | `57f3d21` | TUI explorer / settings / source-control panel render helpers route tree/form draws through `Backend::draw_tree` / `draw_form` via `enter_frame_scope`. In-tree `quadraui_tui::draw_tree` / `draw_form` shims removed. |
+| B5c.5 | `7558220` | Lifted `quadraui_gtk::draw_activity_bar` + `draw_terminal_cells` into `quadraui::gtk::*` (with `quadraui::Theme`). New `ActivityBarRowHit` primitive. New theme fields `inactive_fg` + `selection_bg`. New `Color::lighten`. `GtkBackend::draw_activity_bar` + `draw_terminal` no longer `unimplemented!()`. |
+| B5c.6 | `a4e6c9f` | `Backend::draw_tooltip` + `Backend::draw_context_menu`. The other 4 of the original 6 trait-less primitives deferred (see below). |
+| B5c.7 | this stage | Parity sweep — full test/clippy run across feature combos. `quadraui` 231/231; vimcode `--no-default-features` clean; kubeui builds clean. |
+
+**Trait coverage state (post-B.5c):**
+
+| Primitive | TUI | GTK | Notes |
+|---|---|---|---|
+| `tree`, `list`, `form`, `palette` | ✅ | ✅ | from B.5b |
+| `status_bar` | ✅ | ✅ | hit regions returned (B5c.1) |
+| `tab_bar` | ✅ | ✅ | `TabBarHits` returned, includes close_bounds (B5c.2) |
+| `text_display` | ✅ | ✅ | layout-internal (B5c.3) |
+| `activity_bar` | ⚠️ stub | ✅ | TUI inline; #266 covers TUI lift |
+| `terminal` | ⚠️ stub | ✅ | TUI inline; GTK only consumer today |
+| `tooltip` | ✅ | ✅ | (B5c.6) |
+| `context_menu` | ✅ | ✅ | hit regions returned (B5c.6) |
+| `dialog` | ❌ | ❌ | dual-Pango-layout blocker — #267 |
+| `rich_text_popup`, `completions`, `find_replace` | ❌ | ❌ | rasterisers still in vimcode shims — #266 |
+
+**Smoke-test followups filed during B5c:**
+- #262 — breadcrumb dropdown: parent symbols expandable but not jumpable.
+- #263 — TUI breakpoint red dot missing in gutter (pre-existing).
+- #264 — Settings panel renders broken when sidebar narrow.
+- #265 — TUI nerd-font wide-glyph predicate disagrees with terminal — clicks land off-target.
+- #266 — Lift `rich_text_popup` / `completions` / `find_replace` into `quadraui::{tui,gtk}::*`.
+- #267 — `Backend::draw_dialog` needs dual-Pango-layout handling.
+
+**What's next:** B.5d (#260 — TUI vs GTK setup-code audit), then B.5e
+(#261 — runner crates), then B.6 Win-GUI rebuild on quadraui.
+
+---
 
 **Session 332 (cont.) — #223 TextDisplay rasteriser pilot + kubeui YAML pane adoption:**
 
