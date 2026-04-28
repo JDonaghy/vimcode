@@ -21,32 +21,6 @@ fn qc(c: quadraui::Color) -> RatatuiColor {
 /// foreground). Per-row colours carried inside the `TreeRow` (from
 /// `StyledSpan` / `Badge`) override the theme defaults.
 ///
-/// Respects `tree.scroll_offset` and clips rows that fall outside `area`.
-/// Does not draw a scrollbar yet — scrollbars are a later primitive stage.
-pub(super) fn draw_tree(buf: &mut Buffer, area: Rect, tree: &quadraui::TreeView, theme: &Theme) {
-    quadraui::tui::draw_tree(
-        buf,
-        area,
-        tree,
-        &q_theme(theme),
-        crate::icons::nerd_fonts_enabled(),
-    );
-}
-
-/// Draw a `quadraui::Form` into `area` on `buf`.
-///
-/// Layout: one row per field. Label on the left, input on the right.
-/// Headers (`FieldKind::Label`) span the full width in bold.
-/// Disabled fields render dimmed and their inputs are bracketed the
-/// same as enabled ones (the app skips them during focus navigation).
-///
-/// Focused field gets a subtle background tint. Text input cursor
-/// and selection (A.3d) are rendered when the `TextInput` field's
-/// `cursor` / `selection_anchor` are `Some(_)`.
-pub(super) fn draw_form(buf: &mut Buffer, area: Rect, form: &quadraui::Form, theme: &Theme) {
-    quadraui::tui::draw_form(buf, area, form, &q_theme(theme));
-}
-
 /// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
 /// `render::Theme`. Shared by every public-rasteriser delegate so each
 /// migration adds the field it needs in one place. Lift sequence is

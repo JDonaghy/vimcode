@@ -227,7 +227,8 @@ pub(super) fn draw_frame(
         let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
 
         render_sidebar(
-            frame.buffer_mut(),
+            backend,
+            frame,
             sidebar_area,
             sidebar,
             engine,

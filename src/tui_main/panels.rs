@@ -247,13 +247,15 @@ fn build_activity_bar_primitive(
 // ─── Sidebar rendering ────────────────────────────────────────────────────────
 
 pub(super) fn render_sidebar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     sidebar: &mut TuiSidebar,
     engine: &Engine,
     theme: &Theme,
     explorer_drop_target: Option<usize>,
 ) {
+    let buf = frame.buffer_mut();
     let default_fg = rc(theme.explorer_file_fg);
     let row_bg = rc(theme.tab_bar_bg);
     let active_bg = rc(theme.explorer_active_bg);
@@ -276,7 +278,7 @@ pub(super) fn render_sidebar(
 
     // Settings panel
     if sidebar.active_panel == TuiPanel::Settings {
-        render_settings_panel(buf, area, theme, engine);
+        render_settings_panel(backend, frame, area, theme, engine);
         return;
     }
 
@@ -294,7 +296,7 @@ pub(super) fn render_sidebar(
 
     // Source Control panel
     if sidebar.active_panel == TuiPanel::Git {
-        render_source_control(buf, area, engine, theme);
+        render_source_control(backend, frame, area, engine, theme);
         return;
     }
 
@@ -334,7 +336,19 @@ pub(super) fn render_sidebar(
             width: area.width.saturating_sub(1), // reserve rightmost col for scrollbar
             height: area.height,
         };
-        super::quadraui_tui::draw_tree(buf, tree_area, &tree, theme);
+        // B5c.4: route tree rendering through `Backend::draw_tree`.
+        let q_rect = quadraui::Rect::new(
+            tree_area.x as f32,
+            tree_area.y as f32,
+            tree_area.width as f32,
+            tree_area.height as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_tree(q_rect, &tree);
+        });
+        let buf = frame.buffer_mut();
         render_explorer_scrollbar(buf, area, sidebar, theme);
         return;
     }
@@ -768,12 +782,19 @@ fn render_new_entry_row(
 }
 
 /// Render the settings panel — shows current key settings and the file path.
+///
+/// B5c.4: routes the form rendering through `Backend::draw_form` so
+/// the form rasteriser and call site share the same code path GTK
+/// uses. The buffer-only chrome (background fill, focus border)
+/// stays inline.
 pub(super) fn render_settings_panel(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     theme: &Theme,
     engine: &Engine,
 ) {
+    let buf = frame.buffer_mut();
     use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
 
     let header_fg = rc(theme.status_fg);
@@ -867,7 +888,20 @@ pub(super) fn render_settings_panel(
             width: area.width.saturating_sub(1),
             height: content_height as u16,
         };
-        super::quadraui_tui::draw_form(buf, form_area, &form, theme);
+        // B5c.4: route through the trait. The scrollbar/chrome below
+        // re-borrows `buf` from `frame` after the trait call.
+        let q_rect = quadraui::Rect::new(
+            form_area.x as f32,
+            form_area.y as f32,
+            form_area.width as f32,
+            form_area.height as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_form(q_rect, &form);
+        });
+        let buf = frame.buffer_mut();
 
         // Scrollbar (mirrors the legacy renderer below).
         let total = engine.settings_flat_list().len();
@@ -1721,11 +1755,13 @@ pub(super) fn render_command_line(
 // ─── Input translation ────────────────────────────────────────────────────────
 
 pub(super) fn render_source_control(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
+    let buf = frame.buffer_mut();
     if area.height == 0 {
         return;
     }
@@ -1955,7 +1991,20 @@ pub(super) fn render_source_control(
         height: (area.y + area.height).saturating_sub(section_start_y),
     };
     let sc_tree = render::source_control_to_tree_view(sc, theme);
-    super::quadraui_tui::draw_tree(buf, section_area, &sc_tree, theme);
+    // B5c.4: route through `Backend::draw_tree`. Re-borrow `buf` from
+    // `frame` after the trait call for the popup chrome below.
+    let q_rect = quadraui::Rect::new(
+        section_area.x as f32,
+        section_area.y as f32,
+        section_area.width as f32,
+        section_area.height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_tree(q_rect, &sc_tree);
+    });
+    let buf = frame.buffer_mut();
 
     // ── Branch picker / create popup ─────────────────────────────────────────
     if let Some(ref bp) = sc.branch_picker {
