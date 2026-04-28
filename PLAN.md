@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1–5 shipped this session, plus three bugfixes found during smoke-test (#250 / #251 / #252 all closed). Stages 1–4 wired the queue + drain, accelerator dispatch, dialog modal stack, context-menu modal stack. Stage 5: completion popup on `ModalStack`; bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click inside the popup dismisses + consumes (cursor doesn't move) and click outside dismisses + propagates. Next: B5b.6, hover popup.)
+> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1–6 shipped this session, plus three bugfixes found during smoke-test (#250 / #251 / #252 all closed). Stages 1–4 wired the queue + drain, accelerator dispatch, dialog/context-menu modal-stack click routing. Stage 5: completion popup on `ModalStack`. Stage 6: hover-trigger gate suppresses the LSP hover when any blocking modal (palette / dialog / context menu / completion / find-replace / tab-switcher) is open — closes #247. Next: B5b.7, tab-switcher modal stack.)
 
 ---
 
@@ -45,7 +45,8 @@ dependencies.
 | **B5b.3** | Dialog modal click hit-test routes through `ModalStack::push` + `quadraui::dispatch_mouse_down` (picker-pattern mirror). Push on every frame the dialog is open (idempotent), pop on close. Inner button hit-test still uses GTK pixel rects from the last draw. **Out of scope:** the 9 inline `engine.dialog.is_some()` gates in sidebar key handlers (lines 5464, 5472, 5484, 5490, 5501, 5507, 5518, 5533, 5548) — those gate key routing, not click hit-testing, and are a separate concern from `ModalStack`. | ✅ |
 | **B5b.4** | Context menu click hit-test routes through `ModalStack` + `dispatch_mouse_down`. Inner row hit-test migrated to `quadraui::ContextMenuLayout::hit_test` (matches the renderer; closes #251 off-by-one). | ✅ |
 | **B5b.5** | Completion popup registered on `ModalStack`. Bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click handler pushes them. Click inside the popup dismisses + consumes (cursor doesn't move); click outside dismisses + propagates. | ✅ |
-| **B5b.6–B5b.7** | Per-modal migration onto `ModalStack` — hover popup, tab switcher. | ⬜ |
+| **B5b.6** | Hover popup is already on `ModalStack` via `reconcile_editor_hover_modal` (#216). Stage 6 adds a `blocking_modal_open` gate on the GTK hover trigger so mousing over LSP-hoverable text under an open palette / dialog / context menu / completion / find-replace / tab-switcher doesn't pop the hover popup behind the modal (closes #247). Click-handler refactor (`dispatch_mouse_down` replacing the inline `on_popup` rect check) deferred — current inline path works correctly. | ✅ |
+| **B5b.7** | Tab switcher migration onto `ModalStack`. | ⬜ |
 | **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
 | **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
 | **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. | ⬜ |

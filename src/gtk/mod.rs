@@ -5754,8 +5754,23 @@ impl App {
                 // and feed into dwell detection for auto-hover popups.
                 if mx >= 0.0 {
                     let mut engine = self.engine.borrow_mut();
+                    // Phase B.5b Stage 6: gate the hover trigger when any
+                    // blocking modal is open. Without this, mousing over
+                    // an LSP-hoverable identifier under (e.g.) an open
+                    // palette would still fire the hover request and
+                    // pop the hover popup behind the palette (#247).
+                    // Hover is itself a passive popup, so it doesn't
+                    // count as a blocker — only the modals the user
+                    // is actively focused on.
+                    let blocking_modal_open = engine.picker_open
+                        || engine.tab_switcher_open
+                        || engine.context_menu.is_some()
+                        || engine.dialog.is_some()
+                        || engine.find_replace_open
+                        || engine.completion_idx.is_some();
                     if engine.settings.hover_delay > 0
                         && !engine.editor_hover_has_focus
+                        && !blocking_modal_open
                         && (matches!(engine.mode, core::Mode::Normal | core::Mode::Visual)
                             || engine.is_vscode_mode())
                     {
