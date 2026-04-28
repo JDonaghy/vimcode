@@ -54,6 +54,8 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         hover_fg: q(theme.hover_fg),
         hover_border: q(theme.hover_border),
         input_bg: q(theme.completion_bg),
+        inactive_fg: q(theme.status_inactive_fg),
+        selection_bg: q(theme.selection),
     }
 }
 

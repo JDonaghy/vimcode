@@ -528,17 +528,12 @@ impl Backend for TuiBackend {
         &mut self,
         _rect: QRect,
         _bar: &ActivityBar,
-        _layout: &quadraui::primitives::activity_bar::ActivityBarLayout,
-    ) {
+        _hovered_idx: Option<usize>,
+    ) -> Vec<quadraui::ActivityBarRowHit> {
         unimplemented!("TuiBackend::draw_activity_bar — TUI uses inline draw; trait reserved")
     }
 
-    fn draw_terminal(
-        &mut self,
-        _rect: QRect,
-        _term: &TerminalPrim,
-        _layout: &quadraui::primitives::terminal::TerminalLayout,
-    ) {
+    fn draw_terminal(&mut self, _rect: QRect, _term: &TerminalPrim) {
         unimplemented!("TuiBackend::draw_terminal — TUI uses inline draw; trait reserved")
     }
 
@@ -692,16 +687,11 @@ mod tests {
             &mut self,
             _r: QRect,
             _b: &ActivityBar,
-            _l: &quadraui::primitives::activity_bar::ActivityBarLayout,
-        ) {
+            _h: Option<usize>,
+        ) -> Vec<quadraui::ActivityBarRowHit> {
+            Vec::new()
         }
-        fn draw_terminal(
-            &mut self,
-            _r: QRect,
-            _t: &TerminalPrim,
-            _l: &quadraui::primitives::terminal::TerminalLayout,
-        ) {
-        }
+        fn draw_terminal(&mut self, _r: QRect, _t: &TerminalPrim) {}
         fn draw_text_display(&mut self, _r: QRect, _t: &TextDisplay) {}
     }
 

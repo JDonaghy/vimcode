@@ -619,30 +619,41 @@ impl Backend for GtkBackend {
 
     fn draw_activity_bar(
         &mut self,
-        _rect: QRect,
-        _bar: &ActivityBar,
-        _layout: &quadraui::primitives::activity_bar::ActivityBarLayout,
-    ) {
-        unimplemented!(
-            "GtkBackend::draw_activity_bar — forward-compat stub. The \
-             in-tree `crate::gtk::quadraui_gtk::draw_activity_bar` shim \
-             takes `render::Theme` (legacy), not the `quadraui::Theme` \
-             stored on the backend. Migrating it into quadraui itself \
-             (#223 lift sequence) will let this method route through \
-             the unified path."
+        rect: QRect,
+        bar: &ActivityBar,
+        hovered_idx: Option<usize>,
+    ) -> Vec<quadraui::ActivityBarRowHit> {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_activity_bar called outside enter_frame_scope");
+        // The rasteriser paints from (0, 0) to (width, height); rect.x/y ignored.
+        let _ = rect;
+        quadraui::gtk::draw_activity_bar(
+            cr,
+            layout,
+            rect.width as f64,
+            rect.height as f64,
+            bar,
+            &self.current_theme,
+            hovered_idx,
         )
     }
 
-    fn draw_terminal(
-        &mut self,
-        _rect: QRect,
-        _term: &TerminalPrim,
-        _layout: &quadraui::primitives::terminal::TerminalLayout,
-    ) {
-        unimplemented!(
-            "GtkBackend::draw_terminal — forward-compat stub (see \
-             draw_activity_bar)"
-        )
+    fn draw_terminal(&mut self, rect: QRect, term: &TerminalPrim) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_terminal called outside enter_frame_scope");
+        quadraui::gtk::draw_terminal_cells(
+            cr,
+            layout,
+            term,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            self.current_line_height,
+            self.current_char_width,
+            &self.current_theme,
+        );
     }
 
     fn draw_text_display(&mut self, rect: QRect, td: &TextDisplay) {

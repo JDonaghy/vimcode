@@ -2127,7 +2127,7 @@ impl SimpleComponent for App {
             Rc::new(RefCell::new(None));
         let activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
-        let activity_bar_hits: Rc<RefCell<Vec<crate::gtk::quadraui_gtk::ActivityBarHit>>> =
+        let activity_bar_hits: Rc<RefCell<Vec<quadraui::ActivityBarRowHit>>> =
             Rc::new(RefCell::new(Vec::new()));
         let activity_bar_hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>> =
@@ -3456,13 +3456,13 @@ impl SimpleComponent for App {
                 let active = active_panel_write.borrow().clone();
                 let bar = build_gtk_activity_bar_primitive(&engine, &active, &theme);
                 let hovered = hover_d.get();
-                let hits = crate::gtk::quadraui_gtk::draw_activity_bar(
+                let hits = quadraui::gtk::draw_activity_bar(
                     cr,
                     &layout,
                     da.width() as f64,
                     da.height() as f64,
                     &bar,
-                    &theme,
+                    &crate::gtk::quadraui_gtk::q_theme(&theme),
                     hovered,
                 );
                 *hits_d.borrow_mut() = hits;

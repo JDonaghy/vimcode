@@ -3822,7 +3822,7 @@ pub(super) fn draw_terminal_cells(
     theme: &Theme,
 ) {
     let term = render::terminal_cells_to_quadraui(rows, quadraui::WidgetId::new("terminal:gtk"));
-    super::quadraui_gtk::draw_terminal_cells(
+    quadraui::gtk::draw_terminal_cells(
         cr,
         layout,
         &term,
@@ -3831,7 +3831,7 @@ pub(super) fn draw_terminal_cells(
         cell_area_w,
         line_height,
         char_width,
-        theme,
+        &super::quadraui_gtk::q_theme(theme),
     );
 }
 
