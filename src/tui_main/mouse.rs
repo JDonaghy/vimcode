@@ -1447,7 +1447,11 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         }
 
-        // Right-click on tab bar → open tab context menu
+        // Right-click on tab bar → open tab context menu.
+        //
+        // B5c.2: hit-test via primitive `bar.layout(...).hit_test(...)`
+        // — same code path the rasteriser uses to paint, so click
+        // resolution doesn't drift from the rendered positions.
         if col >= editor_left {
             let rel_col = col - editor_left;
             if let Some(layout) = last_layout {
@@ -1460,17 +1464,39 @@ pub(super) fn handle_mouse(
                         let gw = gtb.bounds.width as u16;
                         if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
                             let local_col = rel_col - gx;
-                            let ov_cols: u16 = if gtb.tab_scroll_offset > 0 { 2 } else { 0 };
-                            let mut x: u16 = ov_cols;
-                            for (i, tab) in gtb.tabs.iter().enumerate().skip(gtb.tab_scroll_offset)
+                            let bar = render::build_tab_bar_primitive(
+                                &gtb.tabs,
+                                false,
+                                gtb.diff_toolbar.as_ref(),
+                                gtb.tab_scroll_offset,
+                                None,
+                            );
+                            let tab_widths: Vec<usize> = gtb
+                                .tabs
+                                .iter()
+                                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                                .collect();
+                            let bar_layout = bar.layout(
+                                gw as f32,
+                                1.0,
+                                0.0,
+                                |i| {
+                                    quadraui::TabMeasure::new(
+                                        tab_widths[i] as f32,
+                                        render::TAB_CLOSE_COLS as f32,
+                                    )
+                                },
+                                |i| {
+                                    quadraui::SegmentMeasure::new(
+                                        bar.right_segments[i].width_cells as f32,
+                                    )
+                                },
+                            );
+                            if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
+                                bar_layout.hit_test(local_col as f32, 0.0)
                             {
-                                let name_w = tab.name.chars().count() as u16;
-                                let tab_w = name_w + TAB_CLOSE_COLS;
-                                if local_col >= x && local_col < x + tab_w {
-                                    engine.open_tab_context_menu(gtb.group_id, i, col, row + 1);
-                                    return sidebar_width;
-                                }
-                                x += tab_w;
+                                engine.open_tab_context_menu(gtb.group_id, i, col, row + 1);
+                                return sidebar_width;
                             }
                             break;
                         }
@@ -1478,17 +1504,43 @@ pub(super) fn handle_mouse(
                 } else {
                     // Single-group tab bar (row == menu_rows)
                     if row == menu_rows && !engine.is_tab_bar_hidden(engine.active_group) {
-                        let sg_offset = layout.tab_scroll_offset;
-                        let ov_cols: u16 = if sg_offset > 0 { 2 } else { 0 };
-                        let mut x: u16 = ov_cols;
-                        for (i, tab) in layout.tab_bar.iter().enumerate().skip(sg_offset) {
-                            let name_w = tab.name.chars().count() as u16;
-                            let tab_w = name_w + TAB_CLOSE_COLS;
-                            if rel_col >= x && rel_col < x + tab_w {
-                                engine.open_tab_context_menu(engine.active_group, i, col, row + 1);
-                                return sidebar_width;
-                            }
-                            x += tab_w;
+                        let editor_col_width = terminal_size
+                            .map(|s| s.width)
+                            .unwrap_or(80)
+                            .saturating_sub(editor_left);
+                        let bar = render::build_tab_bar_primitive(
+                            &layout.tab_bar,
+                            true,
+                            layout.diff_toolbar.as_ref(),
+                            layout.tab_scroll_offset,
+                            None,
+                        );
+                        let tab_widths: Vec<usize> = layout
+                            .tab_bar
+                            .iter()
+                            .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                            .collect();
+                        let bar_layout = bar.layout(
+                            editor_col_width as f32,
+                            1.0,
+                            0.0,
+                            |i| {
+                                quadraui::TabMeasure::new(
+                                    tab_widths[i] as f32,
+                                    render::TAB_CLOSE_COLS as f32,
+                                )
+                            },
+                            |i| {
+                                quadraui::SegmentMeasure::new(
+                                    bar.right_segments[i].width_cells as f32,
+                                )
+                            },
+                        );
+                        if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
+                            bar_layout.hit_test(rel_col as f32, 0.0)
+                        {
+                            engine.open_tab_context_menu(engine.active_group, i, col, row + 1);
+                            return sidebar_width;
                         }
                     }
                 }
@@ -3153,86 +3205,80 @@ pub(super) fn handle_mouse(
             let local_col = rel_col;
             let scroll_offset = layout.tab_scroll_offset;
 
-            let mut x: u16 = 0;
-            let mut tab_matched = false;
-            for (i, tab) in layout.tab_bar.iter().enumerate().skip(scroll_offset) {
-                let name_width = tab.name.chars().count() as u16;
-                let tab_width = name_width + TAB_CLOSE_COLS;
-                if local_col >= x && local_col < x + tab_width {
-                    tab_matched = true;
+            // B5c.2: hand-rolled tab/diff/split geometry replaced by the
+            // primitive's `hit_test` so the click resolution uses the
+            // exact same layout the rasteriser painted.
+            let bar = render::build_tab_bar_primitive(
+                &layout.tab_bar,
+                true,
+                layout.diff_toolbar.as_ref(),
+                scroll_offset,
+                None,
+            );
+            let tab_widths: Vec<usize> = layout
+                .tab_bar
+                .iter()
+                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                .collect();
+            let bar_layout = bar.layout(
+                bar_width as f32,
+                1.0,
+                0.0,
+                |i| quadraui::TabMeasure::new(tab_widths[i] as f32, render::TAB_CLOSE_COLS as f32),
+                |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
+            );
+            match bar_layout.hit_test(local_col as f32, 0.0) {
+                quadraui::TabBarHit::Tab(i) => {
                     if i < engine.active_group().tabs.len() {
-                        let close_col = x + name_width;
-                        if local_col >= close_col {
-                            engine.active_group_mut().active_tab = i;
-                            engine.line_annotations.clear();
-                            if engine.dirty() {
-                                *close_tab_confirm = true;
-                                *close_tab_confirm_focus = 0;
-                            } else {
-                                engine.close_tab();
-                            }
+                        engine.goto_tab(i);
+                        *tab_drag_start = Some((col, row));
+                        engine.lsp_ensure_active_buffer();
+                        if let Some(path) = engine.file_path().cloned() {
+                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                        }
+                    }
+                }
+                quadraui::TabBarHit::TabClose(i) => {
+                    if i < engine.active_group().tabs.len() {
+                        engine.active_group_mut().active_tab = i;
+                        engine.line_annotations.clear();
+                        if engine.dirty() {
+                            *close_tab_confirm = true;
+                            *close_tab_confirm_focus = 0;
                         } else {
-                            engine.goto_tab(i);
-                            // Record drag start position for tab drag-and-drop.
-                            *tab_drag_start = Some((col, row));
-                            engine.lsp_ensure_active_buffer();
-                            if let Some(path) = engine.file_path().cloned() {
-                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                            engine.close_tab();
+                        }
+                    }
+                }
+                quadraui::TabBarHit::RightSegment(id) => {
+                    let has_win = engine.windows.contains_key(&engine.active_window_id());
+                    match id.as_str() {
+                        "tab:diff_prev" => {
+                            if has_win {
+                                engine.jump_prev_hunk();
                             }
                         }
-                    }
-                    break;
-                }
-                x += tab_width;
-            }
-            if !tab_matched {
-                let diff_total_cols = if let Some(dt) = layout.diff_toolbar.as_ref() {
-                    let label_cols = dt
-                        .change_label
-                        .as_ref()
-                        .map(|l| l.len() as u16 + 1)
-                        .unwrap_or(0);
-                    DIFF_TOOLBAR_BTN_COLS + label_cols
-                } else {
-                    0
-                };
-                let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
-                let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
-                let diff_end = split_start;
-                let diff_start = diff_end.saturating_sub(diff_total_cols);
-                // Check diff toolbar FIRST to avoid boundary overlap with split buttons.
-                if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
-                    let in_diff = local_col - diff_start;
-                    let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
-                    let in_btns = in_diff.saturating_sub(label_cols);
-                    let has_win = engine.windows.contains_key(&engine.active_window_id());
-                    if in_diff < label_cols {
-                        // Clicked on label — no-op.
-                    } else if in_btns < DIFF_BTN_COLS {
-                        if has_win {
-                            engine.jump_prev_hunk();
+                        "tab:diff_next" => {
+                            if has_win {
+                                engine.jump_next_hunk();
+                            }
                         }
-                    } else if in_btns < DIFF_BTN_COLS * 2 {
-                        if has_win {
-                            engine.jump_next_hunk();
+                        "tab:diff_toggle" => {
+                            engine.diff_toggle_hide_unchanged();
                         }
-                    } else {
-                        engine.diff_toggle_hide_unchanged();
+                        "tab:split_right" => {
+                            engine.open_editor_group(SplitDirection::Vertical);
+                        }
+                        "tab:split_down" => {
+                            engine.open_editor_group(SplitDirection::Horizontal);
+                        }
+                        "tab:action_menu" => {
+                            engine.open_editor_action_menu(engine.active_group, col, row + 1);
+                        }
+                        _ => {}
                     }
-                } else if local_col >= split_start
-                    && local_col < split_start + TAB_SPLIT_BOTH_COLS
-                    && bar_width >= TAB_SPLIT_BOTH_COLS
-                {
-                    let in_split = local_col - split_start;
-                    if in_split >= TAB_SPLIT_BTN_COLS {
-                        engine.open_editor_group(SplitDirection::Horizontal);
-                    } else {
-                        engine.open_editor_group(SplitDirection::Vertical);
-                    }
-                } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
-                    // Editor action menu button ("…") at far right.
-                    engine.open_editor_action_menu(engine.active_group, col, row + 1);
                 }
+                _ => {}
             }
             return sidebar_width;
         }

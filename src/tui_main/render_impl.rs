@@ -1186,20 +1186,6 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
 /// rasteriser owns the painting.
 pub(super) const TAB_CLOSE_COLS: u16 = 2;
 
-// Split button glyphs: \u{F0932} (split-right), \u{f0d7} (caret-down / split-down).
-/// Terminal columns occupied by each split button (1 space + 2-wide NF glyph).
-pub(super) const TAB_SPLIT_BTN_COLS: u16 = 3;
-/// Total columns reserved for both split buttons.
-pub(super) const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
-
-/// Terminal columns for the editor action menu button ("…").
-pub(super) const TAB_ACTION_BTN_COLS: u16 = 3;
-
-/// Terminal columns per diff toolbar button (1 space + 1 char + 1 space).
-pub(super) const DIFF_BTN_COLS: u16 = 3;
-/// Total columns for all three diff toolbar buttons.
-pub(super) const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
-
 /// Given a column within a group's tab bar, return the shortened file path of
 /// the tab at that column, or `None` if the column doesn't hit a tab with a file.
 pub(super) fn tab_tooltip_at_col(
