@@ -107,6 +107,10 @@ pub struct GtkBackend {
     /// invocation. Every primitive that uses text metrics passes
     /// this through.
     current_line_height: f64,
+    /// Per-frame Pango approximate-char-width in DIPs. Set by the
+    /// App alongside `current_line_height`. Required by primitives
+    /// that map cells to pixels (e.g. `draw_terminal`).
+    current_char_width: f64,
 }
 
 impl GtkBackend {
@@ -129,6 +133,7 @@ impl GtkBackend {
             current_layout_ptr: Cell::new(std::ptr::null()),
             current_theme: quadraui::Theme::default(),
             current_line_height: 16.0,
+            current_char_width: 8.0,
         }
     }
 
@@ -195,6 +200,14 @@ impl GtkBackend {
     #[allow(dead_code)]
     pub fn set_current_line_height(&mut self, line_height: f64) {
         self.current_line_height = line_height;
+    }
+
+    /// Update the cached Pango approximate-char-width (in DIPs).
+    /// Call once per frame alongside [`Self::set_current_line_height`].
+    /// Required by primitives that map cells to pixels (terminal).
+    #[allow(dead_code)]
+    pub fn set_current_char_width(&mut self, char_width: f64) {
+        self.current_char_width = char_width;
     }
 
     /// Enter the frame-scope: stash the cairo context + pango layout
@@ -542,33 +555,120 @@ impl Backend for GtkBackend {
         );
     }
 
-    // ─── Layout-passthrough primitives — deferred to a later stage ─────────
+    // ─── Layout-passthrough primitives ─────────────────────────────────────
     //
-    // These take a pre-computed `*Layout` parameter in their existing
-    // `quadraui_gtk::draw_*` shims that the trait doesn't pass through.
-    // Same situation as TUI Stage 2 — folding them needs the trait to
-    // gain `&Layout` parameters (`BACKEND_TRAIT_PROPOSAL.md` §6.2),
-    // which is a quadraui-side change deferred until more call sites
-    // benefit at once.
+    // Phase B.5b Stage 9: trait extended with `&Layout` parameter per
+    // `BACKEND_TRAIT_PROPOSAL.md` §6.2. The current GTK rasterisers
+    // (`quadraui_gtk::draw_status_bar` etc.) recompute their own
+    // layout internally, so the `_layout` parameter is currently
+    // ignored — kept for forward compatibility when the GTK
+    // rasterisers are updated to consume it. Behaviour is unchanged.
 
-    fn draw_status_bar(&mut self, _rect: QRect, _bar: &StatusBar) {
-        unimplemented!("GtkBackend::draw_status_bar — needs &Layout in trait");
+    // Phase B.5b Stage 9: trait extended with `&Layout` parameter
+    // per `BACKEND_TRAIT_PROPOSAL.md` §6.2. Three of the five
+    // primitives (status_bar, tab_bar, text_display) have
+    // quadraui-side rasterisers that already accept a `quadraui::Theme`,
+    // so the trait impls below route through them. The remaining two
+    // (activity_bar, terminal) only have the in-tree `quadraui_gtk::*`
+    // shims that take the legacy `render::Theme`; until those are
+    // lifted into quadraui itself (#223 lift sequence), the trait
+    // impls stay as stubs and the GTK call sites continue to use the
+    // legacy shims directly.
+
+    fn draw_status_bar(
+        &mut self,
+        rect: QRect,
+        bar: &StatusBar,
+        _layout: &quadraui::primitives::status_bar::StatusBarLayout,
+    ) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_status_bar called outside enter_frame_scope");
+        let _ = quadraui::gtk::draw_status_bar(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            self.current_line_height,
+            bar,
+            &self.current_theme,
+        );
     }
 
-    fn draw_tab_bar(&mut self, _rect: QRect, _bar: &TabBar) {
-        unimplemented!("GtkBackend::draw_tab_bar — needs &Layout in trait");
+    fn draw_tab_bar(
+        &mut self,
+        rect: QRect,
+        bar: &TabBar,
+        _layout: &quadraui::primitives::tab_bar::TabBarLayout,
+    ) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_tab_bar called outside enter_frame_scope");
+        // The free fn paints from x=0 to x=width; rect.x ignored.
+        // hovered_close_tab defaults to None (no hover); call sites
+        // that need it should call the free fn directly until a
+        // future trait extension carries that state.
+        let _ = quadraui::gtk::draw_tab_bar(
+            cr,
+            layout,
+            rect.width as f64,
+            self.current_line_height,
+            rect.y as f64,
+            bar,
+            &self.current_theme,
+            None,
+        );
     }
 
-    fn draw_activity_bar(&mut self, _rect: QRect, _bar: &ActivityBar) {
-        unimplemented!("GtkBackend::draw_activity_bar — needs &Layout in trait");
+    fn draw_activity_bar(
+        &mut self,
+        _rect: QRect,
+        _bar: &ActivityBar,
+        _layout: &quadraui::primitives::activity_bar::ActivityBarLayout,
+    ) {
+        unimplemented!(
+            "GtkBackend::draw_activity_bar — forward-compat stub. The \
+             in-tree `crate::gtk::quadraui_gtk::draw_activity_bar` shim \
+             takes `render::Theme` (legacy), not the `quadraui::Theme` \
+             stored on the backend. Migrating it into quadraui itself \
+             (#223 lift sequence) will let this method route through \
+             the unified path."
+        )
     }
 
-    fn draw_terminal(&mut self, _rect: QRect, _term: &TerminalPrim) {
-        unimplemented!("GtkBackend::draw_terminal — needs &Layout in trait");
+    fn draw_terminal(
+        &mut self,
+        _rect: QRect,
+        _term: &TerminalPrim,
+        _layout: &quadraui::primitives::terminal::TerminalLayout,
+    ) {
+        unimplemented!(
+            "GtkBackend::draw_terminal — forward-compat stub (see \
+             draw_activity_bar)"
+        )
     }
 
-    fn draw_text_display(&mut self, _rect: QRect, _td: &TextDisplay) {
-        unimplemented!("GtkBackend::draw_text_display — needs &Layout in trait");
+    fn draw_text_display(
+        &mut self,
+        rect: QRect,
+        td: &TextDisplay,
+        _layout: &quadraui::primitives::text_display::TextDisplayLayout,
+    ) {
+        let (cr, layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_text_display called outside enter_frame_scope");
+        quadraui::gtk::draw_text_display(
+            cr,
+            layout,
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+            td,
+            &self.current_theme,
+            self.current_line_height,
+        );
     }
 }
 

@@ -469,27 +469,14 @@ struct App {
     /// unparent it before creating a new one (avoids GTK CSS node assertions).
     active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
     /// Cross-backend modal-overlay tracking. Pushed to when a palette /
-    /// dialog / context-menu opens, popped when it closes; consulted by
-    /// `quadraui::dispatch_mouse_down` + the drag-guard check in
-    /// `handle_mouse_drag_msg` so events inside a modal can't fall
-    /// through to the editor behind it (#192).
-    ///
-    /// `Rc<RefCell<_>>` because the draw path is already full of
-    /// borrow_mut() on self.engine and widgets need shared access.
-    modal_stack: Rc<RefCell<quadraui::ModalStack>>,
-    /// Cross-backend drag state. Non-None while the user is mid-drag
-    /// on a scrollbar / handle / resize edge the dispatcher recognises.
-    /// Set on mouse-down, read on mouse-move (drag update), cleared on
-    /// mouse-up. Fixes #190 (palette scrollbar wasn't draggable).
-    drag_state: Rc<RefCell<quadraui::DragState>>,
-    /// Phase B.5 Stage 1: `quadraui::Backend`-impl handle. Holds the
-    /// canonical accelerators / event-queue / viewport / services
-    /// state. The existing `modal_stack` and `drag_state` fields
-    /// above are alias `Rc` clones pointing at the same `RefCell`s
-    /// the backend owns — B.5b Stage 11 migrates call sites onto the
-    /// backend handle and removes the duplicates. As of Stage 1 the
-    /// `init` drain timer holds a clone and pumps `poll_events()`
-    /// every 16 ms.
+    /// `quadraui::Backend`-impl handle. Owns the canonical
+    /// accelerators / event-queue / viewport / services / modal-stack /
+    /// drag-state. Call sites reach modal-stack and drag-state via
+    /// `self.backend.borrow().modal_stack_handle()` and
+    /// `drag_state_handle()` (B.5b Stage 11 dropped the alias `Rc`
+    /// clones that previously lived at `App.modal_stack` /
+    /// `App.drag_state`). The `init` drain timer holds a clone and
+    /// pumps `poll_events()` every 16 ms.
     backend: Rc<RefCell<backend::GtkBackend>>,
 }
 
@@ -2268,8 +2255,6 @@ impl SimpleComponent for App {
         // `dispatch_gtk_panel_accelerator` — see B.5b Stage 2.
         let mut gtk_backend = backend::GtkBackend::new();
         register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
-        let backend_modal_stack = gtk_backend.modal_stack_handle();
-        let backend_drag_state = gtk_backend.drag_state_handle();
         // Phase B.5b Stage 1: shared event-queue handle. Producer-side
         // signal callbacks (key/mouse/scroll on the editor DA) push
         // translated `UiEvent`s into this `RefCell<VecDeque>`; the drain
@@ -2369,13 +2354,6 @@ impl SimpleComponent for App {
             last_colorscheme,
             settings_save_revision: core::settings::save_revision(),
             active_ctx_popover: active_ctx_popover_ref.clone(),
-            // Phase B.5 Stage 1: alias `Rc<RefCell<>>` clones from
-            // `gtk_backend` (built above the let) so existing call
-            // sites that read `model.modal_stack` / `model.drag_state`
-            // keep working unchanged. The `backend` field holds the
-            // canonical owner.
-            modal_stack: backend_modal_stack,
-            drag_state: backend_drag_state,
             backend: backend.clone(),
         };
         let widgets = view_output!();
@@ -2400,6 +2378,7 @@ impl SimpleComponent for App {
         // ── Settings sidebar (Phase A.3c-2: native widgets → DrawingArea) ──────
         {
             let engine_d = engine.clone();
+            let backend_d = backend.clone();
             widgets.settings_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -2412,7 +2391,18 @@ impl SimpleComponent for App {
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                draw_settings_panel(cr, &layout, &engine, &theme, 0.0, 0.0, w, h, line_height);
+                draw_settings_panel(
+                    cr,
+                    &layout,
+                    &engine,
+                    &theme,
+                    &backend_d,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    line_height,
+                );
             });
         }
         {
@@ -2457,6 +2447,7 @@ impl SimpleComponent for App {
             let state_d = explorer_state.clone();
             let row_h_cell = explorer_row_height_cell.clone();
             let sb_rect_cell = explorer_scrollbar_rect.clone();
+            let backend_d = backend.clone();
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -2481,8 +2472,18 @@ impl SimpleComponent for App {
                     &engine,
                     &theme,
                 );
-                let sb_rect =
-                    draw_explorer_panel(cr, &layout, &tree, &theme, 0.0, 0.0, w, h, line_height);
+                let sb_rect = draw_explorer_panel(
+                    cr,
+                    &layout,
+                    &tree,
+                    &theme,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    line_height,
+                    &backend_d,
+                );
                 sb_rect_cell.set(sb_rect);
             });
         }
@@ -2553,13 +2554,13 @@ impl SimpleComponent for App {
             let state_begin = explorer_state.clone();
             let row_h_begin = explorer_row_height_cell.clone();
             let da_begin = widgets.explorer_da.clone();
-            let drag_state_begin = model.drag_state.clone();
+            let drag_state_begin = model.backend.borrow().drag_state_handle();
 
             let state_update = explorer_state.clone();
             let da_update = widgets.explorer_da.clone();
-            let drag_state_update = model.drag_state.clone();
+            let drag_state_update = model.backend.borrow().drag_state_handle();
 
-            let drag_state_end = model.drag_state.clone();
+            let drag_state_end = model.backend.borrow().drag_state_handle();
             let da_end = widgets.explorer_da.clone();
 
             let gesture = gtk4::GestureDrag::new();
@@ -3179,6 +3180,7 @@ impl SimpleComponent for App {
         // ── Source Control sidebar draw + key setup ────────────────────────────
         {
             let engine = engine.clone();
+            let backend_d = backend.clone();
             widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -3204,6 +3206,7 @@ impl SimpleComponent for App {
                     w,
                     h,
                     line_height,
+                    &backend_d,
                 );
             });
         }
@@ -4203,8 +4206,8 @@ impl SimpleComponent for App {
                 // Swallow if the click landed on a focused modal that
                 // wants to consume it (#216 — editor hover popup).
                 self.reconcile_editor_hover_modal();
-                let in_modal = self
-                    .modal_stack
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let in_modal = stack_rc
                     .borrow()
                     .hit_test(quadraui::Point {
                         x: x as f32,
@@ -4787,7 +4790,7 @@ fn sync_scrollbar_positions(
     // palette / picker / tab-switcher overlays.
     let visible_ids: std::collections::HashSet<core::WindowId> =
         window_rects.iter().map(|(wid, _)| *wid).collect();
-    let modal_open = engine.picker_open || engine.tab_switcher_open;
+    let modal_open = engine.is_blocking_modal_open();
     for (wid, ws) in scrollbars.iter() {
         let show = visible_ids.contains(wid) && !modal_open;
         ws.vertical.set_visible(show);
@@ -5176,15 +5179,9 @@ impl App {
         // Native gtk4::Scrollbar widgets render above the DrawingArea
         // (they're real GTK widgets, not Cairo paint), so they'd
         // otherwise poke through every modal popup. Hide them when
-        // any popup is up. (#252.) Adding a new popup kind here is
-        // currently a manual step — once the B.5b modal-stack
-        // migration covers all of them, this can collapse to
-        // `!modal_stack.borrow().is_empty()`.
-        let modal_open = engine.picker_open
-            || engine.tab_switcher_open
-            || engine.context_menu.is_some()
-            || engine.dialog.is_some()
-            || engine.find_replace_open;
+        // any popup is up (#252). The single source of truth lives
+        // in `Engine::is_blocking_modal_open()`.
+        let modal_open = engine.is_blocking_modal_open();
         for (wid, ws) in scrollbars.iter() {
             let show = visible_ids.contains(wid) && !modal_open;
             ws.vertical.set_visible(show);
@@ -5770,15 +5767,10 @@ impl App {
                     // an LSP-hoverable identifier under (e.g.) an open
                     // palette would still fire the hover request and
                     // pop the hover popup behind the palette (#247).
-                    // Hover is itself a passive popup, so it doesn't
-                    // count as a blocker — only the modals the user
-                    // is actively focused on.
-                    let blocking_modal_open = engine.picker_open
-                        || engine.tab_switcher_open
-                        || engine.context_menu.is_some()
-                        || engine.dialog.is_some()
-                        || engine.find_replace_open
-                        || engine.completion_idx.is_some();
+                    // The single source of truth lives in
+                    // `Engine::is_blocking_modal_open()` — hover itself
+                    // is a passive popup that doesn't count.
+                    let blocking_modal_open = engine.is_blocking_modal_open();
                     if engine.settings.hover_delay > 0
                         && !engine.editor_hover_has_focus
                         && !blocking_modal_open
@@ -6142,7 +6134,8 @@ impl App {
         let visible = engine.editor_hover.is_some();
         let rect = self.editor_hover_popup_rect.get();
         drop(engine);
-        let mut stack = self.modal_stack.borrow_mut();
+        let stack_rc = self.backend.borrow().modal_stack_handle();
+        let mut stack = stack_rc.borrow_mut();
         match (visible, rect) {
             (true, Some((px, py, pw, ph))) => {
                 stack.push(
@@ -6182,16 +6175,21 @@ impl App {
         if self.engine.borrow().tab_switcher_open {
             let switcher_id = quadraui::WidgetId::new("tab_switcher");
             let inside = if let Some((px, py, pw, ph)) = self.tab_switcher_popup_rect.get() {
-                self.modal_stack.borrow_mut().push(
-                    switcher_id.clone(),
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
-                let stack = self.modal_stack.borrow();
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .push(
+                        switcher_id.clone(),
+                        quadraui::Rect {
+                            x: px as f32,
+                            y: py as f32,
+                            width: pw as f32,
+                            height: ph as f32,
+                        },
+                    );
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 let events = quadraui::dispatch_mouse_down(
                     &stack,
                     quadraui::Point {
@@ -6213,7 +6211,11 @@ impl App {
             };
 
             self.engine.borrow_mut().tab_switcher_open = false;
-            self.modal_stack.borrow_mut().pop(&switcher_id);
+            self.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .pop(&switcher_id);
 
             if inside {
                 self.draw_needed.set(true);
@@ -6221,7 +6223,9 @@ impl App {
             }
             // Outside: fall through so editor click proceeds.
         } else {
-            self.modal_stack
+            self.backend
+                .borrow()
+                .modal_stack_handle()
                 .borrow_mut()
                 .pop(&quadraui::WidgetId::new("tab_switcher"));
         }
@@ -6243,16 +6247,21 @@ impl App {
         if self.engine.borrow().completion_idx.is_some() {
             let completion_id = quadraui::WidgetId::new("completion");
             let inside = if let Some((px, py, pw, ph)) = self.completion_popup_rect.get() {
-                self.modal_stack.borrow_mut().push(
-                    completion_id.clone(),
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
-                let stack = self.modal_stack.borrow();
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .push(
+                        completion_id.clone(),
+                        quadraui::Rect {
+                            x: px as f32,
+                            y: py as f32,
+                            width: pw as f32,
+                            height: ph as f32,
+                        },
+                    );
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 let events = quadraui::dispatch_mouse_down(
                     &stack,
                     quadraui::Point {
@@ -6275,7 +6284,11 @@ impl App {
 
             // Either way, dismiss the popup — it's transient.
             self.engine.borrow_mut().dismiss_completion();
-            self.modal_stack.borrow_mut().pop(&completion_id);
+            self.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .pop(&completion_id);
 
             if inside {
                 self.draw_needed.set(true);
@@ -6285,7 +6298,9 @@ impl App {
         } else {
             // Defensive cleanup: completion may have been dismissed
             // without us seeing a click. Pop any stale entry.
-            self.modal_stack
+            self.backend
+                .borrow()
+                .modal_stack_handle()
                 .borrow_mut()
                 .pop(&quadraui::WidgetId::new("completion"));
         }
@@ -6356,7 +6371,11 @@ impl App {
             let Some(menu_layout) = menu_layout else {
                 // Empty items list — close defensively.
                 self.engine.borrow_mut().close_context_menu();
-                self.modal_stack.borrow_mut().pop(&cm_id);
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&cm_id);
                 self.draw_needed.set(true);
                 return;
             };
@@ -6364,12 +6383,15 @@ impl App {
             // Push the menu's resolved bounds to the modal stack so
             // any other modal that might be open (picker, dialog) is
             // arbitrated against the menu by `dispatch_mouse_down`.
-            self.modal_stack
+            self.backend
+                .borrow()
+                .modal_stack_handle()
                 .borrow_mut()
                 .push(cm_id.clone(), menu_layout.bounds);
 
             let stack_events = {
-                let stack = self.modal_stack.borrow();
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 quadraui::dispatch_mouse_down(
                     &stack,
                     quadraui::Point {
@@ -6389,7 +6411,11 @@ impl App {
 
             if dismissed {
                 self.engine.borrow_mut().close_context_menu();
-                self.modal_stack.borrow_mut().pop(&cm_id);
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&cm_id);
             } else {
                 // Inner hit. `hit_test` returns Item(id) for clickable
                 // rows, Inert for separators / disabled rows, Empty
@@ -6416,7 +6442,11 @@ impl App {
                                 engine.explorer_needs_refresh = false;
                             }
                             drop(engine);
-                            self.modal_stack.borrow_mut().pop(&cm_id);
+                            self.backend
+                                .borrow()
+                                .modal_stack_handle()
+                                .borrow_mut()
+                                .pop(&cm_id);
                             if needs_tree_refresh {
                                 sender.input(Msg::RefreshFileTree);
                             }
@@ -6428,7 +6458,11 @@ impl App {
                     quadraui::ContextMenuHit::Empty => {
                         // Defensive: dispatcher should have caught this.
                         self.engine.borrow_mut().close_context_menu();
-                        self.modal_stack.borrow_mut().pop(&cm_id);
+                        self.backend
+                            .borrow()
+                            .modal_stack_handle()
+                            .borrow_mut()
+                            .pop(&cm_id);
                     }
                 }
             }
@@ -6437,7 +6471,9 @@ impl App {
         }
         // Defensive cleanup: context menu may have closed via Esc/Enter
         // while no click was seen by us. Pop any stale entry.
-        self.modal_stack
+        self.backend
+            .borrow()
+            .modal_stack_handle()
             .borrow_mut()
             .pop(&quadraui::WidgetId::new("context_menu"));
 
@@ -6572,17 +6608,22 @@ impl App {
                 let (popup_x, popup_y, popup_w, popup_h) =
                     self.compute_picker_popup_bounds(width, height);
                 let picker_id = quadraui::WidgetId::new("picker");
-                self.modal_stack.borrow_mut().push(
-                    picker_id.clone(),
-                    quadraui::Rect {
-                        x: popup_x as f32,
-                        y: popup_y as f32,
-                        width: popup_w as f32,
-                        height: popup_h as f32,
-                    },
-                );
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .push(
+                        picker_id.clone(),
+                        quadraui::Rect {
+                            x: popup_x as f32,
+                            y: popup_y as f32,
+                            width: popup_w as f32,
+                            height: popup_h as f32,
+                        },
+                    );
 
-                let stack = self.modal_stack.borrow();
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 let events = quadraui::dispatch_mouse_down(
                     &stack,
                     quadraui::Point {
@@ -6659,7 +6700,9 @@ impl App {
                             }
                             engine.picker_load_preview();
                         }
-                        self.drag_state
+                        self.backend
+                            .borrow()
+                            .drag_state_handle()
                             .borrow_mut()
                             .begin(quadraui::DragTarget::ScrollbarY {
                                 widget: picker_id.clone(),
@@ -6681,7 +6724,11 @@ impl App {
                 }
                 if dismiss_modal {
                     self.engine.borrow_mut().close_picker();
-                    self.modal_stack.borrow_mut().pop(&picker_id);
+                    self.backend
+                        .borrow()
+                        .modal_stack_handle()
+                        .borrow_mut()
+                        .pop(&picker_id);
                 }
                 // Consume click — don't fall through to editor.
                 return;
@@ -6690,7 +6737,11 @@ impl App {
                 // entry (engine closed it via Esc or Enter while the
                 // stack still has the id). Keep them consistent.
                 let picker_id = quadraui::WidgetId::new("picker");
-                self.modal_stack.borrow_mut().pop(&picker_id);
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&picker_id);
             }
         }
 
@@ -6789,7 +6840,9 @@ impl App {
                                 let new_offset = (rel * max_scroll as f32).round() as usize;
                                 self.engine.borrow_mut().editor_hover_set_scroll(new_offset);
                             }
-                            self.drag_state
+                            self.backend
+                                .borrow()
+                                .drag_state_handle()
                                 .borrow_mut()
                                 .begin(quadraui::DragTarget::ScrollbarY {
                                     widget: quadraui::WidgetId::new("editor_hover"),
@@ -6898,15 +6951,19 @@ impl App {
             };
 
             let dialog_id = quadraui::WidgetId::new("dialog");
-            self.modal_stack.borrow_mut().push(
-                dialog_id.clone(),
-                quadraui::Rect {
-                    x: popup_x as f32,
-                    y: popup_y_pos as f32,
-                    width: popup_w as f32,
-                    height: popup_h as f32,
-                },
-            );
+            self.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .push(
+                    dialog_id.clone(),
+                    quadraui::Rect {
+                        x: popup_x as f32,
+                        y: popup_y_pos as f32,
+                        width: popup_w as f32,
+                        height: popup_h as f32,
+                    },
+                );
 
             // Run the shared dispatch to learn whether this click
             // landed inside the dialog or in the backdrop. We don't
@@ -6915,7 +6972,8 @@ impl App {
             // replaces the inline `outside = x < popup_x || ...`
             // computation.
             let outside = {
-                let stack = self.modal_stack.borrow();
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 let events = quadraui::dispatch_mouse_down(
                     &stack,
                     quadraui::Point {
@@ -6948,12 +7006,20 @@ impl App {
                 // dialog_click_button may have closed the dialog; sync
                 // the stack so the next frame doesn't see a stale entry.
                 if self.engine.borrow().dialog.is_none() {
-                    self.modal_stack.borrow_mut().pop(&dialog_id);
+                    self.backend
+                        .borrow()
+                        .modal_stack_handle()
+                        .borrow_mut()
+                        .pop(&dialog_id);
                 }
             } else if outside {
                 self.engine.borrow_mut().dialog = None;
                 self.engine.borrow_mut().pending_move = None;
-                self.modal_stack.borrow_mut().pop(&dialog_id);
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&dialog_id);
             }
             self.draw_needed.set(true);
         } else {
@@ -6961,7 +7027,9 @@ impl App {
             // seen by us). Pop any stale entry so the stack stays in
             // sync with engine state — same defensive cleanup the
             // picker block does above.
-            self.modal_stack
+            self.backend
+                .borrow()
+                .modal_stack_handle()
                 .borrow_mut()
                 .pop(&quadraui::WidgetId::new("dialog"));
             // ── Status bar branch click — open branch picker ─────────────
@@ -7458,20 +7526,29 @@ impl App {
             let picker_id = quadraui::WidgetId::new("picker");
             if picker_open {
                 let (px, py, pw, ph) = self.compute_picker_popup_bounds(width, height);
-                self.modal_stack.borrow_mut().push(
-                    picker_id.clone(),
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .push(
+                        picker_id.clone(),
+                        quadraui::Rect {
+                            x: px as f32,
+                            y: py as f32,
+                            width: pw as f32,
+                            height: ph as f32,
+                        },
+                    );
             } else {
-                self.modal_stack.borrow_mut().pop(&picker_id);
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&picker_id);
             }
 
-            let drag = self.drag_state.borrow();
+            let drag_rc = self.backend.borrow().drag_state_handle();
+            let drag = drag_rc.borrow();
             let drag_active = drag.is_active();
             if drag_active {
                 // Run dispatch_mouse_drag: emits MouseMoved + any
@@ -7496,7 +7573,8 @@ impl App {
                                 // renderer's selection-anchored clamp
                                 // doesn't snap back.
                                 let vis = {
-                                    let drag = self.drag_state.borrow();
+                                    let drag_rc = self.backend.borrow().drag_state_handle();
+                                    let drag = drag_rc.borrow();
                                     if let Some(quadraui::DragTarget::ScrollbarY {
                                         visible_rows,
                                         ..
@@ -7563,7 +7641,8 @@ impl App {
                 }
             }
 
-            let stack = self.modal_stack.borrow();
+            let stack_rc = self.backend.borrow().modal_stack_handle();
+            let stack = stack_rc.borrow();
             let hit_point = quadraui::Point {
                 x: x as f32,
                 y: y as f32,
@@ -7825,9 +7904,11 @@ impl App {
         // engine later, but today no consumer cares about mouse-up
         // beyond clearing drag state.
         {
-            let mut drag = self.drag_state.borrow_mut();
+            let drag_rc = self.backend.borrow().drag_state_handle();
+            let mut drag = drag_rc.borrow_mut();
             if drag.is_active() {
-                let stack = self.modal_stack.borrow();
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
                 let _events = quadraui::dispatch_mouse_up(
                     &stack,
                     &mut drag,

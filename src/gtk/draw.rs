@@ -720,6 +720,7 @@ pub(super) fn draw_editor(
         width as f64,
         height as f64,
         line_height,
+        backend,
     );
 
     tab_switcher_popup_rect_out.set(draw_tab_switcher_popup(
@@ -2534,6 +2535,7 @@ pub(super) fn draw_picker_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(picker) = &screen.picker else {
         return;
@@ -2545,22 +2547,28 @@ pub(super) fn draw_picker_popup(
     // depth) render through the shared `quadraui::Palette` primitive.
     // File and symbol pickers fall through to the legacy renderer below
     // because the primitive doesn't carry preview / tree indent yet.
+    //
+    // Phase B.5b Stage 8: route through `Backend::draw_palette` instead
+    // of the direct `quadraui_gtk::draw_palette` shim.
     if let Some(palette) = render::picker_panel_to_palette(picker) {
         let popup_w = (editor_width * 0.55).max(500.0);
         let popup_h = (editor_height * 0.60).max(350.0);
         let popup_x = (editor_width - popup_w) / 2.0;
         let popup_y = (editor_height - popup_h) / 2.0;
-        super::quadraui_gtk::draw_palette(
-            cr,
-            layout,
-            popup_x,
-            popup_y,
-            popup_w,
-            popup_h,
-            &palette,
-            theme,
-            line_height,
-        );
+        use quadraui::Backend;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            b.draw_palette(
+                quadraui::Rect::new(
+                    popup_x as f32,
+                    popup_y as f32,
+                    popup_w as f32,
+                    popup_h as f32,
+                ),
+                &palette,
+            );
+        });
         return;
     }
 
@@ -4151,6 +4159,7 @@ pub(super) fn draw_source_control_panel(
     w: f64,
     h: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(ref sc) = screen.source_control else {
         return;
@@ -4377,17 +4386,18 @@ pub(super) fn draw_source_control_panel(
     let _ = (add_r, add_g, add_b, del_r, del_g, del_b); // reserved for future diff-tint use
     let sc_tree = render::source_control_to_tree_view(sc, theme);
     let sections_h = (y + h - y_commit).max(0.0);
-    super::quadraui_gtk::draw_tree(
-        cr,
-        layout,
-        x,
-        y_commit,
-        w,
-        sections_h,
-        &sc_tree,
-        theme,
-        line_height,
-    );
+    // Phase B.5b Stage 8: route through `Backend::draw_tree`.
+    {
+        use quadraui::Backend;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            b.draw_tree(
+                quadraui::Rect::new(x as f32, y_commit as f32, w as f32, sections_h as f32),
+                &sc_tree,
+            );
+        });
+    }
 
     // ── Branch picker / create overlay ───────────────────────────────────────
     if let Some(ref bp) = sc.branch_picker {
@@ -4556,6 +4566,7 @@ pub(super) fn draw_settings_panel(
     layout: &pango::Layout,
     engine: &Engine,
     theme: &Theme,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
     y: f64,
     w: f64,
@@ -4659,18 +4670,19 @@ pub(super) fn draw_settings_panel(
     let form_w = (w - sb_w).max(0.0);
 
     // Form rendering via the shared primitive.
+    // Phase B.5b Stage 8: route through `Backend::draw_form`.
     let form = render::settings_to_form(engine);
-    super::quadraui_gtk::draw_form(
-        cr,
-        layout,
-        x,
-        body_y,
-        form_w,
-        body_h,
-        &form,
-        theme,
-        line_height,
-    );
+    {
+        use quadraui::Backend;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            b.draw_form(
+                quadraui::Rect::new(x as f32, body_y as f32, form_w as f32, body_h as f32),
+                &form,
+            );
+        });
+    }
 
     // ── Inline-edit overlay ─────────────────────────────────────────────────
     let editing_idx: Option<usize> = if let Some(def_idx) = engine.settings_editing {
@@ -4795,6 +4807,7 @@ pub(super) fn draw_explorer_panel(
     w: f64,
     h: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) -> Option<(f64, f64, f64, f64)> {
     if w <= 0.0 || h <= 0.0 {
         return None;
@@ -4824,7 +4837,16 @@ pub(super) fn draw_explorer_panel(
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
-    super::quadraui_gtk::draw_tree(cr, layout, x, y, tree_w, h, tree, theme, line_height);
+    // Phase B.5b Stage 8: route through `Backend::draw_tree`.
+    use quadraui::Backend;
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_tree(
+            quadraui::Rect::new(x as f32, y as f32, tree_w as f32, h as f32),
+            tree,
+        );
+    });
 
     if need_sb {
         let sb_x = x + tree_w;

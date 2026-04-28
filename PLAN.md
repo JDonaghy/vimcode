@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-28 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration shipped Stages 1–7 (the load-bearing user-facing work)** — [#249](https://github.com/JDonaghy/vimcode/issues/249) ready to close. Mechanical draw-layer refactors deferred to [#254](https://github.com/JDonaghy/vimcode/issues/254) (no behaviour change; will land alongside Win-GUI / macOS backend touch in B.6 / B.7). Smoke-test bugfixes shipped this session: #247 / #250 / #251 / #252 all closed. The trait is load-bearing for events and modal arbitration on GTK; drawing still flows through the `quadraui_gtk::draw_*` shim layer.)
+> **Last updated:** 2026-04-28 (Phase B.4 done; B.5 plumbing done; **B.5b shipped end-to-end (Stages 1–12)** — [#249](https://github.com/JDonaghy/vimcode/issues/249) closed. Trait is load-bearing on GTK for events + modal arbitration; trait-callable primitives (palette / tree / form / list) all route through `Backend::draw_*`. Trait extended with `&Layout` parameters for the 5 layout-passthrough primitives (status_bar / tab_bar / activity_bar / terminal / text_display); 3 of 5 GTK trait impls are functional, 2 are forward-compat stubs pending a #223 lift of `quadraui_gtk::*` shims into quadraui itself. `App.modal_stack` / `App.drag_state` alias fields dropped; ~30 call sites now go through `self.backend.borrow().*_handle()`. Dead `quadraui_gtk::draw_{tree,form,list,palette}` shims removed; `events.rs` no longer needs `#![allow(dead_code)]`. Smoke-test bugfixes: #247 / #250 / #251 / #252 all closed.)
 
 ---
 
@@ -61,9 +61,13 @@ dependencies.
 | **B5b.4** | Context menu click hit-test routes through `ModalStack` + `dispatch_mouse_down`. Inner row hit-test migrated to `quadraui::ContextMenuLayout::hit_test` (matches the renderer; closes #251 off-by-one). | ✅ |
 | **B5b.5** | Completion popup registered on `ModalStack`. Bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click handler pushes them. Click inside the popup dismisses + consumes (cursor doesn't move); click outside dismisses + propagates. | ✅ |
 | **B5b.6** | Hover popup is already on `ModalStack` via `reconcile_editor_hover_modal` (#216). Stage 6 adds a `blocking_modal_open` gate on the GTK hover trigger so mousing over LSP-hoverable text under an open palette / dialog / context menu / completion / find-replace / tab-switcher doesn't pop the hover popup behind the modal (closes #247). Click-handler refactor (`dispatch_mouse_down` replacing the inline `on_popup` rect check) deferred — current inline path works correctly. | ✅ |
-| **B5b.7** | Tab-switcher modal click via `ModalStack` + `dispatch_mouse_down`. Bounds piped from `draw_tab_switcher_popup` (returns `Option<Rect>`) into `App.tab_switcher_popup_rect`. Click inside dismisses + consumes; click outside dismisses + propagates. | ✅ |
-| **B5b.8 / .9 / .10 / .11 / .12** | Mechanical draw-layer refactors (migrate ~24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`; extend trait with `&Layout` params for layout-passthrough primitives; drop alias fields + dead shims). **Deferred to [#254](https://github.com/JDonaghy/vimcode/issues/254)** — no runtime behaviour change; will land alongside Win-GUI / macOS work in B.6 / B.7 where touching draw is unavoidable. | 🔁 #254 |
-| **B5b.13** | Smoke-test parity sweep — confirmed by user on Stages 1–7 land (each stage verified before Path A merge). | ✅ |
+| **B5b.7** | Tab-switcher modal click via `ModalStack` + `dispatch_mouse_down`; `Engine::is_blocking_modal_open()` becomes the single source of truth for the hover-trigger gate + scrollbar-hide list (replaces 3 inline enumerations). | ✅ |
+| **B5b.8** | Migrate the 4 trait-callable `quadraui_gtk::draw_*` sites onto `Backend::draw_*` via `enter_frame_scope`: picker (palette), source-control + explorer panels (tree), settings panel (form). | ✅ |
+| **B5b.9** | Trait extended with `&Layout` parameters for the 5 layout-passthrough primitives (status_bar / tab_bar / activity_bar / terminal / text_display) per `BACKEND_TRAIT_PROPOSAL.md` §6.2. TUI + GTK trait impls updated. | ✅ |
+| **B5b.10** | 3 of 5 layout-passthrough trait impls (status_bar / tab_bar / text_display) route through `quadraui::gtk::*`. The other two (activity_bar / terminal) stay as forward-compat stubs because their rasterisers live in `crate::gtk::quadraui_gtk::*` and take legacy `render::Theme`; lifting them into quadraui itself is the #223 lift task. GTK call sites continue to use the legacy shims directly because the trait method returns `()` while sites need hit-region info. | ✅ (within scope) |
+| **B5b.11** | Dropped `App.modal_stack` and `App.drag_state` alias fields; ~30 call sites now reach state via `self.backend.borrow().modal_stack_handle()` / `drag_state_handle()`. | ✅ |
+| **B5b.12** | Deleted dead `quadraui_gtk::draw_{tree, form, list, palette}` shims; removed `#![allow(dead_code)]` from `events.rs`. | ✅ |
+| **B5b.13** | Smoke-test parity confirmed during each stage land (Path A verification). | ✅ |
 
 ### Stage 1 ship notes
 

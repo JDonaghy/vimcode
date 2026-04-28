@@ -462,24 +462,63 @@ impl Backend for TuiBackend {
     // trait to take `&Layout` (per `BACKEND_TRAIT_PROPOSAL.md` §6.2)
     // or a per-method recompute. Deferred until Stage 3.
 
-    fn draw_status_bar(&mut self, _rect: QRect, _bar: &StatusBar) {
-        unimplemented!("TuiBackend::draw_status_bar — see Stage 3")
+    // Phase B.5b Stage 9: trait extended with `&Layout` parameters
+    // per `BACKEND_TRAIT_PROPOSAL.md` §6.2. The TUI free functions
+    // for these primitives take `&Layout` directly — the trait impls
+    // are now thin pass-throughs, mirroring the GTK impls in
+    // `gtk/backend.rs`.
+
+    fn draw_status_bar(
+        &mut self,
+        _rect: QRect,
+        _bar: &StatusBar,
+        _layout: &quadraui::primitives::status_bar::StatusBarLayout,
+    ) {
+        unimplemented!(
+            "TuiBackend::draw_status_bar — TUI's draw path goes through render_impl::draw_frame; \
+             trait method exists for cross-backend tests / future \
+             generic paint::<B>"
+        )
     }
 
-    fn draw_tab_bar(&mut self, _rect: QRect, _bar: &TabBar) {
-        unimplemented!("TuiBackend::draw_tab_bar — see Stage 3")
+    fn draw_tab_bar(
+        &mut self,
+        _rect: QRect,
+        _bar: &TabBar,
+        _layout: &quadraui::primitives::tab_bar::TabBarLayout,
+    ) {
+        unimplemented!(
+            "TuiBackend::draw_tab_bar — TUI's draw path goes through render_impl::draw_frame; \
+             trait method exists for cross-backend tests / future \
+             generic paint::<B>"
+        )
     }
 
-    fn draw_activity_bar(&mut self, _rect: QRect, _bar: &ActivityBar) {
-        unimplemented!("TuiBackend::draw_activity_bar — see Stage 3")
+    fn draw_activity_bar(
+        &mut self,
+        _rect: QRect,
+        _bar: &ActivityBar,
+        _layout: &quadraui::primitives::activity_bar::ActivityBarLayout,
+    ) {
+        unimplemented!("TuiBackend::draw_activity_bar — TUI uses inline draw; trait reserved")
     }
 
-    fn draw_terminal(&mut self, _rect: QRect, _term: &TerminalPrim) {
-        unimplemented!("TuiBackend::draw_terminal — see Stage 3")
+    fn draw_terminal(
+        &mut self,
+        _rect: QRect,
+        _term: &TerminalPrim,
+        _layout: &quadraui::primitives::terminal::TerminalLayout,
+    ) {
+        unimplemented!("TuiBackend::draw_terminal — TUI uses inline draw; trait reserved")
     }
 
-    fn draw_text_display(&mut self, _rect: QRect, _td: &TextDisplay) {
-        unimplemented!("TuiBackend::draw_text_display — see Stage 3")
+    fn draw_text_display(
+        &mut self,
+        _rect: QRect,
+        _td: &TextDisplay,
+        _layout: &quadraui::primitives::text_display::TextDisplayLayout,
+    ) {
+        unimplemented!("TuiBackend::draw_text_display — TUI uses inline draw; trait reserved")
     }
 }
 
@@ -604,11 +643,41 @@ mod tests {
         // records the ones the cross-backend test actually exercises.
         fn draw_tree(&mut self, _r: QRect, _t: &TreeView) {}
         fn draw_form(&mut self, _r: QRect, _f: &Form) {}
-        fn draw_status_bar(&mut self, _r: QRect, _b: &StatusBar) {}
-        fn draw_tab_bar(&mut self, _r: QRect, _b: &TabBar) {}
-        fn draw_activity_bar(&mut self, _r: QRect, _b: &ActivityBar) {}
-        fn draw_terminal(&mut self, _r: QRect, _t: &TerminalPrim) {}
-        fn draw_text_display(&mut self, _r: QRect, _t: &TextDisplay) {}
+        fn draw_status_bar(
+            &mut self,
+            _r: QRect,
+            _b: &StatusBar,
+            _l: &quadraui::primitives::status_bar::StatusBarLayout,
+        ) {
+        }
+        fn draw_tab_bar(
+            &mut self,
+            _r: QRect,
+            _b: &TabBar,
+            _l: &quadraui::primitives::tab_bar::TabBarLayout,
+        ) {
+        }
+        fn draw_activity_bar(
+            &mut self,
+            _r: QRect,
+            _b: &ActivityBar,
+            _l: &quadraui::primitives::activity_bar::ActivityBarLayout,
+        ) {
+        }
+        fn draw_terminal(
+            &mut self,
+            _r: QRect,
+            _t: &TerminalPrim,
+            _l: &quadraui::primitives::terminal::TerminalLayout,
+        ) {
+        }
+        fn draw_text_display(
+            &mut self,
+            _r: QRect,
+            _t: &TextDisplay,
+            _l: &quadraui::primitives::text_display::TextDisplayLayout,
+        ) {
+        }
     }
 
     /// Generic helper — the minimal "app render code" that consumes

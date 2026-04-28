@@ -518,4 +518,23 @@ impl Engine {
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
     }
+
+    /// Returns true if any user-focused modal popup is currently open
+    /// (palette, tab switcher, context menu, dialog, find/replace,
+    /// completion). The passive LSP hover popup is NOT counted —
+    /// it's an informational overlay, not a modal the user is
+    /// interacting with.
+    ///
+    /// Single source of truth for backends that need to gate
+    /// behaviour on modal state — e.g. GTK suppresses the LSP hover
+    /// trigger and hides native scrollbar widgets when this returns
+    /// true.
+    pub fn is_blocking_modal_open(&self) -> bool {
+        self.picker_open
+            || self.tab_switcher_open
+            || self.context_menu.is_some()
+            || self.dialog.is_some()
+            || self.find_replace_open
+            || self.completion_idx.is_some()
+    }
 }

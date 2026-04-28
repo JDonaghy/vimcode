@@ -22,11 +22,6 @@
 //! actual signal callbacks to use them. The functions are
 //! standalone (no Rc/RefCell), so they're trivially testable.
 
-// Stage 4 ships the API; Stage 5+ has the producers. Suppress the
-// not-yet-used warnings module-wide to keep the warning list clean
-// without cluttering each function header.
-#![allow(dead_code)]
-
 use gtk4::gdk;
 
 use quadraui::{Key, Modifiers, MouseButton, NamedKey, Point, UiEvent};
@@ -111,6 +106,13 @@ pub fn gdk_scroll_to_uievent(dx: f64, dy: f64, x: f64, y: f64) -> UiEvent {
 /// Translate a `GtkDrawingArea` resize into [`UiEvent::WindowResized`].
 /// `scale` is the surface scale factor (HiDPI multiplier) — typically
 /// `widget.scale_factor() as f32`.
+///
+/// Currently unused — GTK doesn't surface resize through this queue
+/// because `Backend::begin_frame(viewport)` already updates the
+/// viewport from the active DrawingArea each frame. Kept here as a
+/// reference translator for the day a non-DrawingArea-driven resize
+/// path needs to push into the queue.
+#[allow(dead_code)]
 pub fn gdk_resize_to_uievent(width: i32, height: i32, scale: f32) -> UiEvent {
     UiEvent::WindowResized {
         viewport: quadraui::Viewport::new(width as f32, height as f32, scale),
