@@ -6,13 +6,28 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-27 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration in progress, tracked at [#249](https://github.com/JDonaghy/vimcode/issues/249).** Stages 1–6 shipped this session, plus three bugfixes found during smoke-test (#250 / #251 / #252 all closed). Stages 1–4 wired the queue + drain, accelerator dispatch, dialog/context-menu modal-stack click routing. Stage 5: completion popup on `ModalStack`. Stage 6: hover-trigger gate suppresses the LSP hover when any blocking modal (palette / dialog / context menu / completion / find-replace / tab-switcher) is open — closes #247. Next: B5b.7, tab-switcher modal stack.)
+> **Last updated:** 2026-04-28 (Phase B.4 done; B.5 plumbing done; **B.5b runtime migration shipped Stages 1–7 (the load-bearing user-facing work)** — [#249](https://github.com/JDonaghy/vimcode/issues/249) ready to close. Mechanical draw-layer refactors deferred to [#254](https://github.com/JDonaghy/vimcode/issues/254) (no behaviour change; will land alongside Win-GUI / macOS backend touch in B.6 / B.7). Smoke-test bugfixes shipped this session: #247 / #250 / #251 / #252 all closed. The trait is load-bearing for events and modal arbitration on GTK; drawing still flows through the `quadraui_gtk::draw_*` shim layer.)
 
 ---
 
-## 🎯 CURRENT FOCUS — Phase B.5b: GTK runtime migration onto Backend trait
+## 🎯 CURRENT FOCUS — Phase B.6: Win-GUI rebuild on quadraui
 
-**Master tracking issue: [#249](https://github.com/JDonaghy/vimcode/issues/249).** That issue holds the full 13-stage map; this section is a pointer.
+**B.5b shipped** (see "✅ Phase B.5b" section below). The user-facing
+runtime migration is done: GTK events flow through `quadraui::Backend`,
+modal arbitration goes through `ModalStack` + `dispatch_mouse_down`,
+the hover-trigger gate respects open modals, and per-modal click
+routing is consolidated. Mechanical draw-layer refactors deferred to
+[#254](https://github.com/JDonaghy/vimcode/issues/254) — no behaviour
+change; lands alongside Win-GUI / macOS backend rebuilds.
+
+Next phase is **B.6 — Win-GUI rebuild on quadraui** (and #254 work
+naturally completes alongside it). Win-GUI today is bug-ridden with
+band-aids accumulated from the coexistence-era; like the GTK rebuild,
+it gets rebuilt on top of the trait surface that's now stable.
+
+## ✅ Phase B.5b — GTK runtime migration onto Backend trait
+
+**Master tracking issue: [#249](https://github.com/JDonaghy/vimcode/issues/249) (ready to close).** Stages 1–7 shipped. Stages 8–12 deferred to #254.
 
 ### Why this exists separately from B.5
 
@@ -46,10 +61,9 @@ dependencies.
 | **B5b.4** | Context menu click hit-test routes through `ModalStack` + `dispatch_mouse_down`. Inner row hit-test migrated to `quadraui::ContextMenuLayout::hit_test` (matches the renderer; closes #251 off-by-one). | ✅ |
 | **B5b.5** | Completion popup registered on `ModalStack`. Bounds piped from `draw_completion_popup` (returns `Option<Rect>`) into `App.completion_popup_rect`; click handler pushes them. Click inside the popup dismisses + consumes (cursor doesn't move); click outside dismisses + propagates. | ✅ |
 | **B5b.6** | Hover popup is already on `ModalStack` via `reconcile_editor_hover_modal` (#216). Stage 6 adds a `blocking_modal_open` gate on the GTK hover trigger so mousing over LSP-hoverable text under an open palette / dialog / context menu / completion / find-replace / tab-switcher doesn't pop the hover popup behind the modal (closes #247). Click-handler refactor (`dispatch_mouse_down` replacing the inline `on_popup` rect check) deferred — current inline path works correctly. | ✅ |
-| **B5b.7** | Tab switcher migration onto `ModalStack`. | ⬜ |
-| **B5b.8** | Migrate remaining 24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`. | ⬜ |
-| **B5b.9–B5b.10** | Quadraui trait extension (`&Layout` parameters per `BACKEND_TRAIT_PROPOSAL.md` §6.2) → migrate `status_bar`/`tab_bar`/`activity_bar`/`terminal`/`text_display`. | ⬜ |
-| **B5b.11–B5b.13** | Cleanup: drop alias fields, dead shims, smoke-test parity. | ⬜ |
+| **B5b.7** | Tab-switcher modal click via `ModalStack` + `dispatch_mouse_down`. Bounds piped from `draw_tab_switcher_popup` (returns `Option<Rect>`) into `App.tab_switcher_popup_rect`. Click inside dismisses + consumes; click outside dismisses + propagates. | ✅ |
+| **B5b.8 / .9 / .10 / .11 / .12** | Mechanical draw-layer refactors (migrate ~24 `quadraui_gtk::draw_*` direct sites onto `Backend::draw_*`; extend trait with `&Layout` params for layout-passthrough primitives; drop alias fields + dead shims). **Deferred to [#254](https://github.com/JDonaghy/vimcode/issues/254)** — no runtime behaviour change; will land alongside Win-GUI / macOS work in B.6 / B.7 where touching draw is unavoidable. | 🔁 #254 |
+| **B5b.13** | Smoke-test parity sweep — confirmed by user on Stages 1–7 land (each stage verified before Path A merge). | ✅ |
 
 ### Stage 1 ship notes
 
