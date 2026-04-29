@@ -6,18 +6,19 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-28 (B.5c → B.5d → B.5e (TUI side) all shipped — see "✅ Phase B.5c → B.5e (TUI side)" section below. **Next priority arc set: #270 → #266 → #267 → B.6** with smoke followups (#262 / #263 / #264 / #265) landing alongside any of them. #270 ships the GTK runner (parallel to the TUI runner that landed in #269), #266 lifts the last 3 rasterisers, #267 handles dialog's dual-Pango problem, B.6 rebuilds Win-GUI on quadraui. See "🎯 NEXT FOCUS" section below for full breakdown including dependencies, pickup files, and ordering rationale.)
+> **Last updated:** 2026-04-29 (#266 partially shipped in `779f6e8` — rich_text_popup (TUI + GTK) + completions (TUI) lifted. find_replace deferred to **#271** because it requires a primitive migration of `FrHitRegion` / `FindReplaceClickTarget` / `FR_PANEL_WIDTH` / `compute_find_replace_hit_regions` from `core::engine` to `quadraui::primitives::find_replace` plus icon-constant rework. Smoke filed: **#272** (GTK go-to-definition link click in focused hover does nothing). **Next priority arc: #270 → #271 → #267 → B.6.** See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — #270 → #266 → #267 → B.6 (with smoke followups in parallel)
+## 🎯 NEXT FOCUS — #270 → #271 → #267 → B.6 (with smoke followups in parallel)
 
 **The B.5c → B.5d → B.5e arc shipped end-to-end on the TUI side**
-(see "✅ Phase B.5c → B.5e (TUI side)" below). The next focused work
-is the GTK side of the runner-crate vision plus a few deferred
-trait-coverage items, then Win-GUI rebuild.
+(see "✅ Phase B.5c → B.5e (TUI side)" below). #266 then lifted
+rich_text_popup + completions; find_replace was scoped out into
+#271. The next focused work is the GTK side of the runner-crate
+vision plus a few deferred trait-coverage items, then Win-GUI rebuild.
 
-**Priority order (set 2026-04-28):**
+**Priority order (set 2026-04-29):**
 
 1. **#270 — GTK runner + multi-DrawingArea support.** Mirrors the
    TUI runner work that landed in #269 (`quadraui::tui::run`). Two
@@ -27,15 +28,21 @@ trait-coverage items, then Win-GUI rebuild.
    surfaces; the GTK runner needs a way to express "render scene N
    to DrawingArea N." Two design candidates in #270 — pick during
    pickup.
-2. **#266 — Lift `rich_text_popup` / `completions` / `find_replace`
-   rasterisers** from `src/{tui_main,gtk}/quadraui_*.rs` into
-   `quadraui::{tui,gtk}::*`. Same shape as #268 / B5c.5 — mostly
-   mechanical. Independent of #270; can land in parallel.
+2. **#271 — find_replace primitive migration.** Move `FrHitRegion`,
+   `FindReplaceClickTarget`, `FR_PANEL_WIDTH`, and
+   `compute_find_replace_hit_regions` from `core::engine` to a new
+   `quadraui::primitives::find_replace`. Then lift the per-backend
+   rasterisers (TUI shim + GTK `draw.rs::draw_find_replace_popup`)
+   into `quadraui::{tui,gtk}::*`. Replaces the
+   `crate::icons::FIND_REPLACE*` glyph constants with a
+   backend-agnostic carrier. Bigger than the other rasteriser lifts
+   because it needs primitive-level work, not just a copy.
 3. **#267 — `Backend::draw_dialog` dual-Pango handling.** The lifted
    GTK dialog rasteriser takes both `body_layout` (monospace) and
    `ui_layout` (sans-serif) Pango handles. Trait can't pass two
    layouts; needs a refactor (font-swap on single layout, à la
-   tab_bar). Solves the last "trait-less primitive" gap.
+   tab_bar — same pattern #266 used for rich_text_popup). Solves
+   the last "trait-less primitive" gap on `dialog`.
 4. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
    target before this arc. Win-GUI currently has its own bespoke
    draw + click code; rebuild it as a `Backend` impl with native
@@ -46,15 +53,16 @@ trait-coverage items, then Win-GUI rebuild.
 - #263 — TUI breakpoint dot missing in gutter.
 - #264 — Settings panel renders broken when sidebar narrow.
 - #265 — TUI nerd-font wide-glyph predicate disagrees with terminal.
+- #272 — GTK go-to-definition link click in focused hover does nothing.
 
 ### Why this ordering
 
 #270 closes the runner-crate vision symmetrically with the TUI
-side. #266 + #267 fill the trait-coverage gaps that B.5c left
-deferred. B.6 was always queued for "after the trait is solid";
-post-#266/#267, it is. Doing B.6 first would ship a third backend
-with the same kind of gaps B.5b unwound — the very problem this
-whole arc was structured to prevent.
+side. #271 + #267 fill the remaining trait-coverage gaps. B.6 was
+always queued for "after the trait is solid"; post-#271/#267, it
+is. Doing B.6 first would ship a third backend with the same kind
+of gaps B.5b unwound — the very problem this whole arc was
+structured to prevent.
 
 ### Phase #270 — GTK runner
 
@@ -73,15 +81,47 @@ The novel work is the multi-area runner. Two sketches in #270
 (closure-per-area registration vs target-routed render). Read
 `docs/BACKEND_SETUP_AUDIT.md` §9 question 6 before deciding.
 
-### Phase #266 — Lift remaining 3 rasterisers
+### Phase #266 — Lift remaining 3 rasterisers (✅ partially shipped)
 
-**Pickup:** `src/{tui_main,gtk}/quadraui_*.rs` — search for
-`draw_rich_text_popup`, `draw_completions`, `draw_find_replace`. Each
-moves into `quadraui::{tui,gtk}::*` as its own file. Theme fields
-may need to grow (`q_theme()` adapter is the choke point).
+`779f6e8` shipped the rich_text_popup (TUI + GTK) and completions
+(TUI) lifts. `quadraui::Theme` grew 5 fields (`link_fg`,
+`completion_bg/fg/border/selected_bg`). GTK rich_text_popup now takes
+`ui_font_desc` as an explicit parameter so the rasteriser is
+self-contained; the scrollbar geometry constants
+(`RICH_TEXT_POPUP_SB_WIDTH/_INSET`) re-export from quadraui to keep
+paint and click hit-test single-sourced.
 
-After this lands: `Backend::draw_*` for all three primitives can be
-added on top (currently blocked by the unlifted rasterisers).
+find_replace was deferred to **#271** because it requires a primitive
+migration (see Phase #271 below) — moving it through `q_theme()` is
+not enough.
+
+### Phase #271 — find_replace primitive migration (deferred from #266)
+
+**Pickup files:**
+- `src/core/engine/mod.rs` lines 1060-1210 — `FindReplaceClickTarget`,
+  `FrHitRegion`, `FR_PANEL_WIDTH`, `compute_find_replace_hit_regions`.
+- `src/render.rs` line 3410+ — `FindReplacePanel` plus the engine
+  re-export at line 3406.
+- `src/tui_main/quadraui_tui.rs::draw_find_replace` — TUI rasteriser
+  body to copy.
+- `src/gtk/draw.rs::draw_find_replace_popup` — GTK rasteriser body.
+- `src/core/engine/execute.rs::handle_find_replace_click` and adjacent
+  dispatchers that consume the enum.
+- `src/icons.rs` — `FIND_REPLACE` / `FIND_REPLACE_ALL` glyph constants.
+
+**Sketch:**
+1. New `quadraui::primitives::find_replace` with the lifted enum +
+   struct + const + `compute_hit_regions`.
+2. Engine imports the lifted types back (`core::engine` re-exports
+   them so call sites keep compiling, or rewires call sites).
+3. `render::FindReplacePanel` either becomes an alias for
+   `quadraui::FindReplacePanel` or `build_screen_layout` builds the
+   quadraui shape directly.
+4. Icon glyphs travel inside `FindReplacePanel` (`replace_one_glyph: char`,
+   `replace_all_glyph: char`) so the rasteriser doesn't import vimcode
+   icons.
+5. `quadraui::tui::draw_find_replace` + `quadraui::gtk::draw_find_replace`
+   port the rasteriser bodies; both backend shims collapse to delegators.
 
 ### Phase #267 — Dialog dual-Pango
 
@@ -110,12 +150,13 @@ already nailed down.
 
 **Tracking issues:**
 - [#270](https://github.com/JDonaghy/vimcode/issues/270) — GTK runner.
-- [#266](https://github.com/JDonaghy/vimcode/issues/266) — rasteriser lifts.
+- [#271](https://github.com/JDonaghy/vimcode/issues/271) — find_replace primitive lift (deferred from #266).
 - [#267](https://github.com/JDonaghy/vimcode/issues/267) — dialog dual-Pango.
 - [#262](https://github.com/JDonaghy/vimcode/issues/262) — breadcrumb dropdown.
 - [#263](https://github.com/JDonaghy/vimcode/issues/263) — TUI breakpoint dot.
 - [#264](https://github.com/JDonaghy/vimcode/issues/264) — settings narrow.
 - [#265](https://github.com/JDonaghy/vimcode/issues/265) — TUI nerd-font widths.
+- [#272](https://github.com/JDonaghy/vimcode/issues/272) — GTK hover go-to-definition link click.
 
 ## ✅ Phase B.5c → B.5e (TUI side) — trait coverage + audit + TUI runner (shipped)
 
