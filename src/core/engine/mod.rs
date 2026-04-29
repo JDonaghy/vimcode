@@ -1057,157 +1057,29 @@ pub struct FindReplaceOptions {
     pub in_selection: bool,
 }
 
-/// Click target within the find/replace overlay.
-/// Backends resolve native coordinates → `FindReplaceClickTarget`, then call
-/// `Engine::handle_find_replace_click()` for shared dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FindReplaceClickTarget {
-    /// Toggle replace row visibility (the ▶/▼ chevron).
-    Chevron,
-    /// Click in the find input field at the given char offset.
-    FindInput(usize),
-    /// Click in the replace input field at the given char offset.
-    ReplaceInput(usize),
-    ToggleCase,
-    ToggleWholeWord,
-    ToggleRegex,
-    PrevMatch,
-    NextMatch,
-    ToggleInSelection,
-    Close,
-    TogglePreserveCase,
-    ReplaceCurrent,
-    ReplaceAll,
-}
+// ── Find/replace overlay types (lifted to quadraui in #271) ────────────────
 
-/// A hit region within the find/replace panel, expressed in character-cell units
-/// relative to the panel's top-left **content** corner (inside borders).
-#[derive(Debug, Clone)]
-pub struct FrHitRegion {
-    /// Column offset from panel content-left edge.
-    pub col: u16,
-    /// Row: 0 = find row, 1 = replace row.
-    pub row: u16,
-    /// Width of this region in char cells.
-    pub width: u16,
-}
+/// Re-exports of the lifted `FindReplace` primitive types from
+/// quadraui. Existing engine + render + backend call sites keep
+/// referencing `core::engine::FindReplaceClickTarget` etc. unchanged
+/// — the canonical definitions live in
+/// [`quadraui::primitives::find_replace`].
+pub use quadraui::{FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH};
 
-/// Default panel width for the find/replace overlay (in char cells, including borders).
-pub const FR_PANEL_WIDTH: u16 = 50;
-
-/// Compute hit regions for the find/replace overlay.
-/// Layout: `[chevron(2)] [input(variable)] [Aa(2+1)][ab(2+1)][.*(2+1)] [count(max(len,5)+1)] [↑(2)][↓(2)][≡(2)][×(2)]`
-/// All positions are in char-cell units relative to the panel content corner (inside borders).
+/// Wrapper around `quadraui::compute_find_replace_hit_regions` that
+/// reads the replace-button glyph widths from
+/// [`crate::icons::FIND_REPLACE`] / `FIND_REPLACE_ALL`. Engine /
+/// render call sites that don't want to touch icons keep the same
+/// `(panel_w, show_replace, match_info)` signature this wrapper
+/// preserves.
 pub fn compute_find_replace_hit_regions(
     panel_w: u16,
     show_replace: bool,
     match_info: &str,
 ) -> (Vec<(FrHitRegion, FindReplaceClickTarget)>, u16) {
-    use FindReplaceClickTarget::*;
-
-    let mut regions = Vec::with_capacity(16);
-    let content_w = panel_w.saturating_sub(2);
-
-    // Chevron: cols 0..2
-    regions.push((
-        FrHitRegion {
-            col: 0,
-            row: 0,
-            width: 2,
-        },
-        Chevron,
-    ));
-
-    // Find input: starts at col 2, right side uses remaining space for buttons.
-    // Right side: toggles(3×3=9) + gap(1) + match_info(max(len,5)) + gap(1) + nav(4×2=8) = dynamic
-    let info_len = (match_info.len() as u16).max(5);
-    let right_side_w: u16 = 9 + info_len + 1 + 8; // toggles + count + gap + nav
-    let input_start: u16 = 2;
-    let input_w = content_w.saturating_sub(2 + right_side_w);
-    regions.push((
-        FrHitRegion {
-            col: input_start,
-            row: 0,
-            width: input_w,
-        },
-        FindInput(0),
-    ));
-
-    // Toggle buttons: [Aa(2)gap(1)] [ab(2)gap(1)] [.*(2)gap(1)]
-    let mut tx = input_start + input_w + 1;
-    for target in [ToggleCase, ToggleWholeWord, ToggleRegex] {
-        regions.push((
-            FrHitRegion {
-                col: tx,
-                row: 0,
-                width: 2,
-            },
-            target,
-        ));
-        tx += 3;
-    }
-
-    // Match count (not clickable)
-    tx += info_len + 1;
-
-    // Nav buttons: [↑(2)][↓(2)][≡(2)][×(2)]
-    for target in [PrevMatch, NextMatch, ToggleInSelection, Close] {
-        regions.push((
-            FrHitRegion {
-                col: tx,
-                row: 0,
-                width: 2,
-            },
-            target,
-        ));
-        tx += 2;
-    }
-
-    // Replace row (row 1)
-    if show_replace {
-        regions.push((
-            FrHitRegion {
-                col: input_start,
-                row: 1,
-                width: input_w,
-            },
-            ReplaceInput(0),
-        ));
-
-        let mut bx = input_start + input_w + 1;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: 2,
-            },
-            TogglePreserveCase,
-        ));
-        bx += 3;
-
-        let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: r1_w,
-            },
-            ReplaceCurrent,
-        ));
-        bx += r1_w + 1;
-
-        let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: ra_w,
-            },
-            ReplaceAll,
-        ));
-    }
-
-    (regions, input_w)
+    let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
+    let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
+    quadraui::compute_find_replace_hit_regions(panel_w, show_replace, match_info, r1_w, ra_w)
 }
 
 // ── Activity bar hit regions ────────────────────────────────────────────────

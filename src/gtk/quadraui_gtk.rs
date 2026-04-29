@@ -48,6 +48,7 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         completion_fg: q(theme.completion_fg),
         completion_border: q(theme.completion_border),
         completion_selected_bg: q(theme.completion_selected_bg),
+        accent_bg: q(theme.tab_active_accent),
     }
 }
 

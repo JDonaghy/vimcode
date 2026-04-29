@@ -3403,44 +3403,15 @@ pub struct DialogInputPanel {
 }
 
 // Re-export hit-test types and functions from engine so backends can use `render::*`.
-pub use crate::core::engine::{
-    compute_find_replace_hit_regions, FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH,
-};
+// The find/replace types live in `quadraui::primitives::find_replace`
+// after #271; engine re-exports keep the legacy paths working.
+pub use crate::core::engine::{compute_find_replace_hit_regions, FR_PANEL_WIDTH};
 
-/// The inline find/replace overlay displayed at the top-right of the active editor group.
-#[derive(Debug, Clone)]
-pub struct FindReplacePanel {
-    /// Current query text in the find field.
-    pub query: String,
-    /// Current replacement text (only shown when `show_replace` is true).
-    pub replacement: String,
-    /// Whether the replace row is visible.
-    pub show_replace: bool,
-    /// Which field has focus: 0 = find, 1 = replace.
-    pub focus: u8,
-    /// Cursor position within the focused field (char offset).
-    pub cursor: usize,
-    /// Selection anchor in the focused field. When Some, text between anchor and cursor is selected.
-    pub sel_anchor: Option<usize>,
-    /// "N of M" match count display, or "No results" / empty.
-    pub match_info: String,
-    /// Toggle button states (find row).
-    pub case_sensitive: bool,
-    pub whole_word: bool,
-    pub use_regex: bool,
-    /// Toggle button states (replace row).
-    pub preserve_case: bool,
-    /// Find in selection mode.
-    pub in_selection: bool,
-    /// Bounding rect of the active editor group (pixel coords for GTK/Win-GUI,
-    /// approximate for TUI). The overlay positions itself at the top-right of this rect.
-    pub group_bounds: WindowRect,
-    /// Panel width in char cells (used by backends for positioning).
-    pub panel_width: u16,
-    /// Hit regions for click handling, in char-cell units relative to the panel
-    /// content corner (inside borders). Computed once in `build_screen_layout()`.
-    pub hit_regions: Vec<(FrHitRegion, FindReplaceClickTarget)>,
-}
+/// The inline find/replace overlay displayed at the top-right of the
+/// active editor group. Lifted to [`quadraui::FindReplacePanel`] in
+/// #271; this alias preserves the legacy `render::FindReplacePanel`
+/// path so existing call sites compile unchanged.
+pub type FindReplacePanel = quadraui::FindReplacePanel;
 
 /// Format a button label with the hotkey character bracketed.
 /// e.g., `format_button_label("Recover", 'r')` → `"[R]ecover"`.
@@ -5998,6 +5969,13 @@ pub fn build_screen_layout(
                 engine.find_replace_show_replace,
                 &match_info,
             );
+            // Convert vimcode's f64 WindowRect to quadraui::Rect (f32).
+            let qr = quadraui::Rect::new(
+                active_group_bounds.x as f32,
+                active_group_bounds.y as f32,
+                active_group_bounds.width as f32,
+                active_group_bounds.height as f32,
+            );
             Some(FindReplacePanel {
                 query: engine.find_replace_query.clone(),
                 replacement: engine.find_replace_replacement.clone(),
@@ -6011,8 +5989,10 @@ pub fn build_screen_layout(
                 use_regex: engine.find_replace_options.use_regex,
                 preserve_case: engine.find_replace_options.preserve_case,
                 in_selection: engine.find_replace_options.in_selection,
-                group_bounds: active_group_bounds,
+                group_bounds: qr,
                 panel_width: panel_w,
+                replace_one_glyph: crate::icons::FIND_REPLACE.s().to_string(),
+                replace_all_glyph: crate::icons::FIND_REPLACE_ALL.s().to_string(),
                 hit_regions,
             })
         } else {
