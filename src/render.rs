@@ -9569,6 +9569,171 @@ pub fn to_quadraui_color(c: Color) -> quadraui::Color {
     quadraui::Color::rgb(c.r, c.g, c.b)
 }
 
+// ─── quadraui::Editor adapter (#276 Stage 1C) ────────────────────────────────
+//
+// Convert a vimcode `RenderedWindow` (engine-side IR) into a
+// `quadraui::Editor` for the lifted TUI / GTK rasterisers. Field-for-
+// field mapping; the engine builder remains unchanged (`RenderedWindow`
+// is still consumed by mouse hit-testing in `tui_main/mouse.rs` and
+// `gtk/click.rs`, which is why we adapt at the boundary rather than
+// retargeting the builder).
+
+/// Build a [`quadraui::Editor`] from a [`RenderedWindow`]. The
+/// per-window status line is **not** included — the caller paints
+/// it after calling `draw_editor` (status-line lift was Session 241).
+pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
+    quadraui::Editor {
+        id: quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
+        rect: quadraui::Rect::new(
+            rw.rect.x as f32,
+            rw.rect.y as f32,
+            rw.rect.width as f32,
+            rw.rect.height as f32,
+        ),
+        lines: rw.lines.iter().map(to_q_editor_line).collect(),
+        cursor: rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
+            pos: to_q_cursor_pos(pos),
+            shape: to_q_cursor_shape(shape),
+        }),
+        extra_cursors: rw.extra_cursors.iter().copied().map(to_q_cursor_pos).collect(),
+        selection: rw.selection.as_ref().map(to_q_selection),
+        extra_selections: rw.extra_selections.iter().map(to_q_selection).collect(),
+        yank_highlight: rw.yank_highlight.as_ref().map(to_q_selection),
+        scroll_top: rw.scroll_top,
+        scroll_left: rw.scroll_left,
+        total_lines: rw.total_lines,
+        max_col: rw.max_col,
+        gutter_char_width: rw.gutter_char_width,
+        is_active: rw.is_active,
+        show_active_bg: rw.show_active_bg,
+        has_git_diff: rw.has_git_diff,
+        has_breakpoints: rw.has_breakpoints,
+        diagnostic_gutter: rw
+            .diagnostic_gutter
+            .iter()
+            .map(|(&l, &s)| (l, to_q_severity(s)))
+            .collect(),
+        code_action_lines: rw.code_action_lines.iter().copied().collect(),
+        bracket_match_positions: rw.bracket_match_positions.clone(),
+        active_indent_col: rw.active_indent_col,
+        tabstop: rw.tabstop,
+        cursorline: rw.cursorline,
+        lightbulb_glyph: crate::icons::LIGHTBULB.c(),
+    }
+}
+
+fn to_q_editor_line(rl: &RenderedLine) -> quadraui::EditorLine {
+    quadraui::EditorLine {
+        raw_text: rl.raw_text.clone(),
+        gutter_text: rl.gutter_text.clone(),
+        spans: rl.spans.iter().map(to_q_styled_span).collect(),
+        line_idx: rl.line_idx,
+        is_current_line: rl.is_current_line,
+        is_fold_header: rl.is_fold_header,
+        folded_line_count: rl.folded_line_count,
+        git_diff: rl.git_diff.map(to_q_git_status),
+        diff_status: rl.diff_status.map(to_q_diff_line),
+        diagnostics: rl.diagnostics.iter().map(to_q_diagnostic_mark).collect(),
+        spell_errors: rl.spell_errors.iter().map(to_q_spell_mark).collect(),
+        is_breakpoint: rl.is_breakpoint,
+        is_conditional_bp: rl.is_conditional_bp,
+        is_dap_current: rl.is_dap_current,
+        is_wrap_continuation: rl.is_wrap_continuation,
+        segment_col_offset: rl.segment_col_offset,
+        annotation: rl.annotation.clone(),
+        ghost_suffix: rl.ghost_suffix.clone(),
+        is_ghost_continuation: rl.is_ghost_continuation,
+        indent_guides: rl.indent_guides.clone(),
+        colorcolumns: rl.colorcolumns.clone(),
+    }
+}
+
+fn to_q_styled_span(span: &StyledSpan) -> quadraui::EditorStyledSpan {
+    quadraui::EditorStyledSpan {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        style: quadraui::EditorStyle {
+            fg: to_quadraui_color(span.style.fg),
+            bg: span.style.bg.map(to_quadraui_color),
+            bold: span.style.bold,
+            italic: span.style.italic,
+            font_scale: span.style.font_scale as f32,
+        },
+    }
+}
+
+fn to_q_cursor_pos(pos: CursorPos) -> quadraui::EditorCursorPos {
+    quadraui::EditorCursorPos {
+        view_line: pos.view_line,
+        col: pos.col,
+    }
+}
+
+fn to_q_cursor_shape(shape: CursorShape) -> quadraui::EditorCursorShape {
+    match shape {
+        CursorShape::Block => quadraui::EditorCursorShape::Block,
+        CursorShape::Bar => quadraui::EditorCursorShape::Bar,
+        CursorShape::Underline => quadraui::EditorCursorShape::Underline,
+    }
+}
+
+fn to_q_selection(sel: &SelectionRange) -> quadraui::EditorSelection {
+    quadraui::EditorSelection {
+        kind: match sel.kind {
+            SelectionKind::Char => quadraui::EditorSelectionKind::Char,
+            SelectionKind::Line => quadraui::EditorSelectionKind::Line,
+            SelectionKind::Block => quadraui::EditorSelectionKind::Block,
+        },
+        start_line: sel.start_line,
+        start_col: sel.start_col,
+        end_line: sel.end_line,
+        end_col: sel.end_col,
+    }
+}
+
+fn to_q_severity(s: crate::core::lsp::DiagnosticSeverity) -> quadraui::DiagnosticSeverity {
+    use crate::core::lsp::DiagnosticSeverity as V;
+    match s {
+        V::Error => quadraui::DiagnosticSeverity::Error,
+        V::Warning => quadraui::DiagnosticSeverity::Warning,
+        V::Information => quadraui::DiagnosticSeverity::Information,
+        V::Hint => quadraui::DiagnosticSeverity::Hint,
+    }
+}
+
+fn to_q_git_status(s: GitLineStatus) -> quadraui::GitLineStatus {
+    match s {
+        GitLineStatus::Added => quadraui::GitLineStatus::Added,
+        GitLineStatus::Modified => quadraui::GitLineStatus::Modified,
+        GitLineStatus::Deleted => quadraui::GitLineStatus::Deleted,
+    }
+}
+
+fn to_q_diff_line(d: DiffLine) -> quadraui::DiffLine {
+    match d {
+        DiffLine::Same => quadraui::DiffLine::Same,
+        DiffLine::Added => quadraui::DiffLine::Added,
+        DiffLine::Removed => quadraui::DiffLine::Removed,
+        DiffLine::Padding => quadraui::DiffLine::Padding,
+    }
+}
+
+fn to_q_diagnostic_mark(dm: &DiagnosticMark) -> quadraui::DiagnosticMark {
+    quadraui::DiagnosticMark {
+        start_col: dm.start_col,
+        end_col: dm.end_col,
+        severity: to_q_severity(dm.severity),
+        message: dm.message.clone(),
+    }
+}
+
+fn to_q_spell_mark(sm: &SpellMark) -> quadraui::SpellMark {
+    quadraui::SpellMark {
+        start_col: sm.start_col,
+        end_col: sm.end_col,
+    }
+}
+
 // ─── quadraui::StatusBar adapter (A.6a) ──────────────────────────────────────
 
 /// String id encoding a `StatusAction`. Paired with [`status_action_from_id`].

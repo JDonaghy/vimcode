@@ -87,16 +87,12 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
-use crate::core::engine::{DiffLine, EngineAction};
-use crate::core::lsp::DiagnosticSeverity;
+use crate::core::engine::EngineAction;
 use crate::core::settings::ExplorerAction;
 use crate::core::window::{GroupId, SplitDirection};
-use crate::core::{Engine, GitLineStatus, Mode, OpenMode, WindowRect};
+use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::icons;
-use crate::render::{
-    self, build_screen_layout, Color, CursorShape, RenderedLine, RenderedWindow, SelectionKind,
-    Theme, WildmenuData,
-};
+use crate::render::{self, build_screen_layout, Color, RenderedWindow, Theme, WildmenuData};
 
 // ─── Key binding helpers ──────────────────────────────────────────────────────
 
@@ -4476,15 +4472,3 @@ fn rc(c: Color) -> RColor {
     RColor::Rgb(c.r, c.g, c.b)
 }
 
-/// Return the character index that corresponds to a byte offset in a UTF-8
-/// string. Returns the total char count if `byte_offset` is past the end.
-fn byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
-    let clamped = byte_offset.min(text.len());
-    // Walk back from clamped to find a char boundary (avoids unstable
-    // `floor_char_boundary` which older Rust toolchains lack).
-    let mut safe = clamped;
-    while safe > 0 && !text.is_char_boundary(safe) {
-        safe -= 1;
-    }
-    text[..safe].chars().count()
-}
