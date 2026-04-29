@@ -6,17 +6,17 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Session 342 — **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 4 sub-commits + fmt fixup on `issue-276-editor-primitive`. Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. The editor viewport is now lifted; the only TUI/GTK duplication left is in three sidebar surfaces (#280 / #281 / #282), the rich hover popup (#214), and GTK's not-yet-migrated completion popup. See "🎯 NEXT FOCUS" below.)
+> **Last updated:** 2026-04-29 (Session 343 — doc-only fix on develop reconciling stale `RichTextPopup` references. The editor hover popup was already lifted via #214 (`c8a23e9`, 2026-04-25) + #266 (`779f6e8`, 2026-04-28); the cross-backend coverage table and "NEXT FOCUS" queue both still claimed it as bespoke/TBD. Updated. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual TUI/GTK rasterisers; net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. With Stage 1 + the RichTextPopup reconciliation, the only TUI/GTK duplication left is in three sidebar surfaces (#280 / #281 / #282) and GTK's not-yet-migrated completion popup. See "🎯 NEXT FOCUS" below.)
 
 ---
 
 ## 🎯 NEXT FOCUS — Eliminate remaining TUI/GTK duplication
 
-After Stage 1, **the editor viewport itself is no longer duplicated**.
-What's left is three sidebar surfaces still hand-rolled per backend,
-one rich-document popup that needs a new primitive, and one popup
-that's lifted on TUI but not yet on GTK. Each is a discrete lift,
-none blocks the others.
+After Stage 1 (#276) and the editor hover popup lift (#214 +
+#266), the editor viewport and the rich-document hover popup are
+no longer duplicated. What's left is three sidebar surfaces still
+hand-rolled per backend and one popup that's lifted on TUI but
+not yet on GTK. Each is a discrete lift; none blocks the others.
 
 ### The remaining duplication, ranked by ease × payoff
 
@@ -24,13 +24,13 @@ none blocks the others.
 |---|---|---|---|---|
 | 1 | **GTK `Completions` popup** | (no issue yet) | small (~1 day) | TUI already on `quadraui::Completions`; GTK still bespoke. Smallest remaining lift, eliminates one full duplication. |
 | 2 | **Extension panel** | [#280](https://github.com/JDonaghy/vimcode/issues/280) | ~12 hrs | Extends `TreeView` with section headers; data shape is straightforward. Mechanical port once the primitive accepts headers. |
-| 3 | **Editor hover popup (RichTextPopup)** | [#214](https://github.com/JDonaghy/vimcode/issues/214) | medium (new primitive) | Needs **new primitive** that handles markdown + code-hl + selection + scroll + links. Higher design cost than the chrome lifts but eliminates the most LOC of bespoke duplication still left after Stage 1. |
-| 4 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). Best done after #214 since the section-shape may inform a `MultiSectionView` primitive. |
-| 5 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
+| 3 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). May want a `MultiSectionView` primitive shape designed first; build alongside #282. |
+| 4 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
 
-**Recommended order:** GTK `Completions` (warm-up) → #280 (mechanical
-TreeView extension) → #214 (design pass on RichTextPopup) → #281 → #282.
-The sequencing is "smallest lifts first to bank quick wins; hardest
+**Recommended order:** GTK `Completions` (warm-up) → #280
+(mechanical TreeView extension) → #281 + #282 paired
+(`MultiSectionView` primitive shared between them). The
+sequencing is "smallest lifts first to bank quick wins; hardest
 last when patterns are established."
 
 ### Strategic complement — B.6 Win-GUI rebuild

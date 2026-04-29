@@ -6,7 +6,7 @@ Prior session (341 — Apr 29): Phase C stages 2–4 shipped end-to-end. [#277](
 
 Prior session (340 — Apr 29): #266 + #267 + #270 + #271 all shipped end-to-end. Runner-crate vision real on TUI + GTK; last find_replace primitive gap closed. #266 (`779f6e8`): rich_text_popup + completions lifted. #267 (`8b64217`): `Backend::draw_dialog` + single-Pango-layout refactor. #270 (`b256993` + `f6b5a17`): `GtkBackend` lifted + `quadraui::gtk::run<A: AppLogic>(app)` runner. #271 (`91e89e9`): `FindReplacePanel` lifted; `Theme.accent_bg` added.
 
-**Next priority** (PLAN.md "🎯 NEXT FOCUS"): **Eliminate remaining TUI/GTK duplication.** With Stage 1 landed, the editor viewport is no longer duplicated. What's left: GTK `Completions` lift (smallest), [#280](https://github.com/JDonaghy/vimcode/issues/280) extension panel, [#214](https://github.com/JDonaghy/vimcode/issues/214) RichTextPopup primitive (medium — new primitive), [#281](https://github.com/JDonaghy/vimcode/issues/281) debug sidebar, [#282](https://github.com/JDonaghy/vimcode/issues/282) source control panel. **B.6 (Win-GUI rebuild) is unblocked** by Stage 1 and sits orthogonal to the duplication-elimination arc — pick it up after the chrome lifts or in parallel.
+**Next priority** (PLAN.md "🎯 NEXT FOCUS"): **Eliminate remaining TUI/GTK duplication.** With Stage 1 landed, the editor viewport is no longer duplicated; the rich editor hover popup is also already lifted (#214 + #266). What's left: GTK `Completions` lift (smallest), [#280](https://github.com/JDonaghy/vimcode/issues/280) extension panel, [#281](https://github.com/JDonaghy/vimcode/issues/281) debug sidebar, [#282](https://github.com/JDonaghy/vimcode/issues/282) source control panel. **B.6 (Win-GUI rebuild) is unblocked** by Stage 1 and sits orthogonal to the duplication-elimination arc — pick it up after the chrome lifts or in parallel.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 339 are in **SESSION_HISTORY.md**.
@@ -39,13 +39,14 @@ up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
 **Status (post Phase C Stage 1, 2026-04-29):** Editor viewport
-**now lifted** (#276) — both backends paint through
-`quadraui::{tui,gtk}::draw_editor`. TUI chrome ~98% on quadraui;
-GTK chrome ~92%. Remaining bespoke-per-backend duplication:
-GTK `Completions` (TUI on primitive, GTK not yet), the rich
-hover popup (#214 RichTextPopup TBD), and three sidebar
-surfaces — #280 (extension panel), #281 (debug sidebar), #282
-(source control).
+**lifted** (#276) — both backends paint through
+`quadraui::{tui,gtk}::draw_editor`. The editor hover popup is
+**also lifted** (#214 + #266 — `RichTextPopup` primitive shipped
+2026-04-25; rasterisers lifted 2026-04-28). TUI chrome ~98% on
+quadraui; GTK chrome ~92%. Remaining bespoke-per-backend
+duplication: GTK `Completions` popup (TUI on primitive, GTK not
+yet) and three sidebar surfaces — #280 (extension panel), #281
+(debug sidebar), #282 (source control).
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -66,7 +67,7 @@ surfaces — #280 (extension panel), #281 (debug sidebar), #282
 | Menu dropdown (top menu bar) | `ContextMenu` | ✅ | ✅ | slice 6 (closed #181) |
 | Debug toolbar | `StatusBar` | ✅ | ✅ | slice 8, `caf62a8` |
 | Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
-| Editor hover popup (markdown + code-hl + selection + scroll + links) | _RichTextPopup TBD_ | ❌ bespoke | ❌ bespoke | deferred — needs new primitive (#214) |
+| Editor hover popup (markdown + code-hl + selection + scroll + links) | `RichTextPopup` | ✅ | ✅ | #214 shipped (`c8a23e9`); rasterisers lifted via #266 (`779f6e8`). Both backends consume `quadraui::{tui,gtk}::draw_rich_text_popup`. |
 | Completion popup | `Completions` | ✅ | ❌ bespoke | not yet migrated on GTK (separate slice when convenient) |
 | Editor scrollbar (v + h paint) | `Scrollbar` | ✅ | ✅ | #277, `fbbc85f`+ |
 | Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
@@ -87,7 +88,7 @@ surfaces — #280 (extension panel), #281 (debug sidebar), #282
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
 - ✅ True for picker / status-bar / tree / dialog / context-menu / tooltip-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
-- ⏭️ Not yet true for **rich-document** popups (LSP hover with markdown + code highlighting + selection + scroll + links) — needs **#214 RichTextPopup** primitive, then both backends get migrated together.
+- ✅ True for **rich-document** popups since #214 shipped + #266 lifted both rasterisers — adding new rich popups means writing a `RichTextDocument` and handlers, never touching Pango/cells.
 - ⚠️ **Hit-test glue still per-backend** (#210) — primitive layouts and `hit_test` methods are shared, but the wires from "mouse moved" → "selected_idx changed" are still hand-rolled in each backend's motion handler. Several bugs across the B.5 wave traced back to this (slice 6 row-height drift, slice 8 hand-rolled char-width math). Structural fix: motion handlers should call `layout.hit_test()` directly. The same shape exists in #211 (debug sidebar) and likely a few other surfaces.
 - ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO, future Win-GUI `ReadDirectoryChangesW`). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
@@ -132,7 +133,7 @@ rebuild (B.6) will consume directly. Total diff: +2427 / −1455.
 
 **What's next:** PLAN.md "🎯 NEXT FOCUS" — eliminate remaining
 TUI/GTK duplication via the chrome-lift queue (GTK `Completions`
-→ #280 → #214 → #281 → #282). B.6 Win-GUI rebuild is unblocked
+→ #280 → #281 → #282). B.6 Win-GUI rebuild is unblocked
 and orthogonal — pick it up in parallel or after the lifts.
 
 ---
