@@ -786,6 +786,7 @@ pub(super) fn draw_h_scrollbars(
     hovered: bool,
     dragging_window: Option<core::WindowId>,
 ) {
+    let q_theme = super::quadraui_gtk::q_theme(theme);
     for (window_id, rect) in window_rects {
         let Some((track_x, track_y, track_w, sb_height, thumb_x, thumb_w, _, _)) =
             h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
@@ -793,27 +794,21 @@ pub(super) fn draw_h_scrollbars(
             continue;
         };
 
-        let is_active = dragging_window == Some(*window_id);
-
-        // Track background (slightly darker when hovered/active)
-        let track_alpha = if hovered || is_active { 0.35 } else { 0.20 };
-        let (tr, tg, tb) = theme.scrollbar_track.to_cairo();
-        cr.set_source_rgba(tr, tg, tb, track_alpha);
-        cr.rectangle(track_x, track_y, track_w, sb_height);
-        cr.fill().ok();
-
-        // Thumb: brighter on hover, brighter still on active drag
-        let thumb_alpha = if is_active {
-            0.85
-        } else if hovered {
-            0.70
-        } else {
-            0.50
+        let scrollbar = quadraui::Scrollbar {
+            id: quadraui::WidgetId::new("gtk:editor:h_scrollbar"),
+            axis: quadraui::ScrollAxis::Horizontal,
+            track: quadraui::Rect::new(
+                track_x as f32,
+                track_y as f32,
+                track_w as f32,
+                sb_height as f32,
+            ),
+            thumb_start: (thumb_x - track_x) as f32,
+            thumb_len: thumb_w as f32,
+            hovered,
+            dragging: dragging_window == Some(*window_id),
         };
-        let (thr, thg, thb) = theme.scrollbar_thumb.to_cairo();
-        cr.set_source_rgba(thr, thg, thb, thumb_alpha);
-        cr.rectangle(thumb_x, track_y, thumb_w, sb_height);
-        cr.fill().ok();
+        quadraui::gtk::draw_scrollbar(cr, &scrollbar, &q_theme);
     }
 }
 

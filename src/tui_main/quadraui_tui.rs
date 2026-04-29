@@ -62,6 +62,8 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         completion_border: q(theme.completion_border),
         completion_selected_bg: q(theme.completion_selected_bg),
         accent_bg: q(theme.tab_active_accent),
+        scrollbar_track: q(theme.scrollbar_track),
+        scrollbar_thumb: q(theme.scrollbar_thumb),
     }
 }
 

@@ -2313,6 +2313,11 @@ pub(super) fn render_window(
 
     // Horizontal scrollbar
     if has_h_scrollbar {
+        let cell_bg = if window.show_active_bg {
+            theme.active_background
+        } else {
+            theme.background
+        };
         render_h_scrollbar(
             frame.buffer_mut(),
             area,
@@ -2322,7 +2327,7 @@ pub(super) fn render_window(
             gutter_w,
             has_scrollbar,
             theme,
-            window_bg,
+            cell_bg,
         );
     }
 
@@ -2458,13 +2463,9 @@ pub(super) fn render_scrollbar(
     has_h_scrollbar: bool,
     theme: &Theme,
 ) {
-    if area.height == 0 || total_lines == 0 {
+    if area.height == 0 || total_lines == 0 || area.width == 0 {
         return;
     }
-    let track_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.scrollbar_thumb);
-    let sb_bg = rc(theme.background);
-    // Track height: reserve last row for h-scrollbar if present
     let track_h = if has_h_scrollbar {
         area.height.saturating_sub(1)
     } else {
@@ -2473,24 +2474,31 @@ pub(super) fn render_scrollbar(
     if track_h == 0 {
         return;
     }
-    let h = track_h as f64;
-    let thumb_size = ((viewport_lines as f64 / total_lines as f64) * h)
-        .ceil()
-        .max(1.0) as u16;
-    let thumb_top = ((scroll_top as f64 / total_lines as f64) * h).floor() as u16;
-    let sb_x = area.x + area.width - 1;
-    for dy in 0..track_h {
-        let y = area.y + dy;
-        let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
-        let ch = if in_thumb { '█' } else { '░' };
-        let fg = if in_thumb { thumb_fg } else { track_fg };
-        set_cell(buf, sb_x, y, ch, fg, sb_bg);
-    }
+    let track = quadraui::Rect::new(
+        (area.x + area.width - 1) as f32,
+        area.y as f32,
+        1.0,
+        track_h as f32,
+    );
+    let scrollbar = quadraui::Scrollbar::vertical(
+        "tui:editor:v_scrollbar",
+        track,
+        scroll_top as f32,
+        total_lines as f32,
+        viewport_lines as f32,
+        1.0,
+    );
+    quadraui::tui::draw_scrollbar(
+        buf,
+        &scrollbar,
+        &super::quadraui_tui::q_theme(theme),
+        render::to_quadraui_color(theme.background),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
 /// Render the horizontal scrollbar at the bottom row of `area`. Each
-/// cell uses `window_bg` for its terminal background so the row blends
+/// cell uses `cell_bg` for its terminal background so the row blends
 /// in with the editor area above (using `theme.background` instead
 /// would make the row look like a dark strip when the active window
 /// uses `theme.active_background`).
@@ -2503,18 +2511,14 @@ pub(super) fn render_h_scrollbar(
     gutter_w: u16,
     has_v_scrollbar: bool,
     theme: &Theme,
-    window_bg: ratatui::style::Color,
+    cell_bg: Color,
 ) {
     if area.height == 0 || max_col == 0 || viewport_cols == 0 {
         return;
     }
-    let thumb_fg = rc(theme.scrollbar_thumb);
-    let track_fg = rc(theme.separator);
-    let corner_fg = rc(theme.separator);
 
     let sb_y = area.y + area.height - 1;
     let track_x = area.x + gutter_w;
-    // Leave the rightmost cell for the v-scrollbar corner / separator
     let track_w = area
         .width
         .saturating_sub(gutter_w + if has_v_scrollbar { 1 } else { 0 });
@@ -2522,28 +2526,22 @@ pub(super) fn render_h_scrollbar(
         return;
     }
 
-    let w = track_w as f64;
-    let thumb_size = ((viewport_cols as f64 / max_col as f64) * w)
-        .ceil()
-        .max(1.0) as u16;
-    let thumb_left = ((scroll_left as f64 / max_col as f64) * w).floor() as u16;
+    let track = quadraui::Rect::new(track_x as f32, sb_y as f32, track_w as f32, 1.0);
+    let scrollbar = quadraui::Scrollbar::horizontal(
+        "tui:editor:h_scrollbar",
+        track,
+        scroll_left as f32,
+        max_col as f32,
+        viewport_cols as f32,
+        1.0,
+    );
+    quadraui::tui::draw_scrollbar(
+        buf,
+        &scrollbar,
+        &super::quadraui_tui::q_theme(theme),
+        render::to_quadraui_color(cell_bg),
+    );
 
-    // Render strategy: every cell uses `window_bg` as its terminal
-    // background so the top half of the row matches the editor area
-    // above. The track is drawn with `▁` (lower one-eighth block) in
-    // `track_fg` for a thin separator-like line; the thumb is drawn
-    // with `▄` (lower-half block) in `thumb_fg` so it stands out as a
-    // chunkier bar in the same row.
-    for dx in 0..track_w {
-        let x = track_x + dx;
-        let in_thumb = dx >= thumb_left && dx < thumb_left + thumb_size;
-        let (ch, fg) = if in_thumb {
-            ('▄', thumb_fg)
-        } else {
-            ('▁', track_fg)
-        };
-        set_cell(buf, x, sb_y, ch, fg, window_bg);
-    }
     // Corner cell (intersection of v-scrollbar column and h-scrollbar row)
     if has_v_scrollbar {
         set_cell(
@@ -2551,8 +2549,8 @@ pub(super) fn render_h_scrollbar(
             area.x + area.width - 1,
             sb_y,
             '┘',
-            corner_fg,
-            window_bg,
+            rc(theme.separator),
+            rc(cell_bg),
         );
     }
 }
