@@ -6,32 +6,26 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266, #267, #270 shipped; #270 Stage B in `f6b5a17` adds `quadraui::gtk::run<A: AppLogic>(app)` runner + `AppLogic::AreaId` associated type. The runner-crate vision now ships end-to-end on both TUI and GTK; example LOC dropped 1274 → 526 (-59%) by routing all four examples through `examples/common/{mini_app,demo}.rs`. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). **Next priority arc: #271 → B.6.** See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped end-to-end. The runner-crate vision is real on both TUI and GTK, and the trait surface now has zero remaining vimcode-private rasterisers. **Next priority: B.6 (Win-GUI rebuild)** — the original "next phase" target before this arc. See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — #271 → B.6 (with smoke followups in parallel)
+## 🎯 NEXT FOCUS — B.6 Win-GUI rebuild (with smoke followups in parallel)
 
-**The runner-crate vision shipped end-to-end across the TUI and
-GTK backends.** Remaining priority arc closes the find_replace
-primitive gap, then rebuilds Win-GUI on the now-solid trait
-surface.
+**Trait surface is solid across TUI + GTK.** Every primitive has
+lifted rasterisers, every rasteriser is reachable via the
+`Backend` trait, and the runner-crate vision (`quadraui::tui::run`
+/ `quadraui::gtk::run`) ships end-to-end. The B.5c → B.5e → #266 →
+#267 → #270 → #271 arc that started this season is closed.
 
 **Priority order (set 2026-04-29):**
 
-1. **#271 — find_replace primitive migration.** Move `FrHitRegion`,
-   `FindReplaceClickTarget`, `FR_PANEL_WIDTH`, and
-   `compute_find_replace_hit_regions` from `core::engine` to a new
-   `quadraui::primitives::find_replace`. Then lift the per-backend
-   rasterisers (TUI shim + GTK `draw.rs::draw_find_replace_popup`)
-   into `quadraui::{tui,gtk}::*`. Replaces the
-   `crate::icons::FIND_REPLACE*` glyph constants with a
-   backend-agnostic carrier. Bigger than the other rasteriser lifts
-   because it needs primitive-level work, not just a copy.
-2. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
+1. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
    target before this arc. Win-GUI currently has its own bespoke
    draw + click code; rebuild it as a `Backend` impl with native
-   rasterisers in `quadraui::win_gui::*`.
+   `quadraui::win_gui::draw_*` rasterisers (DirectWrite +
+   Direct2D), modelled on how GTK and TUI consume the trait
+   post-B.5b/B.5c.
 
 **Independent quality work (can land any time):**
 - #262 — Breadcrumb dropdown: parent symbols expandable but not jumpable.
@@ -44,11 +38,13 @@ surface.
 
 ### Why this ordering
 
-#271 fills the last trait-coverage gap (find_replace is the only
-remaining vimcode-private rasteriser pair). B.6 was always queued
-for "after the trait is solid"; post-#271, it is. Doing B.6 first
-would ship a third backend with the same kind of gaps B.5b unwound
-— the very problem this whole arc was structured to prevent.
+The B.5c → #271 arc was structured precisely to land B.6 onto a
+solid trait. Doing B.6 earlier would have shipped a third backend
+with the same kind of gaps B.5b unwound. With every primitive
+lifted and trait-covered, the Win-GUI rebuild starts from
+`quadraui::Backend` + the existing rasteriser library and fills in
+native equivalents for the four that don't yet have a Win-GUI
+impl.
 
 ### Phase #270 Stage A — GtkBackend lift (✅ shipped)
 
@@ -103,33 +99,25 @@ find_replace was deferred to **#271** because it requires a primitive
 migration (see Phase #271 below) — moving it through `q_theme()` is
 not enough.
 
-### Phase #271 — find_replace primitive migration (deferred from #266)
+### Phase #271 — find_replace primitive migration (✅ shipped)
 
-**Pickup files:**
-- `src/core/engine/mod.rs` lines 1060-1210 — `FindReplaceClickTarget`,
-  `FrHitRegion`, `FR_PANEL_WIDTH`, `compute_find_replace_hit_regions`.
-- `src/render.rs` line 3410+ — `FindReplacePanel` plus the engine
-  re-export at line 3406.
-- `src/tui_main/quadraui_tui.rs::draw_find_replace` — TUI rasteriser
-  body to copy.
-- `src/gtk/draw.rs::draw_find_replace_popup` — GTK rasteriser body.
-- `src/core/engine/execute.rs::handle_find_replace_click` and adjacent
-  dispatchers that consume the enum.
-- `src/icons.rs` — `FIND_REPLACE` / `FIND_REPLACE_ALL` glyph constants.
+`91e89e9` shipped the lift:
+- New `quadraui::primitives::find_replace` module with
+  `FindReplaceClickTarget`, `FrHitRegion`, `FR_PANEL_WIDTH`,
+  `compute_hit_regions`, and `FindReplacePanel`.
+- Glyph fields (`replace_one_glyph: String`,
+  `replace_all_glyph: String`) carried on the panel so the
+  rasteriser doesn't depend on any host app's icon registry.
+- `quadraui::tui::draw_find_replace` + `quadraui::gtk::draw_find_replace`
+  rasterisers lifted from the vimcode shims.
+- `quadraui::Theme.accent_bg` added for toggle highlight backgrounds.
+- Vimcode side: `core::engine::*` re-exports the lifted types;
+  `render::FindReplacePanel` is now a type alias for
+  `quadraui::FindReplacePanel`. Both shims (TUI + GTK) collapsed
+  to thin delegators.
 
-**Sketch:**
-1. New `quadraui::primitives::find_replace` with the lifted enum +
-   struct + const + `compute_hit_regions`.
-2. Engine imports the lifted types back (`core::engine` re-exports
-   them so call sites keep compiling, or rewires call sites).
-3. `render::FindReplacePanel` either becomes an alias for
-   `quadraui::FindReplacePanel` or `build_screen_layout` builds the
-   quadraui shape directly.
-4. Icon glyphs travel inside `FindReplacePanel` (`replace_one_glyph: char`,
-   `replace_all_glyph: char`) so the rasteriser doesn't import vimcode
-   icons.
-5. `quadraui::tui::draw_find_replace` + `quadraui::gtk::draw_find_replace`
-   port the rasteriser bodies; both backend shims collapse to delegators.
+Net diff -681/+64 lines. Closes the last "trait-less primitive"
+gap on the find/replace overlay.
 
 ### Phase #267 — Dialog dual-Pango (✅ shipped)
 
