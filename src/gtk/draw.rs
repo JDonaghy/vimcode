@@ -3112,15 +3112,8 @@ pub(super) fn draw_dialog_popup(
         dialog_layout.bounds.height as f64,
     );
 
-    let btn_rects = super::quadraui_gtk::draw_dialog(
-        cr,
-        layout,
-        &ui_layout,
-        &dialog,
-        &dialog_layout,
-        line_height,
-        theme,
-    );
+    let btn_rects =
+        super::quadraui_gtk::draw_dialog(cr, layout, &dialog, &dialog_layout, line_height, theme);
     (btn_rects, Some(popup_rect))
 }
 

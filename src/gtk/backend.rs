@@ -710,6 +710,35 @@ impl Backend for GtkBackend {
             .map(|(x, y, w, h, id)| (QRect::new(x as f32, y as f32, w as f32, h as f32), id))
             .collect()
     }
+
+    fn draw_dialog(
+        &mut self,
+        dialog: &quadraui::Dialog,
+        dialog_layout: &quadraui::DialogLayout,
+    ) -> Vec<QRect> {
+        let line_height = self.current_line_height;
+        let theme = self.current_theme;
+        let (cr, pango_layout) = self
+            .current_frame_refs()
+            .expect("GtkBackend::draw_dialog called outside enter_frame_scope");
+        // Construct UI font on demand from vimcode's settings-driven
+        // `UI_FONT()` macro. Same approach the in-tree shim takes
+        // (#266 lift of rich_text_popup).
+        let ui_font_desc = pango::FontDescription::from_string(&super::draw::UI_FONT());
+        let rects = quadraui::gtk::draw_dialog(
+            cr,
+            pango_layout,
+            &ui_font_desc,
+            dialog,
+            dialog_layout,
+            line_height,
+            &theme,
+        );
+        rects
+            .into_iter()
+            .map(|(x, y, w, h)| QRect::new(x as f32, y as f32, w as f32, h as f32))
+            .collect()
+    }
 }
 
 // ─── Cross-backend validation tests ──────────────────────────────────────────

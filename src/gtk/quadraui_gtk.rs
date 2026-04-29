@@ -102,16 +102,16 @@ pub(super) fn draw_tooltip(
 pub(super) fn draw_dialog(
     cr: &Context,
     layout: &pango::Layout,
-    ui_layout: &pango::Layout,
     dialog: &quadraui::Dialog,
     dialog_layout: &quadraui::DialogLayout,
     line_height: f64,
     theme: &Theme,
 ) -> Vec<(f64, f64, f64, f64)> {
+    let ui_font_desc = pango::FontDescription::from_string(&super::draw::UI_FONT());
     quadraui::gtk::draw_dialog(
         cr,
         layout,
-        ui_layout,
+        &ui_font_desc,
         dialog,
         dialog_layout,
         line_height,
