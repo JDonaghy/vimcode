@@ -212,6 +212,22 @@ pub(super) const RICH_TEXT_POPUP_SB_WIDTH: f64 = quadraui::gtk::RICH_TEXT_POPUP_
 /// right border. Same role as `RICH_TEXT_POPUP_SB_WIDTH`.
 pub(super) const RICH_TEXT_POPUP_SB_INSET: f64 = quadraui::gtk::RICH_TEXT_POPUP_SB_INSET;
 
+/// Draw a `quadraui::Completions` popup at its resolved
+/// `CompletionsLayout` via the lifted `quadraui::gtk::draw_completions`
+/// rasteriser (#285). Vimcode's shim role is to map the rich
+/// `render::Theme` to the smaller `quadraui::Theme` via `q_theme()` —
+/// the body of the rasteriser lives in the quadraui crate. Mirrors
+/// the TUI shim at `src/tui_main/quadraui_tui.rs::draw_completions`.
+pub(super) fn draw_completions(
+    cr: &Context,
+    layout: &pango::Layout,
+    completions: &quadraui::Completions,
+    completions_layout: &quadraui::CompletionsLayout,
+    theme: &Theme,
+) {
+    quadraui::gtk::draw_completions(cr, layout, completions, completions_layout, &q_theme(theme));
+}
+
 /// Draw a `quadraui::RichTextPopup` at its resolved layout. Returns
 /// per-link hit regions in `(x, y, w, h, url)` form. Each visible
 /// line is rendered as a SINGLE Pango call with an `AttrList` —

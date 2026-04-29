@@ -6,32 +6,31 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Session 343 — doc-only fix on develop reconciling stale `RichTextPopup` references. The editor hover popup was already lifted via #214 (`c8a23e9`, 2026-04-25) + #266 (`779f6e8`, 2026-04-28); the cross-backend coverage table and "NEXT FOCUS" queue both still claimed it as bespoke/TBD. Updated. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual TUI/GTK rasterisers; net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. With Stage 1 + the RichTextPopup reconciliation, the only TUI/GTK duplication left is in three sidebar surfaces (#280 / #281 / #282) and GTK's not-yet-migrated completion popup. See "🎯 NEXT FOCUS" below.)
+> **Last updated:** 2026-04-29 (Session 343 — **GTK `Completions` lift ([#285](https://github.com/JDonaghy/vimcode/issues/285)) shipped via Path A** on develop: `quadraui::gtk::draw_completions` rasteriser + `quadraui_gtk::draw_completions` shim added; `src/gtk/draw::draw_completion_popup` body collapsed to a layout-+-delegate flow. Both backends now paint completions through `quadraui::Completions`. Smoke surfaced three pre-existing GTK keymap/click bugs (#286 Ctrl-alone-dismisses, #287 Ctrl-P palette collision, #288 click-divergence) — none caused by the lift. Also reconciled stale `RichTextPopup` claims on the way: #214 (`c8a23e9`, 2026-04-25) + #266 (`779f6e8`, 2026-04-28) had already lifted the editor hover popup, but the table + queue still said TBD. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual rasterisers; net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. With Stage 1 + #285 + the RichTextPopup reconciliation, the only TUI/GTK duplication left is three sidebar surfaces (#280 / #281 / #282). See "🎯 NEXT FOCUS" below.)
 
 ---
 
 ## 🎯 NEXT FOCUS — Eliminate remaining TUI/GTK duplication
 
-After Stage 1 (#276) and the editor hover popup lift (#214 +
-#266), the editor viewport and the rich-document hover popup are
-no longer duplicated. What's left is three sidebar surfaces still
-hand-rolled per backend and one popup that's lifted on TUI but
-not yet on GTK. Each is a discrete lift; none blocks the others.
+After Stage 1 (#276), the GTK Completions lift (#285), and the
+editor hover popup lift (#214 + #266), the editor viewport,
+completion popup, and rich-document hover popup are all no
+longer duplicated. What's left is three sidebar surfaces still
+hand-rolled per backend. Each is a discrete lift; none blocks
+the others.
 
 ### The remaining duplication, ranked by ease × payoff
 
 | # | Surface | Issue | Effort | Why next |
 |---|---|---|---|---|
-| 1 | **GTK `Completions` popup** | (no issue yet) | small (~1 day) | TUI already on `quadraui::Completions`; GTK still bespoke. Smallest remaining lift, eliminates one full duplication. |
-| 2 | **Extension panel** | [#280](https://github.com/JDonaghy/vimcode/issues/280) | ~12 hrs | Extends `TreeView` with section headers; data shape is straightforward. Mechanical port once the primitive accepts headers. |
-| 3 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). May want a `MultiSectionView` primitive shape designed first; build alongside #282. |
-| 4 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
+| 1 | **Extension panel** | [#280](https://github.com/JDonaghy/vimcode/issues/280) | ~12 hrs | Extends `TreeView` with section headers; data shape is straightforward. Mechanical port once the primitive accepts headers. Front-of-queue. |
+| 2 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). May want a `MultiSectionView` primitive shape designed first; build alongside #282. |
+| 3 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
 
-**Recommended order:** GTK `Completions` (warm-up) → #280
-(mechanical TreeView extension) → #281 + #282 paired
-(`MultiSectionView` primitive shared between them). The
-sequencing is "smallest lifts first to bank quick wins; hardest
-last when patterns are established."
+**Recommended order:** #280 (mechanical TreeView extension) →
+#281 + #282 paired (`MultiSectionView` primitive shared between
+them). The sequencing is "smallest lifts first to bank quick
+wins; hardest last when patterns are established."
 
 ### Strategic complement — B.6 Win-GUI rebuild
 

@@ -1163,6 +1163,15 @@ pub(super) fn draw_window_separators(
 /// Returns the popup's `(x, y, w, h)` if drawn, `None` otherwise. The
 /// caller writes the rect into `App.completion_popup_rect` so the
 /// click handler can register it on the modal stack (B.5b Stage 5).
+///
+/// Body is a thin delegator over `quadraui::gtk::draw_completions`
+/// (#285). Builds the `quadraui::Completions` description via the
+/// shared `render::completion_menu_to_quadraui_completions` adapter,
+/// computes the popup placement via `Completions::layout()`, then
+/// forwards to the lifted rasteriser through the
+/// `quadraui_gtk::draw_completions` shim. Returns the resolved popup
+/// bounds (x, y, w, h) so the existing `completion_popup_rect_out`
+/// integration keeps working unchanged.
 pub(super) fn draw_completion_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -1178,53 +1187,45 @@ pub(super) fn draw_completion_popup(
         .find(|w| w.window_id == screen.active_window_id)?;
     let (cursor_pos, _) = active_win.cursor.as_ref()?;
 
-    // Anchor popup below the cursor cell, to the right of the gutter.
+    // Anchor: cell below the cursor cell, to the right of the gutter.
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
-    let popup_x =
+    let cursor_x =
         active_win.rect.x + gutter_width + cursor_pos.col as f64 * char_width - h_scroll_offset;
-    let popup_y = active_win.rect.y + (cursor_pos.view_line + 1) as f64 * line_height;
+    let cursor_y = active_win.rect.y + cursor_pos.view_line as f64 * line_height;
 
-    let visible = menu.candidates.len().min(10);
+    // Popup width matches the pre-lift bespoke math: longest candidate
+    // + 2 cells of padding/border, floored at 100 px.
     let popup_w = ((menu.max_width + 2) as f64 * char_width).max(100.0);
-    let popup_h = visible as f64 * line_height;
+    // Cap visible rows at 10 — same ceiling as the pre-lift code.
+    let max_popup_h = 10.0 * line_height;
 
-    // Background
-    let (r, g, b) = theme.completion_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
+    let completions = render::completion_menu_to_quadraui_completions(menu);
+    let viewport = quadraui::Rect::new(
+        active_win.rect.x as f32,
+        active_win.rect.y as f32,
+        active_win.rect.width as f32,
+        active_win.rect.height as f32,
+    );
+    let line_height_f = line_height as f32;
+    let q_layout = completions.layout(
+        cursor_x as f32,
+        cursor_y as f32,
+        line_height_f,
+        viewport,
+        popup_w as f32,
+        max_popup_h as f32,
+        |_| quadraui::CompletionItemMeasure::new(line_height_f),
+    );
 
-    // Border
-    let (r, g, b) = theme.completion_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
+    super::quadraui_gtk::draw_completions(cr, layout, &completions, &q_layout, theme);
 
-    // Items
-    for (i, candidate) in menu.candidates.iter().enumerate().take(visible) {
-        let item_y = popup_y + i as f64 * line_height;
-
-        // Selected row highlight
-        if i == menu.selected_idx {
-            let (r, g, b) = theme.completion_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x, item_y, popup_w, line_height);
-            cr.fill().ok();
-        }
-
-        // Candidate text
-        let (r, g, b) = theme.completion_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        let display = format!(" {}", candidate);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, item_y);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    Some((popup_x, popup_y, popup_w, popup_h))
+    Some((
+        q_layout.bounds.x as f64,
+        q_layout.bounds.y as f64,
+        q_layout.bounds.width as f64,
+        q_layout.bounds.height as f64,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

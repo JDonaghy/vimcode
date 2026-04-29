@@ -1,6 +1,8 @@
 # VimCode Project State
 
-**Last updated:** Apr 29, 2026 (Session 342 — **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284), merged) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 5 commits on `issue-276-editor-primitive`. **Stage 1A** (`3fcc7fb`) lifted the supporting types (`DiagnosticSeverity` / `GitLineStatus` / `DiffLine` / `CursorShape` / `SelectionKind` / `CursorPos` / `EditorCursor` / `EditorSelection` / `Style` / `StyledSpan` / `DiagnosticMark` / `SpellMark`) + 29 new `Theme` fields + `q_theme()` chrome+editor split. **Stage 1B** (`ef45610`) added the `Editor` + `EditorLine` data structs (3 unit tests). **Stage 1C** (`c985d58`) lifted the TUI rasteriser via `to_q_editor` boundary adapter; `render_window` collapsed ~470 → ~25 LOC. **Stage 1D** (`5b23718`) lifted the GTK rasteriser; `draw_window` collapsed ~720 → ~25 LOC. **fmt fixup** (`8c8cd24`). Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui. quadraui: 290 tests pass (was 287, +3 editor); vimcode `--no-default-features` + clippy clean (1950 lib tests + integration); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean. Smoke-test follow-up filed: [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI LSP-diagnostic-dot column collision with breakpoint marker (verbatim-port behaviour). Issue [#276](https://github.com/JDonaghy/vimcode/issues/276) closed.
+**Last updated:** Apr 29, 2026 (Session 343 — **GTK `Completions` lift ([#285](https://github.com/JDonaghy/vimcode/issues/285)) shipped on `issue-285-gtk-completions-lift`**: `quadraui::gtk::draw_completions` rasteriser added (verbatim port of vimcode's `draw_completion_popup` body — full bg fill, full 4-side border, per-item selected-row highlight, " {label}" via Pango); `quadraui_gtk::draw_completions` shim added (mirror of TUI shim); `src/gtk/draw::draw_completion_popup` body collapsed to a delegator (build `quadraui::Completions` via the existing `render::completion_menu_to_quadraui_completions` adapter, call `Completions::layout(...)`, delegate, return `layout.bounds` for the existing modal-stack click integration). Both backends now paint completions through `quadraui::Completions` — closes the smallest remaining duplication slot from PLAN.md "🎯 NEXT FOCUS" item #1. Net **+99 LOC** of shared paint in quadraui; vimcode-private paint approximately neutral. Quality gate clean: 1950 lib tests + integration tests pass on `--no-default-features`; GTK build + clippy clean. Smoke test pending. Prior session 342 below.
+
+Prior session (342 — Apr 29): **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284), merged) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 5 commits on `issue-276-editor-primitive`. **Stage 1A** (`3fcc7fb`) lifted the supporting types (`DiagnosticSeverity` / `GitLineStatus` / `DiffLine` / `CursorShape` / `SelectionKind` / `CursorPos` / `EditorCursor` / `EditorSelection` / `Style` / `StyledSpan` / `DiagnosticMark` / `SpellMark`) + 29 new `Theme` fields + `q_theme()` chrome+editor split. **Stage 1B** (`ef45610`) added the `Editor` + `EditorLine` data structs (3 unit tests). **Stage 1C** (`c985d58`) lifted the TUI rasteriser via `to_q_editor` boundary adapter; `render_window` collapsed ~470 → ~25 LOC. **Stage 1D** (`5b23718`) lifted the GTK rasteriser; `draw_window` collapsed ~720 → ~25 LOC. **fmt fixup** (`8c8cd24`). Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui. quadraui: 290 tests pass (was 287, +3 editor); vimcode `--no-default-features` + clippy clean (1950 lib tests + integration); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean. Smoke-test follow-up filed: [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI LSP-diagnostic-dot column collision with breakpoint marker (verbatim-port behaviour). Issue [#276](https://github.com/JDonaghy/vimcode/issues/276) closed.
 
 Prior session (341 — Apr 29): Phase C stages 2–4 shipped end-to-end. [#277](https://github.com/JDonaghy/vimcode/issues/277) (`fbbc85f`/`b952c6a`/`d3abb17`/`2cc2ad9`) lifted the `Scrollbar` primitive + dual rasterisers, fixed visible-track q_theme mapping, page-jump on track click, GTK native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above per-window status line. [#278](https://github.com/JDonaghy/vimcode/issues/278) (`fd08db0`) lifted `quadraui::{tui,gtk}::draw_settings_chrome` helpers. [#279](https://github.com/JDonaghy/vimcode/issues/279) (`8e55720`) lifted the `MessageList` primitive + dual rasterisers. Three deferred chrome lifts filed: [#280](https://github.com/JDonaghy/vimcode/issues/280), [#281](https://github.com/JDonaghy/vimcode/issues/281), [#282](https://github.com/JDonaghy/vimcode/issues/282).
 
@@ -38,14 +40,14 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post Phase C Stage 1, 2026-04-29):** Editor viewport
-**lifted** (#276) — both backends paint through
-`quadraui::{tui,gtk}::draw_editor`. The editor hover popup is
-**also lifted** (#214 + #266 — `RichTextPopup` primitive shipped
-2026-04-25; rasterisers lifted 2026-04-28). TUI chrome ~98% on
-quadraui; GTK chrome ~92%. Remaining bespoke-per-backend
-duplication: GTK `Completions` popup (TUI on primitive, GTK not
-yet) and three sidebar surfaces — #280 (extension panel), #281
+**Status (post #285, 2026-04-29):** Editor viewport **lifted**
+(#276), GTK `Completions` lifted (#285), editor hover popup
+already lifted (#214 + #266 — `RichTextPopup` shipped 2026-04-25;
+rasterisers lifted 2026-04-28). Both backends paint completions
+through `quadraui::Completions` and hover popups through
+`quadraui::RichTextPopup`. TUI chrome ~98% on quadraui; GTK
+chrome ~93%. Remaining bespoke-per-backend duplication: three
+sidebar surfaces — #280 (extension panel), #281
 (debug sidebar), #282 (source control).
 
 | Surface | Primitive | TUI | GTK | Notes |
@@ -68,7 +70,7 @@ yet) and three sidebar surfaces — #280 (extension panel), #281
 | Debug toolbar | `StatusBar` | ✅ | ✅ | slice 8, `caf62a8` |
 | Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
 | Editor hover popup (markdown + code-hl + selection + scroll + links) | `RichTextPopup` | ✅ | ✅ | #214 shipped (`c8a23e9`); rasterisers lifted via #266 (`779f6e8`). Both backends consume `quadraui::{tui,gtk}::draw_rich_text_popup`. |
-| Completion popup | `Completions` | ✅ | ❌ bespoke | not yet migrated on GTK (separate slice when convenient) |
+| Completion popup | `Completions` | ✅ | ✅ | #285 — GTK lifted to `quadraui::gtk::draw_completions` |
 | Editor scrollbar (v + h paint) | `Scrollbar` | ✅ | ✅ | #277, `fbbc85f`+ |
 | Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
 | AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
