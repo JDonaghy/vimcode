@@ -1229,6 +1229,7 @@ fn event_loop(
     // `backend.wait_events()` drives the event loop; accelerators
     // registered here surface as `UiEvent::Accelerator(id, mods)`.
     let mut backend = backend::TuiBackend::new();
+    backend.set_nerd_fonts(engine.settings.use_nerd_fonts);
     register_panel_accelerators(&mut backend, &engine.settings.panel_keys);
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
