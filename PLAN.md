@@ -6,28 +6,50 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped end-to-end. The runner-crate vision is real on both TUI and GTK, and the trait surface now has zero remaining vimcode-private rasterisers. **Next priority: B.6 (Win-GUI rebuild)** — the original "next phase" target before this arc. See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped. **Next priority arc set: Phase C — duplication cleanup** (editor paint primitive + remaining chrome lifts), planned in `~/.claude/plans/next-i-want-to-precious-pancake.md`. B.6 (Win-GUI rebuild) moves to *after* Phase C — once the editor primitive lifts, B.6's Win-GUI rebuild inherits the editor paint shape automatically. See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — B.6 Win-GUI rebuild (with smoke followups in parallel)
+## 🎯 NEXT FOCUS — Phase C: editor paint primitive + chrome cleanup → B.6
 
-**Trait surface is solid across TUI + GTK.** Every primitive has
-lifted rasterisers, every rasteriser is reachable via the
-`Backend` trait, and the runner-crate vision (`quadraui::tui::run`
-/ `quadraui::gtk::run`) ships end-to-end. The B.5c → B.5e → #266 →
-#267 → #270 → #271 arc that started this season is closed.
+**The B.5c → B.5e → #266 → #267 → #270 → #271 arc closed the trait
+surface.** What's still duplicated between the `vcd` (TUI) and
+`vimcode` (GTK) binary paths is the editor "widget" paint code
+(~1500 LOC mirrored across `tui_main/render_impl.rs::render_window`
+and `gtk/draw.rs::draw_window`) plus 5 remaining chrome surfaces
+(scrollbar, settings header, AI sidebar, extension panel, debug
+sidebar, source control). Phase C closes those.
 
-**Priority order (set 2026-04-29):**
+**Phase C plan**: see `~/.claude/plans/next-i-want-to-precious-pancake.md`.
+Four Path-A landings for the next session:
 
-1. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
-   target before this arc. Win-GUI currently has its own bespoke
-   draw + click code; rebuild it as a `Backend` impl with native
-   `quadraui::win_gui::draw_*` rasterisers (DirectWrite +
-   Direct2D), modelled on how GTK and TUI consume the trait
-   post-B.5b/B.5c.
+1. **Stage 1 — `quadraui::Editor` primitive + rasterisers**
+   (largest). Lift the editor paint into a published primitive +
+   `quadraui::{tui,gtk}::draw_editor` rasterisers. Vimcode's
+   `RenderedWindow` becomes the source-of-truth for the data shape
+   (verbatim port). Net -1500 to -2000 LOC vimcode-private paint
+   code. Phase 1 only — engine slice extraction (vim grammar +
+   buffer + LSP) explicitly deferred to a separate later wave.
+2. **Stage 2 — `quadraui::Scrollbar` primitive.** Math is already
+   proven identical between backends; just lift the paint. Easy.
+3. **Stage 3 — Settings panel chrome helper.** Form body already
+   paints through `quadraui::Form`; lift the header + search row.
+   Smallest landing.
+4. **Stage 4 — AI sidebar / `MessageList`.** ListView variant with
+   alternating user/assistant backgrounds. Easy.
 
-**Independent quality work (can land any time):**
+**Deferred from Phase C (file as follow-up issues during session)**:
+- Extension panel lift (~12 hrs, depends on `TreeView` section-header extension).
+- Debug sidebar lift (~16 hrs, four-section + per-section scrollbar; hand-rolled hit-test per #210).
+- Source control panel lift (~24 hrs, complex due to inline commit-message editing).
+- **Phase 2 editor extraction** (`editor_core` crate carving out `keys.rs` + buffer + LSP from vimcode for true SQL-client embedding) — separate multi-month wave.
+
+**After Phase C**: B.6 — Win-GUI rebuild on quadraui. With the
+editor primitive lifted, Win-GUI inherits the editor paint shape
+automatically once `quadraui::win_gui::draw_editor` is added
+alongside the other rasterisers.
+
+**Independent quality work (can land any time)**:
 - #262 — Breadcrumb dropdown: parent symbols expandable but not jumpable.
 - #263 — TUI breakpoint dot missing in gutter.
 - #264 — Settings panel renders broken when sidebar narrow.
@@ -38,13 +60,14 @@ lifted rasterisers, every rasteriser is reachable via the
 
 ### Why this ordering
 
-The B.5c → #271 arc was structured precisely to land B.6 onto a
-solid trait. Doing B.6 earlier would have shipped a third backend
-with the same kind of gaps B.5b unwound. With every primitive
-lifted and trait-covered, the Win-GUI rebuild starts from
-`quadraui::Backend` + the existing rasteriser library and fills in
-native equivalents for the four that don't yet have a Win-GUI
-impl.
+Phase C lands every easy duplication win and the editor data
+primitive before B.6. With the editor primitive published, the
+Win-GUI rebuild becomes another mechanical "copy → swap paths →
+backend setters" lift (the recipe used in #268 and #270 Stage A)
+rather than an open-ended "design a third native paint path"
+project. Doing B.6 first would either (a) duplicate the editor
+paint a third time, or (b) force a partial primitive lift mid-B.6.
+Phase C avoids both.
 
 ### Phase #270 Stage A — GtkBackend lift (✅ shipped)
 
