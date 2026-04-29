@@ -1404,6 +1404,12 @@ fn event_loop(
                     size.height as f32,
                     1.0,
                 ));
+                // Keep the backend's `nerd_fonts_enabled` in sync with
+                // the engine each frame. After #268, the lifted
+                // `TuiBackend` no longer reads `crate::icons::*` directly
+                // — apps push the flag in via this setter so runtime
+                // toggles (`:set nonerdfonts`) reach the rasterisers.
+                backend.set_nerd_fonts(engine.settings.use_nerd_fonts);
                 let s = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
                 last_layout = Some(s);
                 last_layout.as_ref()
