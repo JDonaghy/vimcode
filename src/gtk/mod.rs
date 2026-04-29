@@ -21,13 +21,9 @@ use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
-use core::lsp::DiagnosticSeverity;
 use core::settings::LineNumberMode;
-use core::{Engine, GitLineStatus, OpenMode, WindowRect};
-use render::{
-    build_screen_layout, CommandLineData, CursorShape, RenderedWindow, SelectionKind,
-    SelectionRange, StyledSpan, TabInfo, Theme,
-};
+use core::{Engine, OpenMode, WindowRect};
+use render::{build_screen_layout, CommandLineData, RenderedWindow, TabInfo, Theme};
 
 use copypasta_ext::ClipboardProviderExt;
 use std::collections::HashMap;
