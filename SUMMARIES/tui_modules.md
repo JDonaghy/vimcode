@@ -20,7 +20,7 @@
 - `synth_keyevent`, `synth_mouseevent` — inverse helpers
 - 19 unit tests (15 forward + 4 round-trip)
 
-## src/tui_main/mod.rs — 4,237 lines
+## src/tui_main/mod.rs — 4,473 lines
 TUI application shell using ratatui + crossterm. Contains setup, event loop, key translation, clipboard, and cell rendering helpers.
 - `run(file_path, debug_log)` — entry point; sets up terminal, runs event loop, restores terminal on exit
 - `event_loop(terminal, engine)` — main loop: poll events, dispatch keys, call draw_frame, poll async (LSP/DAP/terminal/search)
@@ -30,17 +30,18 @@ TUI application shell using ratatui + crossterm. Contains setup, event loop, key
 - Clipboard via `copypasta_ext::x11_bin::ClipboardContext`
 - Keyboard enhancement flags for Kitty/WezTerm (disambiguate Ctrl+Shift combos)
 
-## src/tui_main/render_impl.rs — 3,944 lines
+## src/tui_main/render_impl.rs — 2,614 lines
 All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 - `draw_frame(frame, engine, theme)` — top-level render function
 - `build_screen_for_tui(engine, cols, rows)` — compute layout geometry
 - Tab bar rendering per editor group
-- Editor window rendering (syntax spans → ratatui Spans)
+- `render_window` — **collapsed to ~25-line delegator post #276** (calls `quadraui::tui::draw_editor` via `render::to_q_editor` + `q_theme()`; applies `EditorPaintResult.cursor_position` for Bar/Underline shapes; paints per-window status line at reserved row). The pre-#276 paint body + `render_text_line` + `render_selection` + `render_scrollbar` + `render_h_scrollbar` helpers now live in `quadraui/src/tui/editor.rs`.
 - Popup rendering: completion, hover, picker, dialog, context menu, diff peek, signature help
 - Per-window status line rendering (`render_window_status_line`)
 - Global status line + command line + wildmenu rendering
 - Menu bar + dropdown rendering (centered nav arrows + Command Center search box)
 - Debug toolbar rendering
+- `char_col_to_visual` — kept as helper for mouse hit-tests (used outside the editor paint path).
 
 ## src/tui_main/panels.rs — 4,034 lines
 Sidebar panel rendering for all TUI panels.

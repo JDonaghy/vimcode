@@ -1,4 +1,4 @@
-# src/render.rs — ~9,762 lines
+# src/render.rs — ~11,941 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -60,6 +60,7 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)
+- `to_q_editor(rw)` — boundary adapter `&RenderedWindow → quadraui::Editor` (#276 Stage 1C). Plus `to_q_editor_line`, `to_q_styled_span`, `to_q_cursor_pos`, `to_q_cursor_shape`, `to_q_selection`, `to_q_severity`, `to_q_git_status`, `to_q_diff_line`, `to_q_diagnostic_mark`, `to_q_spell_mark` per-type converters.
 - `format_button_label(label, hotkey)` — dialog button label formatter
 - `visual_rows_for_line(len, cols)` — wrapped line row count
 - `Theme::from_name(name)` — theme lookup by name

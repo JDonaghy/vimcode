@@ -6,129 +6,108 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Phase C **stages 2–4 shipped** — #277 Scrollbar, #278 settings chrome, #279 MessageList. Stage 1 (#276 editor primitive) remains the next big lift, deferred to a dedicated session because the data primitive + dual rasterisers + verbatim paint port are ~2000 LOC of careful work. B.6 (Win-GUI rebuild) is still parked behind Stage 1. See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (Session 342 — **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 4 sub-commits + fmt fixup on `issue-276-editor-primitive`. Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. The editor viewport is now lifted; the only TUI/GTK duplication left is in three sidebar surfaces (#280 / #281 / #282), the rich hover popup (#214), and GTK's not-yet-migrated completion popup. See "🎯 NEXT FOCUS" below.)
 
 ---
 
-## 🎯 NEXT FOCUS — Phase C Stage 1: editor paint primitive → B.6
+## 🎯 NEXT FOCUS — Eliminate remaining TUI/GTK duplication
 
-**Phase C stages 2–4 shipped this session** (`fbbc85f`/`fd08db0`/`8e55720`):
+After Stage 1, **the editor viewport itself is no longer duplicated**.
+What's left is three sidebar surfaces still hand-rolled per backend,
+one rich-document popup that needs a new primitive, and one popup
+that's lifted on TUI but not yet on GTK. Each is a discrete lift,
+none blocks the others.
 
-- ✅ **Stage 2** ([#277](https://github.com/JDonaghy/vimcode/issues/277)): `quadraui::Scrollbar` primitive + dual rasterisers + visible-track q_theme mapping + page-jump on track click. Includes GTK-side fixes for native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above per-window status line.
-- ✅ **Stage 3** ([#278](https://github.com/JDonaghy/vimcode/issues/278)): `quadraui::{tui,gtk}::draw_settings_chrome` helpers. Settings panel header + search row paint through quadraui; form body already did via `Form`.
-- ✅ **Stage 4** ([#279](https://github.com/JDonaghy/vimcode/issues/279)): `quadraui::MessageList` primitive + dual rasterisers. AI sidebar message-history paint loop lifted; header / separator / input area / focus border stay panel-specific.
+### The remaining duplication, ranked by ease × payoff
 
-**Remaining Phase C work**:
+| # | Surface | Issue | Effort | Why next |
+|---|---|---|---|---|
+| 1 | **GTK `Completions` popup** | (no issue yet) | small (~1 day) | TUI already on `quadraui::Completions`; GTK still bespoke. Smallest remaining lift, eliminates one full duplication. |
+| 2 | **Extension panel** | [#280](https://github.com/JDonaghy/vimcode/issues/280) | ~12 hrs | Extends `TreeView` with section headers; data shape is straightforward. Mechanical port once the primitive accepts headers. |
+| 3 | **Editor hover popup (RichTextPopup)** | [#214](https://github.com/JDonaghy/vimcode/issues/214) | medium (new primitive) | Needs **new primitive** that handles markdown + code-hl + selection + scroll + links. Higher design cost than the chrome lifts but eliminates the most LOC of bespoke duplication still left after Stage 1. |
+| 4 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). Best done after #214 since the section-shape may inform a `MultiSectionView` primitive. |
+| 5 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
 
-1. **Stage 1 — `quadraui::Editor` primitive + dual rasterisers**
-   ([#276](https://github.com/JDonaghy/vimcode/issues/276), largest, deferred).
-   Lift the editor paint into a published primitive +
-   `quadraui::{tui,gtk}::draw_editor` rasterisers. Vimcode's
-   `RenderedWindow` becomes the source-of-truth for the data shape
-   (verbatim port). ~600 LOC of new quadraui types + ~25 new
-   `Theme` fields + ~1200 LOC of careful paint port + adapter +
-   collapse — a dedicated session. Net -1500 to -2000 LOC
-   vimcode-private paint code on landing. Phase 1 only — engine
-   slice extraction (vim grammar + buffer + LSP) explicitly
-   deferred to a separate later wave.
+**Recommended order:** GTK `Completions` (warm-up) → #280 (mechanical
+TreeView extension) → #214 (design pass on RichTextPopup) → #281 → #282.
+The sequencing is "smallest lifts first to bank quick wins; hardest
+last when patterns are established."
 
-### Stage 1 pickup checklist (cold start)
+### Strategic complement — B.6 Win-GUI rebuild
 
-For a new session opening this branch fresh:
+[B.6](#phase-b6--win-gui-rebuild) is **unblocked** now that the editor
+primitive is lifted. Win-GUI rebuild on quadraui is the natural
+multi-week project once the TUI/GTK duplication is fully drained.
+**B.6 doesn't eliminate TUI/GTK duplication** — it adds a third
+backend that consumes the same primitives — so it sits orthogonal
+to the focus above. Pick it up after the chrome lifts, or in
+parallel if a Win-GUI session opens up.
 
-1. **Read `docs/PHASE_C_PLAN.md` Stage 1 section** — it has the
-   complete file list, the data primitive shape, and the recommended
-   verification commands. PLAN.md is a pointer; that doc is the plan.
-2. **Read GitHub issue [#276](https://github.com/JDonaghy/vimcode/issues/276)**
-   for the issue-body summary (mirrors `docs/PHASE_C_PLAN.md`
-   Stage 1).
-3. **Read `quadraui/docs/DECISIONS.md`** and
+### Independent quality work (can land any time)
+
+Pre-existing or smoke-test follow-ups, none blocking the duplication-
+elimination arc:
+
+- [#262](https://github.com/JDonaghy/vimcode/issues/262) — Breadcrumb dropdown: parent symbols expandable but not jumpable.
+- [#263](https://github.com/JDonaghy/vimcode/issues/263) — TUI breakpoint dot missing in gutter.
+- [#264](https://github.com/JDonaghy/vimcode/issues/264) — Settings panel renders broken when sidebar narrow.
+- [#265](https://github.com/JDonaghy/vimcode/issues/265) — TUI nerd-font wide-glyph predicate disagrees with terminal.
+- [#272](https://github.com/JDonaghy/vimcode/issues/272) — GTK go-to-definition link click in focused hover does nothing.
+- [#273](https://github.com/JDonaghy/vimcode/issues/273) — GTK cairo dialog spawns without keyboard focus until → pressed.
+- [#274](https://github.com/JDonaghy/vimcode/issues/274) — Inventory + replace remaining native gtk4::Dialog widgets.
+- [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI: LSP diagnostic dot overwrites breakpoint marker (gutter column collision; verbatim-port behaviour from #276 surfaced during smoke).
+
+### Pickup checklist for any of the above
+
+1. **Read `quadraui/docs/DECISIONS.md`** and
    **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §9** — primitive-
    distinctness principles + resolved decisions log. Required per
    `CLAUDE.md` for any work that touches `quadraui/`.
-4. **Read both paint sites in full before designing the primitive**:
-   `src/tui_main/render_impl.rs::render_window` (~470 LOC, lines
-   1959-2429) and `src/gtk/draw.rs::draw_window` (~720 LOC, lines
-   1090-1810). The primitive shape has to support every paint
-   category these touch.
-5. **Read `src/render.rs` lines 245-770** for the `RenderedWindow` /
-   `RenderedLine` source-of-truth field shapes. **Translate
-   verbatim — don't redesign**.
+2. **Look at the most-recent primitive lift as a template:**
+   - `quadraui/src/primitives/editor.rs` (#276) for primitive shape +
+     unit-test pattern + serde-friendly types.
+   - `quadraui/src/{tui,gtk}/editor.rs` (#276) for verbatim-port
+     rasterisers with private helpers.
+   - `src/render.rs::to_q_editor` (#276) for boundary-adapter shape.
+3. **Verbatim port first; redesign later.** Stage 1 of #276 hardened
+   this rule: lift the data shape from the engine-side IR
+   field-for-field, then iterate. The Stage 2 scrollbar caveat (TUI
+   and GTK had subtly different math) applies — diff each paint
+   category before assuming the two backends draw the same shape.
 
-### Stage 1 known sharp edges
+## ✅ Phase C — quadraui duplication cleanup (closed)
 
-Discovered while surveying for the Stage 1 lift but not yet hit
-because Stage 1 was deferred. A fresh session will run into these
-within the first hour; surfacing them up front saves the discovery:
+Phase C umbrella: [#275](https://github.com/JDonaghy/vimcode/issues/275).
+All four numbered stages shipped:
 
-- **`StyledSpan` impedance mismatch**.
-  `vimcode::render::StyledSpan` is byte-range based
-  (`start_byte`, `end_byte`, `style`). `quadraui::StyledSpan`
-  (existing) is owned-text based (`text`, `fg`, `bg`, …). The
-  editor primitive needs the byte-range shape (verbatim port);
-  decision required: introduce a parallel
-  `quadraui::editor::StyledSpan` shape, or extend the existing
-  `StyledSpan` with an optional byte-range variant. Plan
-  recommends the parallel-shape route via a sub-module
-  (`quadraui::editor::*`) so the existing primitive's plugin-
-  serialisable shape stays clean.
-- **`DiagnosticSeverity` lift**. `RenderedLine` references
-  `crate::core::lsp::DiagnosticSeverity` (an enum, 4 variants).
-  Quadraui can't depend on vimcode core, so this needs lifting
-  into `quadraui::editor::DiagnosticSeverity` (mirror) with the
-  vimcode-side adapter mapping at the boundary.
-- **Phase C plan claimed "math is identical between backends" for
-  scrollbars; that was slightly wrong** (TUI used
-  `floor(scroll/total * track)`, GTK used
-  `(scroll/(total-visible)) * (track - thumb)`). Stage 2 worked
-  around this by keeping each backend's math at the call site and
-  only lifting the paint. **Stage 1's "verbatim port" claim
-  should be verified the same way** — diff each paint category
-  between TUI and GTK and confirm true equivalence before
-  writing the rasteriser, or lift the data primitive and let each
-  backend paint with its existing helpers.
-- **`q_theme()` will grow ~25 fields**. Both adapters are already
-  ~35 lines long, mostly verbatim mappings. Adding 25 more fields
-  is mechanical but worth a structural look — possibly extract a
-  helper or split into `q_theme_chrome()` + `q_theme_editor()` so
-  the surface stays comprehensible.
-- **`active_background` is editor-specific** and currently lives
-  on `vimcode::render::Theme` but not `quadraui::Theme`. The
-  editor primitive needs it; either lift it to `quadraui::Theme`
-  or make the rasteriser take it as a separate parameter. The
-  dual-bg behaviour (active vs inactive window) is a real
-  feature, not bandaid — see `RenderedWindow.show_active_bg`.
+- **Stage 1** ([#276](https://github.com/JDonaghy/vimcode/pull/284), Session 342, `3fcc7fb`/`ef45610`/`c985d58`/`5b23718`/`8c8cd24`) — `quadraui::Editor` primitive + dual rasterisers. ~470 LOC TUI + ~720 LOC GTK paint sites collapsed to ~25-line delegators. ~29 new `Theme` fields. `q_theme()` adapter split into `q_theme_chrome` + `q_theme_editor`. 290 quadraui tests pass (was 287, +3 editor).
+- **Stage 2** ([#277](https://github.com/JDonaghy/vimcode/issues/277), `fbbc85f`/`b952c6a`/`d3abb17`/`2cc2ad9`) — `quadraui::Scrollbar` primitive + dual rasterisers + visible-track q_theme mapping + page-jump on track click. GTK fixes for native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above per-window status line.
+- **Stage 3** ([#278](https://github.com/JDonaghy/vimcode/issues/278), `fd08db0`) — `quadraui::{tui,gtk}::draw_settings_chrome` helpers. Settings panel header + search row paint through quadraui; form body already did via `Form`.
+- **Stage 4** ([#279](https://github.com/JDonaghy/vimcode/issues/279), `8e55720`) — `quadraui::MessageList` primitive + dual rasterisers. AI sidebar message-history paint loop lifted; header / separator / input area / focus border stay panel-specific.
 
-**Deferred from Phase C (filed as follow-up issues this session)**:
-- [#280](https://github.com/JDonaghy/vimcode/issues/280) — Extension panel lift (~12 hrs, depends on `TreeView` section-header extension).
-- [#281](https://github.com/JDonaghy/vimcode/issues/281) — Debug sidebar lift (~16 hrs, four-section + per-section scrollbar; hand-rolled hit-test per #210).
-- [#282](https://github.com/JDonaghy/vimcode/issues/282) — Source control panel lift (~24 hrs, complex due to inline commit-message editing).
-- **Phase 2 editor extraction** (`editor_core` crate carving out `keys.rs` + buffer + LSP from vimcode for true SQL-client embedding) — separate multi-month wave.
+**Lessons captured** (apply to subsequent lifts):
 
-**After Phase C Stage 1**: B.6 — Win-GUI rebuild on quadraui. With the
-editor primitive lifted, Win-GUI inherits the editor paint shape
-automatically once `quadraui::win_gui::draw_editor` is added
-alongside the other rasterisers.
+- **Selection paint ordering is intrinsic-to-surface.** GTK paints
+  selections before text (Cairo painter order); TUI paints after
+  (cells coalesce fg+bg+char). The data primitive is shared; the
+  paint approach is not — don't try to consolidate.
+- **Cursor side-effects** that don't fit `Buffer`-only paint
+  (e.g. `Frame::set_cursor_position` for TUI Bar/Underline shapes)
+  are returned via a `*PaintResult` struct; the host applies them.
+- **Theme growth.** Adding ~25+ fields to `quadraui::Theme` for one
+  primitive is fine, but split the `q_theme()` adapter into chrome +
+  primitive halves so each section stays comprehensible.
+- **Backend-specific math.** "The math is identical" is rarely true
+  on first inspection. Stage 2 (scrollbars) and Stage 1 (cursor inversion
+  vs alpha-rect) both hit small math/mechanism divergences. The data
+  primitive can be shared while each rasteriser keeps its native
+  drawing approach.
+- **Glyphs on the primitive.** Icon characters (lightbulb, find/replace
+  glyphs) live as fields on the primitive itself, populated by the
+  host's icon registry per frame. Keeps the rasteriser independent
+  of the host's icon system.
 
-**Independent quality work (can land any time)**:
-- #262 — Breadcrumb dropdown: parent symbols expandable but not jumpable.
-- #263 — TUI breakpoint dot missing in gutter.
-- #264 — Settings panel renders broken when sidebar narrow.
-- #265 — TUI nerd-font wide-glyph predicate disagrees with terminal.
-- #272 — GTK go-to-definition link click in focused hover does nothing.
-- #273 — GTK cairo dialog spawns without keyboard focus until → pressed.
-- #274 — Inventory + replace remaining native gtk4::Dialog widgets.
-
-### Why this ordering
-
-Phase C lands every easy duplication win and the editor data
-primitive before B.6. With the editor primitive published, the
-Win-GUI rebuild becomes another mechanical "copy → swap paths →
-backend setters" lift (the recipe used in #268 and #270 Stage A)
-rather than an open-ended "design a third native paint path"
-project. Doing B.6 first would either (a) duplicate the editor
-paint a third time, or (b) force a partial primitive lift mid-B.6.
-Phase C avoids both.
+## Phase B history (everything below shipped — kept for reference)
 
 ### Phase #270 Stage A — GtkBackend lift (✅ shipped)
 
