@@ -2272,6 +2272,21 @@ impl SimpleComponent for App {
         // `dispatch_gtk_panel_accelerator` — see B.5b Stage 2.
         let mut gtk_backend = backend::GtkBackend::new();
         register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
+        // #270 lift: GtkBackend no longer reads the `crate::icons`
+        // global atomic or `UI_FONT()` macro internally (those are
+        // vimcode-private). Sync the values onto the backend instead.
+        // Re-synced per-frame in the `CacheFontMetrics` handler below
+        // so runtime toggles (`:set nonerdfonts`, `:set guifont=...`)
+        // propagate.
+        {
+            let e = engine.borrow();
+            gtk_backend.set_nerd_fonts(e.settings.use_nerd_fonts);
+            gtk_backend.set_ui_font(format!(
+                "{} {}",
+                UI_FONT_FAMILY,
+                e.settings.ui_font_size.max(1)
+            ));
+        }
         // Phase B.5b Stage 1: shared event-queue handle. Producer-side
         // signal callbacks (key/mouse/scroll on the editor DA) push
         // translated `UiEvent`s into this `RefCell<VecDeque>`; the drain
@@ -4515,6 +4530,20 @@ impl SimpleComponent for App {
                 let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
+                // #270 lift: keep the lifted `GtkBackend`'s settings-driven
+                // fields in sync with current settings. Cheap (bool +
+                // small String) and runtime toggles (`:set nonerdfonts`,
+                // `:set guifont=…`) propagate without a restart.
+                {
+                    let e = self.engine.borrow();
+                    let mut b = self.backend.borrow_mut();
+                    b.set_nerd_fonts(e.settings.use_nerd_fonts);
+                    b.set_ui_font(format!(
+                        "{} {}",
+                        UI_FONT_FAMILY,
+                        e.settings.ui_font_size.max(1)
+                    ));
+                }
                 // Compute UI font line height for sidebar click handlers.
                 if let Some(ref da) = *self.drawing_area.borrow() {
                     let font_desc = FontDescription::from_string(&UI_FONT());
