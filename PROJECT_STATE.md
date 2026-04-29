@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** Apr 29, 2026 (Session 340 — **4 issues shipped end-to-end: #266 + #267 + #270 (both stages) + #271.** The runner-crate vision is real on both TUI and GTK, and the last find_replace primitive gap is closed.  #266 (`779f6e8`): rich_text_popup + completions lifted. #267 (`8b64217`): `Backend::draw_dialog` + single-Pango-layout refactor. #270 closed end-to-end (`b256993` Stage A + `f6b5a17` Stage B): `GtkBackend` lifted, `quadraui::gtk::run<A: AppLogic>(app)` runner added with `AppLogic::AreaId` associated type, all 4 examples consolidated via `examples/common/{mini_app,demo}.rs` (1274 → 526 example LOC, -59%). #271 (`91e89e9`): `FindReplacePanel` + `FindReplaceClickTarget` + `FrHitRegion` + `compute_hit_regions` lifted from `core::engine` to `quadraui::primitives::find_replace`; both rasterisers lifted; `Theme.accent_bg` added; -681/+64 lines net. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). quadraui: 278 tests pass; vimcode `--no-default-features` + clippy clean; kubeui-gtk builds clean.
+**Last updated:** Apr 29, 2026 (Session 341 — **Phase C stages 2–4 shipped end-to-end**: [#277](https://github.com/JDonaghy/vimcode/issues/277) (`fbbc85f`/`b952c6a`/`d3abb17`/`2cc2ad9`) lifted the `Scrollbar` primitive + dual rasterisers, fixed visible-track q_theme mapping, page-jump on track click, GTK native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above the per-window status line. [#278](https://github.com/JDonaghy/vimcode/issues/278) (`fd08db0`) lifted `quadraui::{tui,gtk}::draw_settings_chrome` helpers — settings panel header + search row paint through quadraui; form body already did via `Form`. [#279](https://github.com/JDonaghy/vimcode/issues/279) (`8e55720`) lifted the `MessageList` primitive + dual rasterisers — AI sidebar message-history paint loop lifted; panel header / separator / input area / focus border stay panel-specific. Three deferred chrome lifts filed: [#280](https://github.com/JDonaghy/vimcode/issues/280) (extension panel), [#281](https://github.com/JDonaghy/vimcode/issues/281) (debug sidebar), [#282](https://github.com/JDonaghy/vimcode/issues/282) (source control). Phase C umbrella [#275](https://github.com/JDonaghy/vimcode/issues/275). quadraui: 287 tests pass (was 278, +9 fit_thumb tests); vimcode `--no-default-features` + clippy clean (5263 tests); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean.
 
-Prior session (339 — Apr 28): B.5c → B.5d → B.5e (TUI side) all shipped end-to-end. B.5c closed (#259) with seven stages of trait coverage. B.5d closed (#260) with `docs/BACKEND_SETUP_AUDIT.md`. B.5e shipped Stage A (#261, `AppLogic` + `Reaction`), then the TUI side of the runner: `TuiBackend` lifted into `quadraui::tui` (#268), `quadraui::tui::run` shipped (#269) with a working `examples/tui_app.rs`. Smoke followups filed: #262 (breadcrumb dropdown), #263 (TUI breakpoint dot), #264 (settings panel narrow), #265 (TUI nerd-font wide-glyph).
+Prior session (340 — Apr 29): #266 + #267 + #270 + #271 all shipped end-to-end. The runner-crate vision is real on both TUI and GTK, and the last find_replace primitive gap is closed. #266 (`779f6e8`): rich_text_popup + completions lifted. #267 (`8b64217`): `Backend::draw_dialog` + single-Pango-layout refactor. #270 closed end-to-end (`b256993` Stage A + `f6b5a17` Stage B): `GtkBackend` lifted, `quadraui::gtk::run<A: AppLogic>(app)` runner added with `AppLogic::AreaId` associated type, all 4 examples consolidated via `examples/common/{mini_app,demo}.rs` (1274 → 526 example LOC, -59%). #271 (`91e89e9`): `FindReplacePanel` + `FindReplaceClickTarget` + `FrHitRegion` + `compute_hit_regions` lifted from `core::engine` to `quadraui::primitives::find_replace`; both rasterisers lifted; `Theme.accent_bg` added; -681/+64 lines net.
 
-**Next priority arc set 2026-04-29** (full plan in `docs/PHASE_C_PLAN.md`, summary in PLAN.md "🎯 NEXT FOCUS"): **Phase C — duplication cleanup**. Four Path-A landings: Stage 1 lifts the editor paint (~1500 LOC mirrored across `tui_main/render_impl.rs::render_window` + `gtk/draw.rs::draw_window`) into `quadraui::Editor` + dual rasterisers (Phase 1 only — engine slice deferred). Stages 2-4 lift the easy chrome (scrollbar, settings header, AI sidebar). Three remaining chrome surfaces (extension panel, debug sidebar, source control) tracked as deferred follow-ups. **B.6 (Win-GUI rebuild) moves to *after* Phase C** so it inherits the editor paint shape automatically once `quadraui::win_gui::draw_editor` lands alongside the other rasterisers.
+**Next priority** (full plan in `docs/PHASE_C_PLAN.md`, summary in PLAN.md "🎯 NEXT FOCUS"): **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/issues/276))** — `quadraui::Editor` primitive + dual rasterisers. Big lift: ~600 LOC of new quadraui types + ~25 new `Theme` fields + ~1200 LOC of careful paint port + adapter + collapse. Net -1500 to -2000 LOC vimcode-private paint code on landing. Phase 1 only — engine slice extraction explicitly deferred. **B.6 (Win-GUI rebuild) is still parked behind Stage 1** so it inherits the editor paint shape automatically once `quadraui::win_gui::draw_editor` lands.
 
 Prior session (336): B.5 shipped 9 stages of GTK trait plumbing (`2c8fe7f` … `2d8ef54`) — `GtkBackend` struct, `Backend` trait impl, GDK→`UiEvent` translation helpers, accelerator registry, frame-scope, `is_modal_open()`, clipboard write, `open_url`. Only the quickfix panel actually consumed the trait at runtime; B.5b is the actual port.)
 
@@ -37,9 +37,13 @@ Snapshot of where each chrome surface stands on its quadraui primitive.
 TUI is the reference implementation; GTK has been catching up. Numbers
 update with each Path-A landing — read this to find the next slice.
 
-**Status:** TUI chrome ~95% on quadraui; GTK chrome ~85% after the
-Phase B.5 wave (#205 closed substantially-complete: 7/8 slices
-landed). One large surface deferred — see #214.
+**Status:** TUI chrome ~98% on quadraui; GTK chrome ~92% after the
+Phase B.5 wave (#205 closed substantially-complete) + Phase C
+stages 2–4 (#277 scrollbar, #278 settings chrome, #279 message
+list). Three sidebar surfaces remain hand-rolled per backend —
+#280 (extension panel), #281 (debug sidebar), #282 (source
+control). Editor viewport itself remains hand-rolled — Stage 1
+(#276) is the next big lift.
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -62,8 +66,13 @@ landed). One large surface deferred — see #214.
 | Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
 | Editor hover popup (markdown + code-hl + selection + scroll + links) | _RichTextPopup TBD_ | ❌ bespoke | ❌ bespoke | deferred — needs new primitive (#214) |
 | Completion popup | `Completions` | ✅ | ❌ bespoke | not yet migrated on GTK (separate slice when convenient) |
-| Ext-panel scrollbar (drag + render) | shared dispatch | ✅ drag | ❌ neither | #200 + GTK migration deferred |
-| Debug sidebar (variables tree, breakpoints, watch) | _none yet_ | ❌ bespoke | ❌ bespoke | hand-rolled hit math (#211) — candidates for TreeView extension |
+| Editor scrollbar (v + h paint) | `Scrollbar` | ✅ | ✅ | #277, `fbbc85f`+ |
+| Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
+| AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
+| Editor viewport (text + gutter + cursor + selection + diagnostics) | _Editor TBD_ | ❌ bespoke | ❌ bespoke | Stage 1 of Phase C — #276, deferred |
+| Extension panel | _TreeView extension TBD_ | ❌ bespoke | ❌ bespoke | #280, deferred (~12 hrs, needs section-header support) |
+| Debug sidebar (variables tree, breakpoints, watch) | _MultiSectionView TBD_ | ❌ bespoke | ❌ bespoke | #281, deferred (~16 hrs, hand-rolled hit math per #210/#211) |
+| Source control panel | _MultiSectionView + InlineInput TBD_ | ❌ bespoke | ❌ bespoke | #282, deferred (~24 hrs, complex) |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 

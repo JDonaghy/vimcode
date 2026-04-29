@@ -1,11 +1,23 @@
 # Phase C — editor paint primitive (Phase 1) + chrome cleanup
 
-> **Status**: Planned, ready to execute. Top-priority arc for the next
-> coding session per `PLAN.md` and `PROJECT_STATE.md`.
+> **Status**: Stages 2–4 ✅ shipped (Session 341, 2026-04-29).
+> Stage 1 (editor primitive) deferred to a dedicated session because
+> it's ~2000 LOC of careful work on its own.
 >
 > **Predecessor**: B.5c → B.5e → #266 → #267 → #270 → #271 (closed).
-> **Successor**: B.6 (Win-GUI rebuild) — moves to *after* Phase C so it
-> inherits the editor paint shape automatically.
+> **Successor**: B.6 (Win-GUI rebuild) — still parked behind Stage 1
+> so it inherits the editor paint shape automatically once
+> `quadraui::win_gui::draw_editor` lands.
+>
+> **Shipped**:
+> - ✅ Stage 2 ([#277](https://github.com/JDonaghy/vimcode/issues/277)) — `Scrollbar` primitive + dual rasterisers + visibility + page-jump fixes.
+> - ✅ Stage 3 ([#278](https://github.com/JDonaghy/vimcode/issues/278)) — `draw_settings_chrome` helpers in both backends.
+> - ✅ Stage 4 ([#279](https://github.com/JDonaghy/vimcode/issues/279)) — `MessageList` primitive + dual rasterisers.
+>
+> **Deferred follow-ups filed during this session**:
+> [#280](https://github.com/JDonaghy/vimcode/issues/280) (extension panel),
+> [#281](https://github.com/JDonaghy/vimcode/issues/281) (debug sidebar),
+> [#282](https://github.com/JDonaghy/vimcode/issues/282) (source control).
 
 ## Context
 

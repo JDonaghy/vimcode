@@ -6,45 +6,39 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped. **Next priority arc set: Phase C — duplication cleanup** (editor paint primitive + remaining chrome lifts), full plan in `docs/PHASE_C_PLAN.md`. B.6 (Win-GUI rebuild) moves to *after* Phase C — once the editor primitive lifts, B.6's Win-GUI rebuild inherits the editor paint shape automatically. See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (Phase C **stages 2–4 shipped** — #277 Scrollbar, #278 settings chrome, #279 MessageList. Stage 1 (#276 editor primitive) remains the next big lift, deferred to a dedicated session because the data primitive + dual rasterisers + verbatim paint port are ~2000 LOC of careful work. B.6 (Win-GUI rebuild) is still parked behind Stage 1. See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — Phase C: editor paint primitive + chrome cleanup → B.6
+## 🎯 NEXT FOCUS — Phase C Stage 1: editor paint primitive → B.6
 
-**The B.5c → B.5e → #266 → #267 → #270 → #271 arc closed the trait
-surface.** What's still duplicated between the `vcd` (TUI) and
-`vimcode` (GTK) binary paths is the editor "widget" paint code
-(~1500 LOC mirrored across `tui_main/render_impl.rs::render_window`
-and `gtk/draw.rs::draw_window`) plus 5 remaining chrome surfaces
-(scrollbar, settings header, AI sidebar, extension panel, debug
-sidebar, source control). Phase C closes those.
+**Phase C stages 2–4 shipped this session** (`fbbc85f`/`fd08db0`/`8e55720`):
 
-**Phase C plan**: see [`docs/PHASE_C_PLAN.md`](docs/PHASE_C_PLAN.md).
-Four Path-A landings for the next session:
+- ✅ **Stage 2** ([#277](https://github.com/JDonaghy/vimcode/issues/277)): `quadraui::Scrollbar` primitive + dual rasterisers + visible-track q_theme mapping + page-jump on track click. Includes GTK-side fixes for native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above per-window status line.
+- ✅ **Stage 3** ([#278](https://github.com/JDonaghy/vimcode/issues/278)): `quadraui::{tui,gtk}::draw_settings_chrome` helpers. Settings panel header + search row paint through quadraui; form body already did via `Form`.
+- ✅ **Stage 4** ([#279](https://github.com/JDonaghy/vimcode/issues/279)): `quadraui::MessageList` primitive + dual rasterisers. AI sidebar message-history paint loop lifted; header / separator / input area / focus border stay panel-specific.
 
-1. **Stage 1 — `quadraui::Editor` primitive + rasterisers**
-   (largest). Lift the editor paint into a published primitive +
+**Remaining Phase C work**:
+
+1. **Stage 1 — `quadraui::Editor` primitive + dual rasterisers**
+   ([#276](https://github.com/JDonaghy/vimcode/issues/276), largest, deferred).
+   Lift the editor paint into a published primitive +
    `quadraui::{tui,gtk}::draw_editor` rasterisers. Vimcode's
    `RenderedWindow` becomes the source-of-truth for the data shape
-   (verbatim port). Net -1500 to -2000 LOC vimcode-private paint
-   code. Phase 1 only — engine slice extraction (vim grammar +
-   buffer + LSP) explicitly deferred to a separate later wave.
-2. **Stage 2 — `quadraui::Scrollbar` primitive.** Math is already
-   proven identical between backends; just lift the paint. Easy.
-3. **Stage 3 — Settings panel chrome helper.** Form body already
-   paints through `quadraui::Form`; lift the header + search row.
-   Smallest landing.
-4. **Stage 4 — AI sidebar / `MessageList`.** ListView variant with
-   alternating user/assistant backgrounds. Easy.
+   (verbatim port). ~600 LOC of new quadraui types + ~25 new
+   `Theme` fields + ~1200 LOC of careful paint port + adapter +
+   collapse — a dedicated session. Net -1500 to -2000 LOC
+   vimcode-private paint code on landing. Phase 1 only — engine
+   slice extraction (vim grammar + buffer + LSP) explicitly
+   deferred to a separate later wave.
 
-**Deferred from Phase C (file as follow-up issues during session)**:
-- Extension panel lift (~12 hrs, depends on `TreeView` section-header extension).
-- Debug sidebar lift (~16 hrs, four-section + per-section scrollbar; hand-rolled hit-test per #210).
-- Source control panel lift (~24 hrs, complex due to inline commit-message editing).
+**Deferred from Phase C (filed as follow-up issues this session)**:
+- [#280](https://github.com/JDonaghy/vimcode/issues/280) — Extension panel lift (~12 hrs, depends on `TreeView` section-header extension).
+- [#281](https://github.com/JDonaghy/vimcode/issues/281) — Debug sidebar lift (~16 hrs, four-section + per-section scrollbar; hand-rolled hit-test per #210).
+- [#282](https://github.com/JDonaghy/vimcode/issues/282) — Source control panel lift (~24 hrs, complex due to inline commit-message editing).
 - **Phase 2 editor extraction** (`editor_core` crate carving out `keys.rs` + buffer + LSP from vimcode for true SQL-client embedding) — separate multi-month wave.
 
-**After Phase C**: B.6 — Win-GUI rebuild on quadraui. With the
+**After Phase C Stage 1**: B.6 — Win-GUI rebuild on quadraui. With the
 editor primitive lifted, Win-GUI inherits the editor paint shape
 automatically once `quadraui::win_gui::draw_editor` is added
 alongside the other rasterisers.
