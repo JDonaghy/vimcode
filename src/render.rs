@@ -9595,7 +9595,12 @@ pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
             pos: to_q_cursor_pos(pos),
             shape: to_q_cursor_shape(shape),
         }),
-        extra_cursors: rw.extra_cursors.iter().copied().map(to_q_cursor_pos).collect(),
+        extra_cursors: rw
+            .extra_cursors
+            .iter()
+            .copied()
+            .map(to_q_cursor_pos)
+            .collect(),
         selection: rw.selection.as_ref().map(to_q_selection),
         extra_selections: rw.extra_selections.iter().map(to_q_selection).collect(),
         yank_highlight: rw.yank_highlight.as_ref().map(to_q_selection),

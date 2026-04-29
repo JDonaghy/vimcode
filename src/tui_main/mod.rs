@@ -4471,4 +4471,3 @@ fn save_session(engine: &mut Engine) {
 fn rc(c: Color) -> RColor {
     RColor::Rgb(c.r, c.g, c.b)
 }
-

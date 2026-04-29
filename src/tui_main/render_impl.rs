@@ -1999,7 +1999,15 @@ pub(super) fn render_window(
     }
 
     if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
-        render_window_status_line(backend, frame, editor_area.x, sy, editor_area.width, status, theme);
+        render_window_status_line(
+            backend,
+            frame,
+            editor_area.x,
+            sy,
+            editor_area.width,
+            status,
+            theme,
+        );
     }
 }
 
