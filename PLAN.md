@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped. **Next priority arc set: Phase C — duplication cleanup** (editor paint primitive + remaining chrome lifts), planned in `~/.claude/plans/next-i-want-to-precious-pancake.md`. B.6 (Win-GUI rebuild) moves to *after* Phase C — once the editor primitive lifts, B.6's Win-GUI rebuild inherits the editor paint shape automatically. See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (#266 + #267 + #270 + #271 all shipped. **Next priority arc set: Phase C — duplication cleanup** (editor paint primitive + remaining chrome lifts), full plan in `docs/PHASE_C_PLAN.md`. B.6 (Win-GUI rebuild) moves to *after* Phase C — once the editor primitive lifts, B.6's Win-GUI rebuild inherits the editor paint shape automatically. See "🎯 NEXT FOCUS" section below.)
 
 ---
 
@@ -20,7 +20,7 @@ and `gtk/draw.rs::draw_window`) plus 5 remaining chrome surfaces
 (scrollbar, settings header, AI sidebar, extension panel, debug
 sidebar, source control). Phase C closes those.
 
-**Phase C plan**: see `~/.claude/plans/next-i-want-to-precious-pancake.md`.
+**Phase C plan**: see [`docs/PHASE_C_PLAN.md`](docs/PHASE_C_PLAN.md).
 Four Path-A landings for the next session:
 
 1. **Stage 1 — `quadraui::Editor` primitive + rasterisers**
