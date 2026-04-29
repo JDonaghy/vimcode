@@ -11642,7 +11642,17 @@ fn h_scrollbar_geometry(
 
     let sb_height = (line_height * 0.35).round().max(4.0);
     let track_x = rect.x;
-    let track_y = rect.y + rect.height - sb_height;
+    // Per-window status line lives at `rect.y + rect.height -
+    // line_height` and paints after the scrollbars, so anchor the
+    // h-scrollbar above it when the status line is on. Otherwise the
+    // status bar overdraws the entire scrollbar (it's `line_height`
+    // tall vs the scrollbar's ~5px).
+    let status_offset = if engine.settings.window_status_line && !engine.terminal_maximized {
+        line_height
+    } else {
+        0.0
+    };
+    let track_y = rect.y + rect.height - sb_height - status_offset;
     let scroll_range = (max_line_length - visible_cols).max(1.0);
     let thumb_frac = visible_cols / max_line_length;
     let thumb_w = (thumb_frac * track_w).max(20.0).min(track_w);
@@ -11880,6 +11890,16 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
         )
         .build();
     gtk_app.connect_command_line(|app, _| {
+        // GTK4 default is to warp the slider to the click position on
+        // a trough left-click — that means clicking near the bottom of
+        // the editor scrollbar in a long file jumps thousands of lines
+        // away from the cursor. Disabling makes left-click page by
+        // `page_increment` (one viewport, since we set that per-frame
+        // alongside `page_size`); middle-click / shift-click retain
+        // the warp behaviour for users who want it.
+        if let Some(settings) = gtk4::Settings::default() {
+            settings.set_gtk_primary_button_warps_slider(false);
+        }
         app.activate();
         0
     });
