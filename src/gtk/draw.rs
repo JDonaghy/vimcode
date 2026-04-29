@@ -5565,8 +5565,6 @@ pub(super) fn draw_ai_sidebar(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (user_r, user_g, user_b) = theme.keyword.to_cairo();
-    let (asst_r, asst_g, asst_b) = theme.string_lit.to_cairo();
 
     // Background
     cr.set_source_rgb(bg_r, bg_g, bg_b);
@@ -5629,18 +5627,22 @@ pub(super) fn draw_ai_sidebar(
     let max_row_y = input_y; // messages render above this
 
     // ── Message history ───────────────────────────────────────────────────────
-    let mut vis_rows: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    let q_user_fg = render::to_quadraui_color(theme.keyword);
+    let q_asst_fg = render::to_quadraui_color(theme.string_lit);
+    let q_default_fg = render::to_quadraui_color(theme.foreground);
+    let q_dim_fg = render::to_quadraui_color(theme.line_number_fg);
+    let mut rows: Vec<quadraui::MessageRow> = Vec::new();
     for msg in &ai.messages {
         let is_user = msg.role == "user";
-        let (role_label, rr, rg, rb) = if is_user {
-            ("You:", user_r, user_g, user_b)
+        let (role_label, role_fg) = if is_user {
+            ("You:", q_user_fg)
         } else {
-            ("AI:", asst_r, asst_g, asst_b)
+            ("AI:", q_asst_fg)
         };
-        vis_rows.push((role_label.to_string(), rr, rg, rb, 4.0));
+        rows.push(quadraui::MessageRow::new(role_label, role_fg, 4.0));
         for line in msg.content.lines() {
             if line.is_empty() {
-                vis_rows.push((" ".to_string(), fg_r, fg_g, fg_b, 12.0));
+                rows.push(quadraui::MessageRow::new(" ", q_default_fg, 12.0));
                 continue;
             }
             let chars: Vec<char> = line.chars().collect();
@@ -5648,26 +5650,28 @@ pub(super) fn draw_ai_sidebar(
             while pos < chars.len() {
                 let end = (pos + wrap_cols).min(chars.len());
                 let chunk: String = chars[pos..end].iter().collect();
-                vis_rows.push((chunk, fg_r, fg_g, fg_b, 12.0));
+                rows.push(quadraui::MessageRow::new(chunk, q_default_fg, 12.0));
                 pos = end;
             }
         }
-        vis_rows.push((" ".to_string(), dim_r, dim_g, dim_b, 0.0));
+        rows.push(quadraui::MessageRow::new(" ", q_dim_fg, 0.0));
     }
-
-    let scroll = ai.scroll_top.min(vis_rows.len().saturating_sub(1));
-    for (i, (text, rr, rg, rb, xi)) in vis_rows.iter().enumerate().skip(scroll) {
-        let vrow = (i - scroll + 1) as f64;
-        let ry = vrow * line_height;
-        if ry >= max_row_y {
-            break;
-        }
-        cr.set_source_rgb(*rr, *rg, *rb);
-        layout.set_text(text);
-        let (_, lh) = layout.pixel_size();
-        cr.move_to(x + xi, y + ry + (line_height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
+    let scroll = ai.scroll_top.min(rows.len().saturating_sub(1));
+    let msg_list = quadraui::MessageList {
+        id: quadraui::WidgetId::new("gtk:ai:messages"),
+        rows,
+        scroll_top: scroll,
+    };
+    quadraui::gtk::draw_message_list(
+        cr,
+        layout,
+        &msg_list,
+        x,
+        y + line_height,
+        w,
+        y + max_row_y,
+        line_height,
+    );
 
     // ── Input area (grows with content) ───────────────────────────────────────
     // Separator line

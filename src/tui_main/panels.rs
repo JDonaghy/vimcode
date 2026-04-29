@@ -3017,8 +3017,6 @@ pub(super) fn render_ai_sidebar(
     let default_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
     let panel_bg = rc(theme.completion_bg);
-    let user_fg = rc(theme.keyword);
-    let asst_fg = rc(theme.string_lit);
     let input_bg = rc(theme.fuzzy_selected_bg);
 
     let write_row =
@@ -3064,15 +3062,19 @@ pub(super) fn render_ai_sidebar(
     // ── Message history ───────────────────────────────────────────────────────
     let scroll = ai.scroll_top;
     let wrap_w = content_w.saturating_sub(1).max(10); // slightly narrower for "  " indent
-    let mut all_rows: Vec<(String, RColor)> = Vec::new();
+    let q_user_fg = render::to_quadraui_color(theme.keyword);
+    let q_asst_fg = render::to_quadraui_color(theme.string_lit);
+    let q_default_fg = render::to_quadraui_color(theme.foreground);
+    let q_panel_bg = render::to_quadraui_color(theme.completion_bg);
+    let mut rows: Vec<quadraui::MessageRow> = Vec::new();
     for msg in &ai.messages {
         let is_user = msg.role == "user";
         let role_label = if is_user { "You:" } else { "AI:" };
-        let role_fg = if is_user { user_fg } else { asst_fg };
-        all_rows.push((role_label.to_string(), role_fg));
+        let role_fg = if is_user { q_user_fg } else { q_asst_fg };
+        rows.push(quadraui::MessageRow::new(role_label, role_fg, 0.0));
         for line in msg.content.lines() {
             if line.is_empty() {
-                all_rows.push(("  ".to_string(), default_fg));
+                rows.push(quadraui::MessageRow::new("", q_default_fg, 2.0));
                 continue;
             }
             let chars: Vec<char> = line.chars().collect();
@@ -3080,30 +3082,46 @@ pub(super) fn render_ai_sidebar(
             while pos < chars.len() {
                 let end = (pos + wrap_w).min(chars.len());
                 let chunk: String = chars[pos..end].iter().collect();
-                all_rows.push((format!("  {}", chunk), default_fg));
+                rows.push(quadraui::MessageRow::new(chunk, q_default_fg, 2.0));
                 pos = end;
             }
         }
-        all_rows.push((" ".to_string(), panel_bg)); // blank separator
+        rows.push(quadraui::MessageRow::new("", q_panel_bg, 0.0)); // blank separator
     }
 
-    let total = all_rows.len();
+    let total = rows.len();
     let start = scroll.min(total.saturating_sub(msg_area_height as usize));
-    for (i, (text, fg)) in all_rows.iter().enumerate().skip(start) {
-        if y >= area.y + 1 + msg_area_height {
-            break;
-        }
-        write_row(buf, y, text, *fg, panel_bg);
-        y += 1;
-        let _ = i;
-    }
+    let msg_list = quadraui::MessageList {
+        id: quadraui::WidgetId::new("tui:ai:messages"),
+        rows,
+        scroll_top: start,
+    };
+    quadraui::tui::draw_message_list(
+        buf,
+        Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: msg_area_height,
+        },
+        &msg_list,
+        q_panel_bg,
+    );
+    y += msg_area_height;
 
-    // Fill remaining message area
-    while y < area.y + 1 + msg_area_height {
+    // Fill any rows the message list didn't cover (when there are
+    // fewer messages than the visible area).
+    let painted = msg_list
+        .rows
+        .len()
+        .saturating_sub(start)
+        .min(msg_area_height as usize) as u16;
+    let mut fill_y = area.y + 1 + painted;
+    while fill_y < area.y + 1 + msg_area_height {
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', dim_fg, panel_bg);
+            set_cell(buf, x, fill_y, ' ', dim_fg, panel_bg);
         }
-        y += 1;
+        fill_y += 1;
     }
 
     // ── Separator ─────────────────────────────────────────────────────────────
