@@ -4401,63 +4401,21 @@ pub(super) fn draw_settings_panel(
     cr.fill().ok();
     layout.set_attributes(None);
 
-    // ── Row 0: header bar ────────────────────────────────────────────────────
-    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
-    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-    layout.set_text("  SETTINGS");
+    // ── Rows 0–1: header + search input chrome ──────────────────────────────
+    quadraui::gtk::draw_settings_chrome(
+        cr,
+        layout,
+        x,
+        y,
+        w,
+        line_height,
+        "  SETTINGS",
+        &engine.settings_query,
+        "Search settings…",
+        engine.settings_input_active,
+        &super::quadraui_gtk::q_theme(theme),
+    );
     let (_, header_lh) = layout.pixel_size();
-    cr.move_to(x + 2.0, y + (line_height - header_lh as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    // ── Row 1: search input ──────────────────────────────────────────────────
-    let search_y = y + line_height;
-    let search_active = engine.settings_input_active;
-    let (sb_r, sb_g, sb_b) = if search_active {
-        (sel_r, sel_g, sel_b)
-    } else {
-        (bg_r, bg_g, bg_b)
-    };
-    cr.set_source_rgb(sb_r, sb_g, sb_b);
-    cr.rectangle(x, search_y, w, line_height);
-    cr.fill().ok();
-
-    let prefix = " /  ";
-    cr.set_source_rgb(dim_r, dim_g, dim_b);
-    layout.set_text(prefix);
-    let (prefix_w, _) = layout.pixel_size();
-    cr.move_to(x + 2.0, search_y + (line_height - header_lh as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    let q_x = x + 2.0 + prefix_w as f64;
-    let q_color = if engine.settings_query.is_empty() {
-        (dim_r, dim_g, dim_b)
-    } else {
-        (fg_r, fg_g, fg_b)
-    };
-    let q_text: &str = if engine.settings_query.is_empty() && !search_active {
-        "Search settings…"
-    } else {
-        engine.settings_query.as_str()
-    };
-    cr.set_source_rgb(q_color.0, q_color.1, q_color.2);
-    layout.set_text(q_text);
-    let (q_w, _) = layout.pixel_size();
-    cr.move_to(q_x, search_y + (line_height - header_lh as f64) / 2.0);
-    pangocairo::show_layout(cr, layout);
-
-    if search_active {
-        let cur_x = q_x
-            + if engine.settings_query.is_empty() {
-                0.0
-            } else {
-                q_w as f64
-            };
-        cr.set_source_rgb(accent_r, accent_g, accent_b);
-        cr.rectangle(cur_x, search_y + 2.0, 1.5, line_height - 4.0);
-        cr.fill().ok();
-    }
 
     // ── Body: form + scrollbar; bottom row reserved for footer ──────────────
     let body_y = y + line_height * 2.0;

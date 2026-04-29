@@ -797,8 +797,6 @@ pub(super) fn render_settings_panel(
     let buf = frame.buffer_mut();
     use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
 
-    let header_fg = rc(theme.status_fg);
-    let header_bg = rc(theme.status_bg);
     let fg = rc(theme.foreground);
     let bg = rc(theme.tab_bar_bg);
     let dim_fg = rc(theme.line_number_fg);
@@ -821,49 +819,23 @@ pub(super) fn render_settings_panel(
         }
     }
 
-    // Row 0: Header " SETTINGS"
-    let header_y = area.y;
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, header_y, ' ', header_fg, header_bg);
-    }
-    let mut x = area.x;
-    for ch in " SETTINGS".chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, header_y, ch, header_fg, header_bg);
-        x += 1;
-    }
-
-    // Row 1: Search input
-    let search_y = area.y + 1;
-    if search_y < area.y + area.height {
-        let search_bg = if engine.settings_input_active {
-            rc(theme.sidebar_sel_bg)
-        } else {
-            bg
-        };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, search_y, ' ', fg, search_bg);
-        }
-        let mut x = area.x;
-        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
-        x += 1;
-        set_cell(buf, x, search_y, '/', dim_fg, search_bg);
-        x += 1;
-        set_cell(buf, x, search_y, ' ', dim_fg, search_bg);
-        x += 1;
-        for ch in engine.settings_query.chars() {
-            if x >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, x, search_y, ch, fg, search_bg);
-            x += 1;
-        }
-        if engine.settings_input_active && x < area.x + area.width {
-            set_cell(buf, x, search_y, '█', fg, search_bg);
-        }
-    }
+    // Rows 0–1: header + search input chrome.
+    let chrome_h = area.height.min(2);
+    let chrome_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: chrome_h,
+    };
+    quadraui::tui::draw_settings_chrome(
+        buf,
+        chrome_area,
+        " SETTINGS",
+        &engine.settings_query,
+        "",
+        engine.settings_input_active,
+        &super::quadraui_tui::q_theme(theme),
+    );
 
     // Rows 2+: scrollable form content
     let content_start = area.y + 2;
