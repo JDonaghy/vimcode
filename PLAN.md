@@ -6,28 +6,20 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266, #267 shipped; **#270 Stage A shipped in `b256993`** — `GtkBackend` + `GtkPlatformServices` + GDK→UiEvent lifted into `quadraui::gtk::*` parallel to #268. Stage B (runner + multi-DrawingArea design) held pending design pick. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). **Next priority arc: #270 Stage B → #271 → B.6.** See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (#266, #267, #270 shipped; #270 Stage B in `f6b5a17` adds `quadraui::gtk::run<A: AppLogic>(app)` runner + `AppLogic::AreaId` associated type. The runner-crate vision now ships end-to-end on both TUI and GTK; example LOC dropped 1274 → 526 (-59%) by routing all four examples through `examples/common/{mini_app,demo}.rs`. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). **Next priority arc: #271 → B.6.** See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — #270 Stage B → #271 → B.6 (with smoke followups in parallel)
+## 🎯 NEXT FOCUS — #271 → B.6 (with smoke followups in parallel)
 
-**#266, #267, and #270 Stage A shipped on the TUI side + GTK
-backend lift.** Stage B (the GTK runner + multi-DrawingArea
-design) is the next focused work, then find_replace primitive
-migration, then Win-GUI rebuild.
+**The runner-crate vision shipped end-to-end across the TUI and
+GTK backends.** Remaining priority arc closes the find_replace
+primitive gap, then rebuilds Win-GUI on the now-solid trait
+surface.
 
 **Priority order (set 2026-04-29):**
 
-1. **#270 Stage B — GTK runner + multi-DrawingArea support.**
-   `GtkBackend` is now in `quadraui::gtk::backend` (Stage A,
-   `b256993`). The remaining work is the runner —
-   `quadraui::gtk::run<A: AppLogic>(app)` parallel to
-   `quadraui::tui::run` — and the multi-DrawingArea design.
-   Vimcode has ~20 `set_draw_func` surfaces; the runner needs a
-   way to express "render scene N to DrawingArea N." Two design
-   candidates in #270 — pick during pickup.
-2. **#271 — find_replace primitive migration.** Move `FrHitRegion`,
+1. **#271 — find_replace primitive migration.** Move `FrHitRegion`,
    `FindReplaceClickTarget`, `FR_PANEL_WIDTH`, and
    `compute_find_replace_hit_regions` from `core::engine` to a new
    `quadraui::primitives::find_replace`. Then lift the per-backend
@@ -36,7 +28,7 @@ migration, then Win-GUI rebuild.
    `crate::icons::FIND_REPLACE*` glyph constants with a
    backend-agnostic carrier. Bigger than the other rasteriser lifts
    because it needs primitive-level work, not just a copy.
-3. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
+2. **B.6 — Win-GUI rebuild on quadraui.** The original "next phase"
    target before this arc. Win-GUI currently has its own bespoke
    draw + click code; rebuild it as a `Backend` impl with native
    rasterisers in `quadraui::win_gui::*`.
@@ -52,12 +44,11 @@ migration, then Win-GUI rebuild.
 
 ### Why this ordering
 
-#270 closes the runner-crate vision symmetrically with the TUI
-side. #271 fills the last trait-coverage gap. B.6 was always
-queued for "after the trait is solid"; post-#271, it is. Doing
-B.6 first would ship a third backend with the same kind of gaps
-B.5b unwound — the very problem this whole arc was structured to
-prevent.
+#271 fills the last trait-coverage gap (find_replace is the only
+remaining vimcode-private rasteriser pair). B.6 was always queued
+for "after the trait is solid"; post-#271, it is. Doing B.6 first
+would ship a third backend with the same kind of gaps B.5b unwound
+— the very problem this whole arc was structured to prevent.
 
 ### Phase #270 Stage A — GtkBackend lift (✅ shipped)
 
@@ -77,15 +68,26 @@ Vimcode-private deps replaced with backend-stored fields:
 Vimcode-side `src/gtk/{backend,events,services}.rs` collapsed to
 thin re-exports — call sites unchanged.
 
-### Phase #270 Stage B — GTK runner (next)
+### Phase #270 Stage B — GTK runner (✅ shipped)
 
-**Pickup files (eventual):**
-- `quadraui/src/gtk/run.rs` (new — runner).
-- `quadraui/examples/gtk_app.rs` (validates end-to-end, mirrors `tui_app.rs`).
+`f6b5a17` shipped:
+- `quadraui::gtk::run<A: AppLogic>(app)` runner — single-DA shell
+  with cairo + Pango setup, theme-bg clear at frame start, key /
+  mouse / scroll → UiEvent translation, Reaction dispatch
+  (Continue / Redraw / Exit). Returns `std::process::ExitCode`.
+- `AppLogic::AreaId` associated type (option B target-routed
+  render) — same trait shape works on both backends. Single-area
+  apps use `type AreaId = ()`.
+- `quadraui/examples/gtk_app.rs` end-to-end + all four examples
+  (tui_app, gtk_app, tui_demo, gtk_demo) consolidated through
+  `examples/common/{mini_app,demo}.rs`. Backend example files
+  collapsed to ~22-line `main()` trampolines; example LOC dropped
+  1274 → 526 (-59%).
 
-The novel work is the multi-area runner. Two sketches in #270
-(closure-per-area registration vs target-routed render). Read
-`docs/BACKEND_SETUP_AUDIT.md` §9 question 6 before deciding.
+Multi-DrawingArea support (vimcode-style ~20 DAs) is the
+trait-level shape ready (`AreaId` is the plumbing) but the runner
+ships single-DA only. A multi-area runner shape will land when
+there's an actual consumer asking for it.
 
 ### Phase #266 — Lift remaining 3 rasterisers (✅ partially shipped)
 
@@ -153,7 +155,6 @@ quadraui's primitive layouts so it doesn't re-derive what TUI/GTK
 already nailed down.
 
 **Tracking issues:**
-- [#270](https://github.com/JDonaghy/vimcode/issues/270) — GTK runner.
 - [#271](https://github.com/JDonaghy/vimcode/issues/271) — find_replace primitive lift (deferred from #266).
 - [#262](https://github.com/JDonaghy/vimcode/issues/262) — breadcrumb dropdown.
 - [#263](https://github.com/JDonaghy/vimcode/issues/263) — TUI breakpoint dot.
