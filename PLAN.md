@@ -6,29 +6,27 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (#266 partially shipped in `779f6e8`; #267 shipped in `8b64217`. #266: rich_text_popup (TUI + GTK) + completions (TUI) lifted; find_replace deferred to **#271** (primitive migration). #267: `quadraui::gtk::draw_dialog` refactored to single-Pango-layout + `ui_font_desc`; `Backend::draw_dialog` trait method added — closes the last "trait-less primitive" gap on dialog. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). **Next priority arc: #270 → #271 → B.6.** See "🎯 NEXT FOCUS" section below.)
+> **Last updated:** 2026-04-29 (#266, #267 shipped; **#270 Stage A shipped in `b256993`** — `GtkBackend` + `GtkPlatformServices` + GDK→UiEvent lifted into `quadraui::gtk::*` parallel to #268. Stage B (runner + multi-DrawingArea design) held pending design pick. Smoke filed: **#272** (GTK link click in focused hover), **#273** (cairo dialog focus-on-spawn — preexisting), **#274** (inventory + replace remaining native gtk4::Dialog widgets). **Next priority arc: #270 Stage B → #271 → B.6.** See "🎯 NEXT FOCUS" section below.)
 
 ---
 
-## 🎯 NEXT FOCUS — #270 → #271 → B.6 (with smoke followups in parallel)
+## 🎯 NEXT FOCUS — #270 Stage B → #271 → B.6 (with smoke followups in parallel)
 
-**The B.5c → B.5d → B.5e arc shipped end-to-end on the TUI side**
-(see "✅ Phase B.5c → B.5e (TUI side)" below). #266 then lifted
-rich_text_popup + completions; find_replace scoped out into #271.
-#267 closed the last "trait-less primitive" gap on dialog. The
-next focused work is the GTK side of the runner-crate vision, the
-find_replace primitive migration, then Win-GUI rebuild.
+**#266, #267, and #270 Stage A shipped on the TUI side + GTK
+backend lift.** Stage B (the GTK runner + multi-DrawingArea
+design) is the next focused work, then find_replace primitive
+migration, then Win-GUI rebuild.
 
 **Priority order (set 2026-04-29):**
 
-1. **#270 — GTK runner + multi-DrawingArea support.** Mirrors the
-   TUI runner work that landed in #269 (`quadraui::tui::run`). Two
-   sub-tasks: lift `GtkBackend` from `src/gtk/backend.rs` into
-   `quadraui::gtk::backend` (parallel to #268's TUI lift), then
-   design the multi-area model. Vimcode has ~20 `set_draw_func`
-   surfaces; the GTK runner needs a way to express "render scene N
-   to DrawingArea N." Two design candidates in #270 — pick during
-   pickup.
+1. **#270 Stage B — GTK runner + multi-DrawingArea support.**
+   `GtkBackend` is now in `quadraui::gtk::backend` (Stage A,
+   `b256993`). The remaining work is the runner —
+   `quadraui::gtk::run<A: AppLogic>(app)` parallel to
+   `quadraui::tui::run` — and the multi-DrawingArea design.
+   Vimcode has ~20 `set_draw_func` surfaces; the runner needs a
+   way to express "render scene N to DrawingArea N." Two design
+   candidates in #270 — pick during pickup.
 2. **#271 — find_replace primitive migration.** Move `FrHitRegion`,
    `FindReplaceClickTarget`, `FR_PANEL_WIDTH`, and
    `compute_find_replace_hit_regions` from `core::engine` to a new
@@ -61,18 +59,29 @@ B.6 first would ship a third backend with the same kind of gaps
 B.5b unwound — the very problem this whole arc was structured to
 prevent.
 
-### Phase #270 — GTK runner
+### Phase #270 Stage A — GtkBackend lift (✅ shipped)
+
+`b256993` shipped:
+- `quadraui::gtk::backend::GtkBackend` (lifted ~920 lines).
+- `quadraui::gtk::services::GtkPlatformServices` (lifted ~96 lines).
+- `quadraui::gtk::events::*` GDK→UiEvent translation (~334 lines).
+
+Vimcode-private deps replaced with backend-stored fields:
+`nerd_fonts_enabled: bool` + `set_nerd_fonts(bool)` setter
+(replaces `crate::icons::nerd_fonts_enabled()` global atomic);
+`ui_font: String` + `set_ui_font(impl Into<String>)` setter
+(replaces `super::draw::UI_FONT()` macro). Both are wired once at
+`GtkBackend` construction and re-synced per frame in vimcode's
+`CacheFontMetrics` handler so runtime toggles propagate.
+
+Vimcode-side `src/gtk/{backend,events,services}.rs` collapsed to
+thin re-exports — call sites unchanged.
+
+### Phase #270 Stage B — GTK runner (next)
 
 **Pickup files (eventual):**
-- `quadraui/src/gtk/backend.rs` (new — lift from `src/gtk/backend.rs`).
-- `quadraui/src/gtk/services.rs` (new — lift from `src/gtk/services.rs`).
 - `quadraui/src/gtk/run.rs` (new — runner).
 - `quadraui/examples/gtk_app.rs` (validates end-to-end, mirrors `tui_app.rs`).
-
-The lift mechanics are the same as #268: copy file, swap
-`quadraui::Foo` → `crate::Foo`, add `nerd_fonts_enabled: bool` field
-to `GtkBackend` (or equivalent), make vimcode-side `gtk/backend.rs`
-a thin re-export.
 
 The novel work is the multi-area runner. Two sketches in #270
 (closure-per-area registration vs target-routed render). Read
