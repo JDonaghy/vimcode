@@ -32,6 +32,73 @@
    slice extraction (vim grammar + buffer + LSP) explicitly
    deferred to a separate later wave.
 
+### Stage 1 pickup checklist (cold start)
+
+For a new session opening this branch fresh:
+
+1. **Read `docs/PHASE_C_PLAN.md` Stage 1 section** — it has the
+   complete file list, the data primitive shape, and the recommended
+   verification commands. PLAN.md is a pointer; that doc is the plan.
+2. **Read GitHub issue [#276](https://github.com/JDonaghy/vimcode/issues/276)**
+   for the issue-body summary (mirrors `docs/PHASE_C_PLAN.md`
+   Stage 1).
+3. **Read `quadraui/docs/DECISIONS.md`** and
+   **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §9** — primitive-
+   distinctness principles + resolved decisions log. Required per
+   `CLAUDE.md` for any work that touches `quadraui/`.
+4. **Read both paint sites in full before designing the primitive**:
+   `src/tui_main/render_impl.rs::render_window` (~470 LOC, lines
+   1959-2429) and `src/gtk/draw.rs::draw_window` (~720 LOC, lines
+   1090-1810). The primitive shape has to support every paint
+   category these touch.
+5. **Read `src/render.rs` lines 245-770** for the `RenderedWindow` /
+   `RenderedLine` source-of-truth field shapes. **Translate
+   verbatim — don't redesign**.
+
+### Stage 1 known sharp edges
+
+Discovered while surveying for the Stage 1 lift but not yet hit
+because Stage 1 was deferred. A fresh session will run into these
+within the first hour; surfacing them up front saves the discovery:
+
+- **`StyledSpan` impedance mismatch**.
+  `vimcode::render::StyledSpan` is byte-range based
+  (`start_byte`, `end_byte`, `style`). `quadraui::StyledSpan`
+  (existing) is owned-text based (`text`, `fg`, `bg`, …). The
+  editor primitive needs the byte-range shape (verbatim port);
+  decision required: introduce a parallel
+  `quadraui::editor::StyledSpan` shape, or extend the existing
+  `StyledSpan` with an optional byte-range variant. Plan
+  recommends the parallel-shape route via a sub-module
+  (`quadraui::editor::*`) so the existing primitive's plugin-
+  serialisable shape stays clean.
+- **`DiagnosticSeverity` lift**. `RenderedLine` references
+  `crate::core::lsp::DiagnosticSeverity` (an enum, 4 variants).
+  Quadraui can't depend on vimcode core, so this needs lifting
+  into `quadraui::editor::DiagnosticSeverity` (mirror) with the
+  vimcode-side adapter mapping at the boundary.
+- **Phase C plan claimed "math is identical between backends" for
+  scrollbars; that was slightly wrong** (TUI used
+  `floor(scroll/total * track)`, GTK used
+  `(scroll/(total-visible)) * (track - thumb)`). Stage 2 worked
+  around this by keeping each backend's math at the call site and
+  only lifting the paint. **Stage 1's "verbatim port" claim
+  should be verified the same way** — diff each paint category
+  between TUI and GTK and confirm true equivalence before
+  writing the rasteriser, or lift the data primitive and let each
+  backend paint with its existing helpers.
+- **`q_theme()` will grow ~25 fields**. Both adapters are already
+  ~35 lines long, mostly verbatim mappings. Adding 25 more fields
+  is mechanical but worth a structural look — possibly extract a
+  helper or split into `q_theme_chrome()` + `q_theme_editor()` so
+  the surface stays comprehensible.
+- **`active_background` is editor-specific** and currently lives
+  on `vimcode::render::Theme` but not `quadraui::Theme`. The
+  editor primitive needs it; either lift it to `quadraui::Theme`
+  or make the rasteriser take it as a separate parameter. The
+  dual-bg behaviour (active vs inactive window) is a real
+  feature, not bandaid — see `RenderedWindow.show_active_bg`.
+
 **Deferred from Phase C (filed as follow-up issues this session)**:
 - [#280](https://github.com/JDonaghy/vimcode/issues/280) — Extension panel lift (~12 hrs, depends on `TreeView` section-header extension).
 - [#281](https://github.com/JDonaghy/vimcode/issues/281) — Debug sidebar lift (~16 hrs, four-section + per-section scrollbar; hand-rolled hit-test per #210).
