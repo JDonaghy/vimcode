@@ -6,31 +6,28 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Session 343 — **GTK `Completions` lift ([#285](https://github.com/JDonaghy/vimcode/issues/285)) shipped via Path A** on develop: `quadraui::gtk::draw_completions` rasteriser + `quadraui_gtk::draw_completions` shim added; `src/gtk/draw::draw_completion_popup` body collapsed to a layout-+-delegate flow. Both backends now paint completions through `quadraui::Completions`. Smoke surfaced three pre-existing GTK keymap/click bugs (#286 Ctrl-alone-dismisses, #287 Ctrl-P palette collision, #288 click-divergence) — none caused by the lift. Also reconciled stale `RichTextPopup` claims on the way: #214 (`c8a23e9`, 2026-04-25) + #266 (`779f6e8`, 2026-04-28) had already lifted the editor hover popup, but the table + queue still said TBD. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual rasterisers; net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui ready for B.6 Win-GUI consumption. With Stage 1 + #285 + the RichTextPopup reconciliation, the only TUI/GTK duplication left is three sidebar surfaces (#280 / #281 / #282). See "🎯 NEXT FOCUS" below.)
+> **Last updated:** 2026-04-29 (Session 343 — **#280 Extension panel lift shipped on `issue-280-ext-panel-treeview-lift`**: `render::ext_sidebar_to_tree_view` adapter + chrome-only paint sites + `TreeViewLayout::hit_test()` click handlers on both backends. Net **−76 LOC** vimcode; no quadraui change (`Decoration::Header` was already supported). Smoke pending. Also discovered #282 (source-control panel) had already shipped via `render::source_control_to_tree_view` + `Backend::draw_tree`; cross-backend table previously said bespoke — reconciled. **Only #281 (debug sidebar) remains as TUI/GTK paint duplication.** Prior session 343 events: #283 (TUI gutter), #285 (GTK Completions), #286 (GTK Ctrl-alone-dismisses), all landed via Path A; doc reconciliation `b96c65d` for `RichTextPopup`. Three smoke-fallout follow-ups filed: #287 Ctrl-P palette collision, #288 click-divergence (#286 fixed). Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below.)
 
 ---
 
 ## 🎯 NEXT FOCUS — Eliminate remaining TUI/GTK duplication
 
-After Stage 1 (#276), the GTK Completions lift (#285), and the
-editor hover popup lift (#214 + #266), the editor viewport,
-completion popup, and rich-document hover popup are all no
-longer duplicated. What's left is three sidebar surfaces still
-hand-rolled per backend. Each is a discrete lift; none blocks
-the others.
+After #280 (extension panel) shipped + the discovery that #282
+(source control) was already on `TreeView`, **only one paint
+duplication remains** in the cross-backend coverage table:
 
-### The remaining duplication, ranked by ease × payoff
+### The remaining duplication
 
-| # | Surface | Issue | Effort | Why next |
+| # | Surface | Issue | Effort | Why now |
 |---|---|---|---|---|
-| 1 | **Extension panel** | [#280](https://github.com/JDonaghy/vimcode/issues/280) | ~12 hrs | Extends `TreeView` with section headers; data shape is straightforward. Mechanical port once the primitive accepts headers. Front-of-queue. |
-| 2 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). May want a `MultiSectionView` primitive shape designed first; build alongside #282. |
-| 3 | **Source control panel** | [#282](https://github.com/JDonaghy/vimcode/issues/282) | ~24 hrs | Complex due to inline commit-message editing. Likely consumes the same `MultiSectionView` shape that #281 designs. |
+| 1 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). The `Decoration::Header` pattern that worked for #280 + #282 may apply here too — investigate first whether `TreeView` covers it before designing a new `MultiSectionView` primitive. |
 
-**Recommended order:** #280 (mechanical TreeView extension) →
-#281 + #282 paired (`MultiSectionView` primitive shared between
-them). The sequencing is "smallest lifts first to bank quick
-wins; hardest last when patterns are established."
+After #281 closes, every entry in the cross-backend coverage
+table is ✅ on both backends. The "TUI/GTK paint duplication"
+arc as scoped in PLAN.md is closed. Smaller residual convergence
+work (#210/#211/#288-style hit-test/click items, ~hundreds of
+LOC) plus intrinsic-to-surface divergences remain but are
+tracked separately.
 
 ### Strategic complement — B.6 Win-GUI rebuild
 

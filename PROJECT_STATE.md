@@ -40,15 +40,19 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post #285, 2026-04-29):** Editor viewport **lifted**
+**Status (post #280, 2026-04-29):** Editor viewport **lifted**
 (#276), GTK `Completions` lifted (#285), editor hover popup
-already lifted (#214 + #266 — `RichTextPopup` shipped 2026-04-25;
-rasterisers lifted 2026-04-28). Both backends paint completions
-through `quadraui::Completions` and hover popups through
-`quadraui::RichTextPopup`. TUI chrome ~98% on quadraui; GTK
-chrome ~93%. Remaining bespoke-per-backend duplication: three
-sidebar surfaces — #280 (extension panel), #281
-(debug sidebar), #282 (source control).
+lifted (#214 + #266 — `RichTextPopup` shipped 2026-04-25;
+rasterisers lifted 2026-04-28), extension panel lifted (#280,
+`d29d1b4`), source control panel lifted (`render::source_control_to_tree_view`
++ `Backend::draw_tree`, table previously stale). Both backends
+paint completions through `quadraui::Completions`, hover popups
+through `quadraui::RichTextPopup`, and section-header trees
+(extension panel + source control) through `quadraui::TreeView`
+with `Decoration::Header`. TUI chrome ~98% on quadraui; GTK chrome
+~95%. **Remaining bespoke-per-backend duplication: one sidebar
+surface — #281 (debug sidebar, ~16 hrs, hand-rolled hit math per
+#210/#211).**
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -75,9 +79,9 @@ sidebar surfaces — #280 (extension panel), #281
 | Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
 | AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
 | Editor viewport (text + gutter + cursor + selection + diagnostics) | `Editor` | ✅ | ✅ | #276, `5b23718`+ (Phase C Stage 1) |
-| Extension panel | _TreeView extension TBD_ | ❌ bespoke | ❌ bespoke | #280, deferred (~12 hrs, needs section-header support) |
+| Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
 | Debug sidebar (variables tree, breakpoints, watch) | _MultiSectionView TBD_ | ❌ bespoke | ❌ bespoke | #281, deferred (~16 hrs, hand-rolled hit math per #210/#211) |
-| Source control panel | _MultiSectionView + InlineInput TBD_ | ❌ bespoke | ❌ bespoke | #282, deferred (~24 hrs, complex) |
+| Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
