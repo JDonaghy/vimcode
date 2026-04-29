@@ -4574,6 +4574,16 @@ pub(super) fn draw_panel_hover_popup(
     (link_rects, Some((popup_x, popup_y, popup_w, popup_h)))
 }
 
+/// Migrated to the `quadraui::TreeView` primitive (#280).
+///
+/// Panel header + search input + focus border stay panel-specific
+/// chrome; section headers and item rows become a `TreeView` built by
+/// `render::ext_sidebar_to_tree_view` and rasterised via
+/// `quadraui::gtk::draw_tree` (through `Backend::draw_tree`). Row
+/// heights match `quadraui::gtk::draw_tree` (header rows
+/// `line_height`, item rows `line_height * 1.4`); the click-hit math
+/// in `Msg::ExtSidebarClick` calls `TreeViewLayout::hit_test()` for
+/// the same convergence reason.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_ext_sidebar(
     cr: &Context,
@@ -4585,6 +4595,7 @@ pub(super) fn draw_ext_sidebar(
     w: f64,
     h: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(ref ext) = screen.ext_sidebar else {
         return;
@@ -4595,78 +4606,14 @@ pub(super) fn draw_ext_sidebar(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
 
     // Background
     cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
-    // Item rows get extra vertical padding for readability.
-    let item_height = (line_height * 1.4).ceil();
-    let pad = (item_height - line_height) / 2.0;
-
     layout.set_attributes(None);
     let mut ry: f64 = 0.0;
-
-    // Helper: draw a text row with optional right-aligned hint (only on selected).
-    // Returns the row height used.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_item_row(
-        cr: &Context,
-        layout: &pango::Layout,
-        x: f64,
-        y: f64,
-        ry: f64,
-        w: f64,
-        item_height: f64,
-        pad: f64,
-        is_selected: bool,
-        sel_rgb: (f64, f64, f64),
-        fg_rgb: (f64, f64, f64),
-        sel_fg_rgb: (f64, f64, f64),
-        dim_rgb: (f64, f64, f64),
-        name_text: &str,
-        hint: &str,
-    ) {
-        if is_selected {
-            cr.set_source_rgb(sel_rgb.0, sel_rgb.1, sel_rgb.2);
-            cr.rectangle(x, y + ry, w, item_height);
-            cr.fill().ok();
-        }
-        // Measure hint width.
-        let hint_w = if is_selected && !hint.is_empty() {
-            layout.set_text(hint);
-            layout.pixel_size().0
-        } else {
-            0
-        };
-        // Draw name with ellipsis if needed.
-        let name_max = (w - 6.0 - hint_w as f64).max(20.0) as i32;
-        let text_rgb = if is_selected { sel_fg_rgb } else { fg_rgb };
-        cr.set_source_rgb(text_rgb.0, text_rgb.1, text_rgb.2);
-        layout.set_text(name_text);
-        layout.set_width(name_max * pango::SCALE);
-        layout.set_ellipsize(pango::EllipsizeMode::End);
-        let (_, text_h) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
-        );
-        pangocairo::show_layout(cr, layout);
-        layout.set_width(-1);
-        layout.set_ellipsize(pango::EllipsizeMode::None);
-        // Right-aligned hint.
-        if hint_w > 0 {
-            cr.set_source_rgb(dim_rgb.0, dim_rgb.1, dim_rgb.2);
-            layout.set_text(hint);
-            cr.move_to(
-                x + w - hint_w as f64 - 4.0,
-                y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
-            );
-            pangocairo::show_layout(cr, layout);
-        }
-    }
 
     // ── Row 0: panel header ──────────────────────────────────────────────────
     cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
@@ -4715,137 +4662,22 @@ pub(super) fn draw_ext_sidebar(
         ry += line_height;
     }
 
-    // ── INSTALLED section ─────────────────────────────────────────────────────
-    let installed_count = ext.items_installed.len();
-    if ry < h {
-        let arrow = if ext.sections_expanded[0] {
-            "▼"
-        } else {
-            "▶"
-        };
-        let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
-        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + ry, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        layout.set_text(&sec_hdr);
-        let (_, lh3) = layout.pixel_size();
-        cr.move_to(x + 2.0, y + ry + (line_height - lh3 as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        ry += line_height;
-    }
-
-    if ext.sections_expanded[0] {
-        for (idx, item) in ext.items_installed.iter().enumerate() {
-            if ry >= h {
-                break;
-            }
-            let is_selected = ext.has_focus && ext.selected == idx;
-            let name_text = if item.update_available {
-                format!("  ● {} \u{2191}", item.display_name)
-            } else {
-                format!("  ● {}", item.display_name)
-            };
-            let hint = if !is_selected {
-                ""
-            } else if item.update_available {
-                "[u]update"
-            } else {
-                "[d]remove"
-            };
-            draw_item_row(
-                cr,
-                layout,
-                x,
-                y,
-                ry,
-                w,
-                item_height,
-                pad,
-                is_selected,
-                (sel_r, sel_g, sel_b),
-                (fg_r, fg_g, fg_b),
-                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
-                (dim_r, dim_g, dim_b),
-                &name_text,
-                hint,
+    // ── Tree body: route through `Backend::draw_tree` ────────────────────────
+    let tree_h = (h - ry).max(0.0);
+    if tree_h > 0.0 {
+        let tree = render::ext_sidebar_to_tree_view(ext);
+        use quadraui::Backend;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            b.draw_tree(
+                quadraui::Rect::new(x as f32, (y + ry) as f32, w as f32, tree_h as f32),
+                &tree,
             );
-            ry += item_height;
-        }
-        if installed_count == 0 && ry < h {
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text("    (none installed)");
-            let (_, lhn) = layout.pixel_size();
-            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            ry += item_height;
-        }
+        });
     }
 
-    // ── AVAILABLE section ─────────────────────────────────────────────────────
-    let available_count = ext.items_available.len();
-    if ry < h {
-        let arrow = if ext.sections_expanded[1] {
-            "▼"
-        } else {
-            "▶"
-        };
-        let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
-        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + ry, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        layout.set_text(&sec_hdr);
-        let (_, lh5) = layout.pixel_size();
-        cr.move_to(x + 2.0, y + ry + (line_height - lh5 as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        ry += line_height;
-    }
-
-    if ext.sections_expanded[1] {
-        for (idx, item) in ext.items_available.iter().enumerate() {
-            if ry >= h {
-                break;
-            }
-            let flat_idx = installed_count + idx;
-            let is_selected = ext.has_focus && ext.selected == flat_idx;
-            let name_text = format!("  ○ {}", item.display_name);
-            let hint = if is_selected { "[i]install" } else { "" };
-            draw_item_row(
-                cr,
-                layout,
-                x,
-                y,
-                ry,
-                w,
-                item_height,
-                pad,
-                is_selected,
-                (sel_r, sel_g, sel_b),
-                (fg_r, fg_g, fg_b),
-                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
-                (dim_r, dim_g, dim_b),
-                &name_text,
-                hint,
-            );
-            ry += item_height;
-        }
-        if available_count == 0 && ry < h {
-            let msg = if ext.fetching {
-                "    Fetching registry…"
-            } else {
-                "    (all extensions installed)"
-            };
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text(msg);
-            let (_, lhn) = layout.pixel_size();
-            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            ry += item_height;
-        }
-    }
-
-    // Focus border
+    // Focus border (drawn last so it sits on top of bg + tree paint)
     if ext.has_focus {
         let (kr, kg, kb) = theme.keyword.to_cairo();
         cr.set_source_rgb(kr, kg, kb);
@@ -4853,8 +4685,6 @@ pub(super) fn draw_ext_sidebar(
         cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
         cr.stroke().ok();
     }
-
-    let _ = ry;
 }
 
 #[allow(clippy::too_many_arguments)]

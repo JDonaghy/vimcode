@@ -2921,71 +2921,62 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.ext_sidebar_has_focus = true;
 
-            // Row layout: 0=header, 1=search, 2=INSTALLED header, 3..=items/headers
+            // Chrome rows match `render_ext_sidebar`: 0 = panel header,
+            // 1 = search box. Rows 2+ are the `quadraui::TreeView` body.
+            // Hit-test the body via `TreeViewLayout::hit_test()` so the
+            // paint and click paths agree by construction (#280, mirrors
+            // the #210/#211 pattern).
             if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
-                // Search box — activate search input
                 engine.ext_sidebar_input_active = true;
             } else {
-                let installed = engine.ext_installed_items();
-                let installed_len = if engine.ext_sidebar_sections_expanded[0] {
-                    installed.len()
-                } else {
-                    0
-                };
-                let installed_header_row: u16 = 2;
-                let installed_display =
-                    installed_len.max(if engine.ext_sidebar_sections_expanded[0] {
-                        1
-                    } else {
-                        0
+                let theme = Theme::onedark();
+                let screen = render::build_screen_layout(engine, &theme, &[], 1.0, 1.0, true);
+                if let Some(ref ext) = screen.ext_sidebar {
+                    let installed_count = ext.items_installed.len();
+                    let tree = render::ext_sidebar_to_tree_view(ext);
+                    // Use f32::MAX for height so hit_test returns Row(idx)
+                    // for any visible row index. TUI rows are 1 cell each.
+                    let layout = tree.layout(sidebar_width as f32, f32::MAX, |_| {
+                        quadraui::TreeRowMeasure::new(1.0)
                     });
-                let available_header_row = installed_header_row + 1 + installed_display as u16;
+                    let rel_y = (sidebar_row - 2) as f32;
+                    if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y) {
+                        let path = tree.rows[row_idx].path.clone();
+                        let now = Instant::now();
+                        let is_double = now.duration_since(*last_click_time)
+                            < Duration::from_millis(400)
+                            && *last_click_pos == (col, row);
+                        *last_click_time = now;
+                        *last_click_pos = (col, row);
 
-                if sidebar_row == installed_header_row {
-                    engine.ext_sidebar_sections_expanded[0] =
-                        !engine.ext_sidebar_sections_expanded[0];
-                } else if sidebar_row > installed_header_row
-                    && sidebar_row < available_header_row
-                    && installed_len > 0
-                {
-                    let idx = (sidebar_row - installed_header_row - 1) as usize;
-                    if idx < installed_len {
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        engine.ext_sidebar_selected = idx;
-                        if is_double {
-                            engine.ext_open_selected_readme();
+                        match path.as_slice() {
+                            [0] => {
+                                engine.ext_sidebar_sections_expanded[0] =
+                                    !engine.ext_sidebar_sections_expanded[0];
+                            }
+                            [1] => {
+                                engine.ext_sidebar_sections_expanded[1] =
+                                    !engine.ext_sidebar_sections_expanded[1];
+                            }
+                            [0, item_idx] if *item_idx != u16::MAX => {
+                                engine.ext_sidebar_selected = *item_idx as usize;
+                                if is_double {
+                                    engine.ext_open_selected_readme();
+                                }
+                            }
+                            [1, item_idx] if *item_idx != u16::MAX => {
+                                engine.ext_sidebar_selected = installed_count + *item_idx as usize;
+                                if is_double {
+                                    engine.ext_open_selected_readme();
+                                }
+                            }
+                            _ => {
+                                // Empty-state row (item_idx == u16::MAX) or
+                                // unknown shape — no-op.
+                            }
                         }
-                    }
-                } else if sidebar_row == available_header_row {
-                    engine.ext_sidebar_sections_expanded[1] =
-                        !engine.ext_sidebar_sections_expanded[1];
-                } else if sidebar_row > available_header_row {
-                    let avail_len = if engine.ext_sidebar_sections_expanded[1] {
-                        engine.ext_available_items().len()
-                    } else {
-                        0
-                    };
-                    let avail_idx = (sidebar_row - available_header_row - 1) as usize;
-                    if avail_idx < avail_len {
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        engine.ext_sidebar_selected = installed_len + avail_idx;
-                        if is_double {
-                            // Double-click opens README
-                            engine.ext_open_selected_readme();
-                        }
-                        // Single-click just selects
                     }
                 }
             }

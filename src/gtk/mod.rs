@@ -3288,6 +3288,7 @@ impl SimpleComponent for App {
         // ── Extensions sidebar draw + key setup ───────────────────────────────
         {
             let engine = engine.clone();
+            let backend_d = backend.clone();
             widgets.ext_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -3303,7 +3304,18 @@ impl SimpleComponent for App {
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                draw_ext_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+                draw_ext_sidebar(
+                    cr,
+                    &layout,
+                    &screen,
+                    &theme,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    line_height,
+                    &backend_d,
+                );
             });
         }
         {
@@ -9441,61 +9453,68 @@ impl App {
             }
             Msg::ExtSidebarClick(x_click, y_click, n_press) => {
                 let mut engine = self.engine.borrow_mut();
-                // Compute line_height from UI font (not editor font) to match drawing.
                 let line_height = self.cached_ui_line_height.max(1.0);
-                // Item rows use 1.4× line_height for spacing.
-                let item_height = (line_height * 1.4_f64).ceil();
-                // Walk the layout to determine which row was clicked.
-                // Headers use line_height, items use item_height.
-                let mut ry: f64 = 0.0;
                 engine.ext_sidebar_has_focus = true;
 
-                // Row 0: panel header (line_height)
-                if y_click < ry + line_height {
-                    // no action on header click
-                } else {
-                    ry += line_height;
-                }
-                // Row 1: search box (line_height)
-                if y_click >= ry && y_click < ry + line_height {
+                // Chrome rows match `draw_ext_sidebar`:
+                //   row 0 (`line_height`) = panel header.
+                //   row 1 (`line_height`) = search input.
+                // Tree body starts at y = 2 * line_height. Click hit-test
+                // through `TreeViewLayout::hit_test()` so paint and click
+                // share the row geometry by construction (#280, #210).
+                let chrome_h = 2.0 * line_height;
+                if y_click < line_height {
+                    // Panel header — no-op.
+                } else if y_click < chrome_h {
                     engine.ext_sidebar_input_active = true;
-                } else if y_click >= ry + line_height {
-                    ry += line_height;
-                    // INSTALLED section header (line_height)
-                    let installed = engine.ext_installed_items().len();
-                    let inst_expanded = engine.ext_sidebar_sections_expanded[0];
-                    if y_click >= ry && y_click < ry + line_height {
-                        engine.ext_sidebar_sections_expanded[0] = !inst_expanded;
-                    } else {
-                        ry += line_height;
-                        if inst_expanded {
-                            let inst_len = if installed == 0 { 1 } else { installed };
-                            let items_h = inst_len as f64 * item_height;
-                            if installed > 0 && y_click >= ry && y_click < ry + items_h {
-                                let idx = ((y_click - ry) / item_height) as usize;
-                                engine.ext_sidebar_selected = idx.min(installed.saturating_sub(1));
+                } else {
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
+                    let screen = build_screen_layout(&engine, &theme, &[], line_height, 1.0, false);
+                    if let Some(ref ext) = screen.ext_sidebar {
+                        let installed_count = ext.items_installed.len();
+                        let tree = render::ext_sidebar_to_tree_view(ext);
+                        let header_h = line_height as f32;
+                        let item_h = (line_height * 1.4).ceil() as f32;
+                        // GTK row cadence: header rows `line_height`, item
+                        // rows `line_height * 1.4` (matches
+                        // `quadraui::gtk::draw_tree`).
+                        let layout = tree.layout(1.0, f32::MAX, |i| {
+                            let is_header =
+                                matches!(tree.rows[i].decoration, quadraui::Decoration::Header);
+                            if is_header {
+                                quadraui::TreeRowMeasure::new(header_h)
+                            } else {
+                                quadraui::TreeRowMeasure::new(item_h)
                             }
-                            ry += items_h;
-                        }
-                        // AVAILABLE section header (line_height)
-                        let avail_expanded = engine.ext_sidebar_sections_expanded[1];
-                        if y_click >= ry && y_click < ry + line_height {
-                            engine.ext_sidebar_sections_expanded[1] = !avail_expanded;
-                        } else {
-                            ry += line_height;
-                            if avail_expanded {
-                                let available = engine.ext_available_items().len();
-                                if available > 0 && y_click >= ry {
-                                    let idx = ((y_click - ry) / item_height) as usize;
+                        });
+                        let rel_y = (y_click - chrome_h) as f32;
+                        if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y) {
+                            let path = tree.rows[row_idx].path.clone();
+                            match path.as_slice() {
+                                [0] => {
+                                    let cur = engine.ext_sidebar_sections_expanded[0];
+                                    engine.ext_sidebar_sections_expanded[0] = !cur;
+                                }
+                                [1] => {
+                                    let cur = engine.ext_sidebar_sections_expanded[1];
+                                    engine.ext_sidebar_sections_expanded[1] = !cur;
+                                }
+                                [0, item_idx] if *item_idx != u16::MAX => {
+                                    engine.ext_sidebar_selected = *item_idx as usize;
+                                }
+                                [1, item_idx] if *item_idx != u16::MAX => {
                                     engine.ext_sidebar_selected =
-                                        installed + idx.min(available.saturating_sub(1));
+                                        installed_count + *item_idx as usize;
+                                }
+                                _ => {
+                                    // Empty-state row (item_idx == u16::MAX) — no-op.
                                 }
                             }
                         }
                     }
                 }
+
                 let _ = x_click;
-                // Double-click opens the README
                 if n_press >= 2 {
                     engine.ext_open_selected_readme();
                     let still_focused = engine.ext_sidebar_has_focus;

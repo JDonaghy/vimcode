@@ -302,7 +302,7 @@ pub(super) fn render_sidebar(
 
     // Extensions panel
     if sidebar.active_panel == TuiPanel::Extensions {
-        render_ext_sidebar(buf, area, engine, theme);
+        render_ext_sidebar(backend, frame, area, engine, theme);
         return;
     }
 
@@ -2818,8 +2818,14 @@ pub(super) fn render_editor_hover_popup(
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────
 
 /// Render the Extensions sidebar panel.
+/// Migrated to the `quadraui::TreeView` primitive (#280). The panel
+/// header row + search-input row stay panel-specific chrome; the
+/// section headers and item rows become a `TreeView` built by
+/// `render::ext_sidebar_to_tree_view` and rasterised via
+/// `quadraui::tui::draw_tree` (through `Backend::draw_tree`).
 pub(super) fn render_ext_sidebar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -2835,163 +2841,76 @@ pub(super) fn render_ext_sidebar(
 
     let header_fg = rc(theme.status_fg);
     let header_bg = rc(theme.status_bg);
-    let sec_bg = rc(theme.status_bg.darken(0.15));
     let default_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
     let sel_bg = rc(theme.fuzzy_selected_bg);
     let panel_bg = rc(theme.completion_bg);
 
-    // Helper: fill one row then write text chars
-    let write_row =
-        |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, y, ' ', fg, bg);
-            }
-            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-            }
-        };
+    // ── Chrome rows: panel header (row 0) + search box (row 1) ───────────────
+    {
+        let buf = frame.buffer_mut();
 
-    let mut y = area.y;
-
-    // ── Row 0: header ────────────────────────────────────────────────────────
-    if y < area.y + area.height {
-        let hdr = if ext.fetching {
-            " \u{eb85} EXTENSIONS  (fetching…)".to_string()
-        } else {
-            " \u{eb85} EXTENSIONS".to_string()
-        };
-        write_row(buf, y, &hdr, header_fg, header_bg);
-        y += 1;
-    }
-
-    // ── Row 1: search box ─────────────────────────────────────────────────────
-    if y < area.y + area.height {
-        let search_bg = if ext.input_active { sel_bg } else { panel_bg };
-        let search_fg = if ext.input_active || !ext.query.is_empty() {
-            default_fg
-        } else {
-            dim_fg
-        };
-        let search_text = if ext.input_active {
-            format!(" \u{f002} {}|", ext.query)
-        } else if ext.query.is_empty() {
-            " \u{f002} Search extensions (press /)".to_string()
-        } else {
-            format!(" \u{f002} {}", ext.query)
-        };
-        write_row(buf, y, &search_text, search_fg, search_bg);
-        y += 1;
-    }
-
-    // ── INSTALLED section ─────────────────────────────────────────────────────
-    let installed_count = ext.items_installed.len();
-    if y < area.y + area.height {
-        let arrow = if ext.sections_expanded[0] {
-            '▼'
-        } else {
-            '▶'
-        };
-        let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
-        write_row(buf, y, &sec_hdr, dim_fg, sec_bg);
-        y += 1;
-    }
-
-    if ext.sections_expanded[0] {
-        for (idx, item) in ext.items_installed.iter().enumerate() {
-            if y >= area.y + area.height {
-                break;
-            }
-            let is_sel = ext.has_focus && ext.selected == idx;
-            let (fg, bg) = if is_sel {
-                (panel_bg, default_fg)
-            } else {
-                (default_fg, panel_bg)
-            };
-            let label = if item.update_available {
-                format!("  ● {} \u{2191}", item.display_name) // ↑ update indicator
-            } else {
-                format!("  ● {}", item.display_name)
-            };
-            write_row(buf, y, &label, fg, bg);
-            // Right-aligned hint
-            let hint = if item.update_available {
-                "[u] update"
-            } else {
-                "[d] remove"
-            };
-            let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
-            for (i, ch) in hint.chars().enumerate() {
-                let cx = hint_start + i as u16;
-                if cx < area.x + area.width {
-                    set_cell(buf, cx, y, ch, dim_fg, bg);
+        let write_row =
+            |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
+                for x in area.x..area.x + area.width {
+                    set_cell(buf, x, y, ' ', fg, bg);
                 }
-            }
-            y += 1;
-        }
-        if installed_count == 0 && y < area.y + area.height {
-            write_row(buf, y, "    (none installed)", dim_fg, panel_bg);
-            y += 1;
-        }
-    }
-
-    // ── AVAILABLE section ─────────────────────────────────────────────────────
-    let available_count = ext.items_available.len();
-    if y < area.y + area.height {
-        let arrow = if ext.sections_expanded[1] {
-            '▼'
-        } else {
-            '▶'
-        };
-        let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
-        write_row(buf, y, &sec_hdr, dim_fg, sec_bg);
-        y += 1;
-    }
-
-    if ext.sections_expanded[1] {
-        for (idx, item) in ext.items_available.iter().enumerate() {
-            if y >= area.y + area.height {
-                break;
-            }
-            let flat_idx = installed_count + idx;
-            let is_sel = ext.has_focus && ext.selected == flat_idx;
-            let (fg, bg) = if is_sel {
-                (panel_bg, default_fg)
-            } else {
-                (default_fg, panel_bg)
-            };
-            write_row(buf, y, &format!("  ○ {}", item.display_name), fg, bg);
-            // Right-aligned hint
-            let hint = "[i] install";
-            let hint_start = area.x + area.width.saturating_sub(hint.len() as u16 + 1);
-            for (i, ch) in hint.chars().enumerate() {
-                let cx = hint_start + i as u16;
-                if cx < area.x + area.width {
-                    set_cell(buf, cx, y, ch, dim_fg, bg);
+                for (i, ch) in text.chars().enumerate().take(area.width as usize) {
+                    set_cell(buf, area.x + i as u16, y, ch, fg, bg);
                 }
-            }
-            y += 1;
-        }
-        if available_count == 0 && y < area.y + area.height {
-            let msg = if ext.fetching {
-                "    Fetching registry…"
-            } else {
-                "    (all installed)"
             };
-            write_row(buf, y, msg, dim_fg, panel_bg);
-            y += 1;
+
+        if area.height >= 1 {
+            let hdr = if ext.fetching {
+                " \u{eb85} EXTENSIONS  (fetching…)".to_string()
+            } else {
+                " \u{eb85} EXTENSIONS".to_string()
+            };
+            write_row(buf, area.y, &hdr, header_fg, header_bg);
+        }
+
+        if area.height >= 2 {
+            let search_bg = if ext.input_active { sel_bg } else { panel_bg };
+            let search_fg = if ext.input_active || !ext.query.is_empty() {
+                default_fg
+            } else {
+                dim_fg
+            };
+            let search_text = if ext.input_active {
+                format!(" \u{f002} {}|", ext.query)
+            } else if ext.query.is_empty() {
+                " \u{f002} Search extensions (press /)".to_string()
+            } else {
+                format!(" \u{f002} {}", ext.query)
+            };
+            write_row(buf, area.y + 1, &search_text, search_fg, search_bg);
         }
     }
 
-    // Fill remainder with panel_bg
-    while y < area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', dim_fg, panel_bg);
-        }
-        y += 1;
+    // ── Tree body: rest of the panel ─────────────────────────────────────────
+    if area.height <= 2 {
+        return;
     }
-
-    let _ = sel_bg;
+    let tree_area = Rect {
+        x: area.x,
+        y: area.y + 2,
+        width: area.width,
+        height: area.height - 2,
+    };
+    let tree = render::ext_sidebar_to_tree_view(ext);
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_tree(
+            quadraui::Rect::new(
+                tree_area.x as f32,
+                tree_area.y as f32,
+                tree_area.width as f32,
+                tree_area.height as f32,
+            ),
+            &tree,
+        );
+    });
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────

@@ -6262,6 +6262,171 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
     }
 }
 
+/// Adapt the engine-side `ExtSidebarData` into a `quadraui::TreeView`
+/// for the shared `draw_tree` primitive (#280).
+///
+/// Tree shape:
+/// - Path `[0]` — "INSTALLED (n)" header (`Decoration::Header`, badge
+///   carries the count).
+/// - Path `[0, i]` — installed item `i` (icon = filled circle / nerd-font
+///   `\u{f4d0}`; badge `[d]remove` or `[u]update` shown only on the
+///   selected row; trailing `\u{2191}` (`↑`) on the label when an
+///   update is available).
+/// - Path `[1]` — "AVAILABLE (m)" header.
+/// - Path `[1, i]` — available item `i` (hollow circle icon; badge
+///   `[i]install` on selected row only).
+/// - Empty-state placeholders (`(none installed)`, `(all installed)`,
+///   `Fetching registry…`) appear as `Decoration::Muted` rows that are
+///   intentionally not in the selection mapping.
+///
+/// `selected: usize` in `ExtSidebarData` is a flat index across items
+/// (installed first, then available). This maps to `selected_path`
+/// = `[0, selected]` while `selected < installed_count` else
+/// `[1, selected - installed_count]`.
+pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView, WidgetId,
+    };
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+
+    let installed_count = ext.items_installed.len();
+    let available_count = ext.items_available.len();
+
+    // Map flat selected → (section, item_idx) for badge gating.
+    let (sel_section, sel_item) = if ext.selected < installed_count {
+        (0u16, ext.selected)
+    } else {
+        (1u16, ext.selected.saturating_sub(installed_count))
+    };
+
+    // ── Section 0: INSTALLED ─────────────────────────────────────────────────
+    rows.push(TreeRow {
+        path: vec![0],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(format!("INSTALLED ({})", installed_count)),
+        badge: None,
+        is_expanded: Some(ext.sections_expanded[0]),
+        decoration: Decoration::Header,
+    });
+
+    if ext.sections_expanded[0] {
+        if installed_count == 0 {
+            rows.push(TreeRow {
+                path: vec![0, u16::MAX],
+                indent: 1,
+                icon: None,
+                text: StyledText::plain("(none installed)".to_string()),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Muted,
+            });
+        } else {
+            for (i, item) in ext.items_installed.iter().enumerate() {
+                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
+                let label = if item.update_available {
+                    format!("\u{25cf} {} \u{2191}", item.display_name)
+                } else {
+                    format!("\u{25cf} {}", item.display_name)
+                };
+                let badge = if is_sel {
+                    let hint = if item.update_available {
+                        "[u]update"
+                    } else {
+                        "[d]remove"
+                    };
+                    Some(Badge::plain(hint.to_string()))
+                } else {
+                    None
+                };
+                rows.push(TreeRow {
+                    path: vec![0, i as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+        }
+    }
+
+    // ── Section 1: AVAILABLE ─────────────────────────────────────────────────
+    rows.push(TreeRow {
+        path: vec![1],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(format!("AVAILABLE ({})", available_count)),
+        badge: None,
+        is_expanded: Some(ext.sections_expanded[1]),
+        decoration: Decoration::Header,
+    });
+
+    if ext.sections_expanded[1] {
+        if available_count == 0 {
+            let msg = if ext.fetching {
+                "Fetching registry\u{2026}"
+            } else {
+                "(all installed)"
+            };
+            rows.push(TreeRow {
+                path: vec![1, u16::MAX],
+                indent: 1,
+                icon: None,
+                text: StyledText::plain(msg.to_string()),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Muted,
+            });
+        } else {
+            for (i, item) in ext.items_available.iter().enumerate() {
+                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
+                let badge = if is_sel {
+                    Some(Badge::plain("[i]install".to_string()))
+                } else {
+                    None
+                };
+                rows.push(TreeRow {
+                    path: vec![1, i as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+        }
+    }
+
+    // Compute the selected_path matching the flat `ext.selected`. Skip
+    // when the selection points outside the visible items (e.g. all
+    // sections collapsed).
+    let selected_path = if ext.has_focus {
+        if sel_section == 0 && sel_item < installed_count && ext.sections_expanded[0] {
+            Some(vec![0u16, sel_item as u16])
+        } else if sel_section == 1 && sel_item < available_count && ext.sections_expanded[1] {
+            Some(vec![1u16, sel_item as u16])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    TreeView {
+        id: WidgetId::new("ext-sidebar-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: 0,
+        style: TreeStyle::default(),
+        has_focus: ext.has_focus,
+    }
+}
+
 /// One visible row in the flat explorer file-tree list. Shared across all
 /// backends; each backend maintains its own `Vec<ExplorerRow>` alongside
 /// scroll / selection state and calls `explorer_to_tree_view` once per
