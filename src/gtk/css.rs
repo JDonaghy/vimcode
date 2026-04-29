@@ -263,7 +263,14 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
             border: 1px solid {border_col};
         }}
 
-        /* Scrollbar — theme-aware overrides */
+        /* Scrollbar — theme-aware overrides.
+           Trough (the track behind the slider) reads `border_col`
+           (theme.separator) at low alpha so the scrollbar is
+           perceptible against the editor bg without overpowering
+           the editor area. */
+        scrollbar {{
+            background: alpha({border_col}, 0.30);
+        }}
         scrollbar slider {{
             background: alpha({sb_thumb}, 0.5);
         }}

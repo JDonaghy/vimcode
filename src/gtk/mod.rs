@@ -5279,6 +5279,11 @@ impl App {
             let v_adj = ws.vertical.adjustment();
             v_adj.set_upper(total_lines as f64);
             v_adj.set_page_size(window.view.viewport_lines as f64);
+            // Page-step (trough click) scrolls by one viewport instead
+            // of the constructor's hardcoded 10. Without this, clicking
+            // the trough always pages by 10 lines regardless of how
+            // tall the window is.
+            v_adj.set_page_increment(window.view.viewport_lines.max(1) as f64);
             v_adj.set_value(window.view.scroll_top as f64);
 
             // Position cursor indicator (fix: ensure height stays constant at 4px)
