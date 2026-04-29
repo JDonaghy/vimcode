@@ -5,6 +5,36 @@ pub(super) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
 }
 
+/// True when `key_name` is a GDK modifier-only key (a `Control_L`,
+/// `Shift_R`, etc. event fired when the user presses a modifier
+/// without combining it with another key).
+///
+/// Vim's input model has no concept of a modifier alone — modifiers
+/// are always part of a chord. Forwarding these to the engine causes
+/// the "dismiss on any non-completion key" path to fire on bare Ctrl
+/// presses while the completion popup is open (#286).
+pub(super) fn is_modifier_only_key(key_name: &str) -> bool {
+    matches!(
+        key_name,
+        "Control_L"
+            | "Control_R"
+            | "Shift_L"
+            | "Shift_R"
+            | "Alt_L"
+            | "Alt_R"
+            | "Meta_L"
+            | "Meta_R"
+            | "Super_L"
+            | "Super_R"
+            | "Hyper_L"
+            | "Hyper_R"
+            | "ISO_Level3_Shift"
+            | "Caps_Lock"
+            | "Num_Lock"
+            | "Scroll_Lock"
+    )
+}
+
 /// Validate a filename for the explorer file / folder creation flow.
 pub(super) fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {

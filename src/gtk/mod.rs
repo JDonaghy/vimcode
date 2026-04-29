@@ -1456,6 +1456,16 @@ impl SimpleComponent for App {
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
                                     let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
 
+                                    // Modifier-only keypresses (Ctrl alone, Shift alone, Alt alone, etc.)
+                                    // shouldn't reach the engine — vim's input model has no concept of
+                                    // "user pressed modifier alone." Pre-#286: Ctrl-down by itself
+                                    // dismissed the active completion popup because the engine's
+                                    // "dismiss on any non-completion key" path treated `Control_L`
+                                    // as a non-completion key. (#286)
+                                    if util::is_modifier_only_key(&key_name) {
+                                        return gtk4::glib::Propagation::Proceed;
+                                    }
+
                                     // When a GTK Entry widget has focus (find dialog, search panel),
                                     // let most keys propagate to it. Only intercept Escape and
                                     // global shortcuts (Ctrl-F, Ctrl-Tab, etc.).
