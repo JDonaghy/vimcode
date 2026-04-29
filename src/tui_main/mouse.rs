@@ -3380,6 +3380,33 @@ pub(super) fn handle_mouse(
                     let track_len =
                         content_height.saturating_sub(if has_h_scrollbar { 1 } else { 0 });
                     let track_visible = track_len as usize;
+                    // Track-click vs thumb-click: page-jump on empty
+                    // track, drag-start on thumb. Standard editor UX —
+                    // clicking the empty track moves by one viewport
+                    // toward the click direction; clicking the thumb
+                    // begins a drag.
+                    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                        rw.scroll_top as f32,
+                        rw.total_lines as f32,
+                        track_visible as f32,
+                        track_len as f32,
+                        1.0,
+                    );
+                    let thumb_top = thumb_start.floor() as u16;
+                    let thumb_size = thumb_len.ceil().max(1.0) as u16;
+                    let cursor_offset = row.saturating_sub(track_abs_start);
+                    if cursor_offset < thumb_top {
+                        let new_scroll = rw.scroll_top.saturating_sub(track_visible);
+                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                        engine.sync_scroll_binds();
+                        return sidebar_width;
+                    } else if cursor_offset >= thumb_top.saturating_add(thumb_size) {
+                        let max_scroll = rw.total_lines.saturating_sub(track_visible);
+                        let new_scroll = (rw.scroll_top + track_visible).min(max_scroll);
+                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                        engine.sync_scroll_binds();
+                        return sidebar_width;
+                    }
                     // Phase B.4 Stage 5d: editor scrollbars on the shared
                     // `quadraui::DragState`. Widget id encodes the window id
                     // so the apply-side router can call
@@ -3438,6 +3465,29 @@ pub(super) fn handle_mouse(
                     if rel_col >= track_x && rel_col < track_x + track_w && track_w > 0 {
                         let track_abs_start = editor_left + track_x;
                         let track_visible = viewport_cols;
+                        // Track-click vs thumb-click: page-jump on the
+                        // empty track, drag-start on the thumb (mirrors
+                        // the v-scrollbar above).
+                        let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                            rw.scroll_left as f32,
+                            rw.max_col as f32,
+                            track_visible as f32,
+                            track_w as f32,
+                            1.0,
+                        );
+                        let thumb_left = thumb_start.floor() as u16;
+                        let thumb_size = thumb_len.ceil().max(1.0) as u16;
+                        let cursor_offset = col.saturating_sub(track_abs_start);
+                        if cursor_offset < thumb_left {
+                            let new_left = rw.scroll_left.saturating_sub(track_visible);
+                            engine.set_scroll_left_for_window(rw.window_id, new_left);
+                            return sidebar_width;
+                        } else if cursor_offset >= thumb_left.saturating_add(thumb_size) {
+                            let max_left = rw.max_col.saturating_sub(track_visible);
+                            let new_left = (rw.scroll_left + track_visible).min(max_left);
+                            engine.set_scroll_left_for_window(rw.window_id, new_left);
+                            return sidebar_width;
+                        }
                         let grab_offset = scrollbar_grab_offset(
                             col as f32,
                             track_abs_start as f32,

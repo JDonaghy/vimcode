@@ -7309,8 +7309,12 @@ impl App {
                 // If we reach here, no menu is open and we proceed with normal handling.
 
                 // ── H scrollbar hit-test (before editor click) ────────────────
-                // If the click lands on a Cairo h scrollbar, start a drag and
-                // don't pass the click through to the editor.
+                // If the click lands on a Cairo h scrollbar:
+                //   - on the thumb → start a drag (delta-tracked).
+                //   - on the empty track → page-jump (scroll by one
+                //     viewport-cols toward the click direction).
+                // Either way, consume the click — don't pass it through
+                // to the editor.
                 {
                     let lh = self.cached_line_height;
                     let cw = self.cached_char_width;
@@ -7319,7 +7323,54 @@ impl App {
                     if let Some((win_id, px_per_col, scroll_left)) =
                         h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
                     {
+                        // Detect track-vs-thumb using the same geometry
+                        // the rasteriser paints. Anchor the per-window
+                        // rect for h_scrollbar_geometry, then compare
+                        // the click x to the thumb's pixel range.
+                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
+                        let thumb_hit = win_rect.and_then(|rect| {
+                            h_scrollbar_geometry(&engine, win_id, &rect, cw, lh).map(
+                                |(track_x, _ty, _tw, _sb_h, thumb_x, thumb_w, _, _)| {
+                                    (track_x, thumb_x, thumb_w)
+                                },
+                            )
+                        });
                         drop(engine);
+                        if let Some((_track_x, thumb_x, thumb_w)) = thumb_hit {
+                            if x < thumb_x {
+                                // Track click left of thumb — page-left.
+                                let mut engine = self.engine.borrow_mut();
+                                let viewport_cols = engine
+                                    .windows
+                                    .get(&win_id)
+                                    .map(|w| w.view.viewport_cols.max(1))
+                                    .unwrap_or(1);
+                                let new_left = scroll_left.saturating_sub(viewport_cols);
+                                engine.set_scroll_left_for_window(win_id, new_left);
+                                self.draw_needed.set(true);
+                                return;
+                            } else if x >= thumb_x + thumb_w {
+                                // Track click right of thumb — page-right.
+                                let mut engine = self.engine.borrow_mut();
+                                let (viewport_cols, max_left) =
+                                    if let Some(window) = engine.windows.get(&win_id) {
+                                        let vc = window.view.viewport_cols.max(1);
+                                        let buf_id = window.buffer_id;
+                                        let max = engine
+                                            .buffer_manager
+                                            .get(buf_id)
+                                            .map(|b| b.max_col.saturating_sub(vc))
+                                            .unwrap_or(0);
+                                        (vc, max)
+                                    } else {
+                                        (1, 0)
+                                    };
+                                let new_left = (scroll_left + viewport_cols).min(max_left);
+                                engine.set_scroll_left_for_window(win_id, new_left);
+                                self.draw_needed.set(true);
+                                return;
+                            }
+                        }
                         self.h_sb_dragging = Some(HScrollDragState {
                             window_id: win_id,
                             drag_start_x: x,

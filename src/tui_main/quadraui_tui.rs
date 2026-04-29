@@ -62,7 +62,12 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         completion_border: q(theme.completion_border),
         completion_selected_bg: q(theme.completion_selected_bg),
         accent_bg: q(theme.tab_active_accent),
-        scrollbar_track: q(theme.scrollbar_track),
+        // The TUI vertical scrollbar historically used `theme.separator`
+        // for the track shade — `theme.scrollbar_track` is set to the
+        // editor bg in many themes (onedark #1a1a1a == bg) which makes
+        // the track invisible. Mapping separator preserves the visible
+        // pre-Stage-2 paint.
+        scrollbar_track: q(theme.separator),
         scrollbar_thumb: q(theme.scrollbar_thumb),
     }
 }

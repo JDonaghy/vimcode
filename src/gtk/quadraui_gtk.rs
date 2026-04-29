@@ -49,7 +49,12 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         completion_border: q(theme.completion_border),
         completion_selected_bg: q(theme.completion_selected_bg),
         accent_bg: q(theme.tab_active_accent),
-        scrollbar_track: q(theme.scrollbar_track),
+        // The GTK h-scrollbar paints the track at low alpha (0.20),
+        // so reading from `theme.scrollbar_track` (which several themes
+        // set to the editor bg) leaves the track invisible against the
+        // editor area. Mapping `theme.separator` (a more contrasting
+        // shade) gives a perceptible track without changing the alpha.
+        scrollbar_track: q(theme.separator),
         scrollbar_thumb: q(theme.scrollbar_thumb),
     }
 }
