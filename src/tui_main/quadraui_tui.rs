@@ -24,8 +24,23 @@ fn qc(c: quadraui::Color) -> RatatuiColor {
 /// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
 /// `render::Theme`. Shared by every public-rasteriser delegate so each
 /// migration adds the field it needs in one place. Lift sequence is
-/// driven by #223.
+/// driven by #223 (chrome) and #276 (editor).
+///
+/// Composes [`q_theme_chrome`] (~36 fields covering chrome / popup /
+/// list / dialog primitives) with [`q_theme_editor`] (~29 fields
+/// covering the editor viewport — gutter, syntax, diagnostics,
+/// cursor, selection, diff, indent guides, annotations). The split
+/// keeps each section comprehensible as the field count grows.
 pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
+    let chrome = q_theme_chrome(theme);
+    q_theme_editor(theme, chrome)
+}
+
+/// Map vimcode chrome colours into the chrome-shaped subset of
+/// `quadraui::Theme`. Returns a `Theme` whose editor-lift fields are
+/// at their `Default` values; the caller (typically [`q_theme`])
+/// overlays them via [`q_theme_editor`].
+fn q_theme_chrome(theme: &Theme) -> quadraui::Theme {
     let q = render::to_quadraui_color;
     quadraui::Theme {
         background: q(theme.background),
@@ -69,6 +84,47 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
         // pre-Stage-2 paint.
         scrollbar_track: q(theme.separator),
         scrollbar_thumb: q(theme.scrollbar_thumb),
+        ..quadraui::Theme::default()
+    }
+}
+
+/// Overlay the editor-lift colours (#276) onto a chrome-shaped
+/// `quadraui::Theme`. The `chrome` argument carries the ~36 chrome
+/// fields populated by [`q_theme_chrome`]; this function sets the
+/// ~29 editor fields and returns the merged theme.
+fn q_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui::Theme {
+    let q = render::to_quadraui_color;
+    quadraui::Theme {
+        editor_active_background: q(theme.active_background),
+        cursorline_bg: q(theme.cursorline_bg),
+        dap_stopped_bg: q(theme.dap_stopped_bg),
+        colorcolumn_bg: q(theme.colorcolumn_bg),
+        diff_added_bg: q(theme.diff_added_bg),
+        diff_removed_bg: q(theme.diff_removed_bg),
+        diff_padding_bg: q(theme.diff_padding_bg),
+        line_number_fg: q(theme.line_number_fg),
+        line_number_active_fg: q(theme.line_number_active_fg),
+        diagnostic_error: q(theme.diagnostic_error),
+        diagnostic_warning: q(theme.diagnostic_warning),
+        diagnostic_info: q(theme.diagnostic_info),
+        diagnostic_hint: q(theme.diagnostic_hint),
+        git_added: q(theme.git_added),
+        git_modified: q(theme.git_modified),
+        git_deleted: q(theme.git_deleted),
+        lightbulb: q(theme.lightbulb),
+        spell_error: q(theme.spell_error),
+        cursor: q(theme.cursor),
+        cursor_normal_alpha: theme.cursor_normal_alpha as f32,
+        selection: q(theme.selection),
+        selection_alpha: theme.selection_alpha as f32,
+        yank_highlight_bg: q(theme.yank_highlight_bg),
+        yank_highlight_alpha: theme.yank_highlight_alpha as f32,
+        bracket_match_bg: q(theme.bracket_match_bg),
+        indent_guide_fg: q(theme.indent_guide_fg),
+        indent_guide_active_fg: q(theme.indent_guide_active_fg),
+        annotation_fg: q(theme.annotation_fg),
+        ghost_text_fg: q(theme.ghost_text_fg),
+        ..chrome
     }
 }
 
