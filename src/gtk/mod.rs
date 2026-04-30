@@ -298,6 +298,13 @@ struct App {
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
+    /// Line height the debug-sidebar draw closure last computed via
+    /// `pangocairo::create_context(cr).metrics(...)`. Click / scroll /
+    /// key handlers read this cell so their row math agrees with what
+    /// was painted, even when the widget's `pango_context()` reports a
+    /// different scale than the cairo-derived context (HiDPI). #281
+    /// smoke surfaced a 4:3 drift between the two paths.
+    debug_sidebar_lh: Rc<Cell<f64>>,
     git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// DrawingArea for extension-provided panels (e.g. git-insights GIT LOG).
@@ -2180,6 +2187,7 @@ impl SimpleComponent for App {
         let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
         let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
+        let debug_sidebar_lh: Rc<Cell<f64>> = Rc::new(Cell::new(20.0));
         let git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
         let overlay_ref = Rc::new(RefCell::new(None));
@@ -2318,6 +2326,7 @@ impl SimpleComponent for App {
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
+            debug_sidebar_lh: debug_sidebar_lh.clone(),
             git_sidebar_da_ref: git_sidebar_da_ref.clone(),
             ext_sidebar_da_ref: ext_sidebar_da_ref.clone(),
             ai_sidebar_da_ref: ai_sidebar_da_ref.clone(),
@@ -3158,6 +3167,7 @@ impl SimpleComponent for App {
         {
             let engine = engine.clone();
             let backend_d = backend.clone();
+            let lh_cell = debug_sidebar_lh.clone();
             widgets
                 .debug_sidebar_da
                 .set_draw_func(move |da, cr, _w, _h| {
@@ -3172,6 +3182,14 @@ impl SimpleComponent for App {
                         / pango::SCALE as f64;
                     let char_width =
                         font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    // Publish line_height for the click / scroll / key
+                    // handlers — they can't recompute it themselves
+                    // (no cairo context available outside the draw
+                    // callback) and `cached_ui_line_height` (computed
+                    // from a different DA's pango_context()) drifts on
+                    // HiDPI displays. #281 smoke surfaced a 4:3 ratio
+                    // off-by-N when these diverged.
+                    lh_cell.set(line_height);
                     let screen =
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
@@ -8897,18 +8915,18 @@ impl App {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
-                // The debug sidebar paint uses UI font line height (computed
-                // inside the `set_draw_func` closure from the same `UI_FONT()`
-                // metrics that drive every other UI panel). Click hit math must
-                // use the matching cache (`cached_ui_line_height`) — using the
-                // editor `cached_line_height` produces row-off-by-N drift that
-                // grows through Variables / Watch / Call Stack / Breakpoints.
-                let lh = self.cached_ui_line_height.max(1.0);
+                // Read line_height from the cell the debug-sidebar draw
+                // closure published. Using the closure's value (rather than
+                // recomputing or reading `cached_ui_line_height`) keeps
+                // click and paint in lockstep even when HiDPI scaling makes
+                // `da.pango_context()` diverge from the cairo-derived
+                // pangocairo context the paint uses (#281 smoke).
+                let lh = self.debug_sidebar_lh.get().max(1.0);
                 let row_idx = (y / lh) as u16;
                 let mut engine = self.engine.borrow_mut();
 
-                // Compute section heights for click mapping. Same UI-font math
-                // as the paint side.
+                // Compute section heights for click mapping. Same line_height
+                // the paint computed.
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     let da_h = da.height() as f64;
                     let content_px = (da_h - 6.0 * lh).max(0.0);
@@ -8997,6 +9015,11 @@ impl App {
                                     tree.layout(1.0, sec_height as f32 * lh as f32, |_| {
                                         quadraui::TreeRowMeasure::new(lh as f32)
                                     });
+                                // Always activate the clicked section so
+                                // keyboard nav operates on it even when
+                                // the click hit an empty-state placeholder
+                                // row. (#281 smoke fix.)
+                                engine.dap_sidebar_section = *section;
                                 let rel_y = (row_idx - items_start) as f32 * lh as f32;
                                 let item_idx = if let quadraui::TreeViewHit::Row(idx) =
                                     layout.hit_test(0.0, rel_y)
@@ -9015,7 +9038,6 @@ impl App {
                                     None
                                 };
                                 if let Some(item_idx) = item_idx {
-                                    engine.dap_sidebar_section = *section;
                                     engine.dap_sidebar_selected = item_idx;
                                     engine.handle_debug_sidebar_key("Return", false);
                                 }
@@ -9059,10 +9081,10 @@ impl App {
                     self.draw_needed.set(true);
                     return;
                 }
-                // Compute section heights for ensure_visible. Same UI font
-                // metric as the paint side (mirrors the click handler).
+                // Compute section heights for ensure_visible. Same
+                // line_height the paint side computed.
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    let lh = self.cached_ui_line_height.max(1.0);
+                    let lh = self.debug_sidebar_lh.get().max(1.0);
                     let da_h = da.height() as f64;
                     let content_px = (da_h - 6.0 * lh).max(0.0);
                     let per_sec = (content_px / 4.0 / lh).floor() as u16;
@@ -9080,10 +9102,9 @@ impl App {
             }
             Msg::DebugSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
-                // Compute section heights using the same UI font line height
-                // the paint side uses (mirrors the click handler — see #281
-                // smoke-fix note).
-                let lh = self.cached_ui_line_height.max(1.0);
+                // Use the published draw-closure line_height — see
+                // `DebugSidebarClick`'s comment.
+                let lh = self.debug_sidebar_lh.get().max(1.0);
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     let da_h = da.height() as f64;
                     let content_px = (da_h - 6.0 * lh).max(0.0);

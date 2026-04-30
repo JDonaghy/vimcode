@@ -2775,13 +2775,17 @@ pub(super) fn handle_mouse(
                                 tree.layout(sidebar_width as f32, sec_height as f32, |_| {
                                     quadraui::TreeRowMeasure::new(1.0)
                                 });
+                            // Always activate the clicked section so
+                            // keyboard nav (Tab, j/k) operates on it
+                            // even when the user clicked an empty-state
+                            // placeholder row. (#281 smoke fix.)
+                            engine.dap_sidebar_section = *section;
                             let rel_y = (sidebar_row - items_start) as f32;
                             if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y)
                             {
                                 let path = tree.rows[row_idx].path.clone();
                                 if let [item_idx_u16] = path.as_slice() {
                                     if *item_idx_u16 != u16::MAX {
-                                        engine.dap_sidebar_section = *section;
                                         engine.dap_sidebar_selected = *item_idx_u16 as usize;
                                         engine.handle_debug_sidebar_key("Return", false);
                                     }
