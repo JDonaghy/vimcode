@@ -2961,12 +2961,12 @@ pub(super) fn handle_mouse(
             engine.ext_sidebar_has_focus = true;
 
             // Chrome rows match `render_ext_sidebar`: 0 = panel header,
-            // 1 = search box. Rows 2+ are the `quadraui::TreeView` body.
-            // Hit-test the body via `TreeViewLayout::hit_test()` so the
-            // paint and click paths agree by construction (#280, mirrors
-            // the #210/#211 pattern).
+            // 1 = search box. Rows 2+ are a `MultiSectionView` (#293).
+            // Hit-test via `MultiSectionViewLayout::hit_test()` so paint
+            // and click read the same source of truth — the structural
+            // fix for the #281 bug classes.
             if sidebar_row == 0 {
-                // Header — no-op
+                // Panel header — no-op
             } else if sidebar_row == 1 {
                 engine.ext_sidebar_input_active = true;
             } else {
@@ -2974,47 +2974,70 @@ pub(super) fn handle_mouse(
                 let screen = render::build_screen_layout(engine, &theme, &[], 1.0, 1.0, true);
                 if let Some(ref ext) = screen.ext_sidebar {
                     let installed_count = ext.items_installed.len();
-                    let tree = render::ext_sidebar_to_tree_view(ext);
-                    // Use f32::MAX for height so hit_test returns Row(idx)
-                    // for any visible row index. TUI rows are 1 cell each.
-                    let layout = tree.layout(sidebar_width as f32, f32::MAX, |_| {
-                        quadraui::TreeRowMeasure::new(1.0)
+                    let view = render::ext_sidebar_to_multi_section_view(ext);
+                    let body_bounds = quadraui::Rect::new(
+                        0.0,
+                        0.0,
+                        sidebar_width as f32,
+                        f32::MAX, // body fills available height
+                    );
+                    let metrics = quadraui::MsvLayoutMetrics {
+                        header_size: 1.0,
+                        divider_size: 0.0,
+                        scrollbar_size: 1.0,
+                    };
+                    let layout = view.layout(body_bounds, metrics, |i| {
+                        let s = &view.sections[i];
+                        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
+                        let content_size = match &s.body {
+                            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
+                            _ => 0.0,
+                        };
+                        quadraui::SectionMeasure {
+                            content_size,
+                            aux_size,
+                        }
                     });
                     let rel_y = (sidebar_row - 2) as f32;
-                    if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y) {
-                        let path = tree.rows[row_idx].path.clone();
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
+                    let now = Instant::now();
+                    let is_double = now.duration_since(*last_click_time)
+                        < Duration::from_millis(400)
+                        && *last_click_pos == (col, row);
+                    *last_click_time = now;
+                    *last_click_pos = (col, row);
 
-                        match path.as_slice() {
-                            [0] => {
-                                engine.ext_sidebar_sections_expanded[0] =
-                                    !engine.ext_sidebar_sections_expanded[0];
-                            }
-                            [1] => {
-                                engine.ext_sidebar_sections_expanded[1] =
-                                    !engine.ext_sidebar_sections_expanded[1];
-                            }
-                            [0, item_idx] if *item_idx != u16::MAX => {
-                                engine.ext_sidebar_selected = *item_idx as usize;
-                                if is_double {
-                                    engine.ext_open_selected_readme();
+                    match layout.hit_test(0.0, rel_y) {
+                        quadraui::MultiSectionViewHit::Header { section, .. } => {
+                            engine.ext_sidebar_sections_expanded[section] =
+                                !engine.ext_sidebar_sections_expanded[section];
+                        }
+                        quadraui::MultiSectionViewHit::Body { section } => {
+                            // Re-test inside the section's TreeView. Body
+                            // bounds tell us the offset to subtract from
+                            // (rel_x, rel_y).
+                            let body_b = layout.sections[section].body_bounds;
+                            if let quadraui::SectionBody::Tree(t) = &view.sections[section].body {
+                                let inner = t.layout(body_b.width, body_b.height, |_| {
+                                    quadraui::TreeRowMeasure::new(1.0)
+                                });
+                                let local_y = rel_y - body_b.y;
+                                if let quadraui::TreeViewHit::Row(row_idx) =
+                                    inner.hit_test(0.0, local_y)
+                                {
+                                    let item_idx = t.rows[row_idx].path[0] as usize;
+                                    if section == 0 {
+                                        engine.ext_sidebar_selected = item_idx;
+                                    } else {
+                                        engine.ext_sidebar_selected = installed_count + item_idx;
+                                    }
+                                    if is_double {
+                                        engine.ext_open_selected_readme();
+                                    }
                                 }
                             }
-                            [1, item_idx] if *item_idx != u16::MAX => {
-                                engine.ext_sidebar_selected = installed_count + *item_idx as usize;
-                                if is_double {
-                                    engine.ext_open_selected_readme();
-                                }
-                            }
-                            _ => {
-                                // Empty-state row (item_idx == u16::MAX) or
-                                // unknown shape — no-op.
-                            }
+                        }
+                        _ => {
+                            // Scrollbar / divider / inert — no-op for now.
                         }
                     }
                 }

@@ -9551,9 +9551,11 @@ impl App {
                 // Chrome rows match `draw_ext_sidebar`:
                 //   row 0 (`line_height`) = panel header.
                 //   row 1 (`line_height`) = search input.
-                // Tree body starts at y = 2 * line_height. Click hit-test
-                // through `TreeViewLayout::hit_test()` so paint and click
-                // share the row geometry by construction (#280, #210).
+                // MultiSectionView body starts at y = 2 * line_height.
+                // Hit-test via `quadraui::gtk::multi_section_view_layout()`
+                // (the same call the rasteriser makes) so paint and
+                // click share the section geometry by construction
+                // (#293, structural fix for the #281 bug classes).
                 let chrome_h = 2.0 * line_height;
                 if y_click < line_height {
                     // Panel header — no-op.
@@ -9564,43 +9566,49 @@ impl App {
                     let screen = build_screen_layout(&engine, &theme, &[], line_height, 1.0, false);
                     if let Some(ref ext) = screen.ext_sidebar {
                         let installed_count = ext.items_installed.len();
-                        let tree = render::ext_sidebar_to_tree_view(ext);
-                        let header_h = line_height as f32;
-                        let item_h = (line_height * 1.4).ceil() as f32;
-                        // GTK row cadence: header rows `line_height`, item
-                        // rows `line_height * 1.4` (matches
-                        // `quadraui::gtk::draw_tree`).
-                        let layout = tree.layout(1.0, f32::MAX, |i| {
-                            let is_header =
-                                matches!(tree.rows[i].decoration, quadraui::Decoration::Header);
-                            if is_header {
-                                quadraui::TreeRowMeasure::new(header_h)
-                            } else {
-                                quadraui::TreeRowMeasure::new(item_h)
-                            }
-                        });
+                        let view = render::ext_sidebar_to_multi_section_view(ext);
+                        // Body bounds are infinite-tall to match the
+                        // rasteriser's bounds at click time (we don't
+                        // know the live DA height here, but click
+                        // y_click is already absolute relative to the
+                        // panel; layout returns hits keyed off section
+                        // bounds the rasteriser produced).
+                        let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, f32::MAX);
+                        let view_layout = quadraui::gtk::multi_section_view_layout(
+                            &view,
+                            body_bounds,
+                            line_height,
+                        );
                         let rel_y = (y_click - chrome_h) as f32;
-                        if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y) {
-                            let path = tree.rows[row_idx].path.clone();
-                            match path.as_slice() {
-                                [0] => {
-                                    let cur = engine.ext_sidebar_sections_expanded[0];
-                                    engine.ext_sidebar_sections_expanded[0] = !cur;
+                        match view_layout.hit_test(0.0, rel_y) {
+                            quadraui::MultiSectionViewHit::Header { section, .. } => {
+                                let cur = engine.ext_sidebar_sections_expanded[section];
+                                engine.ext_sidebar_sections_expanded[section] = !cur;
+                            }
+                            quadraui::MultiSectionViewHit::Body { section } => {
+                                let body_b = view_layout.sections[section].body_bounds;
+                                if let quadraui::SectionBody::Tree(t) = &view.sections[section].body
+                                {
+                                    let item_h = (line_height * 1.4) as f32;
+                                    let inner = t.layout(body_b.width, body_b.height, |_| {
+                                        quadraui::TreeRowMeasure::new(item_h)
+                                    });
+                                    let local_y = rel_y - body_b.y;
+                                    if let quadraui::TreeViewHit::Row(row_idx) =
+                                        inner.hit_test(0.0, local_y)
+                                    {
+                                        let item_idx = t.rows[row_idx].path[0] as usize;
+                                        if section == 0 {
+                                            engine.ext_sidebar_selected = item_idx;
+                                        } else {
+                                            engine.ext_sidebar_selected =
+                                                installed_count + item_idx;
+                                        }
+                                    }
                                 }
-                                [1] => {
-                                    let cur = engine.ext_sidebar_sections_expanded[1];
-                                    engine.ext_sidebar_sections_expanded[1] = !cur;
-                                }
-                                [0, item_idx] if *item_idx != u16::MAX => {
-                                    engine.ext_sidebar_selected = *item_idx as usize;
-                                }
-                                [1, item_idx] if *item_idx != u16::MAX => {
-                                    engine.ext_sidebar_selected =
-                                        installed_count + *item_idx as usize;
-                                }
-                                _ => {
-                                    // Empty-state row (item_idx == u16::MAX) — no-op.
-                                }
+                            }
+                            _ => {
+                                // Scrollbar / divider / inert / outside — no-op.
                             }
                         }
                     }

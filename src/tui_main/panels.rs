@@ -2818,13 +2818,19 @@ pub(super) fn render_editor_hover_popup(
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────
 
 /// Render the Extensions sidebar panel.
-/// Migrated to the `quadraui::TreeView` primitive (#280). The panel
-/// header row + search-input row stay panel-specific chrome; the
-/// section headers and item rows become a `TreeView` built by
-/// `render::ext_sidebar_to_tree_view` and rasterised via
-/// `quadraui::tui::draw_tree` (through `Backend::draw_tree`).
+///
+/// Migrated to `quadraui::MultiSectionView` (#293). The panel header
+/// row + search-input row stay panel-specific chrome; the two
+/// "INSTALLED" / "AVAILABLE" sections (each with its own `TreeView`
+/// body) are now a `MultiSectionView` built by
+/// `render::ext_sidebar_to_multi_section_view` and rasterised via
+/// `quadraui::tui::draw_multi_section_view`. Both the section-header
+/// chevrons / titles and per-section scrollbars come from the
+/// primitive — there is no per-backend section-walk code that paint
+/// and click could disagree on (the structural fix for the #281 bug
+/// classes).
 pub(super) fn render_ext_sidebar(
-    backend: &mut super::backend::TuiBackend,
+    _backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
@@ -2887,30 +2893,26 @@ pub(super) fn render_ext_sidebar(
         }
     }
 
-    // ── Tree body: rest of the panel ─────────────────────────────────────────
+    // ── MultiSectionView body: rest of the panel ─────────────────────────────
     if area.height <= 2 {
         return;
     }
-    let tree_area = Rect {
+    let body_area = Rect {
         x: area.x,
         y: area.y + 2,
         width: area.width,
         height: area.height - 2,
     };
-    let tree = render::ext_sidebar_to_tree_view(ext);
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_tree(
-            quadraui::Rect::new(
-                tree_area.x as f32,
-                tree_area.y as f32,
-                tree_area.width as f32,
-                tree_area.height as f32,
-            ),
-            &tree,
-        );
-    });
+    let view = render::ext_sidebar_to_multi_section_view(ext);
+    let q_theme = super::quadraui_tui::q_theme(theme);
+    let buf = frame.buffer_mut();
+    quadraui::tui::draw_multi_section_view(
+        buf,
+        body_area,
+        &view,
+        &q_theme,
+        crate::icons::nerd_fonts_enabled(),
+    );
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────

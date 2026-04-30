@@ -4584,16 +4584,17 @@ pub(super) fn draw_panel_hover_popup(
     (link_rects, Some((popup_x, popup_y, popup_w, popup_h)))
 }
 
-/// Migrated to the `quadraui::TreeView` primitive (#280).
+/// Migrated to `quadraui::MultiSectionView` (#293).
 ///
 /// Panel header + search input + focus border stay panel-specific
-/// chrome; section headers and item rows become a `TreeView` built by
-/// `render::ext_sidebar_to_tree_view` and rasterised via
-/// `quadraui::gtk::draw_tree` (through `Backend::draw_tree`). Row
-/// heights match `quadraui::gtk::draw_tree` (header rows
-/// `line_height`, item rows `line_height * 1.4`); the click-hit math
-/// in `Msg::ExtSidebarClick` calls `TreeViewLayout::hit_test()` for
-/// the same convergence reason.
+/// chrome; the two "INSTALLED" / "AVAILABLE" sections become a
+/// `MultiSectionView` built by
+/// `render::ext_sidebar_to_multi_section_view` and rasterised via
+/// `quadraui::gtk::draw_multi_section_view`. Both paint and
+/// `Msg::ExtSidebarClick` consult the same `MultiSectionViewLayout`
+/// (via `quadraui::gtk::multi_section_view_layout`), so per-section
+/// drift is impossible by construction (the structural fix for the
+/// #281 bug classes).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_ext_sidebar(
     cr: &Context,
@@ -4605,7 +4606,7 @@ pub(super) fn draw_ext_sidebar(
     w: f64,
     h: f64,
     line_height: f64,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    _backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(ref ext) = screen.ext_sidebar else {
         return;
@@ -4672,22 +4673,26 @@ pub(super) fn draw_ext_sidebar(
         ry += line_height;
     }
 
-    // ── Tree body: route through `Backend::draw_tree` ────────────────────────
-    let tree_h = (h - ry).max(0.0);
-    if tree_h > 0.0 {
-        let tree = render::ext_sidebar_to_tree_view(ext);
-        use quadraui::Backend;
-        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
-            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
-            b.set_current_line_height(line_height);
-            b.draw_tree(
-                quadraui::Rect::new(x as f32, (y + ry) as f32, w as f32, tree_h as f32),
-                &tree,
-            );
-        });
+    // ── MultiSectionView body: rest of the panel ─────────────────────────────
+    let body_h = (h - ry).max(0.0);
+    if body_h > 0.0 {
+        let view = render::ext_sidebar_to_multi_section_view(ext);
+        let q_theme = super::quadraui_gtk::q_theme(theme);
+        quadraui::gtk::draw_multi_section_view(
+            cr,
+            layout,
+            x,
+            y + ry,
+            w,
+            body_h,
+            &view,
+            &q_theme,
+            line_height,
+            crate::icons::nerd_fonts_enabled(),
+        );
     }
 
-    // Focus border (drawn last so it sits on top of bg + tree paint)
+    // Focus border (drawn last so it sits on top of bg + section paint)
     if ext.has_focus {
         let (kr, kg, kb) = theme.keyword.to_cairo();
         cr.set_source_rgb(kr, kg, kb);

@@ -6506,6 +6506,205 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
     }
 }
 
+/// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
+/// (#293).
+///
+/// Two sections — `"installed"` and `"available"` — each carries its own
+/// `TreeView` body of item rows only (the section title is rendered as
+/// the section header, not as a tree-row). Both sections size as
+/// `EqualShare` and scroll independently (`ScrollMode::PerSection`).
+///
+/// Selection mapping: `ExtSidebarData.selected` is a flat index across
+/// installed-then-available items. Within a section, each TreeView's
+/// `selected_path` is `vec![item_idx as u16]` for that section's items.
+///
+/// Empty-state rows (`(none installed)` / `(all installed)` /
+/// `Fetching registry…`) appear as `Decoration::Muted` rows in the
+/// section's tree, intentionally not in the selection mapping.
+pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::MultiSectionView {
+    use quadraui::{
+        Badge, Decoration, EmptyBody, MsvAxis, MultiSectionView, ScrollMode, Section, SectionBody,
+        SectionHeader, SectionSize, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let installed_count = ext.items_installed.len();
+    let available_count = ext.items_available.len();
+
+    let (sel_section, sel_item) = if ext.selected < installed_count {
+        (0u16, ext.selected)
+    } else {
+        (1u16, ext.selected.saturating_sub(installed_count))
+    };
+
+    // ── Build INSTALLED tree ─────────────────────────────────────────
+    let installed_rows: Vec<TreeRow> = if installed_count == 0 {
+        Vec::new()
+    } else {
+        ext.items_installed
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
+                let label = if item.update_available {
+                    format!("\u{25cf} {} \u{2191}", item.display_name)
+                } else {
+                    format!("\u{25cf} {}", item.display_name)
+                };
+                let badge = if is_sel {
+                    let hint = if item.update_available {
+                        "[u]update"
+                    } else {
+                        "[d]remove"
+                    };
+                    Some(Badge::plain(hint.to_string()))
+                } else {
+                    None
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect()
+    };
+
+    let installed_selected_path = if ext.has_focus && sel_section == 0 && sel_item < installed_count
+    {
+        Some(vec![sel_item as u16])
+    } else {
+        None
+    };
+
+    let installed_body = if installed_rows.is_empty() {
+        SectionBody::Empty(EmptyBody {
+            icon: None,
+            text: StyledText::plain("(none installed)".to_string()),
+            hint: None,
+            action: None,
+        })
+    } else {
+        SectionBody::Tree(TreeView {
+            id: WidgetId::new("ext-sidebar-installed-tree"),
+            rows: installed_rows,
+            selection_mode: SelectionMode::Single,
+            selected_path: installed_selected_path,
+            scroll_offset: 0,
+            style: TreeStyle::default(),
+            has_focus: ext.has_focus && sel_section == 0,
+        })
+    };
+
+    // ── Build AVAILABLE tree ─────────────────────────────────────────
+    let available_rows: Vec<TreeRow> = if available_count == 0 {
+        Vec::new()
+    } else {
+        ext.items_available
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
+                let badge = if is_sel {
+                    Some(Badge::plain("[i]install".to_string()))
+                } else {
+                    None
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                }
+            })
+            .collect()
+    };
+
+    let available_selected_path = if ext.has_focus && sel_section == 1 && sel_item < available_count
+    {
+        Some(vec![sel_item as u16])
+    } else {
+        None
+    };
+
+    let available_body = if available_rows.is_empty() {
+        let msg = if ext.fetching {
+            "Fetching registry\u{2026}"
+        } else {
+            "(all installed)"
+        };
+        SectionBody::Empty(EmptyBody {
+            icon: None,
+            text: StyledText::plain(msg.to_string()),
+            hint: None,
+            action: None,
+        })
+    } else {
+        SectionBody::Tree(TreeView {
+            id: WidgetId::new("ext-sidebar-available-tree"),
+            rows: available_rows,
+            selection_mode: SelectionMode::Single,
+            selected_path: available_selected_path,
+            scroll_offset: 0,
+            style: TreeStyle::default(),
+            has_focus: ext.has_focus && sel_section == 1,
+        })
+    };
+
+    let installed_section = Section {
+        id: "installed".to_string(),
+        header: SectionHeader {
+            icon: None,
+            title: StyledText::plain("INSTALLED".to_string()),
+            badge: Some(StyledText::plain(format!("({installed_count})"))),
+            actions: Vec::new(),
+            show_chevron: true,
+        },
+        body: installed_body,
+        aux: None,
+        size: SectionSize::EqualShare,
+        collapsed: !ext.sections_expanded[0],
+        min_size: None,
+        max_size: None,
+    };
+
+    let available_section = Section {
+        id: "available".to_string(),
+        header: SectionHeader {
+            icon: None,
+            title: StyledText::plain("AVAILABLE".to_string()),
+            badge: Some(StyledText::plain(format!("({available_count})"))),
+            actions: Vec::new(),
+            show_chevron: true,
+        },
+        body: available_body,
+        aux: None,
+        size: SectionSize::EqualShare,
+        collapsed: !ext.sections_expanded[1],
+        min_size: None,
+        max_size: None,
+    };
+
+    MultiSectionView {
+        id: WidgetId::new("ext-sidebar-msv"),
+        sections: vec![installed_section, available_section],
+        active_section: Some(sel_section as usize),
+        axis: MsvAxis::Vertical,
+        allow_resize: false,
+        allow_collapse: true,
+        scroll_mode: ScrollMode::PerSection,
+        has_focus: ext.has_focus,
+        panel_scroll: 0.0,
+    }
+}
+
 /// One visible row in the flat explorer file-tree list. Shared across all
 /// backends; each backend maintains its own `Vec<ExplorerRow>` alongside
 /// scroll / selection state and calls `explorer_to_tree_view` once per
