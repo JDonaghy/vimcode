@@ -3003,7 +3003,12 @@ pub(super) fn handle_mouse(
                             aux_size,
                         }
                     });
-                    let rel_y = (sidebar_row - 2) as f32;
+                    // Layout is computed with bounds.height=f32::MAX, so
+                    // panel_scroll clamps to 0 internally — sections are at
+                    // their unscrolled positions. To map a viewport click
+                    // back into those coords we add `panel_scroll`: viewport
+                    // y=N corresponds to unscrolled y=N+scroll.
+                    let logical_y = (sidebar_row - 2) as f32 + view.panel_scroll;
                     let now = Instant::now();
                     let is_double = now.duration_since(*last_click_time)
                         < Duration::from_millis(400)
@@ -3011,21 +3016,18 @@ pub(super) fn handle_mouse(
                     *last_click_time = now;
                     *last_click_pos = (col, row);
 
-                    match layout.hit_test(0.0, rel_y) {
+                    match layout.hit_test(0.0, logical_y) {
                         quadraui::MultiSectionViewHit::Header { section, .. } => {
                             engine.ext_sidebar_sections_expanded[section] =
                                 !engine.ext_sidebar_sections_expanded[section];
                         }
                         quadraui::MultiSectionViewHit::Body { section } => {
-                            // Re-test inside the section's TreeView. Body
-                            // bounds tell us the offset to subtract from
-                            // (rel_x, rel_y).
                             let body_b = layout.sections[section].body_bounds;
                             if let quadraui::SectionBody::Tree(t) = &view.sections[section].body {
                                 let inner = t.layout(body_b.width, body_b.height, |_| {
                                     quadraui::TreeRowMeasure::new(1.0)
                                 });
-                                let local_y = rel_y - body_b.y;
+                                let local_y = logical_y - body_b.y;
                                 if let quadraui::TreeViewHit::Row(row_idx) =
                                     inner.hit_test(0.0, local_y)
                                 {
