@@ -6,28 +6,59 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Session 343 — **#280 Extension panel lift shipped on `issue-280-ext-panel-treeview-lift`**: `render::ext_sidebar_to_tree_view` adapter + chrome-only paint sites + `TreeViewLayout::hit_test()` click handlers on both backends. Net **−76 LOC** vimcode; no quadraui change (`Decoration::Header` was already supported). Smoke pending. Also discovered #282 (source-control panel) had already shipped via `render::source_control_to_tree_view` + `Backend::draw_tree`; cross-backend table previously said bespoke — reconciled. **Only #281 (debug sidebar) remains as TUI/GTK paint duplication.** Prior session 343 events: #283 (TUI gutter), #285 (GTK Completions), #286 (GTK Ctrl-alone-dismisses), all landed via Path A; doc reconciliation `b96c65d` for `RichTextPopup`. Three smoke-fallout follow-ups filed: #287 Ctrl-P palette collision, #288 click-divergence (#286 fixed). Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284)) shipped end-to-end** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below.)
+> **Last updated:** 2026-04-29 (Session 343 — **#281 Debug sidebar lift shipped on `issue-281-debug-sidebar-treeview-lift`**: `render::debug_sidebar_section_to_tree_view` adapter + four-`TreeView`-per-section paint pattern + `TreeViewLayout::hit_test()` click handlers on both backends. Smoke pending. **TUI/GTK paint duplication arc is now DONE** — every entry in the cross-backend coverage table is ✅ on both backends. Prior session 343 events: #283 / #285 / #286 / #280 all landed via Path A; doc reconciliations for #214 (`b96c65d`) and #282 (`6982462`); follow-ups filed #287, #288, #289, #290, #291. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284))** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below for what's next now that the duplication arc is closed.)
 
 ---
 
-## 🎯 NEXT FOCUS — Eliminate remaining TUI/GTK duplication
+## ✅ TUI/GTK paint duplication arc — DONE
 
-After #280 (extension panel) shipped + the discovery that #282
-(source control) was already on `TreeView`, **only one paint
-duplication remains** in the cross-backend coverage table:
+Every entry in the cross-backend coverage table is now ✅ on both
+backends after #281 (debug sidebar lift) shipped. The "TUI/GTK
+paint duplication" arc as scoped through Phase B + Phase C + the
+post-Phase-C cleanup wave (#280 + #281) is closed.
 
-### The remaining duplication
+### What this unblocks
 
-| # | Surface | Issue | Effort | Why now |
-|---|---|---|---|---|
-| 1 | **Debug sidebar** | [#281](https://github.com/JDonaghy/vimcode/issues/281) | ~16 hrs | 4 sections + per-section scrollbars; hand-rolled hit-test (#210/#211 baggage). The `Decoration::Header` pattern that worked for #280 + #282 may apply here too — investigate first whether `TreeView` covers it before designing a new `MultiSectionView` primitive. |
+- **B.6 — Win-GUI rebuild on quadraui.** With every TUI/GTK paint
+  surface lifted to a primitive, Win-GUI can rebuild against the
+  same primitives instead of chasing per-feature parity. Read
+  `docs/NATIVE_GUI_LESSONS.md` first for the per-platform pitfalls
+  surfaced during Win-GUI's first pass. This is the natural
+  multi-week project — pick it up when ready.
+- **macOS backend.** Same shape as Win-GUI: implement
+  `quadraui::macos::draw_*` against Core Graphics + Core Text;
+  consume the same primitives.
 
-After #281 closes, every entry in the cross-backend coverage
-table is ✅ on both backends. The "TUI/GTK paint duplication"
-arc as scoped in PLAN.md is closed. Smaller residual convergence
-work (#210/#211/#288-style hit-test/click items, ~hundreds of
-LOC) plus intrinsic-to-surface divergences remain but are
-tracked separately.
+### What's left (smaller residual work, not "duplication")
+
+- **Hit-test glue (#210, #211)** — motion handlers should call
+  `layout.hit_test()` directly instead of hand-rolling row math.
+  Several lifts (#280, #281, #285) already converted their click
+  handlers; motion handlers (mouse-move) are still per-backend in
+  most cases.
+- **Click divergences** — #288 (completion popup click consume vs
+  fall-through), #287 (Ctrl-P palette collision), #286 already
+  fixed.
+- **Intrinsic-to-surface** divergences that can't be eliminated:
+  selection paint order (Cairo painter order vs ratatui cell
+  coalescence), border style (Cairo arbitrary geometry vs box-
+  drawing chars). Documented in PLAN.md "Lessons captured."
+
+### Recommended next focus
+
+Pick one of:
+
+1. **B.6 Win-GUI rebuild.** Start a fresh phase. Read
+   `docs/NATIVE_GUI_LESSONS.md`, draft a stage map similar to Phase
+   C's, build a primitive at a time. Long.
+2. **macOS backend.** Higher user payoff than Win-GUI (macOS
+   developers are an underserved constituency on vimcode); harder
+   because there's no existing scaffold. Long.
+3. **Independent quality work.** Drain the smaller residual list
+   (#287, #288, #290, #291, #262, #263, #264, #265, #272, #273,
+   #274). Cumulatively meaningful; individually small.
+4. **Crate Extraction (Milestone 2).** #45 vimcode-core crate; #44
+   UiEvent abstraction; #46 SQL client PoC. Architecture work.
 
 ### Strategic complement — B.6 Win-GUI rebuild
 

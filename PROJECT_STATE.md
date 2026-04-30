@@ -40,19 +40,18 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post #280, 2026-04-29):** Editor viewport **lifted**
-(#276), GTK `Completions` lifted (#285), editor hover popup
-lifted (#214 + #266 — `RichTextPopup` shipped 2026-04-25;
-rasterisers lifted 2026-04-28), extension panel lifted (#280,
-`d29d1b4`), source control panel lifted (`render::source_control_to_tree_view`
-+ `Backend::draw_tree`, table previously stale). Both backends
-paint completions through `quadraui::Completions`, hover popups
-through `quadraui::RichTextPopup`, and section-header trees
-(extension panel + source control) through `quadraui::TreeView`
-with `Decoration::Header`. TUI chrome ~98% on quadraui; GTK chrome
-~95%. **Remaining bespoke-per-backend duplication: one sidebar
-surface — #281 (debug sidebar, ~16 hrs, hand-rolled hit math per
-#210/#211).**
+**Status (post #281, 2026-04-29):** **TUI/GTK paint duplication is
+done.** Every entry in the cross-backend coverage table below is ✅
+on both backends. Editor viewport lifted (#276), GTK `Completions`
+(#285), editor hover popup (#214 + #266 — `RichTextPopup`),
+extension panel (#280), source control panel
+(`render::source_control_to_tree_view` + `Backend::draw_tree`),
+debug sidebar (#281 — four `TreeView` instances, one per section).
+TUI chrome 100% on quadraui; GTK chrome 100%. **No paint
+duplication remains.** Smaller residual convergence work
+(#210/#211/#288-style hit-test/click items, ~hundreds of LOC) plus
+intrinsic-to-surface divergences (Cairo painter order vs ratatui
+cell coalescence) remain but are tracked separately.
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -80,7 +79,7 @@ surface — #281 (debug sidebar, ~16 hrs, hand-rolled hit math per
 | AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
 | Editor viewport (text + gutter + cursor + selection + diagnostics) | `Editor` | ✅ | ✅ | #276, `5b23718`+ (Phase C Stage 1) |
 | Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
-| Debug sidebar (variables tree, breakpoints, watch) | _MultiSectionView TBD_ | ❌ bespoke | ❌ bespoke | #281, deferred (~16 hrs, hand-rolled hit math per #210/#211) |
+| Debug sidebar (variables tree, breakpoints, watch) | `TreeView` × 4 (one per section) | ✅ | ✅ | #281, `f3d78d6`. Adapter `render::debug_sidebar_section_to_tree_view` builds one `TreeView` per section. Click via `TreeViewLayout::hit_test()` on both backends. |
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
