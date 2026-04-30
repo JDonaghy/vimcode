@@ -8897,18 +8897,23 @@ impl App {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
-                let lh = self.cached_line_height;
+                // The debug sidebar paint uses UI font line height (computed
+                // inside the `set_draw_func` closure from the same `UI_FONT()`
+                // metrics that drive every other UI panel). Click hit math must
+                // use the matching cache (`cached_ui_line_height`) — using the
+                // editor `cached_line_height` produces row-off-by-N drift that
+                // grows through Variables / Watch / Call Stack / Breakpoints.
+                let lh = self.cached_ui_line_height.max(1.0);
                 let row_idx = (y / lh) as u16;
                 let mut engine = self.engine.borrow_mut();
 
-                // Compute section heights for click mapping.
+                // Compute section heights for click mapping. Same UI-font math
+                // as the paint side.
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    if lh > 0.0 {
-                        let da_h = da.height() as f64;
-                        let content_px = (da_h - 6.0 * lh).max(0.0);
-                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                        engine.dap_sidebar_section_heights = [per_sec; 4];
-                    }
+                    let da_h = da.height() as f64;
+                    let content_px = (da_h - 6.0 * lh).max(0.0);
+                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                    engine.dap_sidebar_section_heights = [per_sec; 4];
                 }
 
                 // Give focus to the debug sidebar
@@ -9060,15 +9065,15 @@ impl App {
             }
             Msg::DebugSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
-                // Compute section heights.
-                let lh = self.cached_line_height;
+                // Compute section heights using the same UI font line height
+                // the paint side uses (mirrors the click handler — see #281
+                // smoke-fix note).
+                let lh = self.cached_ui_line_height.max(1.0);
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    if lh > 0.0 {
-                        let da_h = da.height() as f64;
-                        let content_px = (da_h - 6.0 * lh).max(0.0);
-                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                        engine.dap_sidebar_section_heights = [per_sec; 4];
-                    }
+                    let da_h = da.height() as f64;
+                    let content_px = (da_h - 6.0 * lh).max(0.0);
+                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                    engine.dap_sidebar_section_heights = [per_sec; 4];
                 }
                 // Scroll the active section.
                 let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
