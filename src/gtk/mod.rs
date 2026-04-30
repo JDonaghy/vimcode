@@ -4808,9 +4808,7 @@ impl SimpleComponent for App {
             Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
                 self.handle_sc_sidebar_msg(msg);
             }
-            Msg::ExtSidebarKey(_, _)
-            | Msg::ExtSidebarClick(_, _, _)
-            | Msg::ExtSidebarScroll(_) => {
+            Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarClick(_, _, _) | Msg::ExtSidebarScroll(_) => {
                 self.handle_ext_sidebar_msg(msg);
             }
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
