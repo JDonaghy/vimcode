@@ -9043,15 +9043,30 @@ impl App {
                     self.draw_needed.set(true);
                     return;
                 }
-                // Compute section heights for ensure_visible.
+                // F-keys (F5/F6/F9/F10/F11) are debugger function keys
+                // handled by `engine::handle_normal_key`, not by the
+                // debug-sidebar-local handler. Route them to the engine
+                // directly so step-over / continue / breakpoint-toggle
+                // keep working while the debug sidebar has focus.
+                let is_fkey = key_name.starts_with('F')
+                    && key_name[1..]
+                        .parse::<u8>()
+                        .map(|n| (1..=12).contains(&n))
+                        .unwrap_or(false);
+                if is_fkey {
+                    engine.handle_key(&key_name, None, ctrl);
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                // Compute section heights for ensure_visible. Same UI font
+                // metric as the paint side (mirrors the click handler).
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    let lh = self.cached_line_height;
-                    if lh > 0.0 {
-                        let da_h = da.height() as f64;
-                        let content_px = (da_h - 6.0 * lh).max(0.0);
-                        let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                        engine.dap_sidebar_section_heights = [per_sec; 4];
-                    }
+                    let lh = self.cached_ui_line_height.max(1.0);
+                    let da_h = da.height() as f64;
+                    let content_px = (da_h - 6.0 * lh).max(0.0);
+                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
+                    engine.dap_sidebar_section_heights = [per_sec; 4];
                 }
                 let mapped = map_gtk_key_name(key_name.as_str());
                 engine.handle_debug_sidebar_key(mapped, ctrl);
