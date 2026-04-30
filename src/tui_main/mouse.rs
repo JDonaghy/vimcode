@@ -3039,6 +3039,21 @@ pub(super) fn handle_mouse(
                                 }
                             }
                         }
+                        quadraui::MultiSectionViewHit::PanelScrollbar { .. } => {
+                            // Click-to-jump on the panel scrollbar: treat
+                            // the click position as the desired thumb
+                            // centre and update `panel_scroll` accordingly.
+                            // Layout's internal clamp ensures the value
+                            // never exceeds `total - body_height`.
+                            if let Some(track) = layout.panel_scrollbar {
+                                let track_h = track.height.max(1.0);
+                                let total: f32 =
+                                    layout.sections.iter().map(|s| s.resolved_size).sum();
+                                let max_scroll = (total - body_height).max(0.0);
+                                let click_frac = (rel_y / track_h).clamp(0.0, 1.0);
+                                engine.ext_sidebar_panel_scroll = click_frac * max_scroll;
+                            }
+                        }
                         _ => {
                             // Scrollbar / divider / inert — no-op for now.
                         }

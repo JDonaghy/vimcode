@@ -2909,6 +2909,37 @@ pub(super) fn render_ext_sidebar(
     engine.ext_sidebar_body_height.set(body_area.height as f32);
     let view = render::ext_sidebar_to_multi_section_view(ext);
     let q_theme = super::quadraui_tui::q_theme(theme);
+
+    // Compute total content size so click/drag handlers can derive
+    // `max_panel_scroll` without re-running layout (#293).
+    let metrics = quadraui::MsvLayoutMetrics {
+        header_size: 1.0,
+        divider_size: 0.0,
+        scrollbar_size: 1.0,
+    };
+    let body_qbounds = quadraui::Rect::new(
+        body_area.x as f32,
+        body_area.y as f32,
+        body_area.width as f32,
+        body_area.height as f32,
+    );
+    let view_layout = view.layout(body_qbounds, metrics, |i| {
+        let s = &view.sections[i];
+        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
+        let content_size = match &s.body {
+            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
+            _ => 0.0,
+        };
+        quadraui::SectionMeasure {
+            content_size,
+            aux_size,
+        }
+    });
+    let total: f32 = view_layout.sections.iter().map(|s| s.resolved_size).sum();
+    engine
+        .ext_sidebar_max_panel_scroll
+        .set((total - body_area.height as f32).max(0.0));
+
     let buf = frame.buffer_mut();
     quadraui::tui::draw_multi_section_view(
         buf,

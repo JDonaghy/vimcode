@@ -3335,12 +3335,26 @@ impl SimpleComponent for App {
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                // Cache the MSV body height so click hit-tests use the
-                // same bounds (and thus the same clamped panel_scroll)
-                // as paint (#293).
-                engine
-                    .ext_sidebar_body_height
-                    .set(((h - 2.0 * line_height).max(0.0)) as f32);
+                let body_h = ((h - 2.0 * line_height).max(0.0)) as f32;
+                engine.ext_sidebar_body_height.set(body_h);
+                // Compute max_panel_scroll for scrollbar drag handlers
+                // (avoids re-running layout per drag-update event).
+                if let Some(ref ext) = screen.ext_sidebar {
+                    let view_for_max = render::ext_sidebar_to_multi_section_view(ext);
+                    let layout_for_max = quadraui::gtk::multi_section_view_layout(
+                        &view_for_max,
+                        quadraui::Rect::new(0.0, 0.0, w as f32, body_h),
+                        line_height,
+                    );
+                    let total: f32 = layout_for_max
+                        .sections
+                        .iter()
+                        .map(|s| s.resolved_size)
+                        .sum();
+                    engine
+                        .ext_sidebar_max_panel_scroll
+                        .set((total - body_h).max(0.0));
+                }
                 draw_ext_sidebar(
                     cr,
                     &layout,
@@ -3385,6 +3399,55 @@ impl SimpleComponent for App {
                 gtk4::glib::Propagation::Stop
             });
             widgets.ext_sidebar_da.add_controller(scroll_ctrl);
+        }
+        // Scrollbar thumb drag — mirrors the ext_dyn_panel_da pattern.
+        // Claim the gesture when drag starts in the rightmost 8 px so
+        // sidebar-resize on `main_hbox` doesn't steal the sequence.
+        // Reads `ext_sidebar_body_height` and `ext_sidebar_max_panel_scroll`
+        // (cached by paint each frame) so we don't need to re-run layout.
+        {
+            let engine_drag = engine.clone();
+            let da_ref = ext_sidebar_da_ref.clone();
+            let da_ref_begin = ext_sidebar_da_ref.clone();
+            let draw_needed = model.draw_needed.clone();
+            let gesture = gtk4::GestureDrag::new();
+            gesture.connect_drag_begin(move |g, x, _y| {
+                let da_w = if let Some(ref da) = *da_ref_begin.borrow() {
+                    da.width() as f64
+                } else {
+                    return;
+                };
+                if x >= da_w - 8.0 {
+                    g.set_state(gtk4::EventSequenceState::Claimed);
+                }
+            });
+            gesture.connect_drag_update(move |g, _dx, dy| {
+                let Some((start_x, start_y)) = g.start_point() else {
+                    return;
+                };
+                let (da_w, da_h) = if let Some(ref da) = *da_ref.borrow() {
+                    (da.width() as f64, da.height() as f64)
+                } else {
+                    return;
+                };
+                if start_x < da_w - 8.0 || da_h <= 0.0 {
+                    return;
+                }
+                let mut engine = engine_drag.borrow_mut();
+                let body_h = engine.ext_sidebar_body_height.get().max(1.0) as f64;
+                let chrome_h = (da_h - body_h).max(0.0);
+                let track_h = body_h.max(1.0);
+                let y = (start_y + dy - chrome_h).clamp(0.0, track_h);
+                let frac = (y / track_h) as f32;
+                let max_scroll = engine.ext_sidebar_max_panel_scroll.get();
+                engine.ext_sidebar_panel_scroll = frac * max_scroll;
+                drop(engine);
+                if let Some(ref da) = *da_ref.borrow() {
+                    da.queue_draw();
+                }
+                draw_needed.set(true);
+            });
+            widgets.ext_sidebar_da.add_controller(gesture);
         }
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
@@ -9629,8 +9692,20 @@ impl App {
                                     }
                                 }
                             }
+                            quadraui::MultiSectionViewHit::PanelScrollbar { .. } => {
+                                // Click-to-jump on the panel scrollbar.
+                                if let Some(track) = view_layout.panel_scrollbar {
+                                    let track_h = track.height.max(1.0);
+                                    let total: f32 =
+                                        view_layout.sections.iter().map(|s| s.resolved_size).sum();
+                                    let body_h_f32 = body_height as f32;
+                                    let max_scroll = (total - body_h_f32).max(0.0);
+                                    let click_frac = (rel_y / track_h).clamp(0.0, 1.0);
+                                    engine.ext_sidebar_panel_scroll = click_frac * max_scroll;
+                                }
+                            }
                             _ => {
-                                // Scrollbar / divider / inert / outside — no-op.
+                                // Divider / inert / outside — no-op.
                             }
                         }
                     }

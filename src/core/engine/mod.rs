@@ -2985,6 +2985,11 @@ pub struct Engine {
     /// guaranteeing paint and click apply the same `panel_scroll`
     /// clamp. `Cell<f32>` because paint runs with `&Engine` (#293).
     pub ext_sidebar_body_height: std::cell::Cell<f32>,
+    /// Cache of the most recent maximum legal `panel_scroll` value
+    /// (`total_content - body_height`, `>= 0`). Used by scrollbar drag
+    /// handlers to convert track position to scroll value without
+    /// re-running layout. Updated by paint each frame.
+    pub ext_sidebar_max_panel_scroll: std::cell::Cell<f32>,
     /// Extension name pending removal (set when the remove-confirmation dialog opens).
     pub pending_ext_remove: Option<String>,
 
@@ -3517,6 +3522,7 @@ impl Engine {
             ext_sidebar_input_active: false,
             ext_sidebar_panel_scroll: 0.0,
             ext_sidebar_body_height: std::cell::Cell::new(0.0),
+            ext_sidebar_max_panel_scroll: std::cell::Cell::new(0.0),
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,
