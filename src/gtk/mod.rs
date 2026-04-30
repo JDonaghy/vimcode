@@ -9072,22 +9072,12 @@ impl App {
                     self.draw_needed.set(true);
                     return;
                 }
-                // F-keys (F5/F6/F9/F10/F11) are debugger function keys
-                // handled by `engine::handle_normal_key`, not by the
-                // debug-sidebar-local handler. Route them to the engine
-                // directly so step-over / continue / breakpoint-toggle
-                // keep working while the debug sidebar has focus.
-                let is_fkey = key_name.starts_with('F')
-                    && key_name[1..]
-                        .parse::<u8>()
-                        .map(|n| (1..=12).contains(&n))
-                        .unwrap_or(false);
-                if is_fkey {
-                    engine.handle_key(&key_name, None, ctrl);
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
+                // F-keys (F5/F6/F9/F10/F11) are now handled inside
+                // `engine::handle_debug_sidebar_key` directly so they
+                // reach the debugger without bypass tricks. (#281 smoke
+                // fix — earlier passthrough that called `engine::handle_key`
+                // was re-intercepted at `keys.rs:192` because of the
+                // `dap_sidebar_has_focus` check.)
                 // Compute section heights for ensure_visible. Same
                 // line_height the paint side computed.
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {

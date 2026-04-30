@@ -806,6 +806,25 @@ impl Engine {
                 };
                 self.dap_sidebar_selected = 0;
             }
+            // Debugger F-keys: routed through here when the debug sidebar
+            // has focus so step-over / continue / breakpoint-toggle keep
+            // working without forcing the user to refocus the editor first.
+            // Mirrors the F-key arms in `handle_normal_key` (#281 smoke fix).
+            "F5" => {
+                let _ = self.execute_command("debug");
+            }
+            "F6" => {
+                let _ = self.execute_command("pause");
+            }
+            "F9" => {
+                let _ = self.execute_command("brkpt");
+            }
+            "F10" => {
+                let _ = self.execute_command("stepover");
+            }
+            "F11" => {
+                let _ = self.execute_command("stepin");
+            }
             "Return" | "Enter" | " " => {
                 let sel = self.dap_sidebar_selected;
                 match self.dap_sidebar_section {
