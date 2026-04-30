@@ -6699,7 +6699,15 @@ pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::Mult
         axis: MsvAxis::Vertical,
         allow_resize: false,
         allow_collapse: true,
-        scroll_mode: ScrollMode::PerSection,
+        // WholePanel mode: sections size to their own content height
+        // and stack at deterministic positions. The panel scrolls as a
+        // unit when total content exceeds the visible body area (matches
+        // VSCode Extensions panel UX: INSTALLED grows with item count,
+        // AVAILABLE flows below it). Critical for click hit-testing —
+        // section boundaries don't depend on the bounds.height the
+        // backend passes, so paint and click see the same layout
+        // regardless of which area each measures.
+        scroll_mode: ScrollMode::WholePanel,
         has_focus: ext.has_focus,
         panel_scroll: 0.0,
     }
