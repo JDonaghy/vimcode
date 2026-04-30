@@ -8915,18 +8915,30 @@ impl App {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
-                // Read line_height from the cell the debug-sidebar draw
-                // closure published. Using the closure's value (rather than
-                // recomputing or reading `cached_ui_line_height`) keeps
-                // click and paint in lockstep even when HiDPI scaling makes
-                // `da.pango_context()` diverge from the cairo-derived
-                // pangocairo context the paint uses (#281 smoke).
+                // Mirror the paint walk in `draw_debug_sidebar` exactly —
+                // working in pixel coordinates so the row math doesn't
+                // bake in any unit assumption that diverges between paint
+                // and click.
+                //
+                // Layout from `draw_debug_sidebar` (#281):
+                //   y ∈ [0,        line_height)        — panel header
+                //   y ∈ [line_height, 2*line_height)   — Run/Stop button
+                //   For each of the 4 sections, in order:
+                //     y ∈ [section_top, section_top+lh)        — title
+                //     y ∈ [section_top+lh, section_top+lh+sec_h_px) — items
+                //   where sec_h_px = visible_rows × line_height (chrome unit)
+                //
+                // Items inside each section are painted by
+                // `quadraui::gtk::draw_tree`, which uses **1.4 × lh** per
+                // non-header row (see `quadraui/src/gtk/tree.rs`). The
+                // click hit-test must therefore use 1.4 × lh per row,
+                // not 1.0 × lh.
                 let lh = self.debug_sidebar_lh.get().max(1.0);
-                let row_idx = (y / lh) as u16;
+                let item_h = (lh * 1.4).round();
                 let mut engine = self.engine.borrow_mut();
 
-                // Compute section heights for click mapping. Same line_height
-                // the paint computed.
+                // Section heights (in chrome rows = `lh` units, matching
+                // the paint chrome's `cursor_y += visible_rows * line_height`).
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     let da_h = da.height() as f64;
                     let content_px = (da_h - 6.0 * lh).max(0.0);
@@ -8934,14 +8946,12 @@ impl App {
                     engine.dap_sidebar_section_heights = [per_sec; 4];
                 }
 
-                // Give focus to the debug sidebar
                 engine.dap_sidebar_has_focus = true;
-                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
 
-                if row_idx == 0 {
-                    // Header — no-op
-                } else if row_idx == 1 {
-                    // Run/Stop button
+                if y < lh {
+                    // Panel header — no-op
+                } else if y < 2.0 * lh {
+                    // Run/Stop button row.
                     if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
                         engine.dap_continue();
                     } else if engine.dap_session_active {
@@ -8950,101 +8960,98 @@ impl App {
                         engine.execute_command("debug");
                     }
                 } else {
-                    // Walk sections using fixed-allocation layout:
-                    // row 2+ = [section_header(1) + content(height)]×4
                     let sections = [
                         (DebugSidebarSection::Variables, 0usize),
                         (DebugSidebarSection::Watch, 1),
                         (DebugSidebarSection::CallStack, 2),
                         (DebugSidebarSection::Breakpoints, 3),
                     ];
-                    let mut cur_row: u16 = 2;
+                    let mut cursor_y: f64 = 2.0 * lh;
                     for (section, sec_idx) in &sections {
-                        let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
-                        let section_header_row = cur_row;
-                        let items_start = cur_row + 1;
-                        let items_end = items_start + sec_height;
+                        let sec_rows = engine.dap_sidebar_section_heights[*sec_idx] as f64;
+                        let title_top = cursor_y;
+                        let items_top = title_top + lh;
+                        let items_bot = items_top + sec_rows * lh;
 
-                        if row_idx == section_header_row {
+                        if y >= title_top && y < items_top {
+                            // Click on section title — activate.
                             engine.dap_sidebar_section = *section;
                             engine.dap_sidebar_selected = 0;
                             break;
-                        } else if row_idx >= items_start && row_idx < items_end {
+                        } else if y >= items_top && y < items_bot {
+                            engine.dap_sidebar_section = *section;
                             let item_count = engine.dap_sidebar_section_item_count(*section);
-                            let height = sec_height as usize;
-                            // Scrollbar click: rightmost 6px when items overflow.
+
+                            // Scrollbar overlay: rightmost 6px of the items area.
                             let da_w = self
                                 .debug_sidebar_da_ref
                                 .borrow()
                                 .as_ref()
                                 .map(|da| da.width() as f64)
                                 .unwrap_or(200.0);
-                            if click_x >= da_w - 6.0 && item_count > height && height > 0 {
-                                let rel_row = (row_idx - items_start) as usize;
-                                let ratio = rel_row as f64 / height as f64;
-                                let max_scroll = item_count.saturating_sub(height);
-                                engine.dap_sidebar_scroll[*sec_idx] =
-                                    (ratio * max_scroll as f64) as usize;
-                                engine.dap_sidebar_section = *section;
-                            } else {
-                                // Hit-test through `TreeViewLayout::hit_test()`
-                                // so the click path agrees with the paint path
-                                // by construction (#281, mirrors #280 / #210
-                                // pattern). For flat 1-row items the result is
-                                // arithmetically identical to
-                                // `scroll_off + (row_idx - items_start)`.
-                                let theme = Theme::from_name(&engine.settings.colorscheme);
-                                let screen =
-                                    build_screen_layout(&engine, &theme, &[], lh, 1.0, false);
-                                let sb = &screen.debug_sidebar;
-                                let items_for_section = match section {
-                                    DebugSidebarSection::Variables => &sb.variables,
-                                    DebugSidebarSection::Watch => &sb.watch,
-                                    DebugSidebarSection::CallStack => &sb.frames,
-                                    DebugSidebarSection::Breakpoints => &sb.breakpoints,
-                                };
-                                let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                                let tree = render::debug_sidebar_section_to_tree_view(
-                                    items_for_section,
-                                    scroll_off,
-                                    sb.has_focus,
-                                    sb.session_active,
-                                    "click",
-                                );
-                                let layout =
-                                    tree.layout(1.0, sec_height as f32 * lh as f32, |_| {
-                                        quadraui::TreeRowMeasure::new(lh as f32)
-                                    });
-                                // Always activate the clicked section so
-                                // keyboard nav operates on it even when
-                                // the click hit an empty-state placeholder
-                                // row. (#281 smoke fix.)
-                                engine.dap_sidebar_section = *section;
-                                let rel_y = (row_idx - items_start) as f32 * lh as f32;
-                                let item_idx = if let quadraui::TreeViewHit::Row(idx) =
-                                    layout.hit_test(0.0, rel_y)
-                                {
-                                    let path = tree.rows[idx].path.clone();
-                                    if let [item_idx_u16] = path.as_slice() {
-                                        if *item_idx_u16 != u16::MAX {
-                                            Some(*item_idx_u16 as usize)
-                                        } else {
-                                            None
-                                        }
+                            if click_x >= da_w - 6.0 && item_count > 0 {
+                                // Visible rows = chrome rows / 1.4 (since each
+                                // item paints at 1.4×lh).
+                                let visible_rows =
+                                    (sec_rows * lh / item_h).floor().max(1.0) as usize;
+                                if item_count > visible_rows {
+                                    let rel_y_pct = (y - items_top) / (items_bot - items_top);
+                                    let max_scroll = item_count.saturating_sub(visible_rows);
+                                    engine.dap_sidebar_scroll[*sec_idx] =
+                                        (rel_y_pct * max_scroll as f64) as usize;
+                                }
+                                break;
+                            }
+
+                            // Hit-test inside the items area using the
+                            // SAME row measure the paint side uses
+                            // (`quadraui::gtk::draw_tree` paints non-header
+                            // rows at `line_height * 1.4`).
+                            let theme = Theme::from_name(&engine.settings.colorscheme);
+                            let screen = build_screen_layout(&engine, &theme, &[], lh, 1.0, false);
+                            let sb = &screen.debug_sidebar;
+                            let items_for_section = match section {
+                                DebugSidebarSection::Variables => &sb.variables,
+                                DebugSidebarSection::Watch => &sb.watch,
+                                DebugSidebarSection::CallStack => &sb.frames,
+                                DebugSidebarSection::Breakpoints => &sb.breakpoints,
+                            };
+                            let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
+                            let tree = render::debug_sidebar_section_to_tree_view(
+                                items_for_section,
+                                scroll_off,
+                                sb.has_focus,
+                                sb.session_active,
+                                "click",
+                            );
+                            let viewport_h = (items_bot - items_top) as f32;
+                            let layout = tree.layout(1.0, viewport_h, |_| {
+                                quadraui::TreeRowMeasure::new(item_h as f32)
+                            });
+                            let rel_y = (y - items_top) as f32;
+                            let item_idx = if let quadraui::TreeViewHit::Row(idx) =
+                                layout.hit_test(0.0, rel_y)
+                            {
+                                let path = tree.rows[idx].path.clone();
+                                if let [item_idx_u16] = path.as_slice() {
+                                    if *item_idx_u16 != u16::MAX {
+                                        Some(*item_idx_u16 as usize)
                                     } else {
                                         None
                                     }
                                 } else {
                                     None
-                                };
-                                if let Some(item_idx) = item_idx {
-                                    engine.dap_sidebar_selected = item_idx;
-                                    engine.handle_debug_sidebar_key("Return", false);
                                 }
+                            } else {
+                                None
+                            };
+                            if let Some(item_idx) = item_idx {
+                                engine.dap_sidebar_selected = item_idx;
+                                engine.handle_debug_sidebar_key("Return", false);
                             }
                             break;
                         }
-                        cur_row = items_end;
+                        cursor_y = items_bot;
                     }
                 }
                 drop(engine);
