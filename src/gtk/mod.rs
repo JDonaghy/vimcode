@@ -939,6 +939,7 @@ enum Msg {
     ExtSidebarKey(String, Option<char>),
     /// Click in the Extensions sidebar DrawingArea (x, y, n_press).
     ExtSidebarClick(f64, f64, i32),
+    ExtSidebarScroll(f64),
     /// Key press in the Settings sidebar DrawingArea (key_name, ctrl, unicode).
     SettingsKey(String, bool, Option<char>),
     /// Click in the Settings sidebar DrawingArea (x, y, n_press).
@@ -3369,6 +3370,16 @@ impl SimpleComponent for App {
             });
             widgets.ext_sidebar_da.add_controller(gesture);
         }
+        {
+            let sender_scroll = sender.input_sender().clone();
+            let scroll_ctrl =
+                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
+                sender_scroll.send(Msg::ExtSidebarScroll(dy)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.ext_sidebar_da.add_controller(scroll_ctrl);
+        }
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
         // ── Extension-provided panel (e.g. git-insights) draw + key + click ──
@@ -4797,7 +4808,9 @@ impl SimpleComponent for App {
             Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
                 self.handle_sc_sidebar_msg(msg);
             }
-            Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarClick(_, _, _) => {
+            Msg::ExtSidebarKey(_, _)
+            | Msg::ExtSidebarClick(_, _, _)
+            | Msg::ExtSidebarScroll(_) => {
                 self.handle_ext_sidebar_msg(msg);
             }
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
@@ -9623,6 +9636,21 @@ impl App {
                 } else {
                     drop(engine);
                 }
+                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ExtSidebarScroll(dy) => {
+                let mut engine = self.engine.borrow_mut();
+                let line_height = self.cached_ui_line_height.max(1.0);
+                // Wheel notch ≈ 3 leaf rows (matches the previous
+                // selection-by-3 behaviour). Best-effort clamp; the
+                // rasteriser handles over-scrolled values gracefully.
+                let delta = (dy as f32) * 3.0 * (line_height as f32 * 1.4);
+                engine.ext_sidebar_panel_scroll =
+                    (engine.ext_sidebar_panel_scroll + delta).max(0.0);
+                drop(engine);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }

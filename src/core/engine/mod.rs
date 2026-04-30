@@ -2974,6 +2974,11 @@ pub struct Engine {
     pub ext_sidebar_sections_expanded: [bool; 2],
     /// Whether the sidebar search input field is active.
     pub ext_sidebar_input_active: bool,
+    /// Vertical scroll offset of the Extensions panel content, in
+    /// main-axis units (cells for TUI, pixels for GTK). Drives
+    /// `MultiSectionView::panel_scroll` in `WholePanel` mode (#293).
+    /// Cleared on session start.
+    pub ext_sidebar_panel_scroll: f32,
     /// Extension name pending removal (set when the remove-confirmation dialog opens).
     pub pending_ext_remove: Option<String>,
 
@@ -3504,6 +3509,7 @@ impl Engine {
             ext_sidebar_query: String::new(),
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
+            ext_sidebar_panel_scroll: 0.0,
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,

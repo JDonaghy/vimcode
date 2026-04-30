@@ -1449,6 +1449,9 @@ pub struct ExtSidebarData {
     pub input_active: bool,
     /// True while a background registry fetch is in-flight.
     pub fetching: bool,
+    /// Vertical scroll offset of the panel content in main-axis units
+    /// (cells / pixels). Drives `MultiSectionView::panel_scroll` (#293).
+    pub panel_scroll: f32,
 }
 
 // ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
@@ -6709,7 +6712,7 @@ pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::Mult
         // regardless of which area each measures.
         scroll_mode: ScrollMode::WholePanel,
         has_focus: ext.has_focus,
-        panel_scroll: 0.0,
+        panel_scroll: ext.panel_scroll,
     }
 }
 
@@ -7112,6 +7115,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         query: engine.ext_sidebar_query.clone(),
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
+        panel_scroll: engine.ext_sidebar_panel_scroll,
     })
 }
 

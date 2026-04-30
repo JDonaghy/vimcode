@@ -1307,14 +1307,19 @@ pub(super) fn handle_mouse(
                             (engine.settings_scroll_top + 3).min(max_scroll);
                     }
                 } else if sidebar.active_panel == TuiPanel::Extensions {
-                    // Scroll selection up/down
-                    let total = engine.ext_available_manifests().len();
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.ext_sidebar_selected = engine.ext_sidebar_selected.saturating_sub(3);
+                    // WholePanel scroll: shift the panel viewport by 3
+                    // rows per wheel notch. Clamping is best-effort —
+                    // out-of-range values just reveal empty space at
+                    // the bottom; user scrolls back. (Selection is now
+                    // arrow-key / typed-char driven, not wheel-driven —
+                    // VSCode behaviour.)
+                    let delta: f32 = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                        -3.0
                     } else {
-                        engine.ext_sidebar_selected =
-                            (engine.ext_sidebar_selected + 3).min(total.saturating_sub(1));
-                    }
+                        3.0
+                    };
+                    engine.ext_sidebar_panel_scroll =
+                        (engine.ext_sidebar_panel_scroll + delta).max(0.0);
                 }
                 return sidebar_width;
             }
