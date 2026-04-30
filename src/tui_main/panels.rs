@@ -2903,6 +2903,10 @@ pub(super) fn render_ext_sidebar(
         width: area.width,
         height: area.height - 2,
     };
+    // Cache the body height so click hit-tests pass the same bounds to
+    // `MultiSectionView::layout`, applying the same `panel_scroll`
+    // clamp as paint did (#293).
+    engine.ext_sidebar_body_height.set(body_area.height as f32);
     let view = render::ext_sidebar_to_multi_section_view(ext);
     let q_theme = super::quadraui_tui::q_theme(theme);
     let buf = frame.buffer_mut();

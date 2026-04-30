@@ -3335,6 +3335,12 @@ impl SimpleComponent for App {
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
+                // Cache the MSV body height so click hit-tests use the
+                // same bounds (and thus the same clamped panel_scroll)
+                // as paint (#293).
+                engine
+                    .ext_sidebar_body_height
+                    .set(((h - 2.0 * line_height).max(0.0)) as f32);
                 draw_ext_sidebar(
                     cr,
                     &layout,
@@ -9584,18 +9590,19 @@ impl App {
                         // y_click is already absolute relative to the
                         // panel; layout returns hits keyed off section
                         // bounds the rasteriser produced).
-                        let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, f32::MAX);
+                        // Use the body height paint cached this frame so
+                        // the primitive's internal `panel_scroll` clamp
+                        // produces exactly the section bounds the rasteriser
+                        // used — paint and click see one layout (#293).
+                        let body_height = engine.ext_sidebar_body_height.get().max(1.0) as f64;
+                        let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, body_height as f32);
                         let view_layout = quadraui::gtk::multi_section_view_layout(
                             &view,
                             body_bounds,
                             line_height,
                         );
-                        // body_bounds.height = f32::MAX clamps the layout's
-                        // panel_scroll to 0 — sections sit at their
-                        // unscrolled positions. Map the viewport click back
-                        // into those coords by adding `panel_scroll`.
-                        let logical_y = (y_click - chrome_h) as f32 + view.panel_scroll;
-                        match view_layout.hit_test(0.0, logical_y) {
+                        let rel_y = (y_click - chrome_h) as f32;
+                        match view_layout.hit_test(0.0, rel_y) {
                             quadraui::MultiSectionViewHit::Header { section, .. } => {
                                 let cur = engine.ext_sidebar_sections_expanded[section];
                                 engine.ext_sidebar_sections_expanded[section] = !cur;
@@ -9608,7 +9615,7 @@ impl App {
                                     let inner = t.layout(body_b.width, body_b.height, |_| {
                                         quadraui::TreeRowMeasure::new(item_h)
                                     });
-                                    let local_y = logical_y - body_b.y;
+                                    let local_y = rel_y - body_b.y;
                                     if let quadraui::TreeViewHit::Row(row_idx) =
                                         inner.hit_test(0.0, local_y)
                                     {

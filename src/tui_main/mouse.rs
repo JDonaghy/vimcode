@@ -2980,12 +2980,13 @@ pub(super) fn handle_mouse(
                 if let Some(ref ext) = screen.ext_sidebar {
                     let installed_count = ext.items_installed.len();
                     let view = render::ext_sidebar_to_multi_section_view(ext);
-                    let body_bounds = quadraui::Rect::new(
-                        0.0,
-                        0.0,
-                        sidebar_width as f32,
-                        f32::MAX, // body fills available height
-                    );
+                    // Use the body height paint cached this frame so the
+                    // primitive's internal `panel_scroll` clamp produces
+                    // exactly the section bounds the rasteriser used —
+                    // paint and click see one layout (#293).
+                    let body_height = engine.ext_sidebar_body_height.get().max(1.0);
+                    let body_bounds =
+                        quadraui::Rect::new(0.0, 0.0, sidebar_width as f32, body_height);
                     let metrics = quadraui::MsvLayoutMetrics {
                         header_size: 1.0,
                         divider_size: 0.0,
@@ -3003,12 +3004,7 @@ pub(super) fn handle_mouse(
                             aux_size,
                         }
                     });
-                    // Layout is computed with bounds.height=f32::MAX, so
-                    // panel_scroll clamps to 0 internally — sections are at
-                    // their unscrolled positions. To map a viewport click
-                    // back into those coords we add `panel_scroll`: viewport
-                    // y=N corresponds to unscrolled y=N+scroll.
-                    let logical_y = (sidebar_row - 2) as f32 + view.panel_scroll;
+                    let rel_y = (sidebar_row - 2) as f32;
                     let now = Instant::now();
                     let is_double = now.duration_since(*last_click_time)
                         < Duration::from_millis(400)
@@ -3016,7 +3012,7 @@ pub(super) fn handle_mouse(
                     *last_click_time = now;
                     *last_click_pos = (col, row);
 
-                    match layout.hit_test(0.0, logical_y) {
+                    match layout.hit_test(0.0, rel_y) {
                         quadraui::MultiSectionViewHit::Header { section, .. } => {
                             engine.ext_sidebar_sections_expanded[section] =
                                 !engine.ext_sidebar_sections_expanded[section];
@@ -3027,7 +3023,7 @@ pub(super) fn handle_mouse(
                                 let inner = t.layout(body_b.width, body_b.height, |_| {
                                     quadraui::TreeRowMeasure::new(1.0)
                                 });
-                                let local_y = logical_y - body_b.y;
+                                let local_y = rel_y - body_b.y;
                                 if let quadraui::TreeViewHit::Row(row_idx) =
                                     inner.hit_test(0.0, local_y)
                                 {

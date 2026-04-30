@@ -2979,6 +2979,12 @@ pub struct Engine {
     /// `MultiSectionView::panel_scroll` in `WholePanel` mode (#293).
     /// Cleared on session start.
     pub ext_sidebar_panel_scroll: f32,
+    /// Cache of the most recent rendered body height (cells for TUI,
+    /// pixels for GTK). Backends write this each frame so click
+    /// handlers can pass the same bounds to `MultiSectionView::layout`,
+    /// guaranteeing paint and click apply the same `panel_scroll`
+    /// clamp. `Cell<f32>` because paint runs with `&Engine` (#293).
+    pub ext_sidebar_body_height: std::cell::Cell<f32>,
     /// Extension name pending removal (set when the remove-confirmation dialog opens).
     pub pending_ext_remove: Option<String>,
 
@@ -3510,6 +3516,7 @@ impl Engine {
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
             ext_sidebar_panel_scroll: 0.0,
+            ext_sidebar_body_height: std::cell::Cell::new(0.0),
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,
