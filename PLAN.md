@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-30 (Session 343 closed — **TUI/GTK paint duplication arc DONE on develop@7f3498c**. #281 (Debug sidebar TreeView lift) shipped via Path A in 8 commits, the last 5 being smoke fixes including the actual paint/click parity fixes (`33cfd2b` GTK 1.4× row measure, `f15a490` TUI section_heights single-source-of-truth). Phase C umbrella #275 closed. Cross-backend coverage table is fully ✅✅ on both backends. Six items shipped this session via Path A: #283 / #285 / #286 / #280 / #281 + #214 doc reconciliation. Eight follow-ups filed: #287 / #288 / #290 / #291 (small UX), #289 (xterm.js parking lot), #292 (GTK F-keys when debug sidebar focused — pre-existing menu-bar key interception), **#293 — MultiSectionView primitive** (architectural — should land before B.6 Win-GUI rebuild). Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284))** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below for what's next now that the duplication arc is closed.)
+> **Last updated:** 2026-04-30 (Session 344 closed — **#293 `MultiSectionView` primitive shipped end-to-end via Path A** on `issue-293-multi-section-view` (~9 commits). Composable-bodies multi-section primitive with `WholePanel` + `PerSection` scroll modes; D-003 design entry; first consumer (Extensions sidebar) migrated. Smoke wave fixed: section overlap on scroll (clip + inner scroll_offset adjust), invisible panel-scrollbar, off-by-N click after scroll (cache body_height on engine), scrollbar click-to-jump and GTK thumb-drag. 19 quadraui unit tests + 1950 vimcode lib tests passing. Two follow-ups filed: **#295** TUI scrollbar drag (deferred — TUI mouse handler early-returns on non-Down events), **#296** Debug sidebar migration onto MSV. **#293 closed**; **#282** SC migration onto MSV remains open. Prior session 343: TUI/GTK paint duplication arc closed; cross-backend coverage table fully ✅✅ on both backends. See "🎯 NEXT FOCUS" below.)
 
 ---
 
@@ -46,11 +46,9 @@ post-Phase-C cleanup wave (#280 + #281) is closed.
 
 ### 🎯 Recommended next focus
 
-**Cued up for next session: [#293](https://github.com/JDonaghy/vimcode/issues/293) — `MultiSectionView` primitive.**
+**[#293](https://github.com/JDonaghy/vimcode/issues/293) `MultiSectionView` primitive — DONE.** Shipped Session 344 end-to-end via Path A. First consumer: Extensions sidebar (#280 follow-on, `WholePanel` + cached body_height). Two follow-ups remain: **[#296](https://github.com/JDonaghy/vimcode/issues/296)** Debug sidebar migration (4 sections, `EqualShare`; will fix the breakpoint > 50% bug visually) and **[#282](https://github.com/JDonaghy/vimcode/issues/282)** SC migration (Fixed(3) aux=Input commit + N TreeView sections). After those land, **B.6 Win-GUI rebuild** can consume MSV from day one.
 
-Why this first: the #281 smoke wave surfaced 4 classes of paint/click drift bugs (GTK 1.4× row measure mismatch, TUI section_heights two-source-of-truth, GTK HiDPI line_height divergence, GTK section_heights computation discrepancy). Each was caught only after a real-config smoke run. Each fix was per-backend. **The shape of the bug is "two backends each computing the same multi-section walk, getting subtly different numbers."** A `MultiSectionView` primitive that owns the entire layout (section titles + per-section scrollbar + per-section TreeView body) eliminates the entire bug class by construction.
-
-Effort: ~16-24 hrs (design pass + primitive + dual rasterisers + migrate Extensions / Debug / Source Control to consume it). Order matters: should land **before B.6 Win-GUI rebuild** — otherwise Win-GUI inherits all the same drift bugs the third time.
+Other small follow-ups: **[#295](https://github.com/JDonaghy/vimcode/issues/295)** TUI scrollbar drag (TUI mouse handler infrastructure refactor).
 
 **Then bug fixes** (user-cued for the same session). Front-of-queue picks:
 
