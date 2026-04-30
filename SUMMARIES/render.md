@@ -61,6 +61,11 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)
 - `to_q_editor(rw)` — boundary adapter `&RenderedWindow → quadraui::Editor` (#276 Stage 1C). Plus `to_q_editor_line`, `to_q_styled_span`, `to_q_cursor_pos`, `to_q_cursor_shape`, `to_q_selection`, `to_q_severity`, `to_q_git_status`, `to_q_diff_line`, `to_q_diagnostic_mark`, `to_q_spell_mark` per-type converters.
+- `completion_menu_to_quadraui_completions(menu)` — adapter `&CompletionMenu → quadraui::Completions` for `Backend::draw_completions` (#266, GTK lift in #285).
+- `source_control_to_tree_view(sc, theme)` — adapter `&SourceControlData → quadraui::TreeView` (Phase A.1b). Sections via `Decoration::Header`.
+- `ext_sidebar_to_tree_view(ext)` — adapter `&ExtSidebarData → quadraui::TreeView` (#280). INSTALLED / AVAILABLE sections via `Decoration::Header`; install/remove hint as `Badge` on selected row.
+- `debug_sidebar_section_to_tree_view(items, scroll_offset, has_focus, session_active, section_id)` — adapter for one debug-sidebar section (#281). Each of the four sections (Variables / Watch / Call Stack / Breakpoints) gets its own `TreeView` instance — see `MultiSectionView` follow-up #293 for the architectural improvement that owns the multi-section walk inside quadraui itself.
+- `explorer_to_tree_view(rows, scroll_top, selected, has_focus)` — adapter for the file-tree explorer.
 - `format_button_label(label, hotkey)` — dialog button label formatter
 - `visual_rows_for_line(len, cols)` — wrapped line row count
 - `Theme::from_name(name)` — theme lookup by name

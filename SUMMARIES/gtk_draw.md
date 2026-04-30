@@ -21,7 +21,7 @@ All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function re
 - `draw_dialog_popup` — modal dialog with buttons
 - `draw_bottom_panel_tabs` — terminal/output panel tab strip
 - `draw_debug_output` — debug output panel
-- `draw_debug_sidebar` — DAP variables/call stack/watch/breakpoints
+- `draw_debug_sidebar` — DAP variables/call stack/watch/breakpoints; **delegator post #281** (chrome paints panel header + Run/Stop button + section titles + per-section scrollbar overlays; per-section item rendering goes through `Backend::draw_tree` × 4 via `render::debug_sidebar_section_to_tree_view`). Click handler walks pixel coordinates with `1.4 × line_height` per item row to match `quadraui::gtk::draw_tree`'s row measure.
 - `draw_quickfix_panel` — quickfix list
 - `draw_terminal_panel` — integrated terminal
 - `draw_terminal_cells` — terminal cell grid rendering
@@ -35,6 +35,6 @@ All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function re
 - `draw_explorer_panel` — file explorer sidebar (Phase A.2b-1 scaffolding; inert until sub-phase 2 wires it in). Calls `quadraui_gtk::draw_tree` + 8px Cairo scrollbar overlay matching `draw_settings_panel`.
 - `draw_ext_dyn_panel` — Lua extension panels
 - `draw_panel_hover_popup` — hover popup for panel items
-- `draw_ext_sidebar` — extensions marketplace sidebar
+- `draw_ext_sidebar` — extensions marketplace sidebar; **delegator post #280** (chrome paints panel header + search input + focus border; section headers and items go through `Backend::draw_tree` via `render::ext_sidebar_to_tree_view`, using `Decoration::Header` for INSTALLED/AVAILABLE titles).
 - `draw_ai_sidebar` — AI chat panel
 - `draw_debug_toolbar` — debug control buttons

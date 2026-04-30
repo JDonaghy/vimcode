@@ -47,9 +47,9 @@ All TUI rendering. Converts `ScreenLayout` into ratatui `Frame` draws.
 Sidebar panel rendering for all TUI panels.
 - Activity bar (icon column, panel switching)
 - Explorer file tree with git/diagnostic indicators + inline new-entry rows (`render_new_entry_row()`)
-- Source control panel (staged/unstaged files, commit input, worktrees)
-- Debug sidebar (call stack, variables, watch, breakpoints)
-- Extensions marketplace panel (installed/available, search, install/remove)
+- Source control panel (staged/unstaged files, commit input, worktrees) — body via `Backend::draw_tree` (`render::source_control_to_tree_view`)
+- Debug sidebar (call stack, variables, watch, breakpoints) — **post-#281**: chrome paints panel header + Run/Stop button + section titles + scrollbar overlays; per-section item rendering goes through `Backend::draw_tree` × 4 (`render::debug_sidebar_section_to_tree_view`)
+- Extensions marketplace panel (installed/available, search, install/remove) — **post-#280**: chrome paints panel header + search input; tree body via `Backend::draw_tree` with `Decoration::Header` section titles (`render::ext_sidebar_to_tree_view`)
 - AI chat panel (messages, input)
 - Search panel (query input, results list, replace)
 - Terminal panel (cell grid, tab bar, toolbar, find bar)

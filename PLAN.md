@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-29 (Session 343 — **#281 Debug sidebar lift shipped on `issue-281-debug-sidebar-treeview-lift`**: `render::debug_sidebar_section_to_tree_view` adapter + four-`TreeView`-per-section paint pattern + `TreeViewLayout::hit_test()` click handlers on both backends. Smoke pending. **TUI/GTK paint duplication arc is now DONE** — every entry in the cross-backend coverage table is ✅ on both backends. Prior session 343 events: #283 / #285 / #286 / #280 all landed via Path A; doc reconciliations for #214 (`b96c65d`) and #282 (`6982462`); follow-ups filed #287, #288, #289, #290, #291. Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284))** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below for what's next now that the duplication arc is closed.)
+> **Last updated:** 2026-04-30 (Session 343 closed — **TUI/GTK paint duplication arc DONE on develop@7f3498c**. #281 (Debug sidebar TreeView lift) shipped via Path A in 8 commits, the last 5 being smoke fixes including the actual paint/click parity fixes (`33cfd2b` GTK 1.4× row measure, `f15a490` TUI section_heights single-source-of-truth). Phase C umbrella #275 closed. Cross-backend coverage table is fully ✅✅ on both backends. Six items shipped this session via Path A: #283 / #285 / #286 / #280 / #281 + #214 doc reconciliation. Eight follow-ups filed: #287 / #288 / #290 / #291 (small UX), #289 (xterm.js parking lot), #292 (GTK F-keys when debug sidebar focused — pre-existing menu-bar key interception), **#293 — MultiSectionView primitive** (architectural — should land before B.6 Win-GUI rebuild). Prior session 342: **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284))** — `quadraui::Editor` primitive + dual rasterisers. See "🎯 NEXT FOCUS" below for what's next now that the duplication arc is closed.)
 
 ---
 
@@ -44,31 +44,34 @@ post-Phase-C cleanup wave (#280 + #281) is closed.
   coalescence), border style (Cairo arbitrary geometry vs box-
   drawing chars). Documented in PLAN.md "Lessons captured."
 
-### Recommended next focus
+### 🎯 Recommended next focus
 
-Pick one of:
+**Cued up for next session: [#293](https://github.com/JDonaghy/vimcode/issues/293) — `MultiSectionView` primitive.**
 
-1. **B.6 Win-GUI rebuild.** Start a fresh phase. Read
-   `docs/NATIVE_GUI_LESSONS.md`, draft a stage map similar to Phase
-   C's, build a primitive at a time. Long.
-2. **macOS backend.** Higher user payoff than Win-GUI (macOS
-   developers are an underserved constituency on vimcode); harder
-   because there's no existing scaffold. Long.
-3. **Independent quality work.** Drain the smaller residual list
-   (#287, #288, #290, #291, #262, #263, #264, #265, #272, #273,
-   #274). Cumulatively meaningful; individually small.
-4. **Crate Extraction (Milestone 2).** #45 vimcode-core crate; #44
-   UiEvent abstraction; #46 SQL client PoC. Architecture work.
+Why this first: the #281 smoke wave surfaced 4 classes of paint/click drift bugs (GTK 1.4× row measure mismatch, TUI section_heights two-source-of-truth, GTK HiDPI line_height divergence, GTK section_heights computation discrepancy). Each was caught only after a real-config smoke run. Each fix was per-backend. **The shape of the bug is "two backends each computing the same multi-section walk, getting subtly different numbers."** A `MultiSectionView` primitive that owns the entire layout (section titles + per-section scrollbar + per-section TreeView body) eliminates the entire bug class by construction.
+
+Effort: ~16-24 hrs (design pass + primitive + dual rasterisers + migrate Extensions / Debug / Source Control to consume it). Order matters: should land **before B.6 Win-GUI rebuild** — otherwise Win-GUI inherits all the same drift bugs the third time.
+
+**Then bug fixes** (user-cued for the same session). Front-of-queue picks:
+
+- [#292](https://github.com/JDonaghy/vimcode/issues/292) — GTK F-keys not reaching debugger (likely GTK menu-bar interception). Started in `7f3498c` but didn't land the user-visible fix.
+- [#287](https://github.com/JDonaghy/vimcode/issues/287) — GTK Ctrl-P palette collision in completion popup.
+- [#288](https://github.com/JDonaghy/vimcode/issues/288) — completion popup click divergence (TUI vs GTK).
+- [#290](https://github.com/JDonaghy/vimcode/issues/290) — TUI extension search drops r/i/d/q/`/`.
+- [#291](https://github.com/JDonaghy/vimcode/issues/291) — TUI extension search nav gap.
+
+**Larger candidates after that:**
+
+1. **B.6 Win-GUI rebuild.** Start a fresh phase. Read `docs/NATIVE_GUI_LESSONS.md`, draft a stage map similar to Phase C's. Should consume `MultiSectionView` from day one (#293 first).
+2. **macOS backend.** Higher user payoff; no existing scaffold. Long.
+3. **Crate Extraction (Milestone 2).** #45 vimcode-core; #44 UiEvent abstraction; #46 SQL client PoC. Architecture work.
 
 ### Strategic complement — B.6 Win-GUI rebuild
 
 [B.6](#phase-b6--win-gui-rebuild) is **unblocked** now that the editor
-primitive is lifted. Win-GUI rebuild on quadraui is the natural
-multi-week project once the TUI/GTK duplication is fully drained.
-**B.6 doesn't eliminate TUI/GTK duplication** — it adds a third
-backend that consumes the same primitives — so it sits orthogonal
-to the focus above. Pick it up after the chrome lifts, or in
-parallel if a Win-GUI session opens up.
+primitive is lifted, but blocked-by-soft-dependency on #293
+(`MultiSectionView`). Without #293 the Win-GUI rebuild would
+re-introduce the same drift bug class for a third backend.
 
 ### Independent quality work (can land any time)
 
@@ -82,7 +85,6 @@ elimination arc:
 - [#272](https://github.com/JDonaghy/vimcode/issues/272) — GTK go-to-definition link click in focused hover does nothing.
 - [#273](https://github.com/JDonaghy/vimcode/issues/273) — GTK cairo dialog spawns without keyboard focus until → pressed.
 - [#274](https://github.com/JDonaghy/vimcode/issues/274) — Inventory + replace remaining native gtk4::Dialog widgets.
-- [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI: LSP diagnostic dot overwrites breakpoint marker (gutter column collision; verbatim-port behaviour from #276 surfaced during smoke).
 
 ### Pickup checklist for any of the above
 

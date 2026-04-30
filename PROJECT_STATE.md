@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** Apr 29, 2026 (Session 343 — **GTK `Completions` lift ([#285](https://github.com/JDonaghy/vimcode/issues/285)) shipped on `issue-285-gtk-completions-lift`**: `quadraui::gtk::draw_completions` rasteriser added (verbatim port of vimcode's `draw_completion_popup` body — full bg fill, full 4-side border, per-item selected-row highlight, " {label}" via Pango); `quadraui_gtk::draw_completions` shim added (mirror of TUI shim); `src/gtk/draw::draw_completion_popup` body collapsed to a delegator (build `quadraui::Completions` via the existing `render::completion_menu_to_quadraui_completions` adapter, call `Completions::layout(...)`, delegate, return `layout.bounds` for the existing modal-stack click integration). Both backends now paint completions through `quadraui::Completions` — closes the smallest remaining duplication slot from PLAN.md "🎯 NEXT FOCUS" item #1. Net **+99 LOC** of shared paint in quadraui; vimcode-private paint approximately neutral. Quality gate clean: 1950 lib tests + integration tests pass on `--no-default-features`; GTK build + clippy clean. Smoke test pending. Prior session 342 below.
+**Last updated:** Apr 30, 2026 (Session 343 closed — **TUI/GTK paint duplication arc DONE on develop@7f3498c**. Six items landed via Path A: #283 (TUI gutter), #285 (GTK Completions), #286 (GTK Ctrl-dismiss), #280 (Extension panel TreeView lift), #281 (Debug sidebar TreeView lift, 8 commits incl. paint/click parity fixes), plus doc reconciliation for #214. Phase C umbrella #275 closed. Cross-backend coverage table is fully ✅✅ on both backends. Eight follow-ups filed: #287 / #288 / #290 / #291 (small UX), #289 (xterm.js parking), #292 (GTK F-keys when debug sidebar focused — pre-existing GTK menu-bar interception), and **#293 — MultiSectionView primitive** (architectural; queue this before B.6 Win-GUI rebuild). Prior session 342 below.
 
 Prior session (342 — Apr 29): **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284), merged) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 5 commits on `issue-276-editor-primitive`. **Stage 1A** (`3fcc7fb`) lifted the supporting types (`DiagnosticSeverity` / `GitLineStatus` / `DiffLine` / `CursorShape` / `SelectionKind` / `CursorPos` / `EditorCursor` / `EditorSelection` / `Style` / `StyledSpan` / `DiagnosticMark` / `SpellMark`) + 29 new `Theme` fields + `q_theme()` chrome+editor split. **Stage 1B** (`ef45610`) added the `Editor` + `EditorLine` data structs (3 unit tests). **Stage 1C** (`c985d58`) lifted the TUI rasteriser via `to_q_editor` boundary adapter; `render_window` collapsed ~470 → ~25 LOC. **Stage 1D** (`5b23718`) lifted the GTK rasteriser; `draw_window` collapsed ~720 → ~25 LOC. **fmt fixup** (`8c8cd24`). Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui. quadraui: 290 tests pass (was 287, +3 editor); vimcode `--no-default-features` + clippy clean (1950 lib tests + integration); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean. Smoke-test follow-up filed: [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI LSP-diagnostic-dot column collision with breakpoint marker (verbatim-port behaviour). Issue [#276](https://github.com/JDonaghy/vimcode/issues/276) closed.
 
@@ -102,6 +102,34 @@ cell coalescence) remain but are tracked separately.
 ---
 
 ## Recent Work
+
+**Session 343 — TUI/GTK paint duplication arc closed end-to-end (`develop@7f3498c`):**
+
+Six items shipped via Path A on develop, plus eight follow-up issues filed.
+
+| # | What | Commit |
+|---|---|---|
+| 283 | TUI BP/diagnostic gutter collision (smoke fallout from #276) | `f0b850f` |
+| — | Doc reconciliation: #214 RichTextPopup already shipped | `b96c65d` |
+| 285 | GTK Completions popup lift (`quadraui::gtk::draw_completions`) | `345d81f` |
+| 286 | GTK Ctrl-alone-dismisses completion popup | `392e89c` |
+| 280 | Extension panel TreeView lift (`render::ext_sidebar_to_tree_view`) | `d29d1b4` + `6982462` |
+| 281 | Debug sidebar lift onto four `TreeView` instances + 7 smoke fixes | 8 commits, head `7f3498c` |
+
+**Phase C umbrella ([#275](https://github.com/JDonaghy/vimcode/issues/275)) closed.** Cross-backend coverage table is fully ✅✅ on both backends.
+
+**The #281 smoke wave was instructive.** Eight commits to ship one lift, with three dead-end fixes (`d06568c` `38c052e` `c0fdc8a`) that landed before the actual root causes were diagnosed. The two real fixes were `33cfd2b` (GTK paint uses `line_height × 1.4` per row but click hit-test used 1.0× — the root of the 3→4, 6→8 row drift) and `f15a490` (TUI paint computed section heights locally while click read engine state populated from a different base — root of the section-walk drift). Lesson captured: when paint and click share a multi-section panel, they must read from one source-of-truth in one unit. **Filed as architectural follow-up [#293](https://github.com/JDonaghy/vimcode/issues/293) — `MultiSectionView` primitive** that owns the entire layout (titles + scrollbars + per-section trees) so future panels and future backends (Win-GUI, macOS) cannot reintroduce the drift.
+
+**Follow-ups filed (open, prioritised for next sessions):**
+
+- **#293** `MultiSectionView` primitive — architectural; should land before B.6.
+- #292 GTK F-keys not reaching debugger when sidebar focused (likely menu-bar interception).
+- #287 GTK Ctrl-P palette collision in completion popup.
+- #288 completion popup click divergence TUI vs GTK.
+- #290 / #291 TUI extension search input issues.
+- #289 xterm.js + TUI in-browser demo (parking lot, low priority).
+
+---
 
 **Session 342 — #276 Phase C Stage 1 shipped end-to-end (editor primitive):**
 
