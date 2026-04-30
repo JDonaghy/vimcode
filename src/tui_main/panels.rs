@@ -3187,22 +3187,14 @@ pub(super) fn render_debug_sidebar(
         ),
     ];
 
-    // Available rows after header(1) + button(1) = 2 overhead rows.
-    // Each section has 1 header row, so 4 section headers = 4 rows.
-    // Content rows = available - 4 section headers.
-    let available = (area.height as usize).saturating_sub(2);
-    let section_header_rows = 4;
-    let content_rows = available.saturating_sub(section_header_rows);
-
-    // Compute per-section content heights (equal share; remainder to first).
-    let mut heights = [0u16; 4];
-    if content_rows > 0 {
-        let base = content_rows / 4;
-        let remainder = content_rows % 4;
-        for (i, h) in heights.iter_mut().enumerate() {
-            *h = (base + if i < remainder { 1 } else { 0 }) as u16;
-        }
-    }
+    // Section heights MUST come from `engine.dap_sidebar_section_heights`
+    // (populated by `tui_main/mod.rs:1456` from `size.height - overhead`)
+    // — not recomputed locally from `area.height`. The two bases can
+    // diverge by 1-2 rows depending on terminal height + bottom panel
+    // visibility, and a recomputed paint walking different totals from
+    // the click handler causes section-walk drift (clicking Watch
+    // activates Call Stack, etc. — #281 smoke).
+    let heights: [u16; 4] = sidebar.section_heights;
 
     let track_fg = rc(theme.separator);
     let thumb_fg = rc(theme.scrollbar_thumb);
@@ -3251,19 +3243,36 @@ pub(super) fn render_debug_sidebar(
             set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
         }
 
-        // Section title rows + scrollbar overlays.
+        // Section title rows + scrollbar overlays. Active section gets
+        // bold + accent-tinted bg so it's clearly distinct (#281 smoke
+        // — `status_fg.lighten(0.2)` was too subtle for keyboard-only
+        // users to track which section had focus).
+        let active_bg = rc(theme.fuzzy_selected_bg);
         let mut row_y = area.y + 2;
         for (section_label, items, section_kind, sec_idx, _) in &sections {
             if row_y >= max_y {
                 break;
             }
-            let is_active = sidebar.active_section == *section_kind;
-            let sect_fg = if is_active { act_fg } else { hdr_fg };
+            let is_active = sidebar.has_focus && sidebar.active_section == *section_kind;
+            let (sect_fg, sect_bg, sect_mod) = if is_active {
+                (act_fg, active_bg, ratatui::style::Modifier::BOLD)
+            } else {
+                (hdr_fg, hdr_bg, ratatui::style::Modifier::empty())
+            };
             for x in area.x..area.x + area.width {
-                set_cell(buf, x, row_y, ' ', sect_fg, hdr_bg);
+                set_cell_styled(buf, x, row_y, ' ', sect_fg, sect_bg, sect_mod, None);
             }
             for (i, ch) in section_label.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, row_y, ch, sect_fg, hdr_bg);
+                set_cell_styled(
+                    buf,
+                    area.x + i as u16,
+                    row_y,
+                    ch,
+                    sect_fg,
+                    sect_bg,
+                    sect_mod,
+                    None,
+                );
             }
             row_y += 1;
 
