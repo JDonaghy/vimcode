@@ -290,7 +290,7 @@ pub(super) fn render_sidebar(
 
     // Debug panel
     if sidebar.active_panel == TuiPanel::Debug {
-        render_debug_sidebar(buf, area, engine, theme);
+        render_debug_sidebar(backend, frame, area, engine, theme);
         return;
     }
 
@@ -3127,8 +3127,13 @@ pub(super) fn render_ai_sidebar(
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────
 
 /// Render the debug sidebar: header + run button + 4 sections (Variables, Watch, Call Stack, Breakpoints).
+/// Migrated to four `quadraui::TreeView` instances (#281), one per
+/// section. Panel header (row 0) + Run/Stop button (row 1) + per-section
+/// title rows + per-section scrollbar overlays remain panel-specific
+/// chrome; item rendering goes through `Backend::draw_tree`.
 pub(super) fn render_debug_sidebar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -3139,50 +3144,9 @@ pub(super) fn render_debug_sidebar(
     }
     let hdr_fg = rc(theme.status_fg);
     let hdr_bg = rc(theme.status_bg);
-    let item_fg = rc(theme.line_number_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
     let act_fg = rc(theme.status_fg.lighten(0.2));
-    let row_bg = rc(theme.tab_bar_bg);
 
-    // ── Row 0: header strip ──────────────────────────────────────────────────
-    let cfg_name = engine
-        .dap_launch_configs
-        .get(engine.dap_selected_launch_config)
-        .map(|c| c.name.as_str())
-        .unwrap_or("no config");
-    let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-    }
-    for (i, ch) in header_text.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-    }
-
-    if area.height < 2 {
-        return;
-    }
-
-    // ── Row 1: Run / Stop button ─────────────────────────────────────────────
-    let btn_y = area.y + 1;
-    let (btn_label, btn_icon_fg) =
-        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-            ("\u{f04b}  Continue", rc(theme.git_added))
-        } else if engine.dap_session_active {
-            ("\u{f04d}  Stop", rc(theme.diagnostic_error))
-        } else {
-            ("\u{f04b}  Start Debugging", rc(theme.git_added))
-        };
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, btn_y, ' ', hdr_fg, hdr_bg);
-    }
-    // Icon character gets the semantic color; label text uses status_fg for readability.
-    for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
-        let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
-        set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
-    }
-
-    // ── Sections with fixed-height allocation + per-section scrolling ──────
-    // Build minimal screen layout to get debug_sidebar data
+    // Build minimal screen layout to get debug_sidebar data.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let sidebar = &screen.debug_sidebar;
 
@@ -3191,30 +3155,35 @@ pub(super) fn render_debug_sidebar(
         &[render::DebugSidebarItem],
         DebugSidebarSection,
         usize,
+        &str,
     ); 4] = [
         (
             "\u{f6a9} VARIABLES",
             &sidebar.variables,
             DebugSidebarSection::Variables,
             0,
+            "vars",
         ),
         (
             "\u{f06e} WATCH",
             &sidebar.watch,
             DebugSidebarSection::Watch,
             1,
+            "watch",
         ),
         (
             "\u{f020e} CALL STACK",
             &sidebar.frames,
             DebugSidebarSection::CallStack,
             2,
+            "stack",
         ),
         (
             "\u{f111} BREAKPOINTS",
             &sidebar.breakpoints,
             DebugSidebarSection::Breakpoints,
             3,
+            "bps",
         ),
     ];
 
@@ -3234,107 +3203,131 @@ pub(super) fn render_debug_sidebar(
             *h = (base + if i < remainder { 1 } else { 0 }) as u16;
         }
     }
-    // Store back into engine for ensure_visible calculations.
-    // (We can't mutate engine directly here since it's borrowed, but the heights
-    // are also stored on the sidebar data for reference.)
 
     let track_fg = rc(theme.separator);
     let thumb_fg = rc(theme.scrollbar_thumb);
     let sb_bg = rc(theme.background);
 
-    let mut row_y = area.y + 2;
+    // ── Phase A: chrome paint (panel header + button + section title rows
+    // + per-section scrollbar overlays) ──────────────────────────────────────
     let max_y = area.y + area.height;
+    let mut section_starts: [u16; 4] = [0; 4];
+    {
+        let buf = frame.buffer_mut();
 
-    for (section_label, items, section_kind, sec_idx) in &sections {
-        if row_y >= max_y {
-            break;
-        }
-        // Section header
-        let is_active = sidebar.active_section == *section_kind;
-        let sect_fg = if is_active { act_fg } else { hdr_fg };
+        // Row 0: panel header.
+        let cfg_name = engine
+            .dap_launch_configs
+            .get(engine.dap_selected_launch_config)
+            .map(|c| c.name.as_str())
+            .unwrap_or("no config");
+        let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
         for x in area.x..area.x + area.width {
-            set_cell(buf, x, row_y, ' ', sect_fg, hdr_bg);
+            set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
         }
-        for (i, ch) in section_label.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, row_y, ch, sect_fg, hdr_bg);
+        for (i, ch) in header_text.chars().enumerate().take(area.width as usize) {
+            set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
         }
-        row_y += 1;
 
-        let sec_height = heights[*sec_idx] as usize;
-        let scroll_off = sidebar.scroll_offsets[*sec_idx];
-        let total_items = items.len().max(1); // at least 1 for "(empty)" hint
+        if area.height < 2 {
+            return;
+        }
 
-        // Render items within the allocated height
-        for row_offset in 0..sec_height {
+        // Row 1: Run / Stop button.
+        let btn_y = area.y + 1;
+        let (btn_label, btn_icon_fg) =
+            if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+                ("\u{f04b}  Continue", rc(theme.git_added))
+            } else if engine.dap_session_active {
+                ("\u{f04d}  Stop", rc(theme.diagnostic_error))
+            } else {
+                ("\u{f04b}  Start Debugging", rc(theme.git_added))
+            };
+        for x in area.x..area.x + area.width {
+            set_cell(buf, x, btn_y, ' ', hdr_fg, hdr_bg);
+        }
+        for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
+            let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
+            set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
+        }
+
+        // Section title rows + scrollbar overlays.
+        let mut row_y = area.y + 2;
+        for (section_label, items, section_kind, sec_idx, _) in &sections {
             if row_y >= max_y {
                 break;
             }
-            let item_idx = scroll_off + row_offset;
-            if items.is_empty() && row_offset == 0 {
-                // Empty hint
-                let hint = if engine.dap_session_active {
-                    "  (empty)"
-                } else {
-                    "  (not running)"
-                };
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', item_fg, row_bg);
-                }
-                for (i, ch) in hint.chars().enumerate().take(area.width as usize) {
-                    set_cell(buf, area.x + i as u16, row_y, ch, item_fg, row_bg);
-                }
-            } else if item_idx < items.len() {
-                let item = &items[item_idx];
-                let (fg, bg) = if item.is_selected {
-                    (hdr_fg, sel_bg)
-                } else {
-                    (item_fg, row_bg)
-                };
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', fg, bg);
-                }
-                let indent = item.indent as usize * 2;
-                let text = format!("{:indent$}{}", "", item.text, indent = indent);
-                // Leave rightmost column for scrollbar if needed
-                let max_text_w = if items.len() > sec_height {
-                    (area.width as usize).saturating_sub(1)
-                } else {
-                    area.width as usize
-                };
-                for (i, ch) in text.chars().enumerate().take(max_text_w) {
-                    set_cell(buf, area.x + i as u16, row_y, ch, fg, bg);
-                }
-            } else {
-                // Past end of items — blank row
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, row_y, ' ', item_fg, row_bg);
-                }
+            let is_active = sidebar.active_section == *section_kind;
+            let sect_fg = if is_active { act_fg } else { hdr_fg };
+            for x in area.x..area.x + area.width {
+                set_cell(buf, x, row_y, ' ', sect_fg, hdr_bg);
+            }
+            for (i, ch) in section_label.chars().enumerate().take(area.width as usize) {
+                set_cell(buf, area.x + i as u16, row_y, ch, sect_fg, hdr_bg);
             }
             row_y += 1;
-        }
 
-        // Draw scrollbar in the rightmost column if items exceed visible height
-        if items.len() > sec_height && sec_height > 0 && area.width > 1 {
-            let sb_x = area.x + area.width - 1;
-            let sb_start_y = row_y - sec_height as u16;
-            let thumb_size = ((sec_height * sec_height) / total_items).max(1);
-            // Same shape every other sidebar scrollbar uses
-            // (`scroll * track / total`). Algebraically equivalent to the
-            // `scroll/(total-viewport) * (track - thumb)` formula
-            // `quadraui::dispatch_mouse_drag` uses, so the visible thumb
-            // lines up with the grab_offset hit-test in Stage 5c.
-            let thumb_pos = (scroll_off * sec_height) / total_items;
-            let thumb_pos = thumb_pos.min(sec_height.saturating_sub(thumb_size));
-            for r in 0..sec_height {
-                let in_thumb = r >= thumb_pos && r < thumb_pos + thumb_size;
-                let ch = if in_thumb { '█' } else { '░' };
-                let fg = if in_thumb { thumb_fg } else { track_fg };
-                let sy = sb_start_y + r as u16;
-                if sy < max_y {
-                    set_cell(buf, sb_x, sy, ch, fg, sb_bg);
+            section_starts[*sec_idx] = row_y;
+
+            let sec_height = heights[*sec_idx] as usize;
+            let scroll_off = sidebar.scroll_offsets[*sec_idx];
+            let total_items = items.len().max(1);
+
+            // Scrollbar overlay (rightmost column).
+            if items.len() > sec_height && sec_height > 0 && area.width > 1 {
+                let sb_x = area.x + area.width - 1;
+                let thumb_size = ((sec_height * sec_height) / total_items).max(1);
+                let thumb_pos = (scroll_off * sec_height) / total_items;
+                let thumb_pos = thumb_pos.min(sec_height.saturating_sub(thumb_size));
+                for r in 0..sec_height {
+                    let in_thumb = r >= thumb_pos && r < thumb_pos + thumb_size;
+                    let ch = if in_thumb { '█' } else { '░' };
+                    let fg = if in_thumb { thumb_fg } else { track_fg };
+                    let sy = row_y + r as u16;
+                    if sy < max_y {
+                        set_cell(buf, sb_x, sy, ch, fg, sb_bg);
+                    }
                 }
             }
+
+            row_y += sec_height as u16;
         }
+    }
+
+    // ── Phase B: per-section item rendering via Backend::draw_tree ───────────
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    for (_, items, _, sec_idx, section_id) in &sections {
+        let sec_height = heights[*sec_idx];
+        if sec_height == 0 {
+            continue;
+        }
+        let scroll_off = sidebar.scroll_offsets[*sec_idx];
+        let scrollbar_needed = items.len() > sec_height as usize;
+        let content_w = if scrollbar_needed && area.width > 1 {
+            area.width - 1
+        } else {
+            area.width
+        };
+        let tree = render::debug_sidebar_section_to_tree_view(
+            items,
+            scroll_off,
+            sidebar.has_focus,
+            sidebar.session_active,
+            section_id,
+        );
+        let start_y = section_starts[*sec_idx];
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_tree(
+                quadraui::Rect::new(
+                    area.x as f32,
+                    start_y as f32,
+                    content_w as f32,
+                    sec_height as f32,
+                ),
+                &tree,
+            );
+        });
     }
 }
 

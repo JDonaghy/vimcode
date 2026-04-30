@@ -6262,6 +6262,85 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
     }
 }
 
+/// Adapt one section of the debug sidebar (`Variables` / `Watch` /
+/// `Call Stack` / `Breakpoints`) into a `quadraui::TreeView` for the
+/// shared `draw_tree` primitive (#281).
+///
+/// Each section is a flat list of [`DebugSidebarItem`]s with a
+/// per-item `indent` and a pre-computed `is_selected` flag (only the
+/// active section's items can have `is_selected = true`). The
+/// adapter:
+///
+/// - Maps `item.indent` straight to `TreeRow.indent`.
+/// - Carries `item.text` as plain styled text. Items have no
+///   chevrons or icons today (the variable tree's `▶`/`▼` markers
+///   are baked into the text by the engine).
+/// - Sets `selected_path = Some([row_idx])` when an item carries
+///   `is_selected`, else `None`. The "(empty)" / "(not running)"
+///   placeholder row uses `Decoration::Muted` and is never selected.
+/// - `has_focus` is the panel-level focus flag.
+/// - `scroll_offset` is the section-local scroll offset
+///   (`sidebar.scroll_offsets[section_idx]`).
+///
+/// The section title row + Run/Stop button + per-section scrollbar
+/// overlay stay panel-specific chrome — they're not part of the
+/// `TreeView` (matches the established #280/#282 pattern).
+pub fn debug_sidebar_section_to_tree_view(
+    items: &[DebugSidebarItem],
+    scroll_offset: usize,
+    has_focus: bool,
+    session_active: bool,
+    section_id: &str,
+) -> quadraui::TreeView {
+    use quadraui::{Decoration, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView, WidgetId};
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut selected_path: Option<Vec<u16>> = None;
+
+    if items.is_empty() {
+        let hint = if session_active {
+            "(empty)"
+        } else {
+            "(not running)"
+        };
+        rows.push(TreeRow {
+            path: vec![u16::MAX],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(hint.to_string()),
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Muted,
+        });
+    } else {
+        for (i, item) in items.iter().enumerate() {
+            let row_idx_u16 = i as u16;
+            if item.is_selected {
+                selected_path = Some(vec![row_idx_u16]);
+            }
+            rows.push(TreeRow {
+                path: vec![row_idx_u16],
+                indent: item.indent as u16,
+                icon: None,
+                text: StyledText::plain(item.text.clone()),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+            });
+        }
+    }
+
+    TreeView {
+        id: WidgetId::new(format!("debug-sidebar-{section_id}")),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset,
+        style: TreeStyle::default(),
+        has_focus,
+    }
+}
+
 /// Adapt the engine-side `ExtSidebarData` into a `quadraui::TreeView`
 /// for the shared `draw_tree` primitive (#280).
 ///

@@ -3157,6 +3157,7 @@ impl SimpleComponent for App {
         // ── Debug sidebar DrawingArea setup ───────────────────────────────────
         {
             let engine = engine.clone();
+            let backend_d = backend.clone();
             widgets
                 .debug_sidebar_da
                 .set_draw_func(move |da, cr, _w, _h| {
@@ -3175,7 +3176,18 @@ impl SimpleComponent for App {
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
-                    draw_debug_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
+                    draw_debug_sidebar(
+                        cr,
+                        &layout,
+                        &screen,
+                        &theme,
+                        0.0,
+                        0.0,
+                        w,
+                        h,
+                        line_height,
+                        &backend_d,
+                    );
                 });
         }
         // ── Debug sidebar click handler ────────────────────────────────────────
@@ -8952,10 +8964,52 @@ impl App {
                                     (ratio * max_scroll as f64) as usize;
                                 engine.dap_sidebar_section = *section;
                             } else {
+                                // Hit-test through `TreeViewLayout::hit_test()`
+                                // so the click path agrees with the paint path
+                                // by construction (#281, mirrors #280 / #210
+                                // pattern). For flat 1-row items the result is
+                                // arithmetically identical to
+                                // `scroll_off + (row_idx - items_start)`.
+                                let theme = Theme::from_name(&engine.settings.colorscheme);
+                                let screen =
+                                    build_screen_layout(&engine, &theme, &[], lh, 1.0, false);
+                                let sb = &screen.debug_sidebar;
+                                let items_for_section = match section {
+                                    DebugSidebarSection::Variables => &sb.variables,
+                                    DebugSidebarSection::Watch => &sb.watch,
+                                    DebugSidebarSection::CallStack => &sb.frames,
+                                    DebugSidebarSection::Breakpoints => &sb.breakpoints,
+                                };
                                 let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                                let row_offset = (row_idx - items_start) as usize;
-                                let item_idx = scroll_off + row_offset;
-                                if item_count > 0 && item_idx < item_count {
+                                let tree = render::debug_sidebar_section_to_tree_view(
+                                    items_for_section,
+                                    scroll_off,
+                                    sb.has_focus,
+                                    sb.session_active,
+                                    "click",
+                                );
+                                let layout =
+                                    tree.layout(1.0, sec_height as f32 * lh as f32, |_| {
+                                        quadraui::TreeRowMeasure::new(lh as f32)
+                                    });
+                                let rel_y = (row_idx - items_start) as f32 * lh as f32;
+                                let item_idx = if let quadraui::TreeViewHit::Row(idx) =
+                                    layout.hit_test(0.0, rel_y)
+                                {
+                                    let path = tree.rows[idx].path.clone();
+                                    if let [item_idx_u16] = path.as_slice() {
+                                        if *item_idx_u16 != u16::MAX {
+                                            Some(*item_idx_u16 as usize)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(item_idx) = item_idx {
                                     engine.dap_sidebar_section = *section;
                                     engine.dap_sidebar_selected = item_idx;
                                     engine.handle_debug_sidebar_key("Return", false);

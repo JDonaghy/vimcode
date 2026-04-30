@@ -2744,13 +2744,48 @@ pub(super) fn handle_mouse(
                                 debug_output_scroll,
                             );
                         } else {
+                            // Hit-test through `TreeViewLayout::hit_test()` so
+                            // the click path agrees with the paint path by
+                            // construction (#281, mirrors the #280 / #210
+                            // pattern). For flat 1-cell rows the result is
+                            // arithmetically identical to
+                            // `scroll_off + (sidebar_row - items_start)`,
+                            // but routing through the primitive keeps the
+                            // shape future-proof against scroll / wrapping
+                            // changes.
+                            let theme = Theme::onedark();
+                            let screen =
+                                render::build_screen_layout(engine, &theme, &[], 1.0, 1.0, true);
+                            let sb = &screen.debug_sidebar;
+                            let items_for_section = match section {
+                                DebugSidebarSection::Variables => &sb.variables,
+                                DebugSidebarSection::Watch => &sb.watch,
+                                DebugSidebarSection::CallStack => &sb.frames,
+                                DebugSidebarSection::Breakpoints => &sb.breakpoints,
+                            };
                             let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                            let row_offset = (sidebar_row - items_start) as usize;
-                            let item_idx = scroll_off + row_offset;
-                            if item_count > 0 && item_idx < item_count {
-                                engine.dap_sidebar_section = *section;
-                                engine.dap_sidebar_selected = item_idx;
-                                engine.handle_debug_sidebar_key("Return", false);
+                            let tree = render::debug_sidebar_section_to_tree_view(
+                                items_for_section,
+                                scroll_off,
+                                sb.has_focus,
+                                sb.session_active,
+                                "click",
+                            );
+                            let layout =
+                                tree.layout(sidebar_width as f32, sec_height as f32, |_| {
+                                    quadraui::TreeRowMeasure::new(1.0)
+                                });
+                            let rel_y = (sidebar_row - items_start) as f32;
+                            if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y)
+                            {
+                                let path = tree.rows[row_idx].path.clone();
+                                if let [item_idx_u16] = path.as_slice() {
+                                    if *item_idx_u16 != u16::MAX {
+                                        engine.dap_sidebar_section = *section;
+                                        engine.dap_sidebar_selected = *item_idx_u16 as usize;
+                                        engine.handle_debug_sidebar_key("Return", false);
+                                    }
+                                }
                             }
                         }
                         break;
