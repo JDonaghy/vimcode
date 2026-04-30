@@ -6,7 +6,119 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-30 (Session 344 closed — **#293 `MultiSectionView` primitive shipped end-to-end via Path A** on `issue-293-multi-section-view` (~9 commits). Composable-bodies multi-section primitive with `WholePanel` + `PerSection` scroll modes; D-003 design entry; first consumer (Extensions sidebar) migrated. Smoke wave fixed: section overlap on scroll (clip + inner scroll_offset adjust), invisible panel-scrollbar, off-by-N click after scroll (cache body_height on engine), scrollbar click-to-jump and GTK thumb-drag. 19 quadraui unit tests + 1950 vimcode lib tests passing. Two follow-ups filed: **#295** TUI scrollbar drag (deferred — TUI mouse handler early-returns on non-Down events), **#296** Debug sidebar migration onto MSV. **#293 closed**; **#282** SC migration onto MSV remains open. Prior session 343: TUI/GTK paint duplication arc closed; cross-backend coverage table fully ✅✅ on both backends. See "🎯 NEXT FOCUS" below.)
+> **Last updated:** 2026-04-30 (Session 346 — pivot from Debug-migration smoke iterations to harness-first quadraui work. Today proved the bug class is structural (paint/click drift across coordinate systems) and that theory-only iteration without running the app does not converge. New plan captured in "🧭 Course correction" section below: revert #296 → land `cell_quantum` standalone → build TUI smoke harness → extract quadraui to its own repo → re-do #296 with the harness in place → migrate SC. The eventual extraction has its own self-containment obligations (separate agent docs, full test+mini-app coverage, "vimcode trusts quadraui blindly"). See "🧭 Course correction" below.)
+
+---
+
+## 🧭 Course correction (Session 346) — harness-first quadraui
+
+**The premise.** Quadraui's core promise is "primitives that work without
+per-instance debugging across N backends." That promise needs *structural*
+support (paint and click consume one layout instance, all bounds quantized
+the same way, etc.) AND *empirical* verification (a test that paints,
+hit-tests, and asserts they agree by construction). #296 shipped without
+the empirical verification, which is why the same primitive failed across
+8 commits and 4 sessions.
+
+The course correction is to stop migrating consumers until the harness
+exists, then re-do migrations with the harness gating each one.
+
+### Order of work
+
+Run these in sequence. Each step is small enough to ship in a single
+session; the early ones have low risk so they reset the baseline before
+we commit to anything bigger.
+
+1. **Revert #296** — `git revert 7855663..58844e4` (8 commits). Develop
+   returns to the last-known-good Debug sidebar (legacy paint+click,
+   matches v0.10.0 behaviour). Drop my uncommitted `cell_quantum` work
+   into a stash first so it survives. This is destructive; ask before
+   pulling the trigger.
+2. **Land `cell_quantum`** as a standalone quadraui PR. The change is
+   small, has 2 regression tests already, and helps Extensions and any
+   future MSV consumer regardless of when #296 is re-attempted.
+3. **TUI smoke harness for `MultiSectionView`** — paint-and-click
+   round-trip in `quadraui/tests/`. Build a view, paint into a
+   `ratatui::buffer::Buffer`, find the cell row each section's title
+   landed on, hit_test at that row, assert the hit identifies that
+   section's header. ~50 lines of test code; would have caught today's
+   bug instantly.
+4. **TUI harness for `TreeView`** — same shape (paint, find selected
+   row, click it, verify state changed). TreeView is the most-used
+   primitive; covering it locks down the highest-traffic surface.
+5. **Extract quadraui to its own repo, version 0.0.1.** No API freeze;
+   fast iteration allowed. See "Extraction obligations" below for what
+   the split must include.
+6. **Re-do #296 in the new repo with the harness in place.** Tests
+   demand paint=click round-trip before merge. No `Cell<T>`
+   paint→click bridge fields appear anywhere.
+7. **Migrate SC (#282) using the harness** as the second proof that
+   the harness covers a different shape (Fixed-aux input + N
+   sections).
+
+After step 7, queue: GTK smoke harness; vimcode bug fixes (#287, #288,
+#290, #291, #292); Win-GUI rebuild; macOS; Lua bindings for extension
+mini-apps.
+
+### Extraction obligations (when step 5 happens)
+
+Quadraui extracted to its own repo must be **self-contained**. Vimcode
+developers and agents working in vimcode should never have to think
+about quadraui internals — they import a versioned crate and trust it.
+That requires:
+
+- **Separate `CLAUDE.md` (and other agent docs).** Vimcode's CLAUDE.md
+  stays vimcode-specific (engine modules, multi-backend rule, GTK
+  directory map, etc.). Quadraui gets its own CLAUDE.md covering
+  primitive shape, backend trait, harness rules, mini-app conventions.
+  Quadraui's CLAUDE.md must not reference vimcode anywhere.
+- **All tests live in quadraui.** Per-backend rasteriser tests, paint↔
+  click round-trip harnesses (TUI, GTK, eventually Win-GUI / macOS),
+  and primitive layout unit tests. A green CI in quadraui means every
+  primitive works on every backend it claims to support — period.
+- **Mini-apps in `quadraui/examples/`** that exercise primitives
+  end-to-end. Not contrived test fixtures — small but real apps
+  (a process viewer using `MultiSectionView`, a file browser using
+  `TreeView`, a settings tool using `Form`). They drive harness
+  coverage AND provide reference patterns for downstream consumers.
+  When a primitive lands a new feature, an example must demonstrate
+  it before merge.
+- **No vimcode-shaped types in the public API.** Themes, events, IDs
+  are all defined in quadraui. The vimcode↔quadraui adapter (`render.rs`
+  helpers like `q_theme`, `to_q_editor`) lives in vimcode and converts.
+- **Stable enough to depend on.** `0.0.x` allows breaking changes,
+  but every release has migration notes. Vimcode pins a specific
+  version and bumps it deliberately.
+
+### Why now is the right moment to extract
+
+Two reasons. First, the act of extraction forces the API question —
+right now it's enforced by discipline; after extraction `cargo build`
+enforces it. Second, the user explicitly wants to write a few new apps
+on quadraui to validate the abstractions, and that's much easier when
+quadraui is a path-dep / crate rather than a sub-crate of vimcode.
+
+The cost is modest: keep both repos in the same dev environment with
+`quadraui = { path = "../quadraui" }` until quadraui hits crates.io.
+Coordinated changes span two PRs, but that friction is the *point* —
+it surfaces leaky abstractions early.
+
+### What today taught us
+
+- **Paint/click drift is structural, not discipline-fixable.**
+  `cell_quantum` is one structural fix (TUI snaps section sizes to
+  integer cells before emitting bounds). Every primitive needs an
+  equivalent: backends paint at native precision, hit_test reads the
+  same precision, layout enforces the agreement.
+- **Theory-only iteration without running the app does not converge.**
+  Each "plausibly correct from code reading" fix shipped a new bug.
+  Without an automated paint↔click round-trip, the smoke loop is
+  human-in-the-loop and human-paced.
+- **Per-consumer band-aids perpetuate the bug class they pretend to
+  solve.** This was already in the band-aid lesson below; today
+  validated it again.
+
+The path forward is structural fixes + harness coverage, in that order.
 
 ---
 
