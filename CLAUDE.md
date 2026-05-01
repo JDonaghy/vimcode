@@ -200,6 +200,20 @@ vimcode's `quadraui` dep is a **path dep** to `../quadraui/quadraui` — a sibli
 - **If a quadraui change breaks vimcode's build,** fix vimcode side on a normal vimcode branch (per the workflow above). The path dep doesn't enforce a version contract — it's caller-beware.
 - **Vimcode CI is currently disabled** (`.github/workflows/*.yml.disabled`) because it can't resolve a sibling-clone path dep in a fresh `actions/checkout`. Re-enable strategy is open: workflow step that clones quadraui first, or switch to a git-dep with pinned rev.
 
+## Migration prerequisites (vimcode → quadraui adoption)
+Before migrating a vimcode panel/widget to a quadraui primitive, **ALL** of these must be true:
+
+1. **TUI rasteriser exists in quadraui** — `quadraui::tui::draw_<primitive>` plus the layout helper `tui_<primitive>_layout`.
+2. **GTK rasteriser exists in quadraui** — `quadraui::gtk::draw_<primitive>` plus the layout helper `gtk_<primitive>_layout`.
+3. **Both backends have paint↔click round-trip harnesses passing** — the gate from quadraui's CLAUDE.md "Lessons captured" section. Without these, the migration ships the bug class the harnesses exist to catch (cf. the vimcode #296 smoke wave that triggered the Session 346 course correction).
+4. **Consumer pattern validated** — the way vimcode WILL use the primitive (per-section drag/scroll for MSV; input-aux + collapsible sections for SC; etc.) has been exercised in a quadraui example or kubeui demo. The consumer-state round-trip test catches integration bugs that primitive-level harness alone can't see.
+
+The principle: **a vimcode primitive migration must collapse paint code on every vimcode-supported backend, not just one.** Partial adoption is the opposite of consolidation — it leaves bespoke paint code alive in the un-migrated backends, so vimcode now has TWO sources of truth (the primitive AND the bespoke). Don't ship a migration as "TUI-only for now."
+
+**If a primitive is missing from a backend,** file a quadraui issue to add it before starting the vimcode-side migration.
+
+**Once Win-GUI gets rebuilt on quadraui,** the rule grows to include `quadraui::win_gui::*` rasterisers and harnesses. Same for macOS later.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars
