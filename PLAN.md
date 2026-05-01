@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-30 (Session 346 — pivot from Debug-migration smoke iterations to harness-first quadraui work. Today proved the bug class is structural (paint/click drift across coordinate systems) and that theory-only iteration without running the app does not converge. New plan captured in "🧭 Course correction" section below: revert #296 → land `cell_quantum` standalone → build TUI smoke harness → extract quadraui to its own repo → re-do #296 with the harness in place → migrate SC. The eventual extraction has its own self-containment obligations (separate agent docs, full test+mini-app coverage, "vimcode trusts quadraui blindly"). See "🧭 Course correction" below.)
+> **Last updated:** 2026-04-30 (Session 346 — quadraui extracted to https://github.com/JDonaghy/quadraui. The four directories `quadraui/`, `kubeui-core/`, `kubeui/`, `kubeui-gtk/` no longer live in vimcode; the workspace member list and the quadraui dep path were updated accordingly. Steps 1–5 of the harness-first course correction are done (#297 cell_quantum, #298 TUI MSV harness, #299 TUI TreeView harness landed, then extraction). Steps 6–7 (re-do #296 against the harness, then migrate SC #282) happen in the new repo. Historical references to `quadraui/` paths below now point at the new repo's URLs; in-line code references like `quadraui/src/...` are kept as historical context.)
 
 ---
 
@@ -134,7 +134,7 @@ post-Phase-C cleanup wave (#280 + #281) is closed.
 - **B.6 — Win-GUI rebuild on quadraui.** With every TUI/GTK paint
   surface lifted to a primitive, Win-GUI can rebuild against the
   same primitives instead of chasing per-feature parity. Read
-  `docs/NATIVE_GUI_LESSONS.md` first for the per-platform pitfalls
+  [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) first for the per-platform pitfalls
   surfaced during Win-GUI's first pass. This is the natural
   multi-week project — pick it up when ready.
 - **macOS backend.** Same shape as Win-GUI: implement
@@ -172,7 +172,7 @@ Other small follow-ups: **[#295](https://github.com/JDonaghy/vimcode/issues/295)
 
 **Larger candidates after that:**
 
-1. **B.6 Win-GUI rebuild.** Start a fresh phase. Read `docs/NATIVE_GUI_LESSONS.md`, draft a stage map similar to Phase C's. Should consume `MultiSectionView` from day one (#293 first).
+1. **B.6 Win-GUI rebuild.** Start a fresh phase. Read [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md), draft a stage map similar to Phase C's. Should consume `MultiSectionView` from day one (#293 first).
 2. **macOS backend.** Higher user payoff; no existing scaffold. Long.
 3. **Crate Extraction (Milestone 2).** #45 vimcode-core; #44 UiEvent abstraction; #46 SQL client PoC. Architecture work.
 
@@ -339,7 +339,7 @@ consuming `quadraui::win_gui::draw_*` rasterisers, similar to how
 GTK and TUI work post-B.5b/B.5c. The current Win-GUI is bespoke
 (see `BUGS.md` for known gaps).
 
-**Pickup:** read `docs/NATIVE_GUI_LESSONS.md` first — it documents
+**Pickup:** read [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) first — it documents
 pitfalls from the original Win-GUI build. The rebuild benefits from
 quadraui's primitive layouts so it doesn't re-derive what TUI/GTK
 already nailed down.
@@ -1054,7 +1054,7 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
   TUI units — silently breaks every non-TUI backend with off-by-N
   layout bugs that look like timing bugs but aren't. **Default to
   the generic pattern from day one for any new "fit/scroll/elide"
-  primitive logic.** See `docs/NATIVE_GUI_LESSONS.md` §12 for the
+  primitive logic.** See [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) §12 for the
   detailed analysis.
 
 - **GTK's `idle_add_local_once` doesn't fire reliably during
@@ -1068,7 +1068,7 @@ are documented in [`quadraui/docs/DECISIONS.md`](quadraui/docs/DECISIONS.md).
   sees a stale frame the entire time. The two-pass-paint pattern
   in `src/gtk/mod.rs::set_draw_func` is the GTK equivalent of
   TUI's loop-iteration redraw and Win-GUI's WM_PAINT cycle. See
-  `docs/NATIVE_GUI_LESSONS.md` §13 + §14.
+  [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) §13 + §14.
 
 - **Render-time effective values beat mutation-at-toggle-time.** The
   first draft of terminal maximize (#34) mutated
@@ -1219,7 +1219,7 @@ If you write a new primitive or extend an existing one, verify all six.
 | Doc | Purpose |
 |-----|---------|
 | [`quadraui/docs/UI_CRATE_DESIGN.md`](quadraui/docs/UI_CRATE_DESIGN.md) | Authoritative design. All 13 §7 decisions are resolved. Start here. |
-| [`docs/NATIVE_GUI_LESSONS.md`](docs/NATIVE_GUI_LESSONS.md) | Cross-backend bug patterns — read before A.1c. |
+| [`NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) | Cross-backend bug patterns — read before A.1c. (Lives in quadraui repo since Session 346 extraction.) |
 | [`CLAUDE.md`](CLAUDE.md) | Project-wide rules, quality gates, branching workflow. |
 | [`PROJECT_STATE.md`](PROJECT_STATE.md) | Session-by-session progress (historical). |
 | GitHub milestone [`Cross-Platform UI Crate`](https://github.com/JDonaghy/vimcode/milestone/5) | Tracking issues for backlog primitives and validation apps. |
