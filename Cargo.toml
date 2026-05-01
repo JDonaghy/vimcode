@@ -37,9 +37,6 @@ name = "vimcode-win"
 path = "src/win_gui_bin.rs"
 required-features = ["win-gui"]
 
-[workspace]
-members = ["quadraui", "kubeui-core", "kubeui", "kubeui-gtk"]
-
 [features]
 default = ["gui"]
 # `quadraui/gtk` enables the public `quadraui::gtk::draw_*` rasterisers
@@ -53,7 +50,7 @@ win-gui = ["windows"]
 # (#223). vimcode's TUI binary always builds, so the feature is on by
 # default in the dependency line; the GTK feature ships gated behind
 # vimcode's own `gui` feature above.
-quadraui = { path = "quadraui", features = ["tui"] }
+quadraui = { path = "../quadraui/quadraui", features = ["tui"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
