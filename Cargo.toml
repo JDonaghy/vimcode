@@ -50,6 +50,11 @@ win-gui = ["windows"]
 # (#223). vimcode's TUI binary always builds, so the feature is on by
 # default in the dependency line; the GTK feature ships gated behind
 # vimcode's own `gui` feature above.
+# Quadraui lives in its own repo since Session 346 extraction (see PLAN.md).
+# Path-dep to a sibling checkout: clone https://github.com/JDonaghy/quadraui
+# next to vimcode (i.e. `~/src/quadraui` and `~/src/vimcode` as siblings).
+# CI configuration that doesn't have quadraui sibling-checked-out is
+# currently disabled — see `.github/workflows/*.disabled`.
 quadraui = { path = "../quadraui/quadraui", features = ["tui"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
