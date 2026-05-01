@@ -2991,6 +2991,7 @@ pub(super) fn handle_mouse(
                         header_size: 1.0,
                         divider_size: 0.0,
                         scrollbar_size: 1.0,
+                        cell_quantum: 1.0,
                     };
                     let layout = view.layout(body_bounds, metrics, |i| {
                         let s = &view.sections[i];

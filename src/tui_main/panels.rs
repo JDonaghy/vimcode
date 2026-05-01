@@ -2916,6 +2916,7 @@ pub(super) fn render_ext_sidebar(
         header_size: 1.0,
         divider_size: 0.0,
         scrollbar_size: 1.0,
+        cell_quantum: 1.0,
     };
     let body_qbounds = quadraui::Rect::new(
         body_area.x as f32,
