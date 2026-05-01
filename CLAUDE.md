@@ -191,6 +191,15 @@ This prevents CI failures and maintains code quality.
 - Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
 - Never push directly to `main` — always merge from `develop` via PR
 
+## Working with the quadraui dep
+vimcode's `quadraui` dep is a **path dep** to `../quadraui/quadraui` — a sibling checkout of [JDonaghy/quadraui](https://github.com/JDonaghy/quadraui). Local builds always use whatever branch the sibling is currently on; no publish step.
+
+- **Update to latest integrated quadraui:** `cd ~/src/quadraui && git checkout develop && git pull`. Then `cd ~/src/vimcode && cargo build` picks it up automatically.
+- **Test a quadraui PR before merge:** `cd ~/src/quadraui && git fetch origin && git checkout <pr-branch>`. Switch back to `develop` when done.
+- **Quadraui follows the same branching model as vimcode:** `develop` is the integration branch, `main` is release-only. Track `develop` for in-flight work; once quadraui ships releases we'll pin a `main` rev or a published version.
+- **If a quadraui change breaks vimcode's build,** fix vimcode side on a normal vimcode branch (per the workflow above). The path dep doesn't enforce a version contract — it's caller-beware.
+- **Vimcode CI is currently disabled** (`.github/workflows/*.yml.disabled`) because it can't resolve a sibling-clone path dep in a fresh `actions/checkout`. Re-enable strategy is open: workflow step that clones quadraui first, or switch to a git-dep with pinned rev.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars
