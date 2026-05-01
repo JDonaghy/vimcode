@@ -25,40 +25,70 @@ exists, then re-do migrations with the harness gating each one.
 
 ### Order of work
 
-Run these in sequence. Each step is small enough to ship in a single
-session; the early ones have low risk so they reset the baseline before
-we commit to anything bigger.
+Steps 1–5 shipped end-to-end during Session 346; steps 6–7 happen in the
+extracted quadraui repo and are tracked as issues there.
 
-1. **Revert #296** — `git revert 7855663..58844e4` (8 commits). Develop
-   returns to the last-known-good Debug sidebar (legacy paint+click,
-   matches v0.10.0 behaviour). Drop my uncommitted `cell_quantum` work
-   into a stash first so it survives. This is destructive; ask before
-   pulling the trigger.
-2. **Land `cell_quantum`** as a standalone quadraui PR. The change is
-   small, has 2 regression tests already, and helps Extensions and any
-   future MSV consumer regardless of when #296 is re-attempted.
-3. **TUI smoke harness for `MultiSectionView`** — paint-and-click
-   round-trip in `quadraui/tests/`. Build a view, paint into a
-   `ratatui::buffer::Buffer`, find the cell row each section's title
-   landed on, hit_test at that row, assert the hit identifies that
-   section's header. ~50 lines of test code; would have caught today's
-   bug instantly.
-4. **TUI harness for `TreeView`** — same shape (paint, find selected
-   row, click it, verify state changed). TreeView is the most-used
-   primitive; covering it locks down the highest-traffic surface.
-5. **Extract quadraui to its own repo, version 0.0.1.** No API freeze;
-   fast iteration allowed. See "Extraction obligations" below for what
-   the split must include.
-6. **Re-do #296 in the new repo with the harness in place.** Tests
-   demand paint=click round-trip before merge. No `Cell<T>`
-   paint→click bridge fields appear anywhere.
-7. **Migrate SC (#282) using the harness** as the second proof that
-   the harness covers a different shape (Fixed-aux input + N
-   sections).
+1. ✅ **Revert #296** — turned out the 8 #296 commits were on a feature
+   branch (`issue-296-msv-backend-cache`) that never merged to develop.
+   Local branch left untouched as a record. No revert needed; develop
+   was already clean.
+2. ✅ **Land `cell_quantum`** — [#297](https://github.com/JDonaghy/vimcode/pull/297),
+   merged. `LayoutMetrics::cell_quantum` field; TUI sets `1.0`, GTK leaves
+   `0.0`. Snaps section sizes to integer cells inside the layout function
+   so paint and hit_test agree by construction. +2 regression tests in
+   the primitive (catches the exact drift class).
+3. ✅ **TUI MSV harness** — [#298](https://github.com/JDonaghy/vimcode/pull/298),
+   merged. 4 round-trip tests in `tui::multi_section_view::tests`;
+   extracted `pub fn tui_msv_layout()` so paint and tests share one
+   source of truth. Empirically verified to catch the bug class
+   (mutation breaks the harness; restoration passes).
+4. ✅ **TUI TreeView harness** — [#299](https://github.com/JDonaghy/vimcode/pull/299),
+   merged. Same shape; extracted `tui_tree_layout`. Catches scroll_offset
+   drift specifically.
+5. ✅ **Extract quadraui** — [#300](https://github.com/JDonaghy/vimcode/pull/300),
+   merged. Repo at https://github.com/JDonaghy/quadraui (workspace with
+   `quadraui/`, `kubeui-core/`, `kubeui/`, `kubeui-gtk/`). History
+   preserved via subtree splits. Vimcode now consumes it as a path-dep
+   sibling: `quadraui = { path = "../quadraui/quadraui", features = ["tui"] }`.
+   Vimcode CI temporarily disabled (`.github/workflows/*.yml.disabled`)
+   pending sibling-clone resolution.
+6. ⏳ **Re-do #296 in quadraui** — tracked as
+   [JDonaghy/quadraui#1](https://github.com/JDonaghy/quadraui/issues/1).
+   Vimcode-side adoption tracked here at [#296](https://github.com/JDonaghy/vimcode/issues/296)
+   (label: `blocked`). Will pick up automatically when quadraui#1 closes.
+7. ⏳ **Migrate SC (#282)** — tracked as
+   [JDonaghy/quadraui#2](https://github.com/JDonaghy/quadraui/issues/2).
+   Vimcode-side adoption tracked at [#282](https://github.com/JDonaghy/vimcode/issues/282)
+   (label: `blocked`).
 
-After step 7, queue: GTK smoke harness; vimcode bug fixes (#287, #288,
-#290, #291, #292); Win-GUI rebuild; macOS; Lua bindings for extension
-mini-apps.
+Other work queued as quadraui issues from the Session 346 audit:
+
+- **GTK MSV / TreeView harnesses** — [quadraui#3](https://github.com/JDonaghy/quadraui/issues/3)
+  + [quadraui#4](https://github.com/JDonaghy/quadraui/issues/4). Harness
+  coverage extension; mirror the TUI pattern using `cairo::ImageSurface`.
+- **MenuBar rasterisers** — [quadraui#6](https://github.com/JDonaghy/quadraui/issues/6).
+  Primitive descriptor exists but neither backend rasteriser ships.
+  Vimcode-side adoption: [#301](https://github.com/JDonaghy/vimcode/issues/301)
+  (label: `blocked`).
+- **SearchPanel primitive** — [quadraui#7](https://github.com/JDonaghy/quadraui/issues/7).
+  Spike whether MSV+TreeView covers; if not, file dedicated primitive.
+  Vimcode-side adoption: [#302](https://github.com/JDonaghy/vimcode/issues/302)
+  (label: `blocked`).
+- **Audit orphan primitives** — [quadraui#8](https://github.com/JDonaghy/quadraui/issues/8).
+  `panel.rs`, `progress.rs`, `spinner.rs`, `split.rs`, `toast.rs` have
+  no rasterisers; verdict pending.
+- **CLAUDE.md "harness is the gate" doc** — [quadraui#5](https://github.com/JDonaghy/quadraui/issues/5).
+
+After those land, queue: vimcode bug fixes (#287, #288, #290, #291,
+#292); Win-GUI rebuild; macOS; Lua bindings for extension mini-apps.
+
+### Cross-repo prereq tracking
+
+The `blocked` label + cross-repo issue references make migration prereqs
+visible to `/plan-next` (which now follows the convention — see
+`.claude/commands/plan-next.md`). When a quadraui issue closes, the
+vimcode tracking ticket moves from "Still blocked" to "Newly unblocked"
+in plan-next's report.
 
 ### Extraction obligations (when step 5 happens)
 
