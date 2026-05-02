@@ -4592,7 +4592,7 @@ pub(super) fn draw_panel_hover_popup(
 /// `render::ext_sidebar_to_multi_section_view` and rasterised via
 /// `quadraui::gtk::draw_multi_section_view`. Both paint and
 /// `Msg::ExtSidebarClick` consult the same `MultiSectionViewLayout`
-/// (via `quadraui::gtk::multi_section_view_layout`), so per-section
+/// (via `quadraui::gtk::gtk_msv_layout`), so per-section
 /// drift is impossible by construction (the structural fix for the
 /// #281 bug classes).
 #[allow(clippy::too_many_arguments)]

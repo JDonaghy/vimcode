@@ -3341,7 +3341,7 @@ impl SimpleComponent for App {
                 // (avoids re-running layout per drag-update event).
                 if let Some(ref ext) = screen.ext_sidebar {
                     let view_for_max = render::ext_sidebar_to_multi_section_view(ext);
-                    let layout_for_max = quadraui::gtk::multi_section_view_layout(
+                    let layout_for_max = quadraui::gtk::gtk_msv_layout(
                         &view_for_max,
                         quadraui::Rect::new(0.0, 0.0, w as f32, body_h),
                         line_height,
@@ -9632,7 +9632,7 @@ impl App {
                 //   row 0 (`line_height`) = panel header.
                 //   row 1 (`line_height`) = search input.
                 // MultiSectionView body starts at y = 2 * line_height.
-                // Hit-test via `quadraui::gtk::multi_section_view_layout()`
+                // Hit-test via `quadraui::gtk::gtk_msv_layout()`
                 // (the same call the rasteriser makes) so paint and
                 // click share the section geometry by construction
                 // (#293, structural fix for the #281 bug classes).
@@ -9659,7 +9659,7 @@ impl App {
                         // used — paint and click see one layout (#293).
                         let body_height = engine.ext_sidebar_body_height.get().max(1.0) as f64;
                         let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, body_height as f32);
-                        let view_layout = quadraui::gtk::multi_section_view_layout(
+                        let view_layout = quadraui::gtk::gtk_msv_layout(
                             &view,
                             body_bounds,
                             line_height,
