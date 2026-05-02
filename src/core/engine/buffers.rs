@@ -788,7 +788,7 @@ impl Engine {
         // If a diff split is already active, tear it down first.
         if let Some((left_win, right_win)) = self.diff_window_pair.take() {
             self.diff_results.clear();
-            self.diff_aligned.clear();
+            self.clear_all_diff_alignment();
             self.scroll_bind_pairs
                 .retain(|&(a, b)| !(a == left_win && b == right_win));
             // Clear the diff label on the working copy buffer.
@@ -1022,7 +1022,7 @@ impl Engine {
         // Tear down any existing diff split.
         if let Some((left_win, old_right)) = self.diff_window_pair.take() {
             self.diff_results.clear();
-            self.diff_aligned.clear();
+            self.clear_all_diff_alignment();
             self.scroll_bind_pairs
                 .retain(|&(a, b)| !(a == left_win && b == old_right));
             self.clear_diff_labels(left_win, old_right);
@@ -2534,8 +2534,7 @@ impl Engine {
         }
         self.diff_window_pair = None;
         self.diff_results.clear();
-        self.diff_aligned.clear();
-        self.diff_aligned.clear();
+        self.clear_all_diff_alignment();
         self.diff_unchanged_hidden = false;
         self.message = "Diff off".to_string();
         EngineAction::None

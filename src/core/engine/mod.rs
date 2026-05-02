@@ -4125,6 +4125,20 @@ fn merge_short_same_runs(results: &mut [DiffLine], fill: DiffLine) {
 /// does not.
 ///
 /// Returns `(aligned_a, aligned_b)` — both the same length.
+impl Engine {
+    /// Drop all aligned-diff state and reset every window's
+    /// `aligned_top` pin. Use this anywhere `diff_aligned.clear()`
+    /// would have been called: leaving the pin dangling would let the
+    /// render code keep starting at a stale aligned-row index after
+    /// the user exits diff mode (#166 fallout).
+    pub(crate) fn clear_all_diff_alignment(&mut self) {
+        self.diff_aligned.clear();
+        for w in self.windows.values_mut() {
+            w.view.aligned_top = None;
+        }
+    }
+}
+
 pub fn build_aligned_diff(
     da: &[DiffLine],
     db: &[DiffLine],

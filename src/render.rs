@@ -7989,16 +7989,44 @@ fn build_rendered_window(
 
     // When aligned diff data exists, iterate through the aligned sequence
     // so padding lines appear at the correct visual positions.
+    //
+    // `view.aligned_top` (set by `sync_scroll_binds`) wins when present:
+    // it pins the starting aligned index so both panes of a scroll-bound
+    // pair land on exactly the same row. Without it we fall back to a
+    // seek-from-`scroll_top` heuristic, then back up over any leading
+    // padding so a hunk's filler rows render at the top of the viewport
+    // when scroll_top lands just past them (#166).
     let mut aligned_idx: usize = if let Some(aligned) = diff_aligned {
-        // Find the aligned entry corresponding to scroll_top.
-        aligned
-            .iter()
-            .position(|e| e.source_line.is_some_and(|sl| sl >= scroll_top))
-            .unwrap_or(0)
+        if let Some(top) = view.aligned_top {
+            top.min(aligned.len())
+        } else {
+            let seek_idx = aligned
+                .iter()
+                .position(|e| e.source_line.is_some_and(|sl| sl >= scroll_top))
+                .unwrap_or(0);
+            let mut k = seek_idx;
+            while k > 0 && aligned[k - 1].source_line.is_none() {
+                k -= 1;
+            }
+            k
+        }
     } else {
         0
     };
-    let mut line_idx = scroll_top;
+    // When `aligned_top` pins the start at a padding entry, advance
+    // `line_idx` to the next real source line so the buffer-line-driven
+    // outer loop emits padding for the leading None entries before
+    // emitting that real line. Falls back to `scroll_top` when there is
+    // no aligned data (the non-diff path) or no Some entry remains
+    // (trailing-padding edge case).
+    let mut line_idx = if let Some(aligned) = diff_aligned {
+        aligned[aligned_idx..]
+            .iter()
+            .find_map(|e| e.source_line)
+            .unwrap_or(scroll_top)
+    } else {
+        scroll_top
+    };
     while lines.len() < visible_lines && line_idx < total_lines {
         // Skip hidden lines (fold bodies).
         if view.is_line_hidden(line_idx) {

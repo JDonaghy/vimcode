@@ -10931,6 +10931,141 @@ fn test_diff_aligned_scroll_sync() {
     );
 }
 
+/// Regression for #166: with two non-adjacent hunks, scrolling either
+/// pane past the first hunk used to drift the partner by the net
+/// `(adds − removes)` of every prior hunk because `sync_scroll_binds`
+/// set `partner.scroll_top` to a buffer line that the partner's render
+/// resolved at a different aligned-row index.  Both panes' renders
+/// must now start at the same aligned-row index.
+#[test]
+fn test_diff_aligned_no_drift_past_multi_hunks() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_diff_no_drift");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("a_drift.txt");
+    let f2 = dir.join("b_drift.txt");
+    // Two non-adjacent hunks, each Removed-only on A side (B side has
+    // matching padding via aligned-diff).  After the first hunk, OLD
+    // sync would put the partner one row off; after the second hunk,
+    // two rows off.
+    std::fs::write(&f1, "s0\ns1\nold_a1\nold_a2\ns2\ns3\nold_b\ns4\ns5\n").unwrap();
+    std::fs::write(&f2, "s0\ns1\ns2\ns3\ns4\ns5\n").unwrap();
+
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a, b) = engine.diff_window_pair.unwrap();
+    let aligned_a = engine.diff_aligned.get(&a).cloned().unwrap();
+    let aligned_b = engine.diff_aligned.get(&b).cloned().unwrap();
+    assert_eq!(
+        aligned_a.len(),
+        aligned_b.len(),
+        "aligned sequences must be the same length"
+    );
+
+    // Scroll the working-tree (B) past the first hunk: line 2 ("s2")
+    // is the first Same line after the first hunk.  Pre-fix this set
+    // partner A's scroll_top so A skipped its preceding padding rows
+    // and rendered at a later aligned-row idx than B.
+    engine.active_tab_mut().active_window = b;
+    engine.windows.get_mut(&b).unwrap().view.scroll_top = 2;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a]
+        .view
+        .aligned_top
+        .expect("partner aligned_top must be pinned by sync_scroll_binds in aligned-diff mode");
+    let b_top = engine.windows[&b]
+        .view
+        .aligned_top
+        .expect("active aligned_top");
+    assert_eq!(
+        a_top, b_top,
+        "both panes must start at the same aligned-row idx after sync"
+    );
+
+    // Now drive from the A pane after the second hunk: line 4 ("s4")
+    // is the first Same line after the second hunk.  This is the
+    // scenario the user reported — drift compounds over multiple
+    // hunks if sync uses buffer-line semantics for partner.scroll_top.
+    engine.active_tab_mut().active_window = a;
+    engine.windows.get_mut(&a).unwrap().view.scroll_top = 7;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a]
+        .view
+        .aligned_top
+        .expect("active aligned_top");
+    let b_top = engine.windows[&b]
+        .view
+        .aligned_top
+        .expect("partner aligned_top");
+    assert_eq!(
+        a_top, b_top,
+        "panes must remain aligned after scrolling past the second hunk"
+    );
+    // And the index must point to the post-hunk Same row (s4 is the
+    // first non-padding entry on both sides past hunk 2).
+    let entry_a = aligned_a[a_top].source_line;
+    let entry_b = aligned_b[b_top].source_line;
+    assert_eq!(
+        entry_a,
+        Some(7),
+        "A's aligned[K] should reference A's line 7 (s4), got {entry_a:?}"
+    );
+    assert_eq!(
+        entry_b,
+        Some(4),
+        "B's aligned[K] should reference B's line 4 (s4), got {entry_b:?}"
+    );
+}
+
+/// Regression for #166: when the active pane is on the side WITH
+/// added lines and scrolled past them, the partner with padding
+/// would skip rendering its leading-padding rows.  The fix backs the
+/// render up over preceding padding so the visible aligned range
+/// matches the active pane row-for-row.
+#[test]
+fn test_diff_aligned_top_renders_leading_padding() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_diff_leading_pad");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("a_pad.txt");
+    let f2 = dir.join("b_pad.txt");
+    // A has just two same lines; B has 3 added lines between them.
+    // When user scrolls B to line 4 (last of the added block), A's
+    // aligned[K] is padding — pre-fix this row never rendered.
+    std::fs::write(&f1, "s0\ns1\n").unwrap();
+    std::fs::write(&f2, "s0\nnew0\nnew1\nnew2\nnew3\ns1\n").unwrap();
+
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a, b) = engine.diff_window_pair.unwrap();
+    let aligned_a = engine.diff_aligned.get(&a).cloned().unwrap();
+
+    // Scroll B to line 3 (mid-added block).
+    engine.active_tab_mut().active_window = b;
+    engine.windows.get_mut(&b).unwrap().view.scroll_top = 3;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a].view.aligned_top.expect("a aligned_top");
+    let b_top = engine.windows[&b].view.aligned_top.expect("b aligned_top");
+    assert_eq!(a_top, b_top, "both panes pinned at same aligned idx");
+    // At aligned idx K==3 (counting from start), A side must be a
+    // padding entry (the whole hunk on A is padding).  This is the
+    // regression: pre-fix the partner could not target a None entry.
+    assert!(
+        aligned_a[a_top].source_line.is_none(),
+        "A's aligned[K]={:?} should be padding at this scroll position",
+        aligned_a[a_top].source_line
+    );
+}
+
 #[test]
 fn test_diff_current_change_index() {
     let mut engine = Engine::new();

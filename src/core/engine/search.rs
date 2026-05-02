@@ -331,6 +331,13 @@ impl Engine {
     /// Synchronise the scroll_top of scroll-bound window pairs.
     /// Called after every key that may move the cursor or scroll, and also
     /// after direct scroll_top mutations (e.g. scrollbar drag).
+    ///
+    /// In aligned-diff mode, also stamps `view.aligned_top` on both panes
+    /// to a single shared aligned-row index so the render starts both
+    /// panes at exactly the same row. Without this, scrolling past a
+    /// hunk drifts the panes by `(adds − removes)` rows of every prior
+    /// hunk because `scroll_top` (a buffer line) cannot identify a
+    /// padding row uniquely (#166).
     pub fn sync_scroll_binds(&mut self) {
         if self.scroll_bind_pairs.is_empty() {
             return;
@@ -345,6 +352,26 @@ impl Engine {
             .map(|s| s.buffer.len_lines())
             .unwrap_or(1)
             .max(1);
+
+        // Pre-compute the active pane's effective aligned-row index from
+        // its scroll_top using the same seek + backup-over-padding logic
+        // the render uses, so both sides see one consistent index.
+        let active_aligned_top: Option<usize> = self.diff_aligned.get(&active_id).map(|aligned| {
+            let seek_idx = aligned
+                .iter()
+                .position(|e| e.source_line.is_some_and(|l| l >= active_scroll))
+                .unwrap_or(aligned.len().saturating_sub(1));
+            let mut k = seek_idx;
+            while k > 0 && aligned[k - 1].source_line.is_none() {
+                k -= 1;
+            }
+            k
+        });
+
+        // Stamp active's aligned_top up front; mirror onto partners below.
+        if let Some(w) = self.windows.get_mut(&active_id) {
+            w.view.aligned_top = active_aligned_top;
+        }
 
         let pairs = self.scroll_bind_pairs.clone();
         for (a, b) in pairs {
@@ -361,6 +388,32 @@ impl Engine {
                     self.md_preview_links.contains_key(&pb)
                         || self.md_preview_links.contains_key(&active_buf_id)
                 });
+                // Compute partner's target (line + aligned_top) ahead of
+                // taking a mutable borrow on the partner window.
+                let partner_aligned_target: Option<(usize, usize)> =
+                    match (active_aligned_top, self.diff_aligned.get(&pid)) {
+                        (Some(k), Some(partner_aligned)) if !partner_aligned.is_empty() => {
+                            let line = if k < partner_aligned.len() {
+                                partner_aligned[k..]
+                                    .iter()
+                                    .find_map(|e| e.source_line)
+                                    .or_else(|| {
+                                        partner_aligned[..k]
+                                            .iter()
+                                            .rev()
+                                            .find_map(|e| e.source_line)
+                                    })
+                                    .unwrap_or(0)
+                            } else {
+                                partner_aligned
+                                    .last()
+                                    .and_then(|e| e.source_line)
+                                    .unwrap_or(0)
+                            };
+                            Some((k, line))
+                        }
+                        _ => None,
+                    };
                 if let Some(w) = self.windows.get_mut(&pid) {
                     if is_md_pair {
                         // Proportional scroll: map source position to preview position.
@@ -372,44 +425,13 @@ impl Engine {
                         let ratio = active_scroll as f64 / active_lines as f64;
                         w.view.scroll_top = ((ratio * partner_lines as f64).round() as usize)
                             .min(partner_lines.saturating_sub(1));
-                    } else if let (Some(active_aligned), Some(partner_aligned)) = (
-                        self.diff_aligned.get(&active_id),
-                        self.diff_aligned.get(&pid),
-                    ) {
-                        // Aligned diff scroll: map active scroll_top through
-                        // aligned sequences so both sides stay in visual lockstep
-                        // even when one side has large padding blocks.
-                        let target_idx = active_aligned
-                            .iter()
-                            .position(|e| e.source_line == Some(active_scroll))
-                            .unwrap_or_else(|| {
-                                // Fallback: find nearest aligned entry at or after active_scroll.
-                                active_aligned
-                                    .iter()
-                                    .position(|e| e.source_line.is_some_and(|l| l >= active_scroll))
-                                    .unwrap_or(active_aligned.len().saturating_sub(1))
-                            });
-                        // Map that aligned index to the partner's buffer line.
-                        let partner_line = if target_idx < partner_aligned.len() {
-                            partner_aligned[target_idx..]
-                                .iter()
-                                .find_map(|e| e.source_line)
-                                .or_else(|| {
-                                    partner_aligned[..target_idx]
-                                        .iter()
-                                        .rev()
-                                        .find_map(|e| e.source_line)
-                                })
-                                .unwrap_or(0)
-                        } else {
-                            partner_aligned
-                                .last()
-                                .and_then(|e| e.source_line)
-                                .unwrap_or(0)
-                        };
+                        w.view.aligned_top = None;
+                    } else if let Some((aligned_top, partner_line)) = partner_aligned_target {
                         w.view.scroll_top = partner_line;
+                        w.view.aligned_top = Some(aligned_top);
                     } else {
                         w.view.scroll_top = active_scroll;
+                        w.view.aligned_top = None;
                     }
                 }
             }

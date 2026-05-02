@@ -107,7 +107,7 @@ impl Engine {
             if a == window_id || b == window_id {
                 self.clear_diff_labels(a, b);
                 self.diff_results.clear();
-                self.diff_aligned.clear();
+                self.clear_all_diff_alignment();
                 self.diff_unchanged_hidden = false;
                 // Close the partner diff window + clean up scratch buffers.
                 let partner = if a == window_id { b } else { a };
@@ -184,7 +184,7 @@ impl Engine {
                     self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
-                    self.diff_aligned.clear();
+                    self.clear_all_diff_alignment();
                 }
             }
         }
@@ -363,7 +363,7 @@ impl Engine {
                     self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
-                    self.diff_aligned.clear();
+                    self.clear_all_diff_alignment();
                 }
             }
         }
