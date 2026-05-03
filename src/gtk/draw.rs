@@ -2368,7 +2368,6 @@ pub(super) fn draw_debug_sidebar(
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
     let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
-    let (act_r, act_g, act_b) = theme.tab_active_fg.to_cairo();
 
     // Paint sidebar background.
     cr.set_source_rgb(bg_r, bg_g, bg_b);
@@ -2410,154 +2409,20 @@ pub(super) fn draw_debug_sidebar(
     cr.move_to(x + 8.0, btn_y);
     pangocairo::show_layout(cr, layout);
 
-    // ── Sections with fixed-height allocation + per-section scrolling ──────
-    let var_label = format!("{} VARIABLES", icons::DBG_VARIABLES.nerd);
-    let watch_label = format!("{} WATCH", icons::DBG_WATCH.nerd);
-    let stack_label = format!("{} CALL STACK", icons::DBG_CALL_STACK.nerd);
-    let bps_label = format!("{} BREAKPOINTS", icons::DBG_BREAKPOINTS.nerd);
-    let sections: [(
-        &str,
-        &[render::DebugSidebarItem],
-        render::DebugSidebarSection,
-        usize,
-        &str,
-    ); 4] = [
-        (
-            var_label.as_str(),
-            &sidebar.variables,
-            render::DebugSidebarSection::Variables,
-            0,
-            "vars",
-        ),
-        (
-            watch_label.as_str(),
-            &sidebar.watch,
-            render::DebugSidebarSection::Watch,
-            1,
-            "watch",
-        ),
-        (
-            stack_label.as_str(),
-            &sidebar.frames,
-            render::DebugSidebarSection::CallStack,
-            2,
-            "stack",
-        ),
-        (
-            bps_label.as_str(),
-            &sidebar.breakpoints,
-            render::DebugSidebarSection::Breakpoints,
-            3,
-            "bps",
-        ),
-    ];
-
-    // Compute per-section content heights (equal share of remaining space).
-    let content_px = (h - 6.0 * line_height).max(0.0);
-    let sec_content_h = (content_px / 4.0).floor();
-
-    let mut cursor_y = btn_y + line_height;
-    let max_y = y + h;
-
-    let (sb_r, sb_g, sb_b) = (0.5_f64, 0.5_f64, 0.5_f64);
-
-    // ── Phase A: chrome paint (section title rows + scrollbar overlays) ────
-    let mut section_starts: [f64; 4] = [0.0; 4];
-    let mut section_heights_px: [f64; 4] = [0.0; 4];
-    let mut section_visible_rows: [usize; 4] = [0; 4];
-    for (section_label, items, section_kind, sec_idx, _) in &sections {
-        if cursor_y >= max_y {
-            break;
-        }
-
-        let is_active_section = sidebar.active_section == *section_kind;
-        let (shr, shg, shb) = if is_active_section {
-            (act_r, act_g, act_b)
-        } else {
-            (hdr_fg_r, hdr_fg_g, hdr_fg_b)
-        };
-        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, cursor_y, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(shr, shg, shb);
-        layout.set_text(section_label);
-        cr.move_to(x + 4.0, cursor_y);
-        pangocairo::show_layout(cr, layout);
-        cursor_y += line_height;
-
-        let scroll_off = sidebar.scroll_offsets[*sec_idx];
-        let sec_height = sidebar.section_heights[*sec_idx] as usize;
-        let visible_rows = if sec_height > 0 {
-            sec_height
-        } else {
-            (sec_content_h / line_height).floor() as usize
-        };
-
-        let section_start_y = cursor_y;
-        let section_h_px = visible_rows as f64 * line_height;
-        section_starts[*sec_idx] = section_start_y;
-        section_heights_px[*sec_idx] = section_h_px.min(max_y - section_start_y).max(0.0);
-        section_visible_rows[*sec_idx] = visible_rows;
-
-        // Scrollbar overlay (only when items overflow the viewport).
-        if items.len() > visible_rows && visible_rows > 0 {
-            let sb_w = 4.0_f64;
-            let sb_x = x + w - sb_w;
-            let track_h = visible_rows as f64 * line_height;
-            let total_items = items.len();
-            let thumb_h = ((visible_rows as f64 / total_items as f64) * track_h)
-                .ceil()
-                .max(line_height * 0.5);
-            let max_scroll = total_items - visible_rows;
-            let thumb_top = if max_scroll > 0 {
-                (scroll_off as f64 / max_scroll as f64) * (track_h - thumb_h)
-            } else {
-                0.0
-            };
-            let (st_r, st_g, st_b) = theme.scrollbar_track.to_cairo();
-            cr.set_source_rgba(st_r, st_g, st_b, 0.3);
-            cr.rectangle(sb_x, section_start_y, sb_w, track_h);
-            cr.fill().ok();
-            cr.set_source_rgb(sb_r, sb_g, sb_b);
-            cr.rectangle(sb_x, section_start_y + thumb_top, sb_w, thumb_h);
-            cr.fill().ok();
-        }
-
-        cursor_y = section_start_y + visible_rows as f64 * line_height;
-    }
-
-    // ── Phase B: per-section item rendering via Backend::draw_tree ─────────
-    {
+    // ── MSV body (the four sections). ──
+    // Paint; caching of layout + view is done by the caller (the
+    // draw_func closure in mod.rs, which has `engine` in scope).
+    // See CLAUDE.md "Paint↔click integration pattern".
+    let msv_y = btn_y + line_height;
+    let msv_h = (h - 2.0 * line_height).max(0.0);
+    if msv_h > 0.0 {
+        let view = render::debug_sidebar_to_multi_section_view(sidebar);
+        let body_bounds = quadraui::Rect::new(x as f32, msv_y as f32, w as f32, msv_h as f32);
         use quadraui::Backend;
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            for (_, items, _, sec_idx, section_id) in &sections {
-                let visible_rows = section_visible_rows[*sec_idx];
-                let sec_h = section_heights_px[*sec_idx];
-                if visible_rows == 0 || sec_h <= 0.0 {
-                    continue;
-                }
-                let scrollbar_needed = items.len() > visible_rows;
-                let content_w = if scrollbar_needed {
-                    (w - 4.0).max(0.0)
-                } else {
-                    w
-                };
-                let scroll_off = sidebar.scroll_offsets[*sec_idx];
-                let tree = render::debug_sidebar_section_to_tree_view(
-                    items,
-                    scroll_off,
-                    sidebar.has_focus,
-                    sidebar.session_active,
-                    section_id,
-                );
-                let start_y = section_starts[*sec_idx];
-                b.draw_tree(
-                    quadraui::Rect::new(x as f32, start_y as f32, content_w as f32, sec_h as f32),
-                    &tree,
-                );
-            }
+            b.draw_multi_section_view(body_bounds, &view);
         });
     }
 }

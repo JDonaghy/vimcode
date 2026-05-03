@@ -3176,76 +3176,19 @@ pub(super) fn render_debug_sidebar(
     engine: &Engine,
     theme: &Theme,
 ) {
-    use render::DebugSidebarSection;
     if area.height == 0 {
         return;
     }
     let hdr_fg = rc(theme.status_fg);
     let hdr_bg = rc(theme.status_bg);
-    let act_fg = rc(theme.status_fg.lighten(0.2));
 
     // Build minimal screen layout to get debug_sidebar data.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let sidebar = &screen.debug_sidebar;
 
-    let sections: [(
-        &str,
-        &[render::DebugSidebarItem],
-        DebugSidebarSection,
-        usize,
-        &str,
-    ); 4] = [
-        (
-            "\u{f6a9} VARIABLES",
-            &sidebar.variables,
-            DebugSidebarSection::Variables,
-            0,
-            "vars",
-        ),
-        (
-            "\u{f06e} WATCH",
-            &sidebar.watch,
-            DebugSidebarSection::Watch,
-            1,
-            "watch",
-        ),
-        (
-            "\u{f020e} CALL STACK",
-            &sidebar.frames,
-            DebugSidebarSection::CallStack,
-            2,
-            "stack",
-        ),
-        (
-            "\u{f111} BREAKPOINTS",
-            &sidebar.breakpoints,
-            DebugSidebarSection::Breakpoints,
-            3,
-            "bps",
-        ),
-    ];
-
-    // Section heights MUST come from `engine.dap_sidebar_section_heights`
-    // (populated by `tui_main/mod.rs:1456` from `size.height - overhead`)
-    // — not recomputed locally from `area.height`. The two bases can
-    // diverge by 1-2 rows depending on terminal height + bottom panel
-    // visibility, and a recomputed paint walking different totals from
-    // the click handler causes section-walk drift (clicking Watch
-    // activates Call Stack, etc. — #281 smoke).
-    let heights: [u16; 4] = sidebar.section_heights;
-
-    let track_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.scrollbar_thumb);
-    let sb_bg = rc(theme.background);
-
-    // ── Phase A: chrome paint (panel header + button + section title rows
-    // + per-section scrollbar overlays) ──────────────────────────────────────
-    let max_y = area.y + area.height;
-    let mut section_starts: [u16; 4] = [0; 4];
+    // ── Chrome rows (panel-specific): header + Run/Stop button. ──
     {
         let buf = frame.buffer_mut();
-
-        // Row 0: panel header.
         let cfg_name = engine
             .dap_launch_configs
             .get(engine.dap_selected_launch_config)
@@ -3263,7 +3206,6 @@ pub(super) fn render_debug_sidebar(
             return;
         }
 
-        // Row 1: Run / Stop button.
         let btn_y = area.y + 1;
         let (btn_label, btn_icon_fg) =
             if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
@@ -3280,102 +3222,32 @@ pub(super) fn render_debug_sidebar(
             let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
             set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
         }
-
-        // Section title rows + scrollbar overlays. Active section gets
-        // bold + accent-tinted bg so it's clearly distinct (#281 smoke
-        // — `status_fg.lighten(0.2)` was too subtle for keyboard-only
-        // users to track which section had focus).
-        let active_bg = rc(theme.fuzzy_selected_bg);
-        let mut row_y = area.y + 2;
-        for (section_label, items, section_kind, sec_idx, _) in &sections {
-            if row_y >= max_y {
-                break;
-            }
-            let is_active = sidebar.has_focus && sidebar.active_section == *section_kind;
-            let (sect_fg, sect_bg, sect_mod) = if is_active {
-                (act_fg, active_bg, ratatui::style::Modifier::BOLD)
-            } else {
-                (hdr_fg, hdr_bg, ratatui::style::Modifier::empty())
-            };
-            for x in area.x..area.x + area.width {
-                set_cell_styled(buf, x, row_y, ' ', sect_fg, sect_bg, sect_mod, None);
-            }
-            for (i, ch) in section_label.chars().enumerate().take(area.width as usize) {
-                set_cell_styled(
-                    buf,
-                    area.x + i as u16,
-                    row_y,
-                    ch,
-                    sect_fg,
-                    sect_bg,
-                    sect_mod,
-                    None,
-                );
-            }
-            row_y += 1;
-
-            section_starts[*sec_idx] = row_y;
-
-            let sec_height = heights[*sec_idx] as usize;
-            let scroll_off = sidebar.scroll_offsets[*sec_idx];
-            let total_items = items.len().max(1);
-
-            // Scrollbar overlay (rightmost column).
-            if items.len() > sec_height && sec_height > 0 && area.width > 1 {
-                let sb_x = area.x + area.width - 1;
-                let thumb_size = ((sec_height * sec_height) / total_items).max(1);
-                let thumb_pos = (scroll_off * sec_height) / total_items;
-                let thumb_pos = thumb_pos.min(sec_height.saturating_sub(thumb_size));
-                for r in 0..sec_height {
-                    let in_thumb = r >= thumb_pos && r < thumb_pos + thumb_size;
-                    let ch = if in_thumb { '█' } else { '░' };
-                    let fg = if in_thumb { thumb_fg } else { track_fg };
-                    let sy = row_y + r as u16;
-                    if sy < max_y {
-                        set_cell(buf, sb_x, sy, ch, fg, sb_bg);
-                    }
-                }
-            }
-
-            row_y += sec_height as u16;
-        }
     }
 
-    // ── Phase B: per-section item rendering via Backend::draw_tree ───────────
+    // ── MSV body (the four sections). ──
+    // Paint caches the layout + view; click reads them verbatim.
+    // See CLAUDE.md "Paint↔click integration pattern".
+    if area.height < 3 {
+        return;
+    }
+    let msv_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
+    let view = render::debug_sidebar_to_multi_section_view(sidebar);
+    let layout = quadraui::tui::tui_msv_layout(&view, msv_area);
+    engine.dap_sidebar_msv_layout.replace(Some(layout));
+    engine.dap_sidebar_msv_view.replace(Some(view.clone()));
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    for (_, items, _, sec_idx, section_id) in &sections {
-        let sec_height = heights[*sec_idx];
-        if sec_height == 0 {
-            continue;
-        }
-        let scroll_off = sidebar.scroll_offsets[*sec_idx];
-        let scrollbar_needed = items.len() > sec_height as usize;
-        let content_w = if scrollbar_needed && area.width > 1 {
-            area.width - 1
-        } else {
-            area.width
-        };
-        let tree = render::debug_sidebar_section_to_tree_view(
-            items,
-            scroll_off,
-            sidebar.has_focus,
-            sidebar.session_active,
-            section_id,
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_multi_section_view(
+            quadraui::Rect::new(
+                msv_area.x as f32,
+                msv_area.y as f32,
+                msv_area.width as f32,
+                msv_area.height as f32,
+            ),
+            &view,
         );
-        let start_y = section_starts[*sec_idx];
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_tree(
-                quadraui::Rect::new(
-                    area.x as f32,
-                    start_y as f32,
-                    content_w as f32,
-                    sec_height as f32,
-                ),
-                &tree,
-            );
-        });
-    }
+    });
 }
 
 /// Render the bottom panel tab bar (Terminal | Debug Output).

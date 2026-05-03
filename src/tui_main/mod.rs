@@ -1426,14 +1426,24 @@ fn event_loop(
                 }
             }
 
-            // Compute debug sidebar section heights so ensure_visible and click
-            // hit-testing use the same dimensions as the render function.
+            // Update dap_sidebar_section_heights from the cached MSV
+            // layout (set by paint last frame). Keyboard handlers in
+            // dap_ops.rs (ensure_visible, PageUp/Down, ScrollDown) read
+            // this to know how many rows fit per section. The old formula
+            // recomputed from terminal size and diverged from what MSV
+            // actually painted — this reads the actual layout's
+            // body_bounds.height, which IS the visible row count in TUI
+            // (1 cell per row). Falls back to the old formula only when
+            // no cached layout exists yet (first frame).
             if sidebar.visible && sidebar.active_panel == TuiPanel::Debug {
-                if let Ok(size) = terminal.size() {
-                    // Mirror the draw_frame v_chunks layout to get the exact
-                    // sidebar area height: subtract all rows that appear above or
-                    // below main_area (menu, quickfix, bottom-panel, debug-toolbar,
-                    // status bar, command bar).
+                let cached = engine.dap_sidebar_msv_layout.borrow().clone();
+                if let Some(ref layout) = cached {
+                    for (i, sec) in layout.sections.iter().enumerate() {
+                        if i < 4 {
+                            engine.dap_sidebar_section_heights[i] = sec.body_bounds.height as u16;
+                        }
+                    }
+                } else if let Ok(size) = terminal.size() {
                     let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                     let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
                     let debug_out_open = engine.bottom_panel_kind
@@ -1445,10 +1455,8 @@ fn event_loop(
                         0
                     };
                     let dt_h: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                    // 2 fixed rows: status bar + command bar
                     let overhead = menu_h + qf_h + bp_h + dt_h + 2;
                     let sidebar_h = size.height.saturating_sub(overhead) as usize;
-                    // 2 overhead rows in sidebar (header + button) + 4 section headers
                     let content_rows = sidebar_h.saturating_sub(6);
                     let base = content_rows / 4;
                     let remainder = content_rows % 4;
@@ -2588,28 +2596,18 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
-                        // Compute section heights before key handling so
-                        // ensure_visible has valid dimensions.
-                        if let Ok(size) = terminal.size() {
-                            let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                            let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
-                            let debug_out_open = engine.bottom_panel_kind
-                                == render::BottomPanelKind::DebugOutput
-                                && !engine.dap_output_lines.is_empty();
-                            let bp_h: u16 = if engine.terminal_open || debug_out_open {
-                                engine.session.terminal_panel_rows + 2
-                            } else {
-                                0
-                            };
-                            let dt_h: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                            let overhead = menu_h + qf_h + bp_h + dt_h + 2;
-                            let sidebar_h = size.height.saturating_sub(overhead) as usize;
-                            let content_rows = sidebar_h.saturating_sub(6);
-                            let base = content_rows / 4;
-                            let remainder = content_rows % 4;
-                            for i in 0..4 {
-                                engine.dap_sidebar_section_heights[i] =
-                                    (base + if i < remainder { 1 } else { 0 }) as u16;
+                        // Update section heights from cached MSV layout
+                        // before key handling so ensure_visible has
+                        // valid dimensions (#296).
+                        {
+                            let cached = engine.dap_sidebar_msv_layout.borrow().clone();
+                            if let Some(ref layout) = cached {
+                                for (i, sec) in layout.sections.iter().enumerate() {
+                                    if i < 4 {
+                                        engine.dap_sidebar_section_heights[i] =
+                                            sec.body_bounds.height as u16;
+                                    }
+                                }
                             }
                         }
                         let key_name = match key_event.code {

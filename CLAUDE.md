@@ -214,6 +214,35 @@ The principle: **a vimcode primitive migration must collapse paint code on every
 
 **Once Win-GUI gets rebuilt on quadraui,** the rule grows to include `quadraui::win_gui::*` rasterisers and harnesses. Same for macOS later.
 
+## Paint↔click integration pattern (CRITICAL)
+
+Quadraui's demos use `AppLogic` + `Backend` trait so paint and click share one function context — one `backend.msv_layout(area, &view)` call, same inputs, same result. **Vimcode can't do that**: paint runs inside ratatui's `terminal.draw()` / GTK's `set_draw_func` closure (which owns the `Frame`/`Context`), click runs in the event loop without one.
+
+**The rule: click NEVER re-derives layout. Paint caches it; click reads the cache.**
+
+```rust
+// Engine field:
+pub foo_layout: RefCell<Option<quadraui::FooLayout>>,
+
+// Paint (inside draw closure — has the real area rect):
+let view = render::foo_to_primitive(&data);
+backend.draw_foo(area, &view);  // internally computes layout
+// Cache the layout for click:
+let layout = backend.foo_layout(area, &view);
+engine.foo_layout.replace(Some(layout));
+
+// Click (in event handler — does NOT recompute):
+if let Some(ref layout) = *engine.foo_layout.borrow() {
+    match layout.hit_test(rel_x, rel_y) { ... }
+}
+```
+
+**Why not call `tui_foo_layout` / `gtk_foo_layout` in click?** Because reconstructing the area rect requires reproducing the chrome math that ratatui's `Layout::split` or GTK's `DrawingArea` sizing computed. That formula drifts ±1 cell/pixel when wildmenu / per-window status / terminal-panel states change between the formula's assumptions and the layout engine's actual output. `EqualShare` amplifies any input mismatch into section-boundary shifts. This caused 4 rounds of smoke failures on #296 (Session 347) before the lesson was captured.
+
+**Corollary**: the same applies to inner body layouts (tree, list, form). If click needs to drill into a section's body (e.g., `TreeViewLayout::hit_test` for which row was clicked), cache that inner layout at paint time too — don't call `tui_tree_layout` / `gtk_tree_layout` in click.
+
+**This rule supersedes any suggestion to "compute layout fresh in click for one source of truth."** In vimcode's architecture, the one source of truth IS the layout paint produced. Click consuming a stale-by-one-frame layout is strictly better than click consuming a fresh layout computed from drifted inputs.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars

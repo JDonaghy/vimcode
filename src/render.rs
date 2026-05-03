@@ -6344,6 +6344,111 @@ pub fn debug_sidebar_section_to_tree_view(
     }
 }
 
+/// Adapt `DebugSidebarData` into a `quadraui::MultiSectionView` for
+/// the shared `draw_multi_section_view` primitive (#296). 4 sections
+/// (Variables / Watch / Call Stack / Breakpoints), each `EqualShare`
+/// with a TreeView body and per-section scroll. Implements the
+/// "Debug-sidebar shape" consumer pattern documented in
+/// `quadraui/CLAUDE.md` § "Consumer patterns".
+///
+/// **One source of truth.** Both backends (TUI + GTK) call this adapter
+/// to build the same `MultiSectionView`, then call their respective
+/// `*_msv_layout()` to produce a `MultiSectionViewLayout`. Paint
+/// consumes the layout's section bounds; click consumes its
+/// `hit_test()`. Drift between the two is impossible by construction —
+/// the structural fix the failed pre-Session-346 attempt could not
+/// achieve via Cell smuggling.
+pub fn debug_sidebar_to_multi_section_view(
+    sidebar: &DebugSidebarData,
+) -> quadraui::MultiSectionView {
+    use quadraui::{
+        Icon as QIcon, MsvAxis, MultiSectionView, ScrollMode, Section, SectionBody, SectionHeader,
+        SectionSize, StyledText, WidgetId,
+    };
+
+    fn section_idx(section: DebugSidebarSection) -> usize {
+        match section {
+            DebugSidebarSection::Variables => 0,
+            DebugSidebarSection::Watch => 1,
+            DebugSidebarSection::CallStack => 2,
+            DebugSidebarSection::Breakpoints => 3,
+        }
+    }
+
+    let active_idx = section_idx(sidebar.active_section);
+
+    let make_section =
+        |idx: usize, id: &str, title: &str, icon: icons::Icon, items: &[DebugSidebarItem]| {
+            let scroll_offset = sidebar.scroll_offsets[idx];
+            let tree = debug_sidebar_section_to_tree_view(
+                items,
+                scroll_offset,
+                sidebar.has_focus && active_idx == idx,
+                sidebar.session_active,
+                id,
+            );
+            Section {
+                id: id.to_string(),
+                header: SectionHeader {
+                    icon: Some(QIcon::new(icon.nerd.to_string(), icon.fallback.to_string())),
+                    title: StyledText::plain(title.to_string()),
+                    badge: None,
+                    actions: Vec::new(),
+                    // Per validated pattern: chevrons hidden — sections
+                    // are not user-collapsible. Click on the title row
+                    // activates the section without any toggle.
+                    show_chevron: false,
+                },
+                body: SectionBody::Tree(tree),
+                aux: None,
+                // Equal share gives 25/25/25/25 by construction. The
+                // breakpoint-section-over-50% bug from the pre-MSV paint
+                // walk vanishes as a side-effect of the lift.
+                size: SectionSize::EqualShare,
+                collapsed: false,
+                min_size: None,
+                max_size: None,
+            }
+        };
+
+    let sections = vec![
+        make_section(
+            0,
+            "vars",
+            "VARIABLES",
+            icons::DBG_VARIABLES,
+            &sidebar.variables,
+        ),
+        make_section(1, "watch", "WATCH", icons::DBG_WATCH, &sidebar.watch),
+        make_section(
+            2,
+            "stack",
+            "CALL STACK",
+            icons::DBG_CALL_STACK,
+            &sidebar.frames,
+        ),
+        make_section(
+            3,
+            "bps",
+            "BREAKPOINTS",
+            icons::DBG_BREAKPOINTS,
+            &sidebar.breakpoints,
+        ),
+    ];
+
+    MultiSectionView {
+        id: WidgetId::new("debug-sidebar-msv"),
+        sections,
+        active_section: sidebar.has_focus.then_some(active_idx),
+        axis: MsvAxis::Vertical,
+        allow_resize: false,
+        allow_collapse: false,
+        scroll_mode: ScrollMode::PerSection,
+        has_focus: sidebar.has_focus,
+        panel_scroll: 0.0,
+    }
+}
+
 /// Adapt the engine-side `ExtSidebarData` into a `quadraui::TreeView`
 /// for the shared `draw_tree` primitive (#280).
 ///

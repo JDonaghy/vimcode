@@ -3195,6 +3195,19 @@ impl SimpleComponent for App {
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
+                    // Cache MSV layout + view for click (CLAUDE.md
+                    // "Paint↔click integration pattern"). Must happen
+                    // here — draw_debug_sidebar doesn't have `engine`.
+                    let msv_y = 2.0 * line_height;
+                    let msv_h = (h - msv_y).max(0.0);
+                    if msv_h > 0.0 {
+                        let view =
+                            render::debug_sidebar_to_multi_section_view(&screen.debug_sidebar);
+                        let bounds = quadraui::Rect::new(0.0, msv_y as f32, w as f32, msv_h as f32);
+                        let msv_layout = quadraui::gtk::gtk_msv_layout(&view, bounds, line_height);
+                        engine.dap_sidebar_msv_layout.replace(Some(msv_layout));
+                        engine.dap_sidebar_msv_view.replace(Some(view));
+                    }
                     draw_debug_sidebar(
                         cr,
                         &layout,
@@ -8995,36 +9008,16 @@ impl App {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
                 use crate::core::engine::DebugSidebarSection;
-                // Mirror the paint walk in `draw_debug_sidebar` exactly —
-                // working in pixel coordinates so the row math doesn't
-                // bake in any unit assumption that diverges between paint
-                // and click.
-                //
-                // Layout from `draw_debug_sidebar` (#281):
-                //   y ∈ [0,        line_height)        — panel header
-                //   y ∈ [line_height, 2*line_height)   — Run/Stop button
-                //   For each of the 4 sections, in order:
-                //     y ∈ [section_top, section_top+lh)        — title
-                //     y ∈ [section_top+lh, section_top+lh+sec_h_px) — items
-                //   where sec_h_px = visible_rows × line_height (chrome unit)
-                //
-                // Items inside each section are painted by
-                // `quadraui::gtk::draw_tree`, which uses **1.4 × lh** per
-                // non-header row (see `quadraui/src/gtk/tree.rs`). The
-                // click hit-test must therefore use 1.4 × lh per row,
-                // not 1.0 × lh.
+                // MSV-driven dispatch (#296, harness-gated re-do per
+                // the Session 346 course correction). Both paint and
+                // click ask `gtk_msv_layout` for one
+                // `MultiSectionViewLayout` from one
+                // `MultiSectionView` and one body rect — drift is
+                // impossible by construction. See
+                // `quadraui/CLAUDE.md` § Consumer patterns
+                // ("Debug-sidebar shape").
                 let lh = self.debug_sidebar_lh.get().max(1.0);
-                let item_h = (lh * 1.4).round();
                 let mut engine = self.engine.borrow_mut();
-
-                // Section heights (in chrome rows = `lh` units, matching
-                // the paint chrome's `cursor_y += visible_rows * line_height`).
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    let da_h = da.height() as f64;
-                    let content_px = (da_h - 6.0 * lh).max(0.0);
-                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                    engine.dap_sidebar_section_heights = [per_sec; 4];
-                }
 
                 engine.dap_sidebar_has_focus = true;
 
@@ -9040,98 +9033,70 @@ impl App {
                         engine.execute_command("debug");
                     }
                 } else {
-                    let sections = [
-                        (DebugSidebarSection::Variables, 0usize),
-                        (DebugSidebarSection::Watch, 1),
-                        (DebugSidebarSection::CallStack, 2),
-                        (DebugSidebarSection::Breakpoints, 3),
-                    ];
-                    let mut cursor_y: f64 = 2.0 * lh;
-                    for (section, sec_idx) in &sections {
-                        let sec_rows = engine.dap_sidebar_section_heights[*sec_idx] as f64;
-                        let title_top = cursor_y;
-                        let items_top = title_top + lh;
-                        let items_bot = items_top + sec_rows * lh;
-
-                        if y >= title_top && y < items_top {
-                            // Click on section title — activate.
-                            engine.dap_sidebar_section = *section;
-                            engine.dap_sidebar_selected = 0;
-                            break;
-                        } else if y >= items_top && y < items_bot {
-                            engine.dap_sidebar_section = *section;
-                            let item_count = engine.dap_sidebar_section_item_count(*section);
-
-                            // Scrollbar overlay: rightmost 6px of the items area.
-                            let da_w = self
-                                .debug_sidebar_da_ref
-                                .borrow()
-                                .as_ref()
-                                .map(|da| da.width() as f64)
-                                .unwrap_or(200.0);
-                            if click_x >= da_w - 6.0 && item_count > 0 {
-                                // Visible rows = chrome rows / 1.4 (since each
-                                // item paints at 1.4×lh).
-                                let visible_rows =
-                                    (sec_rows * lh / item_h).floor().max(1.0) as usize;
-                                if item_count > visible_rows {
-                                    let rel_y_pct = (y - items_top) / (items_bot - items_top);
-                                    let max_scroll = item_count.saturating_sub(visible_rows);
-                                    engine.dap_sidebar_scroll[*sec_idx] =
-                                        (rel_y_pct * max_scroll as f64) as usize;
-                                }
-                                break;
+                    // Read the EXACT layout + view paint cached this
+                    // frame. Click never re-derives — see CLAUDE.md
+                    // "Paint↔click integration pattern" (#296).
+                    let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
+                    let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
+                    if let (Some(view_layout), Some(view)) =
+                        (cached_layout.as_ref(), cached_view.as_ref())
+                    {
+                        let lx = click_x as f32;
+                        let ly = y as f32;
+                        let section_kind = |idx: usize| match idx {
+                            0 => DebugSidebarSection::Variables,
+                            1 => DebugSidebarSection::Watch,
+                            2 => DebugSidebarSection::CallStack,
+                            _ => DebugSidebarSection::Breakpoints,
+                        };
+                        match view_layout.hit_test(lx, ly) {
+                            quadraui::MultiSectionViewHit::Header { section, .. } => {
+                                engine.dap_sidebar_section = section_kind(section);
+                                engine.dap_sidebar_selected = 0;
                             }
-
-                            // Hit-test inside the items area using the
-                            // SAME row measure the paint side uses
-                            // (`quadraui::gtk::draw_tree` paints non-header
-                            // rows at `line_height * 1.4`).
-                            let theme = Theme::from_name(&engine.settings.colorscheme);
-                            let screen = build_screen_layout(&engine, &theme, &[], lh, 1.0, false);
-                            let sb = &screen.debug_sidebar;
-                            let items_for_section = match section {
-                                DebugSidebarSection::Variables => &sb.variables,
-                                DebugSidebarSection::Watch => &sb.watch,
-                                DebugSidebarSection::CallStack => &sb.frames,
-                                DebugSidebarSection::Breakpoints => &sb.breakpoints,
-                            };
-                            let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                            let tree = render::debug_sidebar_section_to_tree_view(
-                                items_for_section,
-                                scroll_off,
-                                sb.has_focus,
-                                sb.session_active,
-                                "click",
-                            );
-                            let viewport_h = (items_bot - items_top) as f32;
-                            let layout = tree.layout(1.0, viewport_h, |_| {
-                                quadraui::TreeRowMeasure::new(item_h as f32)
-                            });
-                            let rel_y = (y - items_top) as f32;
-                            let item_idx = if let quadraui::TreeViewHit::Row(idx) =
-                                layout.hit_test(0.0, rel_y)
-                            {
-                                let path = tree.rows[idx].path.clone();
-                                if let [item_idx_u16] = path.as_slice() {
-                                    if *item_idx_u16 != u16::MAX {
-                                        Some(*item_idx_u16 as usize)
-                                    } else {
-                                        None
+                            quadraui::MultiSectionViewHit::Body { section } => {
+                                engine.dap_sidebar_section = section_kind(section);
+                                let body_b = view_layout.sections[section].body_bounds;
+                                if let quadraui::SectionBody::Tree(ref tree) =
+                                    view.sections[section].body
+                                {
+                                    let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
+                                    if let quadraui::TreeViewHit::Row(idx) =
+                                        inner.hit_test(lx - body_b.x, ly - body_b.y)
+                                    {
+                                        let path = tree.rows[idx].path.clone();
+                                        if let [item_idx_u16] = path.as_slice() {
+                                            if *item_idx_u16 != u16::MAX {
+                                                engine.dap_sidebar_selected =
+                                                    *item_idx_u16 as usize;
+                                                engine.handle_debug_sidebar_key("Return", false);
+                                            }
+                                        }
                                     }
-                                } else {
-                                    None
                                 }
-                            } else {
-                                None
-                            };
-                            if let Some(item_idx) = item_idx {
-                                engine.dap_sidebar_selected = item_idx;
-                                engine.handle_debug_sidebar_key("Return", false);
                             }
-                            break;
+                            quadraui::MultiSectionViewHit::Scrollbar { section, .. } => {
+                                engine.dap_sidebar_section = section_kind(section);
+                                let sb = view_layout.sections[section]
+                                    .scrollbar_bounds
+                                    .expect("scrollbar hit implies bounds present");
+                                let body_b = view_layout.sections[section].body_bounds;
+                                if let quadraui::SectionBody::Tree(ref tree) =
+                                    view.sections[section].body
+                                {
+                                    let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
+                                    let visible_rows = inner.visible_rows.len().max(1);
+                                    let total = tree.rows.len();
+                                    if total > visible_rows && sb.height > 0.0 {
+                                        let rel_pct = ((ly - sb.y) / sb.height).clamp(0.0, 1.0);
+                                        let max_scroll = total.saturating_sub(visible_rows);
+                                        engine.dap_sidebar_scroll[section] =
+                                            (rel_pct * max_scroll as f32).round() as usize;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        cursor_y = items_bot;
                     }
                 }
                 drop(engine);
@@ -9159,13 +9124,23 @@ impl App {
                 // was re-intercepted at `keys.rs:192` because of the
                 // `dap_sidebar_has_focus` check.)
                 // Compute section heights for ensure_visible. Same
-                // line_height the paint side computed.
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    let lh = self.debug_sidebar_lh.get().max(1.0);
-                    let da_h = da.height() as f64;
-                    let content_px = (da_h - 6.0 * lh).max(0.0);
-                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                    engine.dap_sidebar_section_heights = [per_sec; 4];
+                // Update section heights from cached MSV layout so
+                // ensure_visible / PageUp / PageDown use actual
+                // visible row counts, not the old lh-unit formula.
+                let lh = self.debug_sidebar_lh.get().max(1.0);
+                let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
+                let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
+                if let (Some(layout), Some(view)) = (cached_layout.as_ref(), cached_view.as_ref()) {
+                    for (i, sec) in layout.sections.iter().enumerate() {
+                        if i < 4 {
+                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[i].body {
+                                let inner =
+                                    quadraui::gtk::gtk_tree_layout(tree, sec.body_bounds, lh);
+                                engine.dap_sidebar_section_heights[i] =
+                                    inner.visible_rows.len() as u16;
+                            }
+                        }
+                    }
                 }
                 let mapped = map_gtk_key_name(key_name.as_str());
                 engine.handle_debug_sidebar_key(mapped, ctrl);
@@ -9179,22 +9154,34 @@ impl App {
             }
             Msg::DebugSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
-                // Use the published draw-closure line_height — see
-                // `DebugSidebarClick`'s comment.
                 let lh = self.debug_sidebar_lh.get().max(1.0);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    let da_h = da.height() as f64;
-                    let content_px = (da_h - 6.0 * lh).max(0.0);
-                    let per_sec = (content_px / 4.0 / lh).floor() as u16;
-                    engine.dap_sidebar_section_heights = [per_sec; 4];
-                }
-                // Scroll the active section.
+                // Use the cached MSV layout to get visible_rows
+                // from the tree layout — same source of truth as
+                // paint + click (#296).
                 let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
                 let sec = engine.dap_sidebar_section;
                 let idx = Engine::dap_sidebar_section_index(sec);
                 let item_count = engine.dap_sidebar_section_item_count(sec);
-                let height = engine.dap_sidebar_section_heights[idx] as usize;
-                let max_scroll = item_count.saturating_sub(height);
+                let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
+                let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
+                let visible_rows = if let (Some(layout), Some(view)) =
+                    (cached_layout.as_ref(), cached_view.as_ref())
+                {
+                    if idx < layout.sections.len() {
+                        let body_b = layout.sections[idx].body_bounds;
+                        if let quadraui::SectionBody::Tree(ref tree) = view.sections[idx].body {
+                            let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
+                            inner.visible_rows.len()
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    }
+                } else {
+                    engine.dap_sidebar_section_heights[idx] as usize
+                };
+                let max_scroll = item_count.saturating_sub(visible_rows.max(1));
                 if dy > 0.0 {
                     engine.dap_sidebar_scroll[idx] =
                         (engine.dap_sidebar_scroll[idx] + scroll_amount).min(max_scroll);
@@ -9659,11 +9646,8 @@ impl App {
                         // used — paint and click see one layout (#293).
                         let body_height = engine.ext_sidebar_body_height.get().max(1.0) as f64;
                         let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, body_height as f32);
-                        let view_layout = quadraui::gtk::gtk_msv_layout(
-                            &view,
-                            body_bounds,
-                            line_height,
-                        );
+                        let view_layout =
+                            quadraui::gtk::gtk_msv_layout(&view, body_bounds, line_height);
                         let rel_y = (y_click - chrome_h) as f32;
                         match view_layout.hit_test(0.0, rel_y) {
                             quadraui::MultiSectionViewHit::Header { section, .. } => {

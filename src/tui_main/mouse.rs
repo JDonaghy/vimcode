@@ -1263,37 +1263,38 @@ pub(super) fn handle_mouse(
                             (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
                     }
                 } else if sidebar.active_panel == TuiPanel::Debug {
-                    use crate::core::engine::DebugSidebarSection;
-                    // Determine which section the mouse is over.
-                    let menu_offset = if engine.menu_bar_visible { 1u16 } else { 0 };
-                    let sidebar_row = row.saturating_sub(menu_offset);
-                    let sections = [
-                        (DebugSidebarSection::Variables, 0usize),
-                        (DebugSidebarSection::Watch, 1),
-                        (DebugSidebarSection::CallStack, 2),
-                        (DebugSidebarSection::Breakpoints, 3),
-                    ];
-                    let mut cur_row: u16 = 2;
-                    let mut target_idx: Option<usize> = None;
-                    for (_section, sec_idx) in &sections {
-                        let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
-                        let section_end = cur_row + 1 + sec_height; // header + content
-                        if sidebar_row >= cur_row && sidebar_row < section_end {
-                            target_idx = Some(*sec_idx);
-                            break;
-                        }
-                        cur_row = section_end;
-                    }
-                    if let Some(sec_idx) = target_idx {
-                        let item_count = engine.dap_sidebar_section_item_count(sections[sec_idx].0);
-                        let height = engine.dap_sidebar_section_heights[sec_idx] as usize;
-                        let max_scroll = item_count.saturating_sub(height);
-                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                            engine.dap_sidebar_scroll[sec_idx] =
-                                engine.dap_sidebar_scroll[sec_idx].saturating_sub(3);
-                        } else {
-                            engine.dap_sidebar_scroll[sec_idx] =
-                                (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
+                    // Use the cached MSV layout to determine which
+                    // section the scroll landed in — same source of
+                    // truth as paint + click (#296).
+                    let layout_opt = engine.dap_sidebar_msv_layout.borrow().clone();
+                    if let Some(layout) = layout_opt.as_ref() {
+                        let lx = col as f32;
+                        let ly = row as f32;
+                        let section_idx = match layout.hit_test(lx, ly) {
+                            quadraui::MultiSectionViewHit::Header { section, .. }
+                            | quadraui::MultiSectionViewHit::Body { section }
+                            | quadraui::MultiSectionViewHit::Scrollbar { section, .. } => {
+                                Some(section)
+                            }
+                            _ => None,
+                        };
+                        if let Some(sec_idx) = section_idx {
+                            let section_kind = match sec_idx {
+                                0 => crate::core::engine::DebugSidebarSection::Variables,
+                                1 => crate::core::engine::DebugSidebarSection::Watch,
+                                2 => crate::core::engine::DebugSidebarSection::CallStack,
+                                _ => crate::core::engine::DebugSidebarSection::Breakpoints,
+                            };
+                            let item_count = engine.dap_sidebar_section_item_count(section_kind);
+                            let visible_rows = layout.sections[sec_idx].body_bounds.height as usize;
+                            let max_scroll = item_count.saturating_sub(visible_rows);
+                            if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                                engine.dap_sidebar_scroll[sec_idx] =
+                                    engine.dap_sidebar_scroll[sec_idx].saturating_sub(3);
+                            } else {
+                                engine.dap_sidebar_scroll[sec_idx] =
+                                    (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
+                            }
                         }
                     }
                 } else if sidebar.active_panel == TuiPanel::Settings {
@@ -1841,7 +1842,7 @@ pub(super) fn handle_mouse(
     if ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return sidebar_width;
     }
-
+    // DEBUG: trace every left-click
     // ── Click on editor hover popup link → execute command or copy URL ─────
     if mouse_on_editor_hover && !editor_hover_link_rects.is_empty() {
         for &(lx, ly, lw, _lh, ref url) in editor_hover_link_rects {
@@ -2209,7 +2210,7 @@ pub(super) fn handle_mouse(
             let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
             let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
             let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
-            if row >= panel_y && row < panel_end {
+            if col >= editor_left && row >= panel_y && row < panel_end {
                 let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
                 let sb_col = term_width.saturating_sub(1);
                 let total = engine.dap_output_lines.len();
@@ -2512,7 +2513,6 @@ pub(super) fn handle_mouse(
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         let sidebar_row = row.saturating_sub(menu_rows);
-
         // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
         if sidebar.ext_panel_name.is_some() {
             sidebar.has_focus = true;
@@ -2686,120 +2686,115 @@ pub(super) fn handle_mouse(
                     engine.execute_command("debug");
                 }
             } else {
-                // Walk sections using fixed-allocation layout:
-                // row 2+ = [section_header(1) + content(height)]×4
-                let sections = [
-                    (DebugSidebarSection::Variables, 0usize),
-                    (DebugSidebarSection::Watch, 1),
-                    (DebugSidebarSection::CallStack, 2),
-                    (DebugSidebarSection::Breakpoints, 3),
-                ];
-                let mut cur_row: u16 = 2;
-                for (section, sec_idx) in &sections {
-                    let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
-                    let section_header_row = cur_row;
-                    let items_start = cur_row + 1;
-                    let items_end = items_start + sec_height;
-
-                    if sidebar_row == section_header_row {
-                        engine.dap_sidebar_section = *section;
-                        engine.dap_sidebar_selected = 0;
-                        break;
-                    } else if sidebar_row >= items_start && sidebar_row < items_end {
-                        let item_count = engine.dap_sidebar_section_item_count(*section);
-                        let height = sec_height as usize;
-                        let sb_col = ab_width + sidebar_width - 1;
-                        // Scrollbar click: rightmost column when items overflow.
-                        if col == sb_col && item_count > height && height > 0 {
-                            engine.dap_sidebar_section = *section;
-                            // Phase B.4 Stage 5c: shared drag-state.
-                            // Widget id encodes section index so the drag
-                            // handler can route the offset to the right
-                            // `dap_sidebar_scroll[idx]`. apply_scrollbar_drag
-                            // computes the click-time offset using the same
-                            // thumb-aware math as subsequent drags.
-                            let track_start = (items_start + menu_rows) as f32;
+                // Read the EXACT layout + view paint cached this
+                // frame. Click never re-derives — see CLAUDE.md
+                // "Paint↔click integration pattern" (#296).
+                let layout_opt = engine.dap_sidebar_msv_layout.borrow().clone();
+                let view_opt = engine.dap_sidebar_msv_view.borrow().clone();
+                if let (Some(layout), Some(view)) = (layout_opt.as_ref(), view_opt.as_ref()) {
+                    let lx = col as f32;
+                    let ly = row as f32;
+                    let section_kind = |idx: usize| match idx {
+                        0 => DebugSidebarSection::Variables,
+                        1 => DebugSidebarSection::Watch,
+                        2 => DebugSidebarSection::CallStack,
+                        _ => DebugSidebarSection::Breakpoints,
+                    };
+                    match layout.hit_test(lx, ly) {
+                        quadraui::MultiSectionViewHit::Header { section, .. } => {
+                            engine.dap_sidebar_section = section_kind(section);
+                            engine.dap_sidebar_selected = 0;
+                        }
+                        quadraui::MultiSectionViewHit::Body { section } => {
+                            engine.dap_sidebar_section = section_kind(section);
+                            let body_b = layout.sections[section].body_bounds;
+                            if let quadraui::SectionBody::Tree(ref tree) =
+                                view.sections[section].body
+                            {
+                                let body_rect = ratatui::layout::Rect::new(
+                                    body_b.x as u16,
+                                    body_b.y as u16,
+                                    body_b.width as u16,
+                                    body_b.height as u16,
+                                );
+                                let inner = quadraui::tui::tui_tree_layout(tree, body_rect);
+                                if let quadraui::TreeViewHit::Row(row_idx) =
+                                    inner.hit_test(lx - body_b.x, ly - body_b.y)
+                                {
+                                    let path = tree.rows[row_idx].path.clone();
+                                    if let [item_idx_u16] = path.as_slice() {
+                                        if *item_idx_u16 != u16::MAX {
+                                            engine.dap_sidebar_selected = *item_idx_u16 as usize;
+                                            engine.handle_debug_sidebar_key("Return", false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        quadraui::MultiSectionViewHit::Scrollbar {
+                            section,
+                            kind: quadraui::ScrollbarHit::Thumb,
+                        } => {
+                            engine.dap_sidebar_section = section_kind(section);
+                            let sb = layout.sections[section]
+                                .scrollbar_bounds
+                                .expect("scrollbar hit implies bounds present");
+                            let body_b = layout.sections[section].body_bounds;
+                            let item_count =
+                                engine.dap_sidebar_section_item_count(section_kind(section));
+                            let visible_rows = body_b.height as usize;
                             let grab_offset = scrollbar_grab_offset(
-                                row as f32,
-                                track_start,
-                                sec_height as f32,
-                                sec_height as usize,
+                                ly,
+                                sb.y,
+                                sb.height,
+                                visible_rows,
                                 item_count,
-                                engine.dap_sidebar_scroll[*sec_idx],
+                                engine.dap_sidebar_scroll[section],
                             );
                             drag_state.begin(quadraui::DragTarget::ScrollbarY {
                                 widget: quadraui::WidgetId::new(format!(
                                     "tui:debug_sidebar:{}",
-                                    *sec_idx
+                                    section
                                 )),
-                                track_start,
-                                track_length: sec_height as f32,
-                                visible_rows: sec_height as usize,
+                                track_start: sb.y,
+                                track_length: sb.height,
+                                visible_rows,
                                 total_items: item_count,
                                 grab_offset,
                             });
                             apply_scrollbar_drag(
                                 drag_state,
-                                quadraui::Point {
-                                    x: col as f32,
-                                    y: row as f32,
-                                },
+                                quadraui::Point { x: lx, y: ly },
                                 engine,
                                 sidebar,
                                 debug_output_scroll,
                             );
-                        } else {
-                            // Hit-test through `TreeViewLayout::hit_test()` so
-                            // the click path agrees with the paint path by
-                            // construction (#281, mirrors the #280 / #210
-                            // pattern). For flat 1-cell rows the result is
-                            // arithmetically identical to
-                            // `scroll_off + (sidebar_row - items_start)`,
-                            // but routing through the primitive keeps the
-                            // shape future-proof against scroll / wrapping
-                            // changes.
-                            let theme = Theme::onedark();
-                            let screen =
-                                render::build_screen_layout(engine, &theme, &[], 1.0, 1.0, true);
-                            let sb = &screen.debug_sidebar;
-                            let items_for_section = match section {
-                                DebugSidebarSection::Variables => &sb.variables,
-                                DebugSidebarSection::Watch => &sb.watch,
-                                DebugSidebarSection::CallStack => &sb.frames,
-                                DebugSidebarSection::Breakpoints => &sb.breakpoints,
-                            };
-                            let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                            let tree = render::debug_sidebar_section_to_tree_view(
-                                items_for_section,
-                                scroll_off,
-                                sb.has_focus,
-                                sb.session_active,
-                                "click",
-                            );
-                            let layout =
-                                tree.layout(sidebar_width as f32, sec_height as f32, |_| {
-                                    quadraui::TreeRowMeasure::new(1.0)
-                                });
-                            // Always activate the clicked section so
-                            // keyboard nav (Tab, j/k) operates on it
-                            // even when the user clicked an empty-state
-                            // placeholder row. (#281 smoke fix.)
-                            engine.dap_sidebar_section = *section;
-                            let rel_y = (sidebar_row - items_start) as f32;
-                            if let quadraui::TreeViewHit::Row(row_idx) = layout.hit_test(0.0, rel_y)
-                            {
-                                let path = tree.rows[row_idx].path.clone();
-                                if let [item_idx_u16] = path.as_slice() {
-                                    if *item_idx_u16 != u16::MAX {
-                                        engine.dap_sidebar_selected = *item_idx_u16 as usize;
-                                        engine.handle_debug_sidebar_key("Return", false);
-                                    }
-                                }
-                            }
                         }
-                        break;
+                        quadraui::MultiSectionViewHit::Scrollbar {
+                            section,
+                            kind: quadraui::ScrollbarHit::TrackBefore,
+                        } => {
+                            engine.dap_sidebar_section = section_kind(section);
+                            let visible_rows = layout.sections[section].body_bounds.height as usize;
+                            let cur = engine.dap_sidebar_scroll[section];
+                            engine.dap_sidebar_scroll[section] =
+                                cur.saturating_sub(visible_rows.max(1));
+                        }
+                        quadraui::MultiSectionViewHit::Scrollbar {
+                            section,
+                            kind: quadraui::ScrollbarHit::TrackAfter,
+                        } => {
+                            engine.dap_sidebar_section = section_kind(section);
+                            let visible_rows = layout.sections[section].body_bounds.height as usize;
+                            let item_count =
+                                engine.dap_sidebar_section_item_count(section_kind(section));
+                            let max_scroll = item_count.saturating_sub(visible_rows);
+                            let cur = engine.dap_sidebar_scroll[section];
+                            engine.dap_sidebar_scroll[section] =
+                                (cur + visible_rows.max(1)).min(max_scroll);
+                        }
+                        _ => {}
                     }
-                    cur_row = items_end;
                 }
             }
             return sidebar_width;

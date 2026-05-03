@@ -2808,6 +2808,17 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
+    /// The exact `MultiSectionViewLayout` paint produced this frame.
+    /// Click reads it verbatim via `hit_test()` — never re-derives.
+    /// See CLAUDE.md "Paint↔click integration pattern" for rationale:
+    /// re-computing layout in click requires reconstructing the area
+    /// rect, which drifts ±1 cell/pixel from paint's actual rect and
+    /// surfaces as section-boundary shifts under EqualShare (#296).
+    pub dap_sidebar_msv_layout: std::cell::RefCell<Option<quadraui::MultiSectionViewLayout>>,
+    /// The `MultiSectionView` descriptor that produced the cached
+    /// layout above. Click needs it to drill into section bodies
+    /// (tree hit_test) and to read section scroll state.
+    pub dap_sidebar_msv_view: std::cell::RefCell<Option<quadraui::MultiSectionView>>,
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -3474,6 +3485,8 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
+            dap_sidebar_msv_layout: std::cell::RefCell::new(None),
+            dap_sidebar_msv_view: std::cell::RefCell::new(None),
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),
