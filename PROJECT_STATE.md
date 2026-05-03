@@ -1,42 +1,29 @@
 # VimCode Project State
 
-**Last updated:** Apr 30, 2026 (Session 346 — **harness-first course correction shipped end-to-end + quadraui extracted to a standalone repo**.
+**Last updated:** May 2, 2026 (Session 347 — **#166 diff-pane drift fix + #296 Debug sidebar MSV migration shipped**).
 
-This session pivoted away from continued #296 Debug-sidebar smoke iteration (4 sessions / 8 commits had failed to converge) and replaced it with a structural fix. Five PRs landed in vimcode:
+Three items landed on develop via Path A:
 
-- [#297](https://github.com/JDonaghy/vimcode/pull/297) `cell_quantum` integer-snap on `LayoutMetrics` — TUI MSV section bounds align to cell grid; paint and hit_test agree by construction. +2 regression tests in the primitive.
-- [#298](https://github.com/JDonaghy/vimcode/pull/298) TUI MSV paint↔click round-trip harness — 4 tests; empirically verified to catch the bug class.
-- [#299](https://github.com/JDonaghy/vimcode/pull/299) TUI TreeView harness — 4 tests; catches scroll_offset drift.
-- [#300](https://github.com/JDonaghy/vimcode/pull/300) Extracted quadraui to its own repo at https://github.com/JDonaghy/quadraui. Workspace contains `quadraui/`, `kubeui-core/`, `kubeui/`, `kubeui-gtk/`. Vimcode now a single-crate package; quadraui dep is `path = "../quadraui/quadraui"`. Vimcode CI temporarily disabled (`.github/workflows/*.yml.disabled`) pending sibling-clone resolution.
-- 3 doc-only commits direct to develop: "Working with the quadraui dep" + "Migration prerequisites" sections in CLAUDE.md, `/plan-next` skill updated to resolve cross-repo `blocked`-label prereqs.
+1. **[#166](https://github.com/JDonaghy/vimcode/issues/166) diff-pane alignment** (`b29a218`). Side-by-side diff panes drifted out of alignment past the first hunk because `sync_scroll_binds` set `partner.scroll_top` to a buffer line that the partner's render resolved at a different aligned-row index. Fix: `view.aligned_top: Option<usize>` pins both panes to one shared aligned-row index; `clear_all_diff_alignment()` helper centralises the teardown. 2 regression tests.
 
-Issue tracking now spans both repos: 8 issues in JDonaghy/quadraui (consumer migrations #1/#2, GTK harnesses #3/#4, doc #5, MenuBar rasterisers #6, SearchPanel primitive #7, orphan-primitive audit #8). 4 vimcode tickets gained the `blocked` label + cross-repo prereq links: [#296](https://github.com/JDonaghy/vimcode/issues/296) (Debug→MSV), [#282](https://github.com/JDonaghy/vimcode/issues/282) (SC→MSV), [#301](https://github.com/JDonaghy/vimcode/issues/301) (TUI menu bar), [#302](https://github.com/JDonaghy/vimcode/issues/302) (search panel). The `/plan-next` skill in both repos resolves these prereqs and reports newly-unblocked tickets when their quadraui dependencies close.
+2. **GTK rename catch-up** (`6d70dba`). `multi_section_view_layout` → `gtk_msv_layout` (quadraui renamed the helper during repo extraction; vimcode lagged behind, breaking GTK build).
 
-Vimcode at 1950 lib + integration tests passing on develop@8cba623. Quadraui at 302 tests passing on its main. **Per the new Migration prerequisites rule**, no further consumer migrations land in vimcode until both backends have rasterisers + harnesses + a validated consumer pattern in quadraui.
+3. **[#296](https://github.com/JDonaghy/vimcode/issues/296) Debug sidebar → MultiSectionView** (`285916b`). Adopted the validated consumer pattern from [quadraui#1](https://github.com/JDonaghy/quadraui/issues/1). Both TUI + GTK paint through `draw_multi_section_view`; click/scroll read the cached `MultiSectionViewLayout` verbatim (never re-derive). New `render::debug_sidebar_to_multi_section_view` adapter: 4 `EqualShare` sections, `PerSection` scroll. Also fixed pre-existing TUI bug: debug-output panel click handler missing `col >= editor_left` check, silently eating sidebar clicks in overlapping row ranges. Net −139 LOC.
 
-**Lessons durably captured** (PLAN.md "🧭 Course correction"; quadraui CLAUDE.md "Lessons captured" pending [quadraui#5](https://github.com/JDonaghy/quadraui/issues/5)):
-- Paint/click drift across coordinate systems IS the structural bug class quadraui exists to eliminate.
-- Per-consumer Cell-on-state fields perpetuate the bug — they don't fix it.
-- Theory-only iteration without running the app does not converge.
-- Harness coverage IS the structural enforcement; harness is the gate for any consumer migration.
+**Key lesson codified** in CLAUDE.md "Paint↔click integration pattern": click NEVER re-derives layout; paint caches it, click reads verbatim. This governs all future quadraui migrations. Captured in memory (`feedback_cache_paint_layout.md`).
 
-Prior session 344 below.
+Vimcode at 1952 lib + integration tests passing on develop@285916b. Both TUI + GTK build + clippy clean.
 
-Prior session (344): **#293 `MultiSectionView` primitive shipped end-to-end via Path A** on `issue-293-multi-section-view`, ~9 commits. New `quadraui::MultiSectionView` primitive (vertically-stacked, individually-sized, collapsible sections with composable bodies — `TreeView`/`ListView`/`Form`/`MessageList`/`Text`/`Empty`/`Custom`); both TUI + GTK rasterisers; D-003 entry in `quadraui/docs/DECISIONS.md` capturing 7 design decisions (body composition, scroll model, resize policy, axis, min/max enforcement, header hits, empty-state). First migration: Extensions sidebar onto `WholePanel` mode with cached `body_height` + `max_panel_scroll` on engine for paint/click parity. Smoke wave fixed 5 distinct bugs (section overlap, panel-scrollbar invisible, off-by-N click after scroll, scrollbar interaction). 19 quadraui unit tests, 1950 vimcode lib tests, all passing. **Two follow-ups filed**: #295 TUI scrollbar drag (deferred — TUI mouse handler early-returns on non-Down events), #296 Debug sidebar migration onto MSV (became the catalyst for Session 346's course correction after the smoke wave failed). Issue [#293](https://github.com/JDonaghy/vimcode/issues/293) closed; horizontal-axis tracker [#294](https://github.com/JDonaghy/vimcode/issues/294) and SC migration [#282](https://github.com/JDonaghy/vimcode/issues/282) remain open (now `blocked` per Session 346). Prior session 343 below.
-
-Prior session (343 — Apr 30): **TUI/GTK paint duplication arc DONE on develop@7f3498c**. Six items landed via Path A: #283 (TUI gutter), #285 (GTK Completions), #286 (GTK Ctrl-dismiss), #280 (Extension panel TreeView lift), #281 (Debug sidebar TreeView lift, 8 commits incl. paint/click parity fixes), plus doc reconciliation for #214. Phase C umbrella #275 closed. Cross-backend coverage table is fully ✅✅ on both backends. Eight follow-ups filed: #287 / #288 / #290 / #291 (small UX), #289 (xterm.js parking), #292 (GTK F-keys when debug sidebar focused — pre-existing GTK menu-bar interception), and **#293 — MultiSectionView primitive** (architectural; queue this before B.6 Win-GUI rebuild). Prior session 342 below.
-
-Prior session (342 — Apr 29): **Phase C Stage 1 ([#276](https://github.com/JDonaghy/vimcode/pull/284), merged) shipped end-to-end**: `quadraui::Editor` primitive + dual TUI/GTK rasterisers landed in 5 commits on `issue-276-editor-primitive`. **Stage 1A** (`3fcc7fb`) lifted the supporting types (`DiagnosticSeverity` / `GitLineStatus` / `DiffLine` / `CursorShape` / `SelectionKind` / `CursorPos` / `EditorCursor` / `EditorSelection` / `Style` / `StyledSpan` / `DiagnosticMark` / `SpellMark`) + 29 new `Theme` fields + `q_theme()` chrome+editor split. **Stage 1B** (`ef45610`) added the `Editor` + `EditorLine` data structs (3 unit tests). **Stage 1C** (`c985d58`) lifted the TUI rasteriser via `to_q_editor` boundary adapter; `render_window` collapsed ~470 → ~25 LOC. **Stage 1D** (`5b23718`) lifted the GTK rasteriser; `draw_window` collapsed ~720 → ~25 LOC. **fmt fixup** (`8c8cd24`). Net **−1456 LOC** of vimcode-private paint code; **+1972 LOC** of shared paint in quadraui. quadraui: 290 tests pass (was 287, +3 editor); vimcode `--no-default-features` + clippy clean (1950 lib tests + integration); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean. Smoke-test follow-up filed: [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI LSP-diagnostic-dot column collision with breakpoint marker (verbatim-port behaviour). Issue [#276](https://github.com/JDonaghy/vimcode/issues/276) closed.
-
-Prior session (341 — Apr 29): Phase C stages 2–4 shipped end-to-end. [#277](https://github.com/JDonaghy/vimcode/issues/277) (`fbbc85f`/`b952c6a`/`d3abb17`/`2cc2ad9`) lifted the `Scrollbar` primitive + dual rasterisers, fixed visible-track q_theme mapping, page-jump on track click, GTK native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above per-window status line. [#278](https://github.com/JDonaghy/vimcode/issues/278) (`fd08db0`) lifted `quadraui::{tui,gtk}::draw_settings_chrome` helpers. [#279](https://github.com/JDonaghy/vimcode/issues/279) (`8e55720`) lifted the `MessageList` primitive + dual rasterisers. Three deferred chrome lifts filed: [#280](https://github.com/JDonaghy/vimcode/issues/280), [#281](https://github.com/JDonaghy/vimcode/issues/281), [#282](https://github.com/JDonaghy/vimcode/issues/282).
-
-Prior session (340 — Apr 29): #266 + #267 + #270 + #271 all shipped end-to-end. Runner-crate vision real on TUI + GTK; last find_replace primitive gap closed. #266 (`779f6e8`): rich_text_popup + completions lifted. #267 (`8b64217`): `Backend::draw_dialog` + single-Pango-layout refactor. #270 (`b256993` + `f6b5a17`): `GtkBackend` lifted + `quadraui::gtk::run<A: AppLogic>(app)` runner. #271 (`91e89e9`): `FindReplacePanel` lifted; `Theme.accent_bg` added.
-
-**Next priority**: With `MultiSectionView` shipped + first consumer (Extensions) live, the structural fix for the #281 paint/click drift bug class is in place. Remaining migrations onto MSV: **#296 Debug sidebar** (4 sections, all `EqualShare`, motivates fixing the breakpoint > 50% bug visually) and **#282 Source Control** (5 sections incl. `Fixed(3)` aux=Input commit message). After those land, **B.6 (Win-GUI rebuild)** is unblocked and can consume MSV from day one rather than re-cloning the section-walk drift class.
+**Next priority**: [#282](https://github.com/JDonaghy/vimcode/issues/282) SC→MSV (blocked label removed — quadraui#2 + #3 both closed). Then Win-GUI rebuild (B.6).
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 339 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 346 are in **SESSION_HISTORY.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
+
+Prior session (346 — Apr 30): Harness-first course correction shipped. Pivoted from failed #296 attempts to structural fix: #297 cell_quantum, #298/#299 harnesses, #300 quadraui extracted to own repo. 4 vimcode issues gained `blocked` label with cross-repo prereq links.
+
+> Sessions 344 and earlier in **SESSION_HISTORY.md**.
+
 
 ---
 
@@ -64,16 +51,12 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post #281, 2026-04-29):** **TUI/GTK paint duplication is
+**Status (post #296, 2026-05-02):** **TUI/GTK paint duplication is
 done.** Every entry in the cross-backend coverage table below is ✅
-on both backends. Editor viewport lifted (#276), GTK `Completions`
-(#285), editor hover popup (#214 + #266 — `RichTextPopup`),
-extension panel (#280), source control panel
-(`render::source_control_to_tree_view` + `Backend::draw_tree`),
-debug sidebar (#281 — four `TreeView` instances, one per section).
-TUI chrome 100% on quadraui; GTK chrome 100%. **No paint
-duplication remains.** Smaller residual convergence work
-(#210/#211/#288-style hit-test/click items, ~hundreds of LOC) plus
+on both backends. Debug sidebar migrated to `MultiSectionView`
+(#296) — both paint and click consume one cached layout per frame.
+**No bespoke section-walk paint code remains.** Residual convergence
+work (#210/#211/#288-style hit-test/click items) plus
 intrinsic-to-surface divergences (Cairo painter order vs ratatui
 cell coalescence) remain but are tracked separately.
 
@@ -103,7 +86,7 @@ cell coalescence) remain but are tracked separately.
 | AI sidebar message history | `MessageList` | ✅ | ✅ | #279, `8e55720` |
 | Editor viewport (text + gutter + cursor + selection + diagnostics) | `Editor` | ✅ | ✅ | #276, `5b23718`+ (Phase C Stage 1) |
 | Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
-| Debug sidebar (variables tree, breakpoints, watch) | `TreeView` × 4 (one per section) | ✅ | ✅ | #281, `f3d78d6`. Adapter `render::debug_sidebar_section_to_tree_view` builds one `TreeView` per section. Click via `TreeViewLayout::hit_test()` on both backends. |
+| Debug sidebar (variables tree, breakpoints, watch) | `MultiSectionView` (4 × `TreeView`) | ✅ | ✅ | #296, `285916b`. Adapter `render::debug_sidebar_to_multi_section_view`. Paint caches layout; click reads verbatim. |
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):

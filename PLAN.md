@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-04-30 (Session 346 — quadraui extracted to https://github.com/JDonaghy/quadraui. The four directories `quadraui/`, `kubeui-core/`, `kubeui/`, `kubeui-gtk/` no longer live in vimcode; the workspace member list and the quadraui dep path were updated accordingly. Steps 1–5 of the harness-first course correction are done (#297 cell_quantum, #298 TUI MSV harness, #299 TUI TreeView harness landed, then extraction). Steps 6–7 (re-do #296 against the harness, then migrate SC #282) happen in the new repo. Historical references to `quadraui/` paths below now point at the new repo's URLs; in-line code references like `quadraui/src/...` are kept as historical context.)
+> **Last updated:** 2026-05-02 (Session 347 — #296 Debug→MSV landed via harness-gated re-do. Step 6 ✅. Step 7 (#282 SC→MSV) next; quadraui#2 closed, ready to adopt.)
 
 ---
 
@@ -52,10 +52,10 @@ extracted quadraui repo and are tracked as issues there.
    sibling: `quadraui = { path = "../quadraui/quadraui", features = ["tui"] }`.
    Vimcode CI temporarily disabled (`.github/workflows/*.yml.disabled`)
    pending sibling-clone resolution.
-6. ⏳ **Re-do #296 in quadraui** — tracked as
-   [JDonaghy/quadraui#1](https://github.com/JDonaghy/quadraui/issues/1).
-   Vimcode-side adoption tracked here at [#296](https://github.com/JDonaghy/vimcode/issues/296)
-   (label: `blocked`). Will pick up automatically when quadraui#1 closes.
+6. ✅ **Re-do #296 with harness gating** — quadraui#1 closed (consumer
+   pattern validated). Vimcode-side adoption landed as `285916b` (Session
+   347). Both backends paint + click through cached MSV layout. "Paint↔click
+   integration pattern" codified in CLAUDE.md. Issue #296 closed.
 7. ⏳ **Migrate SC (#282)** — tracked as
    [JDonaghy/quadraui#2](https://github.com/JDonaghy/quadraui/issues/2).
    Vimcode-side adoption tracked at [#282](https://github.com/JDonaghy/vimcode/issues/282)
