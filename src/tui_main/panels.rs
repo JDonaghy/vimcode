@@ -3179,50 +3179,34 @@ pub(super) fn render_debug_sidebar(
     if area.height == 0 {
         return;
     }
-    let hdr_fg = rc(theme.status_fg);
-    let hdr_bg = rc(theme.status_bg);
 
     // Build minimal screen layout to get debug_sidebar data.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
     let sidebar = &screen.debug_sidebar;
 
-    // ── Chrome rows (panel-specific): header + Run/Stop button. ──
-    {
-        let buf = frame.buffer_mut();
-        let cfg_name = engine
-            .dap_launch_configs
-            .get(engine.dap_selected_launch_config)
-            .map(|c| c.name.as_str())
-            .unwrap_or("no config");
-        let header_text = format!("  \u{f188} DEBUG  |  {cfg_name}");
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-        }
-        for (i, ch) in header_text.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-        }
+    // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──
+    let (title_bar, action_bar) = render::debug_sidebar_chrome_to_status_bars(sidebar, theme);
+    let q_theme = super::quadraui_tui::q_theme(theme);
 
-        if area.height < 2 {
-            return;
-        }
+    let title_rect = quadraui::Rect::new(area.x as f32, area.y as f32, area.width as f32, 1.0);
+    backend.set_current_theme(q_theme);
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        let _ = b.draw_status_bar(title_rect, &title_bar);
+    });
 
-        let btn_y = area.y + 1;
-        let (btn_label, btn_icon_fg) =
-            if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                ("\u{f04b}  Continue", rc(theme.git_added))
-            } else if engine.dap_session_active {
-                ("\u{f04d}  Stop", rc(theme.diagnostic_error))
-            } else {
-                ("\u{f04b}  Start Debugging", rc(theme.git_added))
-            };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, btn_y, ' ', hdr_fg, hdr_bg);
-        }
-        for (i, ch) in btn_label.chars().enumerate().take(area.width as usize) {
-            let fg = if i == 0 { btn_icon_fg } else { hdr_fg };
-            set_cell(buf, area.x + i as u16, btn_y, ch, fg, hdr_bg);
-        }
+    if area.height < 2 {
+        return;
     }
+
+    let action_rect =
+        quadraui::Rect::new(area.x as f32, (area.y + 1) as f32, area.width as f32, 1.0);
+    backend.set_current_theme(q_theme);
+    let hits = backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_status_bar(action_rect, &action_bar)
+    });
+    engine.dap_sidebar_action_hits.replace(hits);
 
     // ── MSV body (the four sections). ──
     // Paint caches the layout + view; click reads them verbatim.

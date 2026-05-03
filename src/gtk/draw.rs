@@ -2362,52 +2362,31 @@ pub(super) fn draw_debug_sidebar(
     h: f64,
     line_height: f64,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
-) {
+) -> Vec<quadraui::StatusBarHitRegion> {
     let sidebar = &screen.debug_sidebar;
 
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
-    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
 
     // Paint sidebar background.
     cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
-    layout.set_attributes(None);
-
-    // ── Row 0: header strip ─────────────────────────────────────────────────
-    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
-
-    let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
-    let header_text = format!("  {} DEBUG  |  {cfg_name}", icons::DEBUG.nerd);
-    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-    layout.set_text(&header_text);
-    cr.move_to(x + 4.0, y);
-    pangocairo::show_layout(cr, layout);
-
-    // ── Row 1: Run/Stop button ───────────────────────────────────────────────
+    // ── Chrome rows via StatusBar primitive. ──
+    let (title_bar, action_bar) = render::debug_sidebar_chrome_to_status_bars(sidebar, theme);
+    let title_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
     let btn_y = y + line_height;
-    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, btn_y, w, line_height);
-    cr.fill().ok();
-
-    let continue_label = format!("{}  Continue", icons::DBG_PLAY.nerd);
-    let stop_label = format!("{}  Stop", icons::DBG_STOP_ALT.nerd);
-    let start_label = format!("{}  Start Debugging", icons::DBG_PLAY.nerd);
-    let (btn_label, btn_color) = if sidebar.session_active && sidebar.stopped {
-        (continue_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
-    } else if sidebar.session_active {
-        (stop_label.as_str(), (0.86_f64, 0.27_f64, 0.22_f64))
-    } else {
-        (start_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
-    };
-    cr.set_source_rgb(btn_color.0, btn_color.1, btn_color.2);
-    layout.set_text(btn_label);
-    cr.move_to(x + 8.0, btn_y);
-    pangocairo::show_layout(cr, layout);
+    let action_rect = quadraui::Rect::new(x as f32, btn_y as f32, w as f32, line_height as f32);
+    let action_hits;
+    {
+        use quadraui::Backend;
+        action_hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            let _ = b.draw_status_bar(title_rect, &title_bar);
+            b.draw_status_bar(action_rect, &action_bar)
+        });
+    }
 
     // ── MSV body (the four sections). ──
     // Paint; caching of layout + view is done by the caller (the
@@ -2425,6 +2404,7 @@ pub(super) fn draw_debug_sidebar(
             b.draw_multi_section_view(body_bounds, &view);
         });
     }
+    action_hits
 }
 
 #[allow(clippy::too_many_arguments)]

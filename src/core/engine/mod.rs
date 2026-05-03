@@ -2819,6 +2819,9 @@ pub struct Engine {
     /// layout above. Click needs it to drill into section bodies
     /// (tree hit_test) and to read section scroll state.
     pub dap_sidebar_msv_view: std::cell::RefCell<Option<quadraui::MultiSectionView>>,
+    /// Cached hit regions for the debug sidebar action-button row.
+    /// Paint fills; click reads verbatim (paint↔click pattern).
+    pub dap_sidebar_action_hits: std::cell::RefCell<Vec<quadraui::StatusBarHitRegion>>,
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -3487,6 +3490,7 @@ impl Engine {
             dap_sidebar_section_heights: [0; 4],
             dap_sidebar_msv_layout: std::cell::RefCell::new(None),
             dap_sidebar_msv_view: std::cell::RefCell::new(None),
+            dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),

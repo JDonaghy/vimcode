@@ -2674,16 +2674,21 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
-            if sidebar_row == 0 {
-                // Header row — no-op
-            } else if sidebar_row == 1 {
-                // Run/Stop button
-                if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                    engine.dap_continue();
-                } else if engine.dap_session_active {
-                    engine.execute_command("stop");
-                } else {
-                    engine.execute_command("debug");
+            if sidebar_row < 2 {
+                // Chrome rows (title + action button).
+                // Resolve click via cached StatusBar hit regions
+                // (absolute terminal coordinates).
+                let hits = engine.dap_sidebar_action_hits.borrow();
+                let matched = hits.iter().any(|r| col >= r.col && col < r.col + r.width);
+                drop(hits);
+                if matched {
+                    if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+                        engine.dap_continue();
+                    } else if engine.dap_session_active {
+                        engine.execute_command("stop");
+                    } else {
+                        engine.execute_command("debug");
+                    }
                 }
             } else {
                 // Read the EXACT layout + view paint cached this

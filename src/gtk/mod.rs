@@ -3208,7 +3208,7 @@ impl SimpleComponent for App {
                         engine.dap_sidebar_msv_layout.replace(Some(msv_layout));
                         engine.dap_sidebar_msv_view.replace(Some(view));
                     }
-                    draw_debug_sidebar(
+                    let action_hits = draw_debug_sidebar(
                         cr,
                         &layout,
                         &screen,
@@ -3220,6 +3220,7 @@ impl SimpleComponent for App {
                         line_height,
                         &backend_d,
                     );
+                    engine.dap_sidebar_action_hits.replace(action_hits);
                 });
         }
         // ── Debug sidebar click handler ────────────────────────────────────────
@@ -9021,16 +9022,23 @@ impl App {
 
                 engine.dap_sidebar_has_focus = true;
 
-                if y < lh {
-                    // Panel header — no-op
-                } else if y < 2.0 * lh {
-                    // Run/Stop button row.
-                    if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                        engine.dap_continue();
-                    } else if engine.dap_session_active {
-                        engine.execute_command("stop");
-                    } else {
-                        engine.execute_command("debug");
+                if y < 2.0 * lh {
+                    // Chrome rows (title + action button).
+                    // Resolve click via cached StatusBar hit regions.
+                    let hits = engine.dap_sidebar_action_hits.borrow();
+                    let matched = hits.iter().any(|r| {
+                        let rx = r.col as f64;
+                        click_x >= rx && click_x < rx + r.width as f64
+                    });
+                    drop(hits);
+                    if matched {
+                        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
+                            engine.dap_continue();
+                        } else if engine.dap_session_active {
+                            engine.execute_command("stop");
+                        } else {
+                            engine.execute_command("debug");
+                        }
                     }
                 } else {
                     // Read the EXACT layout + view paint cached this

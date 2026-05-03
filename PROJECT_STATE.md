@@ -1,20 +1,29 @@
 # VimCode Project State
 
-**Last updated:** May 2, 2026 (Session 347 — **#166 diff-pane drift fix + #296 Debug sidebar MSV migration shipped**).
+**Last updated:** May 3, 2026 (Session 348 — backlog audit + issue triage).
 
-Three items landed on develop via Path A:
+## Active milestone: Cross-Platform UI Crate
 
-1. **[#166](https://github.com/JDonaghy/vimcode/issues/166) diff-pane alignment** (`b29a218`). Side-by-side diff panes drifted out of alignment past the first hunk because `sync_scroll_binds` set `partner.scroll_top` to a buffer line that the partner's render resolved at a different aligned-row index. Fix: `view.aligned_top: Option<usize>` pins both panes to one shared aligned-row index; `clear_all_diff_alignment()` helper centralises the teardown. 2 regression tests.
+**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend paint code — every UI surface paints through a quadraui primitive on both TUI and GTK. Win-GUI is deferred until quadraui implements that backend.
 
-2. **GTK rename catch-up** (`6d70dba`). `multi_section_view_layout` → `gtk_msv_layout` (quadraui renamed the helper during repo extraction; vimcode lagged behind, breaking GTK build).
+**Remaining bespoke surfaces** (6 issues, all adoption gates met):
 
-3. **[#296](https://github.com/JDonaghy/vimcode/issues/296) Debug sidebar → MultiSectionView** (`285916b`). Adopted the validated consumer pattern from [quadraui#1](https://github.com/JDonaghy/quadraui/issues/1). Both TUI + GTK paint through `draw_multi_section_view`; click/scroll read the cached `MultiSectionViewLayout` verbatim (never re-derive). New `render::debug_sidebar_to_multi_section_view` adapter: 4 `EqualShare` sections, `PerSection` scroll. Also fixed pre-existing TUI bug: debug-output panel click handler missing `col >= editor_left` check, silently eating sidebar clicks in overlapping row ranges. Net −139 LOC.
+| # | Surface | Primitive | Est. |
+|---|---------|-----------|------|
+| [#302](https://github.com/JDonaghy/vimcode/issues/302) | Search panel (~321 TUI + native GTK) | MSV+TreeView | 12–16 hrs |
+| [#301](https://github.com/JDonaghy/vimcode/issues/301) | Menu bar (~119 TUI + ~172 GTK) | `MenuBar` | 6–8 hrs |
+| [#304](https://github.com/JDonaghy/vimcode/issues/304) | Bottom panel tabs (~65 TUI + ~82 GTK) | `TabBar` | 3–4 hrs |
+| [#303](https://github.com/JDonaghy/vimcode/issues/303) | Debug output panel (~90 TUI + ~47 GTK) | `ListView` | 2–4 hrs |
+| [#305](https://github.com/JDonaghy/vimcode/issues/305) | Terminal toolbar (~73 TUI + ~66 GTK) | `StatusBar` + `TabBar` | 4–6 hrs |
+| [#306](https://github.com/JDonaghy/vimcode/issues/306) | Debug sidebar chrome (~37 TUI + ~32 GTK) | `StatusBar` | 1–2 hrs |
 
-**Key lesson codified** in CLAUDE.md "Paint↔click integration pattern": click NEVER re-derives layout; paint caches it, click reads verbatim. This governs all future quadraui migrations. Captured in memory (`feedback_cache_paint_layout.md`).
+When this milestone completes, evaluate next milestone priority (likely bug-fix sweep, then Win-GUI rebuild B.6).
+
+---
+
+**Previous session (347):** #166 diff-pane drift fix + #296 Debug→MSV shipped. #282 SC panel closed (already on TreeView). Key lesson codified in CLAUDE.md "Paint↔click integration pattern."
 
 Vimcode at 1952 lib + integration tests passing on develop@285916b. Both TUI + GTK build + clippy clean.
-
-**Next priority**: [#282](https://github.com/JDonaghy/vimcode/issues/282) SC→MSV (blocked label removed — quadraui#2 + #3 both closed). Then Win-GUI rebuild (B.6).
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 346 are in **SESSION_HISTORY.md**.

@@ -1788,6 +1788,67 @@ pub fn debug_toolbar_action_index(id: &quadraui::WidgetId) -> Option<usize> {
     id.as_str().strip_prefix("debug:btn:")?.parse().ok()
 }
 
+/// Build two `StatusBar` rows for the debug sidebar chrome:
+/// row 0 = title ("DEBUG | config_name"), row 1 = action button (Continue/Stop/Start).
+pub fn debug_sidebar_chrome_to_status_bars(
+    sidebar: &DebugSidebarData,
+    theme: &Theme,
+) -> (quadraui::StatusBar, quadraui::StatusBar) {
+    let bg = to_quadraui_color(theme.status_bg);
+    let fg = to_quadraui_color(theme.status_fg);
+    let green = to_quadraui_color(theme.git_added);
+    let red = to_quadraui_color(theme.diagnostic_error);
+
+    let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
+    let title = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("debug_sidebar_title"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: format!("  {} DEBUG  |  {cfg_name}", icons::DEBUG.s()),
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    };
+
+    let action_id = Some(quadraui::WidgetId::new("debug_sidebar:action"));
+    let (icon, label, icon_fg) = if sidebar.session_active && sidebar.stopped {
+        (icons::DBG_PLAY.s(), "  Continue", green)
+    } else if sidebar.session_active {
+        (icons::DBG_STOP_ALT.s(), "  Stop", red)
+    } else {
+        (icons::DBG_PLAY.s(), "  Start Debugging", green)
+    };
+    let action = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("debug_sidebar_action"),
+        left_segments: vec![
+            quadraui::StatusBarSegment {
+                text: icon.to_string(),
+                fg: icon_fg,
+                bg,
+                bold: false,
+                action_id: action_id.clone(),
+            },
+            quadraui::StatusBarSegment {
+                text: label.to_string(),
+                fg,
+                bg,
+                bold: false,
+                action_id,
+            },
+        ],
+        right_segments: Vec::new(),
+    };
+
+    (title, action)
+}
+
+/// Returns `true` if `id` matches the debug sidebar action button.
+pub fn is_debug_sidebar_action(id: &quadraui::WidgetId) -> bool {
+    id.as_str() == "debug_sidebar:action"
+}
+
 // ─── Static menu structure ────────────────────────────────────────────────────
 
 /// Static description of every top-level menu and its items.
