@@ -2219,6 +2219,8 @@ impl SimpleComponent for App {
         #[allow(clippy::type_complexity)]
         let nav_arrow_rects_cell: Rc<RefCell<(f64, f64, f64, f64, f64)>> =
             Rc::new(RefCell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
+        let menu_bar_layout_cell: Rc<RefCell<Option<quadraui::MenuBarLayout>>> =
+            Rc::new(RefCell::new(None));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -3037,9 +3039,9 @@ impl SimpleComponent for App {
         {
             let engine = engine.clone();
             let nav_rects = nav_arrow_rects_cell.clone();
+            let mb_layout_draw = menu_bar_layout_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
-                // Menu bar is always visible in GTK (acts as the window title bar).
                 let theme = Theme::from_name(&engine.settings.colorscheme);
                 let open_items: Vec<render::MenuItemData> = if let Some(midx) = engine.menu_open_idx
                 {
@@ -3080,8 +3082,9 @@ impl SimpleComponent for App {
                 };
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                let rects = draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
-                *nav_rects.borrow_mut() = rects;
+                let (mb_layout, arrow_rects) = draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
+                *nav_rects.borrow_mut() = arrow_rects;
+                *mb_layout_draw.borrow_mut() = Some(mb_layout);
             });
         }
         // Click gesture: open/close individual menus (no hamburger zone here).
@@ -3089,29 +3092,25 @@ impl SimpleComponent for App {
             let sender_menu = sender.input_sender().clone();
             let engine_menu = engine.clone();
             let nav_rects_click = nav_arrow_rects_cell.clone();
+            let mb_layout_click = menu_bar_layout_cell.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
             gesture.connect_pressed(move |gest, _, x, _y| {
                 let engine = engine_menu.borrow();
-                // Scan menu labels from left edge (no hamburger on this widget).
-                // Use ~7px/char + 10px padding as approximation for UI font metrics.
-                let mut cursor_x = 8.0_f64;
-                for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-                    let item_w = name.len() as f64 * 7.0 + 10.0;
-                    if x >= cursor_x && x < cursor_x + item_w {
-                        if engine.menu_open_idx == Some(idx) {
-                            sender_menu.send(Msg::CloseMenu).ok();
-                        } else {
-                            sender_menu.send(Msg::OpenMenu(idx)).ok();
-                        }
-                        return;
+                let mb_hit = mb_layout_click
+                    .borrow()
+                    .as_ref()
+                    .map(|l| l.hit_test(x as f32, 0.5));
+                if let Some(quadraui::MenuBarHit::Item(idx)) = mb_hit {
+                    if engine.menu_open_idx == Some(idx) {
+                        sender_menu.send(Msg::CloseMenu).ok();
+                    } else {
+                        sender_menu.send(Msg::OpenMenu(idx)).ok();
                     }
-                    cursor_x += item_w;
+                    return;
                 }
-                // Use cached arrow pixel positions from draw_menu_bar.
                 let (back_x, back_end, fwd_x, fwd_end, unit_end) = *nav_rects_click.borrow();
                 if x >= back_x && x < back_end {
-                    // Claim the gesture so WindowHandle doesn't maximize on double-click.
                     gest.set_state(gtk4::EventSequenceState::Claimed);
                     sender_menu.send(Msg::MruNavBack).ok();
                     return;
@@ -3121,18 +3120,14 @@ impl SimpleComponent for App {
                     sender_menu.send(Msg::MruNavForward).ok();
                     return;
                 }
-                // Click on the search box area → open Command Center.
                 if x >= fwd_end && x < unit_end {
                     gest.set_state(gtk4::EventSequenceState::Claimed);
                     sender_menu.send(Msg::OpenCommandCenter).ok();
                     return;
                 }
-                // Claim clicks within the nav+search box area to prevent
-                // WindowHandle double-click-to-maximize on the search box.
                 if x >= back_x && x < unit_end {
                     gest.set_state(gtk4::EventSequenceState::Claimed);
                 }
-                // Click in empty part of bar → close any open dropdown
                 if engine.menu_open_idx.is_some() {
                     sender_menu.send(Msg::CloseMenu).ok();
                 }
@@ -3143,23 +3138,21 @@ impl SimpleComponent for App {
         {
             let sender_hover = sender.input_sender().clone();
             let engine_hover = engine.clone();
+            let mb_layout_hover = menu_bar_layout_cell.clone();
             let motion = gtk4::EventControllerMotion::new();
             motion.connect_motion(move |_, x, _y| {
                 let engine = engine_hover.borrow();
-                // Only switch if a menu is already open.
                 let Some(current) = engine.menu_open_idx else {
                     return;
                 };
-                let mut cursor_x = 8.0_f64;
-                for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-                    let item_w = name.len() as f64 * 7.0 + 10.0;
-                    if x >= cursor_x && x < cursor_x + item_w {
-                        if idx != current {
-                            sender_hover.send(Msg::OpenMenu(idx)).ok();
-                        }
-                        return;
+                let hit = mb_layout_hover
+                    .borrow()
+                    .as_ref()
+                    .map(|l| l.hit_test(x as f32, 0.5));
+                if let Some(quadraui::MenuBarHit::Item(idx)) = hit {
+                    if idx != current {
+                        sender_hover.send(Msg::OpenMenu(idx)).ok();
                     }
-                    cursor_x += item_w;
                 }
             });
             widgets.menu_bar_da.add_controller(motion);

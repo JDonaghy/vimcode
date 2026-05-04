@@ -2867,6 +2867,9 @@ pub struct Engine {
     /// Cached hit data from the last paint of the terminal toolbar (find bar
     /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
     pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
+    /// Cached layout from the last paint of the menu bar strip.
+    /// Written at paint time; read by click/hover handlers.
+    pub menu_bar_layout: std::cell::RefCell<Option<quadraui::MenuBarLayout>>,
     /// Launch arguments stored between `initialize` send and response receipt.
     /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
@@ -3536,6 +3539,7 @@ impl Engine {
             bottom_panel_kind: BottomPanelKind::Terminal,
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
             terminal_toolbar_hits: std::cell::RefCell::new(None),
+            menu_bar_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,
             dap_wants_sidebar: false,
