@@ -2729,8 +2729,10 @@ fn event_loop(
                         }
                         let input_active = engine.ext_sidebar_input_active;
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-                            KeyCode::Char('j') | KeyCode::Down if !input_active => ("j", None),
-                            KeyCode::Char('k') | KeyCode::Up if !input_active => ("k", None),
+                            KeyCode::Char('j') if !input_active => ("j", None),
+                            KeyCode::Down => ("Down", None),
+                            KeyCode::Char('k') if !input_active => ("k", None),
+                            KeyCode::Up => ("Up", None),
                             KeyCode::Tab => ("Tab", None),
                             KeyCode::Enter => ("Return", None),
                             KeyCode::Char('d') if !input_active => ("d", None),

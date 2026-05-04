@@ -1671,6 +1671,18 @@ impl Engine {
                     self.ext_sidebar_query.pop();
                     self.ext_sidebar_selected = 0;
                 }
+                "Down" => {
+                    let total = self.ext_flat_item_count();
+                    if total > 0 {
+                        self.ext_sidebar_selected = (self.ext_sidebar_selected + 1).min(total - 1);
+                    }
+                }
+                "Up" => {
+                    self.ext_sidebar_selected = self.ext_sidebar_selected.saturating_sub(1);
+                }
+                "Return" => {
+                    self.ext_open_selected_readme();
+                }
                 _ => {
                     if let Some(ch) = unicode {
                         if !ch.is_control() {
