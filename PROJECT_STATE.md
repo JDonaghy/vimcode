@@ -1,33 +1,32 @@
 # VimCode Project State
 
-**Last updated:** May 4, 2026 (Session 349 — #304 bottom panel tabs shipped; quadraui gained `show_tab_close`).
+**Last updated:** May 4, 2026 (Session 350 — #305 terminal toolbar shipped; quadraui gained rect-height-aware tab bar + compact mode).
 
 ## Active milestone: Cross-Platform UI Crate
 
 **This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
 
-**Remaining bespoke paint surfaces** (3 issues):
+**Remaining bespoke paint surfaces** (2 issues):
 
 | # | Surface | Primitive | Est. |
 |---|---------|-----------|------|
 | [#302](https://github.com/JDonaghy/vimcode/issues/302) | Search panel (~321 TUI + native GTK) | MSV+TreeView | 12–16 hrs |
 | [#301](https://github.com/JDonaghy/vimcode/issues/301) | Menu bar (~119 TUI + ~172 GTK) | `MenuBar` | 6–8 hrs |
-| [#305](https://github.com/JDonaghy/vimcode/issues/305) | Terminal toolbar (~73 TUI + ~66 GTK) | `StatusBar` + `TabBar` | 4–6 hrs |
 
 **All quadraui prereqs are now resolved.** quadraui#6 (MenuBar rasterisers) and quadraui#7 (SearchPanel) are both CLOSED — #301 and #302 are ready to work on with no blockers.
 
 **Scroll dispatch migration** ([#307](https://github.com/JDonaghy/vimcode/issues/307)):
 
-#303 established the `ScrollSurface` + `dispatch_scroll` + `dispatch_click` pattern. [#307](https://github.com/JDonaghy/vimcode/issues/307) tracks migrating all remaining scrollable surfaces (editor viewport, terminal scrollback, sidebar panels, debug sidebar, hover popup) to the same shared dispatch — eliminating ~82 lines of bespoke per-backend scroll routing in TUI `mouse.rs` alone, plus equivalent GTK code.
+#303 established the `ScrollSurface` + `dispatch_scroll` + `dispatch_click` pattern. [#307](https://github.com/JDonaghy/vimcode/issues/307) tracks migrating all remaining scrollable surfaces (editor viewport, terminal scrollback, sidebar panels, debug sidebar, hover popup) to the same shared dispatch — eliminating ~82 lines of bespoke per-backend scroll routing in TUI `mouse.rs` alone, plus equivalent GTK code. Note: GTK terminal scroll wheel was confirmed never wired up (pre-existing gap, not a regression).
 
 **Shipped this session:**
-- **#304** (`5d7fa09`) — Bottom panel tabs → `quadraui::TabBar`. Both backends paint through `build_bottom_panel_tab_bar()` → `Backend::draw_tab_bar()`. Click dispatch via shared `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` (`b9d62cd`) to suppress per-tab close buttons.
+- **#305** (`08dd916`) — Terminal toolbar → `quadraui::StatusBar` (find mode) + `quadraui::TabBar` (tab strip mode). Both backends paint through `render::build_terminal_toolbar()`. Click dispatch via shared `Engine::resolve_terminal_toolbar_click()`. quadraui gained rect-height-aware tab bar (quadraui#49) and compact mode (quadraui#50, `TabBar.compact: bool`). Bottom panel tabs also set `compact: true`. CLAUDE.md gained no-cross-repo-edits rule.
 
 ---
 
-**Previous session (348):** #306 debug sidebar chrome + #303 debug output shipped; platform-neutrality rule established. quadraui #46/#47/#48 built to unblock #303.
+**Previous session (349):** #304 bottom panel tabs shipped; quadraui gained `show_tab_close`.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`5d7fa09`. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`08dd916`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -99,7 +98,8 @@ cell coalescence) remain but are tracked separately.
 | Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
 | Debug sidebar (variables tree, breakpoints, watch) | `MultiSectionView` (4 × `TreeView`) | ✅ | ✅ | #296, `285916b`. Adapter `render::debug_sidebar_to_multi_section_view`. Paint caches layout; click reads verbatim. |
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
-| Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false` suppresses per-tab ×. |
+| Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false`, `compact: true`. |
+| Terminal toolbar (find bar + tab strip) | `StatusBar` / `TabBar` | ✅ | ✅ | #305, `08dd916`. Adapter `render::build_terminal_toolbar`. Click via `Engine::resolve_terminal_toolbar_click`. Tab strip uses `compact: true`. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
@@ -124,27 +124,4 @@ cell coalescence) remain but are tracked separately.
 
 > Sessions 343 and earlier in **SESSION_HISTORY.md**.
 
-**Sharp edges that materialised during the lift**:
-- **`StyledSpan` impedance** — owned-text `quadraui::StyledSpan` (plugin/serde) and byte-range `quadraui::primitives::editor::StyledSpan` (paint) coexist by design.
-- **`DiagnosticSeverity` lift** — quadraui mirror of `core::lsp::DiagnosticSeverity`; `to_q_severity()` adapter at the boundary.
-- **`active_background`** — lifted to `quadraui::Theme::editor_active_background`.
-- **Cursor side-effect (TUI Bar/Underline)** — rasteriser returns `EditorPaintResult::cursor_position`; host calls `Frame::set_cursor_position`.
-- **`Style.font_scale`** narrowed `f64 → f32` to unblock `Eq`/`Serialize` derives. Pango call site upcasts.
-- **Selection paint ordering** — GTK paints before text, TUI paints after. Documented as intrinsic-to-surface; not consolidated.
-
-**Smoke-test follow-up filed**: [#283](https://github.com/JDonaghy/vimcode/issues/283) — TUI LSP-diagnostic dot overwrites breakpoint marker (gutter column collision). Pre-existing behaviour, predates this PR — surfaced during smoke testing because GTK paints both visibly while TUI doesn't.
-
-**What's next:** PLAN.md "🎯 NEXT FOCUS" — eliminate remaining
-TUI/GTK duplication via the chrome-lift queue (GTK `Completions`
-→ #280 → #281 → #282). B.6 Win-GUI rebuild is unblocked
-and orthogonal — pick it up in parallel or after the lifts.
-
----
-
-**Session 341 — Phase C stages 2–4 shipped end-to-end:**
-
-[#277](https://github.com/JDonaghy/vimcode/issues/277) (`fbbc85f`/`b952c6a`/`d3abb17`/`2cc2ad9`) lifted the `Scrollbar` primitive + dual rasterisers, fixed visible-track q_theme mapping, page-jump on track click, GTK native v-scrollbar trough visibility, viewport-sized page step, and h-scrollbar position above the per-window status line. [#278](https://github.com/JDonaghy/vimcode/issues/278) (`fd08db0`) lifted `quadraui::{tui,gtk}::draw_settings_chrome` helpers — settings panel header + search row paint through quadraui; form body already did via `Form`. [#279](https://github.com/JDonaghy/vimcode/issues/279) (`8e55720`) lifted the `MessageList` primitive + dual rasterisers — AI sidebar message-history paint loop lifted; panel header / separator / input area / focus border stay panel-specific. Three deferred chrome lifts filed: [#280](https://github.com/JDonaghy/vimcode/issues/280), [#281](https://github.com/JDonaghy/vimcode/issues/281), [#282](https://github.com/JDonaghy/vimcode/issues/282). Phase C umbrella [#275](https://github.com/JDonaghy/vimcode/issues/275). quadraui: 287 tests pass (was 278, +9 fit_thumb tests); vimcode `--no-default-features` + clippy clean (5263 tests); GTK build + clippy clean; kubeui + kubeui-gtk consumers build clean.
-
----
-
-> Session 339 and earlier in **SESSION_HISTORY.md**.
+> Sessions 349 and earlier in **SESSION_HISTORY.md**.

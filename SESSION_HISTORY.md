@@ -1,12 +1,22 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 349 archived here.
+All sessions through 350 archived here.
 
 > **Format note:** Sessions 282–339 below were archived in their
 > original verbose multi-paragraph format (as maintained in
 > PROJECT_STATE during the A.x / Phase 4 / Phase B / Phase C waves).
 > Sessions 280 and earlier use the one-paragraph compact format.
+
+---
+**Session 350 — #305 terminal toolbar shipped:**
+
+Terminal toolbar migrated to quadraui primitives. Find mode uses `quadraui::StatusBar`, tab strip mode uses `quadraui::TabBar` with `compact: true`. Click dispatch through shared `Engine::resolve_terminal_toolbar_click()` — both backends read cached hit data instead of bespoke coordinate math. ~145 lines of bespoke TUI paint and ~100 lines of bespoke GTK paint replaced. Two quadraui improvements landed: rect-height-aware tab bar (quadraui#49) and compact mode (quadraui#50). CLAUDE.md gained no-cross-repo-edits rule. GTK terminal scroll confirmed as pre-existing gap (tracked by #307). Commit `08dd916`.
+
+---
+**Session 349 — #304 bottom panel tabs shipped:**
+
+Bottom panel tabs (Terminal / Debug Output switcher) migrated to `quadraui::TabBar`. Both backends paint through `render::build_bottom_panel_tab_bar()` → `Backend::draw_tab_bar()`. Click dispatch via shared `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` to suppress per-tab close buttons. All quadraui prereqs for remaining surfaces resolved (quadraui#6 MenuBar, quadraui#7 SearchPanel both CLOSED). Commit `5d7fa09`.
 
 ---
 **Session 339 — #259 Phase B.5c stages 1–7 shipped:**

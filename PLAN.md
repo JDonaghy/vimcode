@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-04 (Session 349 — #304 bottom panel tabs shipped. Course-correction steps all ✅. All quadraui prereqs resolved; #301/#302 unblocked.)
+> **Last updated:** 2026-05-04 (Session 350 — #305 terminal toolbar shipped. 2 bespoke paint surfaces remain (#301 menu bar, #302 search panel). quadraui gained rect-height-aware tab bar (#49) + compact mode (#50).)
 
 ---
 
