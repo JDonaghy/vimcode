@@ -3461,6 +3461,25 @@ pub fn build_menu_bar_view(open_menu_idx: Option<usize>) -> quadraui::MenuBar {
     }
 }
 
+/// Build a `quadraui::CommandCenter` descriptor from engine state.
+pub fn build_command_center_view(
+    nav_back_enabled: bool,
+    nav_forward_enabled: bool,
+    title: &str,
+) -> quadraui::CommandCenter {
+    let search_label = if title.is_empty() {
+        String::new()
+    } else {
+        format!("\u{1f50d} {title}")
+    };
+    quadraui::CommandCenter {
+        id: quadraui::WidgetId::new("command-center"),
+        back_enabled: nav_back_enabled,
+        forward_enabled: nav_forward_enabled,
+        search_label,
+    }
+}
+
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {

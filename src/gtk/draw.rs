@@ -2834,9 +2834,6 @@ pub(super) fn draw_command_line(
     }
 }
 
-/// Returns `(MenuBarLayout, (back_x, back_end, fwd_x, fwd_end, unit_end))` — the quadraui
-/// layout for menu label hit-testing plus pixel hit rects for nav arrows / search box.
-#[allow(clippy::type_complexity)]
 pub(super) fn draw_menu_bar(
     cr: &Context,
     data: &render::MenuBarData,
@@ -2845,7 +2842,7 @@ pub(super) fn draw_menu_bar(
     y: f64,
     width: f64,
     height: f64,
-) -> (quadraui::MenuBarLayout, (f64, f64, f64, f64, f64)) {
+) -> (quadraui::MenuBarLayout, quadraui::CommandCenterLayout) {
     let pango_ctx = pangocairo::create_context(cr);
     let font_desc = pango::FontDescription::from_string(&UI_FONT());
     let pango_layout = pango::Layout::new(&pango_ctx);
@@ -2856,133 +2853,34 @@ pub(super) fn draw_menu_bar(
     let mb_layout =
         quadraui::gtk::draw_menu_bar(cr, &pango_layout, x, y, width, height, &bar, &q_theme);
 
-    let (fr, fg, fb) = theme.foreground.to_cairo();
-
     let menu_end_x = mb_layout
         .visible_items
         .last()
         .map(|vi| x + (vi.bounds.x + vi.bounds.width) as f64)
         .unwrap_or(x);
 
-    // Centered nav arrows + search box (like VSCode Command Center).
-    pango_layout.set_text("\u{25C0}"); // ◀
-    let (back_w, _) = pango_layout.pixel_size();
-    pango_layout.set_text("\u{25B6}"); // ▶
-    let (fwd_w, _) = pango_layout.pixel_size();
-    let arrow_gap = 6.0;
-    let arrows_w = back_w as f64 + arrow_gap + fwd_w as f64;
-
-    let display = if data.title.is_empty() {
-        String::new()
-    } else {
-        format!("\u{1f50d}  {}", data.title)
-    };
-    let box_pad = 12.0;
-    let min_box_w = 280.0;
-    let (box_text_w, _) = if !display.is_empty() {
-        pango_layout.set_text(&display);
-        pango_layout.pixel_size()
-    } else {
-        (0, 0)
-    };
-    let box_w = if !display.is_empty() {
-        (box_text_w as f64 + box_pad * 2.0).max(min_box_w)
-    } else {
-        0.0
-    };
-    let gap_between = if box_w > 0.0 { 10.0 } else { 0.0 };
-    let total_unit_w = arrows_w + gap_between + box_w;
-
-    let available = x + width - menu_end_x;
-    let unit_x = (menu_end_x + (available - total_unit_w) / 2.0).max(menu_end_x + 8.0);
-
-    let dim_fg = theme.line_number_fg;
-    let back_color = if data.nav_back_enabled {
-        theme.foreground
-    } else {
-        dim_fg
-    };
-    let (br2, bg2, bb2) = back_color.to_cairo();
-    cr.set_source_rgb(br2, bg2, bb2);
-    pango_layout.set_text("\u{25C0}");
-    pango_layout.set_attributes(None);
-    let (_, bh) = pango_layout.pixel_size();
-    cr.move_to(unit_x, y + (height - bh as f64) / 2.0);
-    pangocairo::show_layout(cr, &pango_layout);
-
-    let fwd_color = if data.nav_forward_enabled {
-        theme.foreground
-    } else {
-        dim_fg
-    };
-    let (fr2, fg2, fb2) = fwd_color.to_cairo();
-    cr.set_source_rgb(fr2, fg2, fb2);
-    pango_layout.set_text("\u{25B6}");
-    let (_, fh) = pango_layout.pixel_size();
-    cr.move_to(
-        unit_x + back_w as f64 + arrow_gap,
-        y + (height - fh as f64) / 2.0,
+    let cc = render::build_command_center_view(
+        data.nav_back_enabled,
+        data.nav_forward_enabled,
+        &data.title,
     );
-    pangocairo::show_layout(cr, &pango_layout);
+    let cc_x = menu_end_x;
+    let cc_w = (x + width - menu_end_x).max(0.0);
+    pango_layout.set_text("X");
+    let line_height = pango_layout.pixel_size().1 as f64;
+    let cc_layout = quadraui::gtk::draw_command_center(
+        cr,
+        &pango_layout,
+        cc_x,
+        y,
+        cc_w,
+        height,
+        &cc,
+        &q_theme,
+        line_height,
+    );
 
-    if !display.is_empty() {
-        let bx = unit_x + arrows_w + gap_between;
-        let by = y + 3.0;
-        let bh_box = height - 6.0;
-        let radius = 4.0;
-        let (sr, sg, sb) = theme.separator.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        cr.new_path();
-        cr.arc(
-            bx + box_w - radius,
-            by + radius,
-            radius,
-            -std::f64::consts::FRAC_PI_2,
-            0.0,
-        );
-        cr.arc(
-            bx + box_w - radius,
-            by + bh_box - radius,
-            radius,
-            0.0,
-            std::f64::consts::FRAC_PI_2,
-        );
-        cr.arc(
-            bx + radius,
-            by + bh_box - radius,
-            radius,
-            std::f64::consts::FRAC_PI_2,
-            std::f64::consts::PI,
-        );
-        cr.arc(
-            bx + radius,
-            by + radius,
-            radius,
-            std::f64::consts::PI,
-            3.0 * std::f64::consts::FRAC_PI_2,
-        );
-        cr.close_path();
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-        cr.set_source_rgb(fr, fg, fb);
-        pango_layout.set_text(&display);
-        let (_, th) = pango_layout.pixel_size();
-        cr.move_to(bx + box_pad, y + (height - th as f64) / 2.0);
-        pangocairo::show_layout(cr, &pango_layout);
-    }
-
-    let fwd_x_pos = unit_x + back_w as f64 + arrow_gap;
-    let unit_end = unit_x + total_unit_w;
-    (
-        mb_layout,
-        (
-            unit_x,
-            unit_x + back_w as f64,
-            fwd_x_pos,
-            fwd_x_pos + fwd_w as f64,
-            unit_end,
-        ),
-    )
+    (mb_layout, cc_layout)
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]

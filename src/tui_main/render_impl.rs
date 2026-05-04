@@ -201,11 +201,14 @@ pub(super) fn draw_frame(
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
     if let Some(ref menu_data) = screen.menu_bar {
-        let mb_layout = render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
+        let (mb_layout, cc_layout) =
+            render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
         engine.menu_bar_layout.replace(Some(mb_layout));
+        engine.command_center_layout.replace(Some(cc_layout));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
     } else {
         engine.menu_bar_layout.replace(None);
+        engine.command_center_layout.replace(None);
     }
 
     // ── Render activity bar ───────────────────────────────────────────────────
@@ -2226,92 +2229,31 @@ pub(super) fn render_menu_bar(
     area: Rect,
     data: &render::MenuBarData,
     theme: &Theme,
-) -> quadraui::MenuBarLayout {
+) -> (quadraui::MenuBarLayout, quadraui::CommandCenterLayout) {
     let q_theme = super::quadraui_tui::q_theme(theme);
     let bar = render::build_menu_bar_view(data.open_menu_idx);
-    let layout = quadraui::tui::draw_menu_bar(buf, area, &bar, &q_theme);
+    let mb_layout = quadraui::tui::draw_menu_bar(buf, area, &bar, &q_theme);
 
-    if area.height == 0 {
-        return layout;
-    }
-
-    let bar_bg = rc(theme.tab_bar_bg);
-    let bar_fg = rc(theme.tab_inactive_fg);
-    let y = area.y;
-
-    let menu_end: u16 = layout
+    let menu_end: u16 = mb_layout
         .visible_items
         .last()
         .map(|vi| area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
         .unwrap_or(area.x);
 
-    // Center nav arrows + search box as one unit between menu labels and right edge.
-    let dim_fg = rc(theme.line_number_fg);
-    let active_fg = bar_fg;
-
-    let arrows_w: u16 = 4;
-    let display = if data.title.is_empty() {
-        String::new()
-    } else {
-        format!("\u{1f50d} {}", data.title)
+    let cc = render::build_command_center_view(
+        data.nav_back_enabled,
+        data.nav_forward_enabled,
+        &data.title,
+    );
+    let cc_area = Rect {
+        x: menu_end,
+        y: area.y,
+        width: area.width.saturating_sub(menu_end - area.x),
+        height: area.height,
     };
-    let display_chars: Vec<char> = display.chars().collect();
-    let text_len = display_chars.len() as u16;
-    let box_width = if !display.is_empty() { text_len + 4 } else { 0 };
-    let gap = if box_width > 0 { 1u16 } else { 0 };
-    let total_unit = arrows_w + gap + box_width;
-    let right_edge = area.x + area.width;
-    let available = right_edge.saturating_sub(menu_end);
+    let cc_layout = quadraui::tui::draw_command_center(buf, cc_area, &cc, &q_theme);
 
-    if available >= total_unit + 2 {
-        let unit_start = menu_end + (available - total_unit) / 2;
-
-        let mut ax = unit_start;
-        let back_fg = if data.nav_back_enabled {
-            active_fg
-        } else {
-            dim_fg
-        };
-        set_cell(buf, ax, y, '◀', back_fg, bar_bg);
-        ax += 1;
-        set_cell(buf, ax, y, ' ', bar_bg, bar_bg);
-        ax += 1;
-        let fwd_fg = if data.nav_forward_enabled {
-            active_fg
-        } else {
-            dim_fg
-        };
-        set_cell(buf, ax, y, '▶', fwd_fg, bar_bg);
-        ax += 1;
-        set_cell(buf, ax, y, ' ', bar_bg, bar_bg);
-        ax += 1;
-
-        if !display.is_empty() {
-            ax += gap;
-            let box_start = ax;
-            let box_end = box_start + box_width;
-            if box_start < right_edge {
-                set_cell(buf, box_start, y, '[', dim_fg, bar_bg);
-            }
-            if box_start + 1 < right_edge {
-                set_cell(buf, box_start + 1, y, ' ', bar_fg, bar_bg);
-            }
-            for (i, ch) in display_chars.iter().enumerate() {
-                let cx = box_start + 2 + i as u16;
-                if cx < right_edge {
-                    set_cell(buf, cx, y, *ch, bar_fg, bar_bg);
-                }
-            }
-            if box_end >= 2 && box_end - 2 < right_edge {
-                set_cell(buf, box_end - 2, y, ' ', bar_fg, bar_bg);
-            }
-            if box_end >= 1 && box_end - 1 < right_edge {
-                set_cell(buf, box_end - 1, y, ']', dim_fg, bar_bg);
-            }
-        }
-    }
-
-    layout
+    (mb_layout, cc_layout)
 }
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────

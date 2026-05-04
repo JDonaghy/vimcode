@@ -2001,44 +2001,25 @@ pub(super) fn handle_mouse(
             }
             return sidebar_width;
         }
-        // Nav arrows + search box are centered between menu_end and right edge.
-        let menu_end: u16 = engine
-            .menu_bar_layout
+        let cc_hit = engine
+            .command_center_layout
             .borrow()
             .as_ref()
-            .and_then(|l| l.visible_items.last())
-            .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
-            .unwrap_or(0);
-        let arrows_w: u16 = 4;
-        let title = engine
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "VimCode".to_string());
-        let display = format!("\u{1f50d} {}", title);
-        let text_len = display.chars().count() as u16;
-        let box_width = if !title.is_empty() { text_len + 4 } else { 0 };
-        let gap: u16 = if box_width > 0 { 1 } else { 0 };
-        let total_unit = arrows_w + gap + box_width;
-        let term_w = terminal_size.map(|r| r.width).unwrap_or(80);
-        let available = term_w.saturating_sub(menu_end);
-        if available >= total_unit + 2 {
-            let unit_start = menu_end + (available - total_unit) / 2;
-            if col == unit_start {
+            .map(|l| l.hit_test(col as f32, row as f32 + 0.5));
+        match cc_hit {
+            Some(quadraui::CommandCenterHit::Back) => {
                 engine.tab_nav_back();
                 return sidebar_width;
             }
-            if col == unit_start + 2 {
+            Some(quadraui::CommandCenterHit::Forward) => {
                 engine.tab_nav_forward();
                 return sidebar_width;
             }
-            let search_start = unit_start + arrows_w + gap;
-            let search_end = unit_start + total_unit;
-            if col >= search_start && col < search_end {
+            Some(quadraui::CommandCenterHit::SearchBox) => {
                 engine.open_command_center();
                 return sidebar_width;
             }
+            _ => {}
         }
         engine.close_menu();
         return sidebar_width;

@@ -407,9 +407,6 @@ struct App {
     /// by hand. Eliminates the row-height-drift bug class (#210).
     #[allow(clippy::type_complexity)]
     menu_dropdown_hit_regions: Rc<RefCell<Vec<(f64, f64, f64, f64, quadraui::WidgetId)>>>,
-    /// Cached nav arrow pixel hit rects from draw_menu_bar: (back_x, back_end, fwd_x, fwd_end, unit_end).
-    #[allow(dead_code, clippy::type_complexity)]
-    nav_arrow_rects: Rc<RefCell<(f64, f64, f64, f64, f64)>>,
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -2216,10 +2213,9 @@ impl SimpleComponent for App {
         let tab_visible_counts_cell: Rc<
             RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>,
         > = Rc::new(RefCell::new(Vec::new()));
-        #[allow(clippy::type_complexity)]
-        let nav_arrow_rects_cell: Rc<RefCell<(f64, f64, f64, f64, f64)>> =
-            Rc::new(RefCell::new((0.0, 0.0, 0.0, 0.0, 0.0)));
         let menu_bar_layout_cell: Rc<RefCell<Option<quadraui::MenuBarLayout>>> =
+            Rc::new(RefCell::new(None));
+        let command_center_layout_cell: Rc<RefCell<Option<quadraui::CommandCenterLayout>>> =
             Rc::new(RefCell::new(None));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
@@ -2381,7 +2377,6 @@ impl SimpleComponent for App {
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             menu_dropdown_hit_regions: Rc::new(RefCell::new(Vec::new())),
-            nav_arrow_rects: nav_arrow_rects_cell.clone(),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -3038,8 +3033,8 @@ impl SimpleComponent for App {
         // Draw function: renders menu labels using the same Cairo helper.
         {
             let engine = engine.clone();
-            let nav_rects = nav_arrow_rects_cell.clone();
             let mb_layout_draw = menu_bar_layout_cell.clone();
+            let cc_layout_draw = command_center_layout_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
@@ -3082,17 +3077,17 @@ impl SimpleComponent for App {
                 };
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                let (mb_layout, arrow_rects) = draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
-                *nav_rects.borrow_mut() = arrow_rects;
+                let (mb_layout, cc_layout) = draw_menu_bar(cr, &data, &theme, 0.0, 0.0, w, h);
                 *mb_layout_draw.borrow_mut() = Some(mb_layout);
+                *cc_layout_draw.borrow_mut() = Some(cc_layout);
             });
         }
         // Click gesture: open/close individual menus (no hamburger zone here).
         {
             let sender_menu = sender.input_sender().clone();
             let engine_menu = engine.clone();
-            let nav_rects_click = nav_arrow_rects_cell.clone();
             let mb_layout_click = menu_bar_layout_cell.clone();
+            let cc_layout_click = command_center_layout_cell.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
             gesture.connect_pressed(move |gest, _, x, _y| {
@@ -3109,24 +3104,27 @@ impl SimpleComponent for App {
                     }
                     return;
                 }
-                let (back_x, back_end, fwd_x, fwd_end, unit_end) = *nav_rects_click.borrow();
-                if x >= back_x && x < back_end {
-                    gest.set_state(gtk4::EventSequenceState::Claimed);
-                    sender_menu.send(Msg::MruNavBack).ok();
-                    return;
-                }
-                if x >= fwd_x && x < fwd_end {
-                    gest.set_state(gtk4::EventSequenceState::Claimed);
-                    sender_menu.send(Msg::MruNavForward).ok();
-                    return;
-                }
-                if x >= fwd_end && x < unit_end {
-                    gest.set_state(gtk4::EventSequenceState::Claimed);
-                    sender_menu.send(Msg::OpenCommandCenter).ok();
-                    return;
-                }
-                if x >= back_x && x < unit_end {
-                    gest.set_state(gtk4::EventSequenceState::Claimed);
+                let cc_hit = cc_layout_click
+                    .borrow()
+                    .as_ref()
+                    .map(|l| l.hit_test(x as f32, 0.5));
+                match cc_hit {
+                    Some(quadraui::CommandCenterHit::Back) => {
+                        gest.set_state(gtk4::EventSequenceState::Claimed);
+                        sender_menu.send(Msg::MruNavBack).ok();
+                        return;
+                    }
+                    Some(quadraui::CommandCenterHit::Forward) => {
+                        gest.set_state(gtk4::EventSequenceState::Claimed);
+                        sender_menu.send(Msg::MruNavForward).ok();
+                        return;
+                    }
+                    Some(quadraui::CommandCenterHit::SearchBox) => {
+                        gest.set_state(gtk4::EventSequenceState::Claimed);
+                        sender_menu.send(Msg::OpenCommandCenter).ok();
+                        return;
+                    }
+                    _ => {}
                 }
                 if engine.menu_open_idx.is_some() {
                     sender_menu.send(Msg::CloseMenu).ok();
