@@ -13,6 +13,8 @@ This applies to scroll routing, hit-testing, event dispatch, layout math, coordi
 
 **Why this rule exists.** Multiple sessions of effort were wasted adding GTK-specific scroll handlers, hit-test math, and coordinate conversions that never converged. Per-backend fixes are band-aids that create the exact duplication quadraui exists to eliminate. The lesson: if it can't be done through quadraui's backend-independent API, it can't be done yet — and the right action is to build the API.
 
+**Never edit the quadraui repo directly.** The vimcode agent must not modify files under `~/src/quadraui/`. When quadraui needs a change, file a GitHub issue on `JDonaghy/quadraui` describing the gap, then wait. The user will direct a separate quadraui agent to implement and push the fix. Resume the vimcode-side work only after the user confirms the quadraui change has landed.
+
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Read `PLAN.md` if present — it is the pickup doc for any in-flight multi-stage feature (e.g. the current `quadraui` wave). The "Architectural focus" header at the top names the active design axis, lists resolved/open architectural questions, and points at the deeper docs; the stage map below tracks shipped/next work. Read both.

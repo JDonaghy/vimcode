@@ -1366,6 +1366,28 @@ pub enum BottomPanelKind {
     DebugOutput,
 }
 
+/// Cached hit-test data from the last paint of the terminal toolbar.
+pub enum TerminalToolbarHits {
+    FindBar {
+        layout: quadraui::StatusBarLayout,
+        origin_x: f64,
+    },
+    TabStrip(quadraui::TabBarHits),
+}
+
+/// Action resolved from a terminal toolbar click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalToolbarAction {
+    SwitchTab(usize),
+    CloseTab,
+    ToggleMaximize,
+    ToggleSplit,
+    AddTab,
+    CloseFindBar,
+    StartResize,
+    None,
+}
+
 /// State of an in-progress tab drag operation.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
@@ -2842,6 +2864,9 @@ pub struct Engine {
     /// Cached hit regions from the last paint of the bottom panel tab bar.
     /// Written at paint time by both backends; read by click handlers.
     pub bottom_tab_bar_hits: std::cell::RefCell<Option<quadraui::TabBarHits>>,
+    /// Cached hit data from the last paint of the terminal toolbar (find bar
+    /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
+    pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
     /// Launch arguments stored between `initialize` send and response receipt.
     /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
@@ -3510,6 +3535,7 @@ impl Engine {
             dap_selected_launch_config: 0,
             bottom_panel_kind: BottomPanelKind::Terminal,
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
+            terminal_toolbar_hits: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,
             dap_wants_sidebar: false,

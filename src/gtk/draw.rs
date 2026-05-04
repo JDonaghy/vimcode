@@ -554,19 +554,34 @@ pub(super) fn draw_editor(
         match screen.bottom_tabs.active {
             render::BottomPanelKind::Terminal => {
                 if let Some(ref term_panel) = screen.bottom_tabs.terminal {
-                    draw_terminal_panel(
+                    let toolbar_y = term_y + line_height;
+                    let hits = draw_terminal_toolbar(
+                        backend,
                         cr,
                         &layout,
                         term_panel,
                         &theme,
                         0.0,
-                        term_y + line_height, // skip tab bar row
+                        toolbar_y,
                         width as f64,
-                        term_px - line_height,
                         line_height,
-                        char_width,
-                        sender,
                     );
+                    engine.terminal_toolbar_hits.replace(Some(hits));
+                    let content_h = (term_px - 2.0 * line_height).max(0.0);
+                    if content_h > 0.0 {
+                        draw_terminal_panel(
+                            cr,
+                            &layout,
+                            term_panel,
+                            &theme,
+                            0.0,
+                            toolbar_y + line_height,
+                            width as f64,
+                            content_h,
+                            line_height,
+                            char_width,
+                        );
+                    }
                 }
             }
             render::BottomPanelKind::DebugOutput => {
@@ -1039,8 +1054,9 @@ pub(super) fn draw_tab_bar(
     let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
+        let tab_row_h = (line_height * 1.6).ceil();
         b.draw_tab_bar(
-            quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
+            quadraui::Rect::new(0.0, y_offset as f32, width as f32, tab_row_h as f32),
             &bar,
             hovered_close_tab,
         )
@@ -2433,13 +2449,65 @@ pub(super) fn draw_quickfix_panel(
     });
 }
 
-/// Nerd Font icons for the terminal panel toolbar.
-pub(super) const NF_CLOSE: &str = "󰅖"; // nf-md-close_box
-pub(super) const NF_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
-pub(super) const NF_MAXIMIZE: &str = "󰊗"; // nf-md-fullscreen
-pub(super) const NF_UNMAXIMIZE: &str = "󰊓"; // nf-md-fullscreen_exit
+/// Draw the terminal toolbar row (find bar or tab strip) through
+/// quadraui primitives. Returns cached hit data for click dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_terminal_toolbar(
+    backend: &std::rc::Rc<std::cell::RefCell<super::backend::GtkBackend>>,
+    cr: &Context,
+    layout: &pango::Layout,
+    panel: &render::TerminalPanel,
+    theme: &Theme,
+    x: f64,
+    y: f64,
+    w: f64,
+    line_height: f64,
+) -> crate::core::engine::TerminalToolbarHits {
+    use crate::core::engine::TerminalToolbarHits;
+    use pango::FontDescription;
 
-/// Draw the integrated terminal bottom panel.
+    let toolbar = render::build_terminal_toolbar(panel, theme);
+
+    let saved_font = layout.font_description().unwrap_or_default();
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
+    layout.set_font_description(Some(&ui_font_desc));
+
+    let result = match toolbar {
+        render::TerminalToolbar::FindBar(bar) => {
+            use quadraui::Backend;
+            let q_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
+            backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+                b.set_current_line_height(line_height);
+                b.draw_status_bar(q_rect, &bar);
+            });
+            let sb_layout = bar.layout(w as f32, line_height as f32, 16.0, |seg| {
+                layout.set_text(&seg.text);
+                quadraui::StatusSegmentMeasure::new(layout.pixel_size().0.max(0) as f32)
+            });
+            TerminalToolbarHits::FindBar {
+                layout: sb_layout,
+                origin_x: x,
+            }
+        }
+        render::TerminalToolbar::TabStrip(bar) => {
+            use quadraui::Backend;
+            let q_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
+            let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+                b.set_current_line_height(line_height);
+                b.draw_tab_bar(q_rect, &bar, None)
+            });
+            TerminalToolbarHits::TabStrip(hits)
+        }
+    };
+
+    layout.set_font_description(Some(&saved_font));
+    result
+}
+
+/// Draw the integrated terminal bottom panel content (cells + scrollbar).
+/// The toolbar row is drawn separately by `draw_terminal_toolbar`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_terminal_panel(
     cr: &Context,
@@ -2452,102 +2520,12 @@ pub(super) fn draw_terminal_panel(
     term_px: f64,
     line_height: f64,
     char_width: f64,
-    sender: &relm4::Sender<Msg>,
 ) {
-    // Toolbar row (header) — use sans-serif UI font like VSCode.
-    let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(&UI_FONT());
-
-    let (hr, hg, hb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(hr, hg, hb);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
-
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    layout.set_font_description(Some(&ui_font_desc));
-    layout.set_attributes(None);
-
-    if panel.find_active {
-        // Find bar mode: replace tab strip with query + match count
-        let match_info = if panel.find_match_count == 0 {
-            if panel.find_query.is_empty() {
-                String::new()
-            } else {
-                "  (no matches)".to_string()
-            }
-        } else {
-            format!(
-                "  ({}/{})",
-                panel.find_selected_idx + 1,
-                panel.find_match_count
-            )
-        };
-        let find_text = format!(" FIND: {}█{}", panel.find_query, match_info);
-        cr.set_source_rgb(fr, fg2, fb);
-        layout.set_text(&find_text);
-        cr.move_to(x, y);
-        pangocairo::show_layout(cr, layout);
-        // Close icon right-aligned
-        layout.set_text(NF_CLOSE);
-        let (cw, _) = layout.pixel_size();
-        cr.move_to(x + w - cw as f64 - 4.0, y);
-        pangocairo::show_layout(cr, layout);
-    } else {
-        // Tab strip — each tab is 4 chars: "[N] "
-        const TERMINAL_TAB_COLS: usize = 4;
-        let mut tab_x = x;
-        for i in 0..panel.tab_count {
-            let label = format!("[{}] ", i + 1);
-            if i == panel.active_tab {
-                // Active tab: inverted colors (cursor background)
-                let (ar, ag, ab) = theme.cursor.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(tab_x, y, char_width * TERMINAL_TAB_COLS as f64, line_height);
-                cr.fill().ok();
-                let (br, bg_, bb) = theme.background.to_cairo();
-                cr.set_source_rgb(br, bg_, bb);
-            } else {
-                cr.set_source_rgb(fr, fg2, fb);
-            }
-            layout.set_text(&label);
-            cr.move_to(tab_x, y);
-            pangocairo::show_layout(cr, layout);
-            tab_x += char_width * TERMINAL_TAB_COLS as f64;
-        }
-
-        // If no tabs yet (panel open but spawning), show a minimal title
-        if panel.tab_count == 0 {
-            cr.set_source_rgb(fr, fg2, fb);
-            layout.set_text("  TERMINAL");
-            cr.move_to(x, y);
-            pangocairo::show_layout(cr, layout);
-        }
-
-        // Right-aligned toolbar buttons: + ⊞ □ ×   (add, split, max, close)
-        cr.set_source_rgb(fr, fg2, fb);
-        let maxicon = if panel.maximized {
-            NF_UNMAXIMIZE
-        } else {
-            NF_MAXIMIZE
-        };
-        let btn_text = format!("+ {} {} {}", NF_SPLIT, maxicon, NF_CLOSE);
-        layout.set_text(&btn_text);
-        let (btn_w, _) = layout.pixel_size();
-        cr.move_to(x + w - btn_w as f64 - 4.0, y);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // close_x / split_x used by click detection in MouseClick handler
-    let _ = sender; // click detection handled in MouseClick
-
-    // Restore monospace font for terminal content rendering.
-    layout.set_font_description(Some(&saved_font));
-
     // Scrollbar geometry
     const SB_W: f64 = 6.0;
-    let content_y = y + line_height;
-    let content_h = term_px - line_height;
-    let rows_to_draw = ((term_px / line_height) as usize).saturating_sub(1);
+    let content_y = y;
+    let content_h = term_px;
+    let rows_to_draw = (term_px / line_height) as usize;
     let total = panel.scrollback_rows + rows_to_draw;
     let (thumb_top_px, thumb_bot_px) = if panel.scrollback_rows == 0 {
         (0.0, content_h) // no scrollback → full bar

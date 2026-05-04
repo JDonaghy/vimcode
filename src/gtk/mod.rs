@@ -7463,30 +7463,31 @@ impl App {
                         }
                     }
                 } else {
-                    // Header row click — tab switch, toolbar buttons, or resize drag.
-                    const TERMINAL_TAB_COLS: usize = 4;
-                    let tab_count = self.engine.borrow().terminal_panes.len();
-                    let tab_area_px =
-                        tab_count as f64 * TERMINAL_TAB_COLS as f64 * self.cached_char_width;
-                    // Right-aligned buttons (2 cols each): + ⊞ □ ×
-                    let close_x = width - self.cached_char_width * 2.0;
-                    let max_x = width - self.cached_char_width * 4.0;
-                    let split_x = width - self.cached_char_width * 6.0;
-                    let add_x = width - self.cached_char_width * 8.0;
-                    if x < tab_area_px && self.cached_char_width > 0.0 {
-                        let idx =
-                            (x / (TERMINAL_TAB_COLS as f64 * self.cached_char_width)) as usize;
-                        sender.input(Msg::TerminalSwitchTab(idx));
-                    } else if x >= close_x {
-                        sender.input(Msg::TerminalCloseActiveTab);
-                    } else if x >= max_x {
-                        sender.input(Msg::ToggleTerminalMaximize);
-                    } else if x >= split_x {
-                        sender.input(Msg::TerminalToggleSplit);
-                    } else if x >= add_x {
-                        sender.input(Msg::NewTerminalTab);
-                    } else {
-                        self.terminal_resize_dragging = true;
+                    // Header row — dispatch through cached toolbar hit regions.
+                    use crate::core::engine::TerminalToolbarAction;
+                    match self.engine.borrow().resolve_terminal_toolbar_click(x) {
+                        TerminalToolbarAction::SwitchTab(idx) => {
+                            sender.input(Msg::TerminalSwitchTab(idx));
+                        }
+                        TerminalToolbarAction::CloseTab => {
+                            sender.input(Msg::TerminalCloseActiveTab);
+                        }
+                        TerminalToolbarAction::ToggleMaximize => {
+                            sender.input(Msg::ToggleTerminalMaximize);
+                        }
+                        TerminalToolbarAction::ToggleSplit => {
+                            sender.input(Msg::TerminalToggleSplit);
+                        }
+                        TerminalToolbarAction::AddTab => {
+                            sender.input(Msg::NewTerminalTab);
+                        }
+                        TerminalToolbarAction::CloseFindBar => {
+                            self.engine.borrow_mut().terminal_find_active = false;
+                        }
+                        TerminalToolbarAction::StartResize => {
+                            self.terminal_resize_dragging = true;
+                        }
+                        TerminalToolbarAction::None => {}
                     }
                 }
                 self.draw_needed.set(true);

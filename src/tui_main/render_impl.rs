@@ -644,7 +644,21 @@ pub(super) fn draw_frame(
         match engine.bottom_panel_kind {
             render::BottomPanelKind::Terminal => {
                 if let Some(ref term) = screen.bottom_tabs.terminal {
-                    render_terminal_panel(frame.buffer_mut(), content_area, term, theme);
+                    let toolbar_area = Rect {
+                        x: content_area.x,
+                        y: content_area.y,
+                        width: content_area.width,
+                        height: 1,
+                    };
+                    let hits = render_terminal_toolbar(backend, frame, toolbar_area, term, theme);
+                    engine.terminal_toolbar_hits.replace(Some(hits));
+                    let term_content = Rect {
+                        x: content_area.x,
+                        y: content_area.y + 1,
+                        width: content_area.width,
+                        height: content_area.height.saturating_sub(1),
+                    };
+                    render_terminal_panel(frame.buffer_mut(), term_content, term, theme);
                 }
             }
             render::BottomPanelKind::DebugOutput => {

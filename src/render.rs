@@ -10244,6 +10244,7 @@ pub fn build_tab_bar_primitive(
         right_segments: right,
         active_accent,
         show_tab_close: true,
+        compact: false,
     }
 }
 
@@ -10287,6 +10288,123 @@ pub fn build_bottom_panel_tab_bar(
         right_segments: vec![close_seg],
         active_accent: None,
         show_tab_close: false,
+        compact: true,
+    }
+}
+
+// ─── Terminal toolbar adapter (#305) ─────────────────────────────────────────
+
+/// Nerd-font icons for the terminal toolbar segments.
+const NF_TERM_CLOSE: &str = "󰅖";
+const NF_TERM_SPLIT: &str = "󰤼";
+const NF_TERM_MAXIMIZE: &str = "󰊗";
+const NF_TERM_UNMAXIMIZE: &str = "󰊓";
+
+/// The terminal toolbar is either a find bar or a tab strip.
+pub enum TerminalToolbar {
+    FindBar(quadraui::StatusBar),
+    TabStrip(quadraui::TabBar),
+}
+
+/// Build a `TerminalToolbar` from the current terminal panel state.
+pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalToolbar {
+    if panel.find_active {
+        let fg = to_quadraui_color(theme.status_fg);
+        let bg = to_quadraui_color(theme.status_bg);
+
+        let match_info = if panel.find_match_count == 0 {
+            if panel.find_query.is_empty() {
+                String::new()
+            } else {
+                " (no matches)".to_string()
+            }
+        } else {
+            format!(
+                " ({}/{})",
+                panel.find_selected_idx + 1,
+                panel.find_match_count
+            )
+        };
+        let find_text = format!(" FIND: {}█{}", panel.find_query, match_info);
+
+        TerminalToolbar::FindBar(quadraui::StatusBar {
+            id: quadraui::WidgetId::new("term_toolbar"),
+            left_segments: vec![quadraui::StatusBarSegment {
+                text: find_text,
+                fg,
+                bg,
+                bold: false,
+                action_id: None,
+            }],
+            right_segments: vec![quadraui::StatusBarSegment {
+                text: format!(" {} ", NF_TERM_CLOSE),
+                fg,
+                bg,
+                bold: false,
+                action_id: Some(quadraui::WidgetId::new("term_toolbar:find_close")),
+            }],
+        })
+    } else {
+        let mut tabs: Vec<quadraui::TabItem> = (0..panel.tab_count)
+            .map(|i| quadraui::TabItem {
+                label: format!("[{}]", i + 1),
+                is_active: i == panel.active_tab,
+                is_dirty: false,
+                is_preview: false,
+            })
+            .collect();
+
+        if tabs.is_empty() {
+            tabs.push(quadraui::TabItem {
+                label: "TERMINAL".to_string(),
+                is_active: false,
+                is_dirty: false,
+                is_preview: false,
+            });
+        }
+
+        let maxicon = if panel.maximized {
+            NF_TERM_UNMAXIMIZE
+        } else {
+            NF_TERM_MAXIMIZE
+        };
+
+        let right = vec![
+            quadraui::TabBarSegment {
+                text: "+ ".to_string(),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:add")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", NF_TERM_SPLIT),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:split")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", maxicon),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:maximize")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", NF_TERM_CLOSE),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:close")),
+                is_active: false,
+            },
+        ];
+
+        TerminalToolbar::TabStrip(quadraui::TabBar {
+            id: quadraui::WidgetId::new("term_toolbar"),
+            tabs,
+            scroll_offset: 0,
+            right_segments: right,
+            active_accent: None,
+            show_tab_close: false,
+            compact: true,
+        })
     }
 }
 

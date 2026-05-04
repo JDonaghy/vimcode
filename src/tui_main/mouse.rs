@@ -2280,36 +2280,41 @@ pub(super) fn handle_mouse(
             && row < term_strip_top + strip_rows
         {
             if row == term_strip_top {
-                // Header row — tab switch, toolbar buttons, or resize drag.
+                // Header row — dispatch through cached toolbar hit regions.
                 engine.terminal_has_focus = true;
-                const TERMINAL_TAB_COLS: u16 = 4;
-                let tab_count = engine.terminal_panes.len() as u16;
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                if tab_count > 0 && col < tab_count * TERMINAL_TAB_COLS {
-                    engine.terminal_switch_tab((col / TERMINAL_TAB_COLS) as usize);
-                } else if col >= term_width.saturating_sub(2) {
-                    // Close icon (rightmost 2 cols)
-                    engine.terminal_close_active_tab();
-                } else if col >= term_width.saturating_sub(4) {
-                    // Maximize button (2 cols left of close)
-                    let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
-                    let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    engine.toggle_terminal_maximize();
-                    let target = super::terminal_target_maximize_rows_tui(engine, screen_h);
-                    let effective = engine.effective_terminal_panel_rows(target);
-                    engine.terminal_resize(full_cols, effective);
-                } else if col >= term_width.saturating_sub(6) {
-                    // Split button (2 cols left of maximize)
-                    let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let rows = engine.session.terminal_panel_rows;
-                    engine.terminal_toggle_split(full_cols, rows);
-                } else if col >= term_width.saturating_sub(8) {
-                    // Add button (2 cols left of split)
-                    let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let rows = engine.session.terminal_panel_rows;
-                    engine.terminal_new_tab(cols, rows);
-                } else {
-                    *dragging_terminal_resize = true;
+                use crate::core::engine::TerminalToolbarAction;
+                match engine.resolve_terminal_toolbar_click(col as f64) {
+                    TerminalToolbarAction::SwitchTab(idx) => {
+                        engine.terminal_switch_tab(idx);
+                    }
+                    TerminalToolbarAction::CloseTab => {
+                        engine.terminal_close_active_tab();
+                    }
+                    TerminalToolbarAction::ToggleMaximize => {
+                        let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+                        let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                        engine.toggle_terminal_maximize();
+                        let target = super::terminal_target_maximize_rows_tui(engine, screen_h);
+                        let effective = engine.effective_terminal_panel_rows(target);
+                        engine.terminal_resize(full_cols, effective);
+                    }
+                    TerminalToolbarAction::ToggleSplit => {
+                        let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                        let rows = engine.session.terminal_panel_rows;
+                        engine.terminal_toggle_split(full_cols, rows);
+                    }
+                    TerminalToolbarAction::AddTab => {
+                        let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                        let rows = engine.session.terminal_panel_rows;
+                        engine.terminal_new_tab(cols, rows);
+                    }
+                    TerminalToolbarAction::CloseFindBar => {
+                        engine.terminal_find_active = false;
+                    }
+                    TerminalToolbarAction::StartResize => {
+                        *dragging_terminal_resize = true;
+                    }
+                    TerminalToolbarAction::None => {}
                 }
             } else {
                 // Content row — focus split pane or start divider drag.

@@ -233,6 +233,49 @@ impl Engine {
         }
     }
 
+    /// Resolve a terminal toolbar click to an action using cached hit data.
+    /// Both TUI (cell columns) and GTK (pixel positions) pass screen-absolute
+    /// coordinates; the method accounts for coordinate-system differences
+    /// between `StatusBarLayout` (bar-relative) and `TabBarHits` (absolute).
+    pub fn resolve_terminal_toolbar_click(&self, click_x: f64) -> TerminalToolbarAction {
+        let hits = self.terminal_toolbar_hits.borrow();
+        let Some(ref hits) = *hits else {
+            return TerminalToolbarAction::None;
+        };
+        match hits {
+            TerminalToolbarHits::FindBar { layout, origin_x } => {
+                let rel_x = click_x - origin_x;
+                match layout.hit_test(rel_x as f32, 0.0) {
+                    quadraui::StatusBarHit::Segment(id)
+                        if id.as_str() == "term_toolbar:find_close" =>
+                    {
+                        TerminalToolbarAction::CloseFindBar
+                    }
+                    _ => TerminalToolbarAction::None,
+                }
+            }
+            TerminalToolbarHits::TabStrip(hits) => {
+                for (i, &(sx, ex)) in hits.right_segment_bounds.iter().enumerate() {
+                    if click_x >= sx && click_x < ex {
+                        return match i {
+                            0 => TerminalToolbarAction::AddTab,
+                            1 => TerminalToolbarAction::ToggleSplit,
+                            2 => TerminalToolbarAction::ToggleMaximize,
+                            3 => TerminalToolbarAction::CloseTab,
+                            _ => TerminalToolbarAction::None,
+                        };
+                    }
+                }
+                for (idx, &(sx, ex)) in hits.slot_positions.iter().enumerate() {
+                    if click_x >= sx && click_x < ex && sx < ex {
+                        return TerminalToolbarAction::SwitchTab(idx);
+                    }
+                }
+                TerminalToolbarAction::StartResize
+            }
+        }
+    }
+
     /// Toggle "terminal maximized" state.
     ///
     /// This only flips `terminal_maximized`; the stored user-preferred panel

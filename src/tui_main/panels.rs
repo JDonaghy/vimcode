@@ -3295,12 +3295,51 @@ pub(super) fn render_quickfix_panel(
 
 // ─── Terminal panel ───────────────────────────────────────────────────────────
 
-/// Nerd Font icons for the terminal toolbar.
-pub(super) const NF_TERMINAL_CLOSE: &str = "󰅖"; // nf-md-close_box
-pub(super) const NF_TERMINAL_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
-pub(super) const NF_TERMINAL_MAXIMIZE: &str = "󰊗"; // nf-md-fullscreen
-pub(super) const NF_TERMINAL_UNMAXIMIZE: &str = "󰊓"; // nf-md-fullscreen_exit
+/// Render the terminal toolbar row (find bar or tab strip) through
+/// quadraui primitives. Returns cached hit data for click dispatch.
+pub(super) fn render_terminal_toolbar(
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    panel: &render::TerminalPanel,
+    theme: &Theme,
+) -> crate::core::engine::TerminalToolbarHits {
+    use crate::core::engine::TerminalToolbarHits;
 
+    let toolbar = render::build_terminal_toolbar(panel, theme);
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    match toolbar {
+        render::TerminalToolbar::FindBar(bar) => {
+            let layout = backend.enter_frame_scope(frame, |b| {
+                use quadraui::Backend;
+                let _regions = b.draw_status_bar(q_rect, &bar);
+                bar.layout(area.width as f32, 1.0, 2.0, |seg| {
+                    quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+                })
+            });
+            TerminalToolbarHits::FindBar {
+                layout,
+                origin_x: area.x as f64,
+            }
+        }
+        render::TerminalToolbar::TabStrip(bar) => {
+            let hits = backend.enter_frame_scope(frame, |b| {
+                use quadraui::Backend;
+                b.draw_tab_bar(q_rect, &bar, None)
+            });
+            TerminalToolbarHits::TabStrip(hits)
+        }
+    }
+}
+
+/// Render the terminal panel content (cells + scrollbar + split view).
+/// The toolbar row is drawn separately by `render_terminal_toolbar`.
 pub(super) fn render_terminal_panel(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -3310,94 +3349,10 @@ pub(super) fn render_terminal_panel(
     if area.height == 0 {
         return;
     }
-    let hdr_fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
-    let hdr_bg = RColor::Rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
-
-    // ── Toolbar row ──────────────────────────────────────────────────────────
-    // Clear toolbar background
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-    }
-
-    if panel.find_active {
-        // Find bar mode: show query and match count in toolbar
-        let match_info = if panel.find_match_count == 0 {
-            if panel.find_query.is_empty() {
-                String::new()
-            } else {
-                " (no matches)".to_string()
-            }
-        } else {
-            format!(
-                " ({}/{})",
-                panel.find_selected_idx + 1,
-                panel.find_match_count
-            )
-        };
-        let find_str = format!(" FIND: {}█{}", panel.find_query, match_info);
-        let max_chars = area.width.saturating_sub(3) as usize;
-        for (i, ch) in find_str.chars().enumerate().take(max_chars) {
-            set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-        }
-        // Close icon right-aligned
-        for (i, ch) in NF_TERMINAL_CLOSE.chars().enumerate() {
-            let x = area.x + area.width.saturating_sub(1 + i as u16);
-            set_cell(buf, x, area.y, ch, hdr_fg, hdr_bg);
-        }
-    } else {
-        // Tab strip — each tab is exactly 4 chars: "[N] "
-        const TERMINAL_TAB_COLS: u16 = 4;
-        let mut cursor_x = area.x;
-        for i in 0..panel.tab_count {
-            let label: Vec<char> = format!("[{}] ", i + 1).chars().collect();
-            let (tab_fg, tab_bg) = if i == panel.active_tab {
-                (hdr_bg, hdr_fg) // inverted for active tab
-            } else {
-                (hdr_fg, hdr_bg)
-            };
-            for (j, &ch) in label.iter().enumerate().take(TERMINAL_TAB_COLS as usize) {
-                let x = cursor_x + j as u16;
-                if x >= area.x + area.width {
-                    break;
-                }
-                set_cell(buf, x, area.y, ch, tab_fg, tab_bg);
-            }
-            cursor_x += TERMINAL_TAB_COLS;
-            if cursor_x >= area.x + area.width {
-                break;
-            }
-        }
-
-        // If no tabs yet, show minimal title
-        if panel.tab_count == 0 {
-            for (i, ch) in " TERMINAL".chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-            }
-        }
-
-        // Right-aligned icons: + ⊞ □ ×   (add, split, maximize, close)
-        let maxicon = if panel.maximized {
-            NF_TERMINAL_UNMAXIMIZE
-        } else {
-            NF_TERMINAL_MAXIMIZE
-        };
-        let icons = format!("+ {} {} {}", NF_TERMINAL_SPLIT, maxicon, NF_TERMINAL_CLOSE);
-        let icon_chars: Vec<char> = icons.chars().collect();
-        let icon_start = area.width.saturating_sub(icon_chars.len() as u16 + 1);
-        for (i, &ch) in icon_chars.iter().enumerate() {
-            set_cell(
-                buf,
-                area.x + icon_start + i as u16,
-                area.y,
-                ch,
-                hdr_fg,
-                hdr_bg,
-            );
-        }
-    }
+    let fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
 
     // ── Scrollbar geometry ────────────────────────────────────────────────────
-    let content_rows = area.height.saturating_sub(1) as usize;
+    let content_rows = area.height as usize;
     let sb_col = area.x + area.width.saturating_sub(1);
     // Compute thumb range (row indices into the content area).
     let total = panel.scrollback_rows + content_rows;
@@ -3434,7 +3389,7 @@ pub(super) fn render_terminal_panel(
         );
 
         for row_idx in 0..content_rows {
-            let screen_row = area.y + 1 + row_idx as u16;
+            let screen_row = area.y + row_idx as u16;
             if screen_row >= area.y + area.height {
                 break;
             }
@@ -3442,7 +3397,7 @@ pub(super) fn render_terminal_panel(
 
             // Clear both halves.
             for x in area.x..area.x + area.width.saturating_sub(1) {
-                set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg);
+                set_cell(buf, x, screen_row, ' ', fg, term_bg);
             }
 
             // Left pane cells.
@@ -3487,14 +3442,14 @@ pub(super) fn render_terminal_panel(
     let term =
         render::terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"));
     for row_idx in 0..content_rows {
-        let screen_row = area.y + 1 + row_idx as u16;
+        let screen_row = area.y + row_idx as u16;
         if screen_row >= area.y + area.height {
             break;
         }
         let term_bg_default = rc(theme.terminal_bg);
         // Clear row with terminal default background (excluding scrollbar col).
         for x in area.x..area.x + cell_width {
-            set_cell(buf, x, screen_row, ' ', hdr_fg, term_bg_default);
+            set_cell(buf, x, screen_row, ' ', fg, term_bg_default);
         }
 
         render_terminal_pane_cells(buf, &term, area.x, screen_row, cell_width, row_idx, theme);
