@@ -1217,8 +1217,6 @@ fn event_loop(
     // flow through the single `quadraui::DragState` on `TuiBackend`,
     // with widget ids keyed in `mouse.rs::apply_scrollbar_drag`.
 
-    // Scroll offset for the debug output panel (0 = newest/bottom, n = n lines up from bottom).
-    let mut debug_output_scroll: usize = 0;
     // Phase B.4: drag-state, modal stack, accelerator registry, and
     // platform services live on `TuiBackend`. `backend.drag_and_modal_mut()`
     // hands the mouse handler disjoint borrows of both at once;
@@ -1491,7 +1489,6 @@ fn event_loop(
                             engine,
                             sidebar_width,
                             quickfix_scroll_top,
-                            debug_output_scroll,
                             folder_picker.as_ref(),
                             quit_confirm,
                             quit_confirm_focus,
@@ -1544,7 +1541,6 @@ fn event_loop(
                                     engine,
                                     sidebar_width,
                                     quickfix_scroll_top,
-                                    debug_output_scroll,
                                     folder_picker.as_ref(),
                                     quit_confirm,
                                     quit_confirm_focus,
@@ -3911,7 +3907,6 @@ fn event_loop(
                                 &terminal.size().ok(),
                                 sidebar_width,
                                 &mut dragging_sidebar,
-                                &mut debug_output_scroll,
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
@@ -3961,7 +3956,6 @@ fn event_loop(
                     &terminal.size().ok(),
                     sidebar_width,
                     &mut dragging_sidebar,
-                    &mut debug_output_scroll,
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,

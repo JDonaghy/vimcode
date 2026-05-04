@@ -1556,4 +1556,21 @@ impl Engine {
         }
         let _ = self.settings.save();
     }
+
+    /// Handle a scroll event on the debug output panel.
+    /// `delta_y`: positive = scroll down (toward newer), negative = scroll up (toward older).
+    /// Uses forward-indexed convention (TextDisplay's model).
+    pub fn handle_debug_output_scroll(&mut self, delta_y: f32) {
+        let step = (delta_y.abs() * 3.0).ceil() as usize;
+        let total = self.dap_output_lines.len();
+        if delta_y > 0.0 {
+            self.debug_output_scroll += step;
+            if self.debug_output_scroll >= total.saturating_sub(1) {
+                self.debug_output_auto_scroll = true;
+            }
+        } else {
+            self.debug_output_scroll = self.debug_output_scroll.saturating_sub(step);
+            self.debug_output_auto_scroll = false;
+        }
+    }
 }

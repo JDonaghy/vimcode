@@ -568,17 +568,58 @@ pub(super) fn draw_editor(
                 }
             }
             render::BottomPanelKind::DebugOutput => {
-                draw_debug_output(
-                    cr,
-                    &layout,
+                let td = render::debug_output_to_text_display(
                     &screen.bottom_tabs.output_lines,
-                    &theme,
-                    0.0,
-                    term_y + line_height,
-                    width as f64,
-                    term_px - line_height,
-                    line_height,
+                    engine.debug_output_scroll,
+                    engine.debug_output_auto_scroll,
                 );
+                let q_rect = quadraui::Rect::new(
+                    0.0,
+                    (term_y + line_height) as f32,
+                    width as f32,
+                    (term_px - line_height) as f32,
+                );
+                let td_layout = {
+                    use quadraui::Backend;
+                    let mut b = backend.borrow_mut();
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    let layout_result = b.text_display_layout(q_rect, &td);
+                    b.enter_frame_scope(cr, &layout, |b| {
+                        b.draw_text_display(q_rect, &td);
+                    });
+                    layout_result
+                };
+                let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
+                    |(track, thumb)| {
+                        let offset_y = q_rect.y;
+                        quadraui::SurfaceScrollbar {
+                            track_bounds: quadraui::Rect::new(
+                                q_rect.x + track.x,
+                                offset_y + track.y,
+                                track.width,
+                                track.height,
+                            ),
+                            thumb_bounds: quadraui::Rect::new(
+                                q_rect.x + thumb.x,
+                                offset_y + thumb.y,
+                                thumb.width,
+                                thumb.height,
+                            ),
+                            total_items: td.lines.len(),
+                            visible_items: td_layout.visible_lines.len(),
+                            scroll_offset: td_layout.resolved_scroll_offset,
+                        }
+                    },
+                );
+                engine
+                    .scroll_surfaces
+                    .borrow_mut()
+                    .push(quadraui::ScrollSurface {
+                        id: quadraui::WidgetId::new("debug_output"),
+                        bounds: q_rect,
+                        scrollbar,
+                    });
             }
         }
     }
@@ -2256,9 +2297,9 @@ pub(super) fn draw_bottom_panel_tabs(
     layout.set_attributes(None);
 
     let all_tabs: &[(&str, render::BottomPanelKind, bool)] = &[
-        ("TERMINAL", render::BottomPanelKind::Terminal, has_terminal),
+        ("Terminal", render::BottomPanelKind::Terminal, has_terminal),
         (
-            "DEBUG CONSOLE",
+            "Debug Output",
             render::BottomPanelKind::DebugOutput,
             has_debug_output,
         ),
@@ -2300,39 +2341,6 @@ pub(super) fn draw_bottom_panel_tabs(
 
     // Restore the original monospace font.
     layout.set_font_description(Some(&saved_font));
-}
-
-/// Draw debug output lines (read-only scrolling log).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_debug_output(
-    cr: &Context,
-    layout: &pango::Layout,
-    output_lines: &[String],
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    line_height: f64,
-) {
-    let (br, bg_g, bb) = theme.completion_bg.to_cairo();
-    cr.set_source_rgb(br, bg_g, bb);
-    cr.rectangle(x, y, w, h);
-    cr.fill().ok();
-
-    let (fr, fg, fb) = theme.fuzzy_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-    layout.set_attributes(None);
-
-    let visible_rows = (h / line_height) as usize;
-    let start = output_lines.len().saturating_sub(visible_rows);
-    for (row, line_text) in output_lines.iter().skip(start).enumerate() {
-        let ry = y + row as f64 * line_height;
-        let text = format!("  {line_text}");
-        layout.set_text(&text);
-        cr.move_to(x, ry);
-        pangocairo::show_layout(cr, layout);
-    }
 }
 
 /// Draw the VSCode-style debug sidebar content.

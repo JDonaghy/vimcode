@@ -2822,6 +2822,13 @@ pub struct Engine {
     /// Cached hit regions for the debug sidebar action-button row.
     /// Paint fills; click reads verbatim (paint↔click pattern).
     pub dap_sidebar_action_hits: std::cell::RefCell<Vec<quadraui::StatusBarHitRegion>>,
+    /// Forward-indexed scroll offset for the debug output panel (0 = top/oldest).
+    pub debug_output_scroll: usize,
+    /// When true, debug output auto-scrolls to show newest lines.
+    pub debug_output_auto_scroll: bool,
+    /// Scroll surfaces registered at paint time for `dispatch_scroll`.
+    /// Cleared at the start of each frame.
+    pub scroll_surfaces: std::cell::RefCell<Vec<quadraui::ScrollSurface>>,
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -3491,6 +3498,9 @@ impl Engine {
             dap_sidebar_msv_layout: std::cell::RefCell::new(None),
             dap_sidebar_msv_view: std::cell::RefCell::new(None),
             dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
+            debug_output_scroll: 0,
+            debug_output_auto_scroll: true,
+            scroll_surfaces: std::cell::RefCell::new(Vec::new()),
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),

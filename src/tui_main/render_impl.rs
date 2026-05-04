@@ -100,7 +100,6 @@ pub(super) fn draw_frame(
     engine: &Engine,
     sidebar_width: u16,
     quickfix_scroll_top: usize,
-    debug_output_scroll: usize,
     folder_picker: Option<&FolderPickerState>,
     quit_confirm: bool,
     quit_confirm_focus: usize,
@@ -647,13 +646,56 @@ pub(super) fn draw_frame(
                 }
             }
             render::BottomPanelKind::DebugOutput => {
-                render_debug_output(
-                    frame.buffer_mut(),
-                    content_area,
+                let td = render::debug_output_to_text_display(
                     &screen.bottom_tabs.output_lines,
-                    debug_output_scroll,
-                    theme,
+                    engine.debug_output_scroll,
+                    engine.debug_output_auto_scroll,
                 );
+                let q_rect = quadraui::Rect::new(
+                    content_area.x as f32,
+                    content_area.y as f32,
+                    content_area.width as f32,
+                    content_area.height as f32,
+                );
+                backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+                let td_layout = {
+                    use quadraui::Backend;
+                    backend.text_display_layout(q_rect, &td)
+                };
+                backend.enter_frame_scope(frame, |b| {
+                    use quadraui::Backend;
+                    b.draw_text_display(q_rect, &td);
+                });
+                let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
+                    |(track, thumb)| {
+                        let offset_y = q_rect.y;
+                        quadraui::SurfaceScrollbar {
+                            track_bounds: quadraui::Rect::new(
+                                q_rect.x + track.x,
+                                offset_y + track.y,
+                                track.width,
+                                track.height,
+                            ),
+                            thumb_bounds: quadraui::Rect::new(
+                                q_rect.x + thumb.x,
+                                offset_y + thumb.y,
+                                thumb.width,
+                                thumb.height,
+                            ),
+                            total_items: td.lines.len(),
+                            visible_items: td_layout.visible_lines.len(),
+                            scroll_offset: td_layout.resolved_scroll_offset,
+                        }
+                    },
+                );
+                engine
+                    .scroll_surfaces
+                    .borrow_mut()
+                    .push(quadraui::ScrollSurface {
+                        id: quadraui::WidgetId::new("debug_output"),
+                        bounds: q_rect,
+                        scrollbar,
+                    });
             }
         }
     }
@@ -2359,7 +2401,6 @@ mod tests {
                     engine,
                     sidebar_width,
                     0,     // quickfix_scroll_top
-                    0,     // debug_output_scroll
                     None,  // folder_picker
                     false, // quit_confirm
                     0,     // quit_confirm_focus

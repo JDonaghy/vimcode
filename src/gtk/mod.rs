@@ -4601,6 +4601,37 @@ impl SimpleComponent for App {
                         return;
                     }
                 }
+                // Route scroll through dispatch_scroll using cached scroll surfaces.
+                if let Some((px, py)) = self.last_editor_pointer.get() {
+                    let surfaces = engine.scroll_surfaces.borrow();
+                    let scroll_events = quadraui::dispatch_scroll(
+                        &self.backend.borrow().modal_stack_handle().borrow(),
+                        &surfaces,
+                        quadraui::Point {
+                            x: px as f32,
+                            y: py as f32,
+                        },
+                        quadraui::ScrollDelta::new(delta_x as f32, delta_y as f32),
+                    );
+                    drop(surfaces);
+                    for sev in &scroll_events {
+                        if let quadraui::UiEvent::Scroll {
+                            widget: Some(id),
+                            delta,
+                            ..
+                        } = sev
+                        {
+                            if id.as_str() == "debug_output" {
+                                engine.handle_debug_output_scroll(delta.y);
+                                drop(engine);
+                                if let Some(da) = self.drawing_area.borrow().as_ref() {
+                                    da.queue_draw();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 // #240: route to the window under the pointer, falling back
                 // to the active window when the pointer is missing or over
                 // a non-window region. Hovering an unfocused group's pane
@@ -6366,6 +6397,45 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         self.reconcile_editor_hover_modal();
+
+        // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
+        {
+            let surfaces = self.engine.borrow().scroll_surfaces.borrow().clone();
+            let modal = self.backend.borrow().modal_stack_handle().borrow().clone();
+            let mut drag = self.backend.borrow().drag_state_handle().borrow().clone();
+            let click_events = quadraui::dispatch_click(
+                &modal,
+                &surfaces,
+                &mut drag,
+                quadraui::Point {
+                    x: x as f32,
+                    y: y as f32,
+                },
+                quadraui::MouseButton::Left,
+                Default::default(),
+            );
+            *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
+            for cev in &click_events {
+                match cev {
+                    quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset }
+                        if widget.as_str() == "debug_output" =>
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.debug_output_scroll = *new_offset;
+                        engine.debug_output_auto_scroll = false;
+                        drop(engine);
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    quadraui::UiEvent::MouseDown { widget: Some(id), .. }
+                        if id.as_str() == "debug_output" =>
+                    {
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // ── Tab switcher modal arbitration (B.5b Stage 7) ──────────────
         //

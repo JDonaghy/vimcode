@@ -1849,6 +1849,40 @@ pub fn is_debug_sidebar_action(id: &quadraui::WidgetId) -> bool {
     id.as_str() == "debug_sidebar:action"
 }
 
+/// Build a `TextDisplay` for the debug output panel.
+pub fn debug_output_to_text_display(
+    output_lines: &[String],
+    scroll_offset: usize,
+    auto_scroll: bool,
+) -> quadraui::TextDisplay {
+    let lines: Vec<quadraui::TextDisplayLine> = output_lines
+        .iter()
+        .map(|line| quadraui::TextDisplayLine {
+            spans: vec![quadraui::StyledSpan {
+                text: format!("  {line}"),
+                fg: None,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+            }],
+            decoration: quadraui::Decoration::Normal,
+            timestamp: None,
+        })
+        .collect();
+
+    quadraui::TextDisplay {
+        id: quadraui::WidgetId::new("debug_output"),
+        lines,
+        scroll_offset,
+        auto_scroll,
+        max_lines: 0,
+        has_focus: false,
+        title: None,
+        show_scrollbar: true,
+    }
+}
+
 // ─── Static menu structure ────────────────────────────────────────────────────
 
 /// Static description of every top-level menu and its items.
