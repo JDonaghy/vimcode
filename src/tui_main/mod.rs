@@ -2727,16 +2727,18 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
+                        let input_active = engine.ext_sidebar_input_active;
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-                            KeyCode::Char('j') | KeyCode::Down => ("j", None),
-                            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Char('j') | KeyCode::Down if !input_active => ("j", None),
+                            KeyCode::Char('k') | KeyCode::Up if !input_active => ("k", None),
                             KeyCode::Tab => ("Tab", None),
                             KeyCode::Enter => ("Return", None),
-                            KeyCode::Char('d') => ("d", None),
-                            KeyCode::Char('i') => ("i", None),
-                            KeyCode::Char('r') => ("r", None),
-                            KeyCode::Char('/') => ("/", None),
-                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+                            KeyCode::Char('d') if !input_active => ("d", None),
+                            KeyCode::Char('i') if !input_active => ("i", None),
+                            KeyCode::Char('r') if !input_active => ("r", None),
+                            KeyCode::Char('/') if !input_active => ("/", None),
+                            KeyCode::Char('q') if !input_active => ("Escape", None),
+                            KeyCode::Esc => ("Escape", None),
                             KeyCode::Backspace => ("BackSpace", None),
                             KeyCode::Char(ch) => ("char", Some(ch)),
                             _ => ("", None),
