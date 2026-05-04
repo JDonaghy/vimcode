@@ -1,3 +1,18 @@
+## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
+
+**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/`, `src/tui_main/`, or `src/win_gui/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
+
+1. Identify what quadraui infrastructure is missing.
+2. File a quadraui issue describing the gap.
+3. Build the infrastructure in quadraui first.
+4. Only then implement the vimcode side through the shared API.
+
+This applies to scroll routing, hit-testing, event dispatch, layout math, coordinate transforms — everything. The goal is zero platform-specific logic in vimcode. Both TUI and GTK must behave identically from the same shared code path.
+
+**Push back actively.** If the user asks to implement something that would require per-backend code, say so upfront and propose the quadraui-first alternative. Do not attempt a per-backend fix and fail — refuse the approach and explain what quadraui needs first.
+
+**Why this rule exists.** Multiple sessions of effort were wasted adding GTK-specific scroll handlers, hit-test math, and coordinate conversions that never converged. Per-backend fixes are band-aids that create the exact duplication quadraui exists to eliminate. The lesson: if it can't be done through quadraui's backend-independent API, it can't be done yet — and the right action is to build the API.
+
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Read `PLAN.md` if present — it is the pickup doc for any in-flight multi-stage feature (e.g. the current `quadraui` wave). The "Architectural focus" header at the top names the active design axis, lists resolved/open architectural questions, and points at the deeper docs; the stage map below tracks shipped/next work. Read both.
