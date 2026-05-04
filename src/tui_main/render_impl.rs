@@ -201,8 +201,11 @@ pub(super) fn draw_frame(
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
     if let Some(ref menu_data) = screen.menu_bar {
-        render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
+        let mb_layout = render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
+        engine.menu_bar_layout.replace(Some(mb_layout));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
+    } else {
+        engine.menu_bar_layout.replace(None);
     }
 
     // ── Render activity bar ───────────────────────────────────────────────────
@@ -2223,56 +2226,30 @@ pub(super) fn render_menu_bar(
     area: Rect,
     data: &render::MenuBarData,
     theme: &Theme,
-) {
+) -> quadraui::MenuBarLayout {
+    let q_theme = super::quadraui_tui::q_theme(theme);
+    let bar = render::build_menu_bar_view(data.open_menu_idx);
+    let layout = quadraui::tui::draw_menu_bar(buf, area, &bar, &q_theme);
+
     if area.height == 0 {
-        return;
+        return layout;
     }
-    let bar_bg = rc(theme.status_bg);
-    let bar_fg = rc(theme.status_fg);
+
+    let bar_bg = rc(theme.tab_bar_bg);
+    let bar_fg = rc(theme.tab_inactive_fg);
     let y = area.y;
 
-    // Fill background
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, y, ' ', bar_fg, bar_bg);
-    }
-
-    // Menu labels (no hamburger here — it lives in the activity bar below)
-    let mut col = area.x + 1; // one-cell left pad
-
-    for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-        let is_open = data.open_menu_idx == Some(idx);
-        let (fg, bg) = if is_open {
-            (bar_bg, bar_fg) // reversed for open
-        } else {
-            (bar_fg, bar_bg)
-        };
-        // Space before name
-        if col < area.x + area.width {
-            set_cell(buf, col, y, ' ', bar_fg, bar_bg);
-            col += 1;
-        }
-        // Name chars
-        for ch in name.chars() {
-            if col >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, col, y, ch, fg, bg);
-            col += 1;
-        }
-        // Space after name
-        if col < area.x + area.width {
-            set_cell(buf, col, y, ' ', fg, bar_bg);
-            col += 1;
-        }
-    }
+    let menu_end: u16 = layout
+        .visible_items
+        .last()
+        .map(|vi| area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
+        .unwrap_or(area.x);
 
     // Center nav arrows + search box as one unit between menu labels and right edge.
     let dim_fg = rc(theme.line_number_fg);
     let active_fg = bar_fg;
-    let menu_end = col;
 
-    // Compute total unit width: "◀ ▶ [ 🔍 title ]"
-    let arrows_w: u16 = 4; // "◀ ▶" = 4 cols (arrow + space + arrow + space)
+    let arrows_w: u16 = 4;
     let display = if data.title.is_empty() {
         String::new()
     } else {
@@ -2280,7 +2257,6 @@ pub(super) fn render_menu_bar(
     };
     let display_chars: Vec<char> = display.chars().collect();
     let text_len = display_chars.len() as u16;
-    // Box = [ space text space ] = text + 4
     let box_width = if !display.is_empty() { text_len + 4 } else { 0 };
     let gap = if box_width > 0 { 1u16 } else { 0 };
     let total_unit = arrows_w + gap + box_width;
@@ -2290,7 +2266,6 @@ pub(super) fn render_menu_bar(
     if available >= total_unit + 2 {
         let unit_start = menu_end + (available - total_unit) / 2;
 
-        // Draw arrows.
         let mut ax = unit_start;
         let back_fg = if data.nav_back_enabled {
             active_fg
@@ -2311,12 +2286,10 @@ pub(super) fn render_menu_bar(
         set_cell(buf, ax, y, ' ', bar_bg, bar_bg);
         ax += 1;
 
-        // Draw search box.
         if !display.is_empty() {
             ax += gap;
             let box_start = ax;
             let box_end = box_start + box_width;
-            // Use bar_fg (same as menu text) for box border and text
             if box_start < right_edge {
                 set_cell(buf, box_start, y, '[', dim_fg, bar_bg);
             }
@@ -2337,6 +2310,8 @@ pub(super) fn render_menu_bar(
             }
         }
     }
+
+    layout
 }
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────

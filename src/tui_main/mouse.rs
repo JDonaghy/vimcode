@@ -1988,22 +1988,28 @@ pub(super) fn handle_mouse(
 
     // ── Menu bar row click ─────────────────────────────────────────────────────
     if engine.menu_bar_visible && row == 0 {
-        let mut col_pos: u16 = 1; // 1-cell left pad
-        for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-            let item_w = name.chars().count() as u16 + 2; // space + name + space
-            if col >= col_pos && col < col_pos + item_w {
-                if engine.menu_open_idx == Some(idx) {
-                    engine.close_menu();
-                } else {
-                    engine.open_menu(idx);
-                }
-                return sidebar_width;
+        let mb_hit = engine
+            .menu_bar_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.hit_test(col as f32, row as f32 + 0.5));
+        if let Some(quadraui::MenuBarHit::Item(idx)) = mb_hit {
+            if engine.menu_open_idx == Some(idx) {
+                engine.close_menu();
+            } else {
+                engine.open_menu(idx);
             }
-            col_pos += item_w;
+            return sidebar_width;
         }
         // Nav arrows + search box are centered between menu_end and right edge.
-        let menu_end = col_pos;
-        let arrows_w: u16 = 4; // "◀ ▶ "
+        let menu_end: u16 = engine
+            .menu_bar_layout
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.visible_items.last())
+            .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
+            .unwrap_or(0);
+        let arrows_w: u16 = 4;
         let title = engine
             .cwd
             .file_name()
@@ -2019,7 +2025,6 @@ pub(super) fn handle_mouse(
         let available = term_w.saturating_sub(menu_end);
         if available >= total_unit + 2 {
             let unit_start = menu_end + (available - total_unit) / 2;
-            // Back arrow at unit_start, forward at unit_start+2
             if col == unit_start {
                 engine.tab_nav_back();
                 return sidebar_width;
@@ -2028,7 +2033,6 @@ pub(super) fn handle_mouse(
                 engine.tab_nav_forward();
                 return sidebar_width;
             }
-            // Search box area: from arrows_w past unit_start to end of box
             let search_start = unit_start + arrows_w + gap;
             let search_end = unit_start + total_unit;
             if col >= search_start && col < search_end {
@@ -2036,7 +2040,7 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
         }
-        engine.close_menu(); // click in empty area of menu bar
+        engine.close_menu();
         return sidebar_width;
     }
 

@@ -2834,8 +2834,9 @@ pub(super) fn draw_command_line(
     }
 }
 
-/// Returns `(back_x, back_end, fwd_x, fwd_end, unit_end)` — pixel hit rects for nav arrows
-/// and the right edge of the entire interactive area (arrows + search box).
+/// Returns `(MenuBarLayout, (back_x, back_end, fwd_x, fwd_end, unit_end))` — the quadraui
+/// layout for menu label hit-testing plus pixel hit rects for nav arrows / search box.
+#[allow(clippy::type_complexity)]
 pub(super) fn draw_menu_bar(
     cr: &Context,
     data: &render::MenuBarData,
@@ -2844,63 +2845,43 @@ pub(super) fn draw_menu_bar(
     y: f64,
     width: f64,
     height: f64,
-) -> (f64, f64, f64, f64, f64) {
-    // Title bar background: use tab_bar_bg (adapts to light/dark themes).
-    let (tbr, tbg, tbb) = theme.tab_bar_bg.to_cairo();
-    cr.set_source_rgb(tbr, tbg, tbb);
-    cr.rectangle(x, y, width, height);
-    let _ = cr.fill();
-
+) -> (quadraui::MenuBarLayout, (f64, f64, f64, f64, f64)) {
     let pango_ctx = pangocairo::create_context(cr);
     let font_desc = pango::FontDescription::from_string(&UI_FONT());
-    let layout = pango::Layout::new(&pango_ctx);
-    layout.set_font_description(Some(&font_desc));
+    let pango_layout = pango::Layout::new(&pango_ctx);
+    pango_layout.set_font_description(Some(&font_desc));
+
+    let q_theme = super::quadraui_gtk::q_theme(theme);
+    let bar = render::build_menu_bar_view(data.open_menu_idx);
+    let mb_layout =
+        quadraui::gtk::draw_menu_bar(cr, &pango_layout, x, y, width, height, &bar, &q_theme);
 
     let (fr, fg, fb) = theme.foreground.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
 
-    // Menu labels
-    let mut cursor_x = x + 8.0;
-
-    for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-        let is_open = data.open_menu_idx == Some(idx);
-        if is_open {
-            let (ar, ag, ab) = theme.keyword.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-        } else {
-            cr.set_source_rgb(fr, fg, fb);
-        }
-        layout.set_text(name);
-        let (_lw, lh) = layout.pixel_size();
-        cr.move_to(cursor_x, y + (height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, &layout);
-        // Use same metric as click/hover handlers: 7px/char + 10px padding.
-        cursor_x += name.len() as f64 * 7.0 + 10.0;
-    }
+    let menu_end_x = mb_layout
+        .visible_items
+        .last()
+        .map(|vi| x + (vi.bounds.x + vi.bounds.width) as f64)
+        .unwrap_or(x);
 
     // Centered nav arrows + search box (like VSCode Command Center).
-    // The entire unit is centered between the menu labels and the right edge.
-    let menu_end_x = cursor_x;
-
-    // Measure arrow widths.
-    layout.set_text("\u{25C0}"); // ◀
-    let (back_w, _) = layout.pixel_size();
-    layout.set_text("\u{25B6}"); // ▶
-    let (fwd_w, _) = layout.pixel_size();
+    pango_layout.set_text("\u{25C0}"); // ◀
+    let (back_w, _) = pango_layout.pixel_size();
+    pango_layout.set_text("\u{25B6}"); // ▶
+    let (fwd_w, _) = pango_layout.pixel_size();
     let arrow_gap = 6.0;
     let arrows_w = back_w as f64 + arrow_gap + fwd_w as f64;
 
-    // Measure search box text.
     let display = if data.title.is_empty() {
         String::new()
     } else {
         format!("\u{1f50d}  {}", data.title)
     };
     let box_pad = 12.0;
-    let min_box_w = 280.0; // minimum search bar width to match VSCode proportions
+    let min_box_w = 280.0;
     let (box_text_w, _) = if !display.is_empty() {
-        layout.set_text(&display);
-        layout.pixel_size()
+        pango_layout.set_text(&display);
+        pango_layout.pixel_size()
     } else {
         (0, 0)
     };
@@ -2912,11 +2893,9 @@ pub(super) fn draw_menu_bar(
     let gap_between = if box_w > 0.0 { 10.0 } else { 0.0 };
     let total_unit_w = arrows_w + gap_between + box_w;
 
-    // Center the unit between menu_end_x and right edge.
     let available = x + width - menu_end_x;
     let unit_x = (menu_end_x + (available - total_unit_w) / 2.0).max(menu_end_x + 8.0);
 
-    // Draw back arrow.
     let dim_fg = theme.line_number_fg;
     let back_color = if data.nav_back_enabled {
         theme.foreground
@@ -2925,12 +2904,12 @@ pub(super) fn draw_menu_bar(
     };
     let (br2, bg2, bb2) = back_color.to_cairo();
     cr.set_source_rgb(br2, bg2, bb2);
-    layout.set_text("\u{25C0}");
-    let (_, bh) = layout.pixel_size();
+    pango_layout.set_text("\u{25C0}");
+    pango_layout.set_attributes(None);
+    let (_, bh) = pango_layout.pixel_size();
     cr.move_to(unit_x, y + (height - bh as f64) / 2.0);
-    pangocairo::show_layout(cr, &layout);
+    pangocairo::show_layout(cr, &pango_layout);
 
-    // Draw forward arrow.
     let fwd_color = if data.nav_forward_enabled {
         theme.foreground
     } else {
@@ -2938,21 +2917,19 @@ pub(super) fn draw_menu_bar(
     };
     let (fr2, fg2, fb2) = fwd_color.to_cairo();
     cr.set_source_rgb(fr2, fg2, fb2);
-    layout.set_text("\u{25B6}");
-    let (_, fh) = layout.pixel_size();
+    pango_layout.set_text("\u{25B6}");
+    let (_, fh) = pango_layout.pixel_size();
     cr.move_to(
         unit_x + back_w as f64 + arrow_gap,
         y + (height - fh as f64) / 2.0,
     );
-    pangocairo::show_layout(cr, &layout);
+    pangocairo::show_layout(cr, &pango_layout);
 
-    // Draw search box.
     if !display.is_empty() {
         let bx = unit_x + arrows_w + gap_between;
         let by = y + 3.0;
         let bh_box = height - 6.0;
         let radius = 4.0;
-        // Border
         let (sr, sg, sb) = theme.separator.to_cairo();
         cr.set_source_rgb(sr, sg, sb);
         cr.new_path();
@@ -2987,23 +2964,24 @@ pub(super) fn draw_menu_bar(
         cr.close_path();
         cr.set_line_width(1.0);
         let _ = cr.stroke();
-        // Text inside box — same color as menu labels (foreground)
         cr.set_source_rgb(fr, fg, fb);
-        layout.set_text(&display);
-        let (_, th) = layout.pixel_size();
+        pango_layout.set_text(&display);
+        let (_, th) = pango_layout.pixel_size();
         cr.move_to(bx + box_pad, y + (height - th as f64) / 2.0);
-        pangocairo::show_layout(cr, &layout);
+        pangocairo::show_layout(cr, &pango_layout);
     }
 
-    // Return pixel hit rects for back and forward arrows + interactive area end.
-    let fwd_x = unit_x + back_w as f64 + arrow_gap;
+    let fwd_x_pos = unit_x + back_w as f64 + arrow_gap;
     let unit_end = unit_x + total_unit_w;
     (
-        unit_x,
-        unit_x + back_w as f64,
-        fwd_x,
-        fwd_x + fwd_w as f64,
-        unit_end,
+        mb_layout,
+        (
+            unit_x,
+            unit_x + back_w as f64,
+            fwd_x_pos,
+            fwd_x_pos + fwd_w as f64,
+            unit_end,
+        ),
     )
 }
 

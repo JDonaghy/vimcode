@@ -3441,6 +3441,26 @@ pub fn menu_dropdown_action_index(id: &quadraui::WidgetId) -> Option<usize> {
     id.as_str().strip_prefix("menu:")?.parse().ok()
 }
 
+/// Build a `quadraui::MenuBar` descriptor from the static `MENU_STRUCTURE`
+/// and the engine's current open-menu state.
+pub fn build_menu_bar_view(open_menu_idx: Option<usize>) -> quadraui::MenuBar {
+    let items = MENU_STRUCTURE
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _alt_key, _))| quadraui::MenuBarItem {
+            id: quadraui::WidgetId::new(format!("menubar:{i}")),
+            label: format!("&{name}"),
+            disabled: false,
+        })
+        .collect();
+    quadraui::MenuBar {
+        id: quadraui::WidgetId::new("menubar"),
+        items,
+        open_item: open_menu_idx,
+        focused_item: None,
+    }
+}
+
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {
