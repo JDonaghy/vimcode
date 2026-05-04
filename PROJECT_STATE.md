@@ -1,23 +1,29 @@
 # VimCode Project State
 
-**Last updated:** May 3, 2026 (Session 348 — backlog audit + issue triage).
+**Last updated:** May 3, 2026 (Session 348 — #306 debug sidebar chrome + #303 debug output shipped; platform-neutrality rule established).
 
 ## Active milestone: Cross-Platform UI Crate
 
-**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend paint code — every UI surface paints through a quadraui primitive on both TUI and GTK. Win-GUI is deferred until quadraui implements that backend.
+**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
 
-**Remaining bespoke surfaces** (6 issues, all adoption gates met):
+**Remaining bespoke paint surfaces** (3 issues):
 
 | # | Surface | Primitive | Est. |
 |---|---------|-----------|------|
 | [#302](https://github.com/JDonaghy/vimcode/issues/302) | Search panel (~321 TUI + native GTK) | MSV+TreeView | 12–16 hrs |
 | [#301](https://github.com/JDonaghy/vimcode/issues/301) | Menu bar (~119 TUI + ~172 GTK) | `MenuBar` | 6–8 hrs |
-| [#304](https://github.com/JDonaghy/vimcode/issues/304) | Bottom panel tabs (~65 TUI + ~82 GTK) | `TabBar` | 3–4 hrs |
-| [#303](https://github.com/JDonaghy/vimcode/issues/303) | Debug output panel (~90 TUI + ~47 GTK) | `ListView` | 2–4 hrs |
+| [#304](https://github.com/JDonaghy/vimcode/issues/304) | Bottom panel tabs (~65 TUI + ~82 GTK) | `TabBar` or `StatusBar` | 3–4 hrs |
 | [#305](https://github.com/JDonaghy/vimcode/issues/305) | Terminal toolbar (~73 TUI + ~66 GTK) | `StatusBar` + `TabBar` | 4–6 hrs |
-| [#306](https://github.com/JDonaghy/vimcode/issues/306) | Debug sidebar chrome (~37 TUI + ~32 GTK) | `StatusBar` | 1–2 hrs |
 
-When this milestone completes, evaluate next milestone priority (likely bug-fix sweep, then Win-GUI rebuild B.6).
+**Scroll dispatch migration** ([#307](https://github.com/JDonaghy/vimcode/issues/307)):
+
+#303 established the `ScrollSurface` + `dispatch_scroll` + `dispatch_click` pattern. [#307](https://github.com/JDonaghy/vimcode/issues/307) tracks migrating all remaining scrollable surfaces (editor viewport, terminal scrollback, sidebar panels, debug sidebar, hover popup) to the same shared dispatch — eliminating ~82 lines of bespoke per-backend scroll routing in TUI `mouse.rs` alone, plus equivalent GTK code.
+
+**Shipped this session:**
+- **#306** (`368bbcb`) — Debug sidebar chrome → `StatusBar`. Both backends paint header + action button through shared adapter.
+- **#303** (`70d4eef`) — Debug output → `TextDisplay` with built-in scrollbar. Scroll wheel via `dispatch_scroll`, scrollbar click/drag via `dispatch_click`. GTK gained scroll parity it never had. `debug_output_scroll` moved from TUI local variable to engine field (~30 threading sites eliminated).
+- **Platform-neutrality rule** codified in CLAUDE.md (top of file, mandatory). Never add per-backend code to vimcode; if quadraui lacks infrastructure, build it there first.
+- **quadraui #46** (TextDisplay scrollbar), **#47** (dispatch_scroll), **#48** (dispatch_click with scrollbar) — built by agents during this session to unblock #303.
 
 ---
 
