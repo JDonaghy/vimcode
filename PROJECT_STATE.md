@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 3, 2026 (Session 348 — #306 debug sidebar chrome + #303 debug output shipped; platform-neutrality rule established).
+**Last updated:** May 4, 2026 (Session 349 — #304 bottom panel tabs shipped; quadraui gained `show_tab_close`).
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,32 +12,28 @@
 |---|---------|-----------|------|
 | [#302](https://github.com/JDonaghy/vimcode/issues/302) | Search panel (~321 TUI + native GTK) | MSV+TreeView | 12–16 hrs |
 | [#301](https://github.com/JDonaghy/vimcode/issues/301) | Menu bar (~119 TUI + ~172 GTK) | `MenuBar` | 6–8 hrs |
-| [#304](https://github.com/JDonaghy/vimcode/issues/304) | Bottom panel tabs (~65 TUI + ~82 GTK) | `TabBar` or `StatusBar` | 3–4 hrs |
 | [#305](https://github.com/JDonaghy/vimcode/issues/305) | Terminal toolbar (~73 TUI + ~66 GTK) | `StatusBar` + `TabBar` | 4–6 hrs |
+
+**All quadraui prereqs are now resolved.** quadraui#6 (MenuBar rasterisers) and quadraui#7 (SearchPanel) are both CLOSED — #301 and #302 are ready to work on with no blockers.
 
 **Scroll dispatch migration** ([#307](https://github.com/JDonaghy/vimcode/issues/307)):
 
 #303 established the `ScrollSurface` + `dispatch_scroll` + `dispatch_click` pattern. [#307](https://github.com/JDonaghy/vimcode/issues/307) tracks migrating all remaining scrollable surfaces (editor viewport, terminal scrollback, sidebar panels, debug sidebar, hover popup) to the same shared dispatch — eliminating ~82 lines of bespoke per-backend scroll routing in TUI `mouse.rs` alone, plus equivalent GTK code.
 
 **Shipped this session:**
-- **#306** (`368bbcb`) — Debug sidebar chrome → `StatusBar`. Both backends paint header + action button through shared adapter.
-- **#303** (`70d4eef`) — Debug output → `TextDisplay` with built-in scrollbar. Scroll wheel via `dispatch_scroll`, scrollbar click/drag via `dispatch_click`. GTK gained scroll parity it never had. `debug_output_scroll` moved from TUI local variable to engine field (~30 threading sites eliminated).
-- **Platform-neutrality rule** codified in CLAUDE.md (top of file, mandatory). Never add per-backend code to vimcode; if quadraui lacks infrastructure, build it there first.
-- **quadraui #46** (TextDisplay scrollbar), **#47** (dispatch_scroll), **#48** (dispatch_click with scrollbar) — built by agents during this session to unblock #303.
+- **#304** (`5d7fa09`) — Bottom panel tabs → `quadraui::TabBar`. Both backends paint through `build_bottom_panel_tab_bar()` → `Backend::draw_tab_bar()`. Click dispatch via shared `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` (`b9d62cd`) to suppress per-tab close buttons.
 
 ---
 
-**Previous session (347):** #166 diff-pane drift fix + #296 Debug→MSV shipped. #282 SC panel closed (already on TreeView). Key lesson codified in CLAUDE.md "Paint↔click integration pattern."
+**Previous session (348):** #306 debug sidebar chrome + #303 debug output shipped; platform-neutrality rule established. quadraui #46/#47/#48 built to unblock #303.
 
-Vimcode at 1952 lib + integration tests passing on develop@285916b. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`5d7fa09`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 346 are in **SESSION_HISTORY.md**.
+> Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
 
-Prior session (346 — Apr 30): Harness-first course correction shipped. Pivoted from failed #296 attempts to structural fix: #297 cell_quantum, #298/#299 harnesses, #300 quadraui extracted to own repo. 4 vimcode issues gained `blocked` label with cross-repo prereq links.
-
-> Sessions 344 and earlier in **SESSION_HISTORY.md**.
+> Sessions 347 and earlier in **SESSION_HISTORY.md**.
 
 
 ---
@@ -103,6 +99,7 @@ cell coalescence) remain but are tracked separately.
 | Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
 | Debug sidebar (variables tree, breakpoints, watch) | `MultiSectionView` (4 × `TreeView`) | ✅ | ✅ | #296, `285916b`. Adapter `render::debug_sidebar_to_multi_section_view`. Paint caches layout; click reads verbatim. |
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
+| Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false` suppresses per-tab ×. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
@@ -125,56 +122,7 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-**Session 343 — TUI/GTK paint duplication arc closed end-to-end (`develop@7f3498c`):**
-
-Six items shipped via Path A on develop, plus eight follow-up issues filed.
-
-| # | What | Commit |
-|---|---|---|
-| 283 | TUI BP/diagnostic gutter collision (smoke fallout from #276) | `f0b850f` |
-| — | Doc reconciliation: #214 RichTextPopup already shipped | `b96c65d` |
-| 285 | GTK Completions popup lift (`quadraui::gtk::draw_completions`) | `345d81f` |
-| 286 | GTK Ctrl-alone-dismisses completion popup | `392e89c` |
-| 280 | Extension panel TreeView lift (`render::ext_sidebar_to_tree_view`) | `d29d1b4` + `6982462` |
-| 281 | Debug sidebar lift onto four `TreeView` instances + 7 smoke fixes | 8 commits, head `7f3498c` |
-
-**Phase C umbrella ([#275](https://github.com/JDonaghy/vimcode/issues/275)) closed.** Cross-backend coverage table is fully ✅✅ on both backends.
-
-**The #281 smoke wave was instructive.** Eight commits to ship one lift, with three dead-end fixes (`d06568c` `38c052e` `c0fdc8a`) that landed before the actual root causes were diagnosed. The two real fixes were `33cfd2b` (GTK paint uses `line_height × 1.4` per row but click hit-test used 1.0× — the root of the 3→4, 6→8 row drift) and `f15a490` (TUI paint computed section heights locally while click read engine state populated from a different base — root of the section-walk drift). Lesson captured: when paint and click share a multi-section panel, they must read from one source-of-truth in one unit. **Filed as architectural follow-up [#293](https://github.com/JDonaghy/vimcode/issues/293) — `MultiSectionView` primitive** that owns the entire layout (titles + scrollbars + per-section trees) so future panels and future backends (Win-GUI, macOS) cannot reintroduce the drift.
-
-**Follow-ups filed (open, prioritised for next sessions):**
-
-- **#293** `MultiSectionView` primitive — architectural; should land before B.6.
-- #292 GTK F-keys not reaching debugger when sidebar focused (likely menu-bar interception).
-- #287 GTK Ctrl-P palette collision in completion popup.
-- #288 completion popup click divergence TUI vs GTK.
-- #290 / #291 TUI extension search input issues.
-- #289 xterm.js + TUI in-browser demo (parking lot, low priority).
-
----
-
-**Session 342 — #276 Phase C Stage 1 shipped end-to-end (editor primitive):**
-
-The editor viewport — last big duplication between TUI and GTK
-paint paths — is now lifted into `quadraui::Editor`. Five commits
-on `issue-276-editor-primitive`, merged via [PR #284](https://github.com/JDonaghy/vimcode/pull/284) to develop.
-
-| Stage | Commit | Scope |
-|---|---|---|
-| 1A | `3fcc7fb` | Supporting types lift (`DiagnosticSeverity`, `GitLineStatus`, `DiffLine`, `CursorShape`, `SelectionKind`, `CursorPos`, `EditorCursor`, `EditorSelection`, `Style`, byte-range `StyledSpan`, `DiagnosticMark`, `SpellMark`) into `quadraui::primitives::editor`. ~29 new `Theme` fields under "Editor lift" banner. Theme drops `Eq` (f32 alpha fields). `q_theme()` adapter splits into `q_theme_chrome` + `q_theme_editor` halves in both backend adapters. Behavioural no-op. |
-| 1B | `ef45610` | `Editor` + `EditorLine` data structs added to the same module. Field-for-field mirror of `vimcode::render::RenderedWindow` / `RenderedLine`. `Editor.lightbulb_glyph: char` is the only intentional addition (host populates from icon registry per frame). 3 unit tests cover serde round-trip + DiagnosticSeverity ordering. |
-| 1C | `c985d58` | `quadraui::tui::draw_editor` (725 LOC) — verbatim port of `render_impl::render_window` body. `EditorPaintResult { cursor_position: Option<(u16,u16)> }` returned for Bar/Underline shapes (host calls `Frame::set_cursor_position`). `render_text_line` + `render_selection` private to the lifted module. `render::to_q_editor` boundary adapter (165 LOC) added. `render_impl::render_window` collapsed ~470 → ~25 LOC. |
-| 1D | `5b23718` | `quadraui::gtk::draw_editor` (776 LOC) — verbatim port of `gtk/draw::draw_window` body. Selection paints **before** text (Cairo painter order); TUI paints after — divergence is intrinsic to the surfaces. `build_pango_attrs` + `draw_visual_selection` private to the lifted module. `gtk/draw::draw_window` collapsed ~720 → ~25 LOC. |
-| fmt | `8c8cd24` | Trailing rustfmt cleanup. |
-
-**Net code change**: vimcode-private paint code shrank by **−1456 LOC**;
-quadraui gained **+1972 LOC** of shared paint that the upcoming Win-GUI
-rebuild (B.6) will consume directly. Total diff: +2427 / −1455.
-
-**Confirmed architectural decisions** (clarified during planning):
-- **Theme**: ~29 editor fields lifted into `quadraui::Theme` (single rasteriser arg). `q_theme()` adapter splits internally.
-- **Scrollbars**: TUI rasteriser keeps painting them internally via `quadraui::tui::draw_scrollbar` (Stage 2). GTK paints them outside the rasteriser, preserved by the delegator.
-- **Module layout**: flat. `quadraui::Editor` / `EditorLine` / `EditorCursor` at the crate root; byte-range `StyledSpan` stays inside `primitives::editor` to disambiguate from existing owned-text `quadraui::StyledSpan`.
+> Sessions 343 and earlier in **SESSION_HISTORY.md**.
 
 **Sharp edges that materialised during the lift**:
 - **`StyledSpan` impedance** — owned-text `quadraui::StyledSpan` (plugin/serde) and byte-range `quadraui::primitives::editor::StyledSpan` (paint) coexist by design.

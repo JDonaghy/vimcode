@@ -1,7 +1,7 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 339 archived here. Recent work summary (Sessions 341+342) in PROJECT_STATE.md.
+All sessions through 349 archived here.
 
 > **Format note:** Sessions 282–339 below were archived in their
 > original verbose multi-paragraph format (as maintained in
@@ -3135,3 +3135,7 @@ Ctrl+F while terminal has focus opens inline find bar replacing tab strip; case-
 **Sessions 340–344 (Apr 29–30):** Phase C completion + MSV primitive + quadraui extraction. Session 340: #266/#267/#270/#271 shipped (RichTextPopup, Dialog, GtkBackend runner, FindReplacePanel). Session 341: Phase C stages 2–4 (#277 Scrollbar, #278 settings chrome, #279 MessageList). Session 342: Phase C Stage 1 — `quadraui::Editor` primitive + dual rasterisers, net −1456 LOC vimcode-private paint. Session 343: TUI/GTK paint duplication arc closed (#283/#285/#286/#280/#281), Phase C umbrella #275 closed. Session 344: `MultiSectionView` primitive shipped (#293), first MSV consumer (Extensions sidebar).
 
 **Session 346 (Apr 30):** Harness-first course correction. Pivoted from failed #296 attempts (4 sessions / 8 commits on abandoned branch) to structural fix: #297 cell_quantum integer-snap, #298 TUI MSV round-trip harness, #299 TUI TreeView harness, #300 quadraui extracted to own repo at github.com/JDonaghy/quadraui. Migration prerequisites rule added to CLAUDE.md. 4 vimcode issues gained `blocked` label with cross-repo prereq links.
+
+**Session 348 (May 3, 2026):** #306 debug sidebar chrome → `StatusBar` (`368bbcb`); #303 debug output → `TextDisplay` with scrollbar (`70d4eef`), GTK gained scroll parity; `debug_output_scroll` moved from TUI local to engine field. Platform-neutrality rule codified in CLAUDE.md. quadraui #46 (TextDisplay scrollbar), #47 (dispatch_scroll), #48 (dispatch_click) built to unblock #303.
+
+**Session 349 (May 4, 2026):** #304 bottom panel tabs → `quadraui::TabBar` (`5d7fa09`). `render::build_bottom_panel_tab_bar()` adapter builds TabBar with `show_tab_close: false`; both TUI + GTK paint through `Backend::draw_tab_bar()`, click through `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` field (`b9d62cd`) — suppresses per-tab close buttons in both backend rasterisers. All quadraui cross-repo prereqs (quadraui#2, #6, #7) confirmed CLOSED; vimcode #301 and #302 unblocked. Remaining bespoke surfaces: 3 (#301 menu bar, #302 search panel, #305 terminal toolbar).

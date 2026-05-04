@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-02 (Session 347 — #296 Debug→MSV landed via harness-gated re-do. Step 6 ✅. Step 7 (#282 SC→MSV) next; quadraui#2 closed, ready to adopt.)
+> **Last updated:** 2026-05-04 (Session 349 — #304 bottom panel tabs shipped. Course-correction steps all ✅. All quadraui prereqs resolved; #301/#302 unblocked.)
 
 ---
 
@@ -56,24 +56,18 @@ extracted quadraui repo and are tracked as issues there.
    pattern validated). Vimcode-side adoption landed as `285916b` (Session
    347). Both backends paint + click through cached MSV layout. "Paint↔click
    integration pattern" codified in CLAUDE.md. Issue #296 closed.
-7. ⏳ **Migrate SC (#282)** — tracked as
-   [JDonaghy/quadraui#2](https://github.com/JDonaghy/quadraui/issues/2).
-   Vimcode-side adoption tracked at [#282](https://github.com/JDonaghy/vimcode/issues/282)
-   (label: `blocked`).
+7. ✅ **Migrate SC (#282)** — quadraui#2 closed. Vimcode #282 closed
+   (already on TreeView).
 
 Other work queued as quadraui issues from the Session 346 audit:
 
 - **GTK MSV / TreeView harnesses** — [quadraui#3](https://github.com/JDonaghy/quadraui/issues/3)
   + [quadraui#4](https://github.com/JDonaghy/quadraui/issues/4). Harness
   coverage extension; mirror the TUI pattern using `cairo::ImageSurface`.
-- **MenuBar rasterisers** — [quadraui#6](https://github.com/JDonaghy/quadraui/issues/6).
-  Primitive descriptor exists but neither backend rasteriser ships.
-  Vimcode-side adoption: [#301](https://github.com/JDonaghy/vimcode/issues/301)
-  (label: `blocked`).
-- **SearchPanel primitive** — [quadraui#7](https://github.com/JDonaghy/quadraui/issues/7).
-  Spike whether MSV+TreeView covers; if not, file dedicated primitive.
-  Vimcode-side adoption: [#302](https://github.com/JDonaghy/vimcode/issues/302)
-  (label: `blocked`).
+- **MenuBar rasterisers** — [quadraui#6](https://github.com/JDonaghy/quadraui/issues/6) ✅ CLOSED.
+  Vimcode-side adoption: [#301](https://github.com/JDonaghy/vimcode/issues/301) — **unblocked, ready to work on**.
+- **SearchPanel primitive** — [quadraui#7](https://github.com/JDonaghy/quadraui/issues/7) ✅ CLOSED.
+  Vimcode-side adoption: [#302](https://github.com/JDonaghy/vimcode/issues/302) — **unblocked, ready to work on**.
 - **Audit orphan primitives** — [quadraui#8](https://github.com/JDonaghy/quadraui/issues/8).
   `panel.rs`, `progress.rs`, `spinner.rs`, `split.rs`, `toast.rs` have
   no rasterisers; verdict pending.
