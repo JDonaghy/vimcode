@@ -2839,6 +2839,9 @@ pub struct Engine {
     pub dap_selected_launch_config: usize,
     /// Which panel is shown in the shared bottom area (Terminal or Debug Output).
     pub bottom_panel_kind: BottomPanelKind,
+    /// Cached hit regions from the last paint of the bottom panel tab bar.
+    /// Written at paint time by both backends; read by click handlers.
+    pub bottom_tab_bar_hits: std::cell::RefCell<Option<quadraui::TabBarHits>>,
     /// Launch arguments stored between `initialize` send and response receipt.
     /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
@@ -3506,6 +3509,7 @@ impl Engine {
             dap_launch_configs: Vec::new(),
             dap_selected_launch_config: 0,
             bottom_panel_kind: BottomPanelKind::Terminal,
+            bottom_tab_bar_hits: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,
             dap_wants_sidebar: false,

@@ -3234,67 +3234,30 @@ pub(super) fn render_debug_sidebar(
     });
 }
 
-/// Render the bottom panel tab bar (Terminal | Debug Output).
+/// Render the bottom panel tab bar (Terminal | Debug Output) via
+/// `quadraui::Backend::draw_tab_bar`. Returns `TabBarHits` for the
+/// click handler (caller caches on `engine.bottom_tab_bar_hits`).
 pub(super) fn render_bottom_panel_tabs(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
-    active: render::BottomPanelKind,
+    active: &render::BottomPanelKind,
     has_terminal: bool,
     has_debug_output: bool,
     theme: &Theme,
-) {
-    if area.height == 0 {
-        return;
-    }
-    let tab_bg = rc(theme.tab_bar_bg);
-    let active_fg = rc(theme.tab_active_fg);
-    let inactive_fg = rc(theme.tab_inactive_fg);
-
-    // Fill background
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', inactive_fg, tab_bg);
-    }
-
-    let all_tabs = [
-        (
-            "  Terminal  ",
-            render::BottomPanelKind::Terminal,
-            has_terminal,
-        ),
-        (
-            "  Debug Output  ",
-            render::BottomPanelKind::DebugOutput,
-            has_debug_output,
-        ),
-    ];
-    let mut cur_x = area.x;
-    for (label, kind, visible) in &all_tabs {
-        if !visible {
-            continue;
-        }
-        let fg = if *kind == active {
-            active_fg
-        } else {
-            inactive_fg
-        };
-        for (i, ch) in label.chars().enumerate() {
-            let x = cur_x + i as u16;
-            if x >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, x, area.y, ch, fg, tab_bg);
-        }
-        cur_x += label.len() as u16;
-        if cur_x >= area.x + area.width {
-            break;
-        }
-    }
-
-    // Close button (×) at right edge
-    let close_x = area.x + area.width.saturating_sub(2);
-    if close_x > cur_x {
-        set_cell(buf, close_x, area.y, '\u{00d7}', inactive_fg, tab_bg); // ×
-    }
+) -> quadraui::TabBarHits {
+    let bar = render::build_bottom_panel_tab_bar(active, has_terminal, has_debug_output);
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        use quadraui::Backend;
+        b.draw_tab_bar(q_rect, &bar, None)
+    })
 }
 
 // ─── Quickfix panel ───────────────────────────────────────────────────────────

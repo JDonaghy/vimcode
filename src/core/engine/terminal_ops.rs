@@ -183,6 +183,56 @@ impl Engine {
         self.terminal_has_focus = false;
     }
 
+    /// Dispatch a click on the bottom panel tab bar using the cached
+    /// `TabBarHits` from the last paint. Returns `true` if the click
+    /// was consumed (tab switch or panel close).
+    pub fn handle_bottom_tab_bar_click(&mut self, click_x: f64) -> bool {
+        enum Action {
+            Close,
+            Switch(BottomPanelKind),
+            None,
+        }
+        let action = {
+            let hits = self.bottom_tab_bar_hits.borrow();
+            let Some(ref hits) = *hits else {
+                return false;
+            };
+            if hits
+                .right_segment_bounds
+                .first()
+                .is_some_and(|&(sx, ex)| click_x >= sx && click_x < ex)
+            {
+                Action::Close
+            } else {
+                let mut kinds = Vec::new();
+                if self.terminal_open {
+                    kinds.push(BottomPanelKind::Terminal);
+                }
+                if !self.dap_output_lines.is_empty() {
+                    kinds.push(BottomPanelKind::DebugOutput);
+                }
+                hits.slot_positions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &(sx, ex))| click_x >= sx && click_x < ex)
+                    .and_then(|(idx, _)| kinds.get(idx).cloned())
+                    .map_or(Action::None, Action::Switch)
+            }
+        };
+        match action {
+            Action::Close => {
+                self.bottom_panel_open = false;
+                self.close_terminal();
+                true
+            }
+            Action::Switch(kind) => {
+                self.bottom_panel_kind = kind;
+                true
+            }
+            Action::None => false,
+        }
+    }
+
     /// Toggle "terminal maximized" state.
     ///
     /// This only flips `terminal_maximized`; the stored user-preferred panel

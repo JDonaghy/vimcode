@@ -2187,21 +2187,7 @@ pub(super) fn handle_mouse(
             let tab_bar_row = term_height
                 .saturating_sub(1 + global_status_rows + wildmenu_rows + dt_rows + panel_height);
             if row == tab_bar_row {
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let rel_col = col - editor_left; // column relative to editor area
-                                                 // Close button (×) at rightmost 2 cols of editor area
-                if col >= term_width.saturating_sub(2) {
-                    engine.bottom_panel_open = false;
-                    engine.close_terminal();
-                    return sidebar_width;
-                }
-                // Tab label click — switch between Terminal and Debug Output.
-                // Labels: "  Terminal  " (12 chars), "  Debug Output  " (16 chars)
-                if rel_col < 12 {
-                    engine.bottom_panel_kind = render::BottomPanelKind::Terminal;
-                } else if rel_col < 28 {
-                    engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
-                }
+                engine.handle_bottom_tab_bar_click(col as f64);
                 return sidebar_width;
             }
         }
@@ -2231,9 +2217,9 @@ pub(super) fn handle_mouse(
                     engine.debug_output_auto_scroll = false;
                     return sidebar_width;
                 }
-                quadraui::UiEvent::MouseDown { widget: Some(id), .. }
-                    if id.as_str() == "debug_output" =>
-                {
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if id.as_str() == "debug_output" => {
                     return sidebar_width;
                 }
                 _ => {}

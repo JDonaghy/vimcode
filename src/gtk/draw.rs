@@ -537,10 +537,11 @@ pub(super) fn draw_editor(
             (y, term_px)
         };
         // Tab bar row (1 line high) at the top of the bottom panel area.
-        draw_bottom_panel_tabs(
+        let hits = draw_bottom_panel_tabs(
+            backend,
             cr,
             &layout,
-            &screen,
+            &screen.bottom_tabs.active,
             &theme,
             0.0,
             term_y,
@@ -549,6 +550,7 @@ pub(super) fn draw_editor(
             engine.terminal_open,
             !screen.bottom_tabs.output_lines.is_empty(),
         );
+        engine.bottom_tab_bar_hits.replace(Some(hits));
         match screen.bottom_tabs.active {
             render::BottomPanelKind::Terminal => {
                 if let Some(ref term_panel) = screen.bottom_tabs.terminal {
@@ -590,28 +592,30 @@ pub(super) fn draw_editor(
                     });
                     layout_result
                 };
-                let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
-                    |(track, thumb)| {
-                        let offset_y = q_rect.y;
-                        quadraui::SurfaceScrollbar {
-                            track_bounds: quadraui::Rect::new(
-                                q_rect.x + track.x,
-                                offset_y + track.y,
-                                track.width,
-                                track.height,
-                            ),
-                            thumb_bounds: quadraui::Rect::new(
-                                q_rect.x + thumb.x,
-                                offset_y + thumb.y,
-                                thumb.width,
-                                thumb.height,
-                            ),
-                            total_items: td.lines.len(),
-                            visible_items: td_layout.visible_lines.len(),
-                            scroll_offset: td_layout.resolved_scroll_offset,
-                        }
-                    },
-                );
+                let scrollbar =
+                    td_layout
+                        .scrollbar_bounds
+                        .zip(td_layout.thumb_bounds)
+                        .map(|(track, thumb)| {
+                            let offset_y = q_rect.y;
+                            quadraui::SurfaceScrollbar {
+                                track_bounds: quadraui::Rect::new(
+                                    q_rect.x + track.x,
+                                    offset_y + track.y,
+                                    track.width,
+                                    track.height,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    q_rect.x + thumb.x,
+                                    offset_y + thumb.y,
+                                    thumb.width,
+                                    thumb.height,
+                                ),
+                                total_items: td.lines.len(),
+                                visible_items: td_layout.visible_lines.len(),
+                                scroll_offset: td_layout.resolved_scroll_offset,
+                            }
+                        });
                 engine
                     .scroll_surfaces
                     .borrow_mut()
@@ -2260,13 +2264,15 @@ pub(super) fn draw_context_menu_popup(
     super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
 }
 
-/// Draw the tab bar for the bottom panel (Terminal / Debug Output).
-/// One row high at `(x, y)`, full width `w`.
+/// Draw the tab bar for the bottom panel (Terminal / Debug Output) via
+/// `quadraui::Backend::draw_tab_bar`. Returns `TabBarHits` for the
+/// click handler (caller caches on `engine.bottom_tab_bar_hits`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_bottom_panel_tabs(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
-    screen: &render::ScreenLayout,
+    active: &render::BottomPanelKind,
     theme: &Theme,
     x: f64,
     y: f64,
@@ -2274,73 +2280,28 @@ pub(super) fn draw_bottom_panel_tabs(
     line_height: f64,
     has_terminal: bool,
     has_debug_output: bool,
-) {
-    let (br, bg, bb) = theme.tab_bar_bg.to_cairo();
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
+) -> quadraui::TabBarHits {
+    use pango::FontDescription;
 
-    // Background — use tab bar bg to match the editor tab bar.
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
+    let bar = render::build_bottom_panel_tab_bar(active, has_terminal, has_debug_output);
 
-    // Thin separator line at the top.
-    let (sr, sg, sb) = theme.separator.to_cairo();
-    cr.set_source_rgb(sr, sg, sb);
-    cr.rectangle(x, y, w, 1.0);
-    cr.fill().ok();
-
-    // Use sans-serif UI font (like VSCode panel tabs).
     let saved_font = layout.font_description().unwrap_or_default();
     let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
-    layout.set_attributes(None);
 
-    let all_tabs: &[(&str, render::BottomPanelKind, bool)] = &[
-        ("Terminal", render::BottomPanelKind::Terminal, has_terminal),
-        (
-            "Debug Output",
-            render::BottomPanelKind::DebugOutput,
-            has_debug_output,
-        ),
-    ];
+    use quadraui::Backend;
+    let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_tab_bar(
+            quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32),
+            &bar,
+            None,
+        )
+    });
 
-    let padding = 12.0;
-    let mut cursor_x = x + padding;
-    for (label, kind, visible) in all_tabs {
-        if !visible {
-            continue;
-        }
-        let is_active = screen.bottom_tabs.active == *kind;
-        let (lr, lg, lb) = if is_active {
-            (ar, ag, ab)
-        } else {
-            (fr, fg2, fb)
-        };
-        cr.set_source_rgb(lr, lg, lb);
-        layout.set_text(label);
-        cr.move_to(cursor_x, y);
-        pangocairo::show_layout(cr, layout);
-        let extents = layout.pixel_extents().1;
-        let tab_w = extents.width() as f64;
-        // Underline the active tab.
-        if is_active {
-            cr.set_source_rgb(ar, ag, ab);
-            cr.rectangle(cursor_x, y + line_height - 2.0, tab_w, 2.0);
-            cr.fill().ok();
-        }
-        cursor_x += tab_w + padding * 2.0;
-    }
-
-    // Close button (×) at right edge
-    let close_x = x + w - padding - 10.0;
-    cr.set_source_rgb(fr, fg2, fb);
-    layout.set_text("\u{00d7}"); // ×
-    cr.move_to(close_x, y);
-    pangocairo::show_layout(cr, layout);
-
-    // Restore the original monospace font.
     layout.set_font_description(Some(&saved_font));
+    hits
 }
 
 /// Draw the VSCode-style debug sidebar content.

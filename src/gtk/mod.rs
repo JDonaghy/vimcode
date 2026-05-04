@@ -6427,9 +6427,9 @@ impl App {
                         self.draw_needed.set(true);
                         return;
                     }
-                    quadraui::UiEvent::MouseDown { widget: Some(id), .. }
-                        if id.as_str() == "debug_output" =>
-                    {
+                    quadraui::UiEvent::MouseDown {
+                        widget: Some(id), ..
+                    } if id.as_str() == "debug_output" => {
                         return;
                     }
                     _ => {}
@@ -7408,32 +7408,8 @@ impl App {
             };
             if let Some((term_y, zone)) = in_terminal {
                 if zone == 0 {
-                    // Click on the tab bar row: switch active bottom panel tab.
-                    // Sans-serif chars are ~60% of monospace width; use that estimate.
-                    let cw = self.cached_char_width.max(1.0) * 0.6;
-                    let padding = 12.0;
-                    // Close button (×) at right edge
-                    if x >= width - padding - 10.0 {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.bottom_panel_open = false;
-                        engine.close_terminal();
-                        drop(engine);
-                        sender.input(Msg::Resize);
-                        return;
-                    }
-                    let terminal_label = "TERMINAL";
-                    let debug_label = "DEBUG CONSOLE";
-                    let terminal_w = padding + terminal_label.len() as f64 * cw + padding;
-                    let tab_x = x - padding; // offset matches cursor_x start
-                    let new_kind = if tab_x < terminal_w {
-                        render::BottomPanelKind::Terminal
-                    } else if tab_x < terminal_w + debug_label.len() as f64 * cw + padding * 2.0 {
-                        render::BottomPanelKind::DebugOutput
-                    } else {
-                        self.engine.borrow().bottom_panel_kind.clone()
-                    };
-                    self.engine.borrow_mut().bottom_panel_kind = new_kind;
-                    sender.input(Msg::Resize); // triggers redraw
+                    self.engine.borrow_mut().handle_bottom_tab_bar_click(x);
+                    sender.input(Msg::Resize);
                     return;
                 }
                 self.engine.borrow_mut().terminal_has_focus = true;

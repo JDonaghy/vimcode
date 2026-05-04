@@ -10243,6 +10243,50 @@ pub fn build_tab_bar_primitive(
         scroll_offset: tab_scroll_offset,
         right_segments: right,
         active_accent,
+        show_tab_close: true,
+    }
+}
+
+/// Build a `quadraui::TabBar` for the bottom panel tab switcher
+/// (Terminal / Debug Output). The close button (×) is a right segment.
+/// Tabs with `close_width: 0.0` suppress per-tab close glyphs.
+pub fn build_bottom_panel_tab_bar(
+    active: &BottomPanelKind,
+    has_terminal: bool,
+    has_debug_output: bool,
+) -> quadraui::TabBar {
+    let mut tabs = Vec::new();
+    if has_terminal {
+        tabs.push(quadraui::TabItem {
+            label: "Terminal".to_string(),
+            is_active: *active == BottomPanelKind::Terminal,
+            is_dirty: false,
+            is_preview: false,
+        });
+    }
+    if has_debug_output {
+        tabs.push(quadraui::TabItem {
+            label: "Debug Output".to_string(),
+            is_active: *active == BottomPanelKind::DebugOutput,
+            is_dirty: false,
+            is_preview: false,
+        });
+    }
+
+    let close_seg = quadraui::TabBarSegment {
+        text: " \u{00d7} ".to_string(),
+        width_cells: 3,
+        id: Some(quadraui::WidgetId::new("bottom_tab:close")),
+        is_active: false,
+    };
+
+    quadraui::TabBar {
+        id: quadraui::WidgetId::new("tabs:bottom_panel"),
+        tabs,
+        scroll_offset: 0,
+        right_segments: vec![close_seg],
+        active_accent: None,
+        show_tab_close: false,
     }
 }
 

@@ -631,14 +631,16 @@ pub(super) fn draw_frame(
             width: bottom_panel_area.width,
             height: bottom_panel_area.height.saturating_sub(1),
         };
-        render_bottom_panel_tabs(
-            frame.buffer_mut(),
+        let hits = render_bottom_panel_tabs(
+            backend,
+            frame,
             tab_bar_area,
-            engine.bottom_panel_kind.clone(),
+            &engine.bottom_panel_kind,
             engine.terminal_open,
             !screen.bottom_tabs.output_lines.is_empty(),
             theme,
         );
+        engine.bottom_tab_bar_hits.replace(Some(hits));
         match engine.bottom_panel_kind {
             render::BottomPanelKind::Terminal => {
                 if let Some(ref term) = screen.bottom_tabs.terminal {
@@ -666,28 +668,30 @@ pub(super) fn draw_frame(
                     use quadraui::Backend;
                     b.draw_text_display(q_rect, &td);
                 });
-                let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
-                    |(track, thumb)| {
-                        let offset_y = q_rect.y;
-                        quadraui::SurfaceScrollbar {
-                            track_bounds: quadraui::Rect::new(
-                                q_rect.x + track.x,
-                                offset_y + track.y,
-                                track.width,
-                                track.height,
-                            ),
-                            thumb_bounds: quadraui::Rect::new(
-                                q_rect.x + thumb.x,
-                                offset_y + thumb.y,
-                                thumb.width,
-                                thumb.height,
-                            ),
-                            total_items: td.lines.len(),
-                            visible_items: td_layout.visible_lines.len(),
-                            scroll_offset: td_layout.resolved_scroll_offset,
-                        }
-                    },
-                );
+                let scrollbar =
+                    td_layout
+                        .scrollbar_bounds
+                        .zip(td_layout.thumb_bounds)
+                        .map(|(track, thumb)| {
+                            let offset_y = q_rect.y;
+                            quadraui::SurfaceScrollbar {
+                                track_bounds: quadraui::Rect::new(
+                                    q_rect.x + track.x,
+                                    offset_y + track.y,
+                                    track.width,
+                                    track.height,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    q_rect.x + thumb.x,
+                                    offset_y + thumb.y,
+                                    thumb.width,
+                                    thumb.height,
+                                ),
+                                total_items: td.lines.len(),
+                                visible_items: td_layout.visible_lines.len(),
+                                scroll_offset: td_layout.resolved_scroll_offset,
+                            }
+                        });
                 engine
                     .scroll_surfaces
                     .borrow_mut()
