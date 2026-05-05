@@ -4810,55 +4810,20 @@ impl SimpleComponent for App {
                 if let Some(ref layout) = cached {
                     let root = self.engine.borrow().cwd.clone();
                     let view = render::build_search_panel_msv(&self.engine.borrow(), &root);
+                    use quadraui::Backend;
+                    let backend = self.backend.borrow();
                     match layout.hit_test(hx, hy) {
                         quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
                             if let Some(sl) = layout.sections.first() {
                                 if let quadraui::SectionBody::Form(ref form) = view.sections[0].body
                                 {
-                                    let row_h =
-                                        sl.body_bounds.height / form.fields.len().max(1) as f32;
-                                    let form_layout = form.layout(
-                                        sl.body_bounds.width,
-                                        sl.body_bounds.height,
-                                        |i| {
-                                            use quadraui::primitives::form::{
-                                                FieldKind, FormFieldMeasure, FormItemMeasure,
-                                            };
-                                            let field = &form.fields[i];
-                                            match &field.kind {
-                                                FieldKind::ToggleGroup { toggles } => {
-                                                    let items = toggles
-                                                        .iter()
-                                                        .map(|t| FormItemMeasure {
-                                                            id: t.id.clone(),
-                                                            width: t.label.len() as f32 * 8.0,
-                                                        })
-                                                        .collect();
-                                                    FormFieldMeasure::with_items(
-                                                        row_h, 8.0, 8.0, items,
-                                                    )
-                                                }
-                                                FieldKind::ButtonRow { buttons } => {
-                                                    let items = buttons
-                                                        .iter()
-                                                        .map(|b| FormItemMeasure {
-                                                            id: b.id.clone(),
-                                                            width: (b.label.len() + 2) as f32 * 8.0,
-                                                        })
-                                                        .collect();
-                                                    FormFieldMeasure::with_items(
-                                                        row_h, 8.0, 8.0, items,
-                                                    )
-                                                }
-                                                _ => FormFieldMeasure::new(row_h),
-                                            }
-                                        },
-                                    );
+                                    let form_layout = backend.form_layout(sl.body_bounds, form);
                                     let local_x = hx - sl.body_bounds.x;
                                     let local_y = hy - sl.body_bounds.y;
                                     if let quadraui::FormHit::Field(id) =
                                         form_layout.hit_test(local_x, local_y)
                                     {
+                                        drop(backend);
                                         self.engine
                                             .borrow_mut()
                                             .handle_search_form_hit(id.as_str());
@@ -4870,19 +4835,14 @@ impl SimpleComponent for App {
                             if let Some(sl) = layout.sections.get(1) {
                                 if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body
                                 {
-                                    let row_h =
-                                        sl.body_bounds.height / tree.rows.len().max(1) as f32;
-                                    let tree_layout = tree.layout(
-                                        sl.body_bounds.width,
-                                        sl.body_bounds.height,
-                                        |_| quadraui::TreeRowMeasure { height: row_h },
-                                    );
+                                    let tree_layout = backend.tree_layout(sl.body_bounds, tree);
                                     let local_x = hx - sl.body_bounds.x;
                                     let local_y = hy - sl.body_bounds.y;
                                     if let quadraui::TreeViewHit::Row(row_idx) =
                                         tree_layout.hit_test(local_x, local_y)
                                     {
                                         let path = tree.rows[row_idx].path.clone();
+                                        drop(backend);
                                         self.engine.borrow_mut().handle_search_tree_hit(&path);
                                     }
                                 }
