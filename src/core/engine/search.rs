@@ -589,6 +589,15 @@ impl Engine {
                 let root = self.cwd.clone();
                 self.start_project_replace(root);
             }
+            "search:replace_next" => {
+                let idx = self.project_search_selected;
+                self.open_search_result(idx);
+            }
+            "search:buttons" => {
+                let root = self.cwd.clone();
+                self.start_project_search(root);
+            }
+            "search:toggles" => {}
             "search:query" => {
                 self.search_panel_form_focus
                     .replace(Some("search:query".to_string()));
