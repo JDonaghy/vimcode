@@ -1219,16 +1219,6 @@ pub(super) fn handle_mouse(
         }
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            // Editor hover popup scroll wheel — scroll content without focusing
-            if mouse_on_editor_hover && engine.editor_hover.is_some() {
-                let delta = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                    -3
-                } else {
-                    3
-                };
-                engine.editor_hover_scroll(delta);
-                return sidebar_width;
-            }
             // Git panel scroll wheel — not yet on dispatch_scroll.
             // Debug sidebar + other panels fall through to dispatch_scroll.
             if sidebar.visible
@@ -1244,29 +1234,8 @@ pub(super) fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            // Terminal panel scroll (must check before editor scroll).
-            {
-                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let strip_rows: u16 = if engine.terminal_open {
-                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
-                } else {
-                    0
-                };
-                let term_strip_top =
-                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-                if engine.terminal_open
-                    && strip_rows > 0
-                    && row >= term_strip_top
-                    && row < term_strip_top + strip_rows
-                {
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.terminal_scroll_up(3);
-                    } else {
-                        engine.terminal_scroll_down(3);
-                    }
-                    return sidebar_width;
-                }
-            }
+            // Terminal panel scroll now routes through dispatch_scroll
+            // via the registered "tui:terminal_scrollback" surface.
             // Scroll-surface wheel dispatch — routes to registered surfaces.
             {
                 let surfaces = engine.scroll_surfaces.borrow();
@@ -1293,6 +1262,11 @@ pub(super) fn handle_mouse(
                     } = sev
                     {
                         match id.as_str() {
+                            "editor_hover" => {
+                                let step = (delta.y * 3.0).ceil() as i32;
+                                engine.editor_hover_scroll(step);
+                                return sidebar_width;
+                            }
                             "debug_output" => {
                                 engine.handle_debug_output_scroll(delta.y);
                                 return sidebar_width;
@@ -1366,46 +1340,61 @@ pub(super) fn handle_mouse(
                                 }
                                 return sidebar_width;
                             }
+                            "tui:terminal_scrollback" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                if delta.y < 0.0 {
+                                    engine.terminal_scroll_up(step);
+                                } else {
+                                    engine.terminal_scroll_down(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:editor_viewport" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                let scroll_menu_rows: u16 =
+                                    if engine.menu_bar_visible { 1 } else { 0 };
+                                let editor_row = row.saturating_sub(scroll_menu_rows);
+                                let rel_col = col.saturating_sub(editor_left);
+                                let target = last_layout.and_then(|layout| {
+                                    layout.windows.iter().find(|rw| {
+                                        let wx = rw.rect.x as u16;
+                                        let wy = rw.rect.y as u16;
+                                        let ww = rw.rect.width as u16;
+                                        let wh = rw.rect.height as u16;
+                                        rel_col >= wx
+                                            && rel_col < wx + ww
+                                            && editor_row >= wy
+                                            && editor_row < wy + wh
+                                    })
+                                });
+                                if let Some(rw) = target {
+                                    if delta.y < 0.0 {
+                                        engine.scroll_up_visible_for_window(rw.window_id, step);
+                                    } else {
+                                        engine.scroll_down_visible_for_window(rw.window_id, step);
+                                    }
+                                    engine.sync_scroll_binds();
+                                }
+                                return sidebar_width;
+                            }
                             _ => {}
                         }
                     }
                 }
             }
 
+            // Editor viewport scroll is now handled via dispatch_scroll
+            // "tui:editor_viewport" surface above — fallback to active window
+            // for scroll events that don't hit any registered surface.
             if col >= editor_left && row + 2 < term_height {
-                let rel_col = col - editor_left;
-                let scroll_menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let editor_row = row.saturating_sub(scroll_menu_rows);
-                // Find which window the mouse is over; scroll that window
-                let scrolled = last_layout.and_then(|layout| {
-                    layout.windows.iter().find(|rw| {
-                        let wx = rw.rect.x as u16;
-                        let wy = rw.rect.y as u16;
-                        let ww = rw.rect.width as u16;
-                        let wh = rw.rect.height as u16;
-                        rel_col >= wx
-                            && rel_col < wx + ww
-                            && editor_row >= wy
-                            && editor_row < wy + wh
-                    })
-                });
-                if let Some(rw) = scrolled {
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.scroll_up_visible_for_window(rw.window_id, 3);
-                    } else {
-                        engine.scroll_down_visible_for_window(rw.window_id, 3);
-                    }
-                    engine.sync_scroll_binds();
+                // Fallback: scroll active window
+                if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    engine.scroll_up_visible(3);
                 } else {
-                    // Fallback: scroll active window
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.scroll_up_visible(3);
-                    } else {
-                        engine.scroll_down_visible(3);
-                    }
-                    engine.ensure_cursor_visible();
-                    engine.sync_scroll_binds();
+                    engine.scroll_down_visible(3);
                 }
+                engine.ensure_cursor_visible();
+                engine.sync_scroll_binds();
             }
             return sidebar_width;
         }

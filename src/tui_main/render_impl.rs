@@ -418,6 +418,22 @@ pub(super) fn draw_frame(
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
     }
 
+    // Register the editor viewport as a scroll surface so dispatch_scroll
+    // routes scroll wheel events to it (per-window routing done in handler).
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("tui:editor_viewport"),
+            bounds: quadraui::Rect::new(
+                editor_area.x as f32,
+                editor_area.y as f32,
+                editor_area.width as f32,
+                editor_area.height as f32,
+            ),
+            scrollbar: None,
+        });
+
     // ── Tab drag overlay ────────────────────────────────────────────────────
     if engine.tab_drag.is_some() {
         render_tab_drag_overlay(frame, engine, editor_area, screen, theme);
@@ -667,6 +683,20 @@ pub(super) fn draw_frame(
                         height: content_area.height.saturating_sub(1),
                     };
                     render_terminal_panel(frame.buffer_mut(), term_content, term, theme);
+                    // Register terminal content area as a scroll surface.
+                    engine
+                        .scroll_surfaces
+                        .borrow_mut()
+                        .push(quadraui::ScrollSurface {
+                            id: quadraui::WidgetId::new("tui:terminal_scrollback"),
+                            bounds: quadraui::Rect::new(
+                                term_content.x as f32,
+                                term_content.y as f32,
+                                term_content.width as f32,
+                                term_content.height as f32,
+                            ),
+                            scrollbar: None,
+                        });
                 }
             }
             render::BottomPanelKind::DebugOutput => {

@@ -4504,15 +4504,6 @@ impl SimpleComponent for App {
                     self.draw_needed.set(true);
                     return;
                 }
-                // If editor hover popup is visible, scroll it instead of the editor
-                if engine.editor_hover.is_some() && delta_y.abs() > 0.01 {
-                    let delta = (delta_y * 3.0).round() as i32;
-                    if engine.editor_hover_scroll(delta) {
-                        drop(engine);
-                        self.draw_needed.set(true);
-                        return;
-                    }
-                }
                 // Route scroll through dispatch_scroll using cached scroll surfaces.
                 if let Some((px, py)) = self.last_editor_pointer.get() {
                     let surfaces = engine.scroll_surfaces.borrow();
@@ -4533,13 +4524,23 @@ impl SimpleComponent for App {
                             ..
                         } = sev
                         {
-                            if id.as_str() == "debug_output" {
-                                engine.handle_debug_output_scroll(delta.y);
-                                drop(engine);
-                                if let Some(da) = self.drawing_area.borrow().as_ref() {
-                                    da.queue_draw();
+                            match id.as_str() {
+                                "editor_hover" => {
+                                    let step = (delta.y * 3.0).round() as i32;
+                                    engine.editor_hover_scroll(step);
+                                    drop(engine);
+                                    self.draw_needed.set(true);
+                                    return;
                                 }
-                                return;
+                                "debug_output" => {
+                                    engine.handle_debug_output_scroll(delta.y);
+                                    drop(engine);
+                                    if let Some(da) = self.drawing_area.borrow().as_ref() {
+                                        da.queue_draw();
+                                    }
+                                    return;
+                                }
+                                _ => {}
                             }
                         }
                     }
