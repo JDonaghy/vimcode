@@ -521,16 +521,16 @@ impl Engine {
     /// Store search results and update the status message. Called by both sync and async paths.
     pub(crate) fn apply_search_results(&mut self, results: Vec<ProjectMatch>, query: &str) {
         let capped = results.len() >= 10_000;
+        let file_count = {
+            let mut files: Vec<&std::path::Path> =
+                results.iter().map(|m| m.file.as_path()).collect();
+            files.sort();
+            files.dedup();
+            files.len()
+        };
         if results.is_empty() {
             self.message = format!("No results for \"{}\"", query);
         } else {
-            let file_count = {
-                let mut files: Vec<&std::path::Path> =
-                    results.iter().map(|m| m.file.as_path()).collect();
-                files.sort();
-                files.dedup();
-                files.len()
-            };
             self.message = format!(
                 "{} match{} in {} file{}{}",
                 results.len(),
@@ -540,6 +540,7 @@ impl Engine {
                 if capped { " (capped at 10000)" } else { "" }
             );
         }
+        self.search_file_expanded = vec![true; file_count];
         self.project_search_results = results;
         self.project_search_selected = 0;
     }
@@ -570,6 +571,84 @@ impl Engine {
     /// Move the project search selection up by one, clamped to 0.
     pub fn project_search_select_prev(&mut self) {
         self.project_search_selected = self.project_search_selected.saturating_sub(1);
+    }
+
+    /// Handle a click on a search-panel form element (toggle, button) by widget ID.
+    pub fn handle_search_form_hit(&mut self, id: &str) {
+        match id {
+            "search:case" => self.toggle_project_search_case(),
+            "search:word" => self.toggle_project_search_whole_word(),
+            "search:regex" => self.toggle_project_search_regex(),
+            "search:find_next" => {
+                let root = self.cwd.clone();
+                self.start_project_search(root);
+            }
+            "search:replace_all" => {
+                let root = self.cwd.clone();
+                self.start_project_replace(root);
+            }
+            "search:query" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:query".to_string()));
+            }
+            "search:replace" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:replace".to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a click on a search-panel tree row.
+    /// `path[0]` = file group index, `path[1]` = match within that file.
+    pub fn handle_search_tree_hit(&mut self, path: &[u16]) {
+        if path.len() == 1 {
+            let fi = path[0] as usize;
+            if fi < self.search_file_expanded.len() {
+                self.search_file_expanded[fi] = !self.search_file_expanded[fi];
+            }
+        } else if path.len() >= 2 {
+            let fi = path[0] as usize;
+            let mi = path[1] as usize;
+            if let Some(result_idx) = self.tree_path_to_result_idx(fi, mi) {
+                self.project_search_selected = result_idx;
+                self.open_search_result(result_idx);
+            }
+        }
+    }
+
+    /// Map a tree path (file_idx, match_within_file) back to a flat result index.
+    fn tree_path_to_result_idx(&self, file_idx: usize, match_idx: usize) -> Option<usize> {
+        let mut current_file: usize = 0;
+        let mut last_file: Option<&std::path::Path> = None;
+        let mut match_within: usize = 0;
+
+        for (i, m) in self.project_search_results.iter().enumerate() {
+            if last_file != Some(m.file.as_path()) {
+                if last_file.is_some() {
+                    current_file += 1;
+                }
+                last_file = Some(m.file.as_path());
+                match_within = 0;
+            }
+            if current_file == file_idx && match_within == match_idx {
+                return Some(i);
+            }
+            match_within += 1;
+        }
+        None
+    }
+
+    /// Open the file at the given result index and jump to the match line.
+    pub(crate) fn open_search_result(&mut self, result_idx: usize) {
+        if let Some(m) = self.project_search_results.get(result_idx) {
+            let path = m.file.clone();
+            let line = m.line;
+            self.open_file_in_tab(&path);
+            let wid = self.active_window_id();
+            self.set_cursor_for_window(wid, line, 0);
+            self.ensure_cursor_visible();
+        }
     }
 
     // =======================================================================

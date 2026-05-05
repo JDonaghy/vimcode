@@ -1216,29 +1216,7 @@ pub(super) fn ensure_search_selection_visible(
 ///
 /// The results area interleaves file-header rows (not selectable) with result rows.
 /// Returns `None` if the row falls on a file header.
-pub(super) fn visual_row_to_result_idx(
-    results: &[crate::core::ProjectMatch],
-    visual_row: usize,
-) -> Option<usize> {
-    let mut row = 0usize;
-    let mut last_file: Option<&std::path::Path> = None;
-    for (idx, m) in results.iter().enumerate() {
-        if last_file != Some(m.file.as_path()) {
-            last_file = Some(m.file.as_path());
-            if row == visual_row {
-                return None; // file header row
-            }
-            row += 1;
-        }
-        if row == visual_row {
-            return Some(idx);
-        }
-        row += 1;
-    }
-    None
-}
-
-/// Render the project search panel.
+/// Render the project search panel via quadraui MSV + Form + TreeView.
 pub(super) fn render_search_panel(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -1246,316 +1224,64 @@ pub(super) fn render_search_panel(
     engine: &Engine,
     theme: &Theme,
 ) {
-    let header_fg = rc(theme.status_fg);
-    let header_bg = rc(theme.status_bg);
-    let fg = rc(theme.foreground);
-    let bg = rc(theme.tab_bar_bg);
-    let dim_fg = rc(theme.line_number_fg);
-    let sel_fg = bg;
-    let sel_bg = fg;
-    let file_header_fg = rc(theme.keyword);
-
     if area.height == 0 {
         return;
     }
 
-    // Fill background
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
-        }
-    }
-
-    // Row 0: panel header " SEARCH"
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', header_fg, header_bg);
-    }
-    let mut x = area.x;
-    for ch in " SEARCH".chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, area.y, ch, header_fg, header_bg);
-        x += 1;
-    }
-
-    if area.height < 2 {
-        return;
-    }
-
-    // Row 1: search input box  "[ query___ ]"
-    let input_y = area.y + 1;
-    let query = &engine.project_search_query;
-    let input_bg = rc(theme.active_background);
-    let input_fg = fg;
-    // Draw bracket prefix
-    set_cell(buf, area.x, input_y, '[', dim_fg, bg);
-    let end_bracket_x = if area.width > 1 {
-        area.x + area.width - 1
-    } else {
-        area.x
-    };
-    set_cell(buf, end_bracket_x, input_y, ']', dim_fg, bg);
-    // Fill input background
-    for x in (area.x + 1)..end_bracket_x {
-        set_cell(buf, x, input_y, ' ', input_fg, input_bg);
-    }
-    // Render query text
-    let mut x = area.x + 1;
-    for ch in query.chars() {
-        if x >= end_bracket_x {
-            break;
-        }
-        set_cell(buf, x, input_y, ch, input_fg, input_bg);
-        x += 1;
-    }
-    // Cursor blinking indicator: show │ at cursor position when in input mode
-    if sidebar.search_input_mode && !sidebar.replace_input_focused && x < end_bracket_x {
-        set_cell(buf, x, input_y, '\u{258f}', rc(theme.cursor), input_bg); // ▏
-    }
-
-    if area.height < 3 {
-        return;
-    }
-
-    // Row 2: replace input box  "[ replace_ ]"
-    let replace_y = area.y + 2;
-    let replace_text = &engine.project_replace_text;
-    let replace_bg = if sidebar.replace_input_focused && sidebar.search_input_mode {
-        input_bg
-    } else {
-        rc(theme.tab_bar_bg) // dimmer when unfocused
-    };
-    set_cell(buf, area.x, replace_y, '[', dim_fg, bg);
-    let rep_end_x = if area.width > 1 {
-        area.x + area.width - 1
-    } else {
-        area.x
-    };
-    set_cell(buf, rep_end_x, replace_y, ']', dim_fg, bg);
-    for x in (area.x + 1)..rep_end_x {
-        set_cell(buf, x, replace_y, ' ', input_fg, replace_bg);
-    }
-    // Placeholder or actual text
-    if replace_text.is_empty() && !(sidebar.replace_input_focused && sidebar.search_input_mode) {
-        let placeholder = "Replace…";
-        let mut x = area.x + 1;
-        for ch in placeholder.chars() {
-            if x >= rep_end_x {
-                break;
+    engine
+        .search_panel_form_focus
+        .replace(if sidebar.search_input_mode {
+            if sidebar.replace_input_focused {
+                Some("search:replace".to_string())
+            } else {
+                Some("search:query".to_string())
             }
-            set_cell(buf, x, replace_y, ch, dim_fg, replace_bg);
-            x += 1;
-        }
-    } else {
-        let mut x = area.x + 1;
-        for ch in replace_text.chars() {
-            if x >= rep_end_x {
-                break;
-            }
-            set_cell(buf, x, replace_y, ch, input_fg, replace_bg);
-            x += 1;
-        }
-        if sidebar.replace_input_focused && sidebar.search_input_mode && x < rep_end_x {
-            set_cell(buf, x, replace_y, '\u{258f}', rc(theme.cursor), replace_bg);
-        }
-    }
-
-    if area.height < 4 {
-        return;
-    }
-
-    // Row 3: toggle indicators (Aa / Ab| / .* ) + hint
-    let toggle_y = area.y + 3;
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, toggle_y, ' ', dim_fg, bg);
-    }
-    {
-        let opts = &engine.project_search_options;
-        let active_fg = rc(theme.keyword);
-        let mut tx = area.x;
-
-        // Helper: render a label with active/inactive coloring
-        let draw_toggle =
-            |buf: &mut ratatui::buffer::Buffer, label: &str, active: bool, x: &mut u16| {
-                let color = if active { active_fg } else { dim_fg };
-                for ch in label.chars() {
-                    if *x >= area.x + area.width {
-                        break;
-                    }
-                    set_cell(buf, *x, toggle_y, ch, color, bg);
-                    *x += 1;
-                }
-                // Space separator
-                if *x < area.x + area.width {
-                    set_cell(buf, *x, toggle_y, ' ', dim_fg, bg);
-                    *x += 1;
-                }
-            };
-
-        draw_toggle(buf, "Aa", opts.case_sensitive, &mut tx);
-        draw_toggle(buf, "Ab|", opts.whole_word, &mut tx);
-        draw_toggle(buf, ".*", opts.use_regex, &mut tx);
-
-        // Hint text
-        let hint = "Alt+C/W/R/H";
-        if tx + 1 < area.x + area.width {
-            // Small gap
-            tx += 1;
-            for ch in hint.chars() {
-                if tx >= area.x + area.width {
-                    break;
-                }
-                set_cell(buf, tx, toggle_y, ch, dim_fg, bg);
-                tx += 1;
-            }
-        }
-    }
-
-    if area.height < 5 {
-        return;
-    }
-
-    // Row 4: status / hint line
-    let status_y = area.y + 4;
-    let status_text = if engine.project_search_results.is_empty() {
-        if query.is_empty() {
-            " Type to search, Enter to run"
         } else {
-            &engine.message
-        }
-    } else {
-        &engine.message
-    };
-    // We borrow status_text potentially as &engine.message which is a &str reference,
-    // so we just render it directly.
-    let mut x = area.x;
-    for ch in status_text.chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, status_y, ch, dim_fg, bg);
-        x += 1;
-    }
-
-    if area.height < 6 {
-        return;
-    }
-
-    // Rows 5+: results
-    let results = &engine.project_search_results;
-    if results.is_empty() {
-        return;
-    }
-
-    let results_start_y = area.y + 5;
-    let results_height = area.height.saturating_sub(5) as usize;
-
-    // Build the flat display list (file headers + result rows)
-    struct DisplayRow {
-        text: String,
-        is_header: bool,
-        result_idx: Option<usize>,
-    }
-
-    let mut display_rows: Vec<DisplayRow> = Vec::new();
-    let root = &sidebar.root;
-    let mut last_file: Option<&std::path::Path> = None;
-
-    for (idx, m) in results.iter().enumerate() {
-        if last_file != Some(m.file.as_path()) {
-            last_file = Some(m.file.as_path());
-            let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
-            display_rows.push(DisplayRow {
-                text: rel.display().to_string(),
-                is_header: true,
-                result_idx: None,
-            });
-        }
-        let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
-        display_rows.push(DisplayRow {
-            text: snippet,
-            is_header: false,
-            result_idx: Some(idx),
+            None
         });
-    }
+    engine
+        .search_query_caret
+        .replace(engine.project_search_query.len());
+    engine
+        .replace_text_caret
+        .replace(engine.project_replace_text.len());
 
-    let total_display = display_rows.len();
-    let max_scroll = total_display.saturating_sub(results_height);
+    let view = render::build_search_panel_msv(engine, &sidebar.root);
+    let q_theme = super::quadraui_tui::q_theme(theme);
+    quadraui::tui::draw_multi_section_view(
+        buf,
+        area,
+        &view,
+        &q_theme,
+        crate::icons::nerd_fonts_enabled(),
+    );
 
-    // Viewport scrolls freely — only clamped to valid range.
-    // Selection-tracking happens in the keyboard / poll handlers, not here.
-    let scroll_top = sidebar.search_scroll_top.min(max_scroll);
-    sidebar.search_scroll_top = scroll_top;
-
-    for (i, dr) in display_rows
-        .iter()
-        .skip(scroll_top)
-        .take(results_height)
-        .enumerate()
-    {
-        let screen_y = results_start_y + i as u16;
-        if screen_y >= area.y + area.height {
-            break;
-        }
-
-        // Fill row background first
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, screen_y, ' ', fg, bg);
-        }
-
-        let is_selected = !dr.is_header
-            && dr.result_idx == Some(engine.project_search_selected)
-            && !sidebar.search_input_mode;
-
-        let (row_fg, row_bg) = if is_selected {
-            (sel_fg, sel_bg)
-        } else if dr.is_header {
-            (file_header_fg, bg)
-        } else {
-            (fg, bg)
+    let bounds = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    let metrics = quadraui::MsvLayoutMetrics {
+        header_size: 1.0,
+        divider_size: 0.0,
+        scrollbar_size: 1.0,
+        cell_quantum: 1.0,
+    };
+    let layout = view.layout(bounds, metrics, |i| {
+        let s = &view.sections[i];
+        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
+        let content_size = match &s.body {
+            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
+            quadraui::SectionBody::Form(f) => f.fields.len() as f32,
+            _ => 0.0,
         };
-
-        // Re-fill with correct bg for selected rows
-        if is_selected || dr.is_header {
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, screen_y, ' ', row_fg, row_bg);
-            }
+        quadraui::SectionMeasure {
+            content_size,
+            aux_size,
         }
-
-        let mut x = area.x;
-        for ch in dr.text.chars() {
-            if x >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, x, screen_y, ch, row_fg, row_bg);
-            x += 1;
-        }
-    }
-
-    // Vertical scrollbar for results area
-    let total_display = display_rows.len();
-    if total_display > results_height && area.width >= 2 {
-        let track_fg = rc(theme.separator);
-        let thumb_fg = rc(theme.status_fg);
-        let sb_bg = bg;
-        let track_h = results_height as f64;
-        let thumb_size = ((results_height as f64 / total_display as f64) * track_h)
-            .ceil()
-            .max(1.0) as u16;
-        let thumb_top = ((scroll_top as f64 / total_display as f64) * track_h).floor() as u16;
-        let sb_x = area.x + area.width - 1;
-        for dy in 0..results_height as u16 {
-            let y = results_start_y + dy;
-            if y >= area.y + area.height {
-                break;
-            }
-            let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
-            let ch = if in_thumb { '█' } else { '░' };
-            let fg_color = if in_thumb { thumb_fg } else { track_fg };
-            set_cell(buf, sb_x, y, ch, fg_color, sb_bg);
-        }
-    }
+    });
+    engine.search_panel_msv_layout.replace(Some(layout));
 }
 
 // ─── Wildmenu (command Tab completion bar) ───────────────────────────────────

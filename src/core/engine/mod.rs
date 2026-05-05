@@ -2442,6 +2442,17 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Result<ReplaceResult, SearchError>>>,
     /// True while a background replace thread is running.
     pub project_replace_running: bool,
+    /// Per-file collapse state in search results. Indexed by file group order.
+    pub search_file_expanded: Vec<bool>,
+    /// Cached MSV layout from the last search panel paint. Written at paint time.
+    pub search_panel_msv_layout: std::cell::RefCell<Option<quadraui::MultiSectionViewLayout>>,
+    /// Which form field in the search panel has focus (widget ID string).
+    /// Written at paint time from TUI sidebar state.
+    pub search_panel_form_focus: std::cell::RefCell<Option<String>>,
+    /// Cursor position (char offset) in the search query input.
+    pub search_query_caret: std::cell::Cell<usize>,
+    /// Cursor position (char offset) in the replace text input.
+    pub replace_text_caret: std::cell::Cell<usize>,
 
     // --- LSP state ---
     /// Multi-server LSP coordinator. None until first LSP-capable file is opened.
@@ -3371,6 +3382,11 @@ impl Engine {
             project_replace_text: String::new(),
             project_replace_receiver: None,
             project_replace_running: false,
+            search_file_expanded: Vec::new(),
+            search_panel_msv_layout: std::cell::RefCell::new(None),
+            search_panel_form_focus: std::cell::RefCell::new(Some("search:query".to_string())),
+            search_query_caret: std::cell::Cell::new(0),
+            replace_text_caret: std::cell::Cell::new(0),
             lsp_manager: None,
             lsp_diagnostics: HashMap::new(),
             lsp_hover_text: None,

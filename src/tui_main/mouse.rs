@@ -2838,88 +2838,69 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
             sidebar.has_focus = true;
-            // results_height = (total height - 2 status rows) - 5 panel header rows
-            let results_height = term_height.saturating_sub(7) as usize;
-            let results = &engine.project_search_results;
-
-            // Click on the scrollbar column in the results area → jump-scroll
-            if col == sb_col && !results.is_empty() && sidebar_row >= 5 {
-                // Count total display rows (result rows + file header rows)
-                let total_display = {
-                    let mut count = 0usize;
-                    let mut last_file: Option<&std::path::Path> = None;
-                    for m in results.iter() {
-                        if last_file != Some(m.file.as_path()) {
-                            last_file = Some(m.file.as_path());
-                            count += 1;
-                        }
-                        count += 1;
-                    }
-                    count
-                };
-                if total_display > results_height {
-                    // Phase B.4 Stage 5c: arm drag state via the shared
-                    // `quadraui::DragState`. `apply_scrollbar_drag` runs
-                    // dispatch_mouse_drag at click time so the click-time
-                    // offset matches subsequent drags (no thumb jump).
-                    let track_start = (5 + menu_rows) as f32;
-                    let grab_offset = scrollbar_grab_offset(
-                        row as f32,
-                        track_start,
-                        results_height as f32,
-                        results_height,
-                        total_display,
-                        sidebar.search_scroll_top,
-                    );
-                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new("tui:search_results"),
-                        track_start,
-                        track_length: results_height as f32,
-                        visible_rows: results_height,
-                        total_items: total_display,
-                        grab_offset,
-                    });
-                    apply_scrollbar_drag(
-                        drag_state,
-                        quadraui::Point {
-                            x: col as f32,
-                            y: row as f32,
-                        },
-                        engine,
-                        sidebar,
-                    );
-                }
-                return sidebar_width;
-            }
-
-            // sidebar_rows 0-2: header + search + replace inputs — clicking enters input mode
-            if sidebar_row <= 2 {
-                sidebar.search_input_mode = true;
-                sidebar.replace_input_focused = sidebar_row == 2;
-            } else {
-                sidebar.search_input_mode = false;
-                sidebar.replace_input_focused = false;
-                // sidebar_row 3 = toggles, 4 = status line; 5+ = results area
-                // Add scroll offset so clicks map to the correct result.
-                let content_row =
-                    (sidebar_row as usize).saturating_sub(5) + sidebar.search_scroll_top;
-                if !results.is_empty() {
-                    let selected = visual_row_to_result_idx(results, content_row);
-                    if let Some(idx) = selected {
-                        engine.project_search_selected = idx;
-                        // Open the file immediately on click
-                        let result = engine
-                            .project_search_results
-                            .get(idx)
-                            .map(|m| (m.file.clone(), m.line));
-                        if let Some((file, line)) = result {
-                            engine.open_file_in_tab(&file);
-                            let win_id = engine.active_window_id();
-                            engine.set_cursor_for_window(win_id, line, 0);
-                            engine.ensure_cursor_visible();
-                            sidebar.has_focus = false;
+            let msv_layout = engine.search_panel_msv_layout.borrow();
+            if let Some(ref layout) = *msv_layout {
+                let hit_x = col as f32;
+                let hit_y = row as f32 + 0.5;
+                match layout.hit_test(hit_x, hit_y) {
+                    quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
+                        if let Some(sl) = layout.sections.first() {
+                            let local_x = hit_x - sl.body_bounds.x;
+                            let local_y = hit_y - sl.body_bounds.y;
+                            let view = render::build_search_panel_msv(engine, &sidebar.root);
+                            if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
+                                let form_area = ratatui::layout::Rect {
+                                    x: 0,
+                                    y: 0,
+                                    width: sl.body_bounds.width as u16,
+                                    height: sl.body_bounds.height as u16,
+                                };
+                                let form_layout = quadraui::tui::tui_form_layout(form, form_area);
+                                if let quadraui::FormHit::Field(id) =
+                                    form_layout.hit_test(local_x, local_y)
+                                {
+                                    drop(msv_layout);
+                                    engine.handle_search_form_hit(id.as_str());
+                                    sidebar.search_input_mode = id.as_str() == "search:query"
+                                        || id.as_str() == "search:replace";
+                                    sidebar.replace_input_focused = id.as_str() == "search:replace";
+                                    return sidebar_width;
+                                }
+                            }
                         }
                     }
+                    quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
+                        if let Some(sl) = layout.sections.get(1) {
+                            let local_x = hit_x - sl.body_bounds.x;
+                            let local_y = hit_y - sl.body_bounds.y;
+                            let view = render::build_search_panel_msv(engine, &sidebar.root);
+                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
+                                let tree_layout = quadraui::tui::tui_tree_layout(
+                                    tree,
+                                    ratatui::layout::Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width: sl.body_bounds.width as u16,
+                                        height: sl.body_bounds.height as u16,
+                                    },
+                                );
+                                if let quadraui::TreeViewHit::Row(row_idx) =
+                                    tree_layout.hit_test(local_x, local_y)
+                                {
+                                    let path = tree.rows[row_idx].path.clone();
+                                    drop(msv_layout);
+                                    sidebar.search_input_mode = false;
+                                    engine.handle_search_tree_hit(&path);
+                                    if path.len() >= 2 {
+                                        sidebar.has_focus = false;
+                                    }
+                                    return sidebar_width;
+                                }
+                            }
+                        }
+                    }
+                    quadraui::MultiSectionViewHit::Header { .. } => {}
+                    _ => {}
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Extensions {
