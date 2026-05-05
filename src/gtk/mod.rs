@@ -2278,9 +2278,12 @@ impl SimpleComponent for App {
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
         // ── Search sidebar DrawingArea setup ──────────────────────────────
-        backend
-            .borrow_mut()
-            .set_pango_context(widgets.search_sidebar_da.pango_context());
+        {
+            let pango_ctx = widgets.search_sidebar_da.pango_context();
+            let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
+            pango_ctx.set_font_description(Some(&font_desc));
+            backend.borrow_mut().set_pango_context(pango_ctx);
+        }
         {
             let engine = engine.clone();
             let backend_d = backend.clone();
