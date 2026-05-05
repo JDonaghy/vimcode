@@ -3115,12 +3115,22 @@ pub(super) fn render_debug_sidebar(
         } else {
             None
         };
+        let surface_bounds = if let Some(track) = sec.scrollbar_bounds {
+            quadraui::Rect::new(
+                sec.body_bounds.x,
+                sec.body_bounds.y,
+                sec.body_bounds.width + track.width,
+                sec.body_bounds.height,
+            )
+        } else {
+            sec.body_bounds
+        };
         engine
             .scroll_surfaces
             .borrow_mut()
             .push(quadraui::ScrollSurface {
                 id: quadraui::WidgetId::new(format!("debug_sidebar:{}", i)),
-                bounds: sec.body_bounds,
+                bounds: surface_bounds,
                 scrollbar,
             });
     }
