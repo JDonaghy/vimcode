@@ -2233,10 +2233,13 @@ pub(super) fn handle_mouse(
                 }
                 quadraui::UiEvent::MouseDown {
                     widget: Some(id), ..
-                } if matches!(
-                    id.as_str(),
-                    "debug_output" | "explorer:sb" | "ext_panel:sb" | "tui:settings"
-                ) =>
+                } if id.as_str() == "debug_output" => {
+                    return sidebar_width;
+                }
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if matches!(id.as_str(), "explorer:sb" | "ext_panel:sb" | "tui:settings")
+                    && drag_state.is_active() =>
                 {
                     return sidebar_width;
                 }
