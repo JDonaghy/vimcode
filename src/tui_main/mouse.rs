@@ -114,8 +114,8 @@ fn apply_scrollbar_drag(
                     engine.debug_output_auto_scroll = false;
                     handled = true;
                 }
-                other if other.starts_with("tui:debug_sidebar:") => {
-                    if let Some(idx_str) = other.strip_prefix("tui:debug_sidebar:") {
+                other if other.starts_with("debug_sidebar:") => {
+                    if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
                         if let Ok(idx) = idx_str.parse::<usize>() {
                             if idx < engine.dap_sidebar_scroll.len() {
                                 engine.dap_sidebar_scroll[idx] = *new_offset;
@@ -1229,53 +1229,20 @@ pub(super) fn handle_mouse(
                 engine.editor_hover_scroll(delta);
                 return sidebar_width;
             }
-            // Sidebar scroll wheel — panels not yet on dispatch_scroll.
-            if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-                if sidebar.active_panel == TuiPanel::Git {
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.sc_selected = engine.sc_selected.saturating_sub(3);
-                    } else {
-                        let flat_len = engine.sc_flat_len();
-                        engine.sc_selected =
-                            (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
-                    }
-                    return sidebar_width;
-                } else if sidebar.active_panel == TuiPanel::Debug {
-                    let layout_opt = engine.dap_sidebar_msv_layout.borrow().clone();
-                    if let Some(layout) = layout_opt.as_ref() {
-                        let lx = col as f32;
-                        let ly = row as f32;
-                        let section_idx = match layout.hit_test(lx, ly) {
-                            quadraui::MultiSectionViewHit::Header { section, .. }
-                            | quadraui::MultiSectionViewHit::Body { section }
-                            | quadraui::MultiSectionViewHit::Scrollbar { section, .. } => {
-                                Some(section)
-                            }
-                            _ => None,
-                        };
-                        if let Some(sec_idx) = section_idx {
-                            let section_kind = match sec_idx {
-                                0 => crate::core::engine::DebugSidebarSection::Variables,
-                                1 => crate::core::engine::DebugSidebarSection::Watch,
-                                2 => crate::core::engine::DebugSidebarSection::CallStack,
-                                _ => crate::core::engine::DebugSidebarSection::Breakpoints,
-                            };
-                            let item_count = engine.dap_sidebar_section_item_count(section_kind);
-                            let visible_rows = layout.sections[sec_idx].body_bounds.height as usize;
-                            let max_scroll = item_count.saturating_sub(visible_rows);
-                            if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                                engine.dap_sidebar_scroll[sec_idx] =
-                                    engine.dap_sidebar_scroll[sec_idx].saturating_sub(3);
-                            } else {
-                                engine.dap_sidebar_scroll[sec_idx] =
-                                    (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
-                            }
-                        }
-                    }
-                    return sidebar_width;
+            // Git panel scroll wheel — not yet on dispatch_scroll.
+            // Debug sidebar + other panels fall through to dispatch_scroll.
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Git
+            {
+                if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    engine.sc_selected = engine.sc_selected.saturating_sub(3);
+                } else {
+                    let flat_len = engine.sc_flat_len();
+                    engine.sc_selected = (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
                 }
-                // Other sidebar panels (Explorer, Search, Settings, Extensions,
-                // ext_panel) fall through to dispatch_scroll below.
+                return sidebar_width;
             }
             // Terminal panel scroll (must check before editor scroll).
             {
@@ -1387,6 +1354,16 @@ pub(super) fn handle_mouse(
                                 } else {
                                     (engine.ext_sidebar_panel_scroll - step).max(0.0)
                                 };
+                                return sidebar_width;
+                            }
+                            other if other.starts_with("debug_sidebar:") => {
+                                if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
+                                    if let Ok(idx) = idx_str.parse::<usize>() {
+                                        let step = (delta.y.abs() * 3.0).ceil() as isize;
+                                        let step = if delta.y > 0.0 { step } else { -step };
+                                        engine.handle_dap_sidebar_scroll(idx, step);
+                                    }
+                                }
                                 return sidebar_width;
                             }
                             _ => {}
@@ -2228,6 +2205,16 @@ pub(super) fn handle_mouse(
                             engine.settings_scroll_top = *new_offset;
                             return sidebar_width;
                         }
+                        other if other.starts_with("debug_sidebar:") => {
+                            if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
+                                if let Ok(idx) = idx_str.parse::<usize>() {
+                                    if idx < engine.dap_sidebar_scroll.len() {
+                                        engine.dap_sidebar_scroll[idx] = *new_offset;
+                                    }
+                                }
+                            }
+                            return sidebar_width;
+                        }
                         _ => {}
                     }
                 }
@@ -2241,6 +2228,11 @@ pub(super) fn handle_mouse(
                 } if matches!(id.as_str(), "explorer:sb" | "ext_panel:sb" | "tui:settings")
                     && drag_state.is_active() =>
                 {
+                    return sidebar_width;
+                }
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if id.as_str().starts_with("debug_sidebar:") && drag_state.is_active() => {
                     return sidebar_width;
                 }
                 _ => {}
@@ -2632,6 +2624,10 @@ pub(super) fn handle_mouse(
                         2 => DebugSidebarSection::CallStack,
                         _ => DebugSidebarSection::Breakpoints,
                     };
+                    // Scrollbar clicks (thumb drag, track page) are now
+                    // handled by dispatch_click via registered
+                    // ScrollSurface entries. Only body and header clicks
+                    // remain here.
                     match layout.hit_test(lx, ly) {
                         quadraui::MultiSectionViewHit::Header { section, .. } => {
                             engine.dap_sidebar_section = section_kind(section);
@@ -2662,67 +2658,6 @@ pub(super) fn handle_mouse(
                                     }
                                 }
                             }
-                        }
-                        quadraui::MultiSectionViewHit::Scrollbar {
-                            section,
-                            kind: quadraui::ScrollbarHit::Thumb,
-                        } => {
-                            engine.dap_sidebar_section = section_kind(section);
-                            let sb = layout.sections[section]
-                                .scrollbar_bounds
-                                .expect("scrollbar hit implies bounds present");
-                            let body_b = layout.sections[section].body_bounds;
-                            let item_count =
-                                engine.dap_sidebar_section_item_count(section_kind(section));
-                            let visible_rows = body_b.height as usize;
-                            let grab_offset = scrollbar_grab_offset(
-                                ly,
-                                sb.y,
-                                sb.height,
-                                visible_rows,
-                                item_count,
-                                engine.dap_sidebar_scroll[section],
-                            );
-                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                                widget: quadraui::WidgetId::new(format!(
-                                    "tui:debug_sidebar:{}",
-                                    section
-                                )),
-                                track_start: sb.y,
-                                track_length: sb.height,
-                                visible_rows,
-                                total_items: item_count,
-                                grab_offset,
-                            });
-                            apply_scrollbar_drag(
-                                drag_state,
-                                quadraui::Point { x: lx, y: ly },
-                                engine,
-                                sidebar,
-                            );
-                        }
-                        quadraui::MultiSectionViewHit::Scrollbar {
-                            section,
-                            kind: quadraui::ScrollbarHit::TrackBefore,
-                        } => {
-                            engine.dap_sidebar_section = section_kind(section);
-                            let visible_rows = layout.sections[section].body_bounds.height as usize;
-                            let cur = engine.dap_sidebar_scroll[section];
-                            engine.dap_sidebar_scroll[section] =
-                                cur.saturating_sub(visible_rows.max(1));
-                        }
-                        quadraui::MultiSectionViewHit::Scrollbar {
-                            section,
-                            kind: quadraui::ScrollbarHit::TrackAfter,
-                        } => {
-                            engine.dap_sidebar_section = section_kind(section);
-                            let visible_rows = layout.sections[section].body_bounds.height as usize;
-                            let item_count =
-                                engine.dap_sidebar_section_item_count(section_kind(section));
-                            let max_scroll = item_count.saturating_sub(visible_rows);
-                            let cur = engine.dap_sidebar_scroll[section];
-                            engine.dap_sidebar_scroll[section] =
-                                (cur + visible_rows.max(1)).min(max_scroll);
                         }
                         _ => {}
                     }

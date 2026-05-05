@@ -562,6 +562,53 @@ impl Engine {
         }
     }
 
+    /// Map a section index (0–3) back to a `DebugSidebarSection` variant.
+    pub fn dap_sidebar_section_from_index(idx: usize) -> DebugSidebarSection {
+        match idx {
+            0 => DebugSidebarSection::Variables,
+            1 => DebugSidebarSection::Watch,
+            2 => DebugSidebarSection::CallStack,
+            _ => DebugSidebarSection::Breakpoints,
+        }
+    }
+
+    /// Scroll a debug sidebar section by `step` lines (positive = down,
+    /// negative = up), clamped to `[0, max_scroll]`. Reads visible row
+    /// count from the cached MSV layout (populated during paint).
+    pub fn handle_dap_sidebar_scroll(&mut self, section_idx: usize, step: isize) {
+        if section_idx >= 4 {
+            return;
+        }
+        let section_kind = Self::dap_sidebar_section_from_index(section_idx);
+        let item_count = self.dap_sidebar_section_item_count(section_kind);
+        let visible_rows = self.dap_sidebar_visible_rows(section_idx);
+        let max_scroll = item_count.saturating_sub(visible_rows.max(1));
+        if step > 0 {
+            self.dap_sidebar_scroll[section_idx] =
+                (self.dap_sidebar_scroll[section_idx] + step as usize).min(max_scroll);
+        } else {
+            self.dap_sidebar_scroll[section_idx] =
+                self.dap_sidebar_scroll[section_idx].saturating_sub((-step) as usize);
+        }
+    }
+
+    /// Visible row count for a debug sidebar section, reading from
+    /// `section_heights` (set by GTK key handler and TUI mouse handler)
+    /// or falling back to the cached MSV layout body height.
+    fn dap_sidebar_visible_rows(&self, section_idx: usize) -> usize {
+        let from_heights = self.dap_sidebar_section_heights[section_idx] as usize;
+        if from_heights > 0 {
+            return from_heights;
+        }
+        let layout = self.dap_sidebar_msv_layout.borrow();
+        if let Some(ref l) = *layout {
+            if section_idx < l.sections.len() {
+                return l.sections[section_idx].body_bounds.height as usize;
+            }
+        }
+        0
+    }
+
     /// Adjust the scroll offset for the active section so that the selected item is visible.
     pub fn dap_sidebar_ensure_visible(&mut self) {
         let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);

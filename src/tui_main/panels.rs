@@ -3092,6 +3092,39 @@ pub(super) fn render_debug_sidebar(
     let msv_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
     let view = render::debug_sidebar_to_multi_section_view(sidebar);
     let layout = quadraui::tui::tui_msv_layout(&view, msv_area);
+
+    // Register scroll surfaces for each debug sidebar section so
+    // dispatch_scroll and dispatch_click can route scroll wheel +
+    // scrollbar interactions without per-backend code.
+    for (i, sec) in layout.sections.iter().enumerate() {
+        if i >= 4 {
+            break;
+        }
+        let visible_rows = sec.body_bounds.height as usize;
+        let section_kind = Engine::dap_sidebar_section_from_index(i);
+        let item_count = engine.dap_sidebar_section_item_count(section_kind);
+        let scrollbar = if let (Some(track), Some(thumb)) = (sec.scrollbar_bounds, sec.thumb_bounds)
+        {
+            Some(quadraui::SurfaceScrollbar {
+                track_bounds: track,
+                thumb_bounds: thumb,
+                total_items: item_count,
+                visible_items: visible_rows,
+                scroll_offset: engine.dap_sidebar_scroll[i],
+            })
+        } else {
+            None
+        };
+        engine
+            .scroll_surfaces
+            .borrow_mut()
+            .push(quadraui::ScrollSurface {
+                id: quadraui::WidgetId::new(format!("debug_sidebar:{}", i)),
+                bounds: sec.body_bounds,
+                scrollbar,
+            });
+    }
+
     engine.dap_sidebar_msv_layout.replace(Some(layout));
     engine.dap_sidebar_msv_view.replace(Some(view.clone()));
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));

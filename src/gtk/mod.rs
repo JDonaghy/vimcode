@@ -9015,6 +9015,22 @@ impl App {
         }
     }
 
+    fn gtk_populate_dap_section_heights(&self, engine: &mut Engine, lh: f64) {
+        let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
+        let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
+        if let (Some(layout), Some(view)) = (cached_layout.as_ref(), cached_view.as_ref()) {
+            for (i, sec) in layout.sections.iter().enumerate() {
+                if i >= 4 {
+                    break;
+                }
+                if let quadraui::SectionBody::Tree(ref tree) = view.sections[i].body {
+                    let inner = quadraui::gtk::gtk_tree_layout(tree, sec.body_bounds, lh);
+                    engine.dap_sidebar_section_heights[i] = inner.visible_rows.len() as u16;
+                }
+            }
+        }
+    }
+
     fn handle_debug_sidebar_msg(&mut self, msg: Msg) {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
@@ -9141,25 +9157,8 @@ impl App {
                 // fix — earlier passthrough that called `engine::handle_key`
                 // was re-intercepted at `keys.rs:192` because of the
                 // `dap_sidebar_has_focus` check.)
-                // Compute section heights for ensure_visible. Same
-                // Update section heights from cached MSV layout so
-                // ensure_visible / PageUp / PageDown use actual
-                // visible row counts, not the old lh-unit formula.
                 let lh = self.debug_sidebar_lh.get().max(1.0);
-                let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
-                let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
-                if let (Some(layout), Some(view)) = (cached_layout.as_ref(), cached_view.as_ref()) {
-                    for (i, sec) in layout.sections.iter().enumerate() {
-                        if i < 4 {
-                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[i].body {
-                                let inner =
-                                    quadraui::gtk::gtk_tree_layout(tree, sec.body_bounds, lh);
-                                engine.dap_sidebar_section_heights[i] =
-                                    inner.visible_rows.len() as u16;
-                            }
-                        }
-                    }
-                }
+                self.gtk_populate_dap_section_heights(&mut engine, lh);
                 let mapped = map_gtk_key_name(key_name.as_str());
                 engine.handle_debug_sidebar_key(mapped, ctrl);
                 let still_focused = engine.dap_sidebar_has_focus;
@@ -9173,40 +9172,14 @@ impl App {
             Msg::DebugSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
                 let lh = self.debug_sidebar_lh.get().max(1.0);
-                // Use the cached MSV layout to get visible_rows
-                // from the tree layout — same source of truth as
-                // paint + click (#296).
-                let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
                 let sec = engine.dap_sidebar_section;
                 let idx = Engine::dap_sidebar_section_index(sec);
-                let item_count = engine.dap_sidebar_section_item_count(sec);
-                let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
-                let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
-                let visible_rows = if let (Some(layout), Some(view)) =
-                    (cached_layout.as_ref(), cached_view.as_ref())
-                {
-                    if idx < layout.sections.len() {
-                        let body_b = layout.sections[idx].body_bounds;
-                        if let quadraui::SectionBody::Tree(ref tree) = view.sections[idx].body {
-                            let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
-                            inner.visible_rows.len()
-                        } else {
-                            1
-                        }
-                    } else {
-                        1
-                    }
-                } else {
-                    engine.dap_sidebar_section_heights[idx] as usize
-                };
-                let max_scroll = item_count.saturating_sub(visible_rows.max(1));
-                if dy > 0.0 {
-                    engine.dap_sidebar_scroll[idx] =
-                        (engine.dap_sidebar_scroll[idx] + scroll_amount).min(max_scroll);
-                } else {
-                    engine.dap_sidebar_scroll[idx] =
-                        engine.dap_sidebar_scroll[idx].saturating_sub(scroll_amount);
-                }
+                // Populate section_heights from cached layout so the
+                // shared scroll method has correct visible-row counts.
+                self.gtk_populate_dap_section_heights(&mut engine, lh);
+                let step = (dy.abs() * 3.0).ceil() as isize;
+                let step = if dy > 0.0 { step } else { -step };
+                engine.handle_dap_sidebar_scroll(idx, step);
                 drop(engine);
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
