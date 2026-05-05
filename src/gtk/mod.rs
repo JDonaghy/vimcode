@@ -2278,6 +2278,9 @@ impl SimpleComponent for App {
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
         // ── Search sidebar DrawingArea setup ──────────────────────────────
+        backend
+            .borrow_mut()
+            .set_pango_context(widgets.search_sidebar_da.pango_context());
         {
             let engine = engine.clone();
             let backend_d = backend.clone();
