@@ -1,32 +1,36 @@
 # VimCode Project State
 
-**Last updated:** May 4, 2026 (Session 350 — #305 terminal toolbar shipped; quadraui gained rect-height-aware tab bar + compact mode).
+**Last updated:** May 5, 2026 (Session 351 — **All bespoke paint surfaces eliminated.** #301 menu bar, #310 command center, #302 search panel shipped. Also #290 + #291 extension panel bug fixes).
 
 ## Active milestone: Cross-Platform UI Crate
 
 **This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
 
-**Remaining bespoke paint surfaces** (2 issues):
+**All bespoke paint surfaces are now eliminated.** The last two surfaces (#301 menu bar, #302 search panel) shipped this session. Every UI surface in both TUI and GTK now paints through quadraui primitives.
 
-| # | Surface | Primitive | Est. |
-|---|---------|-----------|------|
-| [#302](https://github.com/JDonaghy/vimcode/issues/302) | Search panel (~321 TUI + native GTK) | MSV+TreeView | 12–16 hrs |
-| [#301](https://github.com/JDonaghy/vimcode/issues/301) | Menu bar (~119 TUI + ~172 GTK) | `MenuBar` | 6–8 hrs |
+**Remaining milestone work** is consolidation and infrastructure:
 
-**All quadraui prereqs are now resolved.** quadraui#6 (MenuBar rasterisers) and quadraui#7 (SearchPanel) are both CLOSED — #301 and #302 are ready to work on with no blockers.
-
-**Scroll dispatch migration** ([#307](https://github.com/JDonaghy/vimcode/issues/307)):
-
-#303 established the `ScrollSurface` + `dispatch_scroll` + `dispatch_click` pattern. [#307](https://github.com/JDonaghy/vimcode/issues/307) tracks migrating all remaining scrollable surfaces (editor viewport, terminal scrollback, sidebar panels, debug sidebar, hover popup) to the same shared dispatch — eliminating ~82 lines of bespoke per-backend scroll routing in TUI `mouse.rs` alone, plus equivalent GTK code. Note: GTK terminal scroll wheel was confirmed never wired up (pre-existing gap, not a regression).
+| # | Title | Category |
+|---|-------|----------|
+| [#307](https://github.com/JDonaghy/vimcode/issues/307) | Scroll dispatch migration | Consolidation |
+| [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
+| [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
+| [#308](https://github.com/JDonaghy/vimcode/issues/308) | Menu bar keyboard/hover dispatch gaps | Polish |
+| [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
+| [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
 **Shipped this session:**
-- **#305** (`08dd916`) — Terminal toolbar → `quadraui::StatusBar` (find mode) + `quadraui::TabBar` (tab strip mode). Both backends paint through `render::build_terminal_toolbar()`. Click dispatch via shared `Engine::resolve_terminal_toolbar_click()`. quadraui gained rect-height-aware tab bar (quadraui#49) and compact mode (quadraui#50, `TabBar.compact: bool`). Bottom panel tabs also set `compact: true`. CLAUDE.md gained no-cross-repo-edits rule.
+- **#301** (PR #309, `5baadcc`) — Menu bar labels → `quadraui::MenuBar`. Both backends paint through quadraui rasterisers. Click/hover via cached `MenuBarLayout::hit_test()`.
+- **#310** (`b5fdd7d`) — Nav arrows + search box → `quadraui::CommandCenter`. Eliminated ~242 lines of per-backend rendering + click code. GTK window drag preserved.
+- **#302** (multiple commits ending `de625bb`) — Search panel → `quadraui::MSV + Form + TreeView`. TUI: ~321 lines bespoke paint + ~86 lines click → zero. GTK: ~226 lines native widgets → DrawingArea + same MSV pipeline. Replace All now has confirmation dialog. quadraui gained ToggleGroup + ButtonRow (quadraui#52), full-width Form fields (quadraui#54), GTK Pango-based form_layout (quadraui#56).
+- **#290** (`0a8f46f`) — TUI extension panel search input no longer drops r/i/d/q// characters.
+- **#291** (`924aa24`) — Arrow keys navigate extension panel results while search input active.
 
 ---
 
-**Previous session (349):** #304 bottom panel tabs shipped; quadraui gained `show_tab_close`.
+**Previous session (350):** #305 terminal toolbar shipped; quadraui gained rect-height-aware tab bar + compact mode.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`08dd916`. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`de625bb`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -100,6 +104,9 @@ cell coalescence) remain but are tracked separately.
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
 | Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false`, `compact: true`. |
 | Terminal toolbar (find bar + tab strip) | `StatusBar` / `TabBar` | ✅ | ✅ | #305, `08dd916`. Adapter `render::build_terminal_toolbar`. Click via `Engine::resolve_terminal_toolbar_click`. Tab strip uses `compact: true`. |
+| Menu bar labels | `MenuBar` | ✅ | ✅ | #301, PR #309. Adapter `render::build_menu_bar_view`. Click/hover via cached `MenuBarLayout::hit_test`. |
+| Command center (nav arrows + search box) | `CommandCenter` | ✅ | ✅ | #310, `b5fdd7d`. Adapter `render::build_command_center_view`. Click via `CommandCenterLayout::hit_test`. |
+| Search panel (chrome + results) | `MSV` + `Form` + `TreeView` | ✅ | ✅ | #302, `de625bb`. Adapter `render::build_search_panel_msv`. Form: query/replace TextInput + ToggleGroup + ButtonRow. Tree: file-grouped results. Click via `backend.form_layout`/`backend.tree_layout`. Replace All has confirmation dialog. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 

@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-04 (Session 350 — #305 terminal toolbar shipped. 2 bespoke paint surfaces remain (#301 menu bar, #302 search panel). quadraui gained rect-height-aware tab bar (#49) + compact mode (#50).)
+> **Last updated:** 2026-05-05 (Session 351 — **All bespoke paint surfaces eliminated.** #301 menu bar + #310 command center + #302 search panel shipped. quadraui gained ToggleGroup/ButtonRow (#52), full-width Form (#54), Pango form_layout (#56). Milestone focus shifts to consolidation (#307 scroll dispatch) and polish (#308/#311/#312).)
 
 ---
 
@@ -65,16 +65,22 @@ Other work queued as quadraui issues from the Session 346 audit:
   + [quadraui#4](https://github.com/JDonaghy/quadraui/issues/4). Harness
   coverage extension; mirror the TUI pattern using `cairo::ImageSurface`.
 - **MenuBar rasterisers** — [quadraui#6](https://github.com/JDonaghy/quadraui/issues/6) ✅ CLOSED.
-  Vimcode-side adoption: [#301](https://github.com/JDonaghy/vimcode/issues/301) — **unblocked, ready to work on**.
+  Vimcode-side adoption: [#301](https://github.com/JDonaghy/vimcode/issues/301) ✅ CLOSED (Session 351, PR #309).
 - **SearchPanel primitive** — [quadraui#7](https://github.com/JDonaghy/quadraui/issues/7) ✅ CLOSED.
-  Vimcode-side adoption: [#302](https://github.com/JDonaghy/vimcode/issues/302) — **unblocked, ready to work on**.
+  Vimcode-side adoption: [#302](https://github.com/JDonaghy/vimcode/issues/302) ✅ CLOSED (Session 351, `de625bb`).
+- **CommandCenter primitive** — [quadraui#51](https://github.com/JDonaghy/quadraui/issues/51) ✅ CLOSED.
+  Vimcode-side adoption: [#310](https://github.com/JDonaghy/vimcode/issues/310) ✅ CLOSED (Session 351, `b5fdd7d`).
+- **Form ToggleGroup + ButtonRow** — [quadraui#52](https://github.com/JDonaghy/quadraui/issues/52) ✅ CLOSED.
+- **Form full-width layout** — [quadraui#54](https://github.com/JDonaghy/quadraui/issues/54) ✅ CLOSED.
+- **GTK form_layout Pango measurement** — [quadraui#56](https://github.com/JDonaghy/quadraui/issues/56) ✅ CLOSED.
 - **Audit orphan primitives** — [quadraui#8](https://github.com/JDonaghy/quadraui/issues/8).
   `panel.rs`, `progress.rs`, `spinner.rs`, `split.rs`, `toast.rs` have
   no rasterisers; verdict pending.
 - **CLAUDE.md "harness is the gate" doc** — [quadraui#5](https://github.com/JDonaghy/quadraui/issues/5).
 
-After those land, queue: vimcode bug fixes (#287, #288, #290, #291,
-#292); Win-GUI rebuild; macOS; Lua bindings for extension mini-apps.
+After those land, queue: vimcode bug fixes (#287, #288, #292,
+#308, #311, #312); Win-GUI rebuild; macOS; Lua bindings for extension mini-apps.
+(#290 and #291 fixed in Session 351.)
 
 ### Cross-repo prereq tracking
 
