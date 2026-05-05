@@ -317,7 +317,7 @@ struct App {
     sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
     /// Direct refs to each panel's outer Box for programmatic show/hide.
     explorer_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    search_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
+    search_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
@@ -359,10 +359,6 @@ struct App {
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
     sender: relm4::Sender<Msg>,
-    /// Status text shown below the project search input ("N matches in M files").
-    project_search_status: String,
-    /// Ref to the search results ListBox so we can rebuild it after each search.
-    search_results_list: Rc<RefCell<Option<gtk4::ListBox>>>,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
@@ -812,6 +808,8 @@ enum Msg {
     ProjectReplaceTextChanged(String),
     /// User clicked "Replace All" button — run replace across files.
     ProjectReplaceAll,
+    SearchPanelClick(f64, f64),
+    SearchPanelKey(String, Option<char>),
     /// Mouse scroll wheel on editor drawing area.
     MouseScroll {
         delta_x: f64,
@@ -1155,161 +1153,23 @@ impl SimpleComponent for App {
                             },
                         },
 
-                        // Search panel
+                        // Search panel (quadraui DrawingArea)
                         #[name = "search_panel"]
                         gtk4::Box {
                             set_orientation: gtk4::Orientation::Vertical,
                             set_css_classes: &["sidebar"],
 
                             #[watch]
-                            set_visible: model.active_panel == SidebarPanel::Search,
-
-                            // Header
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Horizontal,
-                                set_css_classes: &["sidebar-header"],
-                                gtk4::Label {
-                                    set_text: " SEARCH",
-                                    set_halign: gtk4::Align::Start,
-                                    set_hexpand: true,
-                                    set_css_classes: &["sidebar-title"],
-                                },
+                            set_visible: {
+                                if model.active_panel == SidebarPanel::Search {
+                                    search_sidebar_da.queue_draw();
+                                }
+                                model.active_panel == SidebarPanel::Search
                             },
 
-                            // Search input row
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Horizontal,
-                                set_margin_top: 6,
-                                set_margin_bottom: 4,
-                                set_margin_start: 6,
-                                set_margin_end: 6,
-
-                                #[name = "project_search_entry"]
-                                gtk4::Entry {
-                                    set_hexpand: true,
-                                    set_width_chars: 1,
-                                    set_placeholder_text: Some("Search files…"),
-
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(Msg::ProjectSearchQueryChanged(
-                                            entry.text().to_string(),
-                                        ));
-                                    },
-
-                                    connect_activate[sender] => move |_| {
-                                        sender.input(Msg::ProjectSearchSubmit);
-                                    },
-                                },
-                            },
-
-                            // Toggle buttons row (Aa / Ab| / .*)
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Horizontal,
-                                set_margin_start: 6,
-                                set_margin_end: 6,
-                                set_margin_bottom: 4,
-                                set_spacing: 4,
-
-                                gtk4::ToggleButton {
-                                    set_label: "Aa",
-                                    set_tooltip_text: Some("Match Case"),
-                                    set_css_classes: &["search-toggle-btn"],
-
-                                    #[watch]
-                                    set_active: model.engine.borrow().project_search_options.case_sensitive,
-
-                                    connect_clicked[sender] => move |_| {
-                                        sender.input(Msg::ProjectSearchToggleCase);
-                                    },
-                                },
-
-                                gtk4::ToggleButton {
-                                    set_label: "Ab|",
-                                    set_tooltip_text: Some("Match Whole Word"),
-                                    set_css_classes: &["search-toggle-btn"],
-
-                                    #[watch]
-                                    set_active: model.engine.borrow().project_search_options.whole_word,
-
-                                    connect_clicked[sender] => move |_| {
-                                        sender.input(Msg::ProjectSearchToggleWholeWord);
-                                    },
-                                },
-
-                                gtk4::ToggleButton {
-                                    set_label: ".*",
-                                    set_tooltip_text: Some("Use Regular Expression"),
-                                    set_css_classes: &["search-toggle-btn"],
-
-                                    #[watch]
-                                    set_active: model.engine.borrow().project_search_options.use_regex,
-
-                                    connect_clicked[sender] => move |_| {
-                                        sender.input(Msg::ProjectSearchToggleRegex);
-                                    },
-                                },
-                            },
-
-                            // Replace input row
-                            gtk4::Box {
-                                set_orientation: gtk4::Orientation::Horizontal,
-                                set_margin_top: 2,
-                                set_margin_bottom: 4,
-                                set_margin_start: 6,
-                                set_margin_end: 6,
-                                set_spacing: 4,
-
-                                gtk4::Entry {
-                                    set_hexpand: true,
-                                    set_width_chars: 1,
-                                    set_placeholder_text: Some("Replace…"),
-
-                                    connect_changed[sender] => move |entry| {
-                                        sender.input(Msg::ProjectReplaceTextChanged(
-                                            entry.text().to_string(),
-                                        ));
-                                    },
-
-                                    connect_activate[sender] => move |_| {
-                                        sender.input(Msg::ProjectReplaceAll);
-                                    },
-                                },
-
-                                gtk4::Button {
-                                    set_label: "All",
-                                    set_tooltip_text: Some("Replace all matches in project"),
-                                    set_css_classes: &["search-toggle-btn"],
-
-                                    connect_clicked[sender] => move |_| {
-                                        sender.input(Msg::ProjectReplaceAll);
-                                    },
-                                },
-                            },
-
-                            // Status label ("N results in M files" / empty)
-                            gtk4::Label {
-                                set_margin_start: 8,
-                                set_margin_bottom: 4,
-                                set_halign: gtk4::Align::Start,
-                                set_css_classes: &["dim-label"],
-
-                                #[watch]
-                                set_text: &model.project_search_status,
-                            },
-
-                            // Results list
-                            gtk4::ScrolledWindow {
+                            #[name = "search_sidebar_da"]
+                            gtk4::DrawingArea {
                                 set_vexpand: true,
-                                set_hscrollbar_policy: gtk4::PolicyType::Never,
-                                set_vscrollbar_policy: gtk4::PolicyType::Automatic,
-                                set_overlay_scrolling: false,
-                                set_css_classes: &["search-results-scroll"],
-
-                                #[name = "search_results_list"]
-                                gtk4::ListBox {
-                                    set_selection_mode: gtk4::SelectionMode::Single,
-                                    set_css_classes: &["search-results-list"],
-                                },
                             },
                         },
 
@@ -2224,7 +2084,8 @@ impl SimpleComponent for App {
         // initial_width + total_offset instead of accumulating delta per event.
         let sidebar_drag_start_w: Rc<Cell<i32>> = Rc::new(Cell::new(300));
         let explorer_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let search_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
+        let search_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
         let debug_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let git_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ext_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
@@ -2237,8 +2098,6 @@ impl SimpleComponent for App {
         let settings_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
         let ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
         let ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
-        let search_results_list_ref: Rc<RefCell<Option<gtk4::ListBox>>> =
-            Rc::new(RefCell::new(None));
 
         // Set up file watcher for settings.json
         let settings_path = std::env::var("HOME")
@@ -2349,7 +2208,7 @@ impl SimpleComponent for App {
             sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
             sidebar_revealer: sidebar_revealer_ref.clone(),
             explorer_panel_box: explorer_panel_box_ref.clone(),
-            search_panel_box: search_panel_box_ref.clone(),
+            search_sidebar_da_ref: search_sidebar_da_ref.clone(),
             debug_panel_box: debug_panel_box_ref.clone(),
             git_panel_box: git_panel_box_ref.clone(),
             ext_panel_box: ext_panel_box_ref.clone(),
@@ -2358,8 +2217,6 @@ impl SimpleComponent for App {
             settings_panel_box: settings_panel_box_ref.clone(),
             settings_da_ref: settings_da_ref.clone(),
             ai_panel_box_ref: ai_panel_box_ref.clone(),
-            project_search_status: String::new(),
-            search_results_list: search_results_list_ref.clone(),
             last_clipboard_content: None,
             clipboard,
             h_sb_dragging: None,
@@ -2413,14 +2270,67 @@ impl SimpleComponent for App {
         *sidebar_inner_sw_ref.borrow_mut() = Some(widgets.sidebar_inner_sw.clone());
         *sidebar_revealer_ref.borrow_mut() = Some(widgets.sidebar_revealer.clone());
         *explorer_panel_box_ref.borrow_mut() = Some(widgets.explorer_panel.clone());
-        *search_panel_box_ref.borrow_mut() = Some(widgets.search_panel.clone());
+        *search_sidebar_da_ref.borrow_mut() = Some(widgets.search_sidebar_da.clone());
         *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
         *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
         *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
         *ext_dyn_panel_box_ref.borrow_mut() = Some(widgets.ext_dyn_panel.clone());
         *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
         *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
-        *search_results_list_ref.borrow_mut() = Some(widgets.search_results_list.clone());
+        // ── Search sidebar DrawingArea setup ──────────────────────────────
+        {
+            let engine = engine.clone();
+            let backend_d = backend.clone();
+            widgets
+                .search_sidebar_da
+                .set_draw_func(move |da, cr, _w, _h| {
+                    let engine = engine.borrow();
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
+                    let q_theme = crate::gtk::quadraui_gtk::q_theme(&theme);
+                    let root = engine.cwd.clone();
+                    let view = render::build_search_panel_msv(&engine, &root);
+                    let w = da.width() as f64;
+                    let h = da.height() as f64;
+                    let pango_ctx = pangocairo::create_context(cr);
+                    let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
+                    let pango_layout = pango::Layout::new(&pango_ctx);
+                    pango_layout.set_font_description(Some(&font_desc));
+                    let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
+                    use quadraui::Backend;
+                    backend_d
+                        .borrow_mut()
+                        .enter_frame_scope(cr, &pango_layout, |b| {
+                            b.set_current_theme(q_theme);
+                            let line_height = {
+                                pango_layout.set_text("Xy");
+                                pango_layout.pixel_size().1 as f64
+                            };
+                            b.set_current_line_height(line_height);
+                            b.draw_multi_section_view(area, &view);
+                        });
+                });
+        }
+        {
+            let sender_click = sender.input_sender().clone();
+            let gesture = gtk4::GestureClick::new();
+            gesture.set_button(1);
+            gesture.connect_pressed(move |_, _, x, y| {
+                sender_click.send(Msg::SearchPanelClick(x, y)).ok();
+            });
+            widgets.search_sidebar_da.add_controller(gesture);
+        }
+        {
+            let sender_key = sender.input_sender().clone();
+            let key_ctrl = gtk4::EventControllerKey::new();
+            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
+                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let unicode = key.to_unicode().filter(|c| !c.is_control());
+                sender_key.send(Msg::SearchPanelKey(key_name, unicode)).ok();
+                gtk4::glib::Propagation::Stop
+            });
+            widgets.search_sidebar_da.set_focusable(true);
+            widgets.search_sidebar_da.add_controller(key_ctrl);
+        }
 
         // ── Settings sidebar (Phase A.3c-2: native widgets → DrawingArea) ──────
         {
@@ -4830,15 +4740,11 @@ impl SimpleComponent for App {
             Msg::ProjectReplaceAll => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.engine.borrow_mut().start_project_replace(cwd);
-                let status = self.engine.borrow().message.clone();
-                self.project_search_status = status;
                 self.draw_needed.set(true);
             }
             Msg::ProjectSearchSubmit => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 self.engine.borrow_mut().start_project_search(cwd);
-                let status = self.engine.borrow().message.clone();
-                self.project_search_status = status;
                 self.draw_needed.set(true);
             }
             Msg::SearchPollTick => {
@@ -4861,6 +4767,72 @@ impl SimpleComponent for App {
                     self.engine.borrow_mut().ensure_cursor_visible();
                 }
                 self.draw_needed.set(true);
+            }
+            Msg::SearchPanelClick(_x, _y) => {
+                // TODO: MSV hit_test → form/tree dispatch (same as TUI)
+                self.draw_needed.set(true);
+                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+            }
+            Msg::SearchPanelKey(key_name, unicode) => {
+                let mapped = map_gtk_key_name(key_name.as_str());
+                let mut engine = self.engine.borrow_mut();
+                let is_query =
+                    engine.search_panel_form_focus.borrow().as_deref() == Some("search:query");
+                let is_replace =
+                    engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
+                match mapped {
+                    "Return" => {
+                        if is_replace {
+                            let cwd = engine.cwd.clone();
+                            engine.start_project_replace(cwd);
+                        } else {
+                            let cwd = engine.cwd.clone();
+                            engine.start_project_search(cwd);
+                        }
+                    }
+                    "BackSpace" => {
+                        if is_replace {
+                            engine.project_replace_text.pop();
+                        } else if is_query {
+                            engine.project_search_query.pop();
+                        }
+                    }
+                    "Tab" => {
+                        if is_query {
+                            engine
+                                .search_panel_form_focus
+                                .replace(Some("search:replace".to_string()));
+                        } else {
+                            engine
+                                .search_panel_form_focus
+                                .replace(Some("search:query".to_string()));
+                        }
+                    }
+                    "Escape" => {
+                        engine.search_panel_form_focus.replace(None);
+                    }
+                    _ => {
+                        if let Some(ch) = unicode {
+                            if is_replace {
+                                engine.project_replace_text.push(ch);
+                            } else {
+                                if !is_query {
+                                    engine
+                                        .search_panel_form_focus
+                                        .replace(Some("search:query".to_string()));
+                                }
+                                engine.project_search_query.push(ch);
+                            }
+                        }
+                    }
+                }
+                drop(engine);
+                self.draw_needed.set(true);
+                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
             }
             Msg::RenameFile(_, _)
             | Msg::MoveFile(_, _)
@@ -5242,78 +5214,6 @@ impl App {
             }
             self.last_clipboard_content = new_content;
         }
-    }
-
-    /// Rebuild the search results ListBox from current engine state.
-    fn rebuild_search_results(&self, sender: &relm4::Sender<Msg>) {
-        let list = match self.search_results_list.borrow().as_ref() {
-            Some(l) => l.clone(),
-            None => return,
-        };
-
-        // Remove all existing rows
-        while let Some(child) = list.first_child() {
-            list.remove(&child);
-        }
-
-        let engine = self.engine.borrow();
-        let results = &engine.project_search_results;
-        if results.is_empty() {
-            return;
-        }
-
-        let theme = Theme::from_name(&engine.settings.colorscheme);
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let mut last_file: Option<PathBuf> = None;
-
-        for (idx, m) in results.iter().enumerate() {
-            // Add a file header row when the file changes
-            if last_file.as_deref() != Some(&m.file) {
-                last_file = Some(m.file.clone());
-                let rel = m.file.strip_prefix(&cwd).unwrap_or(&m.file);
-                let file_label = gtk4::Label::new(None);
-                let header_markup = format!(
-                    "<b><span foreground='{}'>{}</span></b>",
-                    theme.function.to_hex(),
-                    gtk4::glib::markup_escape_text(&rel.display().to_string())
-                );
-                file_label.set_markup(&header_markup);
-                file_label.set_halign(gtk4::Align::Start);
-                file_label.set_margin_top(4);
-                file_label.set_margin_start(4);
-                let header_row = gtk4::ListBoxRow::new();
-                header_row.set_selectable(false);
-                header_row.set_child(Some(&file_label));
-                list.append(&header_row);
-            }
-
-            // Result row
-            let snippet = format!("  {}: {}", m.line + 1, m.line_text.trim());
-            let row_label = gtk4::Label::new(None);
-            let result_markup = format!(
-                "<span foreground='{}'>{}</span>",
-                theme.foreground.to_hex(),
-                gtk4::glib::markup_escape_text(&snippet)
-            );
-            row_label.set_markup(&result_markup);
-            row_label.set_halign(gtk4::Align::Start);
-            row_label.set_ellipsize(pango::EllipsizeMode::End);
-            row_label.set_margin_start(4);
-            let result_row = gtk4::ListBoxRow::new();
-            result_row.set_selectable(true);
-
-            // Tag the row with its result index via the widget name
-            result_row.set_widget_name(&idx.to_string());
-            result_row.set_child(Some(&row_label));
-            list.append(&result_row);
-        }
-
-        let sender_clone = sender.clone();
-        list.connect_row_activated(move |_, row| {
-            if let Ok(idx) = row.widget_name().parse::<usize>() {
-                sender_clone.send(Msg::ProjectSearchOpenResult(idx)).ok();
-            }
-        });
     }
 
     /// Rebuild and sync scrollbars for all windows
@@ -6050,17 +5950,15 @@ impl App {
             }
         }
         if self.engine.borrow_mut().poll_project_search() {
-            let status = self.engine.borrow().message.clone();
-            self.project_search_status = status;
-            let s = self.sender.clone();
-            self.rebuild_search_results(&s);
+            if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
+                da.queue_draw();
+            }
             self.draw_needed.set(true);
         }
         if self.engine.borrow_mut().poll_project_replace() {
-            let status = self.engine.borrow().message.clone();
-            self.project_search_status = status;
-            let s = self.sender.clone();
-            self.rebuild_search_results(&s);
+            if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
+                da.queue_draw();
+            }
             self.draw_needed.set(true);
         }
         // LSP: flush debounced didChange notifications and poll for events
@@ -10233,7 +10131,6 @@ impl App {
                 }
                 for (which, panel_ref) in [
                     (SidebarPanel::Explorer, &self.explorer_panel_box),
-                    (SidebarPanel::Search, &self.search_panel_box),
                     (SidebarPanel::Debug, &self.debug_panel_box),
                     (SidebarPanel::Git, &self.git_panel_box),
                     (SidebarPanel::Extensions, &self.ext_panel_box),
@@ -10339,7 +10236,6 @@ impl App {
                 }
                 for (which, panel_ref) in [
                     (SidebarPanel::Explorer, &self.explorer_panel_box),
-                    (SidebarPanel::Search, &self.search_panel_box),
                     (SidebarPanel::Debug, &self.debug_panel_box),
                     (SidebarPanel::Git, &self.git_panel_box),
                     (SidebarPanel::Extensions, &self.ext_panel_box),
