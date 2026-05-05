@@ -2312,9 +2312,11 @@ impl SimpleComponent for App {
         }
         {
             let sender_click = sender.input_sender().clone();
+            let da_for_click = widgets.search_sidebar_da.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
             gesture.connect_pressed(move |_, _, x, y| {
+                da_for_click.grab_focus();
                 sender_click.send(Msg::SearchPanelClick(x, y)).ok();
             });
             widgets.search_sidebar_da.add_controller(gesture);
@@ -4768,8 +4770,98 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::SearchPanelClick(_x, _y) => {
-                // TODO: MSV hit_test → form/tree dispatch (same as TUI)
+            Msg::SearchPanelClick(x, y) => {
+                let root = self.engine.borrow().cwd.clone();
+                let view = render::build_search_panel_msv(&self.engine.borrow(), &root);
+                let da_w = self
+                    .search_sidebar_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.width() as f32)
+                    .unwrap_or(200.0);
+                let da_h = self
+                    .search_sidebar_da_ref
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.height() as f32)
+                    .unwrap_or(400.0);
+                let bounds = quadraui::Rect::new(0.0, 0.0, da_w, da_h);
+                let line_height = 20.0_f32;
+                let metrics = quadraui::MsvLayoutMetrics {
+                    header_size: line_height,
+                    divider_size: 0.0,
+                    scrollbar_size: 12.0,
+                    cell_quantum: 0.0,
+                };
+                let layout = view.layout(bounds, metrics, |i| {
+                    let s = &view.sections[i];
+                    let aux_size = if s.aux.is_some() {
+                        metrics.header_size
+                    } else {
+                        0.0
+                    };
+                    let content_size = match &s.body {
+                        quadraui::SectionBody::Tree(t) => t.rows.len() as f32 * metrics.header_size,
+                        quadraui::SectionBody::Form(f) => {
+                            f.fields.len() as f32 * metrics.header_size
+                        }
+                        _ => 0.0,
+                    };
+                    quadraui::SectionMeasure {
+                        content_size,
+                        aux_size,
+                    }
+                });
+                let hx = x as f32;
+                let hy = y as f32;
+                match layout.hit_test(hx, hy) {
+                    quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
+                        if let Some(sl) = layout.sections.first() {
+                            if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
+                                let form_layout = quadraui::tui::tui_form_layout(
+                                    form,
+                                    ratatui::layout::Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width: sl.body_bounds.width as u16,
+                                        height: sl.body_bounds.height as u16,
+                                    },
+                                );
+                                let local_x = hx - sl.body_bounds.x;
+                                let local_y = hy - sl.body_bounds.y;
+                                if let quadraui::FormHit::Field(id) =
+                                    form_layout.hit_test(local_x, local_y)
+                                {
+                                    self.engine.borrow_mut().handle_search_form_hit(id.as_str());
+                                }
+                            }
+                        }
+                    }
+                    quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
+                        if let Some(sl) = layout.sections.get(1) {
+                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
+                                let tree_layout = quadraui::tui::tui_tree_layout(
+                                    tree,
+                                    ratatui::layout::Rect {
+                                        x: 0,
+                                        y: 0,
+                                        width: sl.body_bounds.width as u16,
+                                        height: sl.body_bounds.height as u16,
+                                    },
+                                );
+                                let local_x = hx - sl.body_bounds.x;
+                                let local_y = hy - sl.body_bounds.y;
+                                if let quadraui::TreeViewHit::Row(row_idx) =
+                                    tree_layout.hit_test(local_x, local_y)
+                                {
+                                    let path = tree.rows[row_idx].path.clone();
+                                    self.engine.borrow_mut().handle_search_tree_hit(&path);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                     da.queue_draw();
