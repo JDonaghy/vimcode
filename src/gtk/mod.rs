@@ -4820,8 +4820,38 @@ impl SimpleComponent for App {
                                     let form_layout = form.layout(
                                         sl.body_bounds.width,
                                         sl.body_bounds.height,
-                                        |_| {
-                                            quadraui::primitives::form::FormFieldMeasure::new(row_h)
+                                        |i| {
+                                            use quadraui::primitives::form::{
+                                                FieldKind, FormFieldMeasure, FormItemMeasure,
+                                            };
+                                            let field = &form.fields[i];
+                                            match &field.kind {
+                                                FieldKind::ToggleGroup { toggles } => {
+                                                    let items = toggles
+                                                        .iter()
+                                                        .map(|t| FormItemMeasure {
+                                                            id: t.id.clone(),
+                                                            width: t.label.len() as f32 * 8.0,
+                                                        })
+                                                        .collect();
+                                                    FormFieldMeasure::with_items(
+                                                        row_h, 8.0, 8.0, items,
+                                                    )
+                                                }
+                                                FieldKind::ButtonRow { buttons } => {
+                                                    let items = buttons
+                                                        .iter()
+                                                        .map(|b| FormItemMeasure {
+                                                            id: b.id.clone(),
+                                                            width: (b.label.len() + 2) as f32 * 8.0,
+                                                        })
+                                                        .collect();
+                                                    FormFieldMeasure::with_items(
+                                                        row_h, 8.0, 8.0, items,
+                                                    )
+                                                }
+                                                _ => FormFieldMeasure::new(row_h),
+                                            }
                                         },
                                     );
                                     let local_x = hx - sl.body_bounds.x;
@@ -4886,8 +4916,14 @@ impl SimpleComponent for App {
                     "BackSpace" => {
                         if is_replace {
                             engine.project_replace_text.pop();
+                            engine
+                                .replace_text_caret
+                                .set(engine.project_replace_text.len());
                         } else if is_query {
                             engine.project_search_query.pop();
+                            engine
+                                .search_query_caret
+                                .set(engine.project_search_query.len());
                         }
                     }
                     "Tab" => {
@@ -4908,6 +4944,9 @@ impl SimpleComponent for App {
                         if let Some(ch) = unicode {
                             if is_replace {
                                 engine.project_replace_text.push(ch);
+                                engine
+                                    .replace_text_caret
+                                    .set(engine.project_replace_text.len());
                             } else {
                                 if !is_query {
                                     engine
@@ -4915,6 +4954,9 @@ impl SimpleComponent for App {
                                         .replace(Some("search:query".to_string()));
                                 }
                                 engine.project_search_query.push(ch);
+                                engine
+                                    .search_query_caret
+                                    .set(engine.project_search_query.len());
                             }
                         }
                     }

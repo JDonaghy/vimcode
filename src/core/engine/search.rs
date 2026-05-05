@@ -528,18 +528,20 @@ impl Engine {
             files.dedup();
             files.len()
         };
-        if results.is_empty() {
-            self.message = format!("No results for \"{}\"", query);
+        let status = if results.is_empty() {
+            format!("No results for \"{}\"", query)
         } else {
-            self.message = format!(
+            format!(
                 "{} match{} in {} file{}{}",
                 results.len(),
                 if results.len() == 1 { "" } else { "es" },
                 file_count,
                 if file_count == 1 { "" } else { "s" },
                 if capped { " (capped at 10000)" } else { "" }
-            );
-        }
+            )
+        };
+        self.message = status.clone();
+        self.project_search_status = status;
         self.search_file_expanded = vec![true; file_count];
         self.project_search_results = results;
         self.project_search_selected = 0;

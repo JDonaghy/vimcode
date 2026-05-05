@@ -2442,6 +2442,8 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Result<ReplaceResult, SearchError>>>,
     /// True while a background replace thread is running.
     pub project_replace_running: bool,
+    /// Search-specific status message ("N matches in M files").
+    pub project_search_status: String,
     /// Per-file collapse state in search results. Indexed by file group order.
     pub search_file_expanded: Vec<bool>,
     /// Cached MSV layout from the last search panel paint. Written at paint time.
@@ -3382,6 +3384,7 @@ impl Engine {
             project_replace_text: String::new(),
             project_replace_receiver: None,
             project_replace_running: false,
+            project_search_status: String::new(),
             search_file_expanded: Vec::new(),
             search_panel_msv_layout: std::cell::RefCell::new(None),
             search_panel_form_focus: std::cell::RefCell::new(Some("search:query".to_string())),

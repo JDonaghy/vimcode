@@ -3595,11 +3595,13 @@ pub fn build_search_panel_msv(
                     value: StyledText::plain(if results.is_empty() {
                         if engine.project_search_query.is_empty() {
                             "Type to search, Enter to run".to_string()
+                        } else if engine.project_search_status.is_empty() {
+                            String::new()
                         } else {
-                            engine.message.clone()
+                            engine.project_search_status.clone()
                         }
                     } else {
-                        engine.message.clone()
+                        engine.project_search_status.clone()
                     }),
                 },
                 hint: StyledText::default(),
