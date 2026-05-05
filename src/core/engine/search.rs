@@ -586,8 +586,44 @@ impl Engine {
                 self.start_project_search(root);
             }
             "search:replace_all" => {
-                let root = self.cwd.clone();
-                self.start_project_replace(root);
+                if self.project_search_results.is_empty() {
+                    self.message = "No search results to replace".to_string();
+                    return;
+                }
+                let query = self.project_search_query.clone();
+                let replace = self.project_replace_text.clone();
+                let file_count = self.search_file_expanded.len();
+                let match_count = self.project_search_results.len();
+                let replace_display = if replace.is_empty() {
+                    "(empty string)".to_string()
+                } else {
+                    format!("\"{}\"", replace)
+                };
+                self.show_dialog(
+                    "search_replace_all",
+                    "Replace All",
+                    vec![format!(
+                        "Replace {} occurrence{} of \"{}\" with {} across {} file{}?",
+                        match_count,
+                        if match_count == 1 { "" } else { "s" },
+                        query,
+                        replace_display,
+                        file_count,
+                        if file_count == 1 { "" } else { "s" },
+                    )],
+                    vec![
+                        DialogButton {
+                            label: "Cancel".to_string(),
+                            hotkey: 'c',
+                            action: "cancel".to_string(),
+                        },
+                        DialogButton {
+                            label: "Replace All".to_string(),
+                            hotkey: 'r',
+                            action: "replace".to_string(),
+                        },
+                    ],
+                );
             }
             "search:replace_next" => {
                 let idx = self.project_search_selected;

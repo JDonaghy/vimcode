@@ -282,6 +282,13 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "search_replace_all" => {
+                if action == "replace" {
+                    let root = self.cwd.clone();
+                    self.start_project_replace(root);
+                }
+                EngineAction::None
+            }
             "ext_remove" => {
                 if let Some(name) = self.pending_ext_remove.take() {
                     match action {
