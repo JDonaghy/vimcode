@@ -2297,15 +2297,16 @@ impl SimpleComponent for App {
                     pango_layout.set_font_description(Some(&font_desc));
                     let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
                     use quadraui::Backend;
-                    let line_height = {
-                        pango_layout.set_text("Xy");
-                        pango_layout.pixel_size().1 as f64
-                    };
+                    pango_layout.set_text("Xy");
+                    let line_height = pango_layout.pixel_size().1 as f64;
+                    pango_layout.set_text("M");
+                    let char_width = pango_layout.pixel_size().0 as f64;
                     backend_d
                         .borrow_mut()
                         .enter_frame_scope(cr, &pango_layout, |b| {
                             b.set_current_theme(q_theme);
                             b.set_current_line_height(line_height);
+                            b.set_current_char_width(char_width);
                             b.draw_multi_section_view(area, &view);
                         });
                     let metrics = quadraui::MsvLayoutMetrics {
