@@ -2315,33 +2315,7 @@ impl SimpleComponent for App {
                             b.set_current_char_width(char_width);
                             b.draw_multi_section_view(area, &view);
                         });
-                    let metrics = quadraui::MsvLayoutMetrics {
-                        header_size: line_height as f32,
-                        divider_size: 0.0,
-                        scrollbar_size: 12.0,
-                        cell_quantum: 0.0,
-                    };
-                    let layout = view.layout(area, metrics, |i| {
-                        let s = &view.sections[i];
-                        let aux_size = if s.aux.is_some() {
-                            metrics.header_size
-                        } else {
-                            0.0
-                        };
-                        let content_size = match &s.body {
-                            quadraui::SectionBody::Tree(t) => {
-                                t.rows.len() as f32 * line_height as f32
-                            }
-                            quadraui::SectionBody::Form(f) => {
-                                f.fields.len() as f32 * line_height as f32
-                            }
-                            _ => 0.0,
-                        };
-                        quadraui::SectionMeasure {
-                            content_size,
-                            aux_size,
-                        }
-                    });
+                    let layout = backend_d.borrow().msv_layout(area, &view);
                     engine.search_panel_msv_layout.replace(Some(layout));
                 });
         }
