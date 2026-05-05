@@ -1,12 +1,17 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 350 archived here.
+All sessions through 351 archived here.
 
 > **Format note:** Sessions 282–339 below were archived in their
 > original verbose multi-paragraph format (as maintained in
 > PROJECT_STATE during the A.x / Phase 4 / Phase B / Phase C waves).
 > Sessions 280 and earlier use the one-paragraph compact format.
+
+---
+**Session 351 — All bespoke paint surfaces eliminated:**
+
+Final three bespoke surfaces migrated. #301 menu bar → `quadraui::MenuBar` (PR #309, `5baadcc`). #310 command center (nav arrows + search box) → `quadraui::CommandCenter` (`b5fdd7d`), eliminating ~242 lines per-backend. #302 search panel → `quadraui::MSV + Form + TreeView` (ending `de625bb`), TUI ~407 lines bespoke → zero, GTK ~226 lines native widgets → DrawingArea. Replace All gained confirmation dialog. quadraui gained ToggleGroup + ButtonRow (quadraui#52), full-width Form fields (quadraui#54), GTK Pango-based form_layout (quadraui#56). Also fixed #290 (TUI extension panel search drops keys) and #291 (arrow key navigation in extension panel search). Milestone focus shifted to consolidation (#307 scroll dispatch) and polish.
 
 ---
 **Session 350 — #305 terminal toolbar shipped:**

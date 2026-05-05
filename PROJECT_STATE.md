@@ -1,36 +1,35 @@
 # VimCode Project State
 
-**Last updated:** May 5, 2026 (Session 351 — **All bespoke paint surfaces eliminated.** #301 menu bar, #310 command center, #302 search panel shipped. Also #290 + #291 extension panel bug fixes).
+**Last updated:** May 5, 2026 (Session 352 — **#307 Batch 1 scroll dispatch migration.** 5 sidebar panels migrated to `dispatch_scroll`/`dispatch_click`. CLAUDE.md split into core + 4 conditional files. Search panel scroll_offset wired into MSV. Filed #314 for MSV scrollbar click/drag.)
 
 ## Active milestone: Cross-Platform UI Crate
 
 **This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
 
-**All bespoke paint surfaces are now eliminated.** The last two surfaces (#301 menu bar, #302 search panel) shipped this session. Every UI surface in both TUI and GTK now paints through quadraui primitives.
+**All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. Scroll dispatch consolidation (#307) is in progress.
 
 **Remaining milestone work** is consolidation and infrastructure:
 
 | # | Title | Category |
 |---|-------|----------|
-| [#307](https://github.com/JDonaghy/vimcode/issues/307) | Scroll dispatch migration | Consolidation |
+| [#307](https://github.com/JDonaghy/vimcode/issues/307) | Scroll dispatch migration (Batches 2-5 remain) | Consolidation |
+| [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#308](https://github.com/JDonaghy/vimcode/issues/308) | Menu bar keyboard/hover dispatch gaps | Polish |
 | [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
-**Shipped this session:**
-- **#301** (PR #309, `5baadcc`) — Menu bar labels → `quadraui::MenuBar`. Both backends paint through quadraui rasterisers. Click/hover via cached `MenuBarLayout::hit_test()`.
-- **#310** (`b5fdd7d`) — Nav arrows + search box → `quadraui::CommandCenter`. Eliminated ~242 lines of per-backend rendering + click code. GTK window drag preserved.
-- **#302** (multiple commits ending `de625bb`) — Search panel → `quadraui::MSV + Form + TreeView`. TUI: ~321 lines bespoke paint + ~86 lines click → zero. GTK: ~226 lines native widgets → DrawingArea + same MSV pipeline. Replace All now has confirmation dialog. quadraui gained ToggleGroup + ButtonRow (quadraui#52), full-width Form fields (quadraui#54), GTK Pango-based form_layout (quadraui#56).
-- **#290** (`0a8f46f`) — TUI extension panel search input no longer drops r/i/d/q// characters.
-- **#291** (`924aa24`) — Arrow keys navigate extension panel results while search input active.
+**Shipped this session (352):**
+- **#307 Batch 1** (`0be798e`) — Migrated explorer, ext_panel, settings, search, ext_sidebar to `dispatch_scroll`/`dispatch_click`. Registered `ScrollSurface` entries at paint time. Removed ~95 lines bespoke wheel scroll + ~90 lines bespoke scrollbar click/drag. Fixed stale picker modal blocking dispatch_scroll. Fixed explorer scrollbar thumb color mismatch. Wired `search_scroll_top` into MSV TreeView `scroll_offset`.
+- **Body click fix** (`aa133fa`) — `dispatch_click` `MouseDown` for sidebar surfaces gated on `drag_state.is_active()` to avoid consuming body clicks.
+- **CLAUDE.md split** (`80d97ff`) — 314→90 lines (71% reduction). Moved architecture, quadraui guide, patterns, and doc maintenance into `docs/` conditional files.
 
 ---
 
-**Previous session (350):** #305 terminal toolbar shipped; quadraui gained rect-height-aware tab bar + compact mode.
+**Previous session (351):** All bespoke paint surfaces eliminated. #301 menu bar, #310 command center, #302 search panel shipped. #290/#291 extension panel bug fixes.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`de625bb`. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`80d97ff`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -129,6 +128,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 343 and earlier in **SESSION_HISTORY.md**.
-
-> Sessions 349 and earlier in **SESSION_HISTORY.md**.
+> Sessions 351 and earlier in **SESSION_HISTORY.md**.

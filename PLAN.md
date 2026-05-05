@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-05 (Session 351 — **All bespoke paint surfaces eliminated.** #301 menu bar + #310 command center + #302 search panel shipped. quadraui gained ToggleGroup/ButtonRow (#52), full-width Form (#54), Pango form_layout (#56). Milestone focus shifts to consolidation (#307 scroll dispatch) and polish (#308/#311/#312).)
+> **Last updated:** 2026-05-05 (Session 352 — #307 Batch 1 scroll dispatch landed. 5 sidebar panels migrated to `dispatch_scroll`/`dispatch_click`. Batches 2-5 remain (debug sidebar, terminal scrollback, editor viewport, editor hover). #314 filed for search MSV scrollbar click/drag. CLAUDE.md split 71%.)
 
 ---
 
