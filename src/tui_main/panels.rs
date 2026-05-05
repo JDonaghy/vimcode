@@ -350,6 +350,44 @@ pub(super) fn render_sidebar(
         });
         let buf = frame.buffer_mut();
         render_explorer_scrollbar(buf, area, sidebar, theme);
+
+        let total_rows = sidebar.rows.len();
+        let visible_rows = area.height as usize;
+        let scrollbar = if total_rows > visible_rows && area.width >= 2 {
+            let track_h = visible_rows as f64;
+            let thumb_size = ((visible_rows as f64 / total_rows as f64) * track_h)
+                .ceil()
+                .max(1.0);
+            let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor();
+            let sb_x = (area.x + area.width - 1) as f32;
+            Some(quadraui::SurfaceScrollbar {
+                track_bounds: quadraui::Rect::new(sb_x, area.y as f32, 1.0, area.height as f32),
+                thumb_bounds: quadraui::Rect::new(
+                    sb_x,
+                    area.y as f32 + thumb_top as f32,
+                    1.0,
+                    thumb_size as f32,
+                ),
+                total_items: total_rows,
+                visible_items: visible_rows,
+                scroll_offset: sidebar.scroll_top,
+            })
+        } else {
+            None
+        };
+        engine
+            .scroll_surfaces
+            .borrow_mut()
+            .push(quadraui::ScrollSurface {
+                id: quadraui::WidgetId::new("explorer:sb"),
+                bounds: quadraui::Rect::new(
+                    area.x as f32,
+                    area.y as f32,
+                    area.width as f32,
+                    area.height as f32,
+                ),
+                scrollbar,
+            });
         return;
     }
 
@@ -680,8 +718,7 @@ fn render_explorer_scrollbar(
     let total_rows = sidebar.rows.len();
     let visible_rows_count = area.height as usize;
     if total_rows > visible_rows_count && area.width >= 2 {
-        let track_fg = rc(theme.separator);
-        let thumb_fg = rc(theme.status_fg);
+        let dim_fg = rc(theme.line_number_fg);
         let sb_bg = rc(theme.tab_bar_bg);
         let track_h = visible_rows_count as f64;
         let thumb_size = ((visible_rows_count as f64 / total_rows as f64) * track_h)
@@ -696,8 +733,7 @@ fn render_explorer_scrollbar(
             }
             let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
             let ch = if in_thumb { '█' } else { '░' };
-            let fg = if in_thumb { thumb_fg } else { track_fg };
-            set_cell(buf, sb_x, y, ch, fg, sb_bg);
+            set_cell(buf, sb_x, y, ch, dim_fg, sb_bg);
         }
     }
 }
@@ -878,7 +914,7 @@ pub(super) fn render_settings_panel(
         // Scrollbar (mirrors the legacy renderer below).
         let total = engine.settings_flat_list().len();
         let scroll = engine.settings_scroll_top;
-        if total > content_height && content_height > 0 {
+        let settings_scrollbar = if total > content_height && content_height > 0 {
             let sb_col = area.x + area.width - 1;
             let track_len = content_height;
             let thumb_len = (content_height * content_height / total).max(1);
@@ -892,7 +928,39 @@ pub(super) fn render_settings_panel(
                 };
                 set_cell(buf, sb_col, y, ch, dim_fg, bg);
             }
-        }
+            Some(quadraui::SurfaceScrollbar {
+                track_bounds: quadraui::Rect::new(
+                    sb_col as f32,
+                    content_start as f32,
+                    1.0,
+                    track_len as f32,
+                ),
+                thumb_bounds: quadraui::Rect::new(
+                    sb_col as f32,
+                    content_start as f32 + thumb_start as f32,
+                    1.0,
+                    thumb_len as f32,
+                ),
+                total_items: total,
+                visible_items: content_height,
+                scroll_offset: scroll,
+            })
+        } else {
+            None
+        };
+        engine
+            .scroll_surfaces
+            .borrow_mut()
+            .push(quadraui::ScrollSurface {
+                id: quadraui::WidgetId::new("tui:settings"),
+                bounds: quadraui::Rect::new(
+                    area.x as f32,
+                    content_start as f32,
+                    area.width as f32,
+                    content_height as f32,
+                ),
+                scrollbar: settings_scrollbar,
+            });
         return;
     }
 
@@ -1157,7 +1225,7 @@ pub(super) fn render_settings_panel(
     }
 
     // Scrollbar
-    if total > content_height && content_height > 0 {
+    let settings_scrollbar = if total > content_height && content_height > 0 {
         let track_len = content_height;
         let thumb_len = (content_height * content_height / total).max(1);
         let thumb_start = scroll * track_len / total;
@@ -1170,7 +1238,39 @@ pub(super) fn render_settings_panel(
             };
             set_cell(buf, sb_col, y, ch, dim_fg, bg);
         }
-    }
+        Some(quadraui::SurfaceScrollbar {
+            track_bounds: quadraui::Rect::new(
+                sb_col as f32,
+                content_start as f32,
+                1.0,
+                track_len as f32,
+            ),
+            thumb_bounds: quadraui::Rect::new(
+                sb_col as f32,
+                content_start as f32 + thumb_start as f32,
+                1.0,
+                thumb_len as f32,
+            ),
+            total_items: total,
+            visible_items: content_height,
+            scroll_offset: scroll,
+        })
+    } else {
+        None
+    };
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("tui:settings"),
+            bounds: quadraui::Rect::new(
+                area.x as f32,
+                content_start as f32,
+                area.width as f32,
+                content_height as f32,
+            ),
+            scrollbar: settings_scrollbar,
+        });
 }
 
 /// Return the visual display row (0-based, including file-header rows) for a result index.
@@ -1246,7 +1346,7 @@ pub(super) fn render_search_panel(
         .replace_text_caret
         .replace(engine.project_replace_text.len());
 
-    let view = render::build_search_panel_msv(engine, &sidebar.root);
+    let view = render::build_search_panel_msv(engine, &sidebar.root, sidebar.search_scroll_top);
     let q_theme = super::quadraui_tui::q_theme(theme);
     quadraui::tui::draw_multi_section_view(
         buf,
@@ -1282,6 +1382,14 @@ pub(super) fn render_search_panel(
         }
     });
     engine.search_panel_msv_layout.replace(Some(layout));
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("tui:search_results"),
+            bounds,
+            scrollbar: None,
+        });
 }
 
 // ─── Wildmenu (command Tab completion bar) ───────────────────────────────────
@@ -2152,7 +2260,7 @@ pub(super) fn render_ext_panel(
 
     // Scrollbar
     let total = flat_rows.len();
-    if total > content_area_height && content_area_height > 0 {
+    let ext_panel_scrollbar = if total > content_area_height && content_area_height > 0 {
         let sb_x = area.x + area.width - 1;
         let track_h = content_area_height;
         let thumb_h = (track_h * content_area_height / total).max(1);
@@ -2166,7 +2274,35 @@ pub(super) fn render_ext_panel(
             };
             set_cell(buf, sb_x, y, ch, dim_fg, row_bg);
         }
-    }
+        let track_start_y = (area.y + 1 + input_row_count as u16) as f32;
+        Some(quadraui::SurfaceScrollbar {
+            track_bounds: quadraui::Rect::new(sb_x as f32, track_start_y, 1.0, track_h as f32),
+            thumb_bounds: quadraui::Rect::new(
+                sb_x as f32,
+                track_start_y + thumb_top as f32,
+                1.0,
+                thumb_h as f32,
+            ),
+            total_items: total,
+            visible_items: content_area_height,
+            scroll_offset: scroll,
+        })
+    } else {
+        None
+    };
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("ext_panel:sb"),
+            bounds: quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            ),
+            scrollbar: ext_panel_scrollbar,
+        });
 
     // ── Help popup overlay ──────────────────────────────────────────────────
     if panel.help_open && !panel.help_bindings.is_empty() {
@@ -2675,6 +2811,19 @@ pub(super) fn render_ext_sidebar(
         &q_theme,
         crate::icons::nerd_fonts_enabled(),
     );
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("tui:ext_sidebar"),
+            bounds: quadraui::Rect::new(
+                body_area.x as f32,
+                body_area.y as f32,
+                body_area.width as f32,
+                body_area.height as f32,
+            ),
+            scrollbar: None,
+        });
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────

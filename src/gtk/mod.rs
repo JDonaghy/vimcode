@@ -2294,7 +2294,7 @@ impl SimpleComponent for App {
                     let theme = Theme::from_name(&engine.settings.colorscheme);
                     let q_theme = crate::gtk::quadraui_gtk::q_theme(&theme);
                     let root = engine.cwd.clone();
-                    let view = render::build_search_panel_msv(&engine, &root);
+                    let view = render::build_search_panel_msv(&engine, &root, 0);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
                     let pango_ctx = pangocairo::create_context(cr);
@@ -4790,7 +4790,7 @@ impl SimpleComponent for App {
                     .clone();
                 if let Some(ref layout) = cached {
                     let root = self.engine.borrow().cwd.clone();
-                    let view = render::build_search_panel_msv(&self.engine.borrow(), &root);
+                    let view = render::build_search_panel_msv(&self.engine.borrow(), &root, 0);
                     use quadraui::Backend;
                     let backend = self.backend.borrow();
                     match layout.hit_test(hx, hy) {

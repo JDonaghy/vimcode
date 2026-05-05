@@ -378,6 +378,13 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // Reconcile stale picker modal: if the picker closed (keyboard
+    // Escape / confirm) without a backdrop-dismiss click, the "picker"
+    // entry lingers on the stack and swallows all dispatch_scroll events.
+    if !engine.picker_open {
+        modal_stack.pop(&quadraui::WidgetId::new("picker"));
+    }
+
     // ── Hover link click-to-copy ────────────────────────────────────────────────
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
@@ -1222,37 +1229,9 @@ pub(super) fn handle_mouse(
                 engine.editor_hover_scroll(delta);
                 return sidebar_width;
             }
-            // Sidebar scroll wheel
+            // Sidebar scroll wheel — panels not yet on dispatch_scroll.
             if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-                if sidebar.ext_panel_name.is_some() {
-                    // Extension-provided panel (e.g. Git Log): scroll viewport
-                    let flat_len = engine.ext_panel_flat_len();
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.ext_panel_scroll_top = engine.ext_panel_scroll_top.saturating_sub(3);
-                    } else {
-                        engine.ext_panel_scroll_top =
-                            (engine.ext_panel_scroll_top + 3).min(flat_len.saturating_sub(1));
-                    }
-                } else if sidebar.active_panel == TuiPanel::Explorer {
-                    let tree_height = term_height.saturating_sub(3) as usize;
-                    let total = sidebar.rows.len();
-                    if total > tree_height {
-                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                            sidebar.scroll_top = sidebar.scroll_top.saturating_sub(3);
-                        } else {
-                            sidebar.scroll_top =
-                                (sidebar.scroll_top + 3).min(total.saturating_sub(tree_height));
-                        }
-                    }
-                } else if sidebar.active_panel == TuiPanel::Search {
-                    // Scroll the viewport directly; render will keep selection visible.
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        sidebar.search_scroll_top = sidebar.search_scroll_top.saturating_sub(3);
-                    } else {
-                        sidebar.search_scroll_top += 3; // clamped in render_search_panel
-                    }
-                } else if sidebar.active_panel == TuiPanel::Git {
-                    // SC panel: scroll selection
+                if sidebar.active_panel == TuiPanel::Git {
                     if matches!(ev.kind, MouseEventKind::ScrollUp) {
                         engine.sc_selected = engine.sc_selected.saturating_sub(3);
                     } else {
@@ -1260,10 +1239,8 @@ pub(super) fn handle_mouse(
                         engine.sc_selected =
                             (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
                     }
+                    return sidebar_width;
                 } else if sidebar.active_panel == TuiPanel::Debug {
-                    // Use the cached MSV layout to determine which
-                    // section the scroll landed in — same source of
-                    // truth as paint + click (#296).
                     let layout_opt = engine.dap_sidebar_msv_layout.borrow().clone();
                     if let Some(layout) = layout_opt.as_ref() {
                         let lx = col as f32;
@@ -1295,32 +1272,10 @@ pub(super) fn handle_mouse(
                             }
                         }
                     }
-                } else if sidebar.active_panel == TuiPanel::Settings {
-                    let flat = engine.settings_flat_list();
-                    let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
-                    let max_scroll = flat.len().saturating_sub(content_height);
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.settings_scroll_top = engine.settings_scroll_top.saturating_sub(3);
-                    } else {
-                        engine.settings_scroll_top =
-                            (engine.settings_scroll_top + 3).min(max_scroll);
-                    }
-                } else if sidebar.active_panel == TuiPanel::Extensions {
-                    // WholePanel scroll: shift the panel viewport by 3
-                    // rows per wheel notch. Clamping is best-effort —
-                    // out-of-range values just reveal empty space at
-                    // the bottom; user scrolls back. (Selection is now
-                    // arrow-key / typed-char driven, not wheel-driven —
-                    // VSCode behaviour.)
-                    let delta: f32 = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        -3.0
-                    } else {
-                        3.0
-                    };
-                    engine.ext_sidebar_panel_scroll =
-                        (engine.ext_sidebar_panel_scroll + delta).max(0.0);
+                    return sidebar_width;
                 }
-                return sidebar_width;
+                // Other sidebar panels (Explorer, Search, Settings, Extensions,
+                // ext_panel) fall through to dispatch_scroll below.
             }
             // Terminal panel scroll (must check before editor scroll).
             {
@@ -1345,37 +1300,96 @@ pub(super) fn handle_mouse(
                     return sidebar_width;
                 }
             }
-            // Debug output panel scroll wheel.
+            // Scroll-surface wheel dispatch — routes to registered surfaces.
             {
-                // Route scroll through dispatch_scroll using cached scroll surfaces.
-                {
-                    let surfaces = engine.scroll_surfaces.borrow();
-                    let delta_y = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        -1.0
-                    } else {
-                        1.0
-                    };
-                    let scroll_events = quadraui::dispatch_scroll(
-                        modal_stack,
-                        &surfaces,
-                        quadraui::Point {
-                            x: col as f32,
-                            y: row as f32,
-                        },
-                        quadraui::ScrollDelta::new(0.0, delta_y),
-                    );
-                    drop(surfaces);
-                    for sev in &scroll_events {
-                        if let quadraui::UiEvent::Scroll {
-                            widget: Some(id),
-                            delta,
-                            ..
-                        } = sev
-                        {
-                            if id.as_str() == "debug_output" {
+                let surfaces = engine.scroll_surfaces.borrow();
+                let delta_y = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let scroll_events = quadraui::dispatch_scroll(
+                    modal_stack,
+                    &surfaces,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    quadraui::ScrollDelta::new(0.0, delta_y),
+                );
+                drop(surfaces);
+                for sev in &scroll_events {
+                    if let quadraui::UiEvent::Scroll {
+                        widget: Some(id),
+                        delta,
+                        ..
+                    } = sev
+                    {
+                        match id.as_str() {
+                            "debug_output" => {
                                 engine.handle_debug_output_scroll(delta.y);
                                 return sidebar_width;
                             }
+                            "explorer:sb" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                let total = sidebar.rows.len();
+                                let tree_height =
+                                    term_height.saturating_sub(bottom_chrome) as usize;
+                                if delta.y > 0.0 {
+                                    sidebar.scroll_top = (sidebar.scroll_top + step)
+                                        .min(total.saturating_sub(tree_height));
+                                } else {
+                                    sidebar.scroll_top = sidebar.scroll_top.saturating_sub(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "ext_panel:sb" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                let flat_len = engine.ext_panel_flat_len();
+                                if delta.y > 0.0 {
+                                    engine.ext_panel_scroll_top = (engine.ext_panel_scroll_top
+                                        + step)
+                                        .min(flat_len.saturating_sub(1));
+                                } else {
+                                    engine.ext_panel_scroll_top =
+                                        engine.ext_panel_scroll_top.saturating_sub(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:settings" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                let flat = engine.settings_flat_list();
+                                let content_height = term_height.saturating_sub(4) as usize;
+                                let max_scroll = flat.len().saturating_sub(content_height);
+                                if delta.y > 0.0 {
+                                    engine.settings_scroll_top =
+                                        (engine.settings_scroll_top + step).min(max_scroll);
+                                } else {
+                                    engine.settings_scroll_top =
+                                        engine.settings_scroll_top.saturating_sub(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:search_results" => {
+                                let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                if delta.y > 0.0 {
+                                    sidebar.search_scroll_top += step;
+                                } else {
+                                    sidebar.search_scroll_top =
+                                        sidebar.search_scroll_top.saturating_sub(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:ext_sidebar" => {
+                                let step = delta.y.abs() * 3.0;
+                                engine.ext_sidebar_panel_scroll = if delta.y > 0.0 {
+                                    engine.ext_sidebar_panel_scroll + step
+                                } else {
+                                    (engine.ext_sidebar_panel_scroll - step).max(0.0)
+                                };
+                                return sidebar_width;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2195,16 +2209,35 @@ pub(super) fn handle_mouse(
         drop(surfaces);
         for cev in &click_events {
             match cev {
-                quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset }
-                    if widget.as_str() == "debug_output" =>
-                {
-                    engine.debug_output_scroll = *new_offset;
-                    engine.debug_output_auto_scroll = false;
-                    return sidebar_width;
+                quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
+                    match widget.as_str() {
+                        "debug_output" => {
+                            engine.debug_output_scroll = *new_offset;
+                            engine.debug_output_auto_scroll = false;
+                            return sidebar_width;
+                        }
+                        "explorer:sb" => {
+                            sidebar.scroll_top = *new_offset;
+                            return sidebar_width;
+                        }
+                        "ext_panel:sb" => {
+                            engine.ext_panel_scroll_top = *new_offset;
+                            return sidebar_width;
+                        }
+                        "tui:settings" => {
+                            engine.settings_scroll_top = *new_offset;
+                            return sidebar_width;
+                        }
+                        _ => {}
+                    }
                 }
                 quadraui::UiEvent::MouseDown {
                     widget: Some(id), ..
-                } if id.as_str() == "debug_output" => {
+                } if matches!(
+                    id.as_str(),
+                    "debug_output" | "explorer:sb" | "ext_panel:sb" | "tui:settings"
+                ) =>
+                {
                     return sidebar_width;
                 }
                 _ => {}
@@ -2472,8 +2505,6 @@ pub(super) fn handle_mouse(
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
     if sidebar.visible && col < ab_width + sidebar_width {
-        // Rightmost column of the sidebar is the scrollbar column.
-        let sb_col = ab_width + sidebar_width - 1;
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
@@ -2512,39 +2543,7 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
 
-            // Scrollbar click/drag → jump-scroll + arm drag
             let flat_len = engine.ext_panel_flat_len();
-            let content_h =
-                term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
-            if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
-                let track_start = (content_start + menu_rows) as f32;
-                let grab_offset = scrollbar_grab_offset(
-                    row as f32,
-                    track_start,
-                    content_h as f32,
-                    content_h,
-                    flat_len,
-                    engine.ext_panel_scroll_top,
-                );
-                drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                    widget: quadraui::WidgetId::new("ext_panel:sb"),
-                    track_start,
-                    track_length: content_h as f32,
-                    visible_rows: content_h,
-                    total_items: flat_len,
-                    grab_offset,
-                });
-                apply_scrollbar_drag(
-                    drag_state,
-                    quadraui::Point {
-                        x: col as f32,
-                        y: row as f32,
-                    },
-                    engine,
-                    sidebar,
-                );
-                return sidebar_width;
-            }
 
             if sidebar_row == 0 {
                 // Header — no-op
@@ -2570,44 +2569,6 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
-            // tree_height = total height - bottom chrome rows (no header)
-            let tree_height = term_height.saturating_sub(bottom_chrome) as usize;
-            let total_rows = sidebar.rows.len();
-
-            // Click on the scrollbar column → arm drag, jump via shared dispatch.
-            // Thumb-grab preservation: if cursor lands on the visible thumb,
-            // grab_offset stores the cursor-to-thumb-top offset so the thumb
-            // doesn't snap out from under the user's cursor.
-            if col == sb_col && total_rows > tree_height {
-                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let track_start = menu_rows as f32;
-                let grab_offset = scrollbar_grab_offset(
-                    row as f32,
-                    track_start,
-                    tree_height as f32,
-                    tree_height,
-                    total_rows,
-                    sidebar.scroll_top,
-                );
-                drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                    widget: quadraui::WidgetId::new("explorer:sb"),
-                    track_start,
-                    track_length: tree_height as f32,
-                    visible_rows: tree_height,
-                    total_items: total_rows,
-                    grab_offset,
-                });
-                apply_scrollbar_drag(
-                    drag_state,
-                    quadraui::Point {
-                        x: col as f32,
-                        y: row as f32,
-                    },
-                    engine,
-                    sidebar,
-                );
-                return sidebar_width;
-            }
 
             let tree_row = sidebar_row as usize + sidebar.scroll_top;
             if tree_row < sidebar.rows.len() {
@@ -2847,7 +2808,11 @@ pub(super) fn handle_mouse(
                         if let Some(sl) = layout.sections.first() {
                             let local_x = hit_x - sl.body_bounds.x;
                             let local_y = hit_y - sl.body_bounds.y;
-                            let view = render::build_search_panel_msv(engine, &sidebar.root);
+                            let view = render::build_search_panel_msv(
+                                engine,
+                                &sidebar.root,
+                                sidebar.search_scroll_top,
+                            );
                             if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
                                 let form_area = ratatui::layout::Rect {
                                     x: 0,
@@ -2873,7 +2838,11 @@ pub(super) fn handle_mouse(
                         if let Some(sl) = layout.sections.get(1) {
                             let local_x = hit_x - sl.body_bounds.x;
                             let local_y = hit_y - sl.body_bounds.y;
-                            let view = render::build_search_panel_msv(engine, &sidebar.root);
+                            let view = render::build_search_panel_msv(
+                                engine,
+                                &sidebar.root,
+                                sidebar.search_scroll_top,
+                            );
                             if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
                                 let tree_layout = quadraui::tui::tui_tree_layout(
                                     tree,
@@ -3006,41 +2975,9 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Settings {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
-
-            // Row 0: header, Row 1: search input, Row 2+: scrollable content
-            let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
             let flat_total = engine.settings_flat_list().len();
 
-            // Scrollbar column → arm drag, jump via shared dispatch math
-            if col == sb_col && sidebar_row >= 2 && flat_total > content_height {
-                let track_start_row = row - (sidebar_row - 2);
-                let track_len = content_height as u16;
-                let grab_offset = scrollbar_grab_offset(
-                    row as f32,
-                    track_start_row as f32,
-                    track_len as f32,
-                    content_height,
-                    flat_total,
-                    engine.settings_scroll_top,
-                );
-                drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                    widget: quadraui::WidgetId::new("tui:settings"),
-                    track_start: track_start_row as f32,
-                    track_length: track_len as f32,
-                    visible_rows: content_height,
-                    total_items: flat_total,
-                    grab_offset,
-                });
-                apply_scrollbar_drag(
-                    drag_state,
-                    quadraui::Point {
-                        x: col as f32,
-                        y: row as f32,
-                    },
-                    engine,
-                    sidebar,
-                );
-            } else if sidebar_row == 0 {
+            if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
                 // Search box — activate search input

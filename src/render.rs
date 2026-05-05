@@ -3487,6 +3487,7 @@ pub fn build_command_center_view(
 pub fn build_search_panel_msv(
     engine: &Engine,
     root: &std::path::Path,
+    results_scroll: usize,
 ) -> quadraui::MultiSectionView {
     use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
     use quadraui::{
@@ -3698,7 +3699,7 @@ pub fn build_search_panel_msv(
         rows: tree_rows,
         selection_mode: SelectionMode::Single,
         selected_path,
-        scroll_offset: 0,
+        scroll_offset: results_scroll,
         style: TreeStyle::default(),
         has_focus: !query_focused && !replace_focused,
     };

@@ -81,6 +81,7 @@ pub(super) fn draw_editor(
     split_btn_map_out.borrow_mut().clear();
     action_btn_map_out.borrow_mut().clear();
     status_segment_map_out.borrow_mut().clear();
+    engine.scroll_surfaces.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();

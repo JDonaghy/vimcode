@@ -120,6 +120,8 @@ pub(super) fn draw_frame(
 ) {
     let area = frame.area();
 
+    engine.scroll_surfaces.borrow_mut().clear();
+
     // ── Top-level: [menu] / [content_area] ──
     let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
     let top_chunks = Layout::default()
