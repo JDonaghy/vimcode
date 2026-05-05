@@ -2297,17 +2297,45 @@ impl SimpleComponent for App {
                     pango_layout.set_font_description(Some(&font_desc));
                     let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
                     use quadraui::Backend;
+                    let line_height = {
+                        pango_layout.set_text("Xy");
+                        pango_layout.pixel_size().1 as f64
+                    };
                     backend_d
                         .borrow_mut()
                         .enter_frame_scope(cr, &pango_layout, |b| {
                             b.set_current_theme(q_theme);
-                            let line_height = {
-                                pango_layout.set_text("Xy");
-                                pango_layout.pixel_size().1 as f64
-                            };
                             b.set_current_line_height(line_height);
                             b.draw_multi_section_view(area, &view);
                         });
+                    let metrics = quadraui::MsvLayoutMetrics {
+                        header_size: line_height as f32,
+                        divider_size: 0.0,
+                        scrollbar_size: 12.0,
+                        cell_quantum: 0.0,
+                    };
+                    let layout = view.layout(area, metrics, |i| {
+                        let s = &view.sections[i];
+                        let aux_size = if s.aux.is_some() {
+                            metrics.header_size
+                        } else {
+                            0.0
+                        };
+                        let content_size = match &s.body {
+                            quadraui::SectionBody::Tree(t) => {
+                                t.rows.len() as f32 * line_height as f32
+                            }
+                            quadraui::SectionBody::Form(f) => {
+                                f.fields.len() as f32 * line_height as f32
+                            }
+                            _ => 0.0,
+                        };
+                        quadraui::SectionMeasure {
+                            content_size,
+                            aux_size,
+                        }
+                    });
+                    engine.search_panel_msv_layout.replace(Some(layout));
                 });
         }
         {
@@ -4771,96 +4799,67 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SearchPanelClick(x, y) => {
-                let root = self.engine.borrow().cwd.clone();
-                let view = render::build_search_panel_msv(&self.engine.borrow(), &root);
-                let da_w = self
-                    .search_sidebar_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.width() as f32)
-                    .unwrap_or(200.0);
-                let da_h = self
-                    .search_sidebar_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.height() as f32)
-                    .unwrap_or(400.0);
-                let bounds = quadraui::Rect::new(0.0, 0.0, da_w, da_h);
-                let line_height = 20.0_f32;
-                let metrics = quadraui::MsvLayoutMetrics {
-                    header_size: line_height,
-                    divider_size: 0.0,
-                    scrollbar_size: 12.0,
-                    cell_quantum: 0.0,
-                };
-                let layout = view.layout(bounds, metrics, |i| {
-                    let s = &view.sections[i];
-                    let aux_size = if s.aux.is_some() {
-                        metrics.header_size
-                    } else {
-                        0.0
-                    };
-                    let content_size = match &s.body {
-                        quadraui::SectionBody::Tree(t) => t.rows.len() as f32 * metrics.header_size,
-                        quadraui::SectionBody::Form(f) => {
-                            f.fields.len() as f32 * metrics.header_size
-                        }
-                        _ => 0.0,
-                    };
-                    quadraui::SectionMeasure {
-                        content_size,
-                        aux_size,
-                    }
-                });
                 let hx = x as f32;
                 let hy = y as f32;
-                match layout.hit_test(hx, hy) {
-                    quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
-                        if let Some(sl) = layout.sections.first() {
-                            if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
-                                let form_layout = quadraui::tui::tui_form_layout(
-                                    form,
-                                    ratatui::layout::Rect {
-                                        x: 0,
-                                        y: 0,
-                                        width: sl.body_bounds.width as u16,
-                                        height: sl.body_bounds.height as u16,
-                                    },
-                                );
-                                let local_x = hx - sl.body_bounds.x;
-                                let local_y = hy - sl.body_bounds.y;
-                                if let quadraui::FormHit::Field(id) =
-                                    form_layout.hit_test(local_x, local_y)
+                let cached = self
+                    .engine
+                    .borrow()
+                    .search_panel_msv_layout
+                    .borrow()
+                    .clone();
+                if let Some(ref layout) = cached {
+                    let root = self.engine.borrow().cwd.clone();
+                    let view = render::build_search_panel_msv(&self.engine.borrow(), &root);
+                    match layout.hit_test(hx, hy) {
+                        quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
+                            if let Some(sl) = layout.sections.first() {
+                                if let quadraui::SectionBody::Form(ref form) = view.sections[0].body
                                 {
-                                    self.engine.borrow_mut().handle_search_form_hit(id.as_str());
+                                    let row_h =
+                                        sl.body_bounds.height / form.fields.len().max(1) as f32;
+                                    let form_layout = form.layout(
+                                        sl.body_bounds.width,
+                                        sl.body_bounds.height,
+                                        |_| {
+                                            quadraui::primitives::form::FormFieldMeasure::new(row_h)
+                                        },
+                                    );
+                                    let local_x = hx - sl.body_bounds.x;
+                                    let local_y = hy - sl.body_bounds.y;
+                                    if let quadraui::FormHit::Field(id) =
+                                        form_layout.hit_test(local_x, local_y)
+                                    {
+                                        self.engine
+                                            .borrow_mut()
+                                            .handle_search_form_hit(id.as_str());
+                                    }
                                 }
                             }
                         }
-                    }
-                    quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
-                        if let Some(sl) = layout.sections.get(1) {
-                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
-                                let tree_layout = quadraui::tui::tui_tree_layout(
-                                    tree,
-                                    ratatui::layout::Rect {
-                                        x: 0,
-                                        y: 0,
-                                        width: sl.body_bounds.width as u16,
-                                        height: sl.body_bounds.height as u16,
-                                    },
-                                );
-                                let local_x = hx - sl.body_bounds.x;
-                                let local_y = hy - sl.body_bounds.y;
-                                if let quadraui::TreeViewHit::Row(row_idx) =
-                                    tree_layout.hit_test(local_x, local_y)
+                        quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
+                            if let Some(sl) = layout.sections.get(1) {
+                                if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body
                                 {
-                                    let path = tree.rows[row_idx].path.clone();
-                                    self.engine.borrow_mut().handle_search_tree_hit(&path);
+                                    let row_h =
+                                        sl.body_bounds.height / tree.rows.len().max(1) as f32;
+                                    let tree_layout = tree.layout(
+                                        sl.body_bounds.width,
+                                        sl.body_bounds.height,
+                                        |_| quadraui::TreeRowMeasure { height: row_h },
+                                    );
+                                    let local_x = hx - sl.body_bounds.x;
+                                    let local_y = hy - sl.body_bounds.y;
+                                    if let quadraui::TreeViewHit::Row(row_idx) =
+                                        tree_layout.hit_test(local_x, local_y)
+                                    {
+                                        let path = tree.rows[row_idx].path.clone();
+                                        self.engine.borrow_mut().handle_search_tree_hit(&path);
+                                    }
                                 }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
