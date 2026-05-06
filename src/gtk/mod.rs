@@ -2773,7 +2773,13 @@ impl SimpleComponent for App {
                 let gesture = gtk4::GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |_, _, x, y| {
-                    let bar_rect = bar_rect_dd.get();
+                    let stored = bar_rect_dd.get();
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let ev = quadraui::UiEvent::MouseDown {
                         widget: None,
                         button: quadraui::MouseButton::Left,
@@ -2812,7 +2818,13 @@ impl SimpleComponent for App {
                     if !engine_motion.borrow().menu_system.borrow().is_open() {
                         return;
                     }
-                    let bar_rect = bar_rect_motion.get();
+                    let stored = bar_rect_motion.get();
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let ev = quadraui::UiEvent::MouseMoved {
                         position: quadraui::Point {
                             x: x as f32,
