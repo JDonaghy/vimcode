@@ -83,6 +83,23 @@ pub enum EngineAction {
     OpenUrl(String),
 }
 
+/// Result of `Engine::handle_menu_key()` — tells the backend what happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuKeyResult {
+    /// Key was not consumed (menu not open, or unrecognised key).
+    NotHandled,
+    /// Menu state changed — backend should redraw menu bar + dropdown.
+    Redraw,
+    /// Menu was closed (Escape) — backend should redraw + hide dropdown.
+    Closed,
+    /// An item was activated — backend should dispatch the action string.
+    Activate {
+        menu_idx: usize,
+        item_idx: usize,
+        action: String,
+    },
+}
+
 /// One entry in the engine's accelerator registry. Caches the parsed form of
 /// `acc.binding` so [`Engine::match_accelerator`] can do a tight comparison
 /// without re-parsing per keypress.
@@ -2883,6 +2900,10 @@ pub struct Engine {
     /// Cached layout from the last paint of the menu bar strip.
     /// Written at paint time; read by click/hover handlers.
     pub menu_bar_layout: std::cell::RefCell<Option<quadraui::MenuBarLayout>>,
+    /// Cached menu dropdown ContextMenu + layout from the last paint.
+    /// Written at paint time; read by click/hover/key handlers.
+    pub menu_dropdown_ctx: std::cell::RefCell<Option<quadraui::ContextMenu>>,
+    pub menu_dropdown_layout: std::cell::RefCell<Option<quadraui::ContextMenuLayout>>,
     /// Cached layout from the last paint of the command center (nav arrows + search box).
     /// Written at paint time; read by click handlers.
     pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
@@ -3562,6 +3583,8 @@ impl Engine {
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
             terminal_toolbar_hits: std::cell::RefCell::new(None),
             menu_bar_layout: std::cell::RefCell::new(None),
+            menu_dropdown_ctx: std::cell::RefCell::new(None),
+            menu_dropdown_layout: std::cell::RefCell::new(None),
             command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,

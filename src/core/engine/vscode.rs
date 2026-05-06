@@ -114,6 +114,71 @@ impl Engine {
         Some((open_idx, item_idx))
     }
 
+    /// Shared keyboard dispatch when a menu dropdown is open.
+    /// Both TUI and GTK call this instead of duplicating nav logic.
+    ///
+    /// `menu_count` is the number of top-level menus.
+    /// `action_for_item` resolves a (menu_idx, item_idx) pair to the
+    /// action string — called only on Enter.
+    pub fn handle_menu_key(
+        &mut self,
+        key: &str,
+        menu_count: usize,
+        action_for_item: impl Fn(usize, usize) -> Option<String>,
+    ) -> MenuKeyResult {
+        if self.menu_open_idx.is_none() {
+            return MenuKeyResult::NotHandled;
+        }
+        match key {
+            "Left" => {
+                if let Some(idx) = self.menu_open_idx {
+                    self.open_menu(if idx > 0 { idx - 1 } else { menu_count - 1 });
+                }
+                MenuKeyResult::Redraw
+            }
+            "Right" => {
+                if let Some(idx) = self.menu_open_idx {
+                    self.open_menu((idx + 1) % menu_count);
+                }
+                MenuKeyResult::Redraw
+            }
+            "Down" | "Up" => {
+                let delta = if key == "Down" { 1 } else { -1 };
+                let ctx = self.menu_dropdown_ctx.borrow();
+                if let Some(ref menu) = *ctx {
+                    let current = self.menu_highlighted_item.unwrap_or(usize::MAX);
+                    let new_sel = if current == usize::MAX {
+                        menu.first_selectable()
+                    } else {
+                        menu.move_selection(current, delta)
+                    };
+                    drop(ctx);
+                    self.menu_highlighted_item = Some(new_sel);
+                } else {
+                    drop(ctx);
+                }
+                MenuKeyResult::Redraw
+            }
+            "Return" => {
+                if let Some((menu_idx, item_idx)) = self.menu_activate_highlighted() {
+                    if let Some(action) = action_for_item(menu_idx, item_idx) {
+                        return MenuKeyResult::Activate {
+                            menu_idx,
+                            item_idx,
+                            action,
+                        };
+                    }
+                }
+                MenuKeyResult::Redraw
+            }
+            "Escape" => {
+                self.close_menu();
+                MenuKeyResult::Closed
+            }
+            _ => MenuKeyResult::NotHandled,
+        }
+    }
+
     // ── Selection helpers ────────────────────────────────────────────────────
 
     /// Clear selection and ensure Insert mode (used in vscode mode).
