@@ -1650,23 +1650,8 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Menu bar hover-to-switch (when a dropdown is already open) ─────
-    if matches!(ev.kind, MouseEventKind::Moved)
-        && engine.menu_open_idx.is_some()
-        && engine.menu_bar_visible
-        && row == 0
-    {
-        let layout = engine.menu_bar_layout.borrow();
-        if let Some(ref ml) = *layout {
-            if let quadraui::MenuBarHit::Item(idx) = ml.hit_test(col as f32, 0.5) {
-                if engine.menu_open_idx != Some(idx) {
-                    drop(layout);
-                    engine.open_menu(idx);
-                }
-            }
-        }
-        return sidebar_width;
-    }
+    // Menu bar hover-to-switch is handled by MenuSystem::handle() in the
+    // UiEvent intercept (mod.rs).
 
     // ── Cancel hover dismiss if mouse is on the popup ─────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) && mouse_on_hover_popup {
@@ -1983,21 +1968,11 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Menu bar row click ─────────────────────────────────────────────────────
+    // ── Menu bar row click — command center only ──────────────────────────────
+    // Menu bar item clicks and dropdown clicks are handled by
+    // MenuSystem::handle() in the UiEvent intercept (mod.rs).
+    // The command center (nav arrows + search box) is still separate.
     if engine.menu_bar_visible && row == 0 {
-        let mb_hit = engine
-            .menu_bar_layout
-            .borrow()
-            .as_ref()
-            .map(|l| l.hit_test(col as f32, row as f32 + 0.5));
-        if let Some(quadraui::MenuBarHit::Item(idx)) = mb_hit {
-            if engine.menu_open_idx == Some(idx) {
-                engine.close_menu();
-            } else {
-                engine.open_menu(idx);
-            }
-            return sidebar_width;
-        }
         let cc_hit = engine
             .command_center_layout
             .borrow()
@@ -2018,79 +1993,9 @@ pub(super) fn handle_mouse(
             }
             _ => {}
         }
-        engine.close_menu();
+        // Click on menu bar area outside command center / menu items is
+        // handled by MenuSystem (it closes the dropdown if open).
         return sidebar_width;
-    }
-
-    // ── Menu dropdown item click ───────────────────────────────────────────────
-    if let Some(open_idx) = engine.menu_open_idx {
-        if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-            // Determine the dropdown anchor column (same formula as render_menu_dropdown)
-            let mut popup_col: u16 = 1;
-            for i in 0..open_idx {
-                if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                    popup_col += name.chars().count() as u16 + 2;
-                }
-            }
-            let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-            let max_shortcut = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-            let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
-            let popup_x = popup_col.min(term_height.saturating_sub(popup_width));
-            // Dropdown rows: border(1) + items
-            let menu_bar_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let popup_y = menu_bar_row; // dropdown starts below menu bar
-            if row > popup_y && col >= popup_x && col < popup_x + popup_width {
-                let item_idx = (row - popup_y - 1) as usize;
-                if item_idx < items.len() && !items[item_idx].separator && items[item_idx].enabled {
-                    let action = items[item_idx].action.to_string();
-                    if action == "open_file_dialog" {
-                        engine.close_menu();
-                        engine.open_picker(crate::core::engine::PickerSource::Files);
-                    } else {
-                        let act = engine.menu_activate_item(open_idx, item_idx, &action);
-                        if act == EngineAction::OpenTerminal {
-                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                            engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
-                        } else if let EngineAction::RunInTerminal(cmd) = act {
-                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                            engine.terminal_run_command(
-                                &cmd,
-                                cols,
-                                engine.session.terminal_panel_rows,
-                            );
-                        } else if act == EngineAction::OpenFolderDialog {
-                            *folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenFolder,
-                                engine.settings.show_hidden_files,
-                            ));
-                        } else if act == EngineAction::OpenWorkspaceDialog {
-                            // open_workspace_from_file() already ran in the engine;
-                            // refresh the sidebar to reflect the new cwd.
-                            *sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                        } else if act == EngineAction::SaveWorkspaceAsDialog {
-                            let ws_path = engine.cwd.join(".vimcode-workspace");
-                            engine.save_workspace_as(&ws_path);
-                        } else if act == EngineAction::OpenRecentDialog {
-                            *folder_picker = Some(FolderPickerState::new_recent(
-                                &engine.session.recent_workspaces,
-                            ));
-                        } else if act == EngineAction::QuitWithUnsaved {
-                            *quit_confirm = true;
-                            *quit_confirm_focus = 0;
-                        } else if act == EngineAction::ToggleSidebar {
-                            sidebar.visible = !sidebar.visible;
-                        } else if handle_action(engine, act) {
-                            *should_quit = true;
-                        }
-                    }
-                }
-                return sidebar_width;
-            }
-            // Click outside dropdown — close it
-            engine.close_menu();
-        }
     }
 
     // ── Debug toolbar row click ────────────────────────────────────────────────
@@ -2429,6 +2334,15 @@ pub(super) fn handle_mouse(
         match ab_target {
             Some(ActivityBarTarget::MenuToggle) => {
                 engine.toggle_menu_bar();
+                if !engine.menu_bar_visible {
+                    // Close the dropdown. MenuSystem::close() needs &mut Backend,
+                    // but the mouse handler only has (drag_state, modal_stack).
+                    // Pop the modal directly and reset the MenuSystem state by
+                    // re-creating it with the same menu definitions.
+                    modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
+                    let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
+                    *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
+                }
                 return sidebar_width;
             }
             Some(ActivityBarTarget::ExtensionPanel(name)) => {

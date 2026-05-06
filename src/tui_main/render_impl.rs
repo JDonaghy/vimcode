@@ -123,7 +123,7 @@ pub(super) fn draw_frame(
     engine.scroll_surfaces.borrow_mut().clear();
 
     // ── Top-level: [menu] / [content_area] ──
-    let menu_bar_height: u16 = if screen.menu_bar.is_some() { 1 } else { 0 };
+    let menu_bar_height: u16 = if screen.menu_bar_visible { 1 } else { 0 };
     let top_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(menu_bar_height), Constraint::Min(0)])
@@ -202,14 +202,49 @@ pub(super) fn draw_frame(
     let editor_area = editor_col;
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
-    if let Some(ref menu_data) = screen.menu_bar {
-        let (mb_layout, cc_layout) =
-            render_menu_bar(frame.buffer_mut(), menu_bar_area, menu_data, theme);
-        engine.menu_bar_layout.replace(Some(mb_layout));
+    if screen.menu_bar_visible {
+        let q_theme = super::quadraui_tui::q_theme(theme);
+        let bar = engine.menu_system.borrow().menu_bar();
+        let bar_rect = quadraui::Rect::new(
+            menu_bar_area.x as f32,
+            menu_bar_area.y as f32,
+            menu_bar_area.width as f32,
+            menu_bar_area.height as f32,
+        );
+        let mb_layout = backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_menu_bar(bar_rect, &bar)
+        });
+
+        let menu_end: u16 = mb_layout
+            .visible_items
+            .last()
+            .map(|vi| menu_bar_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
+            .unwrap_or(menu_bar_area.x);
+
+        let title = engine
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "VimCode".to_string());
+        let cc = render::build_command_center_view(
+            engine.tab_nav_can_go_back(),
+            engine.tab_nav_can_go_forward(),
+            &title,
+        );
+        let cc_area = Rect {
+            x: menu_end,
+            y: menu_bar_area.y,
+            width: menu_bar_area.width.saturating_sub(menu_end - menu_bar_area.x),
+            height: menu_bar_area.height,
+        };
+        let cc_layout = quadraui::tui::draw_command_center(
+            frame.buffer_mut(), cc_area, &cc, &q_theme,
+        );
         engine.command_center_layout.replace(Some(cc_layout));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
     } else {
-        engine.menu_bar_layout.replace(None);
         engine.command_center_layout.replace(None);
     }
 
@@ -1012,50 +1047,16 @@ pub(super) fn draw_frame(
     }
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
-    if let Some(ref menu_data) = screen.menu_bar {
-        if let Some(menu) = render::menu_dropdown_to_quadraui_context_menu(menu_data) {
-            // Sizing matches legacy: max(label) + max(shortcut) + 6 padding,
-            // clamped to [20, 50]. Inner width = outer - 2 for borders.
-            let max_label = menu_data
-                .open_items
-                .iter()
-                .map(|i| i.label.len())
-                .max()
-                .unwrap_or(4);
-            let max_shortcut = menu_data
-                .open_items
-                .iter()
-                .map(|i| {
-                    if menu_data.is_vscode_mode && !i.vscode_shortcut.is_empty() {
-                        i.vscode_shortcut.len()
-                    } else {
-                        i.shortcut.len()
-                    }
-                })
-                .max()
-                .unwrap_or(0);
-            let outer_width = (max_label + max_shortcut + 6).clamp(20, 50) as f32;
-            let inner_width = (outer_width - 2.0).max(1.0);
-            // The inner anchor sits 1 cell inside the outer box. Outer box
-            // starts at column `open_menu_col` (under the menu label) on
-            // the row directly below the menu-bar strip.
-            let anchor_x = menu_data.open_menu_col as f32 + 1.0;
-            let menu_bar_bottom = menu_bar_area.y + menu_bar_area.height;
-            let anchor_y = menu_bar_bottom as f32 + 1.0;
-            // Shrink the viewport by 1 on each side so layout clamping
-            // accounts for the 1-cell border chrome the rasteriser draws
-            // outside layout.bounds.
-            let inner_viewport = quadraui::Rect::new(
-                (area.x + 1) as f32,
-                (area.y + 1) as f32,
-                area.width.saturating_sub(2) as f32,
-                area.height.saturating_sub(2) as f32,
-            );
-            let layout = menu.layout(anchor_x, anchor_y, inner_viewport, inner_width, |_| {
-                quadraui::ContextMenuItemMeasure::new(1.0)
-            });
-            super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
-        }
+    if screen.menu_bar_visible {
+        let bar_rect = quadraui::Rect::new(
+            menu_bar_area.x as f32,
+            menu_bar_area.y as f32,
+            menu_bar_area.width as f32,
+            menu_bar_area.height as f32,
+        );
+        backend.enter_frame_scope(frame, |b| {
+            engine.menu_system.borrow().render(b, bar_rect);
+        });
     }
 
     // ── Quit confirm overlay — rendered on top of absolutely everything ───────
@@ -2254,39 +2255,8 @@ pub(super) fn render_separators(
 
 // ─── Activity bar ─────────────────────────────────────────────────────────────
 
-// ─── Menu bar rendering ───────────────────────────────────────────────────────────────────
-
-pub(super) fn render_menu_bar(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    data: &render::MenuBarData,
-    theme: &Theme,
-) -> (quadraui::MenuBarLayout, quadraui::CommandCenterLayout) {
-    let q_theme = super::quadraui_tui::q_theme(theme);
-    let bar = render::build_menu_bar_view(data.open_menu_idx);
-    let mb_layout = quadraui::tui::draw_menu_bar(buf, area, &bar, &q_theme);
-
-    let menu_end: u16 = mb_layout
-        .visible_items
-        .last()
-        .map(|vi| area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
-        .unwrap_or(area.x);
-
-    let cc = render::build_command_center_view(
-        data.nav_back_enabled,
-        data.nav_forward_enabled,
-        &data.title,
-    );
-    let cc_area = Rect {
-        x: menu_end,
-        y: area.y,
-        width: area.width.saturating_sub(menu_end - area.x),
-        height: area.height,
-    };
-    let cc_layout = quadraui::tui::draw_command_center(buf, cc_area, &cc, &q_theme);
-
-    (mb_layout, cc_layout)
-}
+// ─── Menu bar rendering ─────────────────────────────────────────────────────
+// (Now handled by MenuSystem::render() — see draw_frame menu dropdown block.)
 
 // ─── Context menu popup rendering ───────────────────────────────────────────────────────
 

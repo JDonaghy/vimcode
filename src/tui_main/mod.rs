@@ -1225,6 +1225,11 @@ fn event_loop(
     let mut backend = backend::TuiBackend::new();
     backend.set_nerd_fonts(engine.settings.use_nerd_fonts);
     register_panel_accelerators(&mut backend, &engine.settings.panel_keys);
+    // Initialize MenuSystem with menu definitions.
+    engine
+        .menu_system
+        .borrow_mut()
+        .set_menus(render::build_menu_defs(engine.is_vscode_mode()));
     // True while user drags the terminal header row to resize the panel.
     let mut dragging_terminal_resize: bool = false;
     // True while user drags the terminal split divider left/right.
@@ -1837,6 +1842,99 @@ fn event_loop(
             }
         }
 
+        // ── MenuSystem intercept — handles all menu keyboard/mouse events ──
+        if engine.menu_bar_visible {
+            let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+            let bar_rect =
+                quadraui::Rect::new(0.0, 0.0, cols as f32, 1.0);
+            let menu_event =
+                engine
+                    .menu_system
+                    .borrow_mut()
+                    .handle(&ui_event, &mut backend, bar_rect);
+            match menu_event {
+                quadraui::MenuEvent::Activated(id) => {
+                    let action = id.as_str().to_string();
+                    if action == "open_file_dialog" {
+                        engine.open_picker(crate::core::engine::PickerSource::Files);
+                    } else {
+                        let act = engine.dispatch_menu_action(&action);
+                        match act {
+                            EngineAction::OpenTerminal => {
+                                let cols = terminal
+                                    .size()
+                                    .ok()
+                                    .map(|s| s.width)
+                                    .unwrap_or(80);
+                                engine.terminal_new_tab(
+                                    cols,
+                                    engine.session.terminal_panel_rows,
+                                );
+                            }
+                            EngineAction::RunInTerminal(cmd) => {
+                                let cols = terminal
+                                    .size()
+                                    .ok()
+                                    .map(|s| s.width)
+                                    .unwrap_or(80);
+                                engine.terminal_run_command(
+                                    &cmd,
+                                    cols,
+                                    engine.session.terminal_panel_rows,
+                                );
+                            }
+                            EngineAction::OpenFolderDialog => {
+                                folder_picker = Some(FolderPickerState::new(
+                                    &engine.cwd.clone(),
+                                    FolderPickerMode::OpenFolder,
+                                    engine.settings.show_hidden_files,
+                                ));
+                            }
+                            EngineAction::OpenWorkspaceDialog => {
+                                sidebar = TuiSidebar::new(
+                                    engine.cwd.clone(),
+                                    sidebar.visible,
+                                );
+                                sidebar.show_hidden_files =
+                                    engine.settings.show_hidden_files;
+                            }
+                            EngineAction::SaveWorkspaceAsDialog => {
+                                let ws_path =
+                                    engine.cwd.join(".vimcode-workspace");
+                                engine.save_workspace_as(&ws_path);
+                            }
+                            EngineAction::OpenRecentDialog => {
+                                folder_picker =
+                                    Some(FolderPickerState::new_recent(
+                                        &engine.session.recent_workspaces,
+                                    ));
+                            }
+                            EngineAction::QuitWithUnsaved => {
+                                quit_confirm = true;
+                                quit_confirm_focus = 0;
+                            }
+                            EngineAction::ToggleSidebar => {
+                                sidebar.visible = !sidebar.visible;
+                            }
+                            act => {
+                                if handle_action(engine, act) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+                quadraui::MenuEvent::StateChanged
+                | quadraui::MenuEvent::Consumed => {
+                    needs_redraw = true;
+                    continue;
+                }
+                quadraui::MenuEvent::Ignored => {}
+            }
+        }
+
         let crossterm_event = match events::uievent_to_crossterm(ui_event) {
             Some(e) => e,
             // UiEvent variants without a crossterm equivalent (Accelerator,
@@ -2278,6 +2376,9 @@ fn event_loop(
                             let panel = match sidebar.toolbar_selected {
                                 0 => {
                                     engine.toggle_menu_bar();
+                                    if !engine.menu_bar_visible {
+                                        engine.menu_system.borrow_mut().close(&mut backend);
+                                    }
                                     sidebar.toolbar_focused = false;
                                     needs_redraw = true;
                                     continue;
@@ -3298,168 +3399,8 @@ fn event_loop(
                         // in this block.
                     }
 
-                    // Escape when menu dropdown is open: close it
-                    if matches!(key_event.code, KeyCode::Esc)
-                        && key_event.kind != KeyEventKind::Release
-                        && engine.menu_open_idx.is_some()
-                    {
-                        engine.close_menu();
-                        needs_redraw = true;
-                        continue;
-                    }
-
-                    // When menu dropdown is open: Left/Right/Up/Down/Enter navigate menus
-                    if engine.menu_open_idx.is_some() && key_event.kind != KeyEventKind::Release {
-                        match key_event.code {
-                            KeyCode::Left => {
-                                if let Some(idx) = engine.menu_open_idx {
-                                    if idx > 0 {
-                                        engine.open_menu(idx - 1);
-                                    } else {
-                                        engine.open_menu(render::MENU_STRUCTURE.len() - 1);
-                                    }
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            KeyCode::Right => {
-                                if let Some(idx) = engine.menu_open_idx {
-                                    engine.open_menu((idx + 1) % render::MENU_STRUCTURE.len());
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            KeyCode::Down => {
-                                if let Some(open_idx) = engine.menu_open_idx {
-                                    if let Some((_, _, items)) =
-                                        render::MENU_STRUCTURE.get(open_idx)
-                                    {
-                                        let seps: Vec<bool> =
-                                            items.iter().map(|i| i.separator).collect();
-                                        engine.menu_move_selection(1, &seps);
-                                    }
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            KeyCode::Up => {
-                                if let Some(open_idx) = engine.menu_open_idx {
-                                    if let Some((_, _, items)) =
-                                        render::MENU_STRUCTURE.get(open_idx)
-                                    {
-                                        let seps: Vec<bool> =
-                                            items.iter().map(|i| i.separator).collect();
-                                        engine.menu_move_selection(-1, &seps);
-                                    }
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            KeyCode::Enter => {
-                                if let Some((menu_idx, item_idx)) =
-                                    engine.menu_activate_highlighted()
-                                {
-                                    if let Some((_, _, items)) =
-                                        render::MENU_STRUCTURE.get(menu_idx)
-                                    {
-                                        if let Some(item) = items.get(item_idx) {
-                                            let action = item.action.to_string();
-                                            if action == "open_file_dialog" {
-                                                engine.close_menu();
-                                                engine.open_picker(
-                                                    crate::core::engine::PickerSource::Files,
-                                                );
-                                            } else {
-                                                let act = engine.menu_activate_item(
-                                                    menu_idx, item_idx, &action,
-                                                );
-                                                if act == EngineAction::OpenTerminal {
-                                                    let cols = terminal
-                                                        .size()
-                                                        .ok()
-                                                        .map(|s| s.width)
-                                                        .unwrap_or(80);
-                                                    engine.terminal_new_tab(
-                                                        cols,
-                                                        engine.session.terminal_panel_rows,
-                                                    );
-                                                } else if let EngineAction::RunInTerminal(cmd) = act
-                                                {
-                                                    let cols = terminal
-                                                        .size()
-                                                        .ok()
-                                                        .map(|s| s.width)
-                                                        .unwrap_or(80);
-                                                    engine.terminal_run_command(
-                                                        &cmd,
-                                                        cols,
-                                                        engine.session.terminal_panel_rows,
-                                                    );
-                                                } else if act == EngineAction::OpenFolderDialog {
-                                                    folder_picker = Some(FolderPickerState::new(
-                                                        &engine.cwd.clone(),
-                                                        FolderPickerMode::OpenFolder,
-                                                        engine.settings.show_hidden_files,
-                                                    ));
-                                                } else if act == EngineAction::OpenWorkspaceDialog {
-                                                    // open_workspace_from_file() already ran;
-                                                    // refresh sidebar.
-                                                    sidebar = TuiSidebar::new(
-                                                        engine.cwd.clone(),
-                                                        sidebar.visible,
-                                                    );
-                                                    sidebar.show_hidden_files =
-                                                        engine.settings.show_hidden_files;
-                                                } else if act == EngineAction::SaveWorkspaceAsDialog
-                                                {
-                                                    let ws_path =
-                                                        engine.cwd.join(".vimcode-workspace");
-                                                    engine.save_workspace_as(&ws_path);
-                                                } else if act == EngineAction::OpenRecentDialog {
-                                                    folder_picker =
-                                                        Some(FolderPickerState::new_recent(
-                                                            &engine.session.recent_workspaces,
-                                                        ));
-                                                } else if act == EngineAction::QuitWithUnsaved {
-                                                    quit_confirm = true;
-                                                    quit_confirm_focus = 0;
-                                                } else if act == EngineAction::ToggleSidebar {
-                                                    sidebar.visible = !sidebar.visible;
-                                                } else if handle_action(engine, act) {
-                                                    return;
-                                                }
-                                            } // close else { (open_file_dialog branch)
-                                        }
-                                    }
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // Alt+letter: open menu (only when menu bar visible)
-                    if key_event.modifiers.contains(KeyModifiers::ALT)
-                        && key_event.kind != KeyEventKind::Release
-                        && engine.menu_bar_visible
-                    {
-                        if let KeyCode::Char(ch) = key_event.code {
-                            let ch_lower = ch.to_ascii_lowercase();
-                            let menu_idx = render::MENU_STRUCTURE
-                                .iter()
-                                .position(|(_, alt_key, _)| *alt_key == ch_lower);
-                            if let Some(idx) = menu_idx {
-                                if engine.menu_open_idx == Some(idx) {
-                                    engine.close_menu();
-                                } else {
-                                    engine.open_menu(idx);
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                        }
-                    }
+                    // Menu keyboard/mouse handling is dispatched by
+                    // MenuSystem::handle() in the UiEvent intercept above.
 
                     // Alt+Left/Right: resize sidebar
                     if key_event.modifiers.contains(KeyModifiers::ALT)
