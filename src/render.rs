@@ -1664,29 +1664,6 @@ pub struct MenuItemData {
     pub separator: bool,
 }
 
-/// Data for the visible menu bar strip and optional open dropdown.
-#[derive(Debug)]
-pub struct MenuBarData {
-    /// Index (into `MENU_STRUCTURE`) of the currently open dropdown, or `None`.
-    pub open_menu_idx: Option<usize>,
-    /// Items in the currently open submenu (empty when no dropdown open).
-    pub open_items: Vec<MenuItemData>,
-    /// Approximate terminal column where the open menu header starts (for TUI anchor).
-    pub open_menu_col: u16,
-    /// Index into `open_items` of the keyboard-highlighted row, or `None`.
-    pub highlighted_item_idx: Option<usize>,
-    /// Title string shown to the right of menu labels (e.g. "VimCode — engine.rs").
-    pub title: String,
-    /// When true the backend should render its own window control buttons (─ ☐ ✕).
-    /// Set to true by the GTK backend which uses `set_decorated(false)`.
-    pub show_window_controls: bool,
-    /// When true, use `vscode_shortcut` instead of `shortcut` for menu items.
-    pub is_vscode_mode: bool,
-    /// Whether the back navigation arrow is enabled (history available).
-    pub nav_back_enabled: bool,
-    /// Whether the forward navigation arrow is enabled (history available).
-    pub nav_forward_enabled: bool,
-}
 
 /// One button in the debug toolbar strip.
 #[derive(Debug, Clone)]
@@ -3395,103 +3372,6 @@ pub fn context_menu_panel_to_quadraui_context_menu(
 }
 
 /// Convert the menu-bar dropdown state into a `quadraui::ContextMenu`.
-///
-/// Returns `None` when no menu is open (caller should suppress the
-/// popup entirely). Each `MenuItemData` maps to a `ContextMenuItem`
-/// with the shortcut placed in `detail` (right-aligned by the
-/// rasteriser). In VSCode mode, `vscode_shortcut` is preferred when
-/// non-empty.
-///
-/// `selected_idx` is translated from the engine's
-/// `open_items`-relative `highlighted_item_idx` into the quadraui
-/// item list (which includes separator rows as their own entries, so
-/// indices would otherwise drift when separators appear before the
-/// highlighted row).
-pub fn menu_dropdown_to_quadraui_context_menu(data: &MenuBarData) -> Option<quadraui::ContextMenu> {
-    if data.open_menu_idx.is_none() || data.open_items.is_empty() {
-        return None;
-    }
-
-    let mut items: Vec<quadraui::ContextMenuItem> = Vec::new();
-    // engine_to_quadraui[engine_idx] = quadraui index of the same item.
-    let mut engine_to_quadraui: Vec<usize> = Vec::with_capacity(data.open_items.len());
-
-    for (i, item) in data.open_items.iter().enumerate() {
-        engine_to_quadraui.push(items.len());
-        if item.separator {
-            // Engine models the separator as its own entry, so mirror
-            // that: a single separator item. Shortcut / label are
-            // ignored on separator rows by the rasteriser.
-            items.push(quadraui::ContextMenuItem {
-                id: None,
-                label: quadraui::StyledText::default(),
-                detail: None,
-                disabled: false,
-            });
-            continue;
-        }
-        let shortcut = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
-            item.vscode_shortcut
-        } else {
-            item.shortcut
-        };
-        items.push(quadraui::ContextMenuItem {
-            id: Some(quadraui::WidgetId::new(format!("menu:{i}"))),
-            label: quadraui::StyledText::plain(item.label.to_string()),
-            detail: if shortcut.is_empty() {
-                None
-            } else {
-                Some(quadraui::StyledText::plain(shortcut.to_string()))
-            },
-            disabled: false,
-        });
-    }
-
-    // `usize::MAX` sentinel means "no row selected" — neither rasteriser
-    // matches it, so nothing is highlighted. This matters for hover-over-
-    // separator, where the GTK motion handler clears `highlighted_item_idx`
-    // to None; the OLD `unwrap_or(0)` would then highlight the first item.
-    let selected_idx = data
-        .highlighted_item_idx
-        .and_then(|eng| engine_to_quadraui.get(eng).copied())
-        .unwrap_or(usize::MAX);
-
-    Some(quadraui::ContextMenu {
-        id: quadraui::WidgetId::new("menu_dropdown"),
-        items,
-        selected_idx,
-        bg: None,
-        placement: quadraui::ContextMenuPlacement::default(),
-    })
-}
-
-/// Resolve a `WidgetId` produced by `menu_dropdown_to_quadraui_context_menu`
-/// back to the engine-side `MENU_STRUCTURE.items` index. Returns `None`
-/// if the id doesn't match the `menu:N` pattern.
-pub fn menu_dropdown_action_index(id: &quadraui::WidgetId) -> Option<usize> {
-    id.as_str().strip_prefix("menu:")?.parse().ok()
-}
-
-/// Build a `quadraui::MenuBar` descriptor from the static `MENU_STRUCTURE`
-/// and the engine's current open-menu state.
-pub fn build_menu_bar_view(open_menu_idx: Option<usize>) -> quadraui::MenuBar {
-    let items = MENU_STRUCTURE
-        .iter()
-        .enumerate()
-        .map(|(i, (name, _alt_key, _))| quadraui::MenuBarItem {
-            id: quadraui::WidgetId::new(format!("menubar:{i}")),
-            label: format!("&{name}"),
-            disabled: false,
-        })
-        .collect();
-    quadraui::MenuBar {
-        id: quadraui::WidgetId::new("menubar"),
-        items,
-        open_item: open_menu_idx,
-        focused_item: None,
-    }
-}
-
 /// Build a `quadraui::CommandCenter` descriptor from engine state.
 pub fn build_command_center_view(
     nav_back_enabled: bool,
