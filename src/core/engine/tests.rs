@@ -12040,25 +12040,8 @@ fn test_menu_bar_toggle() {
 }
 
 #[test]
-fn test_menu_open_close() {
+fn test_menu_dispatch_action() {
     let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    assert_eq!(engine.menu_open_idx, None);
-    engine.open_menu(2);
-    assert_eq!(
-        engine.menu_open_idx,
-        Some(2),
-        "open_menu sets dropdown index"
-    );
-    engine.close_menu();
-    assert_eq!(engine.menu_open_idx, None, "close_menu clears dropdown");
-    assert!(engine.menu_bar_visible, "close_menu keeps bar visible");
-}
-
-#[test]
-fn test_menu_activate_dispatches_command() {
-    let mut engine = Engine::new();
-    // Load a buffer with content so we can verify save via w command.
     let tmp = std::env::temp_dir().join("vimcode_menu_test_save.txt");
     let _ = std::fs::write(&tmp, "hello");
     engine
@@ -12072,74 +12055,20 @@ fn test_menu_activate_dispatches_command() {
         .unwrap()
         .dirty = true;
     engine.menu_bar_visible = true;
-    engine.menu_open_idx = Some(0);
-    // Activate the "Save" item (File menu, action "w") via menu_activate_item.
-    engine.menu_activate_item(0, 2, "w");
-    assert_eq!(
-        engine.menu_open_idx, None,
-        "menu_activate_item closes dropdown"
-    );
-    // Buffer should no longer be dirty after :w
+    engine.dispatch_menu_action("w");
     let dirty = engine
         .buffer_manager
         .get(engine.active_buffer_id())
         .map(|s| s.dirty)
         .unwrap_or(true);
-    assert!(!dirty, "buffer saved after menu activate");
+    assert!(!dirty, "buffer saved after dispatch_menu_action");
     let _ = std::fs::remove_file(&tmp);
 }
 
-// ── Session 82: menu navigation ────────────────────────────────────────────
-
 #[test]
-fn test_menu_item_navigation() {
-    let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    engine.open_menu(0);
-    assert_eq!(
-        engine.menu_highlighted_item, None,
-        "starts with no highlight"
-    );
-
-    // Items: [non-sep(0), non-sep(1), sep(2), non-sep(3)]
-    let seps = [false, false, true, false];
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(0), "first non-sep");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(1), "second non-sep");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(3), "skips separator");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(0), "wraps around");
-
-    // Reverse direction
-    engine.menu_move_selection(-1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(3), "reverse wrap");
-}
-
-#[test]
-fn test_menu_activate_highlighted() {
-    let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    engine.open_menu(2); // arbitrary menu index
-
-    // Nothing highlighted → returns None, menu stays open
-    let result = engine.menu_activate_highlighted();
-    assert!(result.is_none(), "None when nothing highlighted");
-    assert!(engine.menu_open_idx.is_some(), "menu stays open");
-
-    // Highlight an item, then activate
-    engine.menu_highlighted_item = Some(3);
-    let result = engine.menu_activate_highlighted();
-    assert_eq!(result, Some((2, 3)), "returns (menu_idx, item_idx)");
-    assert!(
-        engine.menu_open_idx.is_none(),
-        "menu is closed after activate"
-    );
+fn test_menu_system_starts_closed() {
+    let engine = Engine::new();
+    assert!(!engine.menu_system.borrow().is_open());
 }
 
 #[test]
