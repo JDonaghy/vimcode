@@ -2713,7 +2713,7 @@ impl SimpleComponent for App {
                 let engine = engine.clone();
                 let backend_d = backend.clone();
                 let bar_rect_draw = menu_bar_rect_cell.clone();
-                menu_dd_da.set_draw_func(move |_da, cr, _da_w, _da_h| {
+                menu_dd_da.set_draw_func(move |_da, cr, da_w, da_h| {
                     let eng = engine.borrow();
                     if !eng.menu_system.borrow().is_open() {
                         return;
@@ -2729,14 +2729,15 @@ impl SimpleComponent for App {
                     pango_layout.set_text("M");
                     let cw = pango_layout.pixel_size().0 as f64;
                     let bar_rect = bar_rect_draw.get();
-                    backend_d
-                        .borrow_mut()
-                        .enter_frame_scope(cr, &pango_layout, |b| {
-                            b.set_current_theme(q_theme);
-                            b.set_current_line_height(lh);
-                            b.set_current_char_width(cw);
-                            eng.menu_system.borrow().render(b, bar_rect);
-                        });
+                    let mut b = backend_d.borrow_mut();
+                    use quadraui::Backend;
+                    b.begin_frame(quadraui::Viewport::new(da_w as f32, da_h as f32, 1.0));
+                    b.enter_frame_scope(cr, &pango_layout, |b| {
+                        b.set_current_theme(q_theme);
+                        b.set_current_line_height(lh);
+                        b.set_current_char_width(cw);
+                        eng.menu_system.borrow().render(b, bar_rect);
+                    });
                 });
             }
 
