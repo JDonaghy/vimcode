@@ -28,38 +28,44 @@ impl Engine {
 
     // ── Menu bar ─────────────────────────────────────────────────────────────
 
-    /// Toggle the VSCode-style menu bar strip on/off; clears any open dropdown.
-    #[allow(dead_code)]
+    /// Toggle menu bar visibility. Does NOT close any open dropdown —
+    /// callers with backend access should call `menu_system.close()` when hiding.
     pub fn toggle_menu_bar(&mut self) {
         self.menu_bar_visible = !self.menu_bar_visible;
-        self.menu_open_idx = None;
     }
 
-    /// Open the dropdown for top-level menu at `idx` (e.g. 0=File, 1=Edit, …).
+    /// Dispatch a menu action by command string. Called when
+    /// `MenuEvent::Activated(id)` fires — `id.as_str()` is the action.
+    pub fn dispatch_menu_action(&mut self, action: &str) -> EngineAction {
+        if !self.is_vscode_mode() {
+            self.mode = Mode::Normal;
+        }
+        if action.is_empty() {
+            EngineAction::None
+        } else {
+            self.execute_command(action)
+        }
+    }
+
+    #[cfg(feature = "win-gui")]
     pub fn open_menu(&mut self, idx: usize) {
         self.menu_open_idx = Some(idx);
         self.menu_highlighted_item = None;
     }
 
-    /// Close the currently open dropdown while keeping the bar visible.
+    #[cfg(feature = "win-gui")]
     pub fn close_menu(&mut self) {
         self.menu_open_idx = None;
     }
 
-    /// Activate the item at `item_idx` inside top-level menu `menu_idx`.
-    /// `action` is the command string to dispatch (looked up from the static menu table
-    /// in `render.rs` by the UI layer and passed in here).
-    /// Closes the dropdown and returns the `EngineAction` so the UI layer can handle
-    /// actions that require platform resources (e.g. `OpenTerminal` needs PTY size).
+    #[cfg(feature = "win-gui")]
     pub fn menu_activate_item(
         &mut self,
         menu_idx: usize,
         item_idx: usize,
         action: &str,
     ) -> EngineAction {
-        let _ = (menu_idx, item_idx); // indices are for the UI; engine just dispatches
-                                      // Ensure Normal mode before executing menu actions so all Vim commands work.
-                                      // VSCode mode stays in Insert (its default editing state).
+        let _ = (menu_idx, item_idx);
         if !self.is_vscode_mode() {
             self.mode = Mode::Normal;
         }
@@ -72,11 +78,7 @@ impl Engine {
         result
     }
 
-    /// Move the keyboard highlight up or down within the open dropdown.
-    ///
-    /// `is_separator` is provided by the UI layer (derived from MENU_STRUCTURE) and indicates
-    /// which items are non-selectable separator lines. The cursor wraps around and skips
-    /// separators. `delta` is typically +1 (Down) or -1 (Up).
+    #[cfg(feature = "win-gui")]
     pub fn menu_move_selection(&mut self, delta: i32, is_separator: &[bool]) {
         if self.menu_open_idx.is_none() {
             return;
@@ -101,82 +103,12 @@ impl Engine {
         self.menu_highlighted_item = Some(non_sep[new_pos]);
     }
 
-    /// Activate the currently highlighted item (keyboard Enter).
-    ///
-    /// Returns `Some((menu_idx, item_idx))` if an item was highlighted and the menu was
-    /// closed. The caller must look up the action string from MENU_STRUCTURE and call
-    /// `menu_activate_item` to actually dispatch it.
-    /// Returns `None` if no menu is open or nothing is highlighted.
+    #[cfg(feature = "win-gui")]
     pub fn menu_activate_highlighted(&mut self) -> Option<(usize, usize)> {
         let open_idx = self.menu_open_idx?;
         let item_idx = self.menu_highlighted_item?;
         self.close_menu();
         Some((open_idx, item_idx))
-    }
-
-    /// Shared keyboard dispatch when a menu dropdown is open.
-    /// Both TUI and GTK call this instead of duplicating nav logic.
-    ///
-    /// `menu_count` is the number of top-level menus.
-    /// `action_for_item` resolves a (menu_idx, item_idx) pair to the
-    /// action string — called only on Enter.
-    pub fn handle_menu_key(
-        &mut self,
-        key: &str,
-        menu_count: usize,
-        action_for_item: impl Fn(usize, usize) -> Option<String>,
-    ) -> MenuKeyResult {
-        if self.menu_open_idx.is_none() {
-            return MenuKeyResult::NotHandled;
-        }
-        match key {
-            "Left" => {
-                if let Some(idx) = self.menu_open_idx {
-                    self.open_menu(if idx > 0 { idx - 1 } else { menu_count - 1 });
-                }
-                MenuKeyResult::Redraw
-            }
-            "Right" => {
-                if let Some(idx) = self.menu_open_idx {
-                    self.open_menu((idx + 1) % menu_count);
-                }
-                MenuKeyResult::Redraw
-            }
-            "Down" | "Up" => {
-                let delta = if key == "Down" { 1 } else { -1 };
-                let ctx = self.menu_dropdown_ctx.borrow();
-                if let Some(ref menu) = *ctx {
-                    let current = self.menu_highlighted_item.unwrap_or(usize::MAX);
-                    let new_sel = if current == usize::MAX {
-                        menu.first_selectable()
-                    } else {
-                        menu.move_selection(current, delta)
-                    };
-                    drop(ctx);
-                    self.menu_highlighted_item = Some(new_sel);
-                } else {
-                    drop(ctx);
-                }
-                MenuKeyResult::Redraw
-            }
-            "Return" => {
-                if let Some((menu_idx, item_idx)) = self.menu_activate_highlighted() {
-                    if let Some(action) = action_for_item(menu_idx, item_idx) {
-                        return MenuKeyResult::Activate {
-                            menu_idx,
-                            item_idx,
-                            action,
-                        };
-                    }
-                }
-                MenuKeyResult::Redraw
-            }
-            "Escape" => {
-                self.close_menu();
-                MenuKeyResult::Closed
-            }
-            _ => MenuKeyResult::NotHandled,
-        }
     }
 
     // ── Selection helpers ────────────────────────────────────────────────────

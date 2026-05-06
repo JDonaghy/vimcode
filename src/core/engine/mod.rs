@@ -83,23 +83,6 @@ pub enum EngineAction {
     OpenUrl(String),
 }
 
-/// Result of `Engine::handle_menu_key()` — tells the backend what happened.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MenuKeyResult {
-    /// Key was not consumed (menu not open, or unrecognised key).
-    NotHandled,
-    /// Menu state changed — backend should redraw menu bar + dropdown.
-    Redraw,
-    /// Menu was closed (Escape) — backend should redraw + hide dropdown.
-    Closed,
-    /// An item was activated — backend should dispatch the action string.
-    Activate {
-        menu_idx: usize,
-        item_idx: usize,
-        action: String,
-    },
-}
-
 /// One entry in the engine's accelerator registry. Caches the parsed form of
 /// `acc.binding` so [`Engine::match_accelerator`] can do a tight comparison
 /// without re-parsing per keypress.
@@ -2791,13 +2774,16 @@ pub struct Engine {
     pub menu_bar_visible: bool,
     /// Whether the menu bar can be fully hidden (true in TUI, false in GTK where it's the title bar).
     pub menu_bar_toggleable: bool,
-    /// Index of the currently open top-level menu dropdown (None = bar visible but no dropdown).
+    /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
+    /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
+    pub menu_system: std::cell::RefCell<quadraui::MenuSystem>,
+    #[cfg(feature = "win-gui")]
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
-    /// Index of the keyboard-highlighted item in the currently open menu dropdown.
+    #[cfg(feature = "win-gui")]
     pub menu_highlighted_item: Option<usize>,
 
     // --- DAP (Debug Adapter Protocol) state ---
@@ -2897,13 +2883,6 @@ pub struct Engine {
     /// Cached hit data from the last paint of the terminal toolbar (find bar
     /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
     pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
-    /// Cached layout from the last paint of the menu bar strip.
-    /// Written at paint time; read by click/hover handlers.
-    pub menu_bar_layout: std::cell::RefCell<Option<quadraui::MenuBarLayout>>,
-    /// Cached menu dropdown ContextMenu + layout from the last paint.
-    /// Written at paint time; read by click/hover/key handlers.
-    pub menu_dropdown_ctx: std::cell::RefCell<Option<quadraui::ContextMenu>>,
-    pub menu_dropdown_layout: std::cell::RefCell<Option<quadraui::ContextMenuLayout>>,
     /// Cached layout from the last paint of the command center (nav arrows + search box).
     /// Written at paint time; read by click handlers.
     pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
@@ -3543,9 +3522,12 @@ impl Engine {
             terminal_maximized: false,
             menu_bar_visible: false,
             menu_bar_toggleable: false,
+            menu_system: std::cell::RefCell::new(quadraui::MenuSystem::new(Vec::new())),
+            #[cfg(feature = "win-gui")]
             menu_open_idx: None,
             debug_toolbar_visible: false,
             dap_session_active: false,
+            #[cfg(feature = "win-gui")]
             menu_highlighted_item: None,
             dap_manager: None,
             dap_stopped_thread: None,
@@ -3582,9 +3564,6 @@ impl Engine {
             bottom_panel_kind: BottomPanelKind::Terminal,
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
             terminal_toolbar_hits: std::cell::RefCell::new(None),
-            menu_bar_layout: std::cell::RefCell::new(None),
-            menu_dropdown_ctx: std::cell::RefCell::new(None),
-            menu_dropdown_layout: std::cell::RefCell::new(None),
             command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,

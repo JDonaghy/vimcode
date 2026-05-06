@@ -2390,6 +2390,47 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
     ),
 ];
 
+/// Build `Vec<MenuDef>` from `MENU_STRUCTURE` for `quadraui::MenuSystem`.
+/// `is_vscode_mode` selects which shortcut variant to display.
+pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
+    MENU_STRUCTURE
+        .iter()
+        .map(|(name, _alt, items)| quadraui::MenuDef {
+            id: quadraui::WidgetId::new(*name),
+            label: format!("&{name}"),
+            disabled: false,
+            items: items
+                .iter()
+                .map(|item| {
+                    if item.separator {
+                        return quadraui::ContextMenuItem {
+                            id: None,
+                            label: quadraui::StyledText::default(),
+                            detail: None,
+                            disabled: false,
+                        };
+                    }
+                    let shortcut = if is_vscode_mode && !item.vscode_shortcut.is_empty() {
+                        item.vscode_shortcut
+                    } else {
+                        item.shortcut
+                    };
+                    quadraui::ContextMenuItem {
+                        id: Some(quadraui::WidgetId::new(item.action)),
+                        label: quadraui::StyledText::plain(item.label.to_string()),
+                        detail: if shortcut.is_empty() {
+                            None
+                        } else {
+                            Some(quadraui::StyledText::plain(shortcut.to_string()))
+                        },
+                        disabled: !item.enabled,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Static debug toolbar button definitions.
 /// Icons use the Unicode fallback glyphs (▶ ⏸ ⏹ ↻ etc.) which render
 /// correctly in both TUI (any font) and GTK (no Nerd Font subset needed).
