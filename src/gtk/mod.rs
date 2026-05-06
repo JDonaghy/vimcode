@@ -2696,10 +2696,12 @@ impl SimpleComponent for App {
             widgets.main_hbox.add_controller(gesture);
         }
 
+        // Shared bar_rect — set by the menu bar DA's draw_func each frame,
+        // read by all menu click/motion/key handlers for MenuSystem::handle().
+        let menu_bar_rect_cell: Rc<Cell<quadraui::Rect>> =
+            Rc::new(Cell::new(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)));
+
         // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
-        // A full-window transparent overlay that draws the dropdown in window
-        // coordinates (x=0 at window left edge).  can_target is toggled on/off
-        // with menu open/close so that normal editor clicks pass through.
         {
             let menu_dd_da = gtk4::DrawingArea::new();
             menu_dd_da.set_hexpand(true);
@@ -2710,6 +2712,7 @@ impl SimpleComponent for App {
             {
                 let engine = engine.clone();
                 let backend_d = backend.clone();
+                let bar_rect_draw = menu_bar_rect_cell.clone();
                 menu_dd_da.set_draw_func(move |_da, cr, _da_w, _da_h| {
                     let eng = engine.borrow();
                     if !eng.menu_system.borrow().is_open() {
@@ -2725,12 +2728,7 @@ impl SimpleComponent for App {
                     let lh = pango_layout.pixel_size().1 as f64;
                     pango_layout.set_text("M");
                     let cw = pango_layout.pixel_size().0 as f64;
-                    use quadraui::Backend;
-                    let bar_rect = {
-                        let b = backend_d.borrow();
-                        let vp = b.viewport();
-                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
-                    };
+                    let bar_rect = bar_rect_draw.get();
                     backend_d
                         .borrow_mut()
                         .enter_frame_scope(cr, &pango_layout, |b| {
@@ -2747,15 +2745,11 @@ impl SimpleComponent for App {
                 let sender_dd = sender.input_sender().clone();
                 let engine_dd = engine.clone();
                 let backend_dd = backend.clone();
+                let bar_rect_dd = menu_bar_rect_cell.clone();
                 let gesture = gtk4::GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |_, _, x, y| {
-                    use quadraui::Backend;
-                    let bar_rect = {
-                        let b = backend_dd.borrow();
-                        let vp = b.viewport();
-                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
-                    };
+                    let bar_rect = bar_rect_dd.get();
                     let ev = quadraui::UiEvent::MouseDown {
                         widget: None,
                         button: quadraui::MouseButton::Left,
@@ -2788,17 +2782,13 @@ impl SimpleComponent for App {
                 let sender_motion = sender.input_sender().clone();
                 let engine_motion = engine.clone();
                 let backend_motion = backend.clone();
+                let bar_rect_motion = menu_bar_rect_cell.clone();
                 let motion = gtk4::EventControllerMotion::new();
                 motion.connect_motion(move |_, x, y| {
                     if !engine_motion.borrow().menu_system.borrow().is_open() {
                         return;
                     }
-                    use quadraui::Backend;
-                    let bar_rect = {
-                        let b = backend_motion.borrow();
-                        let vp = b.viewport();
-                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
-                    };
+                    let bar_rect = bar_rect_motion.get();
                     let ev = quadraui::UiEvent::MouseMoved {
                         position: quadraui::Point {
                             x: x as f32,
@@ -2934,6 +2924,7 @@ impl SimpleComponent for App {
             let engine = engine.clone();
             let backend_d = backend.clone();
             let cc_layout_draw = command_center_layout_cell.clone();
+            let bar_rect_update = menu_bar_rect_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let eng = engine.borrow();
                 let theme = Theme::from_name(&eng.settings.colorscheme);
@@ -2952,6 +2943,7 @@ impl SimpleComponent for App {
                 use quadraui::Backend;
                 let bar = eng.menu_system.borrow().menu_bar();
                 let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
+                bar_rect_update.set(bar_rect);
                 let mb_layout = backend_d
                     .borrow_mut()
                     .enter_frame_scope(cr, &pango_layout, |b| {
@@ -2997,6 +2989,7 @@ impl SimpleComponent for App {
             let engine_menu = engine.clone();
             let backend_click = backend.clone();
             let cc_layout_click = command_center_layout_cell.clone();
+            let bar_rect_click = menu_bar_rect_cell.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
             gesture.connect_pressed(move |gest, _, x, _y| {
@@ -3024,12 +3017,7 @@ impl SimpleComponent for App {
                     _ => {}
                 }
                 // Delegate to MenuSystem for menu bar label clicks.
-                use quadraui::Backend;
-                let bar_rect = {
-                    let b = backend_click.borrow();
-                    let vp = b.viewport();
-                    quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
-                };
+                let bar_rect = bar_rect_click.get();
                 let ev = quadraui::UiEvent::MouseDown {
                     widget: None,
                     button: quadraui::MouseButton::Left,
@@ -3063,14 +3051,10 @@ impl SimpleComponent for App {
             let sender_hover = sender.input_sender().clone();
             let engine_hover = engine.clone();
             let backend_hover = backend.clone();
+            let bar_rect_hover = menu_bar_rect_cell.clone();
             let motion = gtk4::EventControllerMotion::new();
             motion.connect_motion(move |_, x, _y| {
-                use quadraui::Backend;
-                let bar_rect = {
-                    let b = backend_hover.borrow();
-                    let vp = b.viewport();
-                    quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
-                };
+                let bar_rect = bar_rect_hover.get();
                 let ev = quadraui::UiEvent::MouseMoved {
                     position: quadraui::Point {
                         x: x as f32,
