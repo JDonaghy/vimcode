@@ -1261,10 +1261,12 @@ pub(super) fn handle_mouse(
                         ..
                     } = sev
                     {
+                        let step = (delta.y.abs() * 3.0).round() as usize;
+                        let down = delta.y > 0.0;
                         match id.as_str() {
                             "editor_hover" => {
-                                let step = (delta.y * 3.0).ceil() as i32;
-                                engine.editor_hover_scroll(step);
+                                let signed = if down { step as i32 } else { -(step as i32) };
+                                engine.editor_hover_scroll(signed);
                                 return sidebar_width;
                             }
                             "debug_output" => {
@@ -1272,11 +1274,10 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "explorer:sb" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
                                 let total = sidebar.rows.len();
                                 let tree_height =
                                     term_height.saturating_sub(bottom_chrome) as usize;
-                                if delta.y > 0.0 {
+                                if down {
                                     sidebar.scroll_top = (sidebar.scroll_top + step)
                                         .min(total.saturating_sub(tree_height));
                                 } else {
@@ -1285,9 +1286,8 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "ext_panel:sb" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
                                 let flat_len = engine.ext_panel_flat_len();
-                                if delta.y > 0.0 {
+                                if down {
                                     engine.ext_panel_scroll_top = (engine.ext_panel_scroll_top
                                         + step)
                                         .min(flat_len.saturating_sub(1));
@@ -1298,11 +1298,10 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:settings" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
                                 let flat = engine.settings_flat_list();
                                 let content_height = term_height.saturating_sub(4) as usize;
                                 let max_scroll = flat.len().saturating_sub(content_height);
-                                if delta.y > 0.0 {
+                                if down {
                                     engine.settings_scroll_top =
                                         (engine.settings_scroll_top + step).min(max_scroll);
                                 } else {
@@ -1312,8 +1311,7 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:search_results" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
-                                if delta.y > 0.0 {
+                                if down {
                                     sidebar.search_scroll_top += step;
                                 } else {
                                     sidebar.search_scroll_top =
@@ -1322,35 +1320,36 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:ext_sidebar" => {
-                                let step = delta.y.abs() * 3.0;
-                                engine.ext_sidebar_panel_scroll = if delta.y > 0.0 {
-                                    engine.ext_sidebar_panel_scroll + step
+                                let fstep = delta.y.abs() * 3.0;
+                                engine.ext_sidebar_panel_scroll = if down {
+                                    engine.ext_sidebar_panel_scroll + fstep
                                 } else {
-                                    (engine.ext_sidebar_panel_scroll - step).max(0.0)
+                                    (engine.ext_sidebar_panel_scroll - fstep).max(0.0)
                                 };
                                 return sidebar_width;
                             }
                             other if other.starts_with("debug_sidebar:") => {
                                 if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
                                     if let Ok(idx) = idx_str.parse::<usize>() {
-                                        let step = (delta.y.abs() * 3.0).ceil() as isize;
-                                        let step = if delta.y > 0.0 { step } else { -step };
-                                        engine.handle_dap_sidebar_scroll(idx, step);
+                                        let signed = if down {
+                                            step as isize
+                                        } else {
+                                            -(step as isize)
+                                        };
+                                        engine.handle_dap_sidebar_scroll(idx, signed);
                                     }
                                 }
                                 return sidebar_width;
                             }
                             "tui:terminal_scrollback" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
-                                if delta.y < 0.0 {
-                                    engine.terminal_scroll_up(step);
-                                } else {
+                                if down {
                                     engine.terminal_scroll_down(step);
+                                } else {
+                                    engine.terminal_scroll_up(step);
                                 }
                                 return sidebar_width;
                             }
                             "tui:editor_viewport" => {
-                                let step = (delta.y.abs() * 3.0).ceil() as usize;
                                 let scroll_menu_rows: u16 =
                                     if engine.menu_bar_visible { 1 } else { 0 };
                                 let editor_row = row.saturating_sub(scroll_menu_rows);
@@ -1368,10 +1367,10 @@ pub(super) fn handle_mouse(
                                     })
                                 });
                                 if let Some(rw) = target {
-                                    if delta.y < 0.0 {
-                                        engine.scroll_up_visible_for_window(rw.window_id, step);
-                                    } else {
+                                    if down {
                                         engine.scroll_down_visible_for_window(rw.window_id, step);
+                                    } else {
+                                        engine.scroll_up_visible_for_window(rw.window_id, step);
                                     }
                                     engine.sync_scroll_binds();
                                 }
