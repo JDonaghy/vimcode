@@ -1354,46 +1354,36 @@ impl SimpleComponent for App {
                                     if engine.borrow().menu_open_idx.is_some() {
                                         match key_name.as_str() {
                                             "Left" => {
-                                                let mut eng = engine.borrow_mut();
+                                                let eng = engine.borrow();
                                                 if let Some(idx) = eng.menu_open_idx {
                                                     let len = render::MENU_STRUCTURE.len();
-                                                    eng.open_menu(if idx > 0 { idx - 1 } else { len - 1 });
+                                                    let new = if idx > 0 { idx - 1 } else { len - 1 };
+                                                    drop(eng);
+                                                    sender.input(Msg::OpenMenu(new));
                                                 }
-                                                drop(eng);
-                                                sender.input(Msg::Resize);
                                                 return gtk4::glib::Propagation::Stop;
                                             }
                                             "Right" => {
-                                                let mut eng = engine.borrow_mut();
+                                                let eng = engine.borrow();
                                                 if let Some(idx) = eng.menu_open_idx {
-                                                    eng.open_menu((idx + 1) % render::MENU_STRUCTURE.len());
+                                                    let new = (idx + 1) % render::MENU_STRUCTURE.len();
+                                                    drop(eng);
+                                                    sender.input(Msg::OpenMenu(new));
                                                 }
-                                                drop(eng);
-                                                sender.input(Msg::Resize);
                                                 return gtk4::glib::Propagation::Stop;
                                             }
-                                            "Down" => {
+                                            "Down" | "Up" => {
+                                                let delta = if key_name == "Down" { 1 } else { -1 };
                                                 let mut eng = engine.borrow_mut();
                                                 if let Some(open_idx) = eng.menu_open_idx {
                                                     if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
                                                         let seps: Vec<bool> = items.iter().map(|i| i.separator).collect();
-                                                        eng.menu_move_selection(1, &seps);
+                                                        eng.menu_move_selection(delta, &seps);
                                                     }
                                                 }
+                                                let highlight = eng.menu_highlighted_item;
                                                 drop(eng);
-                                                sender.input(Msg::Resize);
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                            "Up" => {
-                                                let mut eng = engine.borrow_mut();
-                                                if let Some(open_idx) = eng.menu_open_idx {
-                                                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-                                                        let seps: Vec<bool> = items.iter().map(|i| i.separator).collect();
-                                                        eng.menu_move_selection(-1, &seps);
-                                                    }
-                                                }
-                                                drop(eng);
-                                                sender.input(Msg::Resize);
+                                                sender.input(Msg::MenuHighlight(highlight));
                                                 return gtk4::glib::Propagation::Stop;
                                             }
                                             "Return" => {
@@ -1412,7 +1402,6 @@ impl SimpleComponent for App {
                                                 return gtk4::glib::Propagation::Stop;
                                             }
                                             "Escape" => {
-                                                engine.borrow_mut().close_menu();
                                                 sender.input(Msg::CloseMenu);
                                                 return gtk4::glib::Propagation::Stop;
                                             }
