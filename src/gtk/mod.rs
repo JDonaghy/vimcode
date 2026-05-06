@@ -2714,9 +2714,6 @@ impl SimpleComponent for App {
         // read by all menu click/motion/key handlers for MenuSystem::handle().
         let menu_bar_rect_cell: Rc<Cell<quadraui::Rect>> =
             Rc::new(Cell::new(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)));
-        // Full titlebar DA height (menu labels + command center). The overlay
-        // DA uses this for the y-offset since set_titlebar puts the DA above it.
-        let titlebar_height_cell: Rc<Cell<f32>> = Rc::new(Cell::new(30.0));
 
         // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
         {
@@ -2731,7 +2728,6 @@ impl SimpleComponent for App {
                 let engine = engine.clone();
                 let backend_d = backend.clone();
                 let bar_rect_draw = menu_bar_rect_cell.clone();
-                let titlebar_h_for_offset = titlebar_height_cell.clone();
                 menu_dd_da.set_draw_func(move |_da, cr, da_w, da_h| {
                     let eng = engine.borrow();
                     if !eng.menu_system.borrow().is_open() {
@@ -2751,9 +2747,12 @@ impl SimpleComponent for App {
                     // The menu bar DA is set_titlebar() — it sits ABOVE the
                     // overlay DA. Shift bar_rect.y negative so render() draws
                     // the bar at the titlebar position (above the overlay).
-                    let tb_h = titlebar_h_for_offset.get();
-                    let bar_rect =
-                        quadraui::Rect::new(stored.x, -tb_h, stored.width, stored.height);
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let mut b = backend_d.borrow_mut();
                     use quadraui::Backend;
                     b.begin_frame(quadraui::Viewport::new(da_w as f32, da_h as f32, 1.0));
@@ -2772,14 +2771,16 @@ impl SimpleComponent for App {
                 let engine_dd = engine.clone();
                 let backend_dd = backend.clone();
                 let bar_rect_dd = menu_bar_rect_cell.clone();
-                let titlebar_h_for_offset = titlebar_height_cell.clone();
                 let gesture = gtk4::GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |_, _, x, y| {
                     let stored = bar_rect_dd.get();
-                    let tb_h = titlebar_h_for_offset.get();
-                    let bar_rect =
-                        quadraui::Rect::new(stored.x, -tb_h, stored.width, stored.height);
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let ev = quadraui::UiEvent::MouseDown {
                         widget: None,
                         button: quadraui::MouseButton::Left,
@@ -2813,16 +2814,18 @@ impl SimpleComponent for App {
                 let engine_motion = engine.clone();
                 let backend_motion = backend.clone();
                 let bar_rect_motion = menu_bar_rect_cell.clone();
-                let titlebar_h_for_offset = titlebar_height_cell.clone();
                 let motion = gtk4::EventControllerMotion::new();
                 motion.connect_motion(move |_, x, y| {
                     if !engine_motion.borrow().menu_system.borrow().is_open() {
                         return;
                     }
                     let stored = bar_rect_motion.get();
-                    let tb_h = titlebar_h_for_offset.get();
-                    let bar_rect =
-                        quadraui::Rect::new(stored.x, -tb_h, stored.width, stored.height);
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let ev = quadraui::UiEvent::MouseMoved {
                         position: quadraui::Point {
                             x: x as f32,
@@ -2955,7 +2958,6 @@ impl SimpleComponent for App {
         // ── Menu bar DrawingArea setup ─────────────────────────────────────────
         // Draw: menu bar labels via Backend + command center adjacent.
         {
-            let titlebar_h_update = titlebar_height_cell.clone();
             let engine = engine.clone();
             let backend_d = backend.clone();
             let cc_layout_draw = command_center_layout_cell.clone();
@@ -2977,9 +2979,8 @@ impl SimpleComponent for App {
 
                 use quadraui::Backend;
                 let bar = eng.menu_system.borrow().menu_bar();
-                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, lh as f32);
+                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
                 bar_rect_update.set(bar_rect);
-                titlebar_h_update.set(h as f32);
                 let mb_layout = backend_d
                     .borrow_mut()
                     .enter_frame_scope(cr, &pango_layout, |b| {
