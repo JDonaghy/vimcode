@@ -1349,6 +1349,77 @@ impl SimpleComponent for App {
                                         return gtk4::glib::Propagation::Proceed;
                                     }
 
+                                    // Arrow/Enter/Escape navigation when a menu
+                                    // dropdown is open (mirrors TUI mod.rs:3311).
+                                    if engine.borrow().menu_open_idx.is_some() {
+                                        match key_name.as_str() {
+                                            "Left" => {
+                                                let mut eng = engine.borrow_mut();
+                                                if let Some(idx) = eng.menu_open_idx {
+                                                    let len = render::MENU_STRUCTURE.len();
+                                                    eng.open_menu(if idx > 0 { idx - 1 } else { len - 1 });
+                                                }
+                                                drop(eng);
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "Right" => {
+                                                let mut eng = engine.borrow_mut();
+                                                if let Some(idx) = eng.menu_open_idx {
+                                                    eng.open_menu((idx + 1) % render::MENU_STRUCTURE.len());
+                                                }
+                                                drop(eng);
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "Down" => {
+                                                let mut eng = engine.borrow_mut();
+                                                if let Some(open_idx) = eng.menu_open_idx {
+                                                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                                                        let seps: Vec<bool> = items.iter().map(|i| i.separator).collect();
+                                                        eng.menu_move_selection(1, &seps);
+                                                    }
+                                                }
+                                                drop(eng);
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "Up" => {
+                                                let mut eng = engine.borrow_mut();
+                                                if let Some(open_idx) = eng.menu_open_idx {
+                                                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
+                                                        let seps: Vec<bool> = items.iter().map(|i| i.separator).collect();
+                                                        eng.menu_move_selection(-1, &seps);
+                                                    }
+                                                }
+                                                drop(eng);
+                                                sender.input(Msg::Resize);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "Return" => {
+                                                let mut eng = engine.borrow_mut();
+                                                if let Some((menu_idx, item_idx)) = eng.menu_activate_highlighted() {
+                                                    if let Some((_, _, items)) = render::MENU_STRUCTURE.get(menu_idx) {
+                                                        if let Some(item) = items.get(item_idx) {
+                                                            let action = item.action.to_string();
+                                                            drop(eng);
+                                                            sender.input(Msg::MenuActivateItem(menu_idx, item_idx, action));
+                                                            return gtk4::glib::Propagation::Stop;
+                                                        }
+                                                    }
+                                                }
+                                                drop(eng);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            "Escape" => {
+                                                engine.borrow_mut().close_menu();
+                                                sender.input(Msg::CloseMenu);
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
                                     // Alt+letter: open menu (when menu bar visible)
                                     if alt && !ctrl && !shift {
                                         if let Some(ch) = unicode {

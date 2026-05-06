@@ -1650,6 +1650,24 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
+    // ── Menu bar hover-to-switch (when a dropdown is already open) ─────
+    if matches!(ev.kind, MouseEventKind::Moved)
+        && engine.menu_open_idx.is_some()
+        && engine.menu_bar_visible
+        && row == 0
+    {
+        let layout = engine.menu_bar_layout.borrow();
+        if let Some(ref ml) = *layout {
+            if let quadraui::MenuBarHit::Item(idx) = ml.hit_test(col as f32, 0.5) {
+                if engine.menu_open_idx != Some(idx) {
+                    drop(layout);
+                    engine.open_menu(idx);
+                }
+            }
+        }
+        return sidebar_width;
+    }
+
     // ── Cancel hover dismiss if mouse is on the popup ─────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) && mouse_on_hover_popup {
         engine.cancel_panel_hover_dismiss();
