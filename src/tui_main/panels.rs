@@ -718,22 +718,27 @@ fn render_explorer_scrollbar(
     let total_rows = sidebar.rows.len();
     let visible_rows_count = area.height as usize;
     if total_rows > visible_rows_count && area.width >= 2 {
-        let dim_fg = rc(theme.line_number_fg);
-        let sb_bg = rc(theme.tab_bar_bg);
+        let thumb_fg = rc(theme.scrollbar_thumb);
+        let track_fg = rc(theme.scrollbar_track);
         let track_h = visible_rows_count as f64;
         let thumb_size = ((visible_rows_count as f64 / total_rows as f64) * track_h)
             .ceil()
             .max(1.0) as u16;
         let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor() as u16;
         let sb_x = area.x + area.width - 1;
+        let sb_bg = rc(theme.background);
         for dy in 0..visible_rows_count as u16 {
             let y = area.y + dy;
             if y >= area.y + area.height {
                 break;
             }
             let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
-            let ch = if in_thumb { '█' } else { '░' };
-            set_cell(buf, sb_x, y, ch, dim_fg, sb_bg);
+            let (ch, fg) = if in_thumb {
+                ('█', thumb_fg)
+            } else {
+                ('░', track_fg)
+            };
+            set_cell(buf, sb_x, y, ch, fg, sb_bg);
         }
     }
 }
@@ -919,14 +924,17 @@ pub(super) fn render_settings_panel(
             let track_len = content_height;
             let thumb_len = (content_height * content_height / total).max(1);
             let thumb_start = scroll * track_len / total;
+            let sb_thumb = rc(theme.scrollbar_thumb);
+            let sb_track = rc(theme.scrollbar_track);
+            let sb_bg = rc(theme.background);
             for i in 0..track_len {
                 let y = content_start + i as u16;
-                let ch = if i >= thumb_start && i < thumb_start + thumb_len {
-                    '█'
+                let (ch, cfp) = if i >= thumb_start && i < thumb_start + thumb_len {
+                    ('█', sb_thumb)
                 } else {
-                    '░'
+                    ('░', sb_track)
                 };
-                set_cell(buf, sb_col, y, ch, dim_fg, bg);
+                set_cell(buf, sb_col, y, ch, cfp, sb_bg);
             }
             Some(quadraui::SurfaceScrollbar {
                 track_bounds: quadraui::Rect::new(
@@ -1226,17 +1234,20 @@ pub(super) fn render_settings_panel(
 
     // Scrollbar
     let settings_scrollbar = if total > content_height && content_height > 0 {
+        let sb_thumb = rc(theme.scrollbar_thumb);
+        let sb_track = rc(theme.scrollbar_track);
+        let sb_bg = rc(theme.background);
         let track_len = content_height;
         let thumb_len = (content_height * content_height / total).max(1);
         let thumb_start = scroll * track_len / total;
         for i in 0..track_len {
             let y = content_start + i as u16;
-            let ch = if i >= thumb_start && i < thumb_start + thumb_len {
-                '█'
+            let (ch, cfp) = if i >= thumb_start && i < thumb_start + thumb_len {
+                ('█', sb_thumb)
             } else {
-                '░'
+                ('░', sb_track)
             };
-            set_cell(buf, sb_col, y, ch, dim_fg, bg);
+            set_cell(buf, sb_col, y, ch, cfp, sb_bg);
         }
         Some(quadraui::SurfaceScrollbar {
             track_bounds: quadraui::Rect::new(
@@ -2265,14 +2276,17 @@ pub(super) fn render_ext_panel(
         let track_h = content_area_height;
         let thumb_h = (track_h * content_area_height / total).max(1);
         let thumb_top = scroll * track_h / total;
+        let sb_thumb = rc(theme.scrollbar_thumb);
+        let sb_track = rc(theme.scrollbar_track);
+        let sb_bg = rc(theme.background);
         for i in 0..track_h {
             let y = area.y + 1 + input_row_count as u16 + i as u16;
-            let ch = if i >= thumb_top && i < thumb_top + thumb_h {
-                '█'
+            let (ch, cfp) = if i >= thumb_top && i < thumb_top + thumb_h {
+                ('█', sb_thumb)
             } else {
-                '░'
+                ('░', sb_track)
             };
-            set_cell(buf, sb_x, y, ch, dim_fg, row_bg);
+            set_cell(buf, sb_x, y, ch, cfp, sb_bg);
         }
         let track_start_y = (area.y + 1 + input_row_count as u16) as f32;
         Some(quadraui::SurfaceScrollbar {
