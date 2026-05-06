@@ -2776,7 +2776,7 @@ pub struct Engine {
     pub menu_bar_toggleable: bool,
     /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
     /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
-    pub menu_system: std::cell::RefCell<quadraui::MenuSystem>,
+    pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
     #[cfg(feature = "win-gui")]
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
@@ -3522,7 +3522,9 @@ impl Engine {
             terminal_maximized: false,
             menu_bar_visible: false,
             menu_bar_toggleable: false,
-            menu_system: std::cell::RefCell::new(quadraui::MenuSystem::new(Vec::new())),
+            menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
+                Vec::new(),
+            ))),
             #[cfg(feature = "win-gui")]
             menu_open_idx: None,
             debug_toolbar_visible: false,

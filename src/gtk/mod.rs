@@ -2715,146 +2715,34 @@ impl SimpleComponent for App {
         let menu_bar_rect_cell: Rc<Cell<quadraui::Rect>> =
             Rc::new(Cell::new(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)));
 
-        // ── Menu dropdown overlay DrawingArea ─────────────────────────────────
+        // ── Menu dropdown overlay — quadraui::gtk::MenuOverlay ────────────────
         {
-            let menu_dd_da = gtk4::DrawingArea::new();
-            menu_dd_da.set_hexpand(true);
-            menu_dd_da.set_vexpand(true);
-            menu_dd_da.set_can_target(false);
-            menu_dd_da.set_focusable(false);
-
-            // Draw function — MenuSystem::render() draws bar + dropdown.
-            {
-                let engine = engine.clone();
-                let backend_d = backend.clone();
-                let bar_rect_draw = menu_bar_rect_cell.clone();
-                menu_dd_da.set_draw_func(move |_da, cr, da_w, da_h| {
-                    let eng = engine.borrow();
-                    if !eng.menu_system.borrow().is_open() {
-                        return;
-                    }
-                    let theme = Theme::from_name(&eng.settings.colorscheme);
-                    let q_theme = quadraui_gtk::q_theme(&theme);
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let pango_layout = pango::Layout::new(&pango_ctx);
-                    pango_layout.set_font_description(Some(&font_desc));
-                    pango_layout.set_text("Xy");
-                    let lh = pango_layout.pixel_size().1 as f64;
-                    pango_layout.set_text("M");
-                    let cw = pango_layout.pixel_size().0 as f64;
-                    let stored = bar_rect_draw.get();
-                    // The menu bar DA is set_titlebar() — it sits ABOVE the
-                    // overlay DA. Shift bar_rect.y negative so render() draws
-                    // the bar at the titlebar position (above the overlay).
-                    let bar_rect = quadraui::Rect::new(
-                        stored.x,
-                        -(stored.height),
-                        stored.width,
-                        stored.height,
-                    );
-                    let mut b = backend_d.borrow_mut();
-                    use quadraui::Backend;
-                    b.begin_frame(quadraui::Viewport::new(da_w as f32, da_h as f32, 1.0));
-                    b.enter_frame_scope(cr, &pango_layout, |b| {
-                        b.set_current_theme(q_theme);
-                        b.set_current_line_height(lh);
-                        b.set_current_char_width(cw);
-                        eng.menu_system.borrow().render(b, bar_rect);
-                    });
-                });
-            }
-
-            // Click + motion handlers delegate to MenuSystem::handle().
-            {
-                let sender_dd = sender.input_sender().clone();
-                let engine_dd = engine.clone();
-                let backend_dd = backend.clone();
-                let bar_rect_dd = menu_bar_rect_cell.clone();
-                let gesture = gtk4::GestureClick::new();
-                gesture.set_button(1);
-                gesture.connect_pressed(move |_, _, x, y| {
-                    let stored = bar_rect_dd.get();
-                    let bar_rect = quadraui::Rect::new(
-                        stored.x,
-                        -(stored.height),
-                        stored.width,
-                        stored.height,
-                    );
-                    let ev = quadraui::UiEvent::MouseDown {
-                        widget: None,
-                        button: quadraui::MouseButton::Left,
-                        position: quadraui::Point {
-                            x: x as f32,
-                            y: y as f32,
-                        },
-                        modifiers: quadraui::Modifiers::default(),
-                    };
-                    let menu_event = engine_dd.borrow().menu_system.borrow_mut().handle(
-                        &ev,
-                        &mut *backend_dd.borrow_mut(),
-                        bar_rect,
-                    );
-                    match menu_event {
+            let menu_overlay = quadraui::gtk::MenuOverlay::new();
+            let menu_system_rc = engine.borrow().menu_system.clone();
+            menu_overlay.connect(
+                menu_system_rc,
+                backend.clone(),
+                menu_bar_rect_cell.clone(),
+                &UI_FONT(),
+                {
+                    let sender = sender.input_sender().clone();
+                    move |ev| match ev {
                         quadraui::MenuEvent::Activated(id) => {
-                            sender_dd
+                            sender
                                 .send(Msg::HandleMenuAction(id.as_str().to_string()))
                                 .ok();
                         }
                         quadraui::MenuEvent::Ignored => {}
                         _ => {
-                            sender_dd.send(Msg::MenuRedraw).ok();
+                            sender.send(Msg::MenuRedraw).ok();
                         }
                     }
-                });
-                menu_dd_da.add_controller(gesture);
-            }
-            {
-                let sender_motion = sender.input_sender().clone();
-                let engine_motion = engine.clone();
-                let backend_motion = backend.clone();
-                let bar_rect_motion = menu_bar_rect_cell.clone();
-                let motion = gtk4::EventControllerMotion::new();
-                motion.connect_motion(move |_, x, y| {
-                    if !engine_motion.borrow().menu_system.borrow().is_open() {
-                        return;
-                    }
-                    let stored = bar_rect_motion.get();
-                    let bar_rect = quadraui::Rect::new(
-                        stored.x,
-                        -(stored.height),
-                        stored.width,
-                        stored.height,
-                    );
-                    let ev = quadraui::UiEvent::MouseMoved {
-                        position: quadraui::Point {
-                            x: x as f32,
-                            y: y as f32,
-                        },
-                        buttons: quadraui::ButtonMask::default(),
-                    };
-                    let menu_event = engine_motion.borrow().menu_system.borrow_mut().handle(
-                        &ev,
-                        &mut *backend_motion.borrow_mut(),
-                        bar_rect,
-                    );
-                    match menu_event {
-                        quadraui::MenuEvent::Activated(id) => {
-                            sender_motion
-                                .send(Msg::HandleMenuAction(id.as_str().to_string()))
-                                .ok();
-                        }
-                        quadraui::MenuEvent::Ignored => {}
-                        _ => {
-                            sender_motion.send(Msg::MenuRedraw).ok();
-                        }
-                    }
-                });
-                menu_dd_da.add_controller(motion);
-            }
-
-            widgets.window_overlay.add_overlay(&menu_dd_da);
-            *menu_dropdown_da_ref.borrow_mut() = Some(menu_dd_da);
+                },
+            );
+            widgets
+                .window_overlay
+                .add_overlay(menu_overlay.drawing_area());
+            *menu_dropdown_da_ref.borrow_mut() = Some(menu_overlay.drawing_area().clone());
         }
 
         // ── Panel hover popup overlay DrawingArea ────────────────────────────
