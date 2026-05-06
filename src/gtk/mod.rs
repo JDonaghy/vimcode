@@ -2273,7 +2273,21 @@ impl SimpleComponent for App {
             let pango_ctx = widgets.search_sidebar_da.pango_context();
             let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
             pango_ctx.set_font_description(Some(&font_desc));
-            backend.borrow_mut().set_pango_context(pango_ctx);
+            let metrics = pango_ctx.metrics(Some(&font_desc), None);
+            let lh = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
+            let cw = metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+            let mut b = backend.borrow_mut();
+            b.set_pango_context(pango_ctx);
+            b.set_current_line_height(lh);
+            b.set_current_char_width(cw);
+            {
+                use quadraui::Backend;
+                b.begin_frame(quadraui::Viewport::new(
+                    root.width().max(800) as f32,
+                    root.height().max(600) as f32,
+                    1.0,
+                ));
+            }
         }
         {
             let engine = engine.clone();
@@ -4332,6 +4346,17 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::Resize => {
+                // Update backend viewport for MenuSystem::handle() calls.
+                if let Some(ref overlay) = *self.overlay.borrow() {
+                    use quadraui::Backend;
+                    self.backend
+                        .borrow_mut()
+                        .begin_frame(quadraui::Viewport::new(
+                            overlay.width().max(1) as f32,
+                            overlay.height().max(1) as f32,
+                            1.0,
+                        ));
+                }
                 // Propagate window resize to open terminal panes.
                 if !self.engine.borrow().terminal_panes.is_empty() {
                     if let Some(da) = self.drawing_area.borrow().as_ref() {
