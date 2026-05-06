@@ -1664,7 +1664,6 @@ pub struct MenuItemData {
     pub separator: bool,
 }
 
-
 /// One button in the debug toolbar strip.
 #[derive(Debug, Clone)]
 pub struct DebugButton {

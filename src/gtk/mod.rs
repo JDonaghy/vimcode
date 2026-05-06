@@ -1335,26 +1335,35 @@ impl SimpleComponent for App {
                                     // MenuSystem intercept — handles Alt+letter, arrow keys, Enter, Escape.
                                     // Same pattern as TUI: one call handles all menu keyboard events.
                                     if let Some(ref ev) = ui_event {
-                                        if engine.borrow().menu_bar_visible {
+                                        let bar_visible = engine.borrow().menu_bar_visible;
+                                        if bar_visible {
                                             use quadraui::Backend;
                                             let bar_rect = {
                                                 let b = backend.borrow();
-                                                let vp = b.viewport();
-                                                quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                                                let lh = b.line_height();
+                                                if lh < 1.0 {
+                                                    // Backend not initialized yet (first frame hasn't drawn).
+                                                    quadraui::Rect::default()
+                                                } else {
+                                                    let vp = b.viewport();
+                                                    quadraui::Rect::new(0.0, 0.0, vp.width, lh)
+                                                }
                                             };
-                                            let menu_event = engine.borrow().menu_system.borrow_mut()
-                                                .handle(ev, &mut *backend.borrow_mut(), bar_rect);
-                                            match menu_event {
-                                                quadraui::MenuEvent::Activated(id) => {
-                                                    sender.input(Msg::HandleMenuAction(id.as_str().to_string()));
-                                                    return gtk4::glib::Propagation::Stop;
+                                            if bar_rect.width > 0.0 {
+                                                let menu_event = engine.borrow().menu_system.borrow_mut()
+                                                    .handle(ev, &mut *backend.borrow_mut(), bar_rect);
+                                                match menu_event {
+                                                    quadraui::MenuEvent::Activated(id) => {
+                                                        sender.input(Msg::HandleMenuAction(id.as_str().to_string()));
+                                                        return gtk4::glib::Propagation::Stop;
+                                                    }
+                                                    quadraui::MenuEvent::StateChanged
+                                                    | quadraui::MenuEvent::Consumed => {
+                                                        sender.input(Msg::MenuRedraw);
+                                                        return gtk4::glib::Propagation::Stop;
+                                                    }
+                                                    quadraui::MenuEvent::Ignored => {}
                                                 }
-                                                quadraui::MenuEvent::StateChanged
-                                                | quadraui::MenuEvent::Consumed => {
-                                                    sender.input(Msg::MenuRedraw);
-                                                    return gtk4::glib::Propagation::Stop;
-                                                }
-                                                quadraui::MenuEvent::Ignored => {}
                                             }
                                         }
                                     }

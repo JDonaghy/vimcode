@@ -236,12 +236,13 @@ pub(super) fn draw_frame(
         let cc_area = Rect {
             x: menu_end,
             y: menu_bar_area.y,
-            width: menu_bar_area.width.saturating_sub(menu_end - menu_bar_area.x),
+            width: menu_bar_area
+                .width
+                .saturating_sub(menu_end - menu_bar_area.x),
             height: menu_bar_area.height,
         };
-        let cc_layout = quadraui::tui::draw_command_center(
-            frame.buffer_mut(), cc_area, &cc, &q_theme,
-        );
+        let cc_layout =
+            quadraui::tui::draw_command_center(frame.buffer_mut(), cc_area, &cc, &q_theme);
         engine.command_center_layout.replace(Some(cc_layout));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
     } else {

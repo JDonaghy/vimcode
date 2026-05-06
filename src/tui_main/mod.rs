@@ -1845,8 +1845,7 @@ fn event_loop(
         // ── MenuSystem intercept — handles all menu keyboard/mouse events ──
         if engine.menu_bar_visible {
             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
-            let bar_rect =
-                quadraui::Rect::new(0.0, 0.0, cols as f32, 1.0);
+            let bar_rect = quadraui::Rect::new(0.0, 0.0, cols as f32, 1.0);
             let menu_event =
                 engine
                     .menu_system
@@ -1861,22 +1860,11 @@ fn event_loop(
                         let act = engine.dispatch_menu_action(&action);
                         match act {
                             EngineAction::OpenTerminal => {
-                                let cols = terminal
-                                    .size()
-                                    .ok()
-                                    .map(|s| s.width)
-                                    .unwrap_or(80);
-                                engine.terminal_new_tab(
-                                    cols,
-                                    engine.session.terminal_panel_rows,
-                                );
+                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                             }
                             EngineAction::RunInTerminal(cmd) => {
-                                let cols = terminal
-                                    .size()
-                                    .ok()
-                                    .map(|s| s.width)
-                                    .unwrap_or(80);
+                                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
                                 engine.terminal_run_command(
                                     &cmd,
                                     cols,
@@ -1891,23 +1879,17 @@ fn event_loop(
                                 ));
                             }
                             EngineAction::OpenWorkspaceDialog => {
-                                sidebar = TuiSidebar::new(
-                                    engine.cwd.clone(),
-                                    sidebar.visible,
-                                );
-                                sidebar.show_hidden_files =
-                                    engine.settings.show_hidden_files;
+                                sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
+                                sidebar.show_hidden_files = engine.settings.show_hidden_files;
                             }
                             EngineAction::SaveWorkspaceAsDialog => {
-                                let ws_path =
-                                    engine.cwd.join(".vimcode-workspace");
+                                let ws_path = engine.cwd.join(".vimcode-workspace");
                                 engine.save_workspace_as(&ws_path);
                             }
                             EngineAction::OpenRecentDialog => {
-                                folder_picker =
-                                    Some(FolderPickerState::new_recent(
-                                        &engine.session.recent_workspaces,
-                                    ));
+                                folder_picker = Some(FolderPickerState::new_recent(
+                                    &engine.session.recent_workspaces,
+                                ));
                             }
                             EngineAction::QuitWithUnsaved => {
                                 quit_confirm = true;
@@ -1926,8 +1908,7 @@ fn event_loop(
                     needs_redraw = true;
                     continue;
                 }
-                quadraui::MenuEvent::StateChanged
-                | quadraui::MenuEvent::Consumed => {
+                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
                     needs_redraw = true;
                     continue;
                 }
