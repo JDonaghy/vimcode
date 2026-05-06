@@ -2978,7 +2978,7 @@ impl SimpleComponent for App {
 
                 use quadraui::Backend;
                 let bar = eng.menu_system.borrow().menu_bar();
-                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
+                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, lh as f32);
                 bar_rect_update.set(bar_rect);
                 let mb_layout = backend_d
                     .borrow_mut()
