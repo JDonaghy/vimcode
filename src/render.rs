@@ -2806,13 +2806,9 @@ pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // Menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
-        if layout
-            .menu_bar
-            .as_ref()
-            .is_some_and(|m| m.open_menu_idx.is_some())
-        {
+        if layout.menu_dropdown_open {
             elems.push(UiElement::MenuDropdown);
         }
     }
@@ -2940,7 +2936,7 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // draw_frame(): menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
     }
 
@@ -3072,11 +3068,7 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // on_paint(): menu dropdown (rendered after sidebar for z-order)
-    if layout
-        .menu_bar
-        .as_ref()
-        .is_some_and(|m| m.open_menu_idx.is_some())
-    {
+    if layout.menu_dropdown_open {
         elems.push(UiElement::MenuDropdown);
     }
 
@@ -3103,7 +3095,7 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // Menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
     }
 
@@ -3249,11 +3241,7 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // Menu dropdown (rendered last for z-order)
-    if layout
-        .menu_bar
-        .as_ref()
-        .is_some_and(|m| m.open_menu_idx.is_some())
-    {
+    if layout.menu_dropdown_open {
         elems.push(UiElement::MenuDropdown);
     }
 
@@ -3288,7 +3276,8 @@ pub struct ScreenLayout {
     /// Signature help popup (shown in insert mode after `(` or `,`), or `None`.
     pub signature_help: Option<SignatureHelp>,
     /// Menu bar strip data, or `None` when the bar is hidden.
-    pub menu_bar: Option<MenuBarData>,
+    pub menu_bar_visible: bool,
+    pub menu_dropdown_open: bool,
     /// Debug toolbar strip data, or `None` when hidden and no active session.
     pub debug_toolbar: Option<DebugToolbarData>,
     /// Debug sidebar data — always present (sections may be empty).
@@ -5794,49 +5783,8 @@ pub fn build_screen_layout(
             anchor_col: engine.view().cursor.col,
         });
 
-    let menu_bar = engine.menu_bar_visible.then(|| {
-        let open_items = if let Some(midx) = engine.menu_open_idx {
-            if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
-                items.to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        // Compute approximate column position of the active menu header for dropdown anchor.
-        let open_menu_col: u16 = if let Some(midx) = engine.menu_open_idx {
-            // Hamburger (3) + spaces between labels: each label ~5-8 chars
-            let mut col: u16 = 3; // hamburger icon width
-            for i in 0..midx {
-                if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                    col += name.len() as u16 + 2; // label + 2 spaces
-                }
-            }
-            col
-        } else {
-            0
-        };
-        // Use workspace directory name (not active file) so the centered
-        // search box stays fixed when switching tabs (like VSCode Command Center).
-        let title = engine
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "VimCode".to_string());
-        MenuBarData {
-            open_menu_idx: engine.menu_open_idx,
-            open_items,
-            open_menu_col,
-            highlighted_item_idx: engine.menu_highlighted_item,
-            title,
-            show_window_controls: false, // GTK backend overrides this
-            is_vscode_mode: engine.is_vscode_mode(),
-            nav_back_enabled: engine.tab_nav_can_go_back(),
-            nav_forward_enabled: engine.tab_nav_can_go_forward(),
-        }
-    });
+    let menu_bar_visible = engine.menu_bar_visible;
+    let menu_dropdown_open = engine.menu_system.borrow().is_open();
 
     let debug_toolbar = engine.debug_toolbar_visible.then(|| DebugToolbarData {
         buttons: DEBUG_BUTTONS.to_vec(),
@@ -6296,7 +6244,8 @@ pub fn build_screen_layout(
         quickfix,
         bottom_tabs,
         signature_help,
-        menu_bar,
+        menu_bar_visible,
+        menu_dropdown_open,
         debug_toolbar,
         debug_sidebar,
         source_control,
@@ -12267,7 +12216,7 @@ mod tests {
         let mut e = test_engine("hello\n");
         e.menu_bar_visible = true;
         let layout = render_engine(&e, 80.0, 24.0);
-        assert!(layout.menu_bar.is_some(), "menu bar should be visible");
+        assert!(layout.menu_bar_visible, "menu bar should be visible");
 
         let expected = collect_expected_ui_elements(&layout);
         for (name, collector) in [
