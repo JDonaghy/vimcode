@@ -3174,3 +3174,24 @@ Ctrl+F while terminal has focus opens inline find bar replacing tab strip; case-
 - **#290** (`0a8f46f`) — TUI extension panel search input no longer drops r/i/d/q// chars. Guard shortcut mappings with `!input_active` so they fall through to Char(ch) arm when typing.
 - **#291** (`924aa24`) — Arrow keys navigate extension panel results while search input active. Down/Up always map to "Down"/"Up" key names; engine handles them in input_active block. Enter opens selected result. GTK fixed by engine change alone.
 Follow-ups filed: #308 (menu bar keyboard/hover dispatch gaps), #311 (search panel arrow key cursor movement), #312 (Ctrl-Shift-F visual selection prepopulate). quadraui#53 (Form gaps: textarea, validation, password, segmented control) filed as backlog.
+
+### Session 353 (2026-05-06)
+
+- **#307 Batches 2-5** — All scrollable surfaces migrated to dispatch_scroll/dispatch_click. Removed ~200 lines bespoke scroll/click handlers.
+- **#242 closed** — TUI debug sidebar scrollbar click via dispatch_click.
+- **#246 closed** — TUI panel scrollbar colors unified to theme.scrollbar_thumb/track.
+- **#308 item 3** — TUI menu bar hover-to-switch via cached MenuBarLayout.
+- **#319 Step 1** — `Engine::handle_menu_key()` + `MenuKeyResult` landed. quadraui#61 (`ContextMenu::move_selection/first_selectable`) shipped.
+- **#319 Steps 2-4 reverted** — 3 attempts at per-backend GTK overlay code for menu dropdown, each with different bugs (wrong anchor, wrong font, broken arrow keys). All reverted. Root cause: forked code paths between TUI and GTK. CLAUDE.md updated with negative example.
+- **Issues filed:** #315-#319.
+
+### Session 354 (2026-05-06, continued)
+
+- **#319 MenuSystem migration** — Complete rewrite of menu bar + dropdown using `quadraui::MenuSystem` compose helper. 681 net lines removed (462 added, 1143 deleted across 9 files).
+  - quadraui shipped: `MenuSystem` (#62), `MenuSystem::menu_bar()` accessor, `MenuOverlay` helper, `draw_menu_bar` vertical centering fix, dropdown item padding.
+  - Engine: `MenuSystem` as `Rc<RefCell<MenuSystem>>` on Engine. `dispatch_menu_action()` replaces `menu_activate_item()`. Old fields gated behind `#[cfg(feature = "win-gui")]`.
+  - render.rs: `build_menu_defs(is_vscode_mode)` converts `MENU_STRUCTURE` to `Vec<MenuDef>`. Removed `MenuBarData`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `menu_dropdown_action_index()`.
+  - TUI: Single `MenuSystem::handle()` intercept in event loop replaces ~160 lines (keyboard + mouse handlers). `MenuSystem::render()` at end of frame for dropdown.
+  - GTK: `quadraui::gtk::MenuOverlay` helper (30 lines) replaces 141 lines of hand-rolled overlay DA code. Menu bar DA uses `backend.draw_menu_bar()` with `menu_system.menu_bar()`. Keyboard handler routes UiEvent through `MenuSystem::handle()`.
+  - Key lessons: (1) Never add per-backend code — use quadraui abstractions. (2) `GtkBackend` needs `set_pango_context()` + `begin_frame()` at init for `menu_bar_layout()` to work outside `enter_frame_scope`. (3) GTK `set_titlebar()` moves the menu bar above the overlay DA — `MenuOverlay` handles the negative-y coordinate transform. (4) `bar_rect.height` should be the full titlebar DA height so `draw_menu_bar` centres labels to match the command centre.
+  - Remaining: GTK dropdown item spacing slightly tight (quadraui rendering bug, tracked separately).

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 6, 2026 (Session 353 continued — **#246 closed, #319 attempted and reverted.** Unified TUI panel scrollbar colors. Menu dropdown migration (#319) failed 3x due to per-backend forked code; reverted to develop. Shared `Engine::handle_menu_key()` + `MenuKeyResult` landed (Step 1 kept). quadraui#61 shipped (`ContextMenu::move_selection/first_selectable`). CLAUDE.md updated with negative example. Plan revised in `.claude/plans/lucky-launching-brook.md`.)
+**Last updated:** May 6, 2026 (Session 354 — **#319 MenuSystem migration in progress.** Menu bar + dropdown fully migrated to `quadraui::MenuSystem` on both TUI and GTK. 681 net lines removed. TUI fully working. GTK functional but has minor rendering issues (dropdown item spacing) — tracked as quadraui bug. Branch `issue-319-menu-system-migration` ready for landing once GTK rendering is polished.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,7 +12,7 @@
 
 | # | Title | Category |
 |---|-------|----------|
-| [#319](https://github.com/JDonaghy/vimcode/issues/319) | Menu dropdown → quadraui::ContextMenu | Infrastructure |
+| [#319](https://github.com/JDonaghy/vimcode/issues/319) | Menu dropdown → quadraui::MenuSystem | Infrastructure (in progress — branch `issue-319-menu-system-migration`) |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
@@ -20,21 +20,27 @@
 | [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
-**Shipped this session (353):**
-- **#307 Batches 2-5** — All scrollable surfaces migrated to dispatch_scroll/dispatch_click.
-- **#242 closed** — TUI debug sidebar scrollbar click via dispatch_click.
-- **#246 closed** — TUI panel scrollbar colors unified to theme.scrollbar_thumb/track.
-- **#308 item 3** — TUI menu bar hover-to-switch.
-- **#319 Step 1** — `Engine::handle_menu_key()` + `MenuKeyResult` + engine fields for cached dropdown. quadraui#61 (`ContextMenu::move_selection/first_selectable`) shipped.
-- **#319 Steps 2-4 reverted** — 3 attempts at per-backend GTK overlay code, each with different bugs. Reverted. Plan revised to use shared `render::build_menu_dropdown()` — see `.claude/plans/lucky-launching-brook.md`.
+**Shipped this session (354):**
+- **#319 MenuSystem migration** — Complete rewrite of menu bar + dropdown using `quadraui::MenuSystem`. 681 net lines removed (462 added, 1143 deleted). Both TUI and GTK now use the same shared code path:
+  - `MenuSystem` on engine as `Rc<RefCell<MenuSystem>>` — shared between backends
+  - `render::build_menu_defs(is_vscode_mode)` — converts `MENU_STRUCTURE` to `Vec<MenuDef>`
+  - `menu_system.render(backend, bar_rect)` — draws bar + dropdown (both backends)
+  - `menu_system.handle(&ui_event, backend, bar_rect)` — processes all keyboard/mouse events (both backends)
+  - `MenuEvent::Activated(id)` → `engine.dispatch_menu_action(id.as_str())` — shared action dispatch
+  - GTK overlay uses `quadraui::gtk::MenuOverlay` helper (30 lines replacing 141)
+  - Removed: `MenuBarData`, `MenuKeyResult`, `handle_menu_key()`, `open_menu()`, `close_menu()`, `menu_move_selection()`, `menu_activate_highlighted()`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `draw_menu_bar()`, `draw_menu_dropdown()`, `Msg::OpenMenu/CloseMenu/MenuActivateItem/MenuHighlight`
+  - Old fields (`menu_open_idx`, `menu_highlighted_item`) gated behind `#[cfg(feature = "win-gui")]`
+  - TUI fully working. GTK has minor dropdown item spacing issue (quadraui bug).
+
+**Shipped session 353 (earlier):**
+- **#307 Batches 2-5**, **#242 closed**, **#246 closed**, **#308 item 3**.
 - **Issues filed:** #315-#319.
-- **CLAUDE.md** updated with negative example + verification step for platform-neutrality rule.
 
 ---
 
 **Previous sessions (352 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`7abbad7`. Both TUI + GTK build + clippy clean.
+Vimcode at 1950 lib + 2040 integration tests passing. Branch `issue-319-menu-system-migration` — both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -94,7 +100,7 @@ cell coalescence) remain but are tracked separately.
 | Diff peek popup | `Tooltip{styled_lines}` | ✅ | ✅ | slice 3, `e6650fa` |
 | Dialog (quit/close confirm) | `Dialog` | ✅ | ✅ | slice 5, `7768a25` |
 | Context menu (right-click) | `ContextMenu` | ✅ | ✅ | slice 6, `7ce0f5d` |
-| Menu dropdown (top menu bar) | `ContextMenu` | ✅ | ✅ | slice 6 (closed #181) |
+| Menu dropdown (top menu bar) | `MenuSystem` | ✅ | ✅ | #319. Owned by `MenuSystem::render()` + `MenuOverlay`. |
 | Debug toolbar | `StatusBar` | ✅ | ✅ | slice 8, `caf62a8` |
 | Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
 | Editor hover popup (markdown + code-hl + selection + scroll + links) | `RichTextPopup` | ✅ | ✅ | #214 shipped (`c8a23e9`); rasterisers lifted via #266 (`779f6e8`). Both backends consume `quadraui::{tui,gtk}::draw_rich_text_popup`. |
@@ -108,7 +114,7 @@ cell coalescence) remain but are tracked separately.
 | Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
 | Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false`, `compact: true`. |
 | Terminal toolbar (find bar + tab strip) | `StatusBar` / `TabBar` | ✅ | ✅ | #305, `08dd916`. Adapter `render::build_terminal_toolbar`. Click via `Engine::resolve_terminal_toolbar_click`. Tab strip uses `compact: true`. |
-| Menu bar labels | `MenuBar` | ✅ | ✅ | #301, PR #309. Adapter `render::build_menu_bar_view`. Click/hover via cached `MenuBarLayout::hit_test`. |
+| Menu bar labels | `MenuSystem` | ✅ | ✅ | #319. `quadraui::MenuSystem` owns all state + rendering. `MenuOverlay` helper for GTK overlay DA. |
 | Command center (nav arrows + search box) | `CommandCenter` | ✅ | ✅ | #310, `b5fdd7d`. Adapter `render::build_command_center_view`. Click via `CommandCenterLayout::hit_test`. |
 | Search panel (chrome + results) | `MSV` + `Form` + `TreeView` | ✅ | ✅ | #302, `de625bb`. Adapter `render::build_search_panel_msv`. Form: query/replace TextInput + ToggleGroup + ButtonRow. Tree: file-grouped results. Click via `backend.form_layout`/`backend.tree_layout`. Replace All has confirmation dialog. |
 
@@ -119,6 +125,7 @@ cell coalescence) remain but are tracked separately.
 - Engine-side hit-region builders (`compute_find_replace_hit_regions`) and cell-unit fit algorithms (`StatusBar::fit_right_start`, `TabBar::fit_active_scroll_offset`) — parameterised over a measurement closure so each backend supplies its native unit.
 - `core::settings::SAVE_REVISION` — one source of truth both file watchers consult (#201).
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
+- `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
