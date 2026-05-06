@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 5, 2026 (Session 353 — **#307 completed (all 5 batches), #242 closed, #308 partial.** All scrollable surfaces now route through `dispatch_scroll`/`dispatch_click`. Shared `Engine::handle_dap_sidebar_scroll` eliminates per-backend scroll math. TUI menu hover-to-switch shipped. Filed #315 GTK MSV scrollbar, #316/#317 GTK terminal scrollbar, #318 Alt key clashes, #319 menu dropdown → quadraui::ContextMenu.)
+**Last updated:** May 6, 2026 (Session 353 continued — **#246 closed, #319 attempted and reverted.** Unified TUI panel scrollbar colors. Menu dropdown migration (#319) failed 3x due to per-backend forked code; reverted to develop. Shared `Engine::handle_menu_key()` + `MenuKeyResult` landed (Step 1 kept). quadraui#61 shipped (`ContextMenu::move_selection/first_selectable`). CLAUDE.md updated with negative example. Plan revised in `.claude/plans/lucky-launching-brook.md`.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -21,16 +21,20 @@
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
 **Shipped this session (353):**
-- **#307 Batches 2-5** — Debug sidebar (4 sections → ScrollSurface + dispatch_click), terminal scrollback, editor viewport, editor hover popup all migrated. Shared `Engine::handle_dap_sidebar_scroll()` + `dap_sidebar_visible_rows()`. Unified step rounding (`.ceil()` → `.round()` for TUI/GTK consistency). Net −17 lines across 5 files.
-- **#242 closed** — TUI debug sidebar scrollbar click now routed through dispatch_click.
-- **#308 item 3** — TUI menu bar hover-to-switch via `MenuBarLayout::hit_test` on `MouseEventKind::Moved`.
-- **Issues filed:** #315 (GTK MSV scrollbar), #316 (GTK terminal scrollbar visual), #317 (GTK terminal track click), #318 (Alt key clashes), #319 (menu dropdown → ContextMenu).
+- **#307 Batches 2-5** — All scrollable surfaces migrated to dispatch_scroll/dispatch_click.
+- **#242 closed** — TUI debug sidebar scrollbar click via dispatch_click.
+- **#246 closed** — TUI panel scrollbar colors unified to theme.scrollbar_thumb/track.
+- **#308 item 3** — TUI menu bar hover-to-switch.
+- **#319 Step 1** — `Engine::handle_menu_key()` + `MenuKeyResult` + engine fields for cached dropdown. quadraui#61 (`ContextMenu::move_selection/first_selectable`) shipped.
+- **#319 Steps 2-4 reverted** — 3 attempts at per-backend GTK overlay code, each with different bugs. Reverted. Plan revised to use shared `render::build_menu_dropdown()` — see `.claude/plans/lucky-launching-brook.md`.
+- **Issues filed:** #315-#319.
+- **CLAUDE.md** updated with negative example + verification step for platform-neutrality rule.
 
 ---
 
-**Previous session (352):** #307 Batch 1 scroll dispatch, body click fix, CLAUDE.md split.
+**Previous sessions (352 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`b7f365a`. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`7abbad7`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.

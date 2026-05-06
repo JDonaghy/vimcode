@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 352 archived here.
+All sessions through 353 archived here.
+
+---
+**Session 353 (May 5-6) — #307 complete, #246 closed, #319 attempted + reverted:**
+
+#307 Batches 2-5 shipped: debug sidebar (4 ScrollSurface entries + dispatch_click), terminal scrollback, editor viewport, editor hover popup all migrated to dispatch_scroll/dispatch_click. Shared `Engine::handle_dap_sidebar_scroll()` + `dap_sidebar_visible_rows()`. Unified step rounding `.ceil()` → `.round()`. #242 closed (TUI debug sidebar scrollbar click). #246 closed (TUI panel scrollbar colors unified to theme.scrollbar_thumb/track). #308 item 3 shipped (TUI menu hover-to-switch). Filed #315-#319. #319 Step 1 landed (shared `Engine::handle_menu_key()` + `MenuKeyResult` + engine fields; quadraui#61 `ContextMenu::move_selection/first_selectable`). #319 Steps 2-4 attempted 3x with per-backend GTK overlay code — wrong position, wrong font, broken arrow keys, gap above dropdown — all caused by forked TUI vs GTK code paths violating platform-neutrality rule. Reverted. CLAUDE.md updated with concrete negative example. Plan revised in `.claude/plans/lucky-launching-brook.md`: one shared `render::build_menu_dropdown()` function, 3 lines backend wiring each.
 
 > **Format note:** Sessions 282–339 below were archived in their
 > original verbose multi-paragraph format (as maintained in
