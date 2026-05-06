@@ -9,6 +9,10 @@
 
 **Push back actively.** If the user asks to implement something that would require per-backend code, say so upfront and propose the quadraui-first alternative.
 
+**How to verify:** Before writing any code in a backend file, compare against the relevant quadraui example (`~/src/quadraui/quadraui/examples/`). If the example achieves the same feature with zero backend-specific code, your approach is wrong. Build the shared function in `render.rs` or the engine, have each backend call it in 1-3 lines of wiring.
+
+**Negative example (#319, Session 353):** Menu dropdown keyboard nav was implemented with a GTK overlay DA + Msg dispatch + separate click/motion handlers (~100 lines GTK-specific) vs TUI inline handling (~50 lines TUI-specific). The quadraui `menu_bar_app` example does the same thing with ZERO backend-specific code — one `dropdown_layout()` function called by both backends, one `handle()` method for keyboard/mouse. Three attempts were made and reverted before recognising the architectural mistake.
+
 **Never edit the quadraui repo directly.** The vimcode agent must not modify files under `~/src/quadraui/`. File a GitHub issue on `JDonaghy/quadraui` describing the gap, then wait for the user to confirm the quadraui change has landed.
 
 ## Session Start Protocol
