@@ -395,6 +395,11 @@ struct App {
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
     debug_toolbar_height: Rc<Cell<f64>>,
+    /// Cached menu-dropdown hit regions from the last draw of the
+    /// dropdown overlay. Each entry is `(x, y, w, h, action_id)`
+    /// where `action_id` is e.g. `menu:7`. Click + motion handlers
+    /// walk this list to map (x, y) → engine-side
+    /// `MENU_STRUCTURE.items` index instead of computing row indices
     /// True while the user is dragging the terminal panel's scrollbar thumb.
     terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
@@ -896,14 +901,16 @@ enum Msg {
     TerminalFindPrev,
     /// Toggle the VSCode-style menu bar on/off.
     ToggleMenuBar,
+    /// Dispatch a menu action by command string (from MenuSystem::Activated).
+    HandleMenuAction(String),
+    /// MenuSystem state changed — sync overlay visibility and redraw.
+    MenuRedraw,
     /// Navigate back in MRU tab history.
     MruNavBack,
     /// Navigate forward in MRU tab history.
     MruNavForward,
     /// Open the Command Center picker (search box click).
     OpenCommandCenter,
-    /// Dispatch a menu action by its action string (from MenuSystem).
-    HandleMenuAction(String),
     /// Click in the debug sidebar DrawingArea (x, y coordinates in pixels).
     DebugSidebarClick(f64, f64),
     /// Key press in the debug sidebar DrawingArea.
@@ -1290,15 +1297,16 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::EventControllerKey {
                                 set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine, backend_events, backend, menu_bar_rect_cell] => move |ctrl_ref, key, _, modifier| {
+                                connect_key_pressed[sender, engine, backend_events, backend] => move |ctrl_ref, key, _, modifier| {
                                     // Phase B.5b Stage 1: dual-write the
                                     // translated UiEvent into the backend
                                     // queue. The drain timer consumes and
                                     // discards today; B5b.2 routes the
                                     // accelerator-shaped events back into
                                     // dispatch.
-                                    if let Some(ev) = events::gdk_key_to_uievent(key, modifier, false) {
-                                        backend_events.borrow_mut().push_back(ev);
+                                    let ui_event = events::gdk_key_to_uievent(key, modifier, false);
+                                    if let Some(ref ev) = ui_event {
+                                        backend_events.borrow_mut().push_back(ev.clone());
                                     }
 
                                     let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
@@ -1307,19 +1315,10 @@ impl SimpleComponent for App {
                                     let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
                                     let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
 
-                                    // Modifier-only keypresses (Ctrl alone, Shift alone, Alt alone, etc.)
-                                    // shouldn't reach the engine — vim's input model has no concept of
-                                    // "user pressed modifier alone." Pre-#286: Ctrl-down by itself
-                                    // dismissed the active completion popup because the engine's
-                                    // "dismiss on any non-completion key" path treated `Control_L`
-                                    // as a non-completion key. (#286)
                                     if util::is_modifier_only_key(&key_name) {
                                         return gtk4::glib::Propagation::Proceed;
                                     }
 
-                                    // When a GTK Entry widget has focus (find dialog, search panel),
-                                    // let most keys propagate to it. Only intercept Escape and
-                                    // global shortcuts (Ctrl-F, Ctrl-Tab, etc.).
                                     let entry_has_focus = ctrl_ref
                                         .widget()
                                         .root()
@@ -1330,61 +1329,32 @@ impl SimpleComponent for App {
                                                 || f.downcast_ref::<gtk4::Text>().is_some()
                                         });
                                     if entry_has_focus {
-                                        // Let all other keys reach the Entry widget
-                                        // (e.g. search panel input, terminal find input).
                                         return gtk4::glib::Propagation::Proceed;
                                     }
 
-                                    // Alt+letter: delegate to MenuSystem (handles open/close/toggle)
-                                    if alt && !ctrl && !shift {
-                                        if let Some(ch) = unicode {
-                                            if engine.borrow().menu_bar_visible {
-                                                let ev = quadraui::UiEvent::KeyPressed {
-                                                    key: quadraui::Key::Char(ch.to_ascii_lowercase()),
-                                                    modifiers: quadraui::Modifiers { alt: true, shift: false, ctrl: false, cmd: false },
-                                                    repeat: false,
-                                                };
-                                                let bar_rect = menu_bar_rect_cell.get();
-                                                let menu_event = engine.borrow().menu_system.borrow_mut()
-                                                    .handle(&ev, &mut *backend.borrow_mut(), bar_rect);
-                                                if !matches!(menu_event, quadraui::MenuEvent::Ignored) {
-                                                    sender.input(Msg::Resize);
-                                                    return gtk4::glib::Propagation::Stop;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Menu dropdown keyboard nav: delegate Escape/arrows/Enter to MenuSystem
-                                    if engine.borrow().menu_system.borrow().is_open() {
-                                        let q_key = match key_name.as_str() {
-                                            "Escape" => Some(quadraui::Key::Named(quadraui::NamedKey::Escape)),
-                                            "Down" => Some(quadraui::Key::Named(quadraui::NamedKey::Down)),
-                                            "Up" => Some(quadraui::Key::Named(quadraui::NamedKey::Up)),
-                                            "Left" => Some(quadraui::Key::Named(quadraui::NamedKey::Left)),
-                                            "Right" => Some(quadraui::Key::Named(quadraui::NamedKey::Right)),
-                                            "Return" => Some(quadraui::Key::Named(quadraui::NamedKey::Enter)),
-                                            _ => None,
-                                        };
-                                        if let Some(qk) = q_key {
-                                            let ev = quadraui::UiEvent::KeyPressed {
-                                                key: qk,
-                                                modifiers: quadraui::Modifiers { alt, shift, ctrl, cmd: false },
-                                                repeat: false,
+                                    // MenuSystem intercept — handles Alt+letter, arrow keys, Enter, Escape.
+                                    // Same pattern as TUI: one call handles all menu keyboard events.
+                                    if let Some(ref ev) = ui_event {
+                                        if engine.borrow().menu_bar_visible {
+                                            use quadraui::Backend;
+                                            let bar_rect = {
+                                                let b = backend.borrow();
+                                                let vp = b.viewport();
+                                                quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
                                             };
-                                            let bar_rect = menu_bar_rect_cell.get();
                                             let menu_event = engine.borrow().menu_system.borrow_mut()
-                                                .handle(&ev, &mut *backend.borrow_mut(), bar_rect);
+                                                .handle(ev, &mut *backend.borrow_mut(), bar_rect);
                                             match menu_event {
                                                 quadraui::MenuEvent::Activated(id) => {
                                                     sender.input(Msg::HandleMenuAction(id.as_str().to_string()));
                                                     return gtk4::glib::Propagation::Stop;
                                                 }
-                                                quadraui::MenuEvent::Ignored => {}
-                                                _ => {
-                                                    sender.input(Msg::Resize);
+                                                quadraui::MenuEvent::StateChanged
+                                                | quadraui::MenuEvent::Consumed => {
+                                                    sender.input(Msg::MenuRedraw);
                                                     return gtk4::glib::Propagation::Stop;
                                                 }
+                                                quadraui::MenuEvent::Ignored => {}
                                             }
                                         }
                                     }
@@ -1941,9 +1911,6 @@ impl SimpleComponent for App {
             e.plugin_init();
             // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
             e.ext_refresh();
-            e.menu_system
-                .borrow_mut()
-                .set_menus(render::build_menu_defs(e.is_vscode_mode()));
             if let Some(ref path) = file_path {
                 // CLI argument: open only the specified file/directory, skip session restore
                 if path.is_dir() {
@@ -2095,12 +2062,8 @@ impl SimpleComponent for App {
         let tab_visible_counts_cell: Rc<
             RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>,
         > = Rc::new(RefCell::new(Vec::new()));
-        let menu_bar_layout_cell: Rc<RefCell<Option<quadraui::MenuBarLayout>>> =
-            Rc::new(RefCell::new(None));
         let command_center_layout_cell: Rc<RefCell<Option<quadraui::CommandCenterLayout>>> =
             Rc::new(RefCell::new(None));
-        let menu_bar_rect_cell: Rc<Cell<quadraui::Rect>> =
-            Rc::new(Cell::new(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)));
         let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
             Rc::new(RefCell::new(None));
         let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
@@ -2738,11 +2701,10 @@ impl SimpleComponent for App {
             menu_dd_da.set_vexpand(true);
             menu_dd_da.set_can_target(false); // pass-through until menu opens
 
-            // Draw function — renders the dropdown via MenuSystem when open.
+            // Draw function — MenuSystem::render() draws bar + dropdown.
             {
                 let engine = engine.clone();
                 let backend_d = backend.clone();
-                let bar_rect = menu_bar_rect_cell.clone();
                 menu_dd_da.set_draw_func(move |_da, cr, _da_w, _da_h| {
                     let eng = engine.borrow();
                     if !eng.menu_system.borrow().is_open() {
@@ -2755,39 +2717,49 @@ impl SimpleComponent for App {
                     let pango_layout = pango::Layout::new(&pango_ctx);
                     pango_layout.set_font_description(Some(&font_desc));
                     pango_layout.set_text("Xy");
-                    let line_height = pango_layout.pixel_size().1 as f64;
+                    let lh = pango_layout.pixel_size().1 as f64;
                     pango_layout.set_text("M");
-                    let char_width = pango_layout.pixel_size().0 as f64;
-                    let rect = bar_rect.get();
+                    let cw = pango_layout.pixel_size().0 as f64;
+                    use quadraui::Backend;
+                    let bar_rect = {
+                        let b = backend_d.borrow();
+                        let vp = b.viewport();
+                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                    };
                     backend_d
                         .borrow_mut()
                         .enter_frame_scope(cr, &pango_layout, |b| {
                             b.set_current_theme(q_theme);
-                            b.set_current_line_height(line_height);
-                            b.set_current_char_width(char_width);
-                            eng.menu_system.borrow().render(b, rect);
+                            b.set_current_line_height(lh);
+                            b.set_current_char_width(cw);
+                            eng.menu_system.borrow().render(b, bar_rect);
                         });
                 });
             }
 
-            // Click handler — delegates to MenuSystem::handle().
+            // Click + motion handlers delegate to MenuSystem::handle().
             {
                 let sender_dd = sender.input_sender().clone();
                 let engine_dd = engine.clone();
                 let backend_dd = backend.clone();
-                let bar_rect_dd = menu_bar_rect_cell.clone();
-                let dd_da_dd = menu_dropdown_da_ref.clone();
-                let mb_da_dd = menu_bar_da_ref.clone();
                 let gesture = gtk4::GestureClick::new();
                 gesture.set_button(1);
                 gesture.connect_pressed(move |_, _, x, y| {
+                    use quadraui::Backend;
+                    let bar_rect = {
+                        let b = backend_dd.borrow();
+                        let vp = b.viewport();
+                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                    };
                     let ev = quadraui::UiEvent::MouseDown {
                         widget: None,
                         button: quadraui::MouseButton::Left,
-                        position: quadraui::Point::new(x as f32, y as f32),
+                        position: quadraui::Point {
+                            x: x as f32,
+                            y: y as f32,
+                        },
                         modifiers: quadraui::Modifiers::default(),
                     };
-                    let bar_rect = bar_rect_dd.get();
                     let menu_event = engine_dd.borrow().menu_system.borrow_mut().handle(
                         &ev,
                         &mut *backend_dd.borrow_mut(),
@@ -2801,45 +2773,48 @@ impl SimpleComponent for App {
                         }
                         quadraui::MenuEvent::Ignored => {}
                         _ => {
-                            // Sync overlay can_target
-                            let is_open = engine_dd.borrow().menu_system.borrow().is_open();
-                            if let Some(ref da) = *dd_da_dd.borrow() {
-                                da.set_can_target(is_open);
-                                da.queue_draw();
-                            }
-                            if let Some(ref da) = *mb_da_dd.borrow() {
-                                da.queue_draw();
-                            }
+                            sender_dd.send(Msg::MenuRedraw).ok();
                         }
                     }
                 });
                 menu_dd_da.add_controller(gesture);
             }
-
-            // Motion handler — delegates to MenuSystem::handle().
             {
+                let sender_motion = sender.input_sender().clone();
                 let engine_motion = engine.clone();
                 let backend_motion = backend.clone();
-                let bar_rect_motion = menu_bar_rect_cell.clone();
-                let dd_da_motion = menu_dropdown_da_ref.clone();
                 let motion = gtk4::EventControllerMotion::new();
                 motion.connect_motion(move |_, x, y| {
                     if !engine_motion.borrow().menu_system.borrow().is_open() {
                         return;
                     }
+                    use quadraui::Backend;
+                    let bar_rect = {
+                        let b = backend_motion.borrow();
+                        let vp = b.viewport();
+                        quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                    };
                     let ev = quadraui::UiEvent::MouseMoved {
-                        position: quadraui::Point::new(x as f32, y as f32),
+                        position: quadraui::Point {
+                            x: x as f32,
+                            y: y as f32,
+                        },
                         buttons: quadraui::ButtonMask::default(),
                     };
-                    let bar_rect = bar_rect_motion.get();
                     let menu_event = engine_motion.borrow().menu_system.borrow_mut().handle(
                         &ev,
                         &mut *backend_motion.borrow_mut(),
                         bar_rect,
                     );
-                    if !matches!(menu_event, quadraui::MenuEvent::Ignored) {
-                        if let Some(ref da) = *dd_da_motion.borrow() {
-                            da.queue_draw();
+                    match menu_event {
+                        quadraui::MenuEvent::Activated(id) => {
+                            sender_motion
+                                .send(Msg::HandleMenuAction(id.as_str().to_string()))
+                                .ok();
+                        }
+                        quadraui::MenuEvent::Ignored => {}
+                        _ => {
+                            sender_motion.send(Msg::MenuRedraw).ok();
                         }
                     }
                 });
@@ -2949,13 +2924,11 @@ impl SimpleComponent for App {
         }
 
         // ── Menu bar DrawingArea setup ─────────────────────────────────────────
-        // Draw function: renders menu bar labels via MenuSystem + command center.
+        // Draw: menu bar labels via Backend + command center adjacent.
         {
             let engine = engine.clone();
             let backend_d = backend.clone();
-            let mb_layout_draw = menu_bar_layout_cell.clone();
             let cc_layout_draw = command_center_layout_cell.clone();
-            let bar_rect_draw = menu_bar_rect_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let eng = engine.borrow();
                 let theme = Theme::from_name(&eng.settings.colorscheme);
@@ -2965,72 +2938,64 @@ impl SimpleComponent for App {
                 let pango_layout = pango::Layout::new(&pango_ctx);
                 pango_layout.set_font_description(Some(&font_desc));
                 pango_layout.set_text("Xy");
-                let line_height = pango_layout.pixel_size().1 as f64;
+                let lh = pango_layout.pixel_size().1 as f64;
                 pango_layout.set_text("M");
-                let char_width = pango_layout.pixel_size().0 as f64;
-
+                let cw = pango_layout.pixel_size().0 as f64;
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
-                bar_rect_draw.set(bar_rect);
 
                 use quadraui::Backend;
+                let bar = eng.menu_system.borrow().menu_bar();
+                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
                 let mb_layout = backend_d
                     .borrow_mut()
                     .enter_frame_scope(cr, &pango_layout, |b| {
                         b.set_current_theme(q_theme);
-                        b.set_current_line_height(line_height);
-                        b.set_current_char_width(char_width);
-                        let ms = eng.menu_system.borrow();
-                        let bar = ms.menu_bar();
+                        b.set_current_line_height(lh);
+                        b.set_current_char_width(cw);
                         b.draw_menu_bar(bar_rect, &bar)
                     });
 
-                // Draw command center to the right of the menu bar items.
-                let menu_end_x = mb_layout
+                let menu_end = mb_layout
                     .visible_items
                     .last()
                     .map(|vi| (vi.bounds.x + vi.bounds.width) as f64)
                     .unwrap_or(0.0);
+                let title = eng
+                    .cwd
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "VimCode".to_string());
                 let cc = render::build_command_center_view(
                     eng.tab_nav_can_go_back(),
                     eng.tab_nav_can_go_forward(),
-                    &eng.cwd
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "VimCode".to_string()),
+                    &title,
                 );
-                let cc_x = menu_end_x;
-                let cc_w = (w - menu_end_x).max(0.0);
                 let cc_layout = quadraui::gtk::draw_command_center(
                     cr,
                     &pango_layout,
-                    cc_x,
+                    menu_end,
                     0.0,
-                    cc_w,
+                    (w - menu_end).max(0.0),
                     h,
                     &cc,
-                    &q_theme,
-                    line_height,
+                    &quadraui_gtk::q_theme(&theme),
+                    lh,
                 );
-                *mb_layout_draw.borrow_mut() = Some(mb_layout);
                 *cc_layout_draw.borrow_mut() = Some(cc_layout);
             });
         }
-        // Click gesture: menu bar clicks go to MenuSystem, command center handled separately.
+        // Click: menu bar clicks → MenuSystem, command center clicks handled separately.
         {
             let sender_menu = sender.input_sender().clone();
             let engine_menu = engine.clone();
             let backend_click = backend.clone();
             let cc_layout_click = command_center_layout_cell.clone();
-            let bar_rect_click = menu_bar_rect_cell.clone();
-            let dd_da_click = menu_dropdown_da_ref.clone();
-            let mb_da_click = menu_bar_da_ref.clone();
             let gesture = gtk4::GestureClick::new();
             gesture.set_button(1);
             gesture.connect_pressed(move |gest, _, x, _y| {
-                // Try command center first (it overlaps to the right of menu bar items).
+                // Try command center first (not part of MenuSystem).
                 let cc_hit = cc_layout_click
                     .borrow()
                     .as_ref()
@@ -3053,14 +3018,22 @@ impl SimpleComponent for App {
                     }
                     _ => {}
                 }
-                // Delegate to MenuSystem for menu bar item clicks.
+                // Delegate to MenuSystem for menu bar label clicks.
+                use quadraui::Backend;
+                let bar_rect = {
+                    let b = backend_click.borrow();
+                    let vp = b.viewport();
+                    quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                };
                 let ev = quadraui::UiEvent::MouseDown {
                     widget: None,
                     button: quadraui::MouseButton::Left,
-                    position: quadraui::Point::new(x as f32, 0.5),
+                    position: quadraui::Point {
+                        x: x as f32,
+                        y: 0.5,
+                    },
                     modifiers: quadraui::Modifiers::default(),
                 };
-                let bar_rect = bar_rect_click.get();
                 let menu_event = engine_menu.borrow().menu_system.borrow_mut().handle(
                     &ev,
                     &mut *backend_click.borrow_mut(),
@@ -3074,46 +3047,41 @@ impl SimpleComponent for App {
                     }
                     quadraui::MenuEvent::Ignored => {}
                     _ => {
-                        let is_open = engine_menu.borrow().menu_system.borrow().is_open();
-                        if let Some(ref da) = *dd_da_click.borrow() {
-                            da.set_can_target(is_open);
-                            da.queue_draw();
-                        }
-                        if let Some(ref da) = *mb_da_click.borrow() {
-                            da.queue_draw();
-                        }
+                        sender_menu.send(Msg::MenuRedraw).ok();
                     }
                 }
             });
             widgets.menu_bar_da.add_controller(gesture);
         }
-        // Hover motion: delegates to MenuSystem for hover-to-switch.
+        // Hover: delegate to MenuSystem for hover-to-switch.
         {
+            let sender_hover = sender.input_sender().clone();
             let engine_hover = engine.clone();
             let backend_hover = backend.clone();
-            let bar_rect_hover = menu_bar_rect_cell.clone();
-            let dd_da_hover = menu_dropdown_da_ref.clone();
-            let mb_da_hover = menu_bar_da_ref.clone();
             let motion = gtk4::EventControllerMotion::new();
             motion.connect_motion(move |_, x, _y| {
+                use quadraui::Backend;
+                let bar_rect = {
+                    let b = backend_hover.borrow();
+                    let vp = b.viewport();
+                    quadraui::Rect::new(0.0, 0.0, vp.width, b.line_height())
+                };
                 let ev = quadraui::UiEvent::MouseMoved {
-                    position: quadraui::Point::new(x as f32, 0.5),
+                    position: quadraui::Point {
+                        x: x as f32,
+                        y: 0.5,
+                    },
                     buttons: quadraui::ButtonMask::default(),
                 };
-                let bar_rect = bar_rect_hover.get();
                 let menu_event = engine_hover.borrow().menu_system.borrow_mut().handle(
                     &ev,
                     &mut *backend_hover.borrow_mut(),
                     bar_rect,
                 );
-                if !matches!(menu_event, quadraui::MenuEvent::Ignored) {
-                    let is_open = engine_hover.borrow().menu_system.borrow().is_open();
-                    if let Some(ref da) = *dd_da_hover.borrow() {
-                        da.set_can_target(is_open);
-                        da.queue_draw();
-                    }
-                    if let Some(ref da) = *mb_da_hover.borrow() {
-                        da.queue_draw();
+                match menu_event {
+                    quadraui::MenuEvent::Ignored => {}
+                    _ => {
+                        sender_hover.send(Msg::MenuRedraw).ok();
                     }
                 }
             });
@@ -3754,6 +3722,11 @@ impl SimpleComponent for App {
 
         // Menu bar is always visible in GTK (it acts as the title bar).
         engine.borrow_mut().menu_bar_visible = true;
+        engine
+            .borrow()
+            .menu_system
+            .borrow_mut()
+            .set_menus(render::build_menu_defs(engine.borrow().is_vscode_mode()));
 
         // Create initial scrollbars for the first window
         {
@@ -4986,10 +4959,11 @@ impl SimpleComponent for App {
                 self.handle_terminal_msg(msg);
             }
             Msg::ToggleMenuBar
+            | Msg::HandleMenuAction(_)
+            | Msg::MenuRedraw
             | Msg::MruNavBack
             | Msg::MruNavForward
-            | Msg::OpenCommandCenter
-            | Msg::HandleMenuAction(_) => {
+            | Msg::OpenCommandCenter => {
                 self.handle_menu_msg(msg, &sender);
             }
             Msg::DebugSidebarClick(_, _)
@@ -8936,11 +8910,20 @@ impl App {
         }
     }
 
+    fn sync_menu_overlay(&self) {
+        let is_open = self.engine.borrow().menu_system.borrow().is_open();
+        if let Some(ref da) = *self.menu_dropdown_da.borrow() {
+            da.set_can_target(is_open);
+            da.queue_draw();
+        }
+        if let Some(ref da) = *self.menu_bar_da.borrow() {
+            da.queue_draw();
+        }
+    }
+
     fn handle_menu_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
         match msg {
             Msg::ToggleMenuBar => {
-                // In GTK the menu bar is always on (it's our title bar).
-                // Just queue a redraw so the menu labels re-render.
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
                     da.queue_draw();
                 }
@@ -8958,8 +8941,11 @@ impl App {
                 self.engine.borrow_mut().tab_nav_forward();
                 self.draw_needed.set(true);
             }
+            Msg::MenuRedraw => {
+                self.sync_menu_overlay();
+                self.draw_needed.set(true);
+            }
             Msg::HandleMenuAction(action) => {
-                // Intercept dialog actions that need GTK-side handling
                 match action.as_str() {
                     "open_file_dialog" => {
                         sender.input(Msg::OpenFileDialog);
@@ -8979,6 +8965,7 @@ impl App {
                     }
                     "find" => {
                         self.engine.borrow_mut().open_find_replace();
+                        self.draw_needed.set(true);
                     }
                     "quit_menu" => {
                         if self.engine.borrow().has_any_unsaved() {
@@ -9006,15 +8993,7 @@ impl App {
                         }
                     }
                 }
-                // Sync overlay state after action.
-                let is_open = self.engine.borrow().menu_system.borrow().is_open();
-                if let Some(ref da) = *self.menu_dropdown_da.borrow() {
-                    da.set_can_target(is_open);
-                    da.queue_draw();
-                }
-                if let Some(ref da) = *self.menu_bar_da.borrow() {
-                    da.queue_draw();
-                }
+                self.sync_menu_overlay();
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),

@@ -2835,9 +2835,6 @@ pub(super) fn draw_command_line(
     }
 }
 
-// NOTE: draw_menu_bar and draw_menu_dropdown removed — MenuSystem now owns
-// menu bar + dropdown rendering via Backend::draw_menu_bar / draw_context_menu.
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_source_control_panel(
     cr: &Context,
