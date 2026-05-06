@@ -2928,6 +2928,11 @@ impl SimpleComponent for App {
             let bar_rect_update = menu_bar_rect_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let eng = engine.borrow();
+                // When the dropdown is open, the overlay DA's render() draws both
+                // bar + dropdown. Skip bar drawing here to avoid duplicates.
+                if eng.menu_system.borrow().is_open() {
+                    return;
+                }
                 let theme = Theme::from_name(&eng.settings.colorscheme);
                 let q_theme = quadraui_gtk::q_theme(&theme);
                 let font_desc = FontDescription::from_string(&UI_FONT());
