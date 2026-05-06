@@ -2720,7 +2720,8 @@ impl SimpleComponent for App {
             let menu_dd_da = gtk4::DrawingArea::new();
             menu_dd_da.set_hexpand(true);
             menu_dd_da.set_vexpand(true);
-            menu_dd_da.set_can_target(false); // pass-through until menu opens
+            menu_dd_da.set_can_target(false);
+            menu_dd_da.set_focusable(false);
 
             // Draw function — MenuSystem::render() draws bar + dropdown.
             {
