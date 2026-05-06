@@ -2728,7 +2728,16 @@ impl SimpleComponent for App {
                     let lh = pango_layout.pixel_size().1 as f64;
                     pango_layout.set_text("M");
                     let cw = pango_layout.pixel_size().0 as f64;
-                    let bar_rect = bar_rect_draw.get();
+                    let stored = bar_rect_draw.get();
+                    // The menu bar DA is set_titlebar() — it sits ABOVE the
+                    // overlay DA. Shift bar_rect.y negative so render() draws
+                    // the bar at the titlebar position (above the overlay).
+                    let bar_rect = quadraui::Rect::new(
+                        stored.x,
+                        -(stored.height),
+                        stored.width,
+                        stored.height,
+                    );
                     let mut b = backend_d.borrow_mut();
                     use quadraui::Backend;
                     b.begin_frame(quadraui::Viewport::new(da_w as f32, da_h as f32, 1.0));
@@ -2928,11 +2937,6 @@ impl SimpleComponent for App {
             let bar_rect_update = menu_bar_rect_cell.clone();
             widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
                 let eng = engine.borrow();
-                // When the dropdown is open, the overlay DA's render() draws both
-                // bar + dropdown. Skip bar drawing here to avoid duplicates.
-                if eng.menu_system.borrow().is_open() {
-                    return;
-                }
                 let theme = Theme::from_name(&eng.settings.colorscheme);
                 let q_theme = quadraui_gtk::q_theme(&theme);
                 let font_desc = FontDescription::from_string(&UI_FONT());
