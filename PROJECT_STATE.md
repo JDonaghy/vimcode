@@ -1,35 +1,36 @@
 # VimCode Project State
 
-**Last updated:** May 5, 2026 (Session 352 — **#307 Batch 1 scroll dispatch migration.** 5 sidebar panels migrated to `dispatch_scroll`/`dispatch_click`. CLAUDE.md split into core + 4 conditional files. Search panel scroll_offset wired into MSV. Filed #314 for MSV scrollbar click/drag.)
+**Last updated:** May 5, 2026 (Session 353 — **#307 completed (all 5 batches), #242 closed, #308 partial.** All scrollable surfaces now route through `dispatch_scroll`/`dispatch_click`. Shared `Engine::handle_dap_sidebar_scroll` eliminates per-backend scroll math. TUI menu hover-to-switch shipped. Filed #315 GTK MSV scrollbar, #316/#317 GTK terminal scrollbar, #318 Alt key clashes, #319 menu dropdown → quadraui::ContextMenu.)
 
 ## Active milestone: Cross-Platform UI Crate
 
 **This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
 
-**All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. Scroll dispatch consolidation (#307) is in progress.
+**All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
 **Remaining milestone work** is consolidation and infrastructure:
 
 | # | Title | Category |
 |---|-------|----------|
-| [#307](https://github.com/JDonaghy/vimcode/issues/307) | Scroll dispatch migration (Batches 2-5 remain) | Consolidation |
+| [#319](https://github.com/JDonaghy/vimcode/issues/319) | Menu dropdown → quadraui::ContextMenu | Infrastructure |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
+| [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
-| [#308](https://github.com/JDonaghy/vimcode/issues/308) | Menu bar keyboard/hover dispatch gaps | Polish |
 | [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
-**Shipped this session (352):**
-- **#307 Batch 1** (`0be798e`) — Migrated explorer, ext_panel, settings, search, ext_sidebar to `dispatch_scroll`/`dispatch_click`. Registered `ScrollSurface` entries at paint time. Removed ~95 lines bespoke wheel scroll + ~90 lines bespoke scrollbar click/drag. Fixed stale picker modal blocking dispatch_scroll. Fixed explorer scrollbar thumb color mismatch. Wired `search_scroll_top` into MSV TreeView `scroll_offset`.
-- **Body click fix** (`aa133fa`) — `dispatch_click` `MouseDown` for sidebar surfaces gated on `drag_state.is_active()` to avoid consuming body clicks.
-- **CLAUDE.md split** (`80d97ff`) — 314→90 lines (71% reduction). Moved architecture, quadraui guide, patterns, and doc maintenance into `docs/` conditional files.
+**Shipped this session (353):**
+- **#307 Batches 2-5** — Debug sidebar (4 sections → ScrollSurface + dispatch_click), terminal scrollback, editor viewport, editor hover popup all migrated. Shared `Engine::handle_dap_sidebar_scroll()` + `dap_sidebar_visible_rows()`. Unified step rounding (`.ceil()` → `.round()` for TUI/GTK consistency). Net −17 lines across 5 files.
+- **#242 closed** — TUI debug sidebar scrollbar click now routed through dispatch_click.
+- **#308 item 3** — TUI menu bar hover-to-switch via `MenuBarLayout::hit_test` on `MouseEventKind::Moved`.
+- **Issues filed:** #315 (GTK MSV scrollbar), #316 (GTK terminal scrollbar visual), #317 (GTK terminal track click), #318 (Alt key clashes), #319 (menu dropdown → ContextMenu).
 
 ---
 
-**Previous session (351):** All bespoke paint surfaces eliminated. #301 menu bar, #310 command center, #302 search panel shipped. #290/#291 extension panel bug fixes.
+**Previous session (352):** #307 Batch 1 scroll dispatch, body click fix, CLAUDE.md split.
 
-Vimcode at 1952 lib + 2040 integration tests passing on develop@`80d97ff`. Both TUI + GTK build + clippy clean.
+Vimcode at 1952 lib + 2040 integration tests passing on develop@`b7f365a`. Both TUI + GTK build + clippy clean.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -110,7 +111,7 @@ cell coalescence) remain but are tracked separately.
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
 - All primitive `Layout` algorithms (`StatusBarLayout`, `PaletteLayout`, etc.) — single implementation, both backends consume.
-- `quadraui::dispatch_mouse_down/drag/up` + `ModalStack` + `DragState` — drives palette drag, picker drag, TUI sidebar scrollbar drag, and GTK explorer scrollbar drag (as of `3e5d7d3`).
+- `quadraui::dispatch_scroll/click/mouse_down/drag/up` + `ModalStack` + `DragState` — drives all scroll wheel routing, scrollbar thumb-drag + track-page, palette drag, picker drag. All scrollable surfaces registered as `ScrollSurface` at paint time (#307, completed Session 353).
 - Engine-side hit-region builders (`compute_find_replace_hit_regions`) and cell-unit fit algorithms (`StatusBar::fit_right_start`, `TabBar::fit_active_scroll_offset`) — parameterised over a measurement closure so each backend supplies its native unit.
 - `core::settings::SAVE_REVISION` — one source of truth both file watchers consult (#201).
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.

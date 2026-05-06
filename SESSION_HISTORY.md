@@ -1,12 +1,17 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 351 archived here.
+All sessions through 352 archived here.
 
 > **Format note:** Sessions 282–339 below were archived in their
 > original verbose multi-paragraph format (as maintained in
 > PROJECT_STATE during the A.x / Phase 4 / Phase B / Phase C waves).
 > Sessions 280 and earlier use the one-paragraph compact format.
+
+---
+**Session 352 — #307 Batch 1 scroll dispatch + CLAUDE.md split:**
+
+#307 Batch 1 (`0be798e`): migrated explorer, ext_panel, settings, search, ext_sidebar to `dispatch_scroll`/`dispatch_click`. Registered `ScrollSurface` entries at paint time. Removed ~95 lines bespoke wheel scroll + ~90 lines bespoke scrollbar click/drag. Fixed stale picker modal blocking dispatch_scroll. Fixed explorer scrollbar thumb color mismatch. Wired `search_scroll_top` into MSV TreeView `scroll_offset`. Body click fix (`aa133fa`): gated sidebar `dispatch_click` `MouseDown` on `drag_state.is_active()`. CLAUDE.md split (`80d97ff`): 314→90 lines (71% reduction), moved architecture, quadraui guide, patterns, and doc maintenance into `docs/` conditional files. Filed #314 for MSV scrollbar click/drag.
 
 ---
 **Session 351 — All bespoke paint surfaces eliminated:**
