@@ -1297,7 +1297,7 @@ impl SimpleComponent for App {
 
                             add_controller = gtk4::EventControllerKey {
                                 set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine, backend_events, backend] => move |ctrl_ref, key, _, modifier| {
+                                connect_key_pressed[sender, engine, backend_events, backend, lh_cell = line_height_cell.clone()] => move |ctrl_ref, key, _, modifier| {
                                     // Phase B.5b Stage 1: dual-write the
                                     // translated UiEvent into the backend
                                     // queue. The drain timer consumes and
@@ -1337,19 +1337,15 @@ impl SimpleComponent for App {
                                     if let Some(ref ev) = ui_event {
                                         let bar_visible = engine.borrow().menu_bar_visible;
                                         if bar_visible {
-                                            use quadraui::Backend;
-                                            let bar_rect = {
-                                                let b = backend.borrow();
-                                                let lh = b.line_height();
-                                                if lh < 1.0 {
-                                                    // Backend not initialized yet (first frame hasn't drawn).
-                                                    quadraui::Rect::default()
-                                                } else {
-                                                    let vp = b.viewport();
-                                                    quadraui::Rect::new(0.0, 0.0, vp.width, lh)
-                                                }
-                                            };
-                                            if bar_rect.width > 0.0 {
+                                            let lh = lh_cell.get() as f32;
+                                            let win_w = ctrl_ref
+                                                .widget()
+                                                .root()
+                                                .and_then(|r| r.downcast::<gtk4::Window>().ok())
+                                                .map(|w| w.width() as f32)
+                                                .unwrap_or(800.0);
+                                            let bar_rect = quadraui::Rect::new(0.0, 0.0, win_w, lh);
+                                            if lh > 1.0 {
                                                 let menu_event = engine.borrow().menu_system.borrow_mut()
                                                     .handle(ev, &mut *backend.borrow_mut(), bar_rect);
                                                 match menu_event {
