@@ -1928,6 +1928,7 @@ impl Engine {
     /// Pre-fills the input with the current filename and places the cursor
     /// at the end.  Backends should render an editable text field on the
     /// matching explorer row while this state is active.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_rename(&mut self, path: PathBuf) {
         let name = path
             .file_name()
@@ -2143,6 +2144,7 @@ impl Engine {
     ///
     /// Creates an empty editable entry under `parent_dir`.  Backends should
     /// render a temporary row in the tree for this entry.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_new_file(&mut self, parent_dir: PathBuf) {
         self.explorer_new_entry = Some(ExplorerNewEntryState {
             parent_dir,
@@ -2153,6 +2155,7 @@ impl Engine {
     }
 
     /// Start inline new-folder creation in the explorer sidebar.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_new_folder(&mut self, parent_dir: PathBuf) {
         self.explorer_new_entry = Some(ExplorerNewEntryState {
             parent_dir,

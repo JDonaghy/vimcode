@@ -806,7 +806,7 @@ pub(super) fn draw_frame(
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
         backend.enter_frame_scope(frame, |b| {
             use quadraui::Backend;
-            let _ = b.draw_status_bar(q_rect, &bar);
+            let _ = b.draw_status_bar(q_rect, &bar, None, None);
         });
     }
 
@@ -1687,7 +1687,7 @@ pub(super) fn draw_breadcrumb_bar(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(q_rect, &bar);
+        let _ = b.draw_status_bar(q_rect, &bar, None, None);
     });
 }
 
@@ -2140,7 +2140,7 @@ fn render_window_status_line(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(q_rect, &bar);
+        let _ = b.draw_status_bar(q_rect, &bar, None, None);
     });
 }
 
@@ -2297,16 +2297,9 @@ mod tests {
             visible: false,
             has_focus: false,
             active_panel: TuiPanel::Explorer,
-            selected: 0,
-            scroll_top: 0,
-            rows: Vec::new(),
-            root: std::path::PathBuf::from("/tmp"),
-            expanded: std::collections::HashSet::new(),
             search_input_mode: false,
             replace_input_focused: false,
             search_scroll_top: 0,
-            show_hidden_files: false,
-            sort_case_insensitive: false,
             toolbar_focused: false,
             toolbar_selected: 0,
             pending_ctrl_w: false,

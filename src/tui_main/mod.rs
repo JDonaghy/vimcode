@@ -13,7 +13,6 @@
     clippy::explicit_counter_loop
 )]
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -88,7 +87,6 @@ use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
 use crate::core::engine::EngineAction;
-use crate::core::settings::ExplorerAction;
 use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::icons;
@@ -364,34 +362,16 @@ enum TuiPanel {
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
 
-struct ExplorerRow {
-    depth: usize,
-    name: String,
-    path: PathBuf,
-    is_dir: bool,
-    is_expanded: bool,
-}
-
 struct TuiSidebar {
     visible: bool,
     has_focus: bool,
     active_panel: TuiPanel,
-    selected: usize,
-    scroll_top: usize,
-    rows: Vec<ExplorerRow>,
-    root: PathBuf,
-    /// Set of directory paths that are currently expanded.
-    expanded: HashSet<PathBuf>,
     /// True while typing in the search input box (Search panel only).
     search_input_mode: bool,
     /// When true and `search_input_mode` is true, the replace input is focused.
     replace_input_focused: bool,
     /// Scroll offset for the search results area (written back by render_search_panel).
     search_scroll_top: usize,
-    /// Whether to show dotfiles in the explorer (mirrors Settings.show_hidden_files).
-    show_hidden_files: bool,
-    /// Sort explorer entries case-insensitively (mirrors Settings.explorer_sort_case_insensitive).
-    sort_case_insensitive: bool,
     /// When true, the activity bar (toolbar) has keyboard focus.
     toolbar_focused: bool,
     /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
@@ -403,104 +383,18 @@ struct TuiSidebar {
 }
 
 impl TuiSidebar {
-    fn new(root: PathBuf, visible: bool) -> Self {
-        let mut expanded = HashSet::new();
-        // Root folder starts expanded so the tree is visible
-        expanded.insert(root.clone());
-        let mut sb = TuiSidebar {
+    fn new(visible: bool) -> Self {
+        TuiSidebar {
             visible,
             has_focus: false,
             active_panel: TuiPanel::Explorer,
-            selected: 0,
-            scroll_top: 0,
-            rows: Vec::new(),
-            root,
-            expanded,
             search_input_mode: true,
             replace_input_focused: false,
             search_scroll_top: 0,
-            show_hidden_files: false,
-            sort_case_insensitive: true,
             toolbar_focused: false,
-            toolbar_selected: 1, // Start on Explorer
+            toolbar_selected: 1,
             pending_ctrl_w: false,
             ext_panel_name: None,
-        };
-        sb.build_rows();
-        sb
-    }
-
-    fn build_rows(&mut self) {
-        self.rows.clear();
-        let root = self.root.clone();
-        // Root folder entry at the top (like VSCode project name)
-        let root_name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| root.to_string_lossy().to_string());
-        let root_expanded = self.expanded.contains(&root);
-        self.rows.push(ExplorerRow {
-            depth: 0,
-            name: root_name.to_uppercase(),
-            path: root.clone(),
-            is_dir: true,
-            is_expanded: root_expanded,
-        });
-        if root_expanded {
-            collect_rows(
-                &root,
-                1,
-                &self.expanded,
-                self.show_hidden_files,
-                self.sort_case_insensitive,
-                &mut self.rows,
-            );
-        }
-        if !self.rows.is_empty() && self.selected >= self.rows.len() {
-            self.selected = self.rows.len() - 1;
-        }
-    }
-
-    fn toggle_dir(&mut self, idx: usize) {
-        if idx < self.rows.len() && self.rows[idx].is_dir {
-            let path = self.rows[idx].path.clone();
-            if self.expanded.contains(&path) {
-                self.expanded.remove(&path);
-            } else {
-                self.expanded.insert(path);
-            }
-        }
-        self.build_rows();
-    }
-
-    /// Scroll so `selected` is visible within the given viewport height.
-    fn ensure_visible(&mut self, viewport_height: usize) {
-        if viewport_height == 0 {
-            return;
-        }
-        if self.selected < self.scroll_top {
-            self.scroll_top = self.selected;
-        } else if self.selected >= self.scroll_top + viewport_height {
-            self.scroll_top = self.selected + 1 - viewport_height;
-        }
-    }
-
-    /// Expand all ancestor directories of `target`, rebuild the row list,
-    /// select the row matching `target`, and scroll it into view.
-    fn reveal_path(&mut self, target: &Path, viewport_height: usize) {
-        // Expand every ancestor directory between root and target.
-        if let Ok(rel) = target.strip_prefix(&self.root) {
-            let mut accum = self.root.clone();
-            for component in rel.parent().into_iter().flat_map(|p| p.components()) {
-                accum.push(component);
-                self.expanded.insert(accum.clone());
-            }
-        }
-        self.build_rows();
-        // Select the row whose path matches target, then scroll into view.
-        if let Some(idx) = self.rows.iter().position(|r| r.path == target) {
-            self.selected = idx;
-            self.ensure_visible(viewport_height);
         }
     }
 }
@@ -511,67 +405,6 @@ fn sync_sidebar_focus(sidebar: &TuiSidebar, engine: &mut Engine) {
     let in_fixed_panel = sidebar.has_focus && sidebar.ext_panel_name.is_none();
     engine.explorer_has_focus = in_fixed_panel && sidebar.active_panel == TuiPanel::Explorer;
     engine.search_has_focus = in_fixed_panel && sidebar.active_panel == TuiPanel::Search;
-}
-
-/// Recursively build the flat list of visible rows, respecting the `expanded` set.
-fn collect_rows(
-    dir: &Path,
-    depth: usize,
-    expanded: &HashSet<PathBuf>,
-    show_hidden: bool,
-    case_insensitive: bool,
-    out: &mut Vec<ExplorerRow>,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    // Dirs first, then alphabetical (optionally case-insensitive)
-    entries.sort_by(|a, b| {
-        let ad = a.path().is_dir();
-        let bd = b.path().is_dir();
-        match (ad, bd) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => {
-                if case_insensitive {
-                    let an = a.file_name().to_string_lossy().to_lowercase();
-                    let bn = b.file_name().to_string_lossy().to_lowercase();
-                    an.cmp(&bn)
-                } else {
-                    a.file_name().cmp(&b.file_name())
-                }
-            }
-        }
-    });
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Skip dotfiles unless show_hidden_files is enabled
-        if name.starts_with('.') && !show_hidden {
-            continue;
-        }
-        let is_dir = path.is_dir();
-        let is_expanded = is_dir && expanded.contains(&path);
-        out.push(ExplorerRow {
-            depth,
-            name,
-            path: path.clone(),
-            is_dir,
-            is_expanded,
-        });
-        if is_expanded {
-            collect_rows(
-                &path,
-                depth + 1,
-                expanded,
-                show_hidden,
-                case_insensitive,
-                out,
-            );
-        }
-    }
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -1195,10 +1028,8 @@ fn event_loop(
     } else {
         engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
     };
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut sidebar = TuiSidebar::new(root, initial_visible);
-    sidebar.show_hidden_files = engine.settings.show_hidden_files;
-    sidebar.sort_case_insensitive = engine.settings.explorer_sort_case_insensitive;
+    let mut sidebar = TuiSidebar::new(initial_visible);
+    engine.explorer_rebuild_rows();
 
     // Optional active prompt (for sidebar CRUD operations)
 
@@ -1315,11 +1146,7 @@ fn event_loop(
 
     // Reveal the active file in the explorer sidebar at startup (session restore).
     if let Some(path) = engine.file_path().cloned() {
-        let h = terminal
-            .size()
-            .map(|s| s.height.saturating_sub(4) as usize)
-            .unwrap_or(40);
-        sidebar.reveal_path(&path, h);
+        engine.explorer_reveal_path(&path);
     }
 
     loop {
@@ -1651,9 +1478,7 @@ fn event_loop(
             }
             // Auto-refresh explorer and SC panel to reflect external filesystem changes.
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
-                sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                sidebar.sort_case_insensitive = engine.settings.explorer_sort_case_insensitive;
-                sidebar.build_rows();
+                engine.explorer_rebuild_rows();
                 if sidebar.active_panel == TuiPanel::Git
                     || sidebar.active_panel == TuiPanel::Explorer
                 {
@@ -1847,8 +1672,8 @@ fn event_loop(
                                 ));
                             }
                             EngineAction::OpenWorkspaceDialog => {
-                                sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                                sidebar.show_hidden_files = engine.settings.show_hidden_files;
+                                sidebar = TuiSidebar::new(sidebar.visible);
+                                engine.explorer_rebuild_rows();
                             }
                             EngineAction::SaveWorkspaceAsDialog => {
                                 let ws_path = engine.cwd.join(".vimcode-workspace");
@@ -2205,36 +2030,6 @@ fn event_loop(
                     continue;
                 }
 
-                // ── Inline rename in explorer ────────────────────────────────
-                if engine.explorer_rename.is_some() {
-                    if let Some((key_name, unicode, ctrl)) =
-                        translate_key(key_event, keyboard_enhanced)
-                    {
-                        engine.handle_explorer_rename_key(&key_name, unicode, ctrl);
-                        if engine.explorer_needs_refresh {
-                            sidebar.build_rows();
-                            engine.explorer_needs_refresh = false;
-                        }
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
-                // ── Inline new file/folder in explorer ───────────────────────
-                if engine.explorer_new_entry.is_some() {
-                    if let Some((key_name, unicode, ctrl)) =
-                        translate_key(key_event, keyboard_enhanced)
-                    {
-                        engine.handle_explorer_new_entry_key(&key_name, unicode, ctrl);
-                        if engine.explorer_needs_refresh {
-                            sidebar.build_rows();
-                            engine.explorer_needs_refresh = false;
-                        }
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
                 // ── Folder picker modal ─────────────────────────────────────
                 if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
@@ -2249,16 +2044,10 @@ fn event_loop(
                                 if let Some(path) = picker.filtered.get(picker.selected).cloned() {
                                     folder_picker = None;
                                     engine.open_folder(&path);
-                                    sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                                    sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                                    sidebar.sort_case_insensitive =
-                                        engine.settings.explorer_sort_case_insensitive;
+                                    sidebar = TuiSidebar::new(sidebar.visible);
+                                    engine.explorer_rebuild_rows();
                                     if let Some(fp) = engine.file_path().cloned() {
-                                        let h = terminal
-                                            .size()
-                                            .map(|s| s.height.saturating_sub(4) as usize)
-                                            .unwrap_or(40);
-                                        sidebar.reveal_path(&fp, h);
+                                        engine.explorer_reveal_path(&fp);
                                     }
                                 }
                             } else {
@@ -2278,17 +2067,10 @@ fn event_loop(
                                         }
                                         FolderPickerMode::OpenRecent => {}
                                     }
-                                    sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                                    sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                                    sidebar.sort_case_insensitive =
-                                        engine.settings.explorer_sort_case_insensitive;
-                                    // Reveal the active file from the restored session
+                                    sidebar = TuiSidebar::new(sidebar.visible);
+                                    engine.explorer_rebuild_rows();
                                     if let Some(path) = engine.file_path().cloned() {
-                                        let h = terminal
-                                            .size()
-                                            .map(|s| s.height.saturating_sub(4) as usize)
-                                            .unwrap_or(40);
-                                        sidebar.reveal_path(&path, h);
+                                        engine.explorer_reveal_path(&path);
                                     }
                                 }
                             }
@@ -2546,7 +2328,7 @@ fn event_loop(
                                     continue;
                                 }
                                 KeyCode::Char('h') => {
-                                    let root = sidebar.root.clone();
+                                    let root = engine.cwd.clone();
                                     engine.start_project_replace(root);
                                     continue;
                                 }
@@ -2570,10 +2352,10 @@ fn event_loop(
                                 }
                                 KeyCode::Enter => {
                                     if sidebar.replace_input_focused {
-                                        let root = sidebar.root.clone();
+                                        let root = engine.cwd.clone();
                                         engine.start_project_replace(root);
                                     } else {
-                                        let root = sidebar.root.clone();
+                                        let root = engine.cwd.clone();
                                         engine.start_project_search(root);
                                         sidebar.search_scroll_top = 0;
                                     }
@@ -3104,135 +2886,56 @@ fn event_loop(
                         continue;
                     }
 
-                    match key_event.code {
-                        // Return focus to editor
-                        KeyCode::Esc => {
-                            sidebar.has_focus = false;
-                        }
-                        KeyCode::Char('b') if ctrl => {
+                    {
+                        use crate::core::engine::ExplorerKeyResult;
+                        if ctrl && key_event.code == KeyCode::Char('b') {
                             sidebar.visible = false;
                             sidebar.has_focus = false;
                             engine.session.explorer_visible = false;
                             let _ = engine.session.save();
-                        }
-                        // Navigate down
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !sidebar.rows.is_empty() {
-                                sidebar.selected =
-                                    (sidebar.selected + 1).min(sidebar.rows.len() - 1);
-                            }
-                            if let Ok(size) = terminal.size() {
-                                let h = size.height.saturating_sub(4) as usize; // tab + header + status + cmd
-                                sidebar.ensure_visible(h);
-                            }
-                        }
-                        // Navigate up
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            sidebar.selected = sidebar.selected.saturating_sub(1);
-                            if let Ok(size) = terminal.size() {
-                                let h = size.height.saturating_sub(4) as usize;
-                                sidebar.ensure_visible(h);
-                            }
-                        }
-                        // Expand dir / open file
-                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                            let idx = sidebar.selected;
-                            if idx < sidebar.rows.len() {
-                                if sidebar.rows[idx].is_dir {
-                                    sidebar.toggle_dir(idx);
-                                } else {
-                                    let path = sidebar.rows[idx].path.clone();
-                                    engine.open_file_in_tab(&path);
+                        } else {
+                            let key_name = match key_event.code {
+                                KeyCode::Esc => "Escape",
+                                KeyCode::Enter => "Return",
+                                KeyCode::Up => "Up",
+                                KeyCode::Down => "Down",
+                                KeyCode::Left => "Left",
+                                KeyCode::Right => "Right",
+                                KeyCode::Home => "Home",
+                                KeyCode::End => "End",
+                                KeyCode::PageUp => "PageUp",
+                                KeyCode::PageDown => "PageDown",
+                                KeyCode::Char(c) => {
+                                    // Single-char key names for the engine dispatch
+                                    match c {
+                                        'j' => "j",
+                                        'k' => "k",
+                                        'h' => "h",
+                                        'l' => "l",
+                                        'q' => "q",
+                                        _ => "",
+                                    }
+                                }
+                                _ => "",
+                            };
+                            let chr = if let KeyCode::Char(c) = key_event.code {
+                                Some(c)
+                            } else {
+                                None
+                            };
+                            let result = engine.dispatch_explorer_key(key_name, chr, ctrl);
+                            match result {
+                                ExplorerKeyResult::Unfocused => {
                                     sidebar.has_focus = false;
                                 }
-                            }
-                        }
-                        // Collapse dir / go to parent / switch to toolbar
-                        KeyCode::Char('h') | KeyCode::Left => {
-                            let idx = sidebar.selected;
-                            if idx < sidebar.rows.len() {
-                                if sidebar.rows[idx].is_dir && sidebar.rows[idx].is_expanded {
-                                    // Collapse this dir
-                                    sidebar.toggle_dir(idx);
-                                } else {
-                                    // Move to nearest parent row (lower depth)
-                                    let target_depth = sidebar.rows[idx].depth;
-                                    if target_depth > 0 {
-                                        let parent_idx = sidebar.rows[..idx]
-                                            .iter()
-                                            .rposition(|r| r.depth < target_depth);
-                                        if let Some(pi) = parent_idx {
-                                            sidebar.selected = pi;
-                                        }
-                                    } else {
-                                        // At root level — switch focus to toolbar
-                                        sidebar.has_focus = false;
-                                        sidebar.toolbar_focused = true;
-                                        sidebar.toolbar_selected = 1; // Explorer row
-                                    }
+                                ExplorerKeyResult::FocusToolbar => {
+                                    sidebar.has_focus = false;
+                                    sidebar.toolbar_focused = true;
+                                    sidebar.toolbar_selected = 1;
                                 }
-                            } else {
-                                // Empty explorer — switch to toolbar
-                                sidebar.has_focus = false;
-                                sidebar.toolbar_focused = true;
-                                sidebar.toolbar_selected = 1;
+                                _ => {}
                             }
                         }
-                        // Explorer CRUD keys — resolved from settings
-                        KeyCode::Char(c) if !ctrl => {
-                            if let Some(action) = engine.settings.explorer_keys.resolve(c) {
-                                match action {
-                                    ExplorerAction::NewFile | ExplorerAction::NewFolder => {
-                                        let target_dir = {
-                                            let idx = sidebar.selected;
-                                            if idx < sidebar.rows.len() {
-                                                let p = &sidebar.rows[idx].path;
-                                                if p.is_dir() {
-                                                    p.clone()
-                                                } else {
-                                                    p.parent()
-                                                        .unwrap_or(&sidebar.root)
-                                                        .to_path_buf()
-                                                }
-                                            } else {
-                                                sidebar.root.clone()
-                                            }
-                                        };
-                                        // Expand the target dir so the new entry row is visible
-                                        sidebar.expanded.insert(target_dir.clone());
-                                        sidebar.build_rows();
-                                        if action == ExplorerAction::NewFile {
-                                            engine.start_explorer_new_file(target_dir);
-                                        } else {
-                                            engine.start_explorer_new_folder(target_dir);
-                                        }
-                                    }
-                                    ExplorerAction::Delete => {
-                                        let idx = sidebar.selected;
-                                        if idx < sidebar.rows.len() {
-                                            let path = sidebar.rows[idx].path.clone();
-                                            engine.confirm_delete_file(&path);
-                                        }
-                                    }
-                                    ExplorerAction::Rename => {
-                                        let idx = sidebar.selected;
-                                        if idx < sidebar.rows.len() {
-                                            let path = sidebar.rows[idx].path.clone();
-                                            engine.start_explorer_rename(path);
-                                        }
-                                    }
-                                    ExplorerAction::MoveFile => {
-                                        let idx = sidebar.selected;
-                                        if idx < sidebar.rows.len() {
-                                            let path = sidebar.rows[idx].path.clone();
-                                            let root = sidebar.root.clone();
-                                            engine.start_move_file_dialog(&path, &root);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                     needs_redraw = true;
                     continue;
@@ -3711,10 +3414,8 @@ fn event_loop(
                         } else if action == EngineAction::OpenWorkspaceDialog {
                             // open_workspace_from_file() already ran in the engine;
                             // just refresh the sidebar to reflect the new cwd.
-                            sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                            sidebar.sort_case_insensitive =
-                                engine.settings.explorer_sort_case_insensitive;
+                            sidebar = TuiSidebar::new(sidebar.visible);
+                            engine.explorer_rebuild_rows();
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
                             // For TUI, save workspace to current directory immediately
@@ -3790,21 +3491,15 @@ fn event_loop(
                     // Rebuild explorer tree if a file move just completed.
                     if engine.explorer_needs_refresh {
                         engine.explorer_needs_refresh = false;
-                        sidebar.build_rows();
+                        engine.explorer_rebuild_rows();
                     }
-                    // Schedule yank highlight clear after 200 ms.
                     if engine.yank_highlight.is_some() {
                         yank_hl_deadline = Some(Instant::now() + Duration::from_millis(200));
                         needs_redraw = true;
                     }
-                    // Reveal the active file in the sidebar when the tab changed
                     if engine.active_group().active_tab != prev_tab {
                         if let Some(path) = engine.file_path().cloned() {
-                            let h = terminal
-                                .size()
-                                .map(|s| s.height.saturating_sub(4) as usize)
-                                .unwrap_or(40);
-                            sidebar.reveal_path(&path, h);
+                            engine.explorer_reveal_path(&path);
                         }
                     }
                     // Adjust quickfix scroll to keep selected item visible
@@ -4072,7 +3767,7 @@ fn event_loop(
 fn handle_explorer_context_action(
     action: &str,
     engine: &mut Engine,
-    sidebar: &TuiSidebar,
+    _sidebar: &TuiSidebar,
     terminal_size: Option<Size>,
     ctx_path: PathBuf,
     ctx_is_dir: bool,
@@ -4082,19 +3777,17 @@ fn handle_explorer_context_action(
 
     match action {
         "new_file" | "new_folder" => {
-            let target = if is_dir {
-                path.clone()
+            use crate::core::settings::ExplorerAction;
+            let crud_action = if action == "new_file" {
+                ExplorerAction::NewFile
             } else {
-                path.parent().unwrap_or(&sidebar.root).to_path_buf()
+                ExplorerAction::NewFolder
             };
-            if action == "new_file" {
-                engine.start_explorer_new_file(target);
-            } else {
-                engine.start_explorer_new_folder(target);
-            }
+            engine.dispatch_explorer_crud(crud_action);
         }
         "rename" => {
-            engine.start_explorer_rename(path);
+            use crate::core::settings::ExplorerAction;
+            engine.dispatch_explorer_crud(ExplorerAction::Rename);
         }
         "delete" => {
             engine.confirm_delete_file(&path);
@@ -4105,7 +3798,7 @@ fn handle_explorer_context_action(
             let dir = if is_dir {
                 path.clone()
             } else {
-                path.parent().unwrap_or(&sidebar.root).to_path_buf()
+                path.parent().unwrap_or(&engine.cwd).to_path_buf()
             };
             let cols = terminal_size.map(|s| s.width).unwrap_or(80);
             let rows = engine.session.terminal_panel_rows;

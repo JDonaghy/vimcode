@@ -80,7 +80,10 @@ fn apply_scrollbar_drag(
             let key = widget.as_str();
             match key {
                 "explorer:sb" => {
-                    sidebar.scroll_top = *new_offset;
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .set_scroll_offset(*new_offset);
                     handled = true;
                 }
                 "ext_panel:sb" => {
@@ -585,7 +588,7 @@ pub(super) fn handle_mouse(
                     let action = engine.dialog_click_button(idx);
                     if engine.explorer_needs_refresh {
                         engine.explorer_needs_refresh = false;
-                        sidebar.build_rows();
+                        engine.explorer_rebuild_rows();
                     }
                     if handle_action(engine, action) {
                         *should_quit = true;
@@ -930,9 +933,9 @@ pub(super) fn handle_mouse(
                 {
                     let sidebar_row = row.saturating_sub(menu_rows);
                     if sidebar_row >= 1 {
-                        let tree_row =
-                            (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
-                        if tree_row < sidebar.rows.len() {
+                        let tree_row = (sidebar_row as usize).saturating_sub(1)
+                            + engine.explorer_tree.borrow().scroll_offset();
+                        if tree_row < engine.explorer_rows.len() {
                             if let Some(src_row) = *explorer_drag_src {
                                 // Only activate drag if target differs from source.
                                 if tree_row != src_row {
@@ -1153,9 +1156,9 @@ pub(super) fn handle_mouse(
             // Explorer drag-and-drop: execute move on release.
             if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
                 *explorer_drag_src = None;
-                if src_row < sidebar.rows.len() && target_row < sidebar.rows.len() {
-                    let src_path = sidebar.rows[src_row].path.clone();
-                    let target = &sidebar.rows[target_row];
+                if src_row < engine.explorer_rows.len() && target_row < engine.explorer_rows.len() {
+                    let src_path = engine.explorer_rows[src_row].path.clone();
+                    let target = &engine.explorer_rows[target_row];
                     let dest_dir = if target.is_dir {
                         target.path.clone()
                     } else {
@@ -1213,14 +1216,22 @@ pub(super) fn handle_mouse(
         }
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            // Git panel scroll wheel — not yet on dispatch_scroll.
-            // Debug sidebar + other panels fall through to dispatch_scroll.
+            let scroll_up = matches!(ev.kind, MouseEventKind::ScrollUp);
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Explorer
+            {
+                let delta = if scroll_up { -3_isize } else { 3 };
+                engine.explorer_scroll(delta);
+                return sidebar_width;
+            }
             if sidebar.visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
                 && sidebar.active_panel == TuiPanel::Git
             {
-                if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                if scroll_up {
                     engine.sc_selected = engine.sc_selected.saturating_sub(3);
                 } else {
                     let flat_len = engine.sc_flat_len();
@@ -1268,15 +1279,12 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "explorer:sb" => {
-                                let total = sidebar.rows.len();
-                                let tree_height =
-                                    term_height.saturating_sub(bottom_chrome) as usize;
-                                if down {
-                                    sidebar.scroll_top = (sidebar.scroll_top + step)
-                                        .min(total.saturating_sub(tree_height));
+                                let delta = if down {
+                                    step as isize
                                 } else {
-                                    sidebar.scroll_top = sidebar.scroll_top.saturating_sub(step);
-                                }
+                                    -(step as isize)
+                                };
+                                engine.explorer_scroll(delta);
                                 return sidebar_width;
                             }
                             "ext_panel:sb" => {
@@ -1409,15 +1417,18 @@ pub(super) fn handle_mouse(
         if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
             if sidebar.active_panel == TuiPanel::Explorer {
                 let sidebar_row = row.saturating_sub(menu_rows);
-                let tree_row = sidebar_row as usize + sidebar.scroll_top;
-                if tree_row < sidebar.rows.len() {
-                    sidebar.selected = tree_row;
-                    let path = sidebar.rows[tree_row].path.clone();
-                    let is_dir = sidebar.rows[tree_row].is_dir;
+                let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
+                if tree_row < engine.explorer_rows.len() {
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .set_selected_path(Some(vec![tree_row as u16]));
+                    let path = engine.explorer_rows[tree_row].path.clone();
+                    let is_dir = engine.explorer_rows[tree_row].is_dir;
                     engine.open_explorer_context_menu(path, is_dir, col, row);
                 } else {
                     // Empty space below last entry → context menu for root folder
-                    let root = sidebar.root.clone();
+                    let root = engine.cwd.clone();
                     engine.open_explorer_context_menu(root, true, col, row);
                 }
             }
@@ -2090,7 +2101,10 @@ pub(super) fn handle_mouse(
                             return sidebar_width;
                         }
                         "explorer:sb" => {
-                            sidebar.scroll_top = *new_offset;
+                            engine
+                                .explorer_tree
+                                .borrow_mut()
+                                .set_scroll_offset(*new_offset);
                             return sidebar_width;
                         }
                         "ext_panel:sb" => {
@@ -2464,16 +2478,18 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
 
-            let tree_row = sidebar_row as usize + sidebar.scroll_top;
-            if tree_row < sidebar.rows.len() {
+            let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
+            if tree_row < engine.explorer_rows.len() {
                 // Record potential drag source for DnD.
                 *explorer_drag_src = Some(tree_row);
-                if sidebar.rows[tree_row].is_dir {
-                    sidebar.selected = tree_row;
-                    sidebar.toggle_dir(tree_row);
+                engine
+                    .explorer_tree
+                    .borrow_mut()
+                    .set_selected_path(Some(vec![tree_row as u16]));
+                if engine.explorer_rows[tree_row].is_dir {
+                    engine.explorer_toggle_dir(tree_row);
                 } else {
-                    sidebar.selected = tree_row;
-                    let path = sidebar.rows[tree_row].path.clone();
+                    let path = engine.explorer_rows[tree_row].path.clone();
                     let now = Instant::now();
                     let is_double = now.duration_since(*last_click_time)
                         < Duration::from_millis(400)
@@ -2608,7 +2624,7 @@ pub(super) fn handle_mouse(
                             let local_y = hit_y - sl.body_bounds.y;
                             let view = render::build_search_panel_msv(
                                 engine,
-                                &sidebar.root,
+                                &engine.cwd,
                                 sidebar.search_scroll_top,
                             );
                             if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
@@ -2638,7 +2654,7 @@ pub(super) fn handle_mouse(
                             let local_y = hit_y - sl.body_bounds.y;
                             let view = render::build_search_panel_msv(
                                 engine,
-                                &sidebar.root,
+                                &engine.cwd,
                                 sidebar.search_scroll_top,
                             );
                             if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
@@ -2918,7 +2934,7 @@ pub(super) fn handle_mouse(
                             }
                             *tab_drag_start = Some((col, row));
                             if let Some(path) = engine.file_path().cloned() {
-                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                                engine.explorer_reveal_path(&path);
                             }
                         }
                         TabBarClickTarget::CloseTab(_) => {
@@ -2982,7 +2998,7 @@ pub(super) fn handle_mouse(
                         *tab_drag_start = Some((col, row));
                         engine.lsp_ensure_active_buffer();
                         if let Some(path) = engine.file_path().cloned() {
-                            sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                            engine.explorer_reveal_path(&path);
                         }
                     }
                 }

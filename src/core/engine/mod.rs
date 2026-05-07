@@ -1621,6 +1621,16 @@ pub struct ContextMenuState {
     pub screen_y: u16,
 }
 
+/// One visible row in the flat explorer file-tree list.
+#[derive(Debug, Clone)]
+pub struct ExplorerRow {
+    pub depth: usize,
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+}
+
 /// State for inline rename editing in the explorer sidebar.
 #[derive(Debug, Clone)]
 pub struct ExplorerRenameState {
@@ -2784,6 +2794,24 @@ pub struct Engine {
     /// Cached body rect from last render frame — used by handle() in event
     /// dispatch to pass the same rect that render() used.
     pub dap_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
+    /// quadraui TreeController — owns explorer file tree selection, scroll,
+    /// scrollbar, and click hit-testing. Both TUI and GTK call `render()`
+    /// for painting and `handle()` for mouse events. Keyboard dispatch goes
+    /// through `dispatch_explorer_key()` using the navigation primitives.
+    pub explorer_tree: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// Flat visible rows for the explorer tree, rebuilt on demand (toggle,
+    /// refresh, reveal). `TreePath` index maps directly into this vec.
+    pub explorer_rows: Vec<ExplorerRow>,
+    /// Set of directory paths currently expanded in the explorer tree.
+    pub explorer_expanded: std::collections::HashSet<PathBuf>,
+    /// When a new-file/folder inline edit is active, stores the parent
+    /// directory and whether it's a folder.  Cleared on EditConfirmed /
+    /// EditCancelled.
+    pub explorer_new_entry_pending: Option<(PathBuf, bool)>,
+    /// Cached explorer rect from last render frame.
+    pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached viewport row count from last render frame.
+    pub explorer_viewport_rows: std::cell::Cell<usize>,
     #[cfg(feature = "win-gui")]
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
@@ -3532,6 +3560,20 @@ impl Engine {
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             dap_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            explorer_tree: {
+                let mut tc = quadraui::TreeController::new("explorer-tree");
+                tc.set_vim_keys(true);
+                std::rc::Rc::new(std::cell::RefCell::new(tc))
+            },
+            explorer_rows: Vec::new(),
+            explorer_expanded: {
+                let mut set = std::collections::HashSet::new();
+                set.insert(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                set
+            },
+            explorer_new_entry_pending: None,
+            explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            explorer_viewport_rows: std::cell::Cell::new(0),
             #[cfg(feature = "win-gui")]
             menu_open_idx: None,
             debug_toolbar_visible: false,
@@ -3713,6 +3755,7 @@ impl Engine {
         // is opened via restore_session_files / CLI args, so huge buffers
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        engine.explorer_rebuild_rows();
         engine
     }
 
@@ -4433,6 +4476,8 @@ pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
 mod accessors;
 mod buffers;
 mod dap_ops;
+mod explorer_ops;
+pub use explorer_ops::ExplorerKeyResult;
 mod execute;
 mod ext_panel;
 mod keys;

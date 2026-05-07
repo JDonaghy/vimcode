@@ -1,126 +1,5 @@
 use super::*;
 
-/// Convert the TUI's explorer state (`TuiSidebar.rows` + engine indicators)
-/// into a generic `quadraui::TreeView` that backends can render through
-/// `quadraui_tui::draw_tree()`.
-///
-/// Scope for Phase A.2a: basic tree rendering only — selection, indent,
-/// icons, decoration (error / warning / modified), and one right-aligned
-/// badge per row (diagnostics priority, else git status label). Inline
-/// rename rows, new-entry rows, drop-target highlight, active-file
-/// highlight, and indent guide lines are **not** represented here; those
-/// remain the responsibility of the legacy rendering path in `render_sidebar`
-/// until future primitives (`Form`, `TextInput`) or `TreeView` extensions
-/// cover them.
-pub(super) fn explorer_to_tree_view(
-    sidebar: &TuiSidebar,
-    engine: &Engine,
-    theme: &Theme,
-) -> quadraui::TreeView {
-    use quadraui::{
-        Badge, Decoration, Icon as QIcon, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
-        WidgetId,
-    };
-
-    let (git_statuses, diag_counts) = engine.explorer_indicators();
-    // #186: colour-code diagnostic badges (errors red, warnings yellow).
-    // Git-status letter badges (M/A/D/?) stay on the rasteriser's dim
-    // fallback — they're status labels, not severity indicators.
-    let err_fg = render::to_quadraui_color(theme.diagnostic_error);
-    let warn_fg = render::to_quadraui_color(theme.diagnostic_warning);
-
-    let mut rows: Vec<TreeRow> = Vec::with_capacity(sidebar.rows.len());
-    for (row_idx, row) in sidebar.rows.iter().enumerate() {
-        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
-
-        let diag = diag_counts.get(&canon).copied();
-        let git_label = git_statuses.get(&canon).copied();
-
-        // Row decoration reflects the highest-priority health status.
-        let decoration = match diag {
-            Some((e, _)) if e > 0 => Decoration::Error,
-            Some((_, w)) if w > 0 => Decoration::Warning,
-            _ if git_label.is_some() => Decoration::Modified,
-            _ => Decoration::Normal,
-        };
-
-        // Badge priority: errors > warnings > git status (single indicator;
-        // the pre-migration TUI showed up to three, but the primitive carries
-        // only one badge slot. Restoring multi-indicator rendering is a
-        // follow-up when the primitive gains that capability.)
-        let badge = if let Some((errors, warnings)) = diag {
-            if errors > 0 {
-                Some(Badge::colored(
-                    if errors > 9 {
-                        "9+".to_string()
-                    } else {
-                        errors.to_string()
-                    },
-                    err_fg,
-                ))
-            } else if warnings > 0 {
-                Some(Badge::colored(
-                    if warnings > 9 {
-                        "9+".to_string()
-                    } else {
-                        warnings.to_string()
-                    },
-                    warn_fg,
-                ))
-            } else {
-                git_label.map(|label| Badge::plain(label.to_string()))
-            }
-        } else {
-            git_label.map(|label| Badge::plain(label.to_string()))
-        };
-
-        // Icon: folder glyph for dirs, extension-mapped for files. We hand
-        // quadraui the already-resolved string for both fields — the toggle
-        // between nerd font and fallback is handled inside vimcode before we
-        // build the TreeView, and the primitive re-reads it each frame.
-        let icon = if row.is_dir {
-            Some(QIcon::new(
-                crate::icons::FOLDER.nerd.to_string(),
-                crate::icons::FOLDER.fallback.to_string(),
-            ))
-        } else {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let glyph = crate::icons::file_icon(ext).to_string();
-            Some(QIcon::new(glyph, ".".to_string()))
-        };
-
-        rows.push(TreeRow {
-            path: vec![row_idx as u16],
-            indent: row.depth as u16,
-            icon,
-            text: StyledText::plain(&row.name),
-            badge,
-            is_expanded: if row.is_dir {
-                Some(row.is_expanded)
-            } else {
-                None
-            },
-            decoration,
-        });
-    }
-
-    let selected_path = if sidebar.selected < rows.len() {
-        Some(vec![sidebar.selected as u16])
-    } else {
-        None
-    };
-
-    TreeView {
-        id: WidgetId::new("explorer-tree"),
-        rows,
-        selection_mode: SelectionMode::Single,
-        selected_path,
-        scroll_offset: sidebar.scroll_top,
-        style: TreeStyle::default(),
-        has_focus: sidebar.has_focus,
-    }
-}
-
 pub(super) fn render_activity_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -253,22 +132,11 @@ pub(super) fn render_sidebar(
     sidebar: &mut TuiSidebar,
     engine: &Engine,
     theme: &Theme,
-    explorer_drop_target: Option<usize>,
+    _explorer_drop_target: Option<usize>,
 ) {
     let buf = frame.buffer_mut();
     let default_fg = rc(theme.explorer_file_fg);
     let row_bg = rc(theme.tab_bar_bg);
-    let active_bg = rc(theme.explorer_active_bg);
-
-    // The single active buffer path (the file shown in the active window)
-    let active_path: Option<PathBuf> = engine
-        .file_path()
-        .and_then(|p| p.canonicalize().ok().or_else(|| Some(p.clone())));
-    let sel_bg = if sidebar.has_focus {
-        rc(theme.sidebar_sel_bg)
-    } else {
-        rc(theme.sidebar_sel_bg_inactive)
-    };
 
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
@@ -322,504 +190,58 @@ pub(super) fn render_sidebar(
         }
     }
 
-    // Phase A.2a migration: when no special mode is active (rename /
-    // new-entry / drop-target), render the explorer via the shared
-    // `quadraui::TreeView` primitive. The legacy inline renderer below
-    // still owns the edge cases that introduce virtual rows or overlay
-    // input UI on specific rows.
-    let has_special_mode = engine.explorer_rename.is_some() || engine.explorer_new_entry.is_some();
-    if !has_special_mode {
-        let tree = explorer_to_tree_view(sidebar, engine, theme);
-        let tree_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width.saturating_sub(1), // reserve rightmost col for scrollbar
-            height: area.height,
-        };
-        // B5c.4: route tree rendering through `Backend::draw_tree`.
-        let q_rect = quadraui::Rect::new(
-            tree_area.x as f32,
-            tree_area.y as f32,
-            tree_area.width as f32,
-            tree_area.height as f32,
-        );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_tree(q_rect, &tree);
-        });
-        let buf = frame.buffer_mut();
-        render_explorer_scrollbar(buf, area, sidebar, theme);
-
-        let total_rows = sidebar.rows.len();
-        let visible_rows = area.height as usize;
-        let scrollbar = if total_rows > visible_rows && area.width >= 2 {
-            let track_h = visible_rows as f64;
-            let thumb_size = ((visible_rows as f64 / total_rows as f64) * track_h)
-                .ceil()
-                .max(1.0);
-            let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor();
-            let sb_x = (area.x + area.width - 1) as f32;
-            Some(quadraui::SurfaceScrollbar {
-                track_bounds: quadraui::Rect::new(sb_x, area.y as f32, 1.0, area.height as f32),
-                thumb_bounds: quadraui::Rect::new(
-                    sb_x,
-                    area.y as f32 + thumb_top as f32,
-                    1.0,
-                    thumb_size as f32,
-                ),
-                total_items: total_rows,
-                visible_items: visible_rows,
-                scroll_offset: sidebar.scroll_top,
-            })
-        } else {
-            None
-        };
-        engine
-            .scroll_surfaces
-            .borrow_mut()
-            .push(quadraui::ScrollSurface {
-                id: quadraui::WidgetId::new("explorer:sb"),
-                bounds: quadraui::Rect::new(
-                    area.x as f32,
-                    area.y as f32,
-                    area.width as f32,
-                    area.height as f32,
-                ),
-                scrollbar,
-            });
-        return;
-    }
-
-    // ── Explorer indicators (git status + diagnostics) ─────────────────
-    let (git_statuses, diag_counts) = engine.explorer_indicators();
-    let git_added_fg = rc(theme.git_added);
-    let git_modified_fg = rc(theme.git_modified);
-    let git_deleted_fg = rc(theme.git_deleted);
-    let diag_error_fg = rc(theme.diagnostic_error);
-    let diag_warning_fg = rc(theme.diagnostic_warning);
-
-    // ── Tree rows ────────────────────────────────────────────────────────
-    let tree_height = area.height as usize;
-
-    // Determine where a new-entry row should be inserted (right after parent dir).
-    // `new_entry_after_row` is the sidebar.rows index after which we inject the
-    // virtual new-entry row.  `None` = no active new entry, or parent is root
-    // (insert at index 0 visually, before all rows).
-    let new_entry_insert = engine.explorer_new_entry.as_ref().map(|ne| {
-        // Find the parent dir row index, or usize::MAX for "before all rows"
-        sidebar
-            .rows
-            .iter()
-            .position(|r| r.is_dir && r.path == ne.parent_dir)
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    engine.explorer_tree_rect.set(q_rect);
+    engine.explorer_viewport_rows.set(area.height as usize);
+    render::populate_explorer_tree_controller(engine, theme);
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        engine.explorer_tree.borrow().render(b, q_rect);
     });
-    // `true` if parent is root (no matching row — insert before first row)
-    let new_entry_at_top = new_entry_insert == Some(None);
-    let new_entry_after_idx = new_entry_insert.and_then(|opt| opt);
 
-    // We manually iterate to interleave the virtual new-entry row.
-    let mut visual_row = 0usize;
-    let mut row_iter_idx = sidebar.scroll_top;
-    // If new entry goes at top and scroll_top == 0, render it first
-    let mut new_entry_rendered = engine.explorer_new_entry.is_none();
-
-    // Handle new-entry-at-top: if scroll_top == 0, render the new entry first
-    if new_entry_at_top && !new_entry_rendered && sidebar.scroll_top == 0 {
-        let ne = engine.explorer_new_entry.as_ref().unwrap();
-        let screen_y = area.y;
-        // depth 0: parent is root, so child is at depth 0
-        render_new_entry_row(buf, area, screen_y, ne, 0, theme);
-        visual_row += 1;
-        new_entry_rendered = true;
-    }
-
-    while visual_row < tree_height && row_iter_idx < sidebar.rows.len() {
-        let row_idx = row_iter_idx;
-        let row = &sidebar.rows[row_iter_idx];
-        row_iter_idx += 1;
-
-        let i = visual_row;
-        let screen_y = area.y + i as u16;
-        if screen_y >= area.y + area.height {
-            break;
-        }
-
-        // Fill row background
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, screen_y, ' ', default_fg, row_bg);
-        }
-
-        // Determine colours
-        let is_selected = row_idx == sidebar.selected;
-        let is_drop_target = explorer_drop_target == Some(row_idx);
-        let is_active = !row.is_dir
-            && !engine.explorer_has_focus
-            && active_path.as_ref().is_some_and(|ap| {
-                row.path.canonicalize().unwrap_or_else(|_| row.path.clone()) == *ap
-            });
-
-        let drop_bg = rc(render::Color {
-            r: 40,
-            g: 60,
-            b: 80,
-        }); // muted blue highlight
-            // Determine name color: error > warning > git modified > default.
-        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
-        let name_fg = if let Some(&(errors, warnings)) = diag_counts.get(&canon) {
-            if errors > 0 {
-                diag_error_fg
-            } else if warnings > 0 {
-                diag_warning_fg
-            } else {
-                default_fg
-            }
-        } else if let Some(&label) = git_statuses.get(&canon) {
-            match label {
-                'A' | '?' => git_added_fg,
-                'D' => git_deleted_fg,
-                _ => git_modified_fg,
-            }
-        } else {
-            default_fg
-        };
-
-        let (fg, bg) = if is_drop_target {
-            (name_fg, drop_bg)
-        } else if is_selected {
-            (name_fg, sel_bg)
-        } else if is_active {
-            (name_fg, active_bg)
-        } else {
-            (name_fg, row_bg)
-        };
-
-        let mut x = area.x;
-        // Indent with subtle vertical guide lines (skip outermost levels)
-        let guide_fg = rc(theme.line_number_fg);
-        for level in 0..row.depth {
-            if x >= area.x + area.width {
-                break;
-            }
-            // Show guide lines (skip level 0 = root indent)
-            if level > 0 {
-                set_cell(buf, x, screen_y, '│', guide_fg, bg);
-            } else {
-                set_cell(buf, x, screen_y, ' ', fg, bg);
-            }
-            x += 1;
-            // One space after guide = 2-col indent per level
-            if x < area.x + area.width {
-                set_cell(buf, x, screen_y, ' ', fg, bg);
-                x += 1;
-            }
-        }
-        // Layout: [chevron (2 cols)] [icon (2 cols)] [space] [name]
-        // Dirs: ▾/▸ + space, then folder icon
-        // Files: 2 spaces (no chevron), then file icon
-        // This keeps icons aligned at the same column for siblings.
-        if row.is_dir {
-            let chevron = if row.is_expanded { '▾' } else { '▸' };
-            if x < area.x + area.width {
-                set_cell(buf, x, screen_y, chevron, fg, bg);
-                x += 1;
-            }
-            if x < area.x + area.width {
-                set_cell(buf, x, screen_y, ' ', fg, bg);
-                x += 1;
-            }
-        } else {
-            // No chevron — 2 blank cols to align with dirs
-            for _ in 0..2 {
-                if x < area.x + area.width {
-                    set_cell(buf, x, screen_y, ' ', fg, bg);
-                    x += 1;
-                }
-            }
-        }
-        // Icon (file or folder)
-        let icon_str = if row.is_dir {
-            crate::icons::FOLDER.s()
-        } else {
-            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            crate::icons::file_icon(ext)
-        };
-        for ch in icon_str.chars() {
-            if x >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, x, screen_y, ch, fg, bg);
-            x += 1;
-        }
-        // Space after icon
-        if x < area.x + area.width {
-            set_cell(buf, x, screen_y, ' ', fg, bg);
-            x += 1;
-        }
-        // Name — or inline rename input when active on this row
-        let is_renaming = engine
-            .explorer_rename
-            .as_ref()
-            .is_some_and(|r| r.path == row.path);
-        if is_renaming {
-            let rename = engine.explorer_rename.as_ref().unwrap();
-            let input_bg = rc(theme.background);
-            let input_fg = rc(theme.foreground);
-            let sel_bg = rc(theme.fuzzy_selected_bg);
-            // Compute selection range (byte offsets)
-            let (sel_lo, sel_hi) = rename
-                .selection_anchor
-                .map(|a| (a.min(rename.cursor), a.max(rename.cursor)))
-                .unwrap_or((0, 0));
-            let has_selection = sel_lo != sel_hi;
-            // Available columns for the input text
-            let avail = (area.x + area.width).saturating_sub(x) as usize;
-            // Cursor char position (0-based)
-            let cursor_char = rename.input[..rename.cursor].chars().count();
-            let total_chars = rename.input.chars().count();
-            // Compute horizontal scroll offset (in chars) to keep cursor visible.
-            // Reserve 1 col for the cursor-at-end block.
-            let scroll = if total_chars < avail || cursor_char < avail.saturating_sub(1) {
-                0
-            } else {
-                cursor_char.saturating_sub(avail.saturating_sub(2))
-            };
-            // Render the input text starting from scroll offset
-            for (char_idx, (byte_idx, ch)) in rename.input.char_indices().enumerate() {
-                if char_idx < scroll {
-                    continue;
-                }
-                if x >= area.x + area.width {
-                    break;
-                }
-                let in_sel = has_selection && byte_idx >= sel_lo && byte_idx < sel_hi;
-                let is_cursor = byte_idx == rename.cursor && !has_selection;
-                let (cell_fg, cell_bg) = if is_cursor {
-                    (input_bg, input_fg)
-                } else if in_sel {
-                    (input_fg, sel_bg)
-                } else {
-                    (input_fg, input_bg)
-                };
-                set_cell(buf, x, screen_y, ch, cell_fg, cell_bg);
-                x += 1;
-            }
-            // Cursor at end of input (append position) — only when no selection
-            if !has_selection && rename.cursor >= rename.input.len() && x < area.x + area.width {
-                set_cell(buf, x, screen_y, ' ', input_bg, input_fg);
-                x += 1;
-            }
-            // Fill remaining width with input background
-            while x < area.x + area.width {
-                set_cell(buf, x, screen_y, ' ', input_fg, input_bg);
-                x += 1;
-            }
-        } else {
-            for ch in row.name.chars() {
-                if x >= area.x + area.width {
-                    break;
-                }
-                set_cell(buf, x, screen_y, ch, fg, bg);
-                x += 1;
-            }
-
-            // Right-aligned indicators: diagnostics then git status
-            if !row.is_dir {
-                let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
-                let right_edge = area.x + area.width - 1; // reserve 1 col for scrollbar
-
-                // Build indicator string right-to-left
-                let git_label = git_statuses.get(&canon).copied();
-                let diag = diag_counts.get(&canon).copied();
-
-                // Calculate how many cols we need
-                let mut parts: Vec<(String, ratatui::style::Color)> = Vec::new();
-                if let Some((errors, warnings)) = diag {
-                    if errors > 0 {
-                        let s = if errors > 9 {
-                            "9+".to_string()
-                        } else {
-                            format!("{}", errors)
-                        };
-                        parts.push((s, diag_error_fg));
-                    }
-                    if warnings > 0 {
-                        let s = if warnings > 9 {
-                            "9+".to_string()
-                        } else {
-                            format!("{}", warnings)
-                        };
-                        parts.push((s, diag_warning_fg));
-                    }
-                }
-                if let Some(label) = git_label {
-                    let color = match label {
-                        'A' | '?' => git_added_fg,
-                        'D' => git_deleted_fg,
-                        _ => git_modified_fg,
-                    };
-                    parts.push((format!("{}", label), color));
-                }
-
-                if !parts.is_empty() {
-                    // Total width: parts joined by spaces
-                    let total_width: u16 = parts.iter().map(|(s, _)| s.len() as u16).sum::<u16>()
-                        + (parts.len() as u16).saturating_sub(1); // spaces between
-                    let start_x = right_edge.saturating_sub(total_width);
-                    if x + 1 < start_x {
-                        let mut px = start_x;
-                        for (idx, (text, color)) in parts.iter().enumerate() {
-                            if idx > 0 {
-                                set_cell(buf, px, screen_y, ' ', *color, bg);
-                                px += 1;
-                            }
-                            for ch in text.chars() {
-                                if px < right_edge {
-                                    set_cell(buf, px, screen_y, ch, *color, bg);
-                                    px += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        visual_row += 1;
-
-        // Inject virtual new-entry row after the parent dir row
-        if !new_entry_rendered {
-            if let Some(after_idx) = new_entry_after_idx {
-                if row_idx == after_idx && visual_row < tree_height {
-                    let ne = engine.explorer_new_entry.as_ref().unwrap();
-                    let parent_depth = row.depth;
-                    let screen_y = area.y + visual_row as u16;
-                    if screen_y < area.y + area.height {
-                        render_new_entry_row(buf, area, screen_y, ne, parent_depth, theme);
-                        visual_row += 1;
-                    }
-                    new_entry_rendered = true;
-                }
-            }
-        }
-    }
-
-    render_explorer_scrollbar(buf, area, sidebar, theme);
-}
-
-/// Vertical scrollbar for the explorer panel. Rendered after the tree
-/// rows by both the quadraui path and the legacy special-mode path so
-/// both share identical scroll indication.
-fn render_explorer_scrollbar(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    sidebar: &TuiSidebar,
-    theme: &Theme,
-) {
-    let total_rows = sidebar.rows.len();
-    let visible_rows_count = area.height as usize;
-    if total_rows > visible_rows_count && area.width >= 2 {
-        let thumb_fg = rc(theme.scrollbar_thumb);
-        let track_fg = rc(theme.scrollbar_track);
-        let track_h = visible_rows_count as f64;
-        let thumb_size = ((visible_rows_count as f64 / total_rows as f64) * track_h)
+    let total_rows = engine.explorer_rows.len();
+    let visible_rows = area.height as usize;
+    let scroll_top = engine.explorer_tree.borrow().scroll_offset();
+    let scrollbar = if total_rows > visible_rows && area.width >= 2 {
+        let track_h = visible_rows as f64;
+        let thumb_size = ((visible_rows as f64 / total_rows as f64) * track_h)
             .ceil()
-            .max(1.0) as u16;
-        let thumb_top = ((sidebar.scroll_top as f64 / total_rows as f64) * track_h).floor() as u16;
-        let sb_x = area.x + area.width - 1;
-        let sb_bg = rc(theme.background);
-        for dy in 0..visible_rows_count as u16 {
-            let y = area.y + dy;
-            if y >= area.y + area.height {
-                break;
-            }
-            let in_thumb = dy >= thumb_top && dy < thumb_top + thumb_size;
-            let (ch, fg) = if in_thumb {
-                ('█', thumb_fg)
-            } else {
-                ('░', track_fg)
-            };
-            set_cell(buf, sb_x, y, ch, fg, sb_bg);
-        }
-    }
-}
-
-/// Render the inline new-file/folder entry row in the explorer tree.
-fn render_new_entry_row(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    screen_y: u16,
-    entry: &crate::core::engine::ExplorerNewEntryState,
-    depth: usize,
-    theme: &Theme,
-) {
-    let input_bg = rc(theme.background);
-    let input_fg = rc(theme.foreground);
-    let dim_fg = rc(theme.line_number_fg);
-    let row_bg = rc(theme.tab_bar_bg);
-
-    // Clear row
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, screen_y, ' ', input_fg, row_bg);
-    }
-
-    let mut x = area.x;
-
-    // Indent (child of parent, so depth + 1) — 2-col per level
-    let indent = "  ".repeat(depth + 1);
-    for ch in indent.chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, screen_y, ch, dim_fg, row_bg);
-        x += 1;
-    }
-
-    // Icon prefix
-    let icon_str = if entry.is_folder {
-        "\u{f07b} " // folder icon
+            .max(1.0);
+        let thumb_top = ((scroll_top as f64 / total_rows as f64) * track_h).floor();
+        let sb_x = (area.x + area.width - 1) as f32;
+        Some(quadraui::SurfaceScrollbar {
+            track_bounds: quadraui::Rect::new(sb_x, area.y as f32, 1.0, area.height as f32),
+            thumb_bounds: quadraui::Rect::new(
+                sb_x,
+                area.y as f32 + thumb_top as f32,
+                1.0,
+                thumb_size as f32,
+            ),
+            total_items: total_rows,
+            visible_items: visible_rows,
+            scroll_offset: scroll_top,
+        })
     } else {
-        "  \u{f15b} " // file icon with spacing
+        None
     };
-    for ch in icon_str.chars() {
-        if x >= area.x + area.width {
-            break;
-        }
-        set_cell(buf, x, screen_y, ch, dim_fg, row_bg);
-        x += 1;
-    }
-
-    // Editable input with inverted cursor — scroll if needed
-    let avail = (area.x + area.width).saturating_sub(x) as usize;
-    let cursor_char = entry.input[..entry.cursor].chars().count();
-    let total_chars = entry.input.chars().count();
-    let scroll = if total_chars < avail || cursor_char < avail.saturating_sub(1) {
-        0
-    } else {
-        cursor_char.saturating_sub(avail.saturating_sub(2))
-    };
-    for (char_idx, (byte_idx, ch)) in entry.input.char_indices().enumerate() {
-        if char_idx < scroll {
-            continue;
-        }
-        if x >= area.x + area.width {
-            break;
-        }
-        let is_cursor = byte_idx == entry.cursor;
-        let cell_fg = if is_cursor { input_bg } else { input_fg };
-        let cell_bg = if is_cursor { input_fg } else { input_bg };
-        set_cell(buf, x, screen_y, ch, cell_fg, cell_bg);
-        x += 1;
-    }
-    // Cursor at end of input (append position)
-    if entry.cursor >= entry.input.len() && x < area.x + area.width {
-        set_cell(buf, x, screen_y, ' ', input_bg, input_fg);
-        x += 1;
-    }
-    // Fill remaining width with input background
-    while x < area.x + area.width {
-        set_cell(buf, x, screen_y, ' ', input_fg, input_bg);
-        x += 1;
-    }
+    engine
+        .scroll_surfaces
+        .borrow_mut()
+        .push(quadraui::ScrollSurface {
+            id: quadraui::WidgetId::new("explorer:sb"),
+            bounds: quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            ),
+            scrollbar,
+        });
 }
 
 /// Render the settings panel — shows current key settings and the file path.
@@ -1357,7 +779,7 @@ pub(super) fn render_search_panel(
         .replace_text_caret
         .replace(engine.project_replace_text.len());
 
-    let view = render::build_search_panel_msv(engine, &sidebar.root, sidebar.search_scroll_top);
+    let view = render::build_search_panel_msv(engine, &engine.cwd, sidebar.search_scroll_top);
     let q_theme = super::quadraui_tui::q_theme(theme);
     quadraui::tui::draw_multi_section_view(
         buf,
@@ -3081,7 +2503,7 @@ pub(super) fn render_debug_sidebar(
     backend.set_current_theme(q_theme);
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(title_rect, &title_bar);
+        let _ = b.draw_status_bar(title_rect, &title_bar, None, None);
     });
 
     if area.height < 2 {
@@ -3093,7 +2515,7 @@ pub(super) fn render_debug_sidebar(
     backend.set_current_theme(q_theme);
     let hits = backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        b.draw_status_bar(action_rect, &action_bar)
+        b.draw_status_bar(action_rect, &action_bar, None, None)
     });
     engine.dap_sidebar_action_hits.replace(hits);
 
@@ -3199,7 +2621,7 @@ pub(super) fn render_terminal_toolbar(
         render::TerminalToolbar::FindBar(bar) => {
             let layout = backend.enter_frame_scope(frame, |b| {
                 use quadraui::Backend;
-                let _regions = b.draw_status_bar(q_rect, &bar);
+                let _regions = b.draw_status_bar(q_rect, &bar, None, None);
                 bar.layout(area.width as f32, 1.0, 2.0, |seg| {
                     quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
                 })

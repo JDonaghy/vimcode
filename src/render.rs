@@ -3538,6 +3538,7 @@ pub fn build_search_panel_msv(
                 badge: None,
                 is_expanded: Some(expanded),
                 decoration: Decoration::Header,
+                edit: None,
             });
         }
 
@@ -3573,6 +3574,7 @@ pub fn build_search_panel_msv(
                 },
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             });
         }
         match_within_file += 1;
@@ -6465,6 +6467,7 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
             badge,
             is_expanded: Some(is_expanded),
             decoration: Decoration::Header,
+            edit: None,
         });
 
         if !is_expanded {
@@ -6502,6 +6505,7 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
                         badge: None,
                         is_expanded: None,
                         decoration: Decoration::Normal,
+                        edit: None,
                     });
                 }
             }
@@ -6518,6 +6522,7 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
                         badge: None,
                         is_expanded: None,
                         decoration: Decoration::Normal,
+                        edit: None,
                     });
                 }
             }
@@ -6536,6 +6541,7 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
                         badge: None,
                         is_expanded: None,
                         decoration: Decoration::Muted,
+                        edit: None,
                     });
                 }
             }
@@ -6584,6 +6590,96 @@ pub fn populate_dap_sidebar_system(engine: &Engine) {
     sidebar.set_rows(3, bp_rows);
 }
 
+/// Populate the `TreeController` on `engine.explorer_tree` with current
+/// row data. Call once per frame before `tree_controller.render()` or
+/// `.handle()`.
+pub fn populate_explorer_tree_controller(engine: &Engine, theme: &Theme) {
+    let mut tree = engine.explorer_tree.borrow_mut();
+    tree.set_has_focus(engine.explorer_has_focus);
+    let tree_rows = build_explorer_tree_rows(&engine.explorer_rows, engine, theme);
+    tree.set_rows(tree_rows);
+}
+
+fn build_explorer_tree_rows(
+    rows: &[ExplorerRow],
+    engine: &Engine,
+    theme: &Theme,
+) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Badge, Decoration, Icon as QIcon, StyledText, TreeRow};
+
+    let (git_statuses, diag_counts) = engine.explorer_indicators();
+    let err_fg = to_quadraui_color(theme.diagnostic_error);
+    let warn_fg = to_quadraui_color(theme.diagnostic_warning);
+
+    let mut out: Vec<TreeRow> = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+
+        let diag = diag_counts.get(&canon).copied();
+        let git_label = git_statuses.get(&canon).copied();
+
+        let decoration = match diag {
+            Some((e, _)) if e > 0 => Decoration::Error,
+            Some((_, w)) if w > 0 => Decoration::Warning,
+            _ if git_label.is_some() => Decoration::Modified,
+            _ => Decoration::Normal,
+        };
+
+        let badge = if let Some((errors, warnings)) = diag {
+            if errors > 0 {
+                Some(Badge::colored(
+                    if errors > 9 {
+                        "9+".to_string()
+                    } else {
+                        errors.to_string()
+                    },
+                    err_fg,
+                ))
+            } else if warnings > 0 {
+                Some(Badge::colored(
+                    if warnings > 9 {
+                        "9+".to_string()
+                    } else {
+                        warnings.to_string()
+                    },
+                    warn_fg,
+                ))
+            } else {
+                git_label.map(|label| Badge::plain(label.to_string()))
+            }
+        } else {
+            git_label.map(|label| Badge::plain(label.to_string()))
+        };
+
+        let icon = if row.is_dir {
+            Some(QIcon::new(
+                icons::FOLDER.nerd.to_string(),
+                icons::FOLDER.fallback.to_string(),
+            ))
+        } else {
+            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let glyph = icons::file_icon(ext).to_string();
+            Some(QIcon::new(glyph, ".".to_string()))
+        };
+
+        out.push(TreeRow {
+            path: vec![row_idx as u16],
+            indent: row.depth as u16,
+            icon,
+            text: StyledText::plain(&row.name),
+            badge,
+            is_expanded: if row.is_dir {
+                Some(row.is_expanded)
+            } else {
+                None
+            },
+            decoration,
+            edit: None,
+        });
+    }
+    out
+}
+
 fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
     use quadraui::{Decoration, StyledText, TreeRow};
     let hint = if session_active {
@@ -6599,6 +6695,7 @@ fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
         badge: None,
         is_expanded: None,
         decoration: Decoration::Muted,
+        edit: None,
     }
 }
 
@@ -6639,6 +6736,7 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             });
             *flat_idx += 1;
             if v.var_ref > 0 && expanded.contains(&v.var_ref) {
@@ -6673,6 +6771,7 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
             badge: None,
             is_expanded: None,
             decoration: Decoration::Normal,
+            edit: None,
         });
         flat_idx += 1;
         if expanded {
@@ -6711,6 +6810,7 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
             badge: None,
             is_expanded: None,
             decoration: Decoration::Normal,
+            edit: None,
         });
         flat_idx += 1;
         if expanded {
@@ -6760,6 +6860,7 @@ fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             }
         })
         .collect()
@@ -6796,6 +6897,7 @@ fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             }
         })
         .collect()
@@ -6837,6 +6939,7 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             });
             flat_idx += 1;
         }
@@ -6880,6 +6983,7 @@ pub fn debug_sidebar_section_to_tree_view(
             badge: None,
             is_expanded: None,
             decoration: Decoration::Muted,
+            edit: None,
         });
     } else {
         for (i, item) in items.iter().enumerate() {
@@ -6895,6 +6999,7 @@ pub fn debug_sidebar_section_to_tree_view(
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Normal,
+                edit: None,
             });
         }
     }
@@ -7063,6 +7168,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
         badge: None,
         is_expanded: Some(ext.sections_expanded[0]),
         decoration: Decoration::Header,
+        edit: None,
     });
 
     if ext.sections_expanded[0] {
@@ -7075,6 +7181,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Muted,
+                edit: None,
             });
         } else {
             for (i, item) in ext.items_installed.iter().enumerate() {
@@ -7102,6 +7209,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
                     badge,
                     is_expanded: None,
                     decoration: Decoration::Normal,
+                    edit: None,
                 });
             }
         }
@@ -7116,6 +7224,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
         badge: None,
         is_expanded: Some(ext.sections_expanded[1]),
         decoration: Decoration::Header,
+        edit: None,
     });
 
     if ext.sections_expanded[1] {
@@ -7133,6 +7242,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
                 badge: None,
                 is_expanded: None,
                 decoration: Decoration::Muted,
+                edit: None,
             });
         } else {
             for (i, item) in ext.items_available.iter().enumerate() {
@@ -7150,6 +7260,7 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
                     badge,
                     is_expanded: None,
                     decoration: Decoration::Normal,
+                    edit: None,
                 });
             }
         }
@@ -7244,6 +7355,7 @@ pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::Mult
                     badge,
                     is_expanded: None,
                     decoration: Decoration::Normal,
+                    edit: None,
                 }
             })
             .collect()
@@ -7297,6 +7409,7 @@ pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::Mult
                     badge,
                     is_expanded: None,
                     decoration: Decoration::Normal,
+                    edit: None,
                 }
             })
             .collect()
@@ -7388,19 +7501,7 @@ pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::Mult
     }
 }
 
-/// One visible row in the flat explorer file-tree list. Shared across all
-/// backends; each backend maintains its own `Vec<ExplorerRow>` alongside
-/// scroll / selection state and calls `explorer_to_tree_view` once per
-/// frame to build the `quadraui::TreeView` the shared `draw_tree`
-/// primitive consumes.
-#[derive(Debug, Clone)]
-pub struct ExplorerRow {
-    pub depth: usize,
-    pub name: String,
-    pub path: std::path::PathBuf,
-    pub is_dir: bool,
-    pub is_expanded: bool,
-}
+pub use crate::core::engine::ExplorerRow;
 
 /// Adapt a flat explorer row list into a `quadraui::TreeView` for the
 /// shared `draw_tree` primitive. Each backend drives its own flat-row
@@ -7411,6 +7512,7 @@ pub struct ExplorerRow {
 /// `engine.explorer_indicators()` — the cached indicator map keyed by
 /// canonical path. Directories get a folder glyph; files get the
 /// extension-based icon from `icons::file_icon`.
+#[cfg(feature = "win-gui")]
 pub fn explorer_to_tree_view(
     rows: &[ExplorerRow],
     scroll_top: usize,
@@ -7494,6 +7596,7 @@ pub fn explorer_to_tree_view(
                 None
             },
             decoration,
+            edit: None,
         });
     }
 

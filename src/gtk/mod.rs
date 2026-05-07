@@ -41,7 +41,6 @@ mod util;
 use click::*;
 use css::*;
 use draw::*;
-use explorer::ExplorerState;
 use util::*;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,13 +276,10 @@ struct App {
     /// A.6f: shared `active_panel` mirror — lets the draw func read the
     /// current panel without borrowing `&self`. Updated in `Msg::SwitchPanel`.
     activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>>,
-    /// Flat row model + expand / selection state backing the explorer DA.
-    explorer_state: Rc<RefCell<ExplorerState>>,
-    /// Row height actually used by the most recent `draw_explorer_panel`
-    /// call. The draw callback writes this each frame from the same Pango
+    /// Row height actually used by the most recent explorer draw call.
+    /// The draw callback writes this each frame from the same Pango
     /// context it renders with, so click and scroll handlers hit-test with
-    /// byte-exact row math (Cairo-backed Pango contexts can report
-    /// line-heights that drift from `cached_ui_line_height` on HiDPI).
+    /// byte-exact row math.
     explorer_row_height_cell: Rc<Cell<f64>>,
     /// Fractional dy accumulator for the explorer scroll wheel. Small
     /// trackpad deltas are summed here until they exceed one row, so no
@@ -2013,13 +2009,6 @@ impl SimpleComponent for App {
             );
         }
 
-        // Explorer sidebar state (Phase A.2b-2): flat-row model backing
-        // the DrawingArea. Initialised from the engine's cwd so the root
-        // folder starts expanded, matching the TUI's default.
-        let explorer_state: Rc<RefCell<ExplorerState>> = {
-            let root = engine.borrow().cwd.clone();
-            Rc::new(RefCell::new(ExplorerState::new(&root)))
-        };
         let explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
             Rc::new(RefCell::new(None));
         let activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
@@ -2201,7 +2190,6 @@ impl SimpleComponent for App {
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             activity_bar_da_ref: activity_bar_da_ref.clone(),
             activity_bar_active_panel: activity_bar_active_panel.clone(),
-            explorer_state: explorer_state.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
             explorer_scrollbar_rect: explorer_scrollbar_rect.clone(),
@@ -2446,10 +2434,9 @@ impl SimpleComponent for App {
         }
         *settings_da_ref.borrow_mut() = Some(widgets.settings_da.clone());
 
-        // ── Explorer sidebar (Phase A.2b-2: native TreeView → DrawingArea) ─────
+        // ── Explorer sidebar — TreeController render ─────────────────────────
         {
             let engine_d = engine.clone();
-            let state_d = explorer_state.clone();
             let row_h_cell = explorer_row_height_cell.clone();
             let sb_rect_cell = explorer_scrollbar_rect.clone();
             let backend_d = backend.clone();
@@ -2467,29 +2454,55 @@ impl SimpleComponent for App {
                 row_h_cell.set(row_h);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                let state = state_d.borrow();
-                let has_focus = engine.explorer_has_focus;
-                let tree = crate::render::explorer_to_tree_view(
-                    &state.rows,
-                    state.scroll_top,
-                    state.selected,
-                    has_focus,
-                    &engine,
-                    &theme,
-                );
-                let sb_rect = draw_explorer_panel(
-                    cr,
-                    &layout,
-                    &tree,
-                    &theme,
-                    0.0,
-                    0.0,
-                    w,
-                    h,
-                    line_height,
-                    &backend_d,
-                );
-                sb_rect_cell.set(sb_rect);
+
+                let item_height = row_h;
+                let visible_rows = if item_height > 0.0 {
+                    (h / item_height).floor() as usize
+                } else {
+                    0
+                };
+                engine.explorer_viewport_rows.set(visible_rows);
+                let q_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
+                engine.explorer_tree_rect.set(q_rect);
+
+                crate::render::populate_explorer_tree_controller(&engine, &theme);
+
+                let total = engine.explorer_rows.len();
+                let need_sb = visible_rows > 0 && total > visible_rows;
+                let sb_w_px = if need_sb { 8.0 } else { 0.0 };
+                let tree_w = (w - sb_w_px).max(0.0);
+                let tree_rect = quadraui::Rect::new(0.0, 0.0, tree_w as f32, h as f32);
+
+                backend_d.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                    b.set_current_theme(crate::gtk::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    engine.explorer_tree.borrow().render(b, tree_rect);
+                });
+
+                if need_sb {
+                    let sb_x = tree_w;
+                    let scroll_top = engine.explorer_tree.borrow().scroll_offset();
+                    let track_len = h;
+                    let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
+                    let max_scroll = total.saturating_sub(visible_rows) as f64;
+                    let scroll_ratio = if max_scroll > 0.0 {
+                        scroll_top as f64 / max_scroll
+                    } else {
+                        0.0
+                    };
+                    let thumb_y = scroll_ratio * (track_len - thumb_len);
+                    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
+                    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+                    cr.set_source_rgb(bg_r, bg_g, bg_b);
+                    cr.rectangle(sb_x, 0.0, sb_w_px, track_len);
+                    cr.fill().ok();
+                    cr.set_source_rgb(dim_r, dim_g, dim_b);
+                    cr.rectangle(sb_x + 2.0, thumb_y, sb_w_px - 4.0, thumb_len);
+                    cr.fill().ok();
+                    sb_rect_cell.set(Some((sb_x, 0.0, sb_w_px, track_len)));
+                } else {
+                    sb_rect_cell.set(None);
+                }
             });
         }
         {
@@ -2556,12 +2569,12 @@ impl SimpleComponent for App {
         // suppresses the click (#199).
         {
             let sb_rect_begin = explorer_scrollbar_rect.clone();
-            let state_begin = explorer_state.clone();
+            let engine_begin = engine.clone();
             let row_h_begin = explorer_row_height_cell.clone();
             let da_begin = widgets.explorer_da.clone();
             let drag_state_begin = model.backend.borrow().drag_state_handle();
 
-            let state_update = explorer_state.clone();
+            let engine_update = engine.clone();
             let da_update = widgets.explorer_da.clone();
             let drag_state_update = model.backend.borrow().drag_state_handle();
 
@@ -2579,7 +2592,8 @@ impl SimpleComponent for App {
                 }
                 g.set_state(gtk4::EventSequenceState::Claimed);
 
-                let total = state_begin.borrow().rows.len();
+                let eng = engine_begin.borrow();
+                let total = eng.explorer_rows.len();
                 let item_h = row_h_begin.get().max(1.0);
                 let viewport = (da_begin.height() as f64 / item_h).floor().max(0.0) as usize;
                 let max_scroll = total.saturating_sub(viewport);
@@ -2587,15 +2601,10 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                // Compute the visible thumb's pixel range using the same
-                // math the renderer uses (Stage 5c parity with TUI). If
-                // the click lands on the thumb, `grab_offset` preserves
-                // the cursor's relative position so the thumb doesn't
-                // jump out from under the user.
                 let thumb_ratio = (viewport as f32 / total as f32).min(1.0);
                 let thumb_length = (sb_h as f32 * thumb_ratio).max(1.0);
                 let effective_track = (sb_h as f32 - thumb_length).max(1.0);
-                let scroll_top = state_begin.borrow().scroll_top;
+                let scroll_top = eng.explorer_tree.borrow().scroll_offset();
                 let scroll_ratio = if max_scroll == 0 {
                     0.0
                 } else {
@@ -2608,6 +2617,7 @@ impl SimpleComponent for App {
                 } else {
                     0.0
                 };
+                drop(eng);
 
                 drag_state_begin
                     .borrow_mut()
@@ -2620,9 +2630,6 @@ impl SimpleComponent for App {
                         grab_offset,
                     });
 
-                // Apply the click-time offset using the same thumb-aware
-                // dispatch path subsequent drags will use, so the thumb
-                // doesn't visually jump on the first drag event.
                 let events = quadraui::dispatch_mouse_drag(
                     &drag_state_begin.borrow(),
                     quadraui::Point {
@@ -2633,7 +2640,11 @@ impl SimpleComponent for App {
                 );
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                        state_begin.borrow_mut().scroll_top = *new_offset;
+                        engine_begin
+                            .borrow()
+                            .explorer_tree
+                            .borrow_mut()
+                            .set_scroll_offset(*new_offset);
                     }
                 }
 
@@ -2659,7 +2670,11 @@ impl SimpleComponent for App {
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
                         if widget.as_str() == "explorer:sb" {
-                            state_update.borrow_mut().scroll_top = *new_offset;
+                            engine_update
+                                .borrow()
+                                .explorer_tree
+                                .borrow_mut()
+                                .set_scroll_offset(*new_offset);
                             da_update.queue_draw();
                         }
                     }
@@ -5082,47 +5097,13 @@ impl App {
     /// replacement for `highlight_file_in_tree` (which operated on the
     /// native `gtk4::TreeView`).
     fn reveal_path_in_explorer(&self, target: &Path) {
-        let engine = self.engine.borrow();
-        let root = engine.cwd.clone();
-        let show_hidden = engine.settings.show_hidden_files;
-        let case_insensitive = engine.settings.explorer_sort_case_insensitive;
-        drop(engine);
-        let viewport_rows = self
-            .explorer_sidebar_da_ref
-            .borrow()
-            .as_ref()
-            .map(|da| {
-                let h = da.height() as f64;
-                let item_h = self.explorer_row_height_cell.get().max(1.0);
-                (h / item_h).floor().max(0.0) as usize
-            })
-            .unwrap_or(20);
-        self.explorer_state.borrow_mut().reveal_path(
-            target,
-            &root,
-            viewport_rows,
-            show_hidden,
-            case_insensitive,
-        );
-        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            da.queue_draw();
-        }
+        self.engine.borrow_mut().explorer_reveal_path(target);
+        self.queue_explorer_draw();
     }
 
-    /// Rebuild the explorer flat-row list from disk (used after file
-    /// create/rename/delete/move or when `cwd` changes) and redraw the DA.
     fn refresh_explorer(&self) {
-        let engine = self.engine.borrow();
-        let root = engine.cwd.clone();
-        let show_hidden = engine.settings.show_hidden_files;
-        let case_insensitive = engine.settings.explorer_sort_case_insensitive;
-        drop(engine);
-        self.explorer_state
-            .borrow_mut()
-            .rebuild(&root, show_hidden, case_insensitive);
-        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            da.queue_draw();
-        }
+        self.engine.borrow_mut().explorer_rebuild_rows();
+        self.queue_explorer_draw();
     }
 
     /// Save the current session state and exit the process immediately.
@@ -5625,44 +5606,12 @@ impl App {
         // GTK focus on sidebar DrawingAreas is unreliable, so we check
         // the engine focus flags here (same approach as TUI backend).
 
-        // Explorer sidebar: CRUD keys + navigation
+        // Explorer keys are routed through Msg::ExplorerKey when the DA
+        // has focus. This fallback catches keys when the DA lacks GTK
+        // widget focus (grab_focus is unreliable for DrawingAreas).
         if self.engine.borrow().explorer_has_focus {
-            let key_mapped = map_gtk_key_name(key_name.as_str());
-            if key_mapped == "Escape" {
-                self.engine.borrow_mut().explorer_has_focus = false;
-                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
-                self.draw_needed.set(true);
-                return;
-            }
-            // Explorer CRUD keys
-            if !ctrl {
-                if let Some(ch) = unicode {
-                    let is_crud = self
-                        .engine
-                        .borrow()
-                        .settings
-                        .explorer_keys
-                        .resolve(ch)
-                        .is_some();
-                    if is_crud {
-                        // Defer to avoid borrow conflicts with start_inline_new_entry
-                        let s = sender.clone();
-                        gtk4::glib::idle_add_local_once(move || {
-                            s.input(Msg::ExplorerAction(ch.to_string()));
-                        });
-                        self.draw_needed.set(true);
-                        return;
-                    }
-                }
-            }
-            // Let j/k/Up/Down through to TreeView for navigation
-            if matches!(key_mapped, "j" | "k" | "Up" | "Down") {
-                return; // don't consume — let GTK TreeView handle navigation
-            }
-            // Other keys while explorer focused — ignore (don't pass to editor)
+            let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
+            self.handle_explorer_da_key(key_mapped, unicode, ctrl, sender);
             self.draw_needed.set(true);
             return;
         }
@@ -6232,10 +6181,9 @@ impl App {
                 self.draw_needed.set(true);
             }
         }
-        // Explorer tree indicators (modified/diagnostics) are now pulled by
-        // the DrawingArea's draw callback from `engine.explorer_indicators()`
-        // via the `explorer_to_tree_view` adapter, so we just trigger a
-        // redraw on a 1 Hz cadence to pick up background changes.
+        // Explorer tree indicators (modified/diagnostics) are pulled by
+        // the draw callback via `populate_explorer_tree_controller`, so we
+        // trigger a redraw on a 1 Hz cadence to pick up background changes.
         if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tree_indicator_update = std::time::Instant::now();
             if self.active_panel == SidebarPanel::Explorer {
@@ -10403,84 +10351,37 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::StartInlineNewFile(parent_dir) => {
-                sender.input(Msg::PromptNewFile(parent_dir));
+            Msg::StartInlineNewFile(_) => {
+                sender.input(Msg::ExplorerAction("new_file".to_string()));
             }
-            Msg::StartInlineNewFolder(parent_dir) => {
-                sender.input(Msg::PromptNewFolder(parent_dir));
+            Msg::StartInlineNewFolder(_) => {
+                sender.input(Msg::ExplorerAction("new_folder".to_string()));
             }
             Msg::ExplorerActivateSelected => {
-                let state = self.explorer_state.borrow();
-                if state.selected < state.rows.len() {
-                    let row = &state.rows[state.selected];
-                    let path = row.path.clone();
-                    let is_dir = row.is_dir;
-                    drop(state);
-                    if is_dir {
-                        let root = self.engine.borrow().cwd.clone();
-                        let show_hidden = self.engine.borrow().settings.show_hidden_files;
-                        let case_insensitive =
-                            self.engine.borrow().settings.explorer_sort_case_insensitive;
-                        let idx = self.explorer_state.borrow().selected;
-                        self.explorer_state.borrow_mut().toggle_dir(
-                            idx,
-                            &root,
-                            show_hidden,
-                            case_insensitive,
-                        );
-                        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                            da.queue_draw();
-                        }
-                    } else {
-                        sender.input(Msg::OpenFileFromSidebar(path));
+                self.engine.borrow_mut().explorer_activate_selected();
+                let still_focused = self.engine.borrow().explorer_has_focus;
+                if !still_focused {
+                    if let Some(ref drawing) = *self.drawing_area.borrow() {
+                        drawing.grab_focus();
                     }
                 }
+                self.queue_explorer_draw();
+                self.draw_needed.set(true);
             }
-            Msg::ExplorerAction(key_str) => {
+            Msg::ExplorerAction(action_str) => {
                 use crate::core::settings::ExplorerAction;
-                let action = key_str
-                    .chars()
-                    .next()
-                    .and_then(|ch| self.engine.borrow().settings.explorer_keys.resolve(ch));
+                let action = match action_str.as_str() {
+                    "new_file" => Some(ExplorerAction::NewFile),
+                    "new_folder" => Some(ExplorerAction::NewFolder),
+                    "rename" => Some(ExplorerAction::Rename),
+                    "delete" => Some(ExplorerAction::Delete),
+                    "move_file" => Some(ExplorerAction::MoveFile),
+                    _ => None,
+                };
                 if let Some(action) = action {
-                    let selected_path: Option<PathBuf> = {
-                        let state = self.explorer_state.borrow();
-                        if state.selected < state.rows.len() {
-                            Some(state.rows[state.selected].path.clone())
-                        } else {
-                            None
-                        }
-                    };
-                    let parent_dir = match selected_path.as_ref() {
-                        Some(p) if p.is_dir() => p.clone(),
-                        Some(p) => p
-                            .parent()
-                            .map(|pp| pp.to_path_buf())
-                            .unwrap_or_else(|| self.engine.borrow().cwd.clone()),
-                        None => self.engine.borrow().cwd.clone(),
-                    };
-                    match action {
-                        ExplorerAction::NewFile => {
-                            sender.input(Msg::PromptNewFile(parent_dir));
-                        }
-                        ExplorerAction::NewFolder => {
-                            sender.input(Msg::PromptNewFolder(parent_dir));
-                        }
-                        ExplorerAction::Delete => {
-                            if let Some(path) = selected_path {
-                                sender.input(Msg::ConfirmDeletePath(path));
-                            }
-                        }
-                        ExplorerAction::Rename => {
-                            if let Some(path) = selected_path {
-                                sender.input(Msg::PromptRenameFile(path));
-                            }
-                        }
-                        ExplorerAction::MoveFile => {
-                            // Move not yet supported via keyboard in GTK
-                            // (uses status-line prompt in TUI)
-                        }
-                    }
+                    self.engine.borrow_mut().dispatch_explorer_crud(action);
+                    self.queue_explorer_draw();
+                    self.draw_needed.set(true);
                 }
             }
             Msg::ConfirmDeletePath(path) => {
@@ -10573,6 +10474,8 @@ impl App {
                 ctrl,
             } => {
                 self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
+                self.queue_explorer_draw();
+                self.draw_needed.set(true);
             }
             Msg::ExplorerClick { x, y, n_press } => {
                 self.handle_explorer_da_click(x, y, n_press, sender);
@@ -10581,22 +10484,6 @@ impl App {
                 self.handle_explorer_da_right_click(x, y, sender);
             }
             Msg::ExplorerScroll(dy) => {
-                let total = self.explorer_state.borrow().rows.len();
-                let viewport = self
-                    .explorer_sidebar_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| {
-                        let item_h = self.explorer_row_height_cell.get().max(1.0);
-                        (da.height() as f64 / item_h).floor().max(0.0) as usize
-                    })
-                    .unwrap_or(0);
-                let max_scroll = total.saturating_sub(viewport);
-                // GTK scroll events can arrive with fractional `dy`
-                // (trackpads, smooth scrolling) as well as integer steps
-                // (mouse wheel notches). We accumulate the scaled delta
-                // so small trackpad deltas aren't silently dropped and
-                // large wheel notches still move a noticeable amount.
                 let scaled = dy * 3.0;
                 let accum = self.explorer_scroll_accum.get() + scaled;
                 let step = accum.trunc() as isize;
@@ -10604,94 +10491,23 @@ impl App {
                 if step == 0 {
                     return;
                 }
-                let mut st = self.explorer_state.borrow_mut();
-                let new_top = (st.scroll_top as isize + step).max(0) as usize;
-                st.scroll_top = new_top.min(max_scroll);
-                drop(st);
-                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
+                self.engine.borrow_mut().explorer_scroll(step);
+                self.queue_explorer_draw();
             }
-            Msg::PromptRenameFile(path) => {
-                let sender_clone = sender.input_sender().clone();
-                let initial = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let path_for_close = path.clone();
-                self.prompt_for_name(
-                    "Rename",
-                    &format!("Rename '{}' to:", initial),
-                    &initial,
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::RenameFile(path_for_close.clone(), name))
-                            .ok();
-                    }),
-                );
-            }
-            Msg::PromptNewFile(parent_dir) => {
-                let sender_clone = sender.input_sender().clone();
-                self.prompt_for_name(
-                    "New File",
-                    &format!(
-                        "Create file under {}:",
-                        parent_dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ),
-                    "",
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::CreateFile(parent_dir.clone(), name))
-                            .ok();
-                    }),
-                );
-            }
-            Msg::PromptNewFolder(parent_dir) => {
-                let sender_clone = sender.input_sender().clone();
-                self.prompt_for_name(
-                    "New Folder",
-                    &format!(
-                        "Create folder under {}:",
-                        parent_dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ),
-                    "",
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::CreateFolder(parent_dir.clone(), name))
-                            .ok();
-                    }),
-                );
+            Msg::PromptRenameFile(_) | Msg::PromptNewFile(_) | Msg::PromptNewFolder(_) => {
+                // Explorer CRUD now uses inline editing via TreeController.
+                // These dialog paths are kept as Msg variants for backwards
+                // compatibility but nothing sends them.
             }
             _ => unreachable!(),
         }
     }
 
-    /// Visible-row capacity of the explorer DrawingArea in the current
-    /// allocation. Returns 0 when the DA hasn't been measured yet.
-    fn explorer_viewport_rows(&self) -> usize {
-        self.explorer_sidebar_da_ref
-            .borrow()
-            .as_ref()
-            .map(|da| {
-                let item_h = self.explorer_row_height_cell.get().max(1.0);
-                (da.height() as f64 / item_h).floor().max(0.0) as usize
-            })
-            .unwrap_or(0)
-    }
-
-    /// Pixel y → flat row index. Returns None if out of bounds or
-    /// scroll_offset overshoots the row count.
     fn explorer_row_at(&self, y: f64) -> Option<usize> {
-        let state = self.explorer_state.borrow();
-        let total = state.rows.len();
-        let scroll_top = state.scroll_top;
-        drop(state);
+        let engine = self.engine.borrow();
+        let total = engine.explorer_rows.len();
+        let scroll_top = engine.explorer_tree.borrow().scroll_offset();
+        drop(engine);
         let item_h = self.explorer_row_height_cell.get().max(1.0);
         let local = (y / item_h).floor().max(0.0) as usize;
         let idx = scroll_top + local;
@@ -10709,173 +10525,62 @@ impl App {
         ctrl: bool,
         sender: &ComponentSender<Self>,
     ) {
-        // Escape returns focus to editor.
-        if key_name == "Escape" {
-            sender.input(Msg::FocusEditor);
+        // When an engine dialog is active (delete confirmation), route
+        // keys to the dialog handler, not the explorer dispatch.
+        if self.engine.borrow().dialog.is_some() {
+            let mapped = map_gtk_key_name(&key_name);
+            self.engine.borrow_mut().handle_key(mapped, unicode, false);
+            self.draw_needed.set(true);
             return;
         }
-        // Panel-nav shortcuts (Ctrl-B / Ctrl-Shift-E / Ctrl-Shift-F).
-        // The B.5b Stage 2 dispatcher needs a `gtk4::gdk::Key` — we
-        // lost the original here (it was consumed in the controller
-        // callback to build the String), so dispatch by approximate
-        // string match for the common cases.
-        let pk_toggle_sidebar = self
-            .engine
-            .borrow()
-            .settings
-            .panel_keys
-            .toggle_sidebar
-            .clone();
-        let pk_focus_explorer = self
-            .engine
-            .borrow()
-            .settings
-            .panel_keys
-            .focus_explorer
-            .clone();
-        let pk_focus_search = self
-            .engine
-            .borrow()
-            .settings
-            .panel_keys
-            .focus_search
-            .clone();
-        // Build a printable form of the current key for the settings
-        // string comparison (e.g. "Ctrl-B", "Ctrl-Shift-E"). The
-        // canonical binding format is defined in
-        // `render::matches_key_binding`; we approximate here and only
-        // match exact strings — good enough for the common defaults.
+
+        // Panel-nav shortcuts before engine dispatch.
+        let (pk_toggle, pk_explorer, pk_search) = {
+            let eng = self.engine.borrow();
+            (
+                eng.settings.panel_keys.toggle_sidebar.clone(),
+                eng.settings.panel_keys.focus_explorer.clone(),
+                eng.settings.panel_keys.focus_search.clone(),
+            )
+        };
         let printable = match (ctrl, unicode) {
             (true, Some(c)) => format!("Ctrl-{}", c.to_ascii_uppercase()),
             (false, Some(c)) => c.to_string(),
             _ => key_name.clone(),
         };
-        if printable == pk_toggle_sidebar {
+        if printable == pk_toggle {
             sender.input(Msg::ToggleSidebar);
             return;
         }
-        if printable == pk_focus_explorer {
+        if printable == pk_explorer {
             sender.input(Msg::ToggleFocusExplorer);
             return;
         }
-        if printable == pk_focus_search {
+        if printable == pk_search {
             sender.input(Msg::ToggleFocusSearch);
             return;
         }
 
-        // Vim-style single-char navigation keys (j/k/h/l) take priority
-        // over the generic explorer_keys shortcuts so the user can always
-        // navigate the tree regardless of how explorer_keys is configured.
-        if !ctrl {
-            if let Some(ch) = unicode {
-                match ch {
-                    'j' => {
-                        self.explorer_move_selection(1);
-                        return;
-                    }
-                    'k' => {
-                        self.explorer_move_selection(-1);
-                        return;
-                    }
-                    'l' => {
-                        sender.input(Msg::ExplorerActivateSelected);
-                        return;
-                    }
-                    'h' => {
-                        self.explorer_collapse_or_parent();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        use crate::core::engine::ExplorerKeyResult;
+        let result = self
+            .engine
+            .borrow_mut()
+            .dispatch_explorer_key(&key_name, unicode, ctrl);
 
-        match key_name.as_str() {
-            "Return" | "KP_Enter" => {
-                sender.input(Msg::ExplorerActivateSelected);
-            }
-            "Down" => {
-                self.explorer_move_selection(1);
-            }
-            "Up" => {
-                self.explorer_move_selection(-1);
-            }
-            "Page_Down" | "KP_Page_Down" => {
-                let v = self.explorer_viewport_rows().max(1) as isize;
-                self.explorer_move_selection(v);
-            }
-            "Page_Up" | "KP_Page_Up" => {
-                let v = self.explorer_viewport_rows().max(1) as isize;
-                self.explorer_move_selection(-v);
-            }
-            "Home" => {
-                let mut st = self.explorer_state.borrow_mut();
-                st.selected = 0;
-                st.scroll_top = 0;
-                drop(st);
-                self.queue_explorer_draw();
-            }
-            "End" => {
-                let mut st = self.explorer_state.borrow_mut();
-                if !st.rows.is_empty() {
-                    st.selected = st.rows.len() - 1;
-                }
-                let v = self.explorer_viewport_rows();
-                st.ensure_visible(v);
-                drop(st);
-                self.queue_explorer_draw();
-            }
-            "Right" => {
-                // Right — activate (open or expand).
-                sender.input(Msg::ExplorerActivateSelected);
-            }
-            "Left" => {
-                self.explorer_collapse_or_parent();
-            }
-            _ => {
-                // Single-char explorer shortcuts (a/A/D/r/M etc.).
-                if !ctrl {
-                    if let Some(ch) = unicode {
-                        let ch_str = ch.to_string();
-                        let is_explorer_key = {
-                            let ek = &self.engine.borrow().settings.explorer_keys;
-                            ch_str == ek.new_file
-                                || ch_str == ek.new_folder
-                                || ch_str == ek.delete
-                                || ch_str == ek.rename
-                                || ch_str == ek.move_file
-                        };
-                        if is_explorer_key {
-                            sender.input(Msg::ExplorerAction(ch_str));
-                        }
-                    }
+        match result {
+            ExplorerKeyResult::Unfocused => {
+                self.engine.borrow_mut().explorer_has_focus = false;
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
                 }
             }
+            ExplorerKeyResult::FocusToolbar => {
+                // GTK doesn't have a toolbar focus concept — treat as no-op
+            }
+            _ => {}
         }
-    }
-
-    fn explorer_move_selection(&self, delta: isize) {
-        let mut st = self.explorer_state.borrow_mut();
-        let total = st.rows.len();
-        if total == 0 {
-            return;
-        }
-        let new_sel = (st.selected as isize + delta)
-            .max(0)
-            .min(total as isize - 1) as usize;
-        st.selected = new_sel;
-        let viewport_rows = self
-            .explorer_sidebar_da_ref
-            .borrow()
-            .as_ref()
-            .map(|da| {
-                let item_h = self.explorer_row_height_cell.get().max(1.0);
-                (da.height() as f64 / item_h).floor().max(0.0) as usize
-            })
-            .unwrap_or(0);
-        st.ensure_visible(viewport_rows);
-        drop(st);
         self.queue_explorer_draw();
+        self.draw_needed.set(true);
     }
 
     fn queue_explorer_draw(&self) {
@@ -10884,40 +10589,29 @@ impl App {
         }
     }
 
-    /// h / Left behaviour: collapse the current dir if it is expanded,
-    /// otherwise move selection to the parent-depth row above.
-    fn explorer_collapse_or_parent(&self) {
-        let (idx, is_dir, is_expanded, depth) = {
-            let st = self.explorer_state.borrow();
-            if st.selected >= st.rows.len() {
-                return;
-            }
-            let r = &st.rows[st.selected];
-            (st.selected, r.is_dir, r.is_expanded, r.depth)
-        };
-        if is_dir && is_expanded {
-            let root = self.engine.borrow().cwd.clone();
-            let show_hidden = self.engine.borrow().settings.show_hidden_files;
-            let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
-            self.explorer_state
-                .borrow_mut()
-                .toggle_dir(idx, &root, show_hidden, case_insensitive);
-            self.queue_explorer_draw();
-        } else if depth > 0 {
-            let new_selected = {
-                let st = self.explorer_state.borrow();
-                (0..idx)
-                    .rev()
-                    .find(|&i| st.rows[i].depth < depth)
-                    .unwrap_or(0)
-            };
-            let mut st = self.explorer_state.borrow_mut();
-            st.selected = new_selected;
-            let v = self.explorer_viewport_rows();
-            st.ensure_visible(v);
-            drop(st);
-            self.queue_explorer_draw();
+    fn explorer_jump_scroll(&self, click_y: f64, sb_y: f64, sb_h: f64) {
+        let engine = self.engine.borrow();
+        let total = engine.explorer_rows.len();
+        let viewport = engine.explorer_viewport_rows.get();
+        let max_scroll = total.saturating_sub(viewport);
+        if max_scroll == 0 || sb_h <= 0.0 {
+            return;
         }
+        let thumb_ratio = (viewport as f64 / total as f64).min(1.0);
+        let thumb_h = (sb_h * thumb_ratio).max(1.0);
+        let effective_track = (sb_h - thumb_h).max(1.0);
+        let scroll_top = engine.explorer_tree.borrow().scroll_offset();
+        let scroll_ratio = (scroll_top as f64 / max_scroll.max(1) as f64).clamp(0.0, 1.0);
+        let thumb_top = sb_y + scroll_ratio * effective_track;
+        if click_y >= thumb_top && click_y < thumb_top + thumb_h {
+            return;
+        }
+        let rel = ((click_y - sb_y) / effective_track).clamp(0.0, 1.0);
+        let new_top = (rel * max_scroll as f64).round() as usize;
+        engine
+            .explorer_tree
+            .borrow_mut()
+            .set_scroll_offset(new_top.min(max_scroll));
     }
 
     fn handle_explorer_da_click(
@@ -10932,8 +10626,6 @@ impl App {
         }
         self.engine.borrow_mut().explorer_has_focus = true;
 
-        // Scrollbar click: jump-scroll so the click y becomes the thumb
-        // centre. Return early so the click doesn't also hit-test a row.
         if let Some((sb_x, sb_y, sb_w, sb_h)) = self.explorer_scrollbar_rect.get() {
             if x >= sb_x && x <= sb_x + sb_w && y >= sb_y && y <= sb_y + sb_h {
                 self.explorer_jump_scroll(y, sb_y, sb_h);
@@ -10946,21 +10638,21 @@ impl App {
             return;
         };
         let (path, is_dir) = {
-            let mut st = self.explorer_state.borrow_mut();
-            st.selected = idx;
-            let row = &st.rows[idx];
+            let eng = self.engine.borrow();
+            if idx >= eng.explorer_rows.len() {
+                return;
+            }
+            let row = &eng.explorer_rows[idx];
             (row.path.clone(), row.is_dir)
         };
+        self.engine
+            .borrow()
+            .explorer_tree
+            .borrow_mut()
+            .set_selected_path(Some(vec![idx as u16]));
         self.queue_explorer_draw();
         if is_dir {
-            // Single or double click on a dir toggles expansion — matches
-            // typical file-tree UX.
-            let root = self.engine.borrow().cwd.clone();
-            let show_hidden = self.engine.borrow().settings.show_hidden_files;
-            let case_insensitive = self.engine.borrow().settings.explorer_sort_case_insensitive;
-            self.explorer_state
-                .borrow_mut()
-                .toggle_dir(idx, &root, show_hidden, case_insensitive);
+            self.engine.borrow_mut().explorer_toggle_dir(idx);
             self.queue_explorer_draw();
         } else if n_press >= 2 {
             sender.input(Msg::OpenFileFromSidebar(path));
@@ -10969,55 +10661,24 @@ impl App {
         }
     }
 
-    /// Update `scroll_top` so the clicked y lands at the thumb top.
-    /// `sb_y` / `sb_h` are the scrollbar track bounds.
-    ///
-    /// Uses the same thumb-aware math as `quadraui::dispatch_mouse_drag`
-    /// so that this single-click jump and a subsequent drag converge
-    /// on the same scroll position. Clicks landing on the visible thumb
-    /// are no-ops — `GestureDrag::drag_begin` arms the drag and the
-    /// thumb stays where the user grabbed it (no visual jump).
-    fn explorer_jump_scroll(&self, click_y: f64, sb_y: f64, sb_h: f64) {
-        let total = self.explorer_state.borrow().rows.len();
-        let viewport = self.explorer_viewport_rows();
-        let max_scroll = total.saturating_sub(viewport);
-        if max_scroll == 0 || sb_h <= 0.0 {
-            return;
-        }
-        // Visible thumb geometry — same formulas dispatch_mouse_drag uses.
-        let thumb_ratio = (viewport as f64 / total as f64).min(1.0);
-        let thumb_h = (sb_h * thumb_ratio).max(1.0);
-        let effective_track = (sb_h - thumb_h).max(1.0);
-        let scroll_top = self.explorer_state.borrow().scroll_top;
-        let scroll_ratio = (scroll_top as f64 / max_scroll.max(1) as f64).clamp(0.0, 1.0);
-        let thumb_top = sb_y + scroll_ratio * effective_track;
-        // Click on the visible thumb → leave scroll alone; GestureDrag
-        // takes over with its own grab_offset calculation.
-        if click_y >= thumb_top && click_y < thumb_top + thumb_h {
-            return;
-        }
-        // Click on the track outside the thumb → jump so the thumb top
-        // lands at the cursor.
-        let rel = ((click_y - sb_y) / effective_track).clamp(0.0, 1.0);
-        let new_top = (rel * max_scroll as f64).round() as usize;
-        self.explorer_state.borrow_mut().scroll_top = new_top.min(max_scroll);
-    }
-
     fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, sender: &ComponentSender<Self>) {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.grab_focus();
         }
         self.engine.borrow_mut().explorer_has_focus = true;
-        // If click lands on a row, select it before opening the menu.
-        // If below the last row, fall back to the workspace root.
         let (target, is_dir) = if let Some(idx) = self.explorer_row_at(y) {
-            let mut st = self.explorer_state.borrow_mut();
-            st.selected = idx;
-            let row = &st.rows[idx];
-            (row.path.clone(), row.is_dir)
+            let eng = self.engine.borrow();
+            if idx < eng.explorer_rows.len() {
+                eng.explorer_tree
+                    .borrow_mut()
+                    .set_selected_path(Some(vec![idx as u16]));
+                let row = &eng.explorer_rows[idx];
+                (row.path.clone(), row.is_dir)
+            } else {
+                (self.engine.borrow().cwd.clone(), true)
+            }
         } else {
-            let root = self.engine.borrow().cwd.clone();
-            (root, true)
+            (self.engine.borrow().cwd.clone(), true)
         };
         self.queue_explorer_draw();
         self.show_explorer_context_menu(x, y, target, is_dir, sender);
@@ -11053,15 +10714,6 @@ impl App {
             .map(|it| (it.action.clone(), it.enabled))
             .collect();
 
-        let parent_dir = if target.is_dir() {
-            target.clone()
-        } else {
-            target
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf()
-        };
-
         let actions = gtk4::gio::SimpleActionGroup::new();
         let add_action = |actions: &gtk4::gio::SimpleActionGroup, a: &gtk4::gio::SimpleAction| {
             if ctx_enabled.get(a.name().as_str()) == Some(&false) {
@@ -11072,37 +10724,33 @@ impl App {
 
         {
             let s = sender.input_sender().clone();
-            let pd = parent_dir.clone();
             let a = gtk4::gio::SimpleAction::new("new_file", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptNewFile(pd.clone())).ok();
+                s.send(Msg::ExplorerAction("new_file".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let pd = parent_dir.clone();
             let a = gtk4::gio::SimpleAction::new("new_folder", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptNewFolder(pd.clone())).ok();
+                s.send(Msg::ExplorerAction("new_folder".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let t = target.clone();
             let a = gtk4::gio::SimpleAction::new("rename", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptRenameFile(t.clone())).ok();
+                s.send(Msg::ExplorerAction("rename".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let t = target.clone();
             let a = gtk4::gio::SimpleAction::new("delete", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::ConfirmDeletePath(t.clone())).ok();
+                s.send(Msg::ExplorerAction("delete".to_string())).ok();
             });
             add_action(&actions, &a);
         }
@@ -11228,6 +10876,7 @@ impl App {
     /// `gtk4::TreeView` inline cell editor with this fallback. On OK the
     /// closure fires `on_confirm(name)`. Empty names close the dialog
     /// silently.
+    #[allow(dead_code)]
     fn prompt_for_name(
         &self,
         title: &str,

@@ -1138,6 +1138,8 @@ pub(super) fn draw_breadcrumb_bar(
         let hits = b.draw_status_bar(
             quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
             &bar,
+            None,
+            None,
         );
         *hit_regions_out.borrow_mut() = hits;
     });
@@ -2370,8 +2372,8 @@ pub(super) fn draw_debug_sidebar(
         action_hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            let _ = b.draw_status_bar(title_rect, &title_bar);
-            b.draw_status_bar(action_rect, &action_bar)
+            let _ = b.draw_status_bar(title_rect, &title_bar, None, None);
+            b.draw_status_bar(action_rect, &action_bar, None, None)
         });
     }
 
@@ -2477,7 +2479,7 @@ pub(super) fn draw_terminal_toolbar(
             backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
                 b.set_current_theme(super::quadraui_gtk::q_theme(theme));
                 b.set_current_line_height(line_height);
-                b.draw_status_bar(q_rect, &bar);
+                b.draw_status_bar(q_rect, &bar, None, None);
             });
             let sb_layout = bar.layout(w as f32, line_height as f32, 16.0, |seg| {
                 layout.set_text(&seg.text);
@@ -2728,6 +2730,8 @@ fn draw_window_status_bar(
         b.draw_status_bar(
             quadraui::Rect::new(x as f32, y as f32, width as f32, line_height as f32),
             &bar,
+            None,
+            None,
         )
     });
 
@@ -3427,90 +3431,6 @@ pub(super) fn draw_settings_panel(
     layout.set_text("  Open settings.json");
     cr.move_to(x + 4.0, footer_y + (footer_h - header_lh as f64) / 2.0);
     pangocairo::show_layout(cr, layout);
-}
-
-// ─── Explorer panel (Phase A.2b — DrawingArea migration) ──────────────────────
-//
-// `draw_explorer_panel` renders the file-tree sidebar through
-// `quadraui_gtk::draw_tree`, mirroring the settings-panel migration
-// (A.3c-2) in structure: background fill + a vertical scrollbar overlay
-// for long trees. Row heights come from `draw_tree` itself
-// (`line_height * 1.4`), so the scrollbar math here uses the same scalar
-// to resolve the visible-row count — any future change must keep the two
-// in sync.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_explorer_panel(
-    cr: &Context,
-    layout: &pango::Layout,
-    tree: &quadraui::TreeView,
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    line_height: f64,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
-) -> Option<(f64, f64, f64, f64)> {
-    if w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-
-    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
-    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-
-    // Row heights must match `quadraui_gtk::draw_tree`: header rows use
-    // `line_height`, body rows use `line_height * 1.4`. The explorer
-    // currently emits no header rows (root dir is rendered as a regular
-    // branch), so the visible-row count uses the body height.
-    let item_height = (line_height * 1.4).round();
-    let total = tree.rows.len();
-    let visible_rows = if item_height > 0.0 {
-        (h / item_height).floor() as usize
-    } else {
-        0
-    };
-    let need_sb = visible_rows > 0 && total > visible_rows;
-    let sb_w = if need_sb { 8.0 } else { 0.0 };
-    let tree_w = (w - sb_w).max(0.0);
-
-    // Background covers the whole panel even when the tree is short, so
-    // empty space under the last row matches the rest of the sidebar.
-    cr.set_source_rgb(bg_r, bg_g, bg_b);
-    cr.rectangle(x, y, w, h);
-    cr.fill().ok();
-
-    // Phase B.5b Stage 8: route through `Backend::draw_tree`.
-    use quadraui::Backend;
-    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
-        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
-        b.set_current_line_height(line_height);
-        b.draw_tree(
-            quadraui::Rect::new(x as f32, y as f32, tree_w as f32, h as f32),
-            tree,
-        );
-    });
-
-    if need_sb {
-        let sb_x = x + tree_w;
-        let track_len = h;
-        let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
-        let max_scroll = total.saturating_sub(visible_rows) as f64;
-        let scroll_ratio = if max_scroll > 0.0 {
-            tree.scroll_offset as f64 / max_scroll
-        } else {
-            0.0
-        };
-        let thumb_y = y + scroll_ratio * (track_len - thumb_len);
-        cr.set_source_rgb(bg_r, bg_g, bg_b);
-        cr.rectangle(sb_x, y, sb_w, track_len);
-        cr.fill().ok();
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        cr.rectangle(sb_x + 2.0, thumb_y, sb_w - 4.0, thumb_len);
-        cr.fill().ok();
-        Some((sb_x, y, sb_w, track_len))
-    } else {
-        None
-    }
 }
 
 // ─── Extension-provided panel (e.g. git-insights GIT LOG) ─────────────────────
@@ -4519,6 +4439,8 @@ pub(super) fn draw_debug_toolbar(
         b.draw_status_bar(
             quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32),
             &bar,
+            None,
+            None,
         )
     });
     *hit_regions_out.borrow_mut() = hits;
