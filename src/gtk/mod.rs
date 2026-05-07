@@ -6181,10 +6181,9 @@ impl App {
                 self.draw_needed.set(true);
             }
         }
-        // Explorer tree indicators (modified/diagnostics) are now pulled by
-        // the DrawingArea's draw callback from `engine.explorer_indicators()`
-        // via the `explorer_to_tree_view` adapter, so we just trigger a
-        // redraw on a 1 Hz cadence to pick up background changes.
+        // Explorer tree indicators (modified/diagnostics) are pulled by
+        // the draw callback via `populate_explorer_tree_controller`, so we
+        // trigger a redraw on a 1 Hz cadence to pick up background changes.
         if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tree_indicator_update = std::time::Instant::now();
             if self.active_panel == SidebarPanel::Explorer {
@@ -10495,61 +10494,10 @@ impl App {
                 self.engine.borrow_mut().explorer_scroll(step);
                 self.queue_explorer_draw();
             }
-            Msg::PromptRenameFile(path) => {
-                let sender_clone = sender.input_sender().clone();
-                let initial = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let path_for_close = path.clone();
-                self.prompt_for_name(
-                    "Rename",
-                    &format!("Rename '{}' to:", initial),
-                    &initial,
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::RenameFile(path_for_close.clone(), name))
-                            .ok();
-                    }),
-                );
-            }
-            Msg::PromptNewFile(parent_dir) => {
-                let sender_clone = sender.input_sender().clone();
-                self.prompt_for_name(
-                    "New File",
-                    &format!(
-                        "Create file under {}:",
-                        parent_dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ),
-                    "",
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::CreateFile(parent_dir.clone(), name))
-                            .ok();
-                    }),
-                );
-            }
-            Msg::PromptNewFolder(parent_dir) => {
-                let sender_clone = sender.input_sender().clone();
-                self.prompt_for_name(
-                    "New Folder",
-                    &format!(
-                        "Create folder under {}:",
-                        parent_dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ),
-                    "",
-                    Box::new(move |name| {
-                        sender_clone
-                            .send(Msg::CreateFolder(parent_dir.clone(), name))
-                            .ok();
-                    }),
-                );
+            Msg::PromptRenameFile(_) | Msg::PromptNewFile(_) | Msg::PromptNewFolder(_) => {
+                // Explorer CRUD now uses inline editing via TreeController.
+                // These dialog paths are kept as Msg variants for backwards
+                // compatibility but nothing sends them.
             }
             _ => unreachable!(),
         }
@@ -10928,6 +10876,7 @@ impl App {
     /// `gtk4::TreeView` inline cell editor with this fallback. On OK the
     /// closure fires `on_confirm(name)`. Empty names close the dialog
     /// silently.
+    #[allow(dead_code)]
     fn prompt_for_name(
         &self,
         title: &str,

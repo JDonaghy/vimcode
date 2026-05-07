@@ -7512,6 +7512,7 @@ pub use crate::core::engine::ExplorerRow;
 /// `engine.explorer_indicators()` — the cached indicator map keyed by
 /// canonical path. Directories get a folder glyph; files get the
 /// extension-based icon from `icons::file_icon`.
+#[cfg(feature = "win-gui")]
 pub fn explorer_to_tree_view(
     rows: &[ExplorerRow],
     scroll_top: usize,
