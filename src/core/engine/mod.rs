@@ -3750,6 +3750,7 @@ impl Engine {
         // is opened via restore_session_files / CLI args, so huge buffers
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        engine.explorer_rebuild_rows();
         engine
     }
 
