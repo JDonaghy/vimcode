@@ -5606,15 +5606,10 @@ impl App {
         // GTK focus on sidebar DrawingAreas is unreliable, so we check
         // the engine focus flags here (same approach as TUI backend).
 
-        // Explorer sidebar key routing — DA focus is unreliable, so the
-        // window-level KeyPress handler is the authoritative path.
+        // Explorer keys are routed through Msg::ExplorerKey when the DA
+        // has focus. This fallback catches keys when the DA lacks GTK
+        // widget focus (grab_focus is unreliable for DrawingAreas).
         if self.engine.borrow().explorer_has_focus {
-            if self.engine.borrow().dialog.is_some() {
-                let key_mapped = map_gtk_key_name(key_name.as_str());
-                self.engine.borrow_mut().handle_key(key_mapped, unicode, false);
-                self.draw_needed.set(true);
-                return;
-            }
             let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
             self.handle_explorer_da_key(key_mapped, unicode, ctrl, sender);
             self.draw_needed.set(true);
@@ -10462,12 +10457,13 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ExplorerKey {
-                key_name: _,
-                unicode: _,
-                ctrl: _,
+                key_name,
+                unicode,
+                ctrl,
             } => {
-                // DA focus is unreliable — Msg::KeyPress is the
-                // authoritative explorer key path.
+                self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
+                self.queue_explorer_draw();
+                self.draw_needed.set(true);
             }
             Msg::ExplorerClick { x, y, n_press } => {
                 self.handle_explorer_da_click(x, y, n_press, sender);
@@ -10568,6 +10564,15 @@ impl App {
         ctrl: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // When an engine dialog is active (delete confirmation), route
+        // keys to the dialog handler, not the explorer dispatch.
+        if self.engine.borrow().dialog.is_some() {
+            let mapped = map_gtk_key_name(&key_name);
+            self.engine.borrow_mut().handle_key(mapped, unicode, false);
+            self.draw_needed.set(true);
+            return;
+        }
+
         // Panel-nav shortcuts before engine dispatch.
         let (pk_toggle, pk_explorer, pk_search) = {
             let eng = self.engine.borrow();
