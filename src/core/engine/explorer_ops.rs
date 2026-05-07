@@ -424,7 +424,13 @@ impl Engine {
                 };
                 let mut tree = self.explorer_tree.borrow_mut();
                 tree.set_selected_path(Some(tree_path.clone()));
-                tree.start_editing(tree_path, String::new(), Some(placeholder.to_string()));
+                tree.start_editing(
+                    tree_path,
+                    String::new(),
+                    0,
+                    None,
+                    Some(placeholder.to_string()),
+                );
             }
             ExplorerAction::Delete => {
                 if idx < self.explorer_rows.len() {
@@ -435,10 +441,15 @@ impl Engine {
             ExplorerAction::Rename => {
                 if idx < self.explorer_rows.len() {
                     let name = self.explorer_rows[idx].name.clone();
+                    let stem_end = name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len());
                     let tree_path = vec![idx as u16];
-                    self.explorer_tree
-                        .borrow_mut()
-                        .start_editing(tree_path, name, None);
+                    self.explorer_tree.borrow_mut().start_editing(
+                        tree_path,
+                        name,
+                        stem_end,
+                        Some(0),
+                        None,
+                    );
                 }
             }
             ExplorerAction::MoveFile => {

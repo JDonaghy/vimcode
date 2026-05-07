@@ -2030,36 +2030,6 @@ fn event_loop(
                     continue;
                 }
 
-                // ── Inline rename in explorer ────────────────────────────────
-                if engine.explorer_rename.is_some() {
-                    if let Some((key_name, unicode, ctrl)) =
-                        translate_key(key_event, keyboard_enhanced)
-                    {
-                        engine.handle_explorer_rename_key(&key_name, unicode, ctrl);
-                        if engine.explorer_needs_refresh {
-                            engine.explorer_rebuild_rows();
-                            engine.explorer_needs_refresh = false;
-                        }
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
-                // ── Inline new file/folder in explorer ───────────────────────
-                if engine.explorer_new_entry.is_some() {
-                    if let Some((key_name, unicode, ctrl)) =
-                        translate_key(key_event, keyboard_enhanced)
-                    {
-                        engine.handle_explorer_new_entry_key(&key_name, unicode, ctrl);
-                        if engine.explorer_needs_refresh {
-                            engine.explorer_rebuild_rows();
-                            engine.explorer_needs_refresh = false;
-                        }
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
                 // ── Folder picker modal ─────────────────────────────────────
                 if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
@@ -3807,19 +3777,17 @@ fn handle_explorer_context_action(
 
     match action {
         "new_file" | "new_folder" => {
-            let target = if is_dir {
-                path.clone()
+            use crate::core::settings::ExplorerAction;
+            let crud_action = if action == "new_file" {
+                ExplorerAction::NewFile
             } else {
-                path.parent().unwrap_or(&engine.cwd).to_path_buf()
+                ExplorerAction::NewFolder
             };
-            if action == "new_file" {
-                engine.start_explorer_new_file(target);
-            } else {
-                engine.start_explorer_new_folder(target);
-            }
+            engine.dispatch_explorer_crud(crud_action);
         }
         "rename" => {
-            engine.start_explorer_rename(path);
+            use crate::core::settings::ExplorerAction;
+            engine.dispatch_explorer_crud(ExplorerAction::Rename);
         }
         "delete" => {
             engine.confirm_delete_file(&path);
