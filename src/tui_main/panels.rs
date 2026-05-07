@@ -2907,7 +2907,7 @@ pub(super) fn render_debug_sidebar(
     backend.set_current_theme(q_theme);
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(title_rect, &title_bar);
+        let _ = b.draw_status_bar(title_rect, &title_bar, None, None);
     });
 
     if area.height < 2 {
@@ -2919,7 +2919,7 @@ pub(super) fn render_debug_sidebar(
     backend.set_current_theme(q_theme);
     let hits = backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        b.draw_status_bar(action_rect, &action_bar)
+        b.draw_status_bar(action_rect, &action_bar, None, None)
     });
     engine.dap_sidebar_action_hits.replace(hits);
 
@@ -3025,7 +3025,7 @@ pub(super) fn render_terminal_toolbar(
         render::TerminalToolbar::FindBar(bar) => {
             let layout = backend.enter_frame_scope(frame, |b| {
                 use quadraui::Backend;
-                let _regions = b.draw_status_bar(q_rect, &bar);
+                let _regions = b.draw_status_bar(q_rect, &bar, None, None);
                 bar.layout(area.width as f32, 1.0, 2.0, |seg| {
                     quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
                 })
