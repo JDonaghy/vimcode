@@ -10455,11 +10455,14 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ExplorerKey {
-                key_name,
-                unicode,
-                ctrl,
+                key_name: _,
+                unicode: _,
+                ctrl: _,
             } => {
-                self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
+                // Explorer keys are handled by the Msg::KeyPress path
+                // (which checks explorer_has_focus). The DA key controller
+                // is kept for GTK focus reasons but dispatch is a no-op
+                // to avoid double-dispatch.
             }
             Msg::ExplorerClick { x, y, n_press } => {
                 self.handle_explorer_da_click(x, y, n_press, sender);
