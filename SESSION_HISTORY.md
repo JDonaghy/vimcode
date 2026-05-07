@@ -1,7 +1,17 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 353 archived here.
+All sessions through 355 archived here.
+
+---
+**Session 355 (May 7) — #324 Explorer panel → TreeController (PR #330):**
+
+Full migration of the explorer file tree from duplicated per-backend state (TUI `TuiSidebar` + GTK `ExplorerState`) to a single `quadraui::TreeController` on the engine. Net -798 lines. New file `src/core/engine/explorer_ops.rs` (~355 lines) owns all explorer logic: `explorer_rebuild_rows()`, `explorer_toggle_dir()`, `explorer_reveal_path()`, `explorer_activate_selected()`, `explorer_scroll()`, `dispatch_explorer_key()`, `dispatch_explorer_crud()`, `dispatch_explorer_edit_key()`. `ExplorerKeyResult` enum tells backends what to do (Consumed/Unfocused/FocusToolbar/Ignored). TreeController inline editing via `start_editing(path, text, cursor, selection_anchor, placeholder)` for rename (stem pre-selected) and new-file/folder (placeholder text). `EditConfirmed`/`EditCancelled` events handle filesystem ops. Context menu CRUD unified through `dispatch_explorer_crud`. Deleted: GTK `ExplorerState` + `build_explorer_rows` + `collect_rows` (~190 lines), `draw_explorer_panel` (~80 lines), `handle_explorer_da_key` nav+CRUD (~170 lines), click/scroll helpers (~120 lines), dialog handlers (~60 lines), TUI legacy inline-edit renderer (~370 lines), TUI old rename/new-entry key intercepts (~30 lines). GTK key routing: `Msg::KeyPress` is authoritative (DA focus unreliable), dialog check in `handle_explorer_da_key` routes to `engine.handle_key()` when dialog active. `explorer_to_tree_view()` gated behind `#[cfg(feature = "win-gui")]`. `explorer_rebuild_rows()` called at `Engine::new()` for initial population. Fixed pre-existing `draw_status_bar` 4-arg API break in GTK. Filed: #328 (adopt quadraui#77/#78/#79), #329 (GTK exit coredump), quadraui#83 (inline tree editing — landed as #84), quadraui#86 (context menu — landed as #87), quadraui#89 (selection highlight rendering).
+
+---
+**Session 354 (May 6) — #319 MenuSystem migration complete:**
+
+Menu bar + dropdown fully migrated to `quadraui::MenuSystem` on both TUI and GTK. 681 net lines removed. `MenuSystem` on engine as `Rc<RefCell<MenuSystem>>`. `render::build_menu_defs(is_vscode_mode)` converts `MENU_STRUCTURE` to `Vec<MenuDef>`. `menu_system.render(backend, bar_rect)` draws bar + dropdown. `menu_system.handle(&ui_event, backend, bar_rect)` processes all keyboard/mouse events. `MenuEvent::Activated(id)` → `engine.dispatch_menu_action(id.as_str())`. GTK overlay uses `quadraui::gtk::MenuOverlay` helper (30 lines replacing 141). Removed: `MenuBarData`, `MenuKeyResult`, `handle_menu_key()`, `open_menu()`, `close_menu()`, `menu_move_selection()`, `menu_activate_highlighted()`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `draw_menu_bar()`, `draw_menu_dropdown()`, `Msg::OpenMenu/CloseMenu/MenuActivateItem/MenuHighlight`. Old fields gated behind `#[cfg(feature = "win-gui")]`.
 
 ---
 **Session 353 (May 5-6) — #307 complete, #246 closed, #319 attempted + reverted:**

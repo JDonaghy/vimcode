@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 6, 2026 (Session 354 — **#319 MenuSystem migration in progress.** Menu bar + dropdown fully migrated to `quadraui::MenuSystem` on both TUI and GTK. 681 net lines removed. TUI fully working. GTK functional but has minor rendering issues (dropdown item spacing) — tracked as quadraui bug. Branch `issue-319-menu-system-migration` ready for landing once GTK rendering is polished.)
+**Last updated:** May 7, 2026 (Session 355 — **#324 Explorer panel → TreeController shipped** (PR #330, merged). Both TUI and GTK explorer now use `quadraui::TreeController` for selection, scroll, keyboard nav, inline editing (rename + new file/folder), and context menu CRUD. Net -798 lines. Zero duplicate explorer logic between backends.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,7 +12,8 @@
 
 | # | Title | Category |
 |---|-------|----------|
-| [#319](https://github.com/JDonaghy/vimcode/issues/319) | Menu dropdown → quadraui::MenuSystem | Infrastructure (in progress — branch `issue-319-menu-system-migration`) |
+| [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low priority) |
+| [#329](https://github.com/JDonaghy/vimcode/issues/329) | GTK exit coredump (panic in extern C trampoline) | Bug |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
@@ -20,33 +21,28 @@
 | [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 
-**Shipped this session (354):**
-- **#319 MenuSystem migration** — Complete rewrite of menu bar + dropdown using `quadraui::MenuSystem`. 681 net lines removed (462 added, 1143 deleted). Both TUI and GTK now use the same shared code path:
-  - `MenuSystem` on engine as `Rc<RefCell<MenuSystem>>` — shared between backends
-  - `render::build_menu_defs(is_vscode_mode)` — converts `MENU_STRUCTURE` to `Vec<MenuDef>`
-  - `menu_system.render(backend, bar_rect)` — draws bar + dropdown (both backends)
-  - `menu_system.handle(&ui_event, backend, bar_rect)` — processes all keyboard/mouse events (both backends)
-  - `MenuEvent::Activated(id)` → `engine.dispatch_menu_action(id.as_str())` — shared action dispatch
-  - GTK overlay uses `quadraui::gtk::MenuOverlay` helper (30 lines replacing 141)
-  - Removed: `MenuBarData`, `MenuKeyResult`, `handle_menu_key()`, `open_menu()`, `close_menu()`, `menu_move_selection()`, `menu_activate_highlighted()`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `draw_menu_bar()`, `draw_menu_dropdown()`, `Msg::OpenMenu/CloseMenu/MenuActivateItem/MenuHighlight`
-  - Old fields (`menu_open_idx`, `menu_highlighted_item`) gated behind `#[cfg(feature = "win-gui")]`
-  - TUI fully working. GTK has minor dropdown item spacing issue (quadraui bug).
+**Shipped this session (355):**
+- **#324 Explorer panel → TreeController** (PR #330, merged) — Full migration of explorer from duplicated TUI/GTK state to shared `quadraui::TreeController`. Net -798 lines. New `engine/explorer_ops.rs` (~355 lines) owns all logic. TreeController inline editing for rename (stem pre-selected) and new-file/folder (placeholder text). Context menu CRUD unified through `dispatch_explorer_crud`. Deleted: GTK `ExplorerState`, `draw_explorer_panel`, GTK dialog handlers, TUI legacy inline-edit renderer (~370 lines). Per-backend code: ~28 lines thin wiring each.
+- **Issues filed:** #328 (adopt quadraui scroll improvements), #329 (GTK exit coredump)
+- **Quadraui issues filed + resolved:** #83→#84 (inline tree editing), #85 (placeholder param), #86→#87 (context menu event), #88 (cursor/selection params), #89 (selection highlight rendering — open)
+
+**Shipped session 354 (earlier):**
+- **#319 MenuSystem migration** — 681 net lines removed. Both TUI + GTK use `quadraui::MenuSystem`.
 
 **Shipped session 353 (earlier):**
 - **#307 Batches 2-5**, **#242 closed**, **#246 closed**, **#308 item 3**.
-- **Issues filed:** #315-#319.
 
 ---
 
-**Previous sessions (352 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (354 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1950 lib + 2040 integration tests passing. Branch `issue-319-menu-system-migration` — both TUI + GTK build + clippy clean.
+Vimcode at 1931 lib tests passing. All on develop — no active branches.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
 
-> Sessions 347 and earlier in **SESSION_HISTORY.md**.
+> Sessions 355 and earlier in **SESSION_HISTORY.md**.
 
 
 ---
@@ -126,6 +122,7 @@ cell coalescence) remain but are tracked separately.
 - `core::settings::SAVE_REVISION` — one source of truth both file watchers consult (#201).
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
 - `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
+- `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
