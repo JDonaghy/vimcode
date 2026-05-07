@@ -19,12 +19,15 @@ impl Engine {
             self.settings.show_hidden_files,
             self.settings.explorer_sort_case_insensitive,
         );
-        if let Some(idx) = self.explorer_tree.borrow().selected_row_index() {
-            if idx >= self.explorer_rows.len() && !self.explorer_rows.is_empty() {
-                self.explorer_tree
-                    .borrow_mut()
-                    .set_selected_path(Some(vec![(self.explorer_rows.len() - 1) as u16]));
+        let mut tree = self.explorer_tree.borrow_mut();
+        match tree.selected_row_index() {
+            Some(idx) if idx >= self.explorer_rows.len() && !self.explorer_rows.is_empty() => {
+                tree.set_selected_path(Some(vec![(self.explorer_rows.len() - 1) as u16]));
             }
+            None if !self.explorer_rows.is_empty() => {
+                tree.set_selected_path(Some(vec![0]));
+            }
+            _ => {}
         }
     }
 
