@@ -12499,6 +12499,7 @@ fn test_dap_frames_and_vars_cleared_on_continued() {
     assert!(engine.dap_current_line.is_none());
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_section_navigation() {
     let mut engine = Engine::new();
@@ -12513,6 +12514,7 @@ fn test_dap_sidebar_section_navigation() {
     assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_section_index() {
     assert_eq!(
@@ -12533,6 +12535,7 @@ fn test_dap_sidebar_section_index() {
     );
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_ensure_visible_scrolls_down() {
     let mut engine = Engine::new();
@@ -12546,6 +12549,7 @@ fn test_dap_sidebar_ensure_visible_scrolls_down() {
     assert_eq!(engine.dap_sidebar_scroll[0], 3);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_ensure_visible_scrolls_up() {
     let mut engine = Engine::new();
@@ -12559,6 +12563,7 @@ fn test_dap_sidebar_ensure_visible_scrolls_up() {
     assert_eq!(engine.dap_sidebar_scroll[1], 3);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_ensure_visible_no_change_when_visible() {
     let mut engine = Engine::new();
@@ -12570,6 +12575,7 @@ fn test_dap_sidebar_ensure_visible_no_change_when_visible() {
     assert_eq!(engine.dap_sidebar_scroll[2], 2); // unchanged
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_ensure_visible_zero_height_noop() {
     let mut engine = Engine::new();
@@ -12580,6 +12586,7 @@ fn test_dap_sidebar_ensure_visible_zero_height_noop() {
     assert_eq!(engine.dap_sidebar_scroll[0], 0); // unchanged
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_resize_section() {
     let mut engine = Engine::new();
@@ -12592,6 +12599,7 @@ fn test_dap_sidebar_resize_section() {
     assert_eq!(engine.dap_sidebar_section_heights.iter().sum::<u16>(), 40);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_resize_section_clamps_min() {
     let mut engine = Engine::new();
@@ -12607,6 +12615,7 @@ fn test_dap_sidebar_resize_section_clamps_min() {
     );
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_resize_section_last_noop() {
     let mut engine = Engine::new();
@@ -12616,6 +12625,7 @@ fn test_dap_sidebar_resize_section_last_noop() {
     assert_eq!(engine.dap_sidebar_section_heights, [10, 10, 10, 10]);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_scroll_reset_on_stop() {
     let mut engine = Engine::new();
@@ -12625,6 +12635,7 @@ fn test_dap_sidebar_scroll_reset_on_stop() {
     assert_eq!(engine.dap_sidebar_scroll, [0, 0, 0, 0]);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_sidebar_jk_triggers_ensure_visible() {
     use crate::core::dap::DapVariable;
@@ -12796,6 +12807,7 @@ fn test_debug_toolbar_default_false() {
 
 // ── Session 90: Interactive debug sidebar + conditional breakpoints ──────
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_var_expand_via_enter() {
     use crate::core::dap::DapVariable;
@@ -12831,6 +12843,7 @@ fn test_sidebar_var_expand_via_enter() {
     );
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_var_enter_on_non_expandable() {
     use crate::core::dap::DapVariable;
@@ -12848,6 +12861,7 @@ fn test_sidebar_var_enter_on_non_expandable() {
     assert!(engine.dap_expanded_vars.is_empty());
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_callstack_enter_selects_frame() {
     use crate::core::dap::StackFrame;
@@ -12872,6 +12886,7 @@ fn test_sidebar_callstack_enter_selects_frame() {
     assert_eq!(engine.dap_active_frame, 1, "should select frame 1");
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_section_len_variables() {
     use crate::core::dap::DapVariable;
@@ -12921,6 +12936,7 @@ fn test_sidebar_section_len_variables() {
     assert_eq!(engine.dap_sidebar_section_len(), 5);
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_j_k_clamped() {
     use crate::core::dap::DapVariable;
@@ -12941,6 +12957,7 @@ fn test_sidebar_j_k_clamped() {
     assert_eq!(engine.dap_sidebar_selected, 0, "clamped at start");
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_delete_watch() {
     let mut engine = Engine::new();
@@ -12953,6 +12970,7 @@ fn test_sidebar_delete_watch() {
     assert_eq!(engine.dap_watch_expressions[0], "expr2");
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_sidebar_delete_breakpoint() {
     let mut engine = Engine::new();
@@ -13083,6 +13101,7 @@ fn test_dap_scope_groups_cleared_on_select_frame() {
     assert!(engine.dap_scope_groups.is_empty());
 }
 
+#[cfg(feature = "win-gui")]
 #[test]
 fn test_dap_var_flat_count_with_scope_groups() {
     use crate::core::dap::DapVariable;

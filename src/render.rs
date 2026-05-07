@@ -1320,14 +1320,13 @@ pub struct QuickfixPanel {
     pub has_focus: bool,
 }
 
-/// A single item rendered in the debug sidebar.
+/// A single item rendered in the debug sidebar. Used by win-gui;
+/// TUI/GTK use `SidebarSystem` with `TreeRow` directly via
+/// `populate_dap_sidebar_system()`.
 #[derive(Debug, Clone)]
 pub struct DebugSidebarItem {
-    /// Pre-formatted display text.
     pub text: String,
-    /// Indentation level (0 = top-level, 1 = one indent, …).
     pub indent: u8,
-    /// Whether this item is currently selected (cursor highlight).
     pub is_selected: bool,
 }
 
@@ -1532,33 +1531,19 @@ pub struct AiPanelData {
 /// Always present in `ScreenLayout`; each section may be empty.
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
-    /// True when a DAP session is active.
     pub session_active: bool,
-    /// True when the debuggee is paused (breakpoint hit, step completed, etc.).
     pub stopped: bool,
-    /// Variables section items (flat tree with ▶/▼ prefixes).
     pub variables: Vec<DebugSidebarItem>,
-    /// Watch section items (expression = value).
     pub watch: Vec<DebugSidebarItem>,
-    /// Call Stack section items.
     pub frames: Vec<DebugSidebarItem>,
-    /// Breakpoints section items (always populated from dap_breakpoints).
     pub breakpoints: Vec<DebugSidebarItem>,
-    /// Which section is currently focused.
     pub active_section: DebugSidebarSection,
-    /// Selected item index within the active section.
     pub sidebar_selected: usize,
-    /// Whether the debug sidebar panel has keyboard focus.
     pub has_focus: bool,
-    /// Name of the selected launch configuration, or `None` if no configs loaded.
     pub launch_config_name: Option<String>,
-    /// Debug output lines for the Debug Output bottom tab.
     pub debug_output_lines: Vec<String>,
-    /// Most-recent expression evaluation result, or `None`.
     pub eval_result: Option<String>,
-    /// Per-section scroll offset (items to skip from top) for [Variables, Watch, CallStack, Breakpoints].
     pub scroll_offsets: [usize; 4],
-    /// Per-section allocated content heights in rows (excluding section header).
     pub section_heights: [u16; 4],
 }
 
@@ -6868,25 +6853,7 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
 /// `Call Stack` / `Breakpoints`) into a `quadraui::TreeView` for the
 /// shared `draw_tree` primitive (#281).
 ///
-/// Each section is a flat list of [`DebugSidebarItem`]s with a
-/// per-item `indent` and a pre-computed `is_selected` flag (only the
-/// active section's items can have `is_selected = true`). The
-/// adapter:
-///
-/// - Maps `item.indent` straight to `TreeRow.indent`.
-/// - Carries `item.text` as plain styled text. Items have no
-///   chevrons or icons today (the variable tree's `▶`/`▼` markers
-///   are baked into the text by the engine).
-/// - Sets `selected_path = Some([row_idx])` when an item carries
-///   `is_selected`, else `None`. The "(empty)" / "(not running)"
-///   placeholder row uses `Decoration::Muted` and is never selected.
-/// - `has_focus` is the panel-level focus flag.
-/// - `scroll_offset` is the section-local scroll offset
-///   (`sidebar.scroll_offsets[section_idx]`).
-///
-/// The section title row + Run/Stop button + per-section scrollbar
-/// overlay stay panel-specific chrome — they're not part of the
-/// `TreeView` (matches the established #280/#282 pattern).
+#[cfg(feature = "win-gui")]
 pub fn debug_sidebar_section_to_tree_view(
     items: &[DebugSidebarItem],
     scroll_offset: usize,
@@ -6943,6 +6910,7 @@ pub fn debug_sidebar_section_to_tree_view(
     }
 }
 
+#[cfg(feature = "win-gui")]
 /// Adapt `DebugSidebarData` into a `quadraui::MultiSectionView` for
 /// the shared `draw_multi_section_view` primitive (#296). 4 sections
 /// (Variables / Watch / Call Stack / Breakpoints), each `EqualShare`

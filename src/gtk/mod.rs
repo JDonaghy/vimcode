@@ -5743,7 +5743,23 @@ impl App {
                 if engine.dialog.is_some() {
                     engine.handle_key(&key_name, unicode, ctrl);
                 } else {
-                    engine.handle_debug_sidebar_key(&key_name, ctrl);
+                    let mapped = map_gtk_key_name(key_name.as_str());
+                    let rect = engine.dap_sidebar_body_rect.get();
+                    render::populate_dap_sidebar_system(&engine);
+                    let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
+                        let backend_rc = self.backend.clone();
+                        let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                            &ui_event,
+                            &mut *backend_rc.borrow_mut(),
+                            rect,
+                        );
+                        engine.dispatch_dap_sidebar_event(sidebar_event)
+                    } else {
+                        false
+                    };
+                    if !consumed {
+                        engine.dispatch_dap_sidebar_action_key(mapped);
+                    }
                 }
                 let still_focused = engine.dap_sidebar_has_focus;
                 drop(engine);

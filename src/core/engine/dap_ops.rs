@@ -542,11 +542,12 @@ impl Engine {
     }
 
     /// Compute the number of visible items in the currently active debug sidebar section.
+    #[cfg(feature = "win-gui")]
     pub fn dap_sidebar_section_len(&self) -> usize {
         self.dap_sidebar_section_item_count(self.dap_sidebar_section)
     }
 
-    /// Compute the number of items in a specific debug sidebar section.
+    #[cfg(feature = "win-gui")]
     pub fn dap_sidebar_section_item_count(&self, section: DebugSidebarSection) -> usize {
         match section {
             DebugSidebarSection::Variables => self.dap_var_flat_count(),
@@ -558,7 +559,7 @@ impl Engine {
         }
     }
 
-    /// Map a `DebugSidebarSection` variant to its index (0–3).
+    #[cfg(feature = "win-gui")]
     pub fn dap_sidebar_section_index(section: DebugSidebarSection) -> usize {
         match section {
             DebugSidebarSection::Variables => 0,
@@ -578,8 +579,7 @@ impl Engine {
         }
     }
 
-    /// Adjust the scroll offset for the active section so that the selected item is visible.
-    #[allow(dead_code)]
+    #[cfg(feature = "win-gui")]
     pub fn dap_sidebar_ensure_visible(&mut self) {
         let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
         let height = self.dap_sidebar_section_heights[idx] as usize;
@@ -596,10 +596,7 @@ impl Engine {
         }
     }
 
-    /// Resize adjacent debug sidebar sections by `delta` rows.
-    /// Shrinks `section_idx` and grows `section_idx + 1` (or vice versa for negative delta).
-    /// Clamps each section to a minimum of 1 row and keeps the total constant.
-    #[allow(dead_code)]
+    #[cfg(feature = "win-gui")]
     pub fn dap_sidebar_resize_section(&mut self, section_idx: usize, delta: i16) {
         if section_idx >= 3 {
             return; // no next section to trade rows with
@@ -612,8 +609,7 @@ impl Engine {
         self.dap_sidebar_section_heights[section_idx + 1] = new_b as u16;
     }
 
-    /// Count total items in the flat variable tree (including scope headers,
-    /// expanded children, and additional scope groups).
+    #[cfg(feature = "win-gui")]
     pub(crate) fn dap_var_flat_count(&self) -> usize {
         let mut count = 0;
         // Primary scope header (e.g. "Locals") if we have scope info.
@@ -646,7 +642,7 @@ impl Engine {
         count
     }
 
-    /// Recursively count children in an expanded variable subtree.
+    #[cfg(feature = "win-gui")]
     fn dap_var_subtree_count(&self, var_ref: u64) -> usize {
         let children = match self.dap_child_variables.get(&var_ref) {
             Some(c) => c,
@@ -895,10 +891,7 @@ impl Engine {
         }
     }
 
-    /// Handle a key press directed at the debug sidebar.
-    /// j/k or Up/Down navigate within the active section; Tab switches sections;
-    /// Enter/Space expand/collapse variables, navigate call stack, jump to breakpoint;
-    /// x/d delete watch expressions or breakpoints; q/Escape unfocus.
+    #[cfg(feature = "win-gui")]
     pub fn handle_debug_sidebar_key(&mut self, key_name: &str, _ctrl: bool) -> EngineAction {
         let section_len = self.dap_sidebar_section_len();
         match key_name {
