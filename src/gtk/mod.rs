@@ -10596,27 +10596,6 @@ impl App {
             .borrow_mut()
             .dispatch_explorer_key(&key_name, unicode, ctrl);
 
-        // Intercept engine inline rename/new-entry → GTK dialog
-        {
-            let mut eng = self.engine.borrow_mut();
-            if let Some(rename) = eng.explorer_rename.take() {
-                drop(eng);
-                sender.input(Msg::PromptRenameFile(rename.path));
-                self.queue_explorer_draw();
-                return;
-            }
-            if let Some(ne) = eng.explorer_new_entry.take() {
-                drop(eng);
-                if ne.is_folder {
-                    sender.input(Msg::PromptNewFolder(ne.parent_dir));
-                } else {
-                    sender.input(Msg::PromptNewFile(ne.parent_dir));
-                }
-                self.queue_explorer_draw();
-                return;
-            }
-        }
-
         match result {
             ExplorerKeyResult::Unfocused => {
                 self.engine.borrow_mut().explorer_has_focus = false;

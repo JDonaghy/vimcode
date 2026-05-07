@@ -2804,6 +2804,10 @@ pub struct Engine {
     pub explorer_rows: Vec<ExplorerRow>,
     /// Set of directory paths currently expanded in the explorer tree.
     pub explorer_expanded: std::collections::HashSet<PathBuf>,
+    /// When a new-file/folder inline edit is active, stores the parent
+    /// directory and whether it's a folder.  Cleared on EditConfirmed /
+    /// EditCancelled.
+    pub explorer_new_entry_pending: Option<(PathBuf, bool)>,
     /// Cached explorer rect from last render frame.
     pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
     /// Cached viewport row count from last render frame.
@@ -3567,6 +3571,7 @@ impl Engine {
                 set.insert(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
                 set
             },
+            explorer_new_entry_pending: None,
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             explorer_viewport_rows: std::cell::Cell::new(0),
             #[cfg(feature = "win-gui")]

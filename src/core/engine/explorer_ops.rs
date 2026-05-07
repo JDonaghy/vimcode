@@ -19,6 +19,28 @@ impl Engine {
             self.settings.show_hidden_files,
             self.settings.explorer_sort_case_insensitive,
         );
+        if let Some((ref parent_dir, _is_folder)) = self.explorer_new_entry_pending {
+            let insert_at = self
+                .explorer_rows
+                .iter()
+                .position(|r| r.is_dir && r.path == *parent_dir)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            self.explorer_rows.insert(
+                insert_at,
+                ExplorerRow {
+                    depth: self
+                        .explorer_rows
+                        .get(insert_at.saturating_sub(1))
+                        .map(|r| r.depth + 1)
+                        .unwrap_or(1),
+                    name: String::new(),
+                    path: parent_dir.join("__new__"),
+                    is_dir: false,
+                    is_expanded: false,
+                },
+            );
+        }
         let mut tree = self.explorer_tree.borrow_mut();
         match tree.selected_row_index() {
             Some(idx) if idx >= self.explorer_rows.len() && !self.explorer_rows.is_empty() => {
@@ -87,7 +109,6 @@ impl Engine {
         tree.set_scroll_offset(new);
     }
 
-    #[allow(dead_code)]
     pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
         match event {
             quadraui::TreeControllerEvent::RowActivated { ref path } => {
@@ -103,10 +124,68 @@ impl Engine {
                 }
                 true
             }
+            quadraui::TreeControllerEvent::EditConfirmed {
+                ref path,
+                ref new_text,
+            } => {
+                self.handle_explorer_edit_confirmed(path, new_text);
+                true
+            }
+            quadraui::TreeControllerEvent::EditCancelled { .. } => {
+                self.handle_explorer_edit_cancelled();
+                true
+            }
             quadraui::TreeControllerEvent::RowSelected { .. } => true,
             quadraui::TreeControllerEvent::Ignored => false,
             _ => true,
         }
+    }
+
+    fn handle_explorer_edit_confirmed(&mut self, path: &[u16], new_text: &str) {
+        let new_text = new_text.trim();
+        if new_text.is_empty() {
+            self.handle_explorer_edit_cancelled();
+            return;
+        }
+
+        if let Some((parent_dir, is_folder)) = self.explorer_new_entry_pending.take() {
+            let target = parent_dir.join(new_text);
+            if target.exists() {
+                self.message = format!("'{}' already exists", new_text);
+            } else if is_folder {
+                match std::fs::create_dir_all(&target) {
+                    Ok(_) => self.message = format!("Created folder: {}", new_text),
+                    Err(e) => self.message = format!("Error creating folder: {}", e),
+                }
+            } else {
+                match std::fs::File::create(&target) {
+                    Ok(_) => {
+                        self.message = format!("Created: {}", new_text);
+                        self.explorer_rebuild_rows();
+                        self.open_file_in_tab(&target);
+                        self.explorer_has_focus = false;
+                        return;
+                    }
+                    Err(e) => self.message = format!("Error creating file: {}", e),
+                }
+            }
+            self.explorer_rebuild_rows();
+        } else {
+            let idx = path[0] as usize;
+            if idx < self.explorer_rows.len() {
+                let old_path = self.explorer_rows[idx].path.clone();
+                match self.rename_file(&old_path, new_text) {
+                    Ok(()) => self.message = format!("Renamed to '{}'", new_text),
+                    Err(e) => self.message = e,
+                }
+            }
+            self.explorer_rebuild_rows();
+        }
+    }
+
+    fn handle_explorer_edit_cancelled(&mut self) {
+        self.explorer_new_entry_pending = None;
+        self.explorer_rebuild_rows();
     }
 
     pub fn dispatch_explorer_key(
@@ -115,6 +194,12 @@ impl Engine {
         chr: Option<char>,
         ctrl: bool,
     ) -> ExplorerKeyResult {
+        if self.explorer_tree.borrow().is_editing() {
+            let event = self.dispatch_explorer_edit_key(key_name, chr, ctrl);
+            self.dispatch_explorer_tree_event(event);
+            return ExplorerKeyResult::Consumed;
+        }
+
         if self.explorer_rename.is_some() {
             self.handle_explorer_rename_key(key_name, chr, ctrl);
             return ExplorerKeyResult::Consumed;
@@ -189,6 +274,90 @@ impl Engine {
         }
     }
 
+    fn dispatch_explorer_edit_key(
+        &mut self,
+        key_name: &str,
+        chr: Option<char>,
+        ctrl: bool,
+    ) -> quadraui::TreeControllerEvent {
+        use quadraui::{Key, Modifiers, NamedKey};
+
+        let modifiers = Modifiers {
+            ctrl,
+            shift: false,
+            alt: false,
+            cmd: false,
+        };
+
+        match key_name {
+            "Return" | "KP_Enter" => {
+                let key = Key::Named(NamedKey::Enter);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "Escape" => {
+                let key = Key::Named(NamedKey::Escape);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "BackSpace" => {
+                let key = Key::Named(NamedKey::Backspace);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "Delete" => {
+                let key = Key::Named(NamedKey::Delete);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "Left" => {
+                let key = Key::Named(NamedKey::Left);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "Right" => {
+                let key = Key::Named(NamedKey::Right);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "Home" => {
+                let key = Key::Named(NamedKey::Home);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            "End" => {
+                let key = Key::Named(NamedKey::End);
+                self.explorer_tree
+                    .borrow_mut()
+                    .handle_edit_key_via(&key, &modifiers)
+            }
+            _ => {
+                if ctrl {
+                    if let Some(c) = chr {
+                        let key = Key::Char(c);
+                        return self
+                            .explorer_tree
+                            .borrow_mut()
+                            .handle_edit_key_via(&key, &modifiers);
+                    }
+                }
+                if let Some(c) = chr {
+                    if !c.is_control() {
+                        return self.explorer_tree.borrow_mut().edit_insert_char_via(c);
+                    }
+                }
+                quadraui::TreeControllerEvent::Consumed
+            }
+        }
+    }
+
     fn explorer_collapse_or_parent(&mut self) -> ExplorerKeyResult {
         let idx = match self.explorer_tree.borrow().selected_row_index() {
             Some(i) => i,
@@ -238,13 +407,19 @@ impl Engine {
                 } else {
                     self.cwd.clone()
                 };
+                let is_folder = action == ExplorerAction::NewFolder;
                 self.explorer_expanded.insert(target_dir.clone());
+                self.explorer_new_entry_pending = Some((target_dir, is_folder));
                 self.explorer_rebuild_rows();
-                if action == ExplorerAction::NewFile {
-                    self.start_explorer_new_file(target_dir);
-                } else {
-                    self.start_explorer_new_folder(target_dir);
-                }
+                let insert_idx = self
+                    .explorer_rows
+                    .iter()
+                    .position(|r| r.path.file_name().map(|n| n == "__new__").unwrap_or(false))
+                    .unwrap_or(0);
+                let tree_path = vec![insert_idx as u16];
+                let mut tree = self.explorer_tree.borrow_mut();
+                tree.set_selected_path(Some(tree_path.clone()));
+                tree.start_editing(tree_path, String::new());
             }
             ExplorerAction::Delete => {
                 if idx < self.explorer_rows.len() {
@@ -254,8 +429,11 @@ impl Engine {
             }
             ExplorerAction::Rename => {
                 if idx < self.explorer_rows.len() {
-                    let path = self.explorer_rows[idx].path.clone();
-                    self.start_explorer_rename(path);
+                    let name = self.explorer_rows[idx].name.clone();
+                    let tree_path = vec![idx as u16];
+                    self.explorer_tree
+                        .borrow_mut()
+                        .start_editing(tree_path, name);
                 }
             }
             ExplorerAction::MoveFile => {
