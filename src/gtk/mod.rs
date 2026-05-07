@@ -10352,11 +10352,11 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::StartInlineNewFile(parent_dir) => {
-                sender.input(Msg::PromptNewFile(parent_dir));
+            Msg::StartInlineNewFile(_) => {
+                sender.input(Msg::ExplorerAction("new_file".to_string()));
             }
-            Msg::StartInlineNewFolder(parent_dir) => {
-                sender.input(Msg::PromptNewFolder(parent_dir));
+            Msg::StartInlineNewFolder(_) => {
+                sender.input(Msg::ExplorerAction("new_folder".to_string()));
             }
             Msg::ExplorerActivateSelected => {
                 self.engine.borrow_mut().explorer_activate_selected();
@@ -10369,8 +10369,21 @@ impl App {
                 self.queue_explorer_draw();
                 self.draw_needed.set(true);
             }
-            Msg::ExplorerAction(_) => {
-                // CRUD actions now routed through dispatch_explorer_key
+            Msg::ExplorerAction(action_str) => {
+                use crate::core::settings::ExplorerAction;
+                let action = match action_str.as_str() {
+                    "new_file" => Some(ExplorerAction::NewFile),
+                    "new_folder" => Some(ExplorerAction::NewFolder),
+                    "rename" => Some(ExplorerAction::Rename),
+                    "delete" => Some(ExplorerAction::Delete),
+                    "move_file" => Some(ExplorerAction::MoveFile),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    self.engine.borrow_mut().dispatch_explorer_crud(action);
+                    self.queue_explorer_draw();
+                    self.draw_needed.set(true);
+                }
             }
             Msg::ConfirmDeletePath(path) => {
                 self.engine.borrow_mut().confirm_delete_file(&path);
@@ -10753,15 +10766,6 @@ impl App {
             .map(|it| (it.action.clone(), it.enabled))
             .collect();
 
-        let parent_dir = if target.is_dir() {
-            target.clone()
-        } else {
-            target
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf()
-        };
-
         let actions = gtk4::gio::SimpleActionGroup::new();
         let add_action = |actions: &gtk4::gio::SimpleActionGroup, a: &gtk4::gio::SimpleAction| {
             if ctx_enabled.get(a.name().as_str()) == Some(&false) {
@@ -10772,37 +10776,33 @@ impl App {
 
         {
             let s = sender.input_sender().clone();
-            let pd = parent_dir.clone();
             let a = gtk4::gio::SimpleAction::new("new_file", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptNewFile(pd.clone())).ok();
+                s.send(Msg::ExplorerAction("new_file".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let pd = parent_dir.clone();
             let a = gtk4::gio::SimpleAction::new("new_folder", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptNewFolder(pd.clone())).ok();
+                s.send(Msg::ExplorerAction("new_folder".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let t = target.clone();
             let a = gtk4::gio::SimpleAction::new("rename", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::PromptRenameFile(t.clone())).ok();
+                s.send(Msg::ExplorerAction("rename".to_string())).ok();
             });
             add_action(&actions, &a);
         }
         {
             let s = sender.input_sender().clone();
-            let t = target.clone();
             let a = gtk4::gio::SimpleAction::new("delete", None);
             a.connect_activate(move |_, _| {
-                s.send(Msg::ConfirmDeletePath(t.clone())).ok();
+                s.send(Msg::ExplorerAction("delete".to_string())).ok();
             });
             add_action(&actions, &a);
         }

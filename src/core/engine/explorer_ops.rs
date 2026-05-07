@@ -388,7 +388,7 @@ impl Engine {
         }
     }
 
-    fn dispatch_explorer_crud(&mut self, action: ExplorerAction) -> ExplorerKeyResult {
+    pub fn dispatch_explorer_crud(&mut self, action: ExplorerAction) -> ExplorerKeyResult {
         let idx = self
             .explorer_tree
             .borrow()
