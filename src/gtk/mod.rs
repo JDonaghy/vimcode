@@ -5607,7 +5607,7 @@ impl App {
         // the engine focus flags here (same approach as TUI backend).
 
         // Explorer sidebar: all keys routed through engine dispatch
-        if self.engine.borrow().explorer_has_focus {
+        if self.engine.borrow().explorer_has_focus && self.engine.borrow().dialog.is_none() {
             let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
             self.handle_explorer_da_key(key_mapped, unicode, ctrl, sender);
             self.draw_needed.set(true);
