@@ -6573,6 +6573,297 @@ pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> qua
     }
 }
 
+/// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
+/// current row data for all 4 debug sidebar sections. Call once per
+/// frame before `sidebar_system.render()` or `.handle()`.
+pub fn populate_dap_sidebar_system(engine: &Engine) {
+    let session_active = engine.dap_session_active;
+
+    // ── Variables section ──
+    let var_rows = build_dap_var_rows(engine, session_active);
+    // ── Watch section ──
+    let watch_rows = build_dap_watch_rows(engine, session_active);
+    // ── Call Stack section ──
+    let stack_rows = build_dap_stack_rows(engine, session_active);
+    // ── Breakpoints section ──
+    let bp_rows = build_dap_bp_rows(engine, session_active);
+
+    let mut sidebar = engine.dap_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.dap_sidebar_has_focus);
+    if engine.dap_sidebar_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+    sidebar.set_rows(0, var_rows);
+    sidebar.set_rows(1, watch_rows);
+    sidebar.set_rows(2, stack_rows);
+    sidebar.set_rows(3, bp_rows);
+}
+
+fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
+    use quadraui::{Decoration, StyledText, TreeRow};
+    let hint = if session_active {
+        "(empty)"
+    } else {
+        "(not running)"
+    };
+    TreeRow {
+        path: vec![u16::MAX],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(hint.to_string()),
+        badge: None,
+        is_expanded: None,
+        decoration: Decoration::Muted,
+    }
+}
+
+fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut flat_idx: u16 = 0;
+
+    fn push_var_tree(
+        rows: &mut Vec<TreeRow>,
+        vars: &[crate::core::dap::DapVariable],
+        depth: u16,
+        flat_idx: &mut u16,
+        expanded: &std::collections::HashSet<u64>,
+        children_map: &std::collections::HashMap<u64, Vec<crate::core::dap::DapVariable>>,
+    ) {
+        for v in vars {
+            let prefix = if v.var_ref > 0 {
+                if expanded.contains(&v.var_ref) {
+                    icons::EXPAND_DOWN.nerd
+                } else {
+                    icons::COLLAPSE_RIGHT.nerd
+                }
+            } else {
+                "  "
+            };
+            let text = if v.value.is_empty() {
+                format!("{}{}", prefix, v.name)
+            } else {
+                format!("{}{} = {}", prefix, v.name, v.value)
+            };
+            rows.push(TreeRow {
+                path: vec![*flat_idx],
+                indent: depth,
+                icon: None,
+                text: StyledText::plain(text),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+            });
+            *flat_idx += 1;
+            if v.var_ref > 0 && expanded.contains(&v.var_ref) {
+                if let Some(child_vars) = children_map.get(&v.var_ref) {
+                    push_var_tree(
+                        rows,
+                        child_vars,
+                        depth + 1,
+                        flat_idx,
+                        expanded,
+                        children_map,
+                    );
+                }
+            }
+        }
+    }
+
+    if engine.dap_primary_scope_ref > 0 {
+        let expanded = engine
+            .dap_expanded_vars
+            .contains(&engine.dap_primary_scope_ref);
+        let prefix = if expanded {
+            icons::EXPAND_DOWN.nerd
+        } else {
+            icons::COLLAPSE_RIGHT.nerd
+        };
+        rows.push(TreeRow {
+            path: vec![flat_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+        });
+        flat_idx += 1;
+        if expanded {
+            push_var_tree(
+                &mut rows,
+                &engine.dap_variables,
+                1,
+                &mut flat_idx,
+                &engine.dap_expanded_vars,
+                &engine.dap_child_variables,
+            );
+        }
+    } else {
+        push_var_tree(
+            &mut rows,
+            &engine.dap_variables,
+            0,
+            &mut flat_idx,
+            &engine.dap_expanded_vars,
+            &engine.dap_child_variables,
+        );
+    }
+
+    for (scope_name, var_ref) in &engine.dap_scope_groups {
+        let expanded = engine.dap_expanded_vars.contains(var_ref);
+        let prefix = if expanded {
+            icons::EXPAND_DOWN.nerd
+        } else {
+            icons::COLLAPSE_RIGHT.nerd
+        };
+        rows.push(TreeRow {
+            path: vec![flat_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(format!("{prefix}{scope_name}")),
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+        });
+        flat_idx += 1;
+        if expanded {
+            if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
+                push_var_tree(
+                    &mut rows,
+                    child_vars,
+                    1,
+                    &mut flat_idx,
+                    &engine.dap_expanded_vars,
+                    &engine.dap_child_variables,
+                );
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        vec![empty_placeholder_row(session_active)]
+    } else {
+        rows
+    }
+}
+
+fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    if engine.dap_watch_expressions.is_empty() {
+        return vec![empty_placeholder_row(session_active)];
+    }
+
+    engine
+        .dap_watch_expressions
+        .iter()
+        .zip(engine.dap_watch_values.iter())
+        .enumerate()
+        .map(|(i, (expr, val))| {
+            let val_str = val.as_deref().unwrap_or(if session_active {
+                "\u{2026}" // …
+            } else {
+                "(not running)"
+            });
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{expr} = {val_str}")),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+            }
+        })
+        .collect()
+}
+
+fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    if engine.dap_stack_frames.is_empty() {
+        return vec![empty_placeholder_row(session_active)];
+    }
+
+    engine
+        .dap_stack_frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let src = f
+                .source
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+            let prefix = if i == engine.dap_active_frame {
+                icons::COLLAPSE_RIGHT.nerd
+            } else {
+                "  "
+            };
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+            }
+        })
+        .collect()
+}
+
+fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
+    sorted_bp.sort_by_key(|(path, _)| path.as_str());
+
+    let mut rows = Vec::new();
+    let mut flat_idx: u16 = 0;
+    for (path, bps) in &sorted_bp {
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        for bp in *bps {
+            let suffix = if let Some(cond) = &bp.condition {
+                format!(" [if {cond}]")
+            } else if let Some(hc) = &bp.hit_condition {
+                format!(" [hits {hc}]")
+            } else if let Some(msg) = &bp.log_message {
+                format!(" [log: {msg}]")
+            } else {
+                String::new()
+            };
+            let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
+                "\u{25c6}" // ◆ conditional
+            } else {
+                icons::DBG_BREAKPOINTS.nerd
+            };
+            rows.push(TreeRow {
+                path: vec![flat_idx],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+            });
+            flat_idx += 1;
+        }
+    }
+
+    if rows.is_empty() {
+        vec![empty_placeholder_row(session_active)]
+    } else {
+        rows
+    }
+}
+
 /// Adapt one section of the debug sidebar (`Variables` / `Watch` /
 /// `Call Stack` / `Breakpoints`) into a `quadraui::TreeView` for the
 /// shared `draw_tree` primitive (#281).

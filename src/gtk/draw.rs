@@ -2348,6 +2348,7 @@ pub(super) fn draw_debug_sidebar(
     h: f64,
     line_height: f64,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &crate::core::engine::Engine,
 ) -> Vec<quadraui::StatusBarHitRegion> {
     let sidebar = &screen.debug_sidebar;
 
@@ -2374,20 +2375,16 @@ pub(super) fn draw_debug_sidebar(
         });
     }
 
-    // ── MSV body (the four sections). ──
-    // Paint; caching of layout + view is done by the caller (the
-    // draw_func closure in mod.rs, which has `engine` in scope).
-    // See CLAUDE.md "Paint↔click integration pattern".
+    // ── SidebarSystem body (the four sections). ──
     let msv_y = btn_y + line_height;
     let msv_h = (h - 2.0 * line_height).max(0.0);
     if msv_h > 0.0 {
-        let view = render::debug_sidebar_to_multi_section_view(sidebar);
-        let body_bounds = quadraui::Rect::new(x as f32, msv_y as f32, w as f32, msv_h as f32);
-        use quadraui::Backend;
+        let body_rect = quadraui::Rect::new(x as f32, msv_y as f32, w as f32, msv_h as f32);
+        engine.dap_sidebar_body_rect.set(body_rect);
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            b.draw_multi_section_view(body_bounds, &view);
+            engine.dap_sidebar_system.borrow().render(b, body_rect);
         });
     }
     action_hits

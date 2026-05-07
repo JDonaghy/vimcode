@@ -1435,40 +1435,8 @@ fn event_loop(
             // this to know how many rows fit per section. The old formula
             // recomputed from terminal size and diverged from what MSV
             // actually painted — this reads the actual layout's
-            // body_bounds.height, which IS the visible row count in TUI
-            // (1 cell per row). Falls back to the old formula only when
-            // no cached layout exists yet (first frame).
-            if sidebar.visible && sidebar.active_panel == TuiPanel::Debug {
-                let cached = engine.dap_sidebar_msv_layout.borrow().clone();
-                if let Some(ref layout) = cached {
-                    for (i, sec) in layout.sections.iter().enumerate() {
-                        if i < 4 {
-                            engine.dap_sidebar_section_heights[i] = sec.body_bounds.height as u16;
-                        }
-                    }
-                } else if let Ok(size) = terminal.size() {
-                    let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
-                    let debug_out_open = engine.bottom_panel_kind
-                        == render::BottomPanelKind::DebugOutput
-                        && !engine.dap_output_lines.is_empty();
-                    let bp_h: u16 = if engine.terminal_open || debug_out_open {
-                        engine.session.terminal_panel_rows + 2
-                    } else {
-                        0
-                    };
-                    let dt_h: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                    let overhead = menu_h + qf_h + bp_h + dt_h + 2;
-                    let sidebar_h = size.height.saturating_sub(overhead) as usize;
-                    let content_rows = sidebar_h.saturating_sub(6);
-                    let base = content_rows / 4;
-                    let remainder = content_rows % 4;
-                    for i in 0..4 {
-                        engine.dap_sidebar_section_heights[i] =
-                            (base + if i < remainder { 1 } else { 0 }) as u16;
-                    }
-                }
-            }
+            // SidebarSystem tracks visible rows internally; no need to
+            // populate dap_sidebar_section_heights.
 
             // Detect when a large overlay popup (picker, folder picker, dialog)
             // was visible last frame but isn't now.  Force a full redraw so
@@ -1916,6 +1884,64 @@ fn event_loop(
             }
         }
 
+        // ── SidebarSystem intercept for mouse/scroll in debug sidebar ──
+        if sidebar.visible && sidebar.active_panel == TuiPanel::Debug {
+            let rect = engine.dap_sidebar_body_rect.get();
+            let is_sidebar_mouse = rect.width > 0.0
+                && match &ui_event {
+                    quadraui::UiEvent::Scroll { position, .. }
+                    | quadraui::UiEvent::MouseDown { position, .. }
+                    | quadraui::UiEvent::MouseUp { position, .. }
+                    | quadraui::UiEvent::MouseMoved { position, .. } => rect.contains(*position),
+                    _ => false,
+                };
+            if is_sidebar_mouse {
+                if matches!(ui_event, quadraui::UiEvent::MouseDown { .. }) {
+                    sidebar.has_focus = true;
+                    engine.dap_sidebar_has_focus = true;
+                }
+                render::populate_dap_sidebar_system(engine);
+                // Negate scroll delta — quadraui convention is positive-y = up,
+                // but SidebarSystem expects positive = scroll-down.
+                let adjusted_event = if let quadraui::UiEvent::Scroll {
+                    widget,
+                    delta,
+                    position,
+                } = &ui_event
+                {
+                    quadraui::UiEvent::Scroll {
+                        widget: widget.clone(),
+                        delta: quadraui::ScrollDelta::new(delta.x, -delta.y),
+                        position: *position,
+                    }
+                } else {
+                    ui_event.clone()
+                };
+                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                    &adjusted_event,
+                    &mut backend,
+                    rect,
+                );
+                match sidebar_event {
+                    quadraui::SidebarEvent::RowActivated { section, ref path }
+                    | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                        engine.dispatch_dap_sidebar_row_activated(section, path);
+                        needs_redraw = true;
+                        continue;
+                    }
+                    quadraui::SidebarEvent::Consumed
+                    | quadraui::SidebarEvent::StateChanged
+                    | quadraui::SidebarEvent::ScrollChanged { .. }
+                    | quadraui::SidebarEvent::HeaderActivated { .. } => {
+                        needs_redraw = true;
+                        continue;
+                    }
+                    quadraui::SidebarEvent::Ignored => {} // fall through
+                }
+            }
+        }
+
+        let ui_event_saved = ui_event.clone();
         let crossterm_event = match events::uievent_to_crossterm(ui_event) {
             Some(e) => e,
             // UiEvent variants without a crossterm equivalent (Accelerator,
@@ -2674,53 +2700,52 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
-                        // Update section heights from cached MSV layout
-                        // before key handling so ensure_visible has
-                        // valid dimensions (#296).
-                        {
-                            let cached = engine.dap_sidebar_msv_layout.borrow().clone();
-                            if let Some(ref layout) = cached {
-                                for (i, sec) in layout.sections.iter().enumerate() {
-                                    if i < 4 {
-                                        engine.dap_sidebar_section_heights[i] =
-                                            sec.body_bounds.height as u16;
-                                    }
+                        // Route through SidebarSystem for navigation keys.
+                        render::populate_dap_sidebar_system(engine);
+                        let rect = engine.dap_sidebar_body_rect.get();
+                        let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                            &ui_event_saved,
+                            &mut backend,
+                            rect,
+                        );
+                        match sidebar_event {
+                            quadraui::SidebarEvent::RowActivated { section, ref path }
+                            | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                                engine.dispatch_dap_sidebar_row_activated(section, path);
+                            }
+                            quadraui::SidebarEvent::Ignored => match key_event.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    engine.dap_sidebar_has_focus = false;
+                                    sidebar.has_focus = false;
                                 }
-                            }
-                        }
-                        let key_name = match key_event.code {
-                            KeyCode::Down => Some("Down"),
-                            KeyCode::Up => Some("Up"),
-                            KeyCode::Char('j') => Some("j"),
-                            KeyCode::Char('k') => Some("k"),
-                            KeyCode::Char('g') => Some("g"),
-                            KeyCode::Char('G') => Some("G"),
-                            KeyCode::Home => Some("Home"),
-                            KeyCode::End => Some("End"),
-                            KeyCode::PageDown => Some("PageDown"),
-                            KeyCode::PageUp => Some("PageUp"),
-                            KeyCode::Tab => Some("Tab"),
-                            KeyCode::Enter => Some("Return"),
-                            KeyCode::Char(' ') => Some(" "),
-                            KeyCode::Char('x') => Some("x"),
-                            KeyCode::Char('d') => Some("d"),
-                            KeyCode::Char('q') => Some("q"),
-                            KeyCode::Esc => Some("Escape"),
-                            KeyCode::Char('b') if ctrl => {
-                                sidebar.visible = false;
-                                sidebar.has_focus = false;
-                                engine.session.explorer_visible = false;
-                                engine.dap_sidebar_has_focus = false;
-                                let _ = engine.session.save();
-                                None
-                            }
-                            _ => None,
-                        };
-                        if let Some(name) = key_name {
-                            engine.handle_debug_sidebar_key(name, ctrl);
-                            if !engine.dap_sidebar_has_focus {
-                                sidebar.has_focus = false;
-                            }
+                                KeyCode::Char('x') | KeyCode::Char('d') => {
+                                    engine.dispatch_dap_sidebar_delete();
+                                }
+                                KeyCode::F(5) => {
+                                    engine.execute_command("debug");
+                                }
+                                KeyCode::F(6) => {
+                                    engine.execute_command("pause");
+                                }
+                                KeyCode::F(9) => {
+                                    engine.execute_command("brkpt");
+                                }
+                                KeyCode::F(10) => {
+                                    engine.execute_command("stepover");
+                                }
+                                KeyCode::F(11) => {
+                                    engine.execute_command("stepin");
+                                }
+                                KeyCode::Char('b') if ctrl => {
+                                    sidebar.visible = false;
+                                    sidebar.has_focus = false;
+                                    engine.session.explorer_visible = false;
+                                    engine.dap_sidebar_has_focus = false;
+                                    let _ = engine.session.save();
+                                }
+                                _ => {}
+                            },
+                            _ => {} // StateChanged, Consumed, ScrollChanged, HeaderActivated
                         }
                         needs_redraw = true;
                         continue;

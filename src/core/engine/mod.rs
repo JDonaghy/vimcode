@@ -2777,6 +2777,13 @@ pub struct Engine {
     /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
     /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
     pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
+    /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
+    /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
+    /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
+    pub dap_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// Cached body rect from last render frame — used by handle() in event
+    /// dispatch to pass the same rect that render() used.
+    pub dap_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     #[cfg(feature = "win-gui")]
     pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
@@ -2846,17 +2853,6 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
-    /// The exact `MultiSectionViewLayout` paint produced this frame.
-    /// Click reads it verbatim via `hit_test()` — never re-derives.
-    /// See CLAUDE.md "Paint↔click integration pattern" for rationale:
-    /// re-computing layout in click requires reconstructing the area
-    /// rect, which drifts ±1 cell/pixel from paint's actual rect and
-    /// surfaces as section-boundary shifts under EqualShare (#296).
-    pub dap_sidebar_msv_layout: std::cell::RefCell<Option<quadraui::MultiSectionViewLayout>>,
-    /// The `MultiSectionView` descriptor that produced the cached
-    /// layout above. Click needs it to drill into section bodies
-    /// (tree hit_test) and to read section scroll state.
-    pub dap_sidebar_msv_view: std::cell::RefCell<Option<quadraui::MultiSectionView>>,
     /// Cached hit regions for the debug sidebar action-button row.
     /// Paint fills; click reads verbatim (paint↔click pattern).
     pub dap_sidebar_action_hits: std::cell::RefCell<Vec<quadraui::StatusBarHitRegion>>,
@@ -3525,6 +3521,17 @@ impl Engine {
             menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
                 Vec::new(),
             ))),
+            dap_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
+                    quadraui::SidebarSectionDef::new("watch", "WATCH"),
+                    quadraui::SidebarSectionDef::new("stack", "CALL STACK"),
+                    quadraui::SidebarSectionDef::new("bps", "BREAKPOINTS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            dap_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             #[cfg(feature = "win-gui")]
             menu_open_idx: None,
             debug_toolbar_visible: false,
@@ -3553,8 +3560,6 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
-            dap_sidebar_msv_layout: std::cell::RefCell::new(None),
-            dap_sidebar_msv_view: std::cell::RefCell::new(None),
             dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
             debug_output_scroll: 0,
             debug_output_auto_scroll: true,

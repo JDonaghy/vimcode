@@ -438,6 +438,12 @@ impl Engine {
         self.dap_pre_launch_done = false;
         self.dap_deferred_lang = None;
         self.dap_sidebar_scroll = [0; 4];
+        {
+            let mut sidebar = self.dap_sidebar_system.borrow_mut();
+            for i in 0..4 {
+                sidebar.set_rows(i, Vec::new());
+            }
+        }
         self.message = "DAP: session stopped".to_string();
     }
 
@@ -572,44 +578,8 @@ impl Engine {
         }
     }
 
-    /// Scroll a debug sidebar section by `step` lines (positive = down,
-    /// negative = up), clamped to `[0, max_scroll]`. Reads visible row
-    /// count from the cached MSV layout (populated during paint).
-    pub fn handle_dap_sidebar_scroll(&mut self, section_idx: usize, step: isize) {
-        if section_idx >= 4 {
-            return;
-        }
-        let section_kind = Self::dap_sidebar_section_from_index(section_idx);
-        let item_count = self.dap_sidebar_section_item_count(section_kind);
-        let visible_rows = self.dap_sidebar_visible_rows(section_idx);
-        let max_scroll = item_count.saturating_sub(visible_rows.max(1));
-        if step > 0 {
-            self.dap_sidebar_scroll[section_idx] =
-                (self.dap_sidebar_scroll[section_idx] + step as usize).min(max_scroll);
-        } else {
-            self.dap_sidebar_scroll[section_idx] =
-                self.dap_sidebar_scroll[section_idx].saturating_sub((-step) as usize);
-        }
-    }
-
-    /// Visible row count for a debug sidebar section, reading from
-    /// `section_heights` (set by GTK key handler and TUI mouse handler)
-    /// or falling back to the cached MSV layout body height.
-    fn dap_sidebar_visible_rows(&self, section_idx: usize) -> usize {
-        let from_heights = self.dap_sidebar_section_heights[section_idx] as usize;
-        if from_heights > 0 {
-            return from_heights;
-        }
-        let layout = self.dap_sidebar_msv_layout.borrow();
-        if let Some(ref l) = *layout {
-            if section_idx < l.sections.len() {
-                return l.sections[section_idx].body_bounds.height as usize;
-            }
-        }
-        0
-    }
-
     /// Adjust the scroll offset for the active section so that the selected item is visible.
+    #[allow(dead_code)]
     pub fn dap_sidebar_ensure_visible(&mut self) {
         let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
         let height = self.dap_sidebar_section_heights[idx] as usize;
@@ -782,6 +752,94 @@ impl Engine {
             }
         }
         None
+    }
+
+    /// Dispatch a row activation from `SidebarSystem` (Enter or click).
+    /// Maps the flat row index back to the engine action (expand variable,
+    /// navigate stack frame, jump to breakpoint).
+    pub fn dispatch_dap_sidebar_row_activated(&mut self, section: usize, path: &[u16]) {
+        let flat_idx = path.first().copied().unwrap_or(u16::MAX) as usize;
+        if flat_idx == u16::MAX as usize {
+            return;
+        }
+        match Self::dap_sidebar_section_from_index(section) {
+            DebugSidebarSection::Variables => {
+                if let Some(var_ref) = self.dap_var_ref_at_flat_index(flat_idx) {
+                    if var_ref > 0 {
+                        self.dap_toggle_expand_var(var_ref);
+                    }
+                }
+            }
+            DebugSidebarSection::CallStack => {
+                self.dap_select_frame(flat_idx);
+                if let Some(frame) = self.dap_stack_frames.get(flat_idx).cloned() {
+                    if let Some(src) = &frame.source {
+                        let src_path = PathBuf::from(src);
+                        self.open_file_in_tab(&src_path);
+                        let target_line = (frame.line as usize).saturating_sub(1);
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = 0;
+                        self.scroll_cursor_center();
+                    }
+                }
+            }
+            DebugSidebarSection::Breakpoints => {
+                if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(flat_idx) {
+                    let line = self
+                        .dap_breakpoints
+                        .get(&path)
+                        .and_then(|bps| bps.get(bp_idx))
+                        .map(|bp| bp.line);
+                    if let Some(line) = line {
+                        let bp_path = PathBuf::from(&path);
+                        self.open_file_in_tab(&bp_path);
+                        let target_line = (line as usize).saturating_sub(1);
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = 0;
+                        self.scroll_cursor_center();
+                    }
+                }
+            }
+            DebugSidebarSection::Watch => {}
+        }
+    }
+
+    /// Dispatch a delete action (x/d) from SidebarSystem. Reads the
+    /// currently selected row from the sidebar system and deletes the
+    /// watch expression or breakpoint at that index.
+    pub fn dispatch_dap_sidebar_delete(&mut self) {
+        let section = self
+            .dap_sidebar_system
+            .borrow()
+            .active_section()
+            .unwrap_or(0);
+        let flat_idx = self
+            .dap_sidebar_system
+            .borrow()
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(u16::MAX) as usize;
+        if flat_idx == u16::MAX as usize {
+            return;
+        }
+        match Self::dap_sidebar_section_from_index(section) {
+            DebugSidebarSection::Watch if flat_idx < self.dap_watch_expressions.len() => {
+                self.dap_remove_watch(flat_idx);
+            }
+            DebugSidebarSection::Breakpoints => {
+                if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(flat_idx) {
+                    if let Some(bps) = self.dap_breakpoints.get_mut(&path) {
+                        if bp_idx < bps.len() {
+                            let line = bps[bp_idx].line;
+                            bps.remove(bp_idx);
+                            self.message = format!("Breakpoint removed: line {line}");
+                            self.dap_send_breakpoints_for_file(&path);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Handle a key press directed at the debug sidebar.

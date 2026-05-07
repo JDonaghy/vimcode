@@ -3097,72 +3097,21 @@ pub(super) fn render_debug_sidebar(
     });
     engine.dap_sidebar_action_hits.replace(hits);
 
-    // ── MSV body (the four sections). ──
-    // Paint caches the layout + view; click reads them verbatim.
-    // See CLAUDE.md "Paint↔click integration pattern".
+    // ── SidebarSystem body (the four sections). ──
     if area.height < 3 {
         return;
     }
-    let msv_area = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
-    let view = render::debug_sidebar_to_multi_section_view(sidebar);
-    let layout = quadraui::tui::tui_msv_layout(&view, msv_area);
-
-    // Register scroll surfaces for each debug sidebar section so
-    // dispatch_scroll and dispatch_click can route scroll wheel +
-    // scrollbar interactions without per-backend code.
-    for (i, sec) in layout.sections.iter().enumerate() {
-        if i >= 4 {
-            break;
-        }
-        let visible_rows = sec.body_bounds.height as usize;
-        let section_kind = Engine::dap_sidebar_section_from_index(i);
-        let item_count = engine.dap_sidebar_section_item_count(section_kind);
-        let scrollbar = if let (Some(track), Some(thumb)) = (sec.scrollbar_bounds, sec.thumb_bounds)
-        {
-            Some(quadraui::SurfaceScrollbar {
-                track_bounds: track,
-                thumb_bounds: thumb,
-                total_items: item_count,
-                visible_items: visible_rows,
-                scroll_offset: engine.dap_sidebar_scroll[i],
-            })
-        } else {
-            None
-        };
-        let surface_bounds = if let Some(track) = sec.scrollbar_bounds {
-            quadraui::Rect::new(
-                sec.body_bounds.x,
-                sec.body_bounds.y,
-                sec.body_bounds.width + track.width,
-                sec.body_bounds.height,
-            )
-        } else {
-            sec.body_bounds
-        };
-        engine
-            .scroll_surfaces
-            .borrow_mut()
-            .push(quadraui::ScrollSurface {
-                id: quadraui::WidgetId::new(format!("debug_sidebar:{}", i)),
-                bounds: surface_bounds,
-                scrollbar,
-            });
-    }
-
-    engine.dap_sidebar_msv_layout.replace(Some(layout));
-    engine.dap_sidebar_msv_view.replace(Some(view.clone()));
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    let msv_rect = quadraui::Rect::new(
+        area.x as f32,
+        (area.y + 2) as f32,
+        area.width as f32,
+        (area.height - 2) as f32,
+    );
+    engine.dap_sidebar_body_rect.set(msv_rect);
+    render::populate_dap_sidebar_system(engine);
+    backend.set_current_theme(q_theme);
     backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_multi_section_view(
-            quadraui::Rect::new(
-                msv_area.x as f32,
-                msv_area.y as f32,
-                msv_area.width as f32,
-                msv_area.height as f32,
-            ),
-            &view,
-        );
+        engine.dap_sidebar_system.borrow().render(b, msv_rect);
     });
 }
 

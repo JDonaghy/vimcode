@@ -631,6 +631,34 @@ fn map_gtk_key_name(gdk_name: &str) -> &str {
     }
 }
 
+fn gtk_key_name_to_quadraui(mapped: &str, ctrl: bool) -> Option<quadraui::UiEvent> {
+    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
+    let key = match mapped {
+        "Down" => Key::Named(NamedKey::Down),
+        "Up" => Key::Named(NamedKey::Up),
+        "Home" => Key::Named(NamedKey::Home),
+        "End" => Key::Named(NamedKey::End),
+        "PageDown" => Key::Named(NamedKey::PageDown),
+        "PageUp" => Key::Named(NamedKey::PageUp),
+        "Tab" => Key::Named(NamedKey::Tab),
+        "Return" => Key::Named(NamedKey::Enter),
+        " " => Key::Char(' '),
+        "j" => Key::Char('j'),
+        "k" => Key::Char('k'),
+        "g" => Key::Char('g'),
+        "G" => Key::Char('G'),
+        _ => return None,
+    };
+    Some(UiEvent::KeyPressed {
+        key,
+        modifiers: Modifiers {
+            ctrl,
+            ..Modifiers::default()
+        },
+        repeat: false,
+    })
+}
+
 /// Map a GDK key name and extract the unicode character for input-mode handlers.
 ///
 /// Returns `(mapped_key_name, unicode)`.  Special keys return `None` for unicode;
@@ -3032,19 +3060,7 @@ impl SimpleComponent for App {
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
-                    // Cache MSV layout + view for click (CLAUDE.md
-                    // "Paint↔click integration pattern"). Must happen
-                    // here — draw_debug_sidebar doesn't have `engine`.
-                    let msv_y = 2.0 * line_height;
-                    let msv_h = (h - msv_y).max(0.0);
-                    if msv_h > 0.0 {
-                        let view =
-                            render::debug_sidebar_to_multi_section_view(&screen.debug_sidebar);
-                        let bounds = quadraui::Rect::new(0.0, msv_y as f32, w as f32, msv_h as f32);
-                        let msv_layout = quadraui::gtk::gtk_msv_layout(&view, bounds, line_height);
-                        engine.dap_sidebar_msv_layout.replace(Some(msv_layout));
-                        engine.dap_sidebar_msv_view.replace(Some(view));
-                    }
+                    render::populate_dap_sidebar_system(&engine);
                     let action_hits = draw_debug_sidebar(
                         cr,
                         &layout,
@@ -3056,6 +3072,7 @@ impl SimpleComponent for App {
                         h,
                         line_height,
                         &backend_d,
+                        &engine,
                     );
                     engine.dap_sidebar_action_hits.replace(action_hits);
                 });
@@ -8925,42 +8942,14 @@ impl App {
         }
     }
 
-    fn gtk_populate_dap_section_heights(&self, engine: &mut Engine, lh: f64) {
-        let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
-        let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
-        if let (Some(layout), Some(view)) = (cached_layout.as_ref(), cached_view.as_ref()) {
-            for (i, sec) in layout.sections.iter().enumerate() {
-                if i >= 4 {
-                    break;
-                }
-                if let quadraui::SectionBody::Tree(ref tree) = view.sections[i].body {
-                    let inner = quadraui::gtk::gtk_tree_layout(tree, sec.body_bounds, lh);
-                    engine.dap_sidebar_section_heights[i] = inner.visible_rows.len() as u16;
-                }
-            }
-        }
-    }
-
     fn handle_debug_sidebar_msg(&mut self, msg: Msg) {
         match msg {
             Msg::DebugSidebarClick(click_x, y) => {
-                use crate::core::engine::DebugSidebarSection;
-                // MSV-driven dispatch (#296, harness-gated re-do per
-                // the Session 346 course correction). Both paint and
-                // click ask `gtk_msv_layout` for one
-                // `MultiSectionViewLayout` from one
-                // `MultiSectionView` and one body rect — drift is
-                // impossible by construction. See
-                // `quadraui/CLAUDE.md` § Consumer patterns
-                // ("Debug-sidebar shape").
                 let lh = self.debug_sidebar_lh.get().max(1.0);
                 let mut engine = self.engine.borrow_mut();
-
                 engine.dap_sidebar_has_focus = true;
 
                 if y < 2.0 * lh {
-                    // Chrome rows (title + action button).
-                    // Resolve click via cached StatusBar hit regions.
                     let hits = engine.dap_sidebar_action_hits.borrow();
                     let matched = hits.iter().any(|r| {
                         let rx = r.col as f64;
@@ -8977,75 +8966,30 @@ impl App {
                         }
                     }
                 } else {
-                    // Read the EXACT layout + view paint cached this
-                    // frame. Click never re-derives — see CLAUDE.md
-                    // "Paint↔click integration pattern" (#296).
-                    let cached_layout = engine.dap_sidebar_msv_layout.borrow().clone();
-                    let cached_view = engine.dap_sidebar_msv_view.borrow().clone();
-                    if let (Some(view_layout), Some(view)) =
-                        (cached_layout.as_ref(), cached_view.as_ref())
-                    {
-                        let lx = click_x as f32;
-                        let ly = y as f32;
-                        let section_kind = |idx: usize| match idx {
-                            0 => DebugSidebarSection::Variables,
-                            1 => DebugSidebarSection::Watch,
-                            2 => DebugSidebarSection::CallStack,
-                            _ => DebugSidebarSection::Breakpoints,
-                        };
-                        match view_layout.hit_test(lx, ly) {
-                            quadraui::MultiSectionViewHit::Header { section, .. } => {
-                                engine.dap_sidebar_section = section_kind(section);
-                                engine.dap_sidebar_selected = 0;
-                            }
-                            quadraui::MultiSectionViewHit::Body { section } => {
-                                engine.dap_sidebar_section = section_kind(section);
-                                let body_b = view_layout.sections[section].body_bounds;
-                                if let quadraui::SectionBody::Tree(ref tree) =
-                                    view.sections[section].body
-                                {
-                                    let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
-                                    if let quadraui::TreeViewHit::Row(idx) =
-                                        inner.hit_test(lx - body_b.x, ly - body_b.y)
-                                    {
-                                        let path = tree.rows[idx].path.clone();
-                                        if let [item_idx_u16] = path.as_slice() {
-                                            if *item_idx_u16 != u16::MAX {
-                                                engine.dap_sidebar_selected =
-                                                    *item_idx_u16 as usize;
-                                                engine.handle_debug_sidebar_key("Return", false);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            quadraui::MultiSectionViewHit::Scrollbar { section, .. } => {
-                                engine.dap_sidebar_section = section_kind(section);
-                                let sb = view_layout.sections[section]
-                                    .scrollbar_bounds
-                                    .expect("scrollbar hit implies bounds present");
-                                let body_b = view_layout.sections[section].body_bounds;
-                                if let quadraui::SectionBody::Tree(ref tree) =
-                                    view.sections[section].body
-                                {
-                                    let inner = quadraui::gtk::gtk_tree_layout(tree, body_b, lh);
-                                    let visible_rows = inner.visible_rows.len().max(1);
-                                    let total = tree.rows.len();
-                                    if total > visible_rows && sb.height > 0.0 {
-                                        let rel_pct = ((ly - sb.y) / sb.height).clamp(0.0, 1.0);
-                                        let max_scroll = total.saturating_sub(visible_rows);
-                                        engine.dap_sidebar_scroll[section] =
-                                            (rel_pct * max_scroll as f32).round() as usize;
-                                    }
-                                }
-                            }
-                            _ => {}
+                    let rect = engine.dap_sidebar_body_rect.get();
+                    render::populate_dap_sidebar_system(&engine);
+                    let click_event = quadraui::UiEvent::MouseDown {
+                        widget: None,
+                        button: quadraui::MouseButton::Left,
+                        position: quadraui::Point::new(click_x as f32, y as f32),
+                        modifiers: quadraui::Modifiers::default(),
+                    };
+                    let backend_rc = self.backend.clone();
+                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                        &click_event,
+                        &mut *backend_rc.borrow_mut(),
+                        rect,
+                    );
+                    match sidebar_event {
+                        quadraui::SidebarEvent::RowActivated { section, ref path }
+                        | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                            engine.dispatch_dap_sidebar_row_activated(section, path);
                         }
+                        _ => {}
                     }
                 }
                 drop(engine);
 
-                // Grab focus on the debug sidebar DA
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.grab_focus();
                     da.queue_draw();
@@ -9061,16 +9005,30 @@ impl App {
                     self.draw_needed.set(true);
                     return;
                 }
-                // F-keys (F5/F6/F9/F10/F11) are now handled inside
-                // `engine::handle_debug_sidebar_key` directly so they
-                // reach the debugger without bypass tricks. (#281 smoke
-                // fix — earlier passthrough that called `engine::handle_key`
-                // was re-intercepted at `keys.rs:192` because of the
-                // `dap_sidebar_has_focus` check.)
-                let lh = self.debug_sidebar_lh.get().max(1.0);
-                self.gtk_populate_dap_section_heights(&mut engine, lh);
+                let rect = engine.dap_sidebar_body_rect.get();
+                render::populate_dap_sidebar_system(&engine);
                 let mapped = map_gtk_key_name(key_name.as_str());
-                engine.handle_debug_sidebar_key(mapped, ctrl);
+                let key = gtk_key_name_to_quadraui(mapped, ctrl);
+                if let Some(ui_event) = key {
+                    let backend_rc = self.backend.clone();
+                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                        &ui_event,
+                        &mut *backend_rc.borrow_mut(),
+                        rect,
+                    );
+                    match sidebar_event {
+                        quadraui::SidebarEvent::RowActivated { section, ref path }
+                        | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                            engine.dispatch_dap_sidebar_row_activated(section, path);
+                        }
+                        quadraui::SidebarEvent::Ignored => {
+                            self.handle_dap_sidebar_action_key(&mut engine, mapped, ctrl);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.handle_dap_sidebar_action_key(&mut engine, mapped, ctrl);
+                }
                 let still_focused = engine.dap_sidebar_has_focus;
                 drop(engine);
                 self.focus_editor_if_needed(still_focused);
@@ -9080,16 +9038,20 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::DebugSidebarScroll(dy) => {
-                let mut engine = self.engine.borrow_mut();
-                let lh = self.debug_sidebar_lh.get().max(1.0);
-                let sec = engine.dap_sidebar_section;
-                let idx = Engine::dap_sidebar_section_index(sec);
-                // Populate section_heights from cached layout so the
-                // shared scroll method has correct visible-row counts.
-                self.gtk_populate_dap_section_heights(&mut engine, lh);
-                let step = (dy.abs() * 3.0).ceil() as isize;
-                let step = if dy > 0.0 { step } else { -step };
-                engine.handle_dap_sidebar_scroll(idx, step);
+                let engine = self.engine.borrow_mut();
+                let rect = engine.dap_sidebar_body_rect.get();
+                render::populate_dap_sidebar_system(&engine);
+                let scroll_event = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, -dy as f32),
+                    position: quadraui::Point::new(rect.x + 1.0, rect.y + 1.0),
+                };
+                let backend_rc = self.backend.clone();
+                engine.dap_sidebar_system.borrow_mut().handle(
+                    &scroll_event,
+                    &mut *backend_rc.borrow_mut(),
+                    rect,
+                );
                 drop(engine);
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
@@ -9097,6 +9059,35 @@ impl App {
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
+        }
+    }
+
+    fn handle_dap_sidebar_action_key(&self, engine: &mut Engine, key_name: &str, ctrl: bool) {
+        match key_name {
+            "Escape" | "q" => {
+                engine.dap_sidebar_has_focus = false;
+            }
+            "x" | "d" => {
+                engine.dispatch_dap_sidebar_delete();
+            }
+            "F5" => {
+                engine.execute_command("debug");
+            }
+            "F6" => {
+                engine.execute_command("pause");
+            }
+            "F9" => {
+                engine.execute_command("brkpt");
+            }
+            "F10" => {
+                engine.execute_command("stepover");
+            }
+            "F11" => {
+                engine.execute_command("stepin");
+            }
+            _ => {
+                let _ = ctrl;
+            }
         }
     }
 

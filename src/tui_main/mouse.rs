@@ -114,15 +114,9 @@ fn apply_scrollbar_drag(
                     engine.debug_output_auto_scroll = false;
                     handled = true;
                 }
+                // debug_sidebar:N — no longer needed, SidebarSystem handles scrollbar internally
                 other if other.starts_with("debug_sidebar:") => {
-                    if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            if idx < engine.dap_sidebar_scroll.len() {
-                                engine.dap_sidebar_scroll[idx] = *new_offset;
-                                handled = true;
-                            }
-                        }
-                    }
+                    handled = true;
                 }
                 // Editor window scrollbars — widget id format
                 // `tui:editor:<window_id>:<vsb|hsb>`. Apply-side parses the
@@ -1329,16 +1323,7 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             other if other.starts_with("debug_sidebar:") => {
-                                if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
-                                    if let Ok(idx) = idx_str.parse::<usize>() {
-                                        let signed = if down {
-                                            step as isize
-                                        } else {
-                                            -(step as isize)
-                                        };
-                                        engine.handle_dap_sidebar_scroll(idx, signed);
-                                    }
-                                }
+                                // SidebarSystem handles scroll internally
                                 return sidebar_width;
                             }
                             "tui:terminal_scrollback" => {
@@ -2117,13 +2102,7 @@ pub(super) fn handle_mouse(
                             return sidebar_width;
                         }
                         other if other.starts_with("debug_sidebar:") => {
-                            if let Some(idx_str) = other.strip_prefix("debug_sidebar:") {
-                                if let Ok(idx) = idx_str.parse::<usize>() {
-                                    if idx < engine.dap_sidebar_scroll.len() {
-                                        engine.dap_sidebar_scroll[idx] = *new_offset;
-                                    }
-                                }
-                            }
+                            // SidebarSystem handles scrollbar internally
                             return sidebar_width;
                         }
                         _ => {}
@@ -2509,14 +2488,11 @@ pub(super) fn handle_mouse(
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Debug {
-            use crate::core::engine::DebugSidebarSection;
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
             if sidebar_row < 2 {
                 // Chrome rows (title + action button).
-                // Resolve click via cached StatusBar hit regions
-                // (absolute terminal coordinates).
                 let hits = engine.dap_sidebar_action_hits.borrow();
                 let matched = hits.iter().any(|r| col >= r.col && col < r.col + r.width);
                 drop(hits);
@@ -2530,57 +2506,27 @@ pub(super) fn handle_mouse(
                     }
                 }
             } else {
-                // Read the EXACT layout + view paint cached this
-                // frame. Click never re-derives — see CLAUDE.md
-                // "Paint↔click integration pattern" (#296).
-                let layout_opt = engine.dap_sidebar_msv_layout.borrow().clone();
-                let view_opt = engine.dap_sidebar_msv_view.borrow().clone();
-                if let (Some(layout), Some(view)) = (layout_opt.as_ref(), view_opt.as_ref()) {
-                    let lx = col as f32;
-                    let ly = row as f32;
-                    let section_kind = |idx: usize| match idx {
-                        0 => DebugSidebarSection::Variables,
-                        1 => DebugSidebarSection::Watch,
-                        2 => DebugSidebarSection::CallStack,
-                        _ => DebugSidebarSection::Breakpoints,
-                    };
-                    // Scrollbar clicks (thumb drag, track page) are now
-                    // handled by dispatch_click via registered
-                    // ScrollSurface entries. Only body and header clicks
-                    // remain here.
-                    match layout.hit_test(lx, ly) {
-                        quadraui::MultiSectionViewHit::Header { section, .. } => {
-                            engine.dap_sidebar_section = section_kind(section);
-                            engine.dap_sidebar_selected = 0;
-                        }
-                        quadraui::MultiSectionViewHit::Body { section } => {
-                            engine.dap_sidebar_section = section_kind(section);
-                            let body_b = layout.sections[section].body_bounds;
-                            if let quadraui::SectionBody::Tree(ref tree) =
-                                view.sections[section].body
-                            {
-                                let body_rect = ratatui::layout::Rect::new(
-                                    body_b.x as u16,
-                                    body_b.y as u16,
-                                    body_b.width as u16,
-                                    body_b.height as u16,
-                                );
-                                let inner = quadraui::tui::tui_tree_layout(tree, body_rect);
-                                if let quadraui::TreeViewHit::Row(row_idx) =
-                                    inner.hit_test(lx - body_b.x, ly - body_b.y)
-                                {
-                                    let path = tree.rows[row_idx].path.clone();
-                                    if let [item_idx_u16] = path.as_slice() {
-                                        if *item_idx_u16 != u16::MAX {
-                                            engine.dap_sidebar_selected = *item_idx_u16 as usize;
-                                            engine.handle_debug_sidebar_key("Return", false);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
+                // Route body click through SidebarSystem.
+                let rect = engine.dap_sidebar_body_rect.get();
+                crate::render::populate_dap_sidebar_system(engine);
+                let click_event = quadraui::UiEvent::MouseDown {
+                    widget: None,
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let mut tui_backend = super::backend::TuiBackend::default();
+                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                    &click_event,
+                    &mut tui_backend,
+                    rect,
+                );
+                match sidebar_event {
+                    quadraui::SidebarEvent::RowActivated { section, ref path }
+                    | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                        engine.dispatch_dap_sidebar_row_activated(section, path);
                     }
+                    _ => {}
                 }
             }
             return sidebar_width;
