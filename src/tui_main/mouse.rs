@@ -1213,14 +1213,22 @@ pub(super) fn handle_mouse(
         }
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            // Git panel scroll wheel — not yet on dispatch_scroll.
-            // Debug sidebar + other panels fall through to dispatch_scroll.
+            let scroll_up = matches!(ev.kind, MouseEventKind::ScrollUp);
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Explorer
+            {
+                let delta = if scroll_up { -3_isize } else { 3 };
+                engine.explorer_scroll(delta);
+                return sidebar_width;
+            }
             if sidebar.visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
                 && sidebar.active_panel == TuiPanel::Git
             {
-                if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                if scroll_up {
                     engine.sc_selected = engine.sc_selected.saturating_sub(3);
                 } else {
                     let flat_len = engine.sc_flat_len();

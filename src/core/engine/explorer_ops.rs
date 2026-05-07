@@ -166,7 +166,11 @@ impl Engine {
             }
             "Return" | "KP_Enter" | "l" | "Right" => {
                 self.explorer_activate_selected();
-                ExplorerKeyResult::Consumed
+                if self.explorer_has_focus {
+                    ExplorerKeyResult::Consumed
+                } else {
+                    ExplorerKeyResult::Unfocused
+                }
             }
             "h" | "Left" => {
                 self.explorer_collapse_or_parent()
