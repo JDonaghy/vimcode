@@ -5606,11 +5606,10 @@ impl App {
         // GTK focus on sidebar DrawingAreas is unreliable, so we check
         // the engine focus flags here (same approach as TUI backend).
 
-        // Explorer sidebar: all keys routed through engine dispatch
+        // Explorer keys are handled by Msg::ExplorerKey (DA key controller).
+        // Only intercept here when a dialog is active (delete confirmation etc.)
+        // so dialog hotkeys reach the engine instead of the explorer dispatch.
         if self.engine.borrow().explorer_has_focus && self.engine.borrow().dialog.is_none() {
-            let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
-            self.handle_explorer_da_key(key_mapped, unicode, ctrl, sender);
-            self.draw_needed.set(true);
             return;
         }
 
@@ -10455,14 +10454,11 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ExplorerKey {
-                key_name: _,
-                unicode: _,
-                ctrl: _,
+                key_name,
+                unicode,
+                ctrl,
             } => {
-                // Explorer keys are handled by the Msg::KeyPress path
-                // (which checks explorer_has_focus). The DA key controller
-                // is kept for GTK focus reasons but dispatch is a no-op
-                // to avoid double-dispatch.
+                self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
             }
             Msg::ExplorerClick { x, y, n_press } => {
                 self.handle_explorer_da_click(x, y, n_press, sender);

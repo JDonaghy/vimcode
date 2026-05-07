@@ -417,9 +417,14 @@ impl Engine {
                     .position(|r| r.path.file_name().map(|n| n == "__new__").unwrap_or(false))
                     .unwrap_or(0);
                 let tree_path = vec![insert_idx as u16];
+                let placeholder = if is_folder {
+                    "New folder name..."
+                } else {
+                    "New file name..."
+                };
                 let mut tree = self.explorer_tree.borrow_mut();
                 tree.set_selected_path(Some(tree_path.clone()));
-                tree.start_editing(tree_path, String::new());
+                tree.start_editing(tree_path, String::new(), Some(placeholder.to_string()));
             }
             ExplorerAction::Delete => {
                 if idx < self.explorer_rows.len() {
@@ -433,7 +438,7 @@ impl Engine {
                     let tree_path = vec![idx as u16];
                     self.explorer_tree
                         .borrow_mut()
-                        .start_editing(tree_path, name);
+                        .start_editing(tree_path, name, None);
                 }
             }
             ExplorerAction::MoveFile => {
