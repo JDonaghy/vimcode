@@ -571,7 +571,13 @@ pub(super) fn render_sidebar(
         }
     }
 
-    render_explorer_scrollbar(buf, area, engine.explorer_rows.len(), explorer_scroll_top, theme);
+    render_explorer_scrollbar(
+        buf,
+        area,
+        engine.explorer_rows.len(),
+        explorer_scroll_top,
+        theme,
+    );
 }
 
 fn render_explorer_scrollbar(

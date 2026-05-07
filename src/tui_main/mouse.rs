@@ -80,7 +80,10 @@ fn apply_scrollbar_drag(
             let key = widget.as_str();
             match key {
                 "explorer:sb" => {
-                    engine.explorer_tree.borrow_mut().set_scroll_offset(*new_offset);
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .set_scroll_offset(*new_offset);
                     handled = true;
                 }
                 "ext_panel:sb" => {
@@ -930,8 +933,8 @@ pub(super) fn handle_mouse(
                 {
                     let sidebar_row = row.saturating_sub(menu_rows);
                     if sidebar_row >= 1 {
-                        let tree_row =
-                            (sidebar_row as usize).saturating_sub(1) + engine.explorer_tree.borrow().scroll_offset();
+                        let tree_row = (sidebar_row as usize).saturating_sub(1)
+                            + engine.explorer_tree.borrow().scroll_offset();
                         if tree_row < engine.explorer_rows.len() {
                             if let Some(src_row) = *explorer_drag_src {
                                 // Only activate drag if target differs from source.
@@ -1276,7 +1279,11 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "explorer:sb" => {
-                                let delta = if down { step as isize } else { -(step as isize) };
+                                let delta = if down {
+                                    step as isize
+                                } else {
+                                    -(step as isize)
+                                };
                                 engine.explorer_scroll(delta);
                                 return sidebar_width;
                             }
@@ -1412,7 +1419,9 @@ pub(super) fn handle_mouse(
                 let sidebar_row = row.saturating_sub(menu_rows);
                 let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
                 if tree_row < engine.explorer_rows.len() {
-                    engine.explorer_tree.borrow_mut()
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
                         .set_selected_path(Some(vec![tree_row as u16]));
                     let path = engine.explorer_rows[tree_row].path.clone();
                     let is_dir = engine.explorer_rows[tree_row].is_dir;
@@ -2092,7 +2101,10 @@ pub(super) fn handle_mouse(
                             return sidebar_width;
                         }
                         "explorer:sb" => {
-                            engine.explorer_tree.borrow_mut().set_scroll_offset(*new_offset);
+                            engine
+                                .explorer_tree
+                                .borrow_mut()
+                                .set_scroll_offset(*new_offset);
                             return sidebar_width;
                         }
                         "ext_panel:sb" => {
@@ -2470,7 +2482,9 @@ pub(super) fn handle_mouse(
             if tree_row < engine.explorer_rows.len() {
                 // Record potential drag source for DnD.
                 *explorer_drag_src = Some(tree_row);
-                engine.explorer_tree.borrow_mut()
+                engine
+                    .explorer_tree
+                    .borrow_mut()
                     .set_selected_path(Some(vec![tree_row as u16]));
                 if engine.explorer_rows[tree_row].is_dir {
                     engine.explorer_toggle_dir(tree_row);

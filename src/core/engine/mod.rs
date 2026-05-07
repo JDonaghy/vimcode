@@ -3564,9 +3564,7 @@ impl Engine {
             explorer_rows: Vec::new(),
             explorer_expanded: {
                 let mut set = std::collections::HashSet::new();
-                set.insert(
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                );
+                set.insert(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
                 set
             },
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),

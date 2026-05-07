@@ -87,10 +87,8 @@ impl Engine {
         tree.set_scroll_offset(new);
     }
 
-    pub fn dispatch_explorer_tree_event(
-        &mut self,
-        event: quadraui::TreeControllerEvent,
-    ) -> bool {
+    #[allow(dead_code)]
+    pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
         match event {
             quadraui::TreeControllerEvent::RowActivated { ref path } => {
                 let idx = path[0] as usize;
@@ -142,9 +140,7 @@ impl Engine {
                 ExplorerKeyResult::Consumed
             }
             "Home" => {
-                self.explorer_tree
-                    .borrow_mut()
-                    .jump_to_edge(true, viewport);
+                self.explorer_tree.borrow_mut().jump_to_edge(true, viewport);
                 ExplorerKeyResult::Consumed
             }
             "End" => {
@@ -175,9 +171,7 @@ impl Engine {
                     ExplorerKeyResult::Unfocused
                 }
             }
-            "h" | "Left" => {
-                self.explorer_collapse_or_parent()
-            }
+            "h" | "Left" => self.explorer_collapse_or_parent(),
             "Escape" | "q" => {
                 self.explorer_has_focus = false;
                 ExplorerKeyResult::Unfocused
@@ -239,9 +233,7 @@ impl Engine {
                     if p.is_dir() {
                         p.clone()
                     } else {
-                        p.parent()
-                            .unwrap_or(&self.cwd)
-                            .to_path_buf()
+                        p.parent().unwrap_or(&self.cwd).to_path_buf()
                     }
                 } else {
                     self.cwd.clone()

@@ -362,14 +362,6 @@ enum TuiPanel {
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
 
-struct ExplorerRow {
-    depth: usize,
-    name: String,
-    path: PathBuf,
-    is_dir: bool,
-    is_expanded: bool,
-}
-
 struct TuiSidebar {
     visible: bool,
     has_focus: bool,
@@ -405,7 +397,6 @@ impl TuiSidebar {
             ext_panel_name: None,
         }
     }
-
 }
 
 /// Sync the engine's `explorer_has_focus` and `search_has_focus` fields from the
@@ -2962,8 +2953,7 @@ fn event_loop(
                             } else {
                                 None
                             };
-                            let result =
-                                engine.dispatch_explorer_key(key_name, chr, ctrl);
+                            let result = engine.dispatch_explorer_key(key_name, chr, ctrl);
                             match result {
                                 ExplorerKeyResult::Unfocused => {
                                     sidebar.has_focus = false;
