@@ -941,6 +941,10 @@ enum Msg {
     OpenCommandCenter,
     /// Click in the debug sidebar DrawingArea (x, y coordinates in pixels).
     DebugSidebarClick(f64, f64),
+    /// Drag motion in the debug sidebar (absolute x, y from GestureDrag).
+    DebugSidebarDrag(f64, f64),
+    /// Drag end in the debug sidebar (absolute x, y).
+    DebugSidebarDragEnd(f64, f64),
     /// Key press in the debug sidebar DrawingArea.
     DebugSidebarKey(String, bool),
     /// Scroll in the debug sidebar DrawingArea (dy value from EventControllerScroll).
@@ -3087,6 +3091,28 @@ impl SimpleComponent for App {
             });
             widgets.debug_sidebar_da.add_controller(gesture);
         }
+        // ── Debug sidebar drag handler (scrollbar thumb) ─────────────────────
+        {
+            let sender_drag = sender.input_sender().clone();
+            let sender_drag_end = sender.input_sender().clone();
+            let gesture = gtk4::GestureDrag::new();
+            gesture.set_button(1);
+            gesture.connect_drag_update(move |g, off_x, off_y| {
+                if let Some((sx, sy)) = g.start_point() {
+                    sender_drag
+                        .send(Msg::DebugSidebarDrag(sx + off_x, sy + off_y))
+                        .ok();
+                }
+            });
+            gesture.connect_drag_end(move |g, off_x, off_y| {
+                if let Some((sx, sy)) = g.start_point() {
+                    sender_drag_end
+                        .send(Msg::DebugSidebarDragEnd(sx + off_x, sy + off_y))
+                        .ok();
+                }
+            });
+            widgets.debug_sidebar_da.add_controller(gesture);
+        }
         // ── Debug sidebar keyboard handler ───────────────────────────────────
         {
             let sender_dbg_key = sender.input_sender().clone();
@@ -4909,6 +4935,8 @@ impl SimpleComponent for App {
                 self.handle_menu_msg(msg, &sender);
             }
             Msg::DebugSidebarClick(_, _)
+            | Msg::DebugSidebarDrag(_, _)
+            | Msg::DebugSidebarDragEnd(_, _)
             | Msg::DebugSidebarKey(_, _)
             | Msg::DebugSidebarScroll(_) => {
                 self.handle_debug_sidebar_msg(msg);
@@ -8980,13 +9008,7 @@ impl App {
                         &mut *backend_rc.borrow_mut(),
                         rect,
                     );
-                    match sidebar_event {
-                        quadraui::SidebarEvent::RowActivated { section, ref path }
-                        | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                            engine.dispatch_dap_sidebar_row_activated(section, path);
-                        }
-                        _ => {}
-                    }
+                    engine.dispatch_dap_sidebar_event(sidebar_event);
                 }
                 drop(engine);
 
@@ -9009,25 +9031,19 @@ impl App {
                 render::populate_dap_sidebar_system(&engine);
                 let mapped = map_gtk_key_name(key_name.as_str());
                 let key = gtk_key_name_to_quadraui(mapped, ctrl);
-                if let Some(ui_event) = key {
+                let consumed = if let Some(ui_event) = key {
                     let backend_rc = self.backend.clone();
                     let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
                         &ui_event,
                         &mut *backend_rc.borrow_mut(),
                         rect,
                     );
-                    match sidebar_event {
-                        quadraui::SidebarEvent::RowActivated { section, ref path }
-                        | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                            engine.dispatch_dap_sidebar_row_activated(section, path);
-                        }
-                        quadraui::SidebarEvent::Ignored => {
-                            self.handle_dap_sidebar_action_key(&mut engine, mapped, ctrl);
-                        }
-                        _ => {}
-                    }
+                    engine.dispatch_dap_sidebar_event(sidebar_event)
                 } else {
-                    self.handle_dap_sidebar_action_key(&mut engine, mapped, ctrl);
+                    false
+                };
+                if !consumed {
+                    engine.dispatch_dap_sidebar_action_key(mapped);
                 }
                 let still_focused = engine.dap_sidebar_has_focus;
                 drop(engine);
@@ -9058,36 +9074,49 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
+            Msg::DebugSidebarDrag(x, y) => {
+                let engine = self.engine.borrow();
+                let rect = engine.dap_sidebar_body_rect.get();
+                let event = quadraui::UiEvent::MouseMoved {
+                    position: quadraui::Point::new(x as f32, y as f32),
+                    buttons: quadraui::ButtonMask {
+                        left: true,
+                        ..Default::default()
+                    },
+                };
+                let backend_rc = self.backend.clone();
+                engine.dap_sidebar_system.borrow_mut().handle(
+                    &event,
+                    &mut *backend_rc.borrow_mut(),
+                    rect,
+                );
+                drop(engine);
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::DebugSidebarDragEnd(x, y) => {
+                let engine = self.engine.borrow();
+                let rect = engine.dap_sidebar_body_rect.get();
+                let event = quadraui::UiEvent::MouseUp {
+                    widget: None,
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(x as f32, y as f32),
+                };
+                let backend_rc = self.backend.clone();
+                engine.dap_sidebar_system.borrow_mut().handle(
+                    &event,
+                    &mut *backend_rc.borrow_mut(),
+                    rect,
+                );
+                drop(engine);
+                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
             _ => unreachable!(),
-        }
-    }
-
-    fn handle_dap_sidebar_action_key(&self, engine: &mut Engine, key_name: &str, ctrl: bool) {
-        match key_name {
-            "Escape" | "q" => {
-                engine.dap_sidebar_has_focus = false;
-            }
-            "x" | "d" => {
-                engine.dispatch_dap_sidebar_delete();
-            }
-            "F5" => {
-                engine.execute_command("debug");
-            }
-            "F6" => {
-                engine.execute_command("pause");
-            }
-            "F9" => {
-                engine.execute_command("brkpt");
-            }
-            "F10" => {
-                engine.execute_command("stepover");
-            }
-            "F11" => {
-                engine.execute_command("stepin");
-            }
-            _ => {
-                let _ = ctrl;
-            }
         }
     }
 

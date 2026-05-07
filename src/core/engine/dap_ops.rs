@@ -842,6 +842,59 @@ impl Engine {
         }
     }
 
+    /// Process a `SidebarEvent` from the `SidebarSystem` and take the
+    /// appropriate engine action. Returns `true` if the event was
+    /// consumed (caller should redraw), `false` if `Ignored` (caller
+    /// should fall through to action-key dispatch).
+    pub fn dispatch_dap_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { section, ref path }
+            | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                self.dispatch_dap_sidebar_row_activated(section, path);
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true, // StateChanged, Consumed, ScrollChanged, HeaderActivated → redraw
+        }
+    }
+
+    /// Handle action keys that `SidebarSystem` didn't consume
+    /// (returned `Ignored`). Shared between TUI and GTK backends.
+    /// Returns `true` if the sidebar lost focus (q/Esc).
+    pub fn dispatch_dap_sidebar_action_key(&mut self, key_name: &str) -> bool {
+        match key_name {
+            "Escape" | "q" => {
+                self.dap_sidebar_has_focus = false;
+                true
+            }
+            "x" | "d" => {
+                self.dispatch_dap_sidebar_delete();
+                false
+            }
+            "F5" => {
+                self.execute_command("debug");
+                false
+            }
+            "F6" => {
+                self.execute_command("pause");
+                false
+            }
+            "F9" => {
+                self.execute_command("brkpt");
+                false
+            }
+            "F10" => {
+                self.execute_command("stepover");
+                false
+            }
+            "F11" => {
+                self.execute_command("stepin");
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a key press directed at the debug sidebar.
     /// j/k or Up/Down navigate within the active section; Tab switches sections;
     /// Enter/Space expand/collapse variables, navigate call stack, jump to breakpoint;

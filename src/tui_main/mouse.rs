@@ -2521,13 +2521,7 @@ pub(super) fn handle_mouse(
                     &mut tui_backend,
                     rect,
                 );
-                match sidebar_event {
-                    quadraui::SidebarEvent::RowActivated { section, ref path }
-                    | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                        engine.dispatch_dap_sidebar_row_activated(section, path);
-                    }
-                    _ => {}
-                }
+                engine.dispatch_dap_sidebar_event(sidebar_event);
             }
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Git {

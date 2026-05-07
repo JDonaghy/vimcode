@@ -1922,21 +1922,9 @@ fn event_loop(
                     &mut backend,
                     rect,
                 );
-                match sidebar_event {
-                    quadraui::SidebarEvent::RowActivated { section, ref path }
-                    | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                        engine.dispatch_dap_sidebar_row_activated(section, path);
-                        needs_redraw = true;
-                        continue;
-                    }
-                    quadraui::SidebarEvent::Consumed
-                    | quadraui::SidebarEvent::StateChanged
-                    | quadraui::SidebarEvent::ScrollChanged { .. }
-                    | quadraui::SidebarEvent::HeaderActivated { .. } => {
-                        needs_redraw = true;
-                        continue;
-                    }
-                    quadraui::SidebarEvent::Ignored => {} // fall through
+                if engine.dispatch_dap_sidebar_event(sidebar_event) {
+                    needs_redraw = true;
+                    continue;
                 }
             }
         }
@@ -2708,44 +2696,37 @@ fn event_loop(
                             &mut backend,
                             rect,
                         );
-                        match sidebar_event {
-                            quadraui::SidebarEvent::RowActivated { section, ref path }
-                            | quadraui::SidebarEvent::RowSelected { section, ref path } => {
-                                engine.dispatch_dap_sidebar_row_activated(section, path);
+                        if !engine.dispatch_dap_sidebar_event(sidebar_event) {
+                            // Ignored — handle action keys via shared dispatch.
+                            let key_name = match key_event.code {
+                                KeyCode::Esc => "Escape",
+                                KeyCode::Char(c) => match c {
+                                    'q' => "q",
+                                    'x' => "x",
+                                    'd' => "d",
+                                    'b' if ctrl => {
+                                        sidebar.visible = false;
+                                        sidebar.has_focus = false;
+                                        engine.session.explorer_visible = false;
+                                        engine.dap_sidebar_has_focus = false;
+                                        let _ = engine.session.save();
+                                        ""
+                                    }
+                                    _ => "",
+                                },
+                                KeyCode::F(n @ 5..=11) => match n {
+                                    5 => "F5",
+                                    6 => "F6",
+                                    9 => "F9",
+                                    10 => "F10",
+                                    11 => "F11",
+                                    _ => "",
+                                },
+                                _ => "",
+                            };
+                            if engine.dispatch_dap_sidebar_action_key(key_name) {
+                                sidebar.has_focus = false;
                             }
-                            quadraui::SidebarEvent::Ignored => match key_event.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    engine.dap_sidebar_has_focus = false;
-                                    sidebar.has_focus = false;
-                                }
-                                KeyCode::Char('x') | KeyCode::Char('d') => {
-                                    engine.dispatch_dap_sidebar_delete();
-                                }
-                                KeyCode::F(5) => {
-                                    engine.execute_command("debug");
-                                }
-                                KeyCode::F(6) => {
-                                    engine.execute_command("pause");
-                                }
-                                KeyCode::F(9) => {
-                                    engine.execute_command("brkpt");
-                                }
-                                KeyCode::F(10) => {
-                                    engine.execute_command("stepover");
-                                }
-                                KeyCode::F(11) => {
-                                    engine.execute_command("stepin");
-                                }
-                                KeyCode::Char('b') if ctrl => {
-                                    sidebar.visible = false;
-                                    sidebar.has_focus = false;
-                                    engine.session.explorer_visible = false;
-                                    engine.dap_sidebar_has_focus = false;
-                                    let _ = engine.session.save();
-                                }
-                                _ => {}
-                            },
-                            _ => {} // StateChanged, Consumed, ScrollChanged, HeaderActivated
                         }
                         needs_redraw = true;
                         continue;
