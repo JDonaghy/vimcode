@@ -1221,29 +1221,24 @@ pub(super) fn render_source_control(
         return;
     }
 
-    // Section rendering — migrated to the `quadraui::TreeView` primitive.
-    // The adapter `render::source_control_to_tree_view()` builds a flat
-    // TreeView (Staged / Changes / Worktrees / Log) and `quadraui_tui::draw_tree`
-    // rasterises it into the reserved area below the header + commit + buttons.
+    // Section rendering — migrated to `SidebarSystem` (#321).
     let section_area = Rect {
         x: area.x,
         y: section_start_y,
         width: area.width,
         height: (area.y + area.height).saturating_sub(section_start_y),
     };
-    let sc_tree = render::source_control_to_tree_view(sc, theme);
-    // B5c.4: route through `Backend::draw_tree`. Re-borrow `buf` from
-    // `frame` after the trait call for the popup chrome below.
     let q_rect = quadraui::Rect::new(
         section_area.x as f32,
         section_area.y as f32,
         section_area.width as f32,
         section_area.height as f32,
     );
+    engine.sc_sidebar_body_rect.set(q_rect);
+    render::populate_sc_sidebar_system(engine, theme);
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_tree(q_rect, &sc_tree);
+        engine.sc_sidebar_system.borrow().render(b, q_rect);
     });
     let buf = frame.buffer_mut();
 

@@ -2576,7 +2576,6 @@ pub struct Engine {
     /// Changes, Worktrees, Recent Commits) selection, scroll, keyboard nav,
     /// and mouse handling. Both TUI and GTK call `render()` and `handle()`.
     pub sc_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
-    #[allow(dead_code)]
     pub sc_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
@@ -4516,6 +4515,7 @@ mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchInputAction};
 mod source_control;
+pub use source_control::ScKeyResult;
 mod spell_ops;
 mod terminal_ops;
 mod visual;

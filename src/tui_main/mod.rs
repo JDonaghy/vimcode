@@ -2863,89 +2863,83 @@ fn event_loop(
 
                     // ── Source Control panel keyboard handling ──────────────
                     if sidebar.active_panel == TuiPanel::Git {
-                        // h/Left: switch focus to toolbar (when not in commit input or button mode)
+                        // h/Left → switch focus to activity bar toolbar.
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
                             && !engine.sc_commit_input_active
                             && engine.sc_button_focused.is_none()
+                            && !engine.sc_branch_picker_open
+                            && !engine.sc_branch_create_mode
+                            && !engine.sc_help_open
                         {
                             sidebar.has_focus = false;
                             engine.sc_has_focus = false;
+                            engine.sc_sidebar_system.borrow_mut().set_has_focus(false);
                             sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 4; // Git row
+                            sidebar.toolbar_selected = 4;
                             needs_redraw = true;
                             continue;
                         }
-                        if engine.sc_commit_input_active
-                            || engine.sc_branch_picker_open
-                            || engine.sc_branch_create_mode
-                            || engine.sc_help_open
-                        {
-                            // In input/popup mode, route all keys through.
-                            let (key_str, unicode): (&str, Option<char>) = match key_event.code {
-                                KeyCode::Enter => ("Return", None),
-                                KeyCode::Esc => ("Escape", None),
-                                KeyCode::Backspace => ("BackSpace", None),
-                                KeyCode::Delete => ("Delete", None),
-                                KeyCode::Up => ("Up", None),
-                                KeyCode::Down => ("Down", None),
-                                KeyCode::Left => ("Left", None),
-                                KeyCode::Right => ("Right", None),
-                                KeyCode::Home => ("Home", None),
-                                KeyCode::End => ("End", None),
-                                KeyCode::Char(ch) => ("char", Some(ch)),
-                                _ => ("", None),
-                            };
-                            if key_str == "char" {
-                                engine.handle_sc_key("", ctrl, unicode);
-                            } else if !key_str.is_empty() {
-                                engine.handle_sc_key(key_str, ctrl, None);
+                        // Ctrl+b → toggle sidebar visibility.
+                        if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
+                            sidebar.visible = false;
+                            sidebar.has_focus = false;
+                            engine.session.explorer_visible = false;
+                            engine.sc_has_focus = false;
+                            engine.sc_sidebar_system.borrow_mut().set_has_focus(false);
+                            let _ = engine.session.save();
+                            needs_redraw = true;
+                            continue;
+                        }
+                        // Map crossterm key → string name + unicode.
+                        let (key_str, unicode): (&str, Option<char>) = match key_event.code {
+                            KeyCode::Enter => ("Return", None),
+                            KeyCode::Esc => ("Escape", None),
+                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Delete => ("Delete", None),
+                            KeyCode::Up => ("Up", None),
+                            KeyCode::Down => ("Down", None),
+                            KeyCode::Left => ("Left", None),
+                            KeyCode::Right => ("Right", None),
+                            KeyCode::Home => ("Home", None),
+                            KeyCode::End => ("End", None),
+                            KeyCode::Tab => ("Tab", None),
+                            KeyCode::BackTab => ("BackTab", None),
+                            KeyCode::PageUp => ("Page_Up", None),
+                            KeyCode::PageDown => ("Page_Down", None),
+                            KeyCode::Char(ch) => {
+                                let name = match ch {
+                                    'j' => "j",
+                                    'k' => "k",
+                                    'h' => "h",
+                                    'l' => "l",
+                                    's' => "s",
+                                    'S' => "S",
+                                    'd' => "d",
+                                    'D' => "D",
+                                    'c' => "c",
+                                    'C' => "C",
+                                    'p' => "p",
+                                    'P' => "P",
+                                    'f' => "f",
+                                    'r' => "r",
+                                    'b' => "b",
+                                    'B' => "B",
+                                    'q' => "q",
+                                    '?' => "?",
+                                    '/' => "/",
+                                    _ => "",
+                                };
+                                (name, Some(ch))
                             }
-                        } else {
-                            let key_name: Option<&str> = match key_event.code {
-                                KeyCode::Char('j') | KeyCode::Down => Some("j"),
-                                KeyCode::Char('k') | KeyCode::Up => Some("k"),
-                                KeyCode::Char('h') | KeyCode::Left => Some("h"),
-                                KeyCode::Char('l') | KeyCode::Right => Some("l"),
-                                KeyCode::Char('s') => Some("s"),
-                                KeyCode::Char('S') => Some("S"),
-                                KeyCode::Char('d') => Some("d"),
-                                KeyCode::Char('D') => Some("D"),
-                                KeyCode::Char('c') => Some("c"),
-                                KeyCode::Char('p') => Some("p"),
-                                KeyCode::Char('P') => Some("P"),
-                                KeyCode::Char('f') => Some("f"),
-                                KeyCode::Char('b') if !ctrl => Some("b"),
-                                KeyCode::Char('B') => Some("B"),
-                                KeyCode::Char('?') => Some("?"),
-                                KeyCode::Tab => Some("Tab"),
-                                KeyCode::Enter => Some("Return"),
-                                KeyCode::Char('q') | KeyCode::Esc => Some("Escape"),
-                                KeyCode::Char('r') => Some("r"),
-                                KeyCode::Char('b') if ctrl => {
-                                    sidebar.visible = false;
-                                    sidebar.has_focus = false;
-                                    engine.session.explorer_visible = false;
-                                    engine.sc_has_focus = false;
-                                    let _ = engine.session.save();
-                                    None
-                                }
-                                _ => None,
-                            };
-                            if let Some(name) = key_name {
-                                if name == "Return" {
-                                    // Open tab immediately, diff arrives
-                                    // asynchronously via poll_sc_diff.
-                                    let done = engine.sc_open_selected_async();
-                                    if done && !engine.sc_has_focus {
-                                        sidebar.has_focus = false;
-                                    }
-                                } else {
-                                    engine.handle_sc_key(name, ctrl, None);
-                                    if !engine.sc_has_focus {
-                                        sidebar.has_focus = false;
-                                    }
-                                }
+                            _ => ("", None),
+                        };
+                        if !key_str.is_empty() || unicode.is_some() {
+                            use crate::core::engine::ScKeyResult;
+                            let result =
+                                engine.dispatch_sc_sidebar_key_unified(key_str, ctrl, unicode);
+                            if matches!(result, ScKeyResult::Unfocused) {
+                                sidebar.has_focus = false;
                             }
                         }
                         needs_redraw = true;

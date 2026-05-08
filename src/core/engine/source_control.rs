@@ -1,6 +1,5 @@
 use super::*;
 
-#[allow(dead_code)]
 pub enum ScKeyResult {
     Consumed,
     Unfocused,
@@ -87,7 +86,7 @@ impl Engine {
     ///   - STAGED header → unstage all
     ///   - CHANGES header → stage all
     pub fn sc_stage_selected(&mut self) {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        let (section, idx) = self.sc_selected_from_sidebar_system();
         // Section header: bulk operation
         if idx == usize::MAX {
             if section == 0 {
@@ -142,7 +141,6 @@ impl Engine {
     }
 
     /// Unstage all staged files.
-    #[allow(dead_code)]
     pub fn sc_unstage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let _ = git::unstage_all(&dir);
@@ -627,7 +625,7 @@ impl Engine {
 
     /// Show a confirmation dialog before discarding changes for the selected file.
     pub fn sc_confirm_discard_selected(&mut self) {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        let (section, idx) = self.sc_selected_from_sidebar_system();
         if section != 1 || idx == usize::MAX {
             return;
         }
@@ -1164,13 +1162,11 @@ impl Engine {
     }
 
     // ─── SidebarSystem integration ───────────────────────────────────
-    // These methods are wired by the TUI and GTK backends (next issues).
 
     /// Read the active section index and selected item index from the
     /// SidebarSystem. Returns `(section, item_idx)` where section is
     /// 0=staged, 1=changes, 2=worktrees, 3=log. Returns `(0, usize::MAX)`
     /// if nothing is selected.
-    #[allow(dead_code)]
     pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
         let sidebar = self.sc_sidebar_system.borrow();
         let section = sidebar.active_section().unwrap_or(0);
@@ -1184,7 +1180,6 @@ impl Engine {
 
     /// Feed a navigation key through the SidebarSystem (using the layout
     /// cached during the previous render frame) and dispatch the result.
-    #[allow(dead_code)]
     fn sc_sidebar_navigate(&mut self, key: quadraui::Key) {
         let rect = self.sc_sidebar_body_rect.get();
         let ev = quadraui::UiEvent::KeyPressed {
@@ -1198,7 +1193,6 @@ impl Engine {
 
     /// Handle a SidebarEvent produced by the SidebarSystem after a
     /// navigation key or mouse click.
-    #[allow(dead_code)]
     pub fn dispatch_sc_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
         match event {
             quadraui::SidebarEvent::RowActivated { section, .. } => {
@@ -1213,7 +1207,6 @@ impl Engine {
 
     /// Activate the selected row in the given section (equivalent to
     /// pressing Enter).
-    #[allow(dead_code)]
     fn sc_activate_row(&mut self, section: usize) {
         let (_, idx) = self.sc_selected_from_sidebar_system();
         if idx == usize::MAX {
@@ -1262,7 +1255,6 @@ impl Engine {
 
     /// Handle domain-specific action keys (stage, discard, commit, etc.)
     /// that are NOT navigation. Returns true if consumed.
-    #[allow(dead_code)]
     pub fn dispatch_sc_action_key(&mut self, key: &str) -> bool {
         match key {
             "s" => {
@@ -1327,7 +1319,6 @@ impl Engine {
 
     /// Unified key dispatch for the SC panel. Both TUI and GTK call this
     /// single method — no per-backend key→action mapping needed.
-    #[allow(dead_code)]
     pub fn dispatch_sc_sidebar_key_unified(
         &mut self,
         key: &str,
@@ -1404,7 +1395,6 @@ impl Engine {
     /// Handle a mouse/scroll UiEvent by feeding it through the
     /// SidebarSystem (using the layout cached during the previous
     /// render frame) and dispatching the result.
-    #[allow(dead_code)]
     pub fn handle_sc_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
         let rect = self.sc_sidebar_body_rect.get();
         let sidebar_event = self

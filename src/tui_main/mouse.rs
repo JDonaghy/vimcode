@@ -1231,12 +1231,12 @@ pub(super) fn handle_mouse(
                 && col < ab_width + sidebar_width
                 && sidebar.active_panel == TuiPanel::Git
             {
-                if scroll_up {
-                    engine.sc_selected = engine.sc_selected.saturating_sub(3);
-                } else {
-                    let flat_len = engine.sc_flat_len();
-                    engine.sc_selected = (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
-                }
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { -3.0 } else { 3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                engine.handle_sc_sidebar_ui_event(scroll_ev);
                 return sidebar_width;
             }
             // Terminal panel scroll now routes through dispatch_scroll
@@ -2478,6 +2478,7 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Git {
             sidebar.has_focus = true;
             engine.sc_has_focus = true;
+            engine.sc_sidebar_system.borrow_mut().set_has_focus(true);
 
             // sidebar_row layout:
             //   0 = header
@@ -2485,22 +2486,18 @@ pub(super) fn handle_mouse(
             //   1+commit_rows = pad above
             //   2+commit_rows = button row
             //   3+commit_rows = pad below
-            //   4+commit_rows .. = sections
+            //   4+commit_rows .. = sections (rendered by SidebarSystem)
             let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
-            let commit_end = 1 + commit_rows; // first row after commit input
-            let btn_row = 2 + commit_rows; // pad_above + 1
-            let section_start = 4 + commit_rows; // btn + pad_below + 1
+            let commit_end = 1 + commit_rows;
+            let btn_row = 2 + commit_rows;
+            let section_start = 4 + commit_rows;
             if sidebar_row == 0 {
-                // Panel header — no-op
                 engine.sc_commit_input_active = false;
             } else if sidebar_row >= 1 && sidebar_row < commit_end {
-                // Commit input row(s) — enter commit mode
                 engine.sc_commit_input_active = true;
                 engine.sc_commit_cursor = engine.sc_commit_message.len();
             } else if sidebar_row == btn_row {
                 engine.sc_commit_input_active = false;
-                // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
-                // Use column relative to the sidebar content area start.
                 let rel_col = col.saturating_sub(ab_width);
                 let commit_w = sidebar_width / 2;
                 let btn_idx = if rel_col < commit_w {
@@ -2513,36 +2510,24 @@ pub(super) fn handle_mouse(
                 engine.sc_activate_button(btn_idx);
             } else if sidebar_row >= section_start {
                 engine.sc_commit_input_active = false;
-                // Sections area — map to flat index.
-                // sc_visual_row_to_flat expects: 0=header,1=commit,2=buttons,3+=sections.
-                let adjusted = sidebar_row - section_start + 3;
-                // The SC panel stopped rendering a "(no changes)" placeholder
-                // row for expanded-but-empty sections when the section
-                // rendering migrated to the TreeView primitive (see the
-                // NOTE in `render::source_control_to_tree_view`). Pass
-                // `empty_section_hint: false` so the click math matches
-                // the actual render — otherwise every row after an
-                // expanded-but-empty section is off by +1 and clicking
-                // any row highlights the one above it (#184).
-                if let Some((flat_idx, is_header)) =
-                    engine.sc_visual_row_to_flat(adjusted as usize, false)
-                {
-                    engine.sc_selected = flat_idx;
-                    if is_header {
-                        engine.handle_sc_key("Tab", false, None);
-                    } else {
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        if is_double {
-                            engine.sc_open_selected_async();
-                            engine.sc_has_focus = true;
-                            sidebar.has_focus = true;
-                        }
-                    }
+                let click_ev = quadraui::UiEvent::MouseDown {
+                    widget: None,
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                engine.handle_sc_sidebar_ui_event(click_ev);
+                let now = Instant::now();
+                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
+                    && *last_click_pos == (col, row);
+                *last_click_time = now;
+                *last_click_pos = (col, row);
+                if is_double {
+                    let double_ev = quadraui::UiEvent::DoubleClick {
+                        widget: None,
+                        position: quadraui::Point::new(col as f32, row as f32),
+                    };
+                    engine.handle_sc_sidebar_ui_event(double_ev);
                 }
             }
             return sidebar_width;
