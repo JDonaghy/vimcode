@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 7, 2026 (Session 357 — **#329 GTK exit coredump** fixed. Root cause was RefCell double-borrow in `reveal_path_in_explorer`, not `process::exit` as originally hypothesized. Three-part fix: `try_borrow_mut` for `reveal_path_in_explorer` + tab-switcher timer, deferred `process::exit` via GLib idle callback, `ShowQuitConfirm` fallthrough guard.)
+**Last updated:** May 8, 2026 (Session 357 — **#329 GTK exit coredump** fixed + **#311 search panel cursor movement** shipped (PR #335). Consolidated search input key dispatch into `Engine::handle_search_input_key()`, eliminating ~90 lines of per-backend duplication. Filed #333, #334 for follow-up dedup.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -17,18 +17,20 @@
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
-| [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
+| [#333](https://github.com/JDonaghy/vimcode/issues/333) | TUI: remove duplicate search panel focus state | Cleanup |
+| [#334](https://github.com/JDonaghy/vimcode/issues/334) | Unify search panel results-mode behavior | Polish |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
 **Shipped this session (357):**
-- **#329 GTK exit coredump** (Path A, `fddd573`) — Root cause: `reveal_path_in_explorer` called `borrow_mut()` while the engine RefCell was already borrowed, panicking through the extern "C" `clicked_trampoline` → abort. Three-part fix: (1) `try_borrow_mut()` for `reveal_path_in_explorer` and the 100ms tab-switcher timer callback, (2) `process::exit` deferred via `idle_add_local_once` so it never runs inside a signal emission chain, (3) `return` after `save_session_and_exit()` in `ShowQuitConfirm` to prevent fallthrough after `-> !` became `-> ()`.
+- **#329 GTK exit coredump** (Path A, `fddd573`) — RefCell double-borrow in `reveal_path_in_explorer` panicked through extern "C" trampoline. Fixed with `try_borrow_mut`, deferred `process::exit`, and `ShowQuitConfirm` fallthrough guard.
+- **#311 Search panel cursor movement** (PR #335, merged) — Left/Right/Home/End cursor movement + mid-string insert/delete in search query/replace inputs. Consolidated duplicated key dispatch from GTK (~50 lines) and TUI (~50 lines) into `Engine::handle_search_input_key()` returning `SearchInputAction`. 9 new tests. Filed #333 (TUI focus state dedup) and #334 (results-mode behavior unification).
 
 ---
 
 **Previous sessions (356 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1931 lib tests passing. All on develop — no active branches.
+Vimcode at 1940 lib tests passing. All on develop — no active branches.
 
 > Sessions 357 and earlier in **SESSION_HISTORY.md**.
 
