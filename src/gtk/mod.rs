@@ -959,6 +959,8 @@ enum Msg {
     ExtSidebarKey(String, Option<char>),
     /// Click in the Extensions sidebar DrawingArea (x, y, n_press).
     ExtSidebarClick(f64, f64, i32),
+    ExtSidebarMouseUp(f64, f64),
+    ExtSidebarMotion(f64, f64),
     ExtSidebarScroll(f64),
     /// Key press in the Settings sidebar DrawingArea (key_name, ctrl, unicode).
     SettingsKey(String, bool, Option<char>),
@@ -3284,7 +3286,19 @@ impl SimpleComponent for App {
             gesture.connect_pressed(move |_, n_press, x, y| {
                 sender_ext.send(Msg::ExtSidebarClick(x, y, n_press)).ok();
             });
+            let sender_up = sender.input_sender().clone();
+            gesture.connect_released(move |_, _n, x, y| {
+                sender_up.send(Msg::ExtSidebarMouseUp(x, y)).ok();
+            });
             widgets.ext_sidebar_da.add_controller(gesture);
+        }
+        {
+            let sender_motion = sender.input_sender().clone();
+            let motion_ctrl = gtk4::EventControllerMotion::new();
+            motion_ctrl.connect_motion(move |_, x, y| {
+                sender_motion.send(Msg::ExtSidebarMotion(x, y)).ok();
+            });
+            widgets.ext_sidebar_da.add_controller(motion_ctrl);
         }
         {
             let sender_scroll = sender.input_sender().clone();
@@ -3296,8 +3310,6 @@ impl SimpleComponent for App {
             });
             widgets.ext_sidebar_da.add_controller(scroll_ctrl);
         }
-        // Scrollbar thumb drag handled by SidebarSystem.handle() via
-        // Msg::ExtSidebarClick/ExtSidebarScroll dispatch (#338).
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
         // ── Extension-provided panel (e.g. git-insights) draw + key + click ──
@@ -4863,7 +4875,11 @@ impl SimpleComponent for App {
             Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
                 self.handle_sc_sidebar_msg(msg);
             }
-            Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarClick(_, _, _) | Msg::ExtSidebarScroll(_) => {
+            Msg::ExtSidebarKey(_, _)
+            | Msg::ExtSidebarClick(_, _, _)
+            | Msg::ExtSidebarMouseUp(_, _)
+            | Msg::ExtSidebarMotion(_, _)
+            | Msg::ExtSidebarScroll(_) => {
                 self.handle_ext_sidebar_msg(msg);
             }
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
@@ -9466,6 +9482,44 @@ impl App {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
+            }
+            Msg::ExtSidebarMouseUp(x, y) => {
+                let mut engine = self.engine.borrow_mut();
+                let line_height = self.cached_ui_line_height.max(1.0);
+                let chrome_h = 2.0 * line_height;
+                let rect = engine.ext_sidebar_body_rect.get();
+                let pos = quadraui::Point::new(x as f32, (y - chrome_h) as f32 + rect.y);
+                let ev = quadraui::UiEvent::MouseUp {
+                    widget: None,
+                    button: quadraui::MouseButton::Left,
+                    position: pos,
+                };
+                engine.handle_ext_sidebar_ui_event(ev);
+                drop(engine);
+                self.draw_needed.set(true);
+                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+            }
+            Msg::ExtSidebarMotion(x, y) => {
+                let mut engine = self.engine.borrow_mut();
+                let line_height = self.cached_ui_line_height.max(1.0);
+                let chrome_h = 2.0 * line_height;
+                let rect = engine.ext_sidebar_body_rect.get();
+                let pos = quadraui::Point::new(x as f32, (y - chrome_h) as f32 + rect.y);
+                let ev = quadraui::UiEvent::MouseMoved {
+                    position: pos,
+                    buttons: quadraui::ButtonMask {
+                        left: true,
+                        right: false,
+                        middle: false,
+                    },
+                };
+                engine.handle_ext_sidebar_ui_event(ev);
+                drop(engine);
+                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
             }
             Msg::ExtSidebarScroll(dy) => {
                 let mut engine = self.engine.borrow_mut();
