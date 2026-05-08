@@ -885,6 +885,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
             cell_quantum: 1.0,
         },
     );
+    engine.sc_sidebar_system.borrow_mut().set_backend_info(
+        1.0,
+        quadraui::MsvLayoutMetrics {
+            header_size: 1.0,
+            divider_size: 0.0,
+            scrollbar_size: 1.0,
+            cell_quantum: 1.0,
+        },
+    );
     // Auto-detect Nerd Font availability. On Windows, terminal fonts typically
     // don't include Nerd Font glyphs. If none found, disable and show message.
     let nerd_font_missing = engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
