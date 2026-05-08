@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 8, 2026 (Session 357 — **#329 GTK exit coredump** fixed + **#311 search panel cursor movement** shipped (PR #335). Consolidated search input key dispatch into `Engine::handle_search_input_key()`, eliminating ~90 lines of per-backend duplication. Filed #333, #334 for follow-up dedup.)
+**Last updated:** May 8, 2026 (Session 358 — **Extensions sidebar → SidebarSystem** complete (#336/#337/#338). Three-issue migration: engine infrastructure, TUI backend, GTK backend + cleanup. All keyboard nav, mouse click, scroll, and scrollbar drag dispatch runs through shared engine methods via `handle_cached()` (quadraui#99). GTK uses `wire_da_events` (quadraui#101) for uniform event wiring. Net ~200 lines removed across the migration.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -22,17 +22,20 @@
 | [#334](https://github.com/JDonaghy/vimcode/issues/334) | Unify search panel results-mode behavior | Polish |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (357):**
-- **#329 GTK exit coredump** (Path A, `fddd573`) — RefCell double-borrow in `reveal_path_in_explorer` panicked through extern "C" trampoline. Fixed with `try_borrow_mut`, deferred `process::exit`, and `ShowQuitConfirm` fallthrough guard.
-- **#311 Search panel cursor movement** (PR #335, merged) — Left/Right/Home/End cursor movement + mid-string insert/delete in search query/replace inputs. Consolidated duplicated key dispatch from GTK (~50 lines) and TUI (~50 lines) into `Engine::handle_search_input_key()` returning `SearchInputAction`. 9 new tests. Filed #333 (TUI focus state dedup) and #334 (results-mode behavior unification).
+**Shipped this session (358):**
+- **#336 Extensions sidebar: engine + render layer** (Path A) — Added `ext_sidebar_system: Rc<RefCell<SidebarSystem>>` to Engine (WholePanel scroll, Selection nav, vim keys). `populate_ext_sidebar_system()` builds TreeRows from registry data. `dispatch_ext_sidebar_event()` + `dispatch_ext_sidebar_action_key()` for domain actions. 5 new tests.
+- **#337 Extensions sidebar: TUI → SidebarSystem** (Path A) — Replaced bespoke MSV render, click hit-testing (~90 lines), and scroll handling with `SidebarSystem.render()` and `.handle()`. Net -73 lines TUI.
+- **#338 Extensions sidebar: GTK → SidebarSystem + cleanup** (Path A, 4 commits) — GTK backend wired to SidebarSystem. Unified key dispatch via `dispatch_ext_sidebar_key_unified()` + `ExtSidebarKeyResult` eliminates all duplicated key-to-action mapping. `handle_cached()` (quadraui#99) enables backend-free event dispatch from shared engine code. `wire_da_events` (quadraui#101) replaces ~30 lines of manual GTK signal handler wiring. Removed dead fields (`ext_sidebar_body_height`, `ext_sidebar_max_panel_scroll`). Gated old methods behind `#[cfg(win-gui)]`.
+- **Also closed:** #322 (superseded by #336/#337/#338), #326 (duplicate of #322).
+- **quadraui issues filed + resolved:** #93 (WholePanel scroll), #95 (scrollbar fix), #97 (has_focus getter), #99 (backend-free handle_cached), #101 (wire_da_events).
 
 ---
 
-**Previous sessions (356 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (357 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1940 lib tests passing. All on develop — no active branches.
+Vimcode at 1946 lib tests passing. All on develop — no active branches.
 
-> Sessions 357 and earlier in **SESSION_HISTORY.md**.
+> Sessions 358 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.

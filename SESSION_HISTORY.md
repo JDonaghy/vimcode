@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 357 archived here.
+All sessions through 358 archived here.
+
+---
+**Session 358 (May 8) — Extensions sidebar → SidebarSystem (#336/#337/#338):**
+
+Three-issue migration of the extensions sidebar from hand-rolled state management to `quadraui::SidebarSystem`. **#336** (engine + render): Added `ext_sidebar_system: Rc<RefCell<SidebarSystem>>` with WholePanel scroll, Selection nav, vim keys. `populate_ext_sidebar_system()` builds TreeRows. `dispatch_ext_sidebar_event()` + `dispatch_ext_sidebar_action_key()` for domain actions. `ext_selected_from_sidebar_system()` reads selection from SidebarSystem. 5 new tests. +280 lines. **#337** (TUI): Replaced bespoke MSV render, ~90-line click hit-testing, and scroll handling with `SidebarSystem.render()` and `.handle()`. Fixed scroll direction (removed delta negation), `RowSelected` clears search input, `ext_open_selected_readme` reads from SidebarSystem. Net -73 lines. **#338** (GTK + cleanup, 4 commits): (1) GTK backend wired to SidebarSystem render/handle. (2) Unified key dispatch via `dispatch_ext_sidebar_key_unified()` + `ExtSidebarKeyResult` — both TUI and GTK call one engine method, no per-backend key mapping. (3) `handle_cached()` (quadraui#99, backend-free SidebarSystem event handling via cached layout metrics) enables all nav/mouse/scroll dispatch from shared engine code. `set_backend_info()` called at TUI init and GTK font change. (4) `wire_da_events` (quadraui#101) replaces ~30 lines of manual GTK signal handler wiring with one 3-line call. Removed dead fields `ext_sidebar_body_height`/`ext_sidebar_max_panel_scroll`. Gated `handle_ext_sidebar_key`/`ext_flat_item_count`/`ext_selected_to_section` behind `#[cfg(win-gui)]`. Updated 3 existing tests + `ext_remove` in `lsp_ops.rs` to use SidebarSystem. Also closed #322 (superseded) and #326 (duplicate). quadraui issues filed and resolved: #93 (WholePanel scroll), #95 (scrollbar click/drag fix), #97 (has_focus getter), #99 (handle_cached), #101 (wire_da_events).
 
 ---
 **Session 357 (May 7-8) — #329 GTK exit coredump + #311 search panel cursor movement:**
