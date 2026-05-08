@@ -2,7 +2,6 @@ use super::*;
 
 pub enum ExtSidebarKeyResult {
     Consumed,
-    NavigateSidebar(quadraui::Key),
     Unfocused,
 }
 
@@ -1931,6 +1930,98 @@ impl Engine {
         }
     }
 
+    pub fn populate_ext_sidebar_system(&self) {
+        use quadraui::{Decoration, StyledText, TreeRow};
+
+        let manifests = self.ext_available_manifests();
+        let q = self.ext_sidebar_query.to_lowercase();
+
+        let installed_rows: Vec<TreeRow> = manifests
+            .iter()
+            .filter(|m| self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .enumerate()
+            .map(|(i, m)| {
+                let display = if m.display_name.is_empty() {
+                    &m.name
+                } else {
+                    &m.display_name
+                };
+                let has_update = self.ext_has_update(&m.name);
+                let label = if has_update {
+                    format!("\u{25cf} {} \u{2191}", display)
+                } else {
+                    format!("\u{25cf} {}", display)
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect();
+
+        let available_rows: Vec<TreeRow> = manifests
+            .iter()
+            .filter(|m| !self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .enumerate()
+            .map(|(i, m)| {
+                let display = if m.display_name.is_empty() {
+                    &m.name
+                } else {
+                    &m.display_name
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", display)),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect();
+
+        let mut sidebar = self.ext_sidebar_system.borrow_mut();
+        sidebar.set_has_focus(self.ext_sidebar_has_focus);
+        if self.ext_sidebar_has_focus && sidebar.active_section().is_none() {
+            sidebar.set_active_section(Some(0));
+        }
+        sidebar.set_rows(0, installed_rows);
+        sidebar.set_rows(1, available_rows);
+    }
+
+    fn ext_sidebar_navigate(&mut self, key: quadraui::Key) {
+        self.populate_ext_sidebar_system();
+        let rect = self.ext_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self
+            .ext_sidebar_system
+            .borrow_mut()
+            .handle_cached(&ev, rect);
+        self.dispatch_ext_sidebar_event(sidebar_event);
+    }
+
     pub fn dispatch_ext_sidebar_key_unified(
         &mut self,
         key: &str,
@@ -1948,8 +2039,14 @@ impl Engine {
                     self.ext_sidebar_query.pop();
                     ExtSidebarKeyResult::Consumed
                 }
-                "Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Down)),
-                "Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Up)),
+                "Down" => {
+                    self.ext_sidebar_navigate(Key::Named(NamedKey::Down));
+                    ExtSidebarKeyResult::Consumed
+                }
+                "Up" => {
+                    self.ext_sidebar_navigate(Key::Named(NamedKey::Up));
+                    ExtSidebarKeyResult::Consumed
+                }
                 "Return" => {
                     self.ext_open_selected_readme();
                     ExtSidebarKeyResult::Consumed
@@ -1982,19 +2079,37 @@ impl Engine {
                     self.dispatch_ext_sidebar_action_key(key);
                     ExtSidebarKeyResult::Consumed
                 }
-                "j" => ExtSidebarKeyResult::NavigateSidebar(Key::Char('j')),
-                "k" => ExtSidebarKeyResult::NavigateSidebar(Key::Char('k')),
-                "Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Down)),
-                "Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Up)),
-                "Tab" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Tab)),
-                "BackTab" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::BackTab)),
-                "Home" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Home)),
-                "End" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::End)),
-                "Page_Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::PageUp)),
-                "Page_Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::PageDown)),
-                _ => ExtSidebarKeyResult::Consumed,
+                _ => {
+                    let nav_key = match key {
+                        "j" => Some(Key::Char('j')),
+                        "k" => Some(Key::Char('k')),
+                        "Down" => Some(Key::Named(NamedKey::Down)),
+                        "Up" => Some(Key::Named(NamedKey::Up)),
+                        "Tab" => Some(Key::Named(NamedKey::Tab)),
+                        "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+                        "Home" => Some(Key::Named(NamedKey::Home)),
+                        "End" => Some(Key::Named(NamedKey::End)),
+                        "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+                        "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+                        _ => None,
+                    };
+                    if let Some(k) = nav_key {
+                        self.ext_sidebar_navigate(k);
+                    }
+                    ExtSidebarKeyResult::Consumed
+                }
             }
         }
+    }
+
+    pub fn handle_ext_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        self.populate_ext_sidebar_system();
+        let rect = self.ext_sidebar_body_rect.get();
+        let sidebar_event = self
+            .ext_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_ext_sidebar_event(sidebar_event)
     }
 
     /// Returns the filtered list of installed extension manifests.

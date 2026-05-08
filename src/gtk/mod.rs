@@ -4587,6 +4587,20 @@ impl SimpleComponent for App {
                     let fm = pango_ctx.metrics(Some(&font_desc), None);
                     self.cached_ui_line_height =
                         (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64;
+                    let lh = self.cached_ui_line_height as f32;
+                    self.engine
+                        .borrow()
+                        .ext_sidebar_system
+                        .borrow_mut()
+                        .set_backend_info(
+                            lh,
+                            quadraui::MsvLayoutMetrics {
+                                header_size: (lh * 1.2).round(),
+                                divider_size: 0.0,
+                                scrollbar_size: 8.0,
+                                cell_quantum: 0.0,
+                            },
+                        );
                 }
                 // Keep shared cells in sync so the resize callback can use accurate values.
                 self.line_height_cell.set(line_height);
@@ -5537,25 +5551,7 @@ impl App {
                 if engine.dialog.is_some() {
                     engine.handle_key(mapped, unicode, false);
                 } else {
-                    use crate::core::engine::ExtSidebarKeyResult;
-                    match engine.dispatch_ext_sidebar_key_unified(mapped, unicode) {
-                        ExtSidebarKeyResult::NavigateSidebar(key) => {
-                            render::populate_ext_sidebar_system(&engine);
-                            let rect = engine.ext_sidebar_body_rect.get();
-                            let ev = quadraui::UiEvent::KeyPressed {
-                                key,
-                                modifiers: quadraui::Modifiers::default(),
-                                repeat: false,
-                            };
-                            let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
-                                &ev,
-                                &mut *self.backend.borrow_mut(),
-                                rect,
-                            );
-                            engine.dispatch_ext_sidebar_event(sidebar_event);
-                        }
-                        ExtSidebarKeyResult::Unfocused | ExtSidebarKeyResult::Consumed => {}
-                    }
+                    engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
                 }
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
@@ -9429,26 +9425,7 @@ impl App {
                     }
                     return;
                 }
-                use crate::core::engine::ExtSidebarKeyResult;
-                match engine.dispatch_ext_sidebar_key_unified(mapped, unicode) {
-                    ExtSidebarKeyResult::NavigateSidebar(key) => {
-                        render::populate_ext_sidebar_system(&engine);
-                        let rect = engine.ext_sidebar_body_rect.get();
-                        let ev = quadraui::UiEvent::KeyPressed {
-                            key,
-                            modifiers: quadraui::Modifiers::default(),
-                            repeat: false,
-                        };
-                        let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
-                            &ev,
-                            &mut *self.backend.borrow_mut(),
-                            rect,
-                        );
-                        engine.dispatch_ext_sidebar_event(sidebar_event);
-                    }
-                    ExtSidebarKeyResult::Unfocused => {}
-                    ExtSidebarKeyResult::Consumed => {}
-                }
+                engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
@@ -9468,7 +9445,6 @@ impl App {
                 } else if y_click < chrome_h {
                     engine.ext_sidebar_input_active = true;
                 } else {
-                    render::populate_ext_sidebar_system(&engine);
                     let rect = engine.ext_sidebar_body_rect.get();
                     let click_pos =
                         quadraui::Point::new(x_click as f32, (y_click - chrome_h) as f32 + rect.y);
@@ -9478,12 +9454,7 @@ impl App {
                         position: click_pos,
                         modifiers: quadraui::Modifiers::default(),
                     };
-                    let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
-                        &ev,
-                        &mut *self.backend.borrow_mut(),
-                        rect,
-                    );
-                    engine.dispatch_ext_sidebar_event(sidebar_event);
+                    engine.handle_ext_sidebar_ui_event(ev);
                 }
                 if n_press >= 2 {
                     engine.ext_open_selected_readme();
@@ -9497,19 +9468,14 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ExtSidebarScroll(dy) => {
-                let engine = self.engine.borrow();
-                render::populate_ext_sidebar_system(&engine);
+                let mut engine = self.engine.borrow_mut();
                 let rect = engine.ext_sidebar_body_rect.get();
                 let ev = quadraui::UiEvent::Scroll {
                     widget: None,
                     delta: quadraui::ScrollDelta::new(0.0, dy as f32),
                     position: quadraui::Point::new(rect.x + 1.0, rect.y + 1.0),
                 };
-                let _ = engine.ext_sidebar_system.borrow_mut().handle(
-                    &ev,
-                    &mut *self.backend.borrow_mut(),
-                    rect,
-                );
+                engine.handle_ext_sidebar_ui_event(ev);
                 drop(engine);
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {

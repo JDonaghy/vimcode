@@ -876,6 +876,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 
     let mut engine = Engine::new();
+    engine.ext_sidebar_system.borrow_mut().set_backend_info(
+        1.0,
+        quadraui::MsvLayoutMetrics {
+            header_size: 1.0,
+            divider_size: 0.0,
+            scrollbar_size: 1.0,
+            cell_quantum: 1.0,
+        },
+    );
     // Auto-detect Nerd Font availability. On Windows, terminal fonts typically
     // don't include Nerd Font glyphs. If none found, disable and show message.
     let nerd_font_missing = engine.settings.use_nerd_fonts && !icons::detect_nerd_font_windows();
@@ -1776,13 +1785,7 @@ fn event_loop(
                     sidebar.has_focus = true;
                     engine.ext_sidebar_has_focus = true;
                 }
-                render::populate_ext_sidebar_system(engine);
-                let sidebar_event =
-                    engine
-                        .ext_sidebar_system
-                        .borrow_mut()
-                        .handle(&ui_event, &mut backend, rect);
-                if engine.dispatch_ext_sidebar_event(sidebar_event) {
+                if engine.handle_ext_sidebar_ui_event(ui_event.clone()) {
                     needs_redraw = true;
                     continue;
                 }
@@ -2684,21 +2687,6 @@ fn event_loop(
                         };
                         use crate::core::engine::ExtSidebarKeyResult;
                         match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
-                            ExtSidebarKeyResult::NavigateSidebar(key) => {
-                                render::populate_ext_sidebar_system(engine);
-                                let rect = engine.ext_sidebar_body_rect.get();
-                                let ev = quadraui::UiEvent::KeyPressed {
-                                    key,
-                                    modifiers: quadraui::Modifiers::default(),
-                                    repeat: false,
-                                };
-                                let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
-                                    &ev,
-                                    &mut backend,
-                                    rect,
-                                );
-                                engine.dispatch_ext_sidebar_event(sidebar_event);
-                            }
                             ExtSidebarKeyResult::Unfocused => {
                                 sidebar.has_focus = false;
                             }
