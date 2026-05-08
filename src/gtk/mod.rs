@@ -3250,26 +3250,6 @@ impl SimpleComponent for App {
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
                 let h = da.height() as f64;
-                let body_h = ((h - 2.0 * line_height).max(0.0)) as f32;
-                engine.ext_sidebar_body_height.set(body_h);
-                // Compute max_panel_scroll for scrollbar drag handlers
-                // (avoids re-running layout per drag-update event).
-                if let Some(ref ext) = screen.ext_sidebar {
-                    let view_for_max = render::ext_sidebar_to_multi_section_view(ext);
-                    let layout_for_max = quadraui::gtk::gtk_msv_layout(
-                        &view_for_max,
-                        quadraui::Rect::new(0.0, 0.0, w as f32, body_h),
-                        line_height,
-                    );
-                    let total: f32 = layout_for_max
-                        .sections
-                        .iter()
-                        .map(|s| s.resolved_size)
-                        .sum();
-                    engine
-                        .ext_sidebar_max_panel_scroll
-                        .set((total - body_h).max(0.0));
-                }
                 draw_ext_sidebar(
                     cr,
                     &layout,
@@ -3281,6 +3261,7 @@ impl SimpleComponent for App {
                     h,
                     line_height,
                     &backend_d,
+                    &engine,
                 );
             });
         }
@@ -3315,55 +3296,8 @@ impl SimpleComponent for App {
             });
             widgets.ext_sidebar_da.add_controller(scroll_ctrl);
         }
-        // Scrollbar thumb drag — mirrors the ext_dyn_panel_da pattern.
-        // Claim the gesture when drag starts in the rightmost 8 px so
-        // sidebar-resize on `main_hbox` doesn't steal the sequence.
-        // Reads `ext_sidebar_body_height` and `ext_sidebar_max_panel_scroll`
-        // (cached by paint each frame) so we don't need to re-run layout.
-        {
-            let engine_drag = engine.clone();
-            let da_ref = ext_sidebar_da_ref.clone();
-            let da_ref_begin = ext_sidebar_da_ref.clone();
-            let draw_needed = model.draw_needed.clone();
-            let gesture = gtk4::GestureDrag::new();
-            gesture.connect_drag_begin(move |g, x, _y| {
-                let da_w = if let Some(ref da) = *da_ref_begin.borrow() {
-                    da.width() as f64
-                } else {
-                    return;
-                };
-                if x >= da_w - 8.0 {
-                    g.set_state(gtk4::EventSequenceState::Claimed);
-                }
-            });
-            gesture.connect_drag_update(move |g, _dx, dy| {
-                let Some((start_x, start_y)) = g.start_point() else {
-                    return;
-                };
-                let (da_w, da_h) = if let Some(ref da) = *da_ref.borrow() {
-                    (da.width() as f64, da.height() as f64)
-                } else {
-                    return;
-                };
-                if start_x < da_w - 8.0 || da_h <= 0.0 {
-                    return;
-                }
-                let mut engine = engine_drag.borrow_mut();
-                let body_h = engine.ext_sidebar_body_height.get().max(1.0) as f64;
-                let chrome_h = (da_h - body_h).max(0.0);
-                let track_h = body_h.max(1.0);
-                let y = (start_y + dy - chrome_h).clamp(0.0, track_h);
-                let frac = (y / track_h) as f32;
-                let max_scroll = engine.ext_sidebar_max_panel_scroll.get();
-                engine.ext_sidebar_panel_scroll = frac * max_scroll;
-                drop(engine);
-                if let Some(ref da) = *da_ref.borrow() {
-                    da.queue_draw();
-                }
-                draw_needed.set(true);
-            });
-            widgets.ext_sidebar_da.add_controller(gesture);
-        }
+        // Scrollbar thumb drag handled by SidebarSystem.handle() via
+        // Msg::ExtSidebarClick/ExtSidebarScroll dispatch (#338).
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
         // ── Extension-provided panel (e.g. git-insights) draw + key + click ──
@@ -9477,7 +9411,45 @@ impl App {
                     }
                     return;
                 }
-                engine.handle_ext_sidebar_key(mapped, false, unicode);
+                if engine.ext_sidebar_input_active {
+                    engine.handle_ext_sidebar_key(mapped, false, unicode);
+                } else {
+                    let action_key = matches!(
+                        mapped,
+                        "Escape" | "q" | "/" | "r" | "i" | "d" | "u" | "Return"
+                    );
+                    if action_key {
+                        engine.dispatch_ext_sidebar_action_key(mapped);
+                    } else {
+                        let key = match mapped {
+                            "j" => Some(quadraui::Key::Char('j')),
+                            "k" => Some(quadraui::Key::Char('k')),
+                            "Down" => Some(quadraui::Key::Named(quadraui::NamedKey::Down)),
+                            "Up" => Some(quadraui::Key::Named(quadraui::NamedKey::Up)),
+                            "Tab" => Some(quadraui::Key::Named(quadraui::NamedKey::Tab)),
+                            "Home" => Some(quadraui::Key::Named(quadraui::NamedKey::Home)),
+                            "End" => Some(quadraui::Key::Named(quadraui::NamedKey::End)),
+                            "Page_Up" => Some(quadraui::Key::Named(quadraui::NamedKey::PageUp)),
+                            "Page_Down" => Some(quadraui::Key::Named(quadraui::NamedKey::PageDown)),
+                            _ => None,
+                        };
+                        if let Some(k) = key {
+                            render::populate_ext_sidebar_system(&engine);
+                            let rect = engine.ext_sidebar_body_rect.get();
+                            let ev = quadraui::UiEvent::KeyPressed {
+                                key: k,
+                                modifiers: quadraui::Modifiers::default(),
+                                repeat: false,
+                            };
+                            let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                                &ev,
+                                &mut *self.backend.borrow_mut(),
+                                rect,
+                            );
+                            engine.dispatch_ext_sidebar_event(sidebar_event);
+                        }
+                    }
+                }
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
@@ -9491,115 +9463,59 @@ impl App {
                 let mut engine = self.engine.borrow_mut();
                 let line_height = self.cached_ui_line_height.max(1.0);
                 engine.ext_sidebar_has_focus = true;
-
-                // Chrome rows match `draw_ext_sidebar`:
-                //   row 0 (`line_height`) = panel header.
-                //   row 1 (`line_height`) = search input.
-                // MultiSectionView body starts at y = 2 * line_height.
-                // Hit-test via `quadraui::gtk::gtk_msv_layout()`
-                // (the same call the rasteriser makes) so paint and
-                // click share the section geometry by construction
-                // (#293, structural fix for the #281 bug classes).
                 let chrome_h = 2.0 * line_height;
                 if y_click < line_height {
                     // Panel header — no-op.
                 } else if y_click < chrome_h {
                     engine.ext_sidebar_input_active = true;
                 } else {
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let screen = build_screen_layout(&engine, &theme, &[], line_height, 1.0, false);
-                    if let Some(ref ext) = screen.ext_sidebar {
-                        let installed_count = ext.items_installed.len();
-                        let view = render::ext_sidebar_to_multi_section_view(ext);
-                        // Body bounds are infinite-tall to match the
-                        // rasteriser's bounds at click time (we don't
-                        // know the live DA height here, but click
-                        // y_click is already absolute relative to the
-                        // panel; layout returns hits keyed off section
-                        // bounds the rasteriser produced).
-                        // Use the body height paint cached this frame so
-                        // the primitive's internal `panel_scroll` clamp
-                        // produces exactly the section bounds the rasteriser
-                        // used — paint and click see one layout (#293).
-                        let body_height = engine.ext_sidebar_body_height.get().max(1.0) as f64;
-                        let body_bounds = quadraui::Rect::new(0.0, 0.0, 1.0, body_height as f32);
-                        let view_layout =
-                            quadraui::gtk::gtk_msv_layout(&view, body_bounds, line_height);
-                        let rel_y = (y_click - chrome_h) as f32;
-                        match view_layout.hit_test(0.0, rel_y) {
-                            quadraui::MultiSectionViewHit::Header { section, .. } => {
-                                let cur = engine.ext_sidebar_sections_expanded[section];
-                                engine.ext_sidebar_sections_expanded[section] = !cur;
-                            }
-                            quadraui::MultiSectionViewHit::Body { section } => {
-                                let body_b = view_layout.sections[section].body_bounds;
-                                if let quadraui::SectionBody::Tree(t) = &view.sections[section].body
-                                {
-                                    let item_h = (line_height * 1.4) as f32;
-                                    let inner = t.layout(body_b.width, body_b.height, |_| {
-                                        quadraui::TreeRowMeasure::new(item_h)
-                                    });
-                                    let local_y = rel_y - body_b.y;
-                                    if let quadraui::TreeViewHit::Row(row_idx) =
-                                        inner.hit_test(0.0, local_y)
-                                    {
-                                        let item_idx = t.rows[row_idx].path[0] as usize;
-                                        if section == 0 {
-                                            engine.ext_sidebar_selected = item_idx;
-                                        } else {
-                                            engine.ext_sidebar_selected =
-                                                installed_count + item_idx;
-                                        }
-                                    }
-                                }
-                            }
-                            quadraui::MultiSectionViewHit::PanelScrollbar { .. } => {
-                                // Click-to-jump on the panel scrollbar.
-                                if let Some(track) = view_layout.panel_scrollbar {
-                                    let track_h = track.height.max(1.0);
-                                    let total: f32 =
-                                        view_layout.sections.iter().map(|s| s.resolved_size).sum();
-                                    let body_h_f32 = body_height as f32;
-                                    let max_scroll = (total - body_h_f32).max(0.0);
-                                    let click_frac = (rel_y / track_h).clamp(0.0, 1.0);
-                                    engine.ext_sidebar_panel_scroll = click_frac * max_scroll;
-                                }
-                            }
-                            _ => {
-                                // Divider / inert / outside — no-op.
-                            }
-                        }
-                    }
+                    render::populate_ext_sidebar_system(&engine);
+                    let rect = engine.ext_sidebar_body_rect.get();
+                    let click_pos =
+                        quadraui::Point::new(x_click as f32, (y_click - chrome_h) as f32 + rect.y);
+                    let ev = quadraui::UiEvent::MouseDown {
+                        widget: None,
+                        button: quadraui::MouseButton::Left,
+                        position: click_pos,
+                        modifiers: quadraui::Modifiers::default(),
+                    };
+                    let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                        &ev,
+                        &mut *self.backend.borrow_mut(),
+                        rect,
+                    );
+                    engine.dispatch_ext_sidebar_event(sidebar_event);
                 }
-
-                let _ = x_click;
                 if n_press >= 2 {
                     engine.ext_open_selected_readme();
-                    let still_focused = engine.ext_sidebar_has_focus;
-                    drop(engine);
-                    self.focus_editor_if_needed(still_focused);
-                } else {
-                    drop(engine);
                 }
+                let still_focused = engine.ext_sidebar_has_focus;
+                drop(engine);
+                self.focus_editor_if_needed(still_focused);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
             }
             Msg::ExtSidebarScroll(dy) => {
-                let mut engine = self.engine.borrow_mut();
-                let line_height = self.cached_ui_line_height.max(1.0);
-                // Wheel notch ≈ 3 leaf rows (matches the previous
-                // selection-by-3 behaviour). Best-effort clamp; the
-                // rasteriser handles over-scrolled values gracefully.
-                let delta = (dy as f32) * 3.0 * (line_height as f32 * 1.4);
-                engine.ext_sidebar_panel_scroll =
-                    (engine.ext_sidebar_panel_scroll + delta).max(0.0);
+                let engine = self.engine.borrow();
+                render::populate_ext_sidebar_system(&engine);
+                let rect = engine.ext_sidebar_body_rect.get();
+                let ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, dy as f32),
+                    position: quadraui::Point::new(rect.x + 1.0, rect.y + 1.0),
+                };
+                let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                    &ev,
+                    &mut *self.backend.borrow_mut(),
+                    rect,
+                );
                 drop(engine);
+                self.draw_needed.set(true);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
-                self.draw_needed.set(true);
             }
             _ => unreachable!(),
         }

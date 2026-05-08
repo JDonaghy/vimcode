@@ -4088,7 +4088,8 @@ pub(super) fn draw_ext_sidebar(
     w: f64,
     h: f64,
     line_height: f64,
-    _backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &crate::core::engine::Engine,
 ) {
     let Some(ref ext) = screen.ext_sidebar else {
         return;
@@ -4155,23 +4156,17 @@ pub(super) fn draw_ext_sidebar(
         ry += line_height;
     }
 
-    // ── MultiSectionView body: rest of the panel ─────────────────────────────
+    // ── SidebarSystem body: rest of the panel ──────────────────────────────
     let body_h = (h - ry).max(0.0);
     if body_h > 0.0 {
-        let view = render::ext_sidebar_to_multi_section_view(ext);
-        let q_theme = super::quadraui_gtk::q_theme(theme);
-        quadraui::gtk::draw_multi_section_view(
-            cr,
-            layout,
-            x,
-            y + ry,
-            w,
-            body_h,
-            &view,
-            &q_theme,
-            line_height,
-            crate::icons::nerd_fonts_enabled(),
-        );
+        let body_rect = quadraui::Rect::new(x as f32, (y + ry) as f32, w as f32, body_h as f32);
+        engine.ext_sidebar_body_rect.set(body_rect);
+        render::populate_ext_sidebar_system(engine);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            engine.ext_sidebar_system.borrow().render(b, body_rect);
+        });
     }
 
     // Focus border (drawn last so it sits on top of bg + section paint)
