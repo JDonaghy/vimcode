@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 7, 2026 (Session 356 — **#306 StatusBar hover/press for debug toolbar** (PR #332, merged). quadraui's `draw_status_bar` gains `hovered_id`/`pressed_id` params; buttons lighten on hover, darken on press. TUI uses new `quadraui::StatusBarInteraction` compose helper (15-line UiEvent intercept replaces ~80 lines per-backend mouse routing). GTK uses manual wiring (works, migration to StatusBarInteraction tracked in #331). Filed quadraui#91 + vimcode#331.)
+**Last updated:** May 7, 2026 (Session 357 — **#329 GTK exit coredump** fixed. Root cause was RefCell double-borrow in `reveal_path_in_explorer`, not `process::exit` as originally hypothesized. Three-part fix: `try_borrow_mut` for `reveal_path_in_explorer` + tab-switcher timer, deferred `process::exit` via GLib idle callback, `ShowQuitConfirm` fallthrough guard.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -13,7 +13,6 @@
 | # | Title | Category |
 |---|-------|----------|
 | [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low priority) |
-| [#329](https://github.com/JDonaghy/vimcode/issues/329) | GTK exit coredump (panic in extern C trampoline) | Bug |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
@@ -22,26 +21,16 @@
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (356):**
-- **#306 StatusBar hover/press for debug toolbar** (PR #332, merged) — All 11 `draw_status_bar` call sites updated for new `hovered_id`/`pressed_id` quadraui API. TUI: `StatusBarInteraction` compose helper handles hover/press/click via UiEvent dispatch (~15 lines replacing ~80 lines per-backend mouse routing). GTK: manual hover detection in 20Hz poll + pressed on click/mouse-up (working). Debug toolbar buttons lighten on hover, darken on press.
-- **Issues filed:** quadraui#91 (StatusBar hover via UiEvent dispatch — landed), #331 (GTK migration to StatusBarInteraction — deferred to GTK UiEvent migration)
-
-**Shipped session 355 (earlier):**
-- **#324 Explorer panel → TreeController** (PR #330, merged) — Net -798 lines. Both backends use shared `quadraui::TreeController`.
-
-**Shipped session 354 (earlier):**
-- **#319 MenuSystem migration** — 681 net lines removed. Both TUI + GTK use `quadraui::MenuSystem`.
-
-**Shipped session 353 (earlier):**
-- **#307 Batches 2-5**, **#242 closed**, **#246 closed**, **#308 item 3**.
+**Shipped this session (357):**
+- **#329 GTK exit coredump** (Path A, `fddd573`) — Root cause: `reveal_path_in_explorer` called `borrow_mut()` while the engine RefCell was already borrowed, panicking through the extern "C" `clicked_trampoline` → abort. Three-part fix: (1) `try_borrow_mut()` for `reveal_path_in_explorer` and the 100ms tab-switcher timer callback, (2) `process::exit` deferred via `idle_add_local_once` so it never runs inside a signal emission chain, (3) `return` after `save_session_and_exit()` in `ShowQuitConfirm` to prevent fallthrough after `-> !` became `-> ()`.
 
 ---
 
-**Previous sessions (354 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (356 and earlier):** in SESSION_HISTORY.md.
 
 Vimcode at 1931 lib tests passing. All on develop — no active branches.
 
-> Sessions 356 and earlier in **SESSION_HISTORY.md**.
+> Sessions 357 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.

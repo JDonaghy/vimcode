@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 356 archived here.
+All sessions through 357 archived here.
+
+---
+**Session 357 (May 7) — #329 GTK exit coredump fixed (Path A, `fddd573`):**
+
+Issue #329 reported a coredump when closing the GTK window via the close button. Original hypothesis was `process::exit(0)` running inside a GTK signal emission chain, but the real root cause was a RefCell double-borrow: `reveal_path_in_explorer()` called `self.engine.borrow_mut()` while the engine was already borrowed elsewhere. This panicked through the extern "C" `clicked_trampoline`, killing the Relm4 runtime, which made the subsequent `sender.input(Msg::WindowClose)` panic (dead channel) → abort. Three-part fix in `src/gtk/mod.rs`: (1) `reveal_path_in_explorer` and the 100ms tab-switcher timer callback now use `try_borrow_mut()` — silently no-op if the engine is already borrowed, (2) `save_session_and_exit` changed from `-> !` to `-> ()` with `process::exit(0)` deferred via `gtk4::glib::idle_add_local_once` (same for `exit(1)` in `QuitWithError`), (3) added `return` after `save_session_and_exit()` in the `ShowQuitConfirm` handler to prevent falling through to `show_dialog()` when there are no unsaved changes. Repro: create new file, delete it, exit → crash. +22/-10 lines, 1 file.
 
 ---
 **Session 356 (May 7) — #306 StatusBar hover/press for debug toolbar (PR #332):**
