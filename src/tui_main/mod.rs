@@ -2901,6 +2901,10 @@ fn event_loop(
                             continue;
                         }
                         // Map crossterm key → string name + unicode.
+                        // With keyboard enhancement (Kitty protocol), Shift+s
+                        // arrives as Char('s') + SHIFT, not Char('S'). Resolve
+                        // the actual character before matching.
+                        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
                         let (key_str, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Enter => ("Return", None),
                             KeyCode::Esc => ("Escape", None),
@@ -2917,7 +2921,12 @@ fn event_loop(
                             KeyCode::PageUp => ("Page_Up", None),
                             KeyCode::PageDown => ("Page_Down", None),
                             KeyCode::Char(ch) => {
-                                let name = match ch {
+                                let resolved = if shift && ch.is_ascii_lowercase() {
+                                    ch.to_ascii_uppercase()
+                                } else {
+                                    ch
+                                };
+                                let name = match resolved {
                                     'j' => "j",
                                     'k' => "k",
                                     'h' => "h",
@@ -2939,7 +2948,7 @@ fn event_loop(
                                     '/' => "/",
                                     _ => "",
                                 };
-                                (name, Some(ch))
+                                (name, Some(resolved))
                             }
                             _ => ("", None),
                         };

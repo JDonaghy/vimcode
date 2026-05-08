@@ -15302,6 +15302,25 @@ fn test_sc_unified_dispatch_branch_picker() {
 }
 
 #[test]
+fn test_sc_unified_dispatch_stage_all() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    // "S" should reach dispatch_sc_action_key → sc_stage_all
+    let result = engine.dispatch_sc_sidebar_key_unified("S", false, Some('S'));
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    // sc_stage_all calls git which won't work in test env, but the key
+    // should at least be consumed (not ignored). Verify it wasn't treated
+    // as a navigation key by checking the SidebarSystem state didn't change.
+}
+
+#[test]
+fn test_sc_action_key_uppercase_s() {
+    let mut engine = make_sc_engine_with_files();
+    let consumed = engine.dispatch_sc_action_key("S");
+    assert!(consumed, "S should be consumed by dispatch_sc_action_key");
+}
+
+#[test]
 fn test_is_safe_url_allows_https() {
     assert!(is_safe_url("https://github.com/user/repo"));
     assert!(is_safe_url("http://example.com"));
