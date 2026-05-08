@@ -1,5 +1,11 @@
 use super::*;
 
+#[allow(dead_code)]
+pub enum ScKeyResult {
+    Consumed,
+    Unfocused,
+}
+
 impl Engine {
     // ─── Source Control ────────────────────────────────────────────────────────
 
@@ -1155,5 +1161,256 @@ impl Engine {
             return (3, flat - pos);
         }
         (3, usize::MAX) // fallback
+    }
+
+    // ─── SidebarSystem integration ───────────────────────────────────
+    // These methods are wired by the TUI and GTK backends (next issues).
+
+    /// Read the active section index and selected item index from the
+    /// SidebarSystem. Returns `(section, item_idx)` where section is
+    /// 0=staged, 1=changes, 2=worktrees, 3=log. Returns `(0, usize::MAX)`
+    /// if nothing is selected.
+    #[allow(dead_code)]
+    pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
+        let sidebar = self.sc_sidebar_system.borrow();
+        let section = sidebar.active_section().unwrap_or(0);
+        let idx = sidebar
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .map(|v| v as usize)
+            .unwrap_or(usize::MAX);
+        (section, idx)
+    }
+
+    /// Feed a navigation key through the SidebarSystem (using the layout
+    /// cached during the previous render frame) and dispatch the result.
+    #[allow(dead_code)]
+    fn sc_sidebar_navigate(&mut self, key: quadraui::Key) {
+        let rect = self.sc_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self.sc_sidebar_system.borrow_mut().handle_cached(&ev, rect);
+        self.dispatch_sc_sidebar_event(sidebar_event);
+    }
+
+    /// Handle a SidebarEvent produced by the SidebarSystem after a
+    /// navigation key or mouse click.
+    #[allow(dead_code)]
+    pub fn dispatch_sc_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { section, .. } => {
+                self.sc_activate_row(section);
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { .. } => true,
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    /// Activate the selected row in the given section (equivalent to
+    /// pressing Enter).
+    #[allow(dead_code)]
+    fn sc_activate_row(&mut self, section: usize) {
+        let (_, idx) = self.sc_selected_from_sidebar_system();
+        if idx == usize::MAX {
+            return;
+        }
+        match section {
+            2 => self.sc_switch_worktree(idx),
+            3 => {
+                if let Some(entry) = self.sc_log.get(idx) {
+                    self.message = format!("{} {}", entry.hash, entry.message);
+                }
+            }
+            0 | 1 => {
+                let statuses = self.sc_file_statuses.clone();
+                let files: Vec<&git::FileStatus> = if section == 0 {
+                    statuses.iter().filter(|f| f.staged.is_some()).collect()
+                } else {
+                    statuses.iter().filter(|f| f.unstaged.is_some()).collect()
+                };
+                if let Some(f) = files.get(idx) {
+                    let git_root =
+                        git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+                    let path = git_root.join(&f.path);
+                    if !path.exists() {
+                        self.message = format!("SC: file not found: {}", path.display());
+                    } else {
+                        let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
+                            || matches!(f.staged, Some(git::StatusKind::Added));
+                        let has_head =
+                            !is_new && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
+                        if has_head {
+                            self.cmd_git_diff_split(&path);
+                        } else {
+                            let _ =
+                                self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                        }
+                        self.sc_has_focus = false;
+                        self.sc_sidebar_system.borrow_mut().set_has_focus(false);
+                        self.sc_button_focused = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle domain-specific action keys (stage, discard, commit, etc.)
+    /// that are NOT navigation. Returns true if consumed.
+    #[allow(dead_code)]
+    pub fn dispatch_sc_action_key(&mut self, key: &str) -> bool {
+        match key {
+            "s" => {
+                self.sc_stage_selected();
+                true
+            }
+            "S" => {
+                self.sc_stage_all();
+                true
+            }
+            "d" => {
+                self.sc_confirm_discard_selected();
+                true
+            }
+            "D" => {
+                self.sc_confirm_discard_all();
+                true
+            }
+            "c" => {
+                self.sc_commit_input_active = true;
+                true
+            }
+            "C" => {
+                if self.sc_commit_message.trim().is_empty() {
+                    self.sc_commit_input_active = true;
+                } else {
+                    self.sc_do_commit();
+                }
+                true
+            }
+            "p" => {
+                self.sc_pull();
+                true
+            }
+            "P" => {
+                self.sc_push();
+                true
+            }
+            "f" => {
+                self.sc_fetch();
+                true
+            }
+            "r" => {
+                self.sc_refresh();
+                true
+            }
+            "b" => {
+                self.sc_open_branch_picker();
+                true
+            }
+            "B" => {
+                self.sc_open_branch_create();
+                true
+            }
+            "?" => {
+                self.sc_help_open = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Unified key dispatch for the SC panel. Both TUI and GTK call this
+    /// single method — no per-backend key→action mapping needed.
+    #[allow(dead_code)]
+    pub fn dispatch_sc_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+    ) -> ScKeyResult {
+        use quadraui::{Key, NamedKey};
+
+        if self.sc_help_open {
+            self.sc_help_open = false;
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_branch_picker_open {
+            self.handle_sc_branch_picker_key(key, ctrl, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_branch_create_mode {
+            self.handle_sc_branch_create_key(key, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_commit_input_active {
+            self.handle_sc_commit_input_key(key, ctrl, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if let Some(btn) = self.sc_button_focused {
+            self.handle_sc_button_key(key, btn);
+            if !self.sc_has_focus {
+                return ScKeyResult::Unfocused;
+            }
+            return ScKeyResult::Consumed;
+        }
+
+        // Navigation keys → feed through SidebarSystem.
+        let nav_key = match key {
+            "j" | "Down" => Some(Key::Named(NamedKey::Down)),
+            "k" | "Up" => Some(Key::Named(NamedKey::Up)),
+            "Home" => Some(Key::Named(NamedKey::Home)),
+            "End" => Some(Key::Named(NamedKey::End)),
+            "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+            "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+            "Tab" => Some(Key::Named(NamedKey::Tab)),
+            "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+            _ => None,
+        };
+        if let Some(k) = nav_key {
+            self.sc_sidebar_navigate(k);
+            return ScKeyResult::Consumed;
+        }
+
+        // Domain action keys.
+        match key {
+            "Escape" | "q" => {
+                self.sc_has_focus = false;
+                self.sc_sidebar_system.borrow_mut().set_has_focus(false);
+                self.sc_button_focused = None;
+                ScKeyResult::Unfocused
+            }
+            "Return" | "Enter" => {
+                let (section, _) = self.sc_selected_from_sidebar_system();
+                self.sc_activate_row(section);
+                if !self.sc_has_focus {
+                    ScKeyResult::Unfocused
+                } else {
+                    ScKeyResult::Consumed
+                }
+            }
+            _ => {
+                self.dispatch_sc_action_key(key);
+                ScKeyResult::Consumed
+            }
+        }
+    }
+
+    /// Handle a mouse/scroll UiEvent by feeding it through the
+    /// SidebarSystem (using the layout cached during the previous
+    /// render frame) and dispatching the result.
+    #[allow(dead_code)]
+    pub fn handle_sc_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        let rect = self.sc_sidebar_body_rect.get();
+        let sidebar_event = self
+            .sc_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_sc_sidebar_event(sidebar_event)
     }
 }

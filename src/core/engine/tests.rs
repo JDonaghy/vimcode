@@ -15236,6 +15236,71 @@ fn test_sc_hover_log_entry_generates_markdown() {
     );
 }
 
+// ─── SC SidebarSystem (#321) ────────────────────────────────────────────
+
+#[test]
+fn test_sc_sidebar_system_initialized_with_4_sections() {
+    let engine = Engine::new();
+    let sidebar = engine.sc_sidebar_system.borrow();
+    assert!(sidebar.is_section_visible(0));
+    assert!(sidebar.is_section_visible(1));
+    assert!(sidebar.is_section_visible(2));
+    assert!(sidebar.is_section_visible(3));
+}
+
+#[test]
+fn test_sc_unified_dispatch_escape_unfocuses() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Unfocused));
+    assert!(!engine.sc_has_focus);
+}
+
+#[test]
+fn test_sc_unified_dispatch_q_unfocuses() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("q", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Unfocused));
+    assert!(!engine.sc_has_focus);
+}
+
+#[test]
+fn test_sc_unified_dispatch_commit_input_toggle() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    assert!(!engine.sc_commit_input_active);
+    let result = engine.dispatch_sc_sidebar_key_unified("c", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(engine.sc_commit_input_active);
+    let result = engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(!engine.sc_commit_input_active);
+}
+
+#[test]
+fn test_sc_unified_dispatch_help_toggle() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("?", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(engine.sc_help_open);
+    let result = engine.dispatch_sc_sidebar_key_unified("x", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(!engine.sc_help_open);
+}
+
+#[test]
+fn test_sc_unified_dispatch_branch_picker() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    engine.dispatch_sc_sidebar_key_unified("b", false, None);
+    assert!(engine.sc_branch_picker_open);
+    engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(!engine.sc_branch_picker_open);
+}
+
 #[test]
 fn test_is_safe_url_allows_https() {
     assert!(is_safe_url("https://github.com/user/repo"));

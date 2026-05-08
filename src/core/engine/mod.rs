@@ -2572,6 +2572,12 @@ pub struct Engine {
     pub sc_sections_expanded: [bool; 4],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
+    /// quadraui SidebarSystem — owns SC sidebar (4 sections: Staged Changes,
+    /// Changes, Worktrees, Recent Commits) selection, scroll, keyboard nav,
+    /// and mouse handling. Both TUI and GTK call `render()` and `handle()`.
+    pub sc_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    #[allow(dead_code)]
+    pub sc_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
     pub sc_behind: u32,
@@ -3466,6 +3472,19 @@ impl Engine {
             sc_selected: 0,
             sc_sections_expanded: [true, true, true, true],
             sc_has_focus: false,
+            sc_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
+                    quadraui::SidebarSectionDef::new("changes", "CHANGES"),
+                    quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
+                    quadraui::SidebarSectionDef::new("log", "RECENT COMMITS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
+                s.set_allow_collapse(true);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            sc_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             sc_ahead: 0,
             sc_behind: 0,
             sc_log: Vec::new(),

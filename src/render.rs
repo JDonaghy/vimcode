@@ -6594,6 +6594,134 @@ pub fn populate_ext_sidebar_system(engine: &Engine) {
     engine.populate_ext_sidebar_system();
 }
 
+/// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
+/// row data for all 4 SC sections. Call once per frame before
+/// `sidebar_system.render()` or `.handle_cached()`.
+pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
+    use quadraui::{Decoration, StyledSpan, StyledText, TreeRow};
+
+    let add_fg = to_q_color(theme.git_added);
+    let del_fg = to_q_color(theme.git_deleted);
+    let mod_fg = to_q_color(theme.git_modified);
+    let dim_fg = to_q_color(theme.status_inactive_fg);
+
+    let staged: Vec<_> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.staged.is_some())
+        .collect();
+    let unstaged: Vec<_> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.unstaged.is_some())
+        .collect();
+    let show_worktrees = engine.sc_worktrees.len() > 1;
+
+    let file_row = |i: usize, f: &crate::core::git::FileStatus, is_staged: bool| {
+        let kind = if is_staged { f.staged } else { f.unstaged };
+        let ch = kind.map(|k| k.label()).unwrap_or('?');
+        let color = match ch {
+            'A' => add_fg,
+            'D' => del_fg,
+            _ => mod_fg,
+        };
+        TreeRow {
+            path: vec![i as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(ch.to_string(), color),
+                    StyledSpan::plain(format!(" {}", f.path)),
+                ],
+            },
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        }
+    };
+
+    let staged_rows: Vec<TreeRow> = staged
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, true))
+        .collect();
+
+    let unstaged_rows: Vec<TreeRow> = unstaged
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, false))
+        .collect();
+
+    let worktree_rows: Vec<TreeRow> = engine
+        .sc_worktrees
+        .iter()
+        .enumerate()
+        .map(|(i, wt)| {
+            let check = if wt.is_current { "\u{2713} " } else { "  " };
+            let branch = wt.branch.as_deref().unwrap_or("HEAD");
+            let main_marker = if wt.is_main { " [main]" } else { "" };
+            let text = format!("{}{} {}{}", check, branch, wt.path.display(), main_marker);
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(text),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect();
+
+    let log_rows: Vec<TreeRow> = engine
+        .sc_log
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| TreeRow {
+            path: vec![i as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(entry.hash.clone(), dim_fg),
+                    StyledSpan::plain(format!(" {}", entry.message)),
+                ],
+            },
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Muted,
+            edit: None,
+        })
+        .collect();
+
+    let mut sidebar = engine.sc_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.sc_has_focus);
+    if engine.sc_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+
+    let badge = |n: usize| {
+        if n > 0 {
+            Some(StyledText::plain(format!("({})", n)))
+        } else {
+            None
+        }
+    };
+    sidebar.set_section_badge(0, badge(staged.len()));
+    sidebar.set_section_badge(1, badge(unstaged.len()));
+    sidebar.set_section_badge(2, badge(engine.sc_worktrees.len()));
+    sidebar.set_section_badge(3, badge(engine.sc_log.len()));
+    sidebar.set_section_visible(2, show_worktrees);
+
+    sidebar.set_rows(0, staged_rows);
+    sidebar.set_rows(1, unstaged_rows);
+    sidebar.set_rows(2, worktree_rows);
+    sidebar.set_rows(3, log_rows);
+}
+
 /// Populate the `TreeController` on `engine.explorer_tree` with current
 /// row data. Call once per frame before `tree_controller.render()` or
 /// `.handle()`.
