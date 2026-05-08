@@ -1,5 +1,11 @@
 use super::*;
 
+pub enum ExtSidebarKeyResult {
+    Consumed,
+    NavigateSidebar(quadraui::Key),
+    Unfocused,
+}
+
 impl Engine {
     // ─── Extension Panel helpers ────────────────────────────────────────────
 
@@ -1923,6 +1929,72 @@ impl Engine {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub fn dispatch_ext_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        unicode: Option<char>,
+    ) -> ExtSidebarKeyResult {
+        use quadraui::{Key, NamedKey};
+
+        if self.ext_sidebar_input_active {
+            match key {
+                "Escape" => {
+                    self.ext_sidebar_input_active = false;
+                    ExtSidebarKeyResult::Consumed
+                }
+                "BackSpace" => {
+                    self.ext_sidebar_query.pop();
+                    ExtSidebarKeyResult::Consumed
+                }
+                "Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Down)),
+                "Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Up)),
+                "Return" => {
+                    self.ext_open_selected_readme();
+                    ExtSidebarKeyResult::Consumed
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.ext_sidebar_query.push(ch);
+                        }
+                    }
+                    ExtSidebarKeyResult::Consumed
+                }
+            }
+        } else {
+            match key {
+                "Escape" | "q" => {
+                    self.ext_sidebar_has_focus = false;
+                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    ExtSidebarKeyResult::Unfocused
+                }
+                "/" => {
+                    self.ext_sidebar_input_active = true;
+                    ExtSidebarKeyResult::Consumed
+                }
+                "r" => {
+                    self.ext_refresh();
+                    ExtSidebarKeyResult::Consumed
+                }
+                "i" | "d" | "u" | "Return" => {
+                    self.dispatch_ext_sidebar_action_key(key);
+                    ExtSidebarKeyResult::Consumed
+                }
+                "j" => ExtSidebarKeyResult::NavigateSidebar(Key::Char('j')),
+                "k" => ExtSidebarKeyResult::NavigateSidebar(Key::Char('k')),
+                "Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Down)),
+                "Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Up)),
+                "Tab" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Tab)),
+                "BackTab" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::BackTab)),
+                "Home" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::Home)),
+                "End" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::End)),
+                "Page_Up" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::PageUp)),
+                "Page_Down" => ExtSidebarKeyResult::NavigateSidebar(Key::Named(NamedKey::PageDown)),
+                _ => ExtSidebarKeyResult::Consumed,
+            }
         }
     }
 

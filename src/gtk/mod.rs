@@ -5537,7 +5537,25 @@ impl App {
                 if engine.dialog.is_some() {
                     engine.handle_key(mapped, unicode, false);
                 } else {
-                    engine.handle_ext_sidebar_key(mapped, false, unicode);
+                    use crate::core::engine::ExtSidebarKeyResult;
+                    match engine.dispatch_ext_sidebar_key_unified(mapped, unicode) {
+                        ExtSidebarKeyResult::NavigateSidebar(key) => {
+                            render::populate_ext_sidebar_system(&engine);
+                            let rect = engine.ext_sidebar_body_rect.get();
+                            let ev = quadraui::UiEvent::KeyPressed {
+                                key,
+                                modifiers: quadraui::Modifiers::default(),
+                                repeat: false,
+                            };
+                            let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                                &ev,
+                                &mut *self.backend.borrow_mut(),
+                                rect,
+                            );
+                            engine.dispatch_ext_sidebar_event(sidebar_event);
+                        }
+                        ExtSidebarKeyResult::Unfocused | ExtSidebarKeyResult::Consumed => {}
+                    }
                 }
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
@@ -9411,44 +9429,25 @@ impl App {
                     }
                     return;
                 }
-                if engine.ext_sidebar_input_active {
-                    engine.handle_ext_sidebar_key(mapped, false, unicode);
-                } else {
-                    let action_key = matches!(
-                        mapped,
-                        "Escape" | "q" | "/" | "r" | "i" | "d" | "u" | "Return"
-                    );
-                    if action_key {
-                        engine.dispatch_ext_sidebar_action_key(mapped);
-                    } else {
-                        let key = match mapped {
-                            "j" => Some(quadraui::Key::Char('j')),
-                            "k" => Some(quadraui::Key::Char('k')),
-                            "Down" => Some(quadraui::Key::Named(quadraui::NamedKey::Down)),
-                            "Up" => Some(quadraui::Key::Named(quadraui::NamedKey::Up)),
-                            "Tab" => Some(quadraui::Key::Named(quadraui::NamedKey::Tab)),
-                            "Home" => Some(quadraui::Key::Named(quadraui::NamedKey::Home)),
-                            "End" => Some(quadraui::Key::Named(quadraui::NamedKey::End)),
-                            "Page_Up" => Some(quadraui::Key::Named(quadraui::NamedKey::PageUp)),
-                            "Page_Down" => Some(quadraui::Key::Named(quadraui::NamedKey::PageDown)),
-                            _ => None,
+                use crate::core::engine::ExtSidebarKeyResult;
+                match engine.dispatch_ext_sidebar_key_unified(mapped, unicode) {
+                    ExtSidebarKeyResult::NavigateSidebar(key) => {
+                        render::populate_ext_sidebar_system(&engine);
+                        let rect = engine.ext_sidebar_body_rect.get();
+                        let ev = quadraui::UiEvent::KeyPressed {
+                            key,
+                            modifiers: quadraui::Modifiers::default(),
+                            repeat: false,
                         };
-                        if let Some(k) = key {
-                            render::populate_ext_sidebar_system(&engine);
-                            let rect = engine.ext_sidebar_body_rect.get();
-                            let ev = quadraui::UiEvent::KeyPressed {
-                                key: k,
-                                modifiers: quadraui::Modifiers::default(),
-                                repeat: false,
-                            };
-                            let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
-                                &ev,
-                                &mut *self.backend.borrow_mut(),
-                                rect,
-                            );
-                            engine.dispatch_ext_sidebar_event(sidebar_event);
-                        }
+                        let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                            &ev,
+                            &mut *self.backend.borrow_mut(),
+                            rect,
+                        );
+                        engine.dispatch_ext_sidebar_event(sidebar_event);
                     }
+                    ExtSidebarKeyResult::Unfocused => {}
+                    ExtSidebarKeyResult::Consumed => {}
                 }
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();

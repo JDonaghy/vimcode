@@ -4499,6 +4499,7 @@ mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;
 mod ext_panel;
+pub use ext_panel::ExtSidebarKeyResult;
 mod keys;
 mod lsp_ops;
 mod motions;

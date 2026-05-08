@@ -2644,93 +2644,65 @@ fn event_loop(
 
                     // ── Extensions panel keyboard handling ──────────────────
                     if sidebar.active_panel == TuiPanel::Extensions {
-                        // h/Left: switch focus to toolbar
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
                             && !engine.ext_sidebar_input_active
                         {
                             sidebar.has_focus = false;
                             engine.ext_sidebar_has_focus = false;
+                            engine.ext_sidebar_system.borrow_mut().set_has_focus(false);
                             sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 5; // Extensions row
+                            sidebar.toolbar_selected = 5;
                             needs_redraw = true;
                             continue;
                         }
-                        if engine.ext_sidebar_input_active {
-                            engine.handle_ext_sidebar_key(
-                                match key_event.code {
-                                    KeyCode::Esc => "Escape",
-                                    KeyCode::Backspace => "BackSpace",
-                                    KeyCode::Down => "Down",
-                                    KeyCode::Up => "Up",
-                                    KeyCode::Enter => "Return",
-                                    _ => "",
-                                },
-                                ctrl,
-                                match key_event.code {
-                                    KeyCode::Char(ch) => Some(ch),
-                                    _ => None,
-                                },
-                            );
-                        } else {
-                            let key_name = match key_event.code {
-                                KeyCode::Char('d') => "d",
-                                KeyCode::Char('i') => "i",
-                                KeyCode::Char('r') => "r",
-                                KeyCode::Char('u') => "u",
-                                KeyCode::Char('/') => "/",
-                                KeyCode::Char('q') => "q",
-                                KeyCode::Esc => "Escape",
-                                KeyCode::Enter => "Return",
-                                _ => "",
-                            };
-                            if !key_name.is_empty() {
-                                engine.dispatch_ext_sidebar_action_key(key_name);
-                            } else {
+                        let key_name = match key_event.code {
+                            KeyCode::Char(c) => {
+                                // Single-char keys: engine recognizes j/k/d/i/r/u/q//
+                                let mut buf = [0u8; 4];
+                                c.encode_utf8(&mut buf);
+                                std::str::from_utf8(&buf[..c.len_utf8()])
+                                    .unwrap_or("")
+                                    .to_string()
+                            }
+                            KeyCode::Esc => "Escape".to_string(),
+                            KeyCode::Enter => "Return".to_string(),
+                            KeyCode::Backspace => "BackSpace".to_string(),
+                            KeyCode::Tab => "Tab".to_string(),
+                            KeyCode::BackTab => "BackTab".to_string(),
+                            KeyCode::Down => "Down".to_string(),
+                            KeyCode::Up => "Up".to_string(),
+                            KeyCode::Home => "Home".to_string(),
+                            KeyCode::End => "End".to_string(),
+                            KeyCode::PageUp => "Page_Up".to_string(),
+                            KeyCode::PageDown => "Page_Down".to_string(),
+                            _ => String::new(),
+                        };
+                        let unicode = match key_event.code {
+                            KeyCode::Char(c) => Some(c),
+                            _ => None,
+                        };
+                        use crate::core::engine::ExtSidebarKeyResult;
+                        match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
+                            ExtSidebarKeyResult::NavigateSidebar(key) => {
                                 render::populate_ext_sidebar_system(engine);
                                 let rect = engine.ext_sidebar_body_rect.get();
-                                let mk = |key| {
-                                    Some(quadraui::UiEvent::KeyPressed {
-                                        key,
-                                        modifiers: quadraui::Modifiers::default(),
-                                        repeat: false,
-                                    })
+                                let ev = quadraui::UiEvent::KeyPressed {
+                                    key,
+                                    modifiers: quadraui::Modifiers::default(),
+                                    repeat: false,
                                 };
-                                let ui_event = match key_event.code {
-                                    KeyCode::Char('j') => mk(quadraui::Key::Char('j')),
-                                    KeyCode::Char('k') => mk(quadraui::Key::Char('k')),
-                                    KeyCode::Down => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::Down))
-                                    }
-                                    KeyCode::Up => mk(quadraui::Key::Named(quadraui::NamedKey::Up)),
-                                    KeyCode::Tab => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::Tab))
-                                    }
-                                    KeyCode::Home => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::Home))
-                                    }
-                                    KeyCode::End => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::End))
-                                    }
-                                    KeyCode::PageUp => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::PageUp))
-                                    }
-                                    KeyCode::PageDown => {
-                                        mk(quadraui::Key::Named(quadraui::NamedKey::PageDown))
-                                    }
-                                    _ => None,
-                                };
-                                if let Some(ev) = ui_event {
-                                    let sidebar_event = engine
-                                        .ext_sidebar_system
-                                        .borrow_mut()
-                                        .handle(&ev, &mut backend, rect);
-                                    engine.dispatch_ext_sidebar_event(sidebar_event);
-                                }
+                                let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                                    &ev,
+                                    &mut backend,
+                                    rect,
+                                );
+                                engine.dispatch_ext_sidebar_event(sidebar_event);
                             }
-                            if !engine.ext_sidebar_has_focus {
+                            ExtSidebarKeyResult::Unfocused => {
                                 sidebar.has_focus = false;
                             }
+                            ExtSidebarKeyResult::Consumed => {}
                         }
                         needs_redraw = true;
                         continue;
