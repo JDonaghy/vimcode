@@ -4856,70 +4856,9 @@ impl SimpleComponent for App {
             }
             Msg::SearchPanelKey(key_name, unicode) => {
                 let mapped = map_gtk_key_name(key_name.as_str());
-                let mut engine = self.engine.borrow_mut();
-                let is_query =
-                    engine.search_panel_form_focus.borrow().as_deref() == Some("search:query");
-                let is_replace =
-                    engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
-                match mapped {
-                    "Return" => {
-                        if is_replace {
-                            let cwd = engine.cwd.clone();
-                            engine.start_project_replace(cwd);
-                        } else {
-                            let cwd = engine.cwd.clone();
-                            engine.start_project_search(cwd);
-                        }
-                    }
-                    "BackSpace" => {
-                        if is_replace {
-                            engine.project_replace_text.pop();
-                            engine
-                                .replace_text_caret
-                                .set(engine.project_replace_text.len());
-                        } else if is_query {
-                            engine.project_search_query.pop();
-                            engine
-                                .search_query_caret
-                                .set(engine.project_search_query.len());
-                        }
-                    }
-                    "Tab" => {
-                        if is_query {
-                            engine
-                                .search_panel_form_focus
-                                .replace(Some("search:replace".to_string()));
-                        } else {
-                            engine
-                                .search_panel_form_focus
-                                .replace(Some("search:query".to_string()));
-                        }
-                    }
-                    "Escape" => {
-                        engine.search_panel_form_focus.replace(None);
-                    }
-                    _ => {
-                        if let Some(ch) = unicode {
-                            if is_replace {
-                                engine.project_replace_text.push(ch);
-                                engine
-                                    .replace_text_caret
-                                    .set(engine.project_replace_text.len());
-                            } else {
-                                if !is_query {
-                                    engine
-                                        .search_panel_form_focus
-                                        .replace(Some("search:query".to_string()));
-                                }
-                                engine.project_search_query.push(ch);
-                                engine
-                                    .search_query_caret
-                                    .set(engine.project_search_query.len());
-                            }
-                        }
-                    }
-                }
-                drop(engine);
+                self.engine
+                    .borrow_mut()
+                    .handle_search_input_key(mapped, unicode);
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                     da.queue_draw();

@@ -4487,7 +4487,7 @@ mod panels;
 mod picker;
 mod plugins;
 mod search;
-pub use search::find_word_boundaries;
+pub use search::{find_word_boundaries, SearchInputAction};
 mod source_control;
 mod spell_ops;
 mod terminal_ops;
