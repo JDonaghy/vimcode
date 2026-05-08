@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-07 (Session 355 — #324 explorer TreeController migration shipped. #319 MenuSystem shipped Session 354. Next: SidebarSystem migrations (#321/#322/#323/#326), polish (#314/#295/#315), bugs (#329/#318/#292/#288/#287).)
+> **Last updated:** 2026-05-07 (Session 356 — #306 StatusBar hover/press shipped (PR #332). TUI uses `quadraui::StatusBarInteraction`; GTK manual wiring deferred to #331. Next: SidebarSystem migrations (#321/#322/#323/#326), polish (#314/#295/#315), bugs (#329/#318/#292/#288/#287).)
 
 ---
 

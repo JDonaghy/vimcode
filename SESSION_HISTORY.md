@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 355 archived here.
+All sessions through 356 archived here.
+
+---
+**Session 356 (May 7) — #306 StatusBar hover/press for debug toolbar (PR #332):**
+
+quadraui's `Backend::draw_status_bar` gained `hovered_id: Option<&WidgetId>` and `pressed_id: Option<&WidgetId>` params. When a clickable segment's `action_id` matches `hovered_id`, its background is lightened; when it matches `pressed_id`, its background is darkened. All 11 `draw_status_bar` call sites across GTK (5) and TUI (6) updated. Non-toolbar call sites pass `None, None`. GTK: `debug_toolbar_hovered_id`/`debug_toolbar_pressed_id` as `Rc<RefCell<Option<WidgetId>>>` on the model; hover detection in 20Hz poll (hit-testing cached `debug_toolbar_hit_regions`); pressed set on click, cleared on mouse-up; threaded through draw closure → `draw_editor` → `draw_debug_toolbar`. TUI: initially mirrored GTK pattern with per-backend mouse routing (~80 lines), but `MouseEventKind::Moved` events on the toolbar row were consumed by earlier handlers in the 1400-line `handle_mouse` match block before reaching our code. Debugged extensively with checkpoint logs — events reached the match block but not the `_ => {}` wildcard arm. Filed quadraui#91 requesting shared `StatusBarInteraction` compose helper. quadraui delivered `StatusBarInteraction` struct (~40 lines): stores hit regions, processes `UiEvent`s via `handle()`, exposes `hovered_id()`/`pressed_id()`, returns `StatusBarAction::{Clicked,Redraw,Ignored}`. TUI refactored to use it: ~15-line `UiEvent` intercept in the main event loop replaces all per-backend mouse routing. Filed #331 to migrate GTK to `StatusBarInteraction` when GTK's `UiEvent` pipeline becomes active (currently events are produced but discarded). Worked in a git worktree off `develop` to avoid interfering with parallel #324 work.
 
 ---
 **Session 355 (May 7) — #324 Explorer panel → TreeController (PR #330):**

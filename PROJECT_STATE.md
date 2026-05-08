@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 7, 2026 (Session 355 — **#324 Explorer panel → TreeController shipped** (PR #330, merged). Both TUI and GTK explorer now use `quadraui::TreeController` for selection, scroll, keyboard nav, inline editing (rename + new file/folder), and context menu CRUD. Net -798 lines. Zero duplicate explorer logic between backends.)
+**Last updated:** May 7, 2026 (Session 356 — **#306 StatusBar hover/press for debug toolbar** (PR #332, merged). quadraui's `draw_status_bar` gains `hovered_id`/`pressed_id` params; buttons lighten on hover, darken on press. TUI uses new `quadraui::StatusBarInteraction` compose helper (15-line UiEvent intercept replaces ~80 lines per-backend mouse routing). GTK uses manual wiring (works, migration to StatusBarInteraction tracked in #331). Filed quadraui#91 + vimcode#331.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -20,11 +20,14 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#311](https://github.com/JDonaghy/vimcode/issues/311) | Search panel arrow key cursor movement | Polish |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
+| [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (355):**
-- **#324 Explorer panel → TreeController** (PR #330, merged) — Full migration of explorer from duplicated TUI/GTK state to shared `quadraui::TreeController`. Net -798 lines. New `engine/explorer_ops.rs` (~355 lines) owns all logic. TreeController inline editing for rename (stem pre-selected) and new-file/folder (placeholder text). Context menu CRUD unified through `dispatch_explorer_crud`. Deleted: GTK `ExplorerState`, `draw_explorer_panel`, GTK dialog handlers, TUI legacy inline-edit renderer (~370 lines). Per-backend code: ~28 lines thin wiring each.
-- **Issues filed:** #328 (adopt quadraui scroll improvements), #329 (GTK exit coredump)
-- **Quadraui issues filed + resolved:** #83→#84 (inline tree editing), #85 (placeholder param), #86→#87 (context menu event), #88 (cursor/selection params), #89 (selection highlight rendering — open)
+**Shipped this session (356):**
+- **#306 StatusBar hover/press for debug toolbar** (PR #332, merged) — All 11 `draw_status_bar` call sites updated for new `hovered_id`/`pressed_id` quadraui API. TUI: `StatusBarInteraction` compose helper handles hover/press/click via UiEvent dispatch (~15 lines replacing ~80 lines per-backend mouse routing). GTK: manual hover detection in 20Hz poll + pressed on click/mouse-up (working). Debug toolbar buttons lighten on hover, darken on press.
+- **Issues filed:** quadraui#91 (StatusBar hover via UiEvent dispatch — landed), #331 (GTK migration to StatusBarInteraction — deferred to GTK UiEvent migration)
+
+**Shipped session 355 (earlier):**
+- **#324 Explorer panel → TreeController** (PR #330, merged) — Net -798 lines. Both backends use shared `quadraui::TreeController`.
 
 **Shipped session 354 (earlier):**
 - **#319 MenuSystem migration** — 681 net lines removed. Both TUI + GTK use `quadraui::MenuSystem`.
@@ -38,11 +41,12 @@
 
 Vimcode at 1931 lib tests passing. All on develop — no active branches.
 
+> Sessions 356 and earlier in **SESSION_HISTORY.md**.
+
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
 
-> Sessions 355 and earlier in **SESSION_HISTORY.md**.
 
 
 ---
@@ -123,6 +127,7 @@ cell coalescence) remain but are tracked separately.
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
 - `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
 - `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
+- `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
