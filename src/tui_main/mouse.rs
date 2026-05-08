@@ -1321,15 +1321,6 @@ pub(super) fn handle_mouse(
                                 }
                                 return sidebar_width;
                             }
-                            "tui:ext_sidebar" => {
-                                let fstep = delta.y.abs() * 3.0;
-                                engine.ext_sidebar_panel_scroll = if down {
-                                    engine.ext_sidebar_panel_scroll + fstep
-                                } else {
-                                    (engine.ext_sidebar_panel_scroll - fstep).max(0.0)
-                                };
-                                return sidebar_width;
-                            }
                             other if other.starts_with("debug_sidebar:") => {
                                 // SidebarSystem handles scroll internally
                                 return sidebar_width;
@@ -2633,103 +2624,12 @@ pub(super) fn handle_mouse(
         } else if sidebar.active_panel == TuiPanel::Extensions {
             sidebar.has_focus = true;
             engine.ext_sidebar_has_focus = true;
-
-            // Chrome rows match `render_ext_sidebar`: 0 = panel header,
-            // 1 = search box. Rows 2+ are a `MultiSectionView` (#293).
-            // Hit-test via `MultiSectionViewLayout::hit_test()` so paint
-            // and click read the same source of truth — the structural
-            // fix for the #281 bug classes.
             if sidebar_row == 0 {
                 // Panel header — no-op
             } else if sidebar_row == 1 {
                 engine.ext_sidebar_input_active = true;
-            } else {
-                let theme = Theme::onedark();
-                let screen = render::build_screen_layout(engine, &theme, &[], 1.0, 1.0, true);
-                if let Some(ref ext) = screen.ext_sidebar {
-                    let installed_count = ext.items_installed.len();
-                    let view = render::ext_sidebar_to_multi_section_view(ext);
-                    // Use the body height paint cached this frame so the
-                    // primitive's internal `panel_scroll` clamp produces
-                    // exactly the section bounds the rasteriser used —
-                    // paint and click see one layout (#293).
-                    let body_height = engine.ext_sidebar_body_height.get().max(1.0);
-                    let body_bounds =
-                        quadraui::Rect::new(0.0, 0.0, sidebar_width as f32, body_height);
-                    let metrics = quadraui::MsvLayoutMetrics {
-                        header_size: 1.0,
-                        divider_size: 0.0,
-                        scrollbar_size: 1.0,
-                        cell_quantum: 1.0,
-                    };
-                    let layout = view.layout(body_bounds, metrics, |i| {
-                        let s = &view.sections[i];
-                        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
-                        let content_size = match &s.body {
-                            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
-                            _ => 0.0,
-                        };
-                        quadraui::SectionMeasure {
-                            content_size,
-                            aux_size,
-                        }
-                    });
-                    let rel_y = (sidebar_row - 2) as f32;
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
-
-                    match layout.hit_test(0.0, rel_y) {
-                        quadraui::MultiSectionViewHit::Header { section, .. } => {
-                            engine.ext_sidebar_sections_expanded[section] =
-                                !engine.ext_sidebar_sections_expanded[section];
-                        }
-                        quadraui::MultiSectionViewHit::Body { section } => {
-                            let body_b = layout.sections[section].body_bounds;
-                            if let quadraui::SectionBody::Tree(t) = &view.sections[section].body {
-                                let inner = t.layout(body_b.width, body_b.height, |_| {
-                                    quadraui::TreeRowMeasure::new(1.0)
-                                });
-                                let local_y = rel_y - body_b.y;
-                                if let quadraui::TreeViewHit::Row(row_idx) =
-                                    inner.hit_test(0.0, local_y)
-                                {
-                                    let item_idx = t.rows[row_idx].path[0] as usize;
-                                    if section == 0 {
-                                        engine.ext_sidebar_selected = item_idx;
-                                    } else {
-                                        engine.ext_sidebar_selected = installed_count + item_idx;
-                                    }
-                                    if is_double {
-                                        engine.ext_open_selected_readme();
-                                    }
-                                }
-                            }
-                        }
-                        quadraui::MultiSectionViewHit::PanelScrollbar { .. } => {
-                            // Click-to-jump on the panel scrollbar: treat
-                            // the click position as the desired thumb
-                            // centre and update `panel_scroll` accordingly.
-                            // Layout's internal clamp ensures the value
-                            // never exceeds `total - body_height`.
-                            if let Some(track) = layout.panel_scrollbar {
-                                let track_h = track.height.max(1.0);
-                                let total: f32 =
-                                    layout.sections.iter().map(|s| s.resolved_size).sum();
-                                let max_scroll = (total - body_height).max(0.0);
-                                let click_frac = (rel_y / track_h).clamp(0.0, 1.0);
-                                engine.ext_sidebar_panel_scroll = click_frac * max_scroll;
-                            }
-                        }
-                        _ => {
-                            // Scrollbar / divider / inert — no-op for now.
-                        }
-                    }
-                }
             }
+            // Rows 2+ handled by SidebarSystem mouse intercept in main loop
         } else if sidebar.active_panel == TuiPanel::Settings {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;

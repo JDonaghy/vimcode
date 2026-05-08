@@ -6591,7 +6591,7 @@ pub fn populate_dap_sidebar_system(engine: &Engine) {
 }
 
 pub fn populate_ext_sidebar_system(engine: &Engine) {
-    use quadraui::{Badge, Decoration, StyledText, TreeRow};
+    use quadraui::{Decoration, StyledText, TreeRow};
 
     let manifests = engine.ext_available_manifests();
     let q = engine.ext_sidebar_query.to_lowercase();

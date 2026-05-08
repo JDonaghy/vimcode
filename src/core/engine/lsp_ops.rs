@@ -375,7 +375,7 @@ impl Engine {
     /// Used by Enter and double-click.
     pub fn ext_open_selected_readme(&mut self) {
         let manifests = self.ext_available_manifests();
-        let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+        let (in_installed, idx) = self.ext_selected_from_sidebar_system();
         let manifest = if in_installed {
             let installed = self.ext_installed_items();
             installed

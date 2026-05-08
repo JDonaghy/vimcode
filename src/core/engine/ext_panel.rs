@@ -1824,7 +1824,10 @@ impl Engine {
                 self.ext_open_selected_readme();
                 true
             }
-            quadraui::SidebarEvent::RowSelected { .. } => true,
+            quadraui::SidebarEvent::RowSelected { .. } => {
+                self.ext_sidebar_input_active = false;
+                true
+            }
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }

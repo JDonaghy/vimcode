@@ -2130,7 +2130,7 @@ pub(super) fn render_editor_hover_popup(
 /// and click could disagree on (the structural fix for the #281 bug
 /// classes).
 pub(super) fn render_ext_sidebar(
-    _backend: &mut super::backend::TuiBackend,
+    backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
@@ -2193,75 +2193,23 @@ pub(super) fn render_ext_sidebar(
         }
     }
 
-    // ── MultiSectionView body: rest of the panel ─────────────────────────────
+    // ── SidebarSystem body: rest of the panel ──────────────────────────────
     if area.height <= 2 {
         return;
     }
-    let body_area = Rect {
-        x: area.x,
-        y: area.y + 2,
-        width: area.width,
-        height: area.height - 2,
-    };
-    // Cache the body height so click hit-tests pass the same bounds to
-    // `MultiSectionView::layout`, applying the same `panel_scroll`
-    // clamp as paint did (#293).
-    engine.ext_sidebar_body_height.set(body_area.height as f32);
-    let view = render::ext_sidebar_to_multi_section_view(ext);
+    let msv_rect = quadraui::Rect::new(
+        area.x as f32,
+        (area.y + 2) as f32,
+        area.width as f32,
+        (area.height - 2) as f32,
+    );
+    engine.ext_sidebar_body_rect.set(msv_rect);
+    render::populate_ext_sidebar_system(engine);
     let q_theme = super::quadraui_tui::q_theme(theme);
-
-    // Compute total content size so click/drag handlers can derive
-    // `max_panel_scroll` without re-running layout (#293).
-    let metrics = quadraui::MsvLayoutMetrics {
-        header_size: 1.0,
-        divider_size: 0.0,
-        scrollbar_size: 1.0,
-        cell_quantum: 1.0,
-    };
-    let body_qbounds = quadraui::Rect::new(
-        body_area.x as f32,
-        body_area.y as f32,
-        body_area.width as f32,
-        body_area.height as f32,
-    );
-    let view_layout = view.layout(body_qbounds, metrics, |i| {
-        let s = &view.sections[i];
-        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
-        let content_size = match &s.body {
-            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
-            _ => 0.0,
-        };
-        quadraui::SectionMeasure {
-            content_size,
-            aux_size,
-        }
+    backend.set_current_theme(q_theme);
+    backend.enter_frame_scope(frame, |b| {
+        engine.ext_sidebar_system.borrow().render(b, msv_rect);
     });
-    let total: f32 = view_layout.sections.iter().map(|s| s.resolved_size).sum();
-    engine
-        .ext_sidebar_max_panel_scroll
-        .set((total - body_area.height as f32).max(0.0));
-
-    let buf = frame.buffer_mut();
-    quadraui::tui::draw_multi_section_view(
-        buf,
-        body_area,
-        &view,
-        &q_theme,
-        crate::icons::nerd_fonts_enabled(),
-    );
-    engine
-        .scroll_surfaces
-        .borrow_mut()
-        .push(quadraui::ScrollSurface {
-            id: quadraui::WidgetId::new("tui:ext_sidebar"),
-            bounds: quadraui::Rect::new(
-                body_area.x as f32,
-                body_area.y as f32,
-                body_area.width as f32,
-                body_area.height as f32,
-            ),
-            scrollbar: None,
-        });
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────
