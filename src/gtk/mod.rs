@@ -4168,7 +4168,11 @@ impl SimpleComponent for App {
             let da = widgets.drawing_area.clone();
             let root_ref = root.clone();
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                if !engine_ref.borrow().tab_switcher_open {
+                let open = engine_ref
+                    .try_borrow()
+                    .map(|e| e.tab_switcher_open)
+                    .unwrap_or(false);
+                if !open {
                     return gtk4::glib::ControlFlow::Continue;
                 }
                 // Query the current keyboard modifier state from GDK
@@ -4180,8 +4184,11 @@ impl SimpleComponent for App {
                             let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
                             let alt = mods.contains(gdk::ModifierType::ALT_MASK);
                             if !ctrl && !alt {
-                                engine_ref.borrow_mut().tab_switcher_confirm();
-                                da.queue_draw();
+                                if let Ok(mut e) = engine_ref.try_borrow_mut() {
+                                    e.tab_switcher_confirm();
+                                    drop(e);
+                                    da.queue_draw();
+                                }
                             }
                         }
                     }
@@ -5107,8 +5114,11 @@ impl App {
     /// replacement for `highlight_file_in_tree` (which operated on the
     /// native `gtk4::TreeView`).
     fn reveal_path_in_explorer(&self, target: &Path) {
-        self.engine.borrow_mut().explorer_reveal_path(target);
-        self.queue_explorer_draw();
+        if let Ok(mut engine) = self.engine.try_borrow_mut() {
+            engine.explorer_reveal_path(target);
+            drop(engine);
+            self.queue_explorer_draw();
+        }
     }
 
     fn refresh_explorer(&self) {
@@ -5116,9 +5126,10 @@ impl App {
         self.queue_explorer_draw();
     }
 
-    /// Save the current session state and exit the process immediately.
-    /// This is the canonical quit path — called when there are no unsaved changes.
-    fn save_session_and_exit(&self) -> ! {
+    /// Save the current session state and schedule process exit via idle callback.
+    /// Uses `idle_add_local_once` so `process::exit` runs outside any GTK signal
+    /// emission chain, avoiding UB from unwinding through extern "C" trampolines.
+    fn save_session_and_exit(&self) {
         let mut engine = self.engine.borrow_mut();
         let buffer_id = engine.active_buffer_id();
         if let Some(path) = engine
@@ -5145,7 +5156,7 @@ impl App {
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
         drop(engine);
-        std::process::exit(0);
+        gtk4::glib::idle_add_local_once(|| std::process::exit(0));
     }
 
     /// Dispatch an `EngineAction` produced by `handle_key` or macro playback.
@@ -5221,7 +5232,7 @@ impl App {
                 engine.cleanup_all_swaps();
                 engine.lsp_shutdown();
                 drop(engine);
-                std::process::exit(1);
+                gtk4::glib::idle_add_local_once(|| std::process::exit(1));
             }
             EngineAction::OpenUrl(url) => {
                 open_url(&url);
@@ -11227,6 +11238,7 @@ impl App {
             Msg::ShowQuitConfirm => {
                 if !self.engine.borrow().has_any_unsaved() {
                     self.save_session_and_exit();
+                    return;
                 }
                 use crate::core::engine::DialogButton;
                 self.engine.borrow_mut().show_dialog(
