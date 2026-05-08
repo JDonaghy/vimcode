@@ -772,12 +772,14 @@ pub(super) fn render_search_panel(
         } else {
             None
         });
-    engine
-        .search_query_caret
-        .replace(engine.project_search_query.len());
-    engine
-        .replace_text_caret
-        .replace(engine.project_replace_text.len());
+    let q_len = engine.project_search_query.len();
+    if engine.search_query_caret.get() > q_len {
+        engine.search_query_caret.set(q_len);
+    }
+    let r_len = engine.project_replace_text.len();
+    if engine.replace_text_caret.get() > r_len {
+        engine.replace_text_caret.set(r_len);
+    }
 
     let view = render::build_search_panel_msv(engine, &engine.cwd, sidebar.search_scroll_top);
     let q_theme = super::quadraui_tui::q_theme(theme);

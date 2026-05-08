@@ -7515,6 +7515,116 @@ fn test_project_search_select_next_prev() {
 }
 
 #[test]
+fn test_search_input_insert_and_caret() {
+    let mut e = Engine::new();
+    e.project_search_query = "abc".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_insert_char(false, 'X');
+    assert_eq!(e.project_search_query, "abcX");
+    assert_eq!(e.search_query_caret.get(), 4);
+    e.search_query_caret.set(1);
+    e.search_input_insert_char(false, 'Y');
+    assert_eq!(e.project_search_query, "aYbcX");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_backspace_mid() {
+    let mut e = Engine::new();
+    e.project_search_query = "hello".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "helo");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_backspace_at_start() {
+    let mut e = Engine::new();
+    e.project_search_query = "hi".to_string();
+    e.search_query_caret.set(0);
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "hi");
+    assert_eq!(e.search_query_caret.get(), 0);
+}
+
+#[test]
+fn test_search_input_delete() {
+    let mut e = Engine::new();
+    e.project_search_query = "abcd".to_string();
+    e.search_query_caret.set(1);
+    e.search_input_delete(false);
+    assert_eq!(e.project_search_query, "acd");
+    assert_eq!(e.search_query_caret.get(), 1);
+}
+
+#[test]
+fn test_search_input_move_caret() {
+    let mut e = Engine::new();
+    e.project_search_query = "hello".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_move_caret(false, "Left");
+    assert_eq!(e.search_query_caret.get(), 2);
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), 3);
+    e.search_input_move_caret(false, "Home");
+    assert_eq!(e.search_query_caret.get(), 0);
+    e.search_input_move_caret(false, "End");
+    assert_eq!(e.search_query_caret.get(), 5);
+}
+
+#[test]
+fn test_search_input_move_caret_boundaries() {
+    let mut e = Engine::new();
+    e.project_search_query = "ab".to_string();
+    e.search_query_caret.set(0);
+    e.search_input_move_caret(false, "Left");
+    assert_eq!(e.search_query_caret.get(), 0);
+    e.search_query_caret.set(2);
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_replace_field() {
+    let mut e = Engine::new();
+    e.project_replace_text = "old".to_string();
+    e.replace_text_caret.set(1);
+    e.search_input_insert_char(true, 'X');
+    assert_eq!(e.project_replace_text, "oXld");
+    assert_eq!(e.replace_text_caret.get(), 2);
+    e.search_input_backspace(true);
+    assert_eq!(e.project_replace_text, "old");
+    assert_eq!(e.replace_text_caret.get(), 1);
+}
+
+#[test]
+fn test_search_input_paste() {
+    let mut e = Engine::new();
+    e.project_search_query = "ab".to_string();
+    e.search_query_caret.set(1);
+    e.search_input_paste(false, "XY\nignored");
+    assert_eq!(e.project_search_query, "aXYb");
+    assert_eq!(e.search_query_caret.get(), 3);
+}
+
+#[test]
+fn test_search_input_unicode() {
+    let mut e = Engine::new();
+    e.project_search_query = "café".to_string();
+    let len = e.project_search_query.len();
+    e.search_query_caret.set(len);
+    e.search_input_insert_char(false, '!');
+    assert_eq!(e.project_search_query, "café!");
+    e.search_query_caret.set("caf".len());
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "caé!");
+    e.search_input_move_caret(false, "Right");
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), "caé!".len());
+}
+
+#[test]
 fn test_start_and_poll_project_search() {
     let dir = make_search_dir("engine_async");
     let mut engine = Engine::new();

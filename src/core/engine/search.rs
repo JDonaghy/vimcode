@@ -1,5 +1,13 @@
 use super::*;
 
+pub enum SearchInputAction {
+    Consumed,
+    StartSearch,
+    StartReplace,
+    Unfocused,
+    Ignored,
+}
+
 /// Find word boundaries around char position `pos` in `text`.
 /// Returns `(start, end)` where `start..end` is the word range.
 /// A "word" character is alphanumeric or underscore.
@@ -573,6 +581,151 @@ impl Engine {
     /// Move the project search selection up by one, clamped to 0.
     pub fn project_search_select_prev(&mut self) {
         self.project_search_selected = self.project_search_selected.saturating_sub(1);
+    }
+
+    pub fn handle_search_input_key(
+        &mut self,
+        key: &str,
+        unicode: Option<char>,
+    ) -> SearchInputAction {
+        let focus = self.search_panel_form_focus.borrow().clone();
+        let is_replace = focus.as_deref() == Some("search:replace");
+        let is_query = focus.as_deref() == Some("search:query");
+
+        match key {
+            "Return" => {
+                if is_replace {
+                    let cwd = self.cwd.clone();
+                    self.start_project_replace(cwd);
+                    return SearchInputAction::StartReplace;
+                }
+                let cwd = self.cwd.clone();
+                self.start_project_search(cwd);
+                SearchInputAction::StartSearch
+            }
+            "BackSpace" => {
+                self.search_input_backspace(is_replace);
+                SearchInputAction::Consumed
+            }
+            "Delete" => {
+                self.search_input_delete(is_replace);
+                SearchInputAction::Consumed
+            }
+            "Left" | "Right" | "Home" | "End" => {
+                self.search_input_move_caret(is_replace, key);
+                SearchInputAction::Consumed
+            }
+            "Tab" | "BackTab" => {
+                if is_query {
+                    self.search_panel_form_focus
+                        .replace(Some("search:replace".to_string()));
+                } else {
+                    self.search_panel_form_focus
+                        .replace(Some("search:query".to_string()));
+                }
+                SearchInputAction::Consumed
+            }
+            "Escape" => {
+                self.search_panel_form_focus.replace(None);
+                SearchInputAction::Unfocused
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    let target_replace = if !is_query && !is_replace {
+                        self.search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        false
+                    } else {
+                        is_replace
+                    };
+                    self.search_input_insert_char(target_replace, ch);
+                    SearchInputAction::Consumed
+                } else {
+                    SearchInputAction::Ignored
+                }
+            }
+        }
+    }
+
+    pub fn search_input_insert_char(&mut self, is_replace: bool, ch: char) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        text.insert(pos, ch);
+        caret.set(pos + ch.len_utf8());
+    }
+
+    pub fn search_input_backspace(&mut self, is_replace: bool) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        if pos == 0 {
+            return;
+        }
+        let prev = text[..pos]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        text.remove(prev);
+        caret.set(prev);
+    }
+
+    pub fn search_input_delete(&mut self, is_replace: bool) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        if pos < text.len() {
+            text.remove(pos);
+        }
+    }
+
+    pub fn search_input_move_caret(&mut self, is_replace: bool, key: &str) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        match key {
+            "Left" => {
+                let prev = text[..pos]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                caret.set(prev);
+            }
+            "Right" => {
+                let next = text[pos..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| pos + i)
+                    .unwrap_or(text.len());
+                caret.set(next);
+            }
+            "Home" => caret.set(0),
+            "End" => caret.set(text.len()),
+            _ => {}
+        }
+    }
+
+    pub fn search_input_paste(&mut self, is_replace: bool, clip: &str) {
+        let line = clip.lines().next().unwrap_or("");
+        for ch in line.chars() {
+            if !ch.is_control() {
+                self.search_input_insert_char(is_replace, ch);
+            }
+        }
     }
 
     /// Handle a click on a search-panel form element (toggle, button) by widget ID.

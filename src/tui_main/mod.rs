@@ -2371,54 +2371,56 @@ fn event_loop(
                                 let _ = engine.session.save();
                             }
                             // Input mode: typing into the search or replace box
-                            _ if sidebar.search_input_mode => match key_event.code {
-                                KeyCode::Tab | KeyCode::BackTab => {
-                                    sidebar.replace_input_focused = !sidebar.replace_input_focused;
-                                }
-                                KeyCode::Enter => {
-                                    if sidebar.replace_input_focused {
-                                        let root = engine.cwd.clone();
-                                        engine.start_project_replace(root);
-                                    } else {
-                                        let root = engine.cwd.clone();
-                                        engine.start_project_search(root);
-                                        sidebar.search_scroll_top = 0;
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    if sidebar.replace_input_focused {
-                                        engine.project_replace_text.pop();
-                                    } else {
-                                        engine.project_search_query.pop();
-                                    }
-                                }
-                                KeyCode::Char('v')
-                                    if key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                            _ if sidebar.search_input_mode => {
+                                // Ctrl+V paste is backend-specific (clipboard access)
+                                if key_event.code == KeyCode::Char('v')
+                                    && key_event.modifiers.contains(KeyModifiers::CONTROL)
                                 {
+                                    let is_replace = sidebar.replace_input_focused;
                                     if let Some(text) = Engine::clipboard_paste() {
-                                        let line = text.lines().next().unwrap_or("");
-                                        for c in line.chars() {
-                                            if !c.is_control() {
-                                                if sidebar.replace_input_focused {
-                                                    engine.project_replace_text.push(c);
-                                                } else {
-                                                    engine.project_search_query.push(c);
-                                                }
-                                            }
+                                        engine.search_input_paste(is_replace, &text);
+                                    }
+                                } else {
+                                    let key = match key_event.code {
+                                        KeyCode::Enter => "Return",
+                                        KeyCode::Backspace => "BackSpace",
+                                        KeyCode::Delete => "Delete",
+                                        KeyCode::Left => "Left",
+                                        KeyCode::Right => "Right",
+                                        KeyCode::Home => "Home",
+                                        KeyCode::End => "End",
+                                        KeyCode::Tab => "Tab",
+                                        KeyCode::BackTab => "BackTab",
+                                        KeyCode::Esc => "Escape",
+                                        _ => "",
+                                    };
+                                    let unicode = match key_event.code {
+                                        KeyCode::Char(c)
+                                            if !key_event
+                                                .modifiers
+                                                .contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            Some(c)
                                         }
+                                        _ => None,
+                                    };
+                                    use crate::core::engine::SearchInputAction;
+                                    let action = engine.handle_search_input_key(key, unicode);
+                                    match action {
+                                        SearchInputAction::StartSearch => {
+                                            sidebar.search_scroll_top = 0;
+                                        }
+                                        SearchInputAction::Unfocused => {
+                                            sidebar.search_input_mode = false;
+                                        }
+                                        _ => {}
                                     }
+                                    // Sync TUI-local focus flags from engine state
+                                    let focus = engine.search_panel_form_focus.borrow().clone();
+                                    sidebar.replace_input_focused =
+                                        focus.as_deref() == Some("search:replace");
                                 }
-                                KeyCode::Char(c)
-                                    if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    if sidebar.replace_input_focused {
-                                        engine.project_replace_text.push(c);
-                                    } else {
-                                        engine.project_search_query.push(c);
-                                    }
-                                }
-                                _ => {}
-                            },
+                            }
                             // Results mode: navigating the results list
                             _ => {
                                 match key_event.code {
@@ -2472,7 +2474,10 @@ fn event_loop(
                                     {
                                         sidebar.search_input_mode = true;
                                         sidebar.replace_input_focused = false;
-                                        engine.project_search_query.push(c);
+                                        engine
+                                            .search_panel_form_focus
+                                            .replace(Some("search:query".to_string()));
+                                        engine.search_input_insert_char(false, c);
                                     }
                                     _ => {}
                                 }
