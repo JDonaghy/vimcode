@@ -113,6 +113,8 @@ pub(super) fn draw_frame(
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
     editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
+    debug_toolbar_interaction: &quadraui::StatusBarInteraction,
+    debug_toolbar_rect_out: &mut quadraui::Rect,
     // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
     // Set once per frame by the caller (cached theme); the migrated
     // call sites wrap their access in `backend.enter_frame_scope`.
@@ -803,11 +805,18 @@ pub(super) fn draw_frame(
             debug_toolbar_area.width as f32,
             debug_toolbar_area.height as f32,
         );
+        *debug_toolbar_rect_out = q_rect;
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
+        let hits = backend.enter_frame_scope(frame, |b| {
             use quadraui::Backend;
-            let _ = b.draw_status_bar(q_rect, &bar, None, None);
+            b.draw_status_bar(
+                q_rect,
+                &bar,
+                debug_toolbar_interaction.hovered_id(),
+                debug_toolbar_interaction.pressed_id(),
+            )
         });
+        debug_toolbar_interaction.set_hit_regions(hits);
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -2320,6 +2329,8 @@ mod tests {
         let mut editor_hover_link_rects = Vec::new();
         let mut editor_hover_scrollbar = None;
         let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
+        let dbg_toolbar_interaction = quadraui::StatusBarInteraction::new();
+        let mut dbg_toolbar_rect = quadraui::Rect::default();
         let mut backend = super::backend::TuiBackend::new();
 
         terminal
@@ -2345,6 +2356,8 @@ mod tests {
                     &mut editor_hover_link_rects,
                     &mut editor_hover_scrollbar,
                     &mut tab_visible_counts,
+                    &dbg_toolbar_interaction,
+                    &mut dbg_toolbar_rect,
                     &mut backend,
                 );
             })

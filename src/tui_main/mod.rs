@@ -1073,6 +1073,8 @@ fn event_loop(
     let mut fr_input_dragging: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
+    let mut debug_toolbar_interaction = quadraui::StatusBarInteraction::new();
+    let mut debug_toolbar_rect = quadraui::Rect::default();
     // Double-click detection state
     let mut last_click_time = Instant::now()
         .checked_sub(Duration::from_secs(1))
@@ -1302,6 +1304,8 @@ fn event_loop(
                             &mut editor_hover_link_rects,
                             &mut editor_hover_scrollbar,
                             &mut tab_visible_counts,
+                            &debug_toolbar_interaction,
+                            &mut debug_toolbar_rect,
                             &mut backend,
                         );
                     }
@@ -1354,6 +1358,8 @@ fn event_loop(
                                     &mut editor_hover_link_rects,
                                     &mut editor_hover_scrollbar,
                                     &mut tab_visible_counts2,
+                                    &debug_toolbar_interaction,
+                                    &mut debug_toolbar_rect,
                                     &mut backend,
                                 );
                             }
@@ -1751,6 +1757,25 @@ fn event_loop(
                     needs_redraw = true;
                     continue;
                 }
+            }
+        }
+
+        // ── Debug toolbar hover/press via StatusBarInteraction ──
+        if engine.debug_toolbar_visible && debug_toolbar_rect.width > 0.0 {
+            match debug_toolbar_interaction.handle(&ui_event, debug_toolbar_rect) {
+                quadraui::StatusBarAction::Clicked(id) => {
+                    if let Some(idx) = render::debug_toolbar_action_index(&id) {
+                        if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
+                            let _ = engine.execute_command(btn.action);
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+                quadraui::StatusBarAction::Redraw => {
+                    needs_redraw = true;
+                }
+                quadraui::StatusBarAction::Ignored => {}
             }
         }
 

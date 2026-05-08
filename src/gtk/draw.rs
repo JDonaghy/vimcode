@@ -69,6 +69,8 @@ pub(super) fn draw_editor(
     // the quickfix panel uses it as a pilot — the rest still call
     // `quadraui_gtk::draw_*` shims directly.
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    debug_toolbar_hovered_id: Option<&quadraui::WidgetId>,
+    debug_toolbar_pressed_id: Option<&quadraui::WidgetId>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -657,6 +659,8 @@ pub(super) fn draw_editor(
             width as f64,
             line_height,
             debug_toolbar_hit_regions_out,
+            debug_toolbar_hovered_id,
+            debug_toolbar_pressed_id,
         );
         debug_toolbar_y_offset_out.set(toolbar_y);
         debug_toolbar_height_out.set(line_height);
@@ -4425,6 +4429,8 @@ pub(super) fn draw_debug_toolbar(
     width: f64,
     height: f64,
     hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    hovered_id: Option<&quadraui::WidgetId>,
+    pressed_id: Option<&quadraui::WidgetId>,
 ) {
     let pango_ctx = pangocairo::create_context(cr);
     let ui_font_desc = FontDescription::from_string(&UI_FONT());
@@ -4439,8 +4445,8 @@ pub(super) fn draw_debug_toolbar(
         b.draw_status_bar(
             quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32),
             &bar,
-            None,
-            None,
+            hovered_id,
+            pressed_id,
         )
     });
     *hit_regions_out.borrow_mut() = hits;

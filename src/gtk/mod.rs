@@ -391,6 +391,10 @@ struct App {
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
     debug_toolbar_height: Rc<Cell<f64>>,
+    /// Which debug toolbar button the cursor is over (hit-tested from cached regions).
+    debug_toolbar_hovered_id: Rc<RefCell<Option<quadraui::WidgetId>>>,
+    /// Which debug toolbar button is currently pressed (mouse-down, not yet released).
+    debug_toolbar_pressed_id: Rc<RefCell<Option<quadraui::WidgetId>>>,
     /// Cached menu-dropdown hit regions from the last draw of the
     /// dropdown overlay. Each entry is `(x, y, w, h, action_id)`
     /// where `action_id` is e.g. `menu:7`. Click + motion handlers
@@ -2245,6 +2249,8 @@ impl SimpleComponent for App {
             debug_toolbar_hit_regions: Rc::new(RefCell::new(Vec::new())),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
+            debug_toolbar_hovered_id: Rc::new(RefCell::new(None)),
+            debug_toolbar_pressed_id: Rc::new(RefCell::new(None)),
             terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
@@ -3943,6 +3949,8 @@ impl SimpleComponent for App {
         let dbg_hits_for_draw = model.debug_toolbar_hit_regions.clone();
         let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
         let dbg_h_for_draw = model.debug_toolbar_height.clone();
+        let dbg_hovered_for_draw = model.debug_toolbar_hovered_id.clone();
+        let dbg_pressed_for_draw = model.debug_toolbar_pressed_id.clone();
         let backend_for_draw = model.backend.clone();
         widgets
             .drawing_area
@@ -3984,6 +3992,8 @@ impl SimpleComponent for App {
                             &dbg_y_for_draw,
                             &dbg_h_for_draw,
                             &backend_for_draw,
+                            dbg_hovered_for_draw.borrow().as_ref(),
+                            dbg_pressed_for_draw.borrow().as_ref(),
                         );
                     };
 
@@ -5889,6 +5899,30 @@ impl App {
                     }
                 }
 
+                // Debug toolbar hover detection — same pattern as tab_close_hover above.
+                {
+                    let dbg_y = self.debug_toolbar_y_offset.get();
+                    let dbg_h = self.debug_toolbar_height.get();
+                    let new_hover = if dbg_h > 0.0 && my >= dbg_y && my < dbg_y + dbg_h {
+                        let regions = self.debug_toolbar_hit_regions.borrow();
+                        regions.iter().find_map(|region| {
+                            let r_x = region.col as f64;
+                            let r_w = region.width as f64;
+                            if mx >= r_x && mx < r_x + r_w {
+                                Some(region.id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    if new_hover != *self.debug_toolbar_hovered_id.borrow() {
+                        *self.debug_toolbar_hovered_id.borrow_mut() = new_hover;
+                        self.draw_needed.set(true);
+                    }
+                }
+
                 // Sync per-window viewport dimensions from actual window rects
                 // so ensure_cursor_visible uses accurate heights (not the rough
                 // DrawingArea-based estimate from connect_resize).
@@ -6969,6 +7003,9 @@ impl App {
             let dbg_y = self.debug_toolbar_y_offset.get();
             let dbg_h = self.debug_toolbar_height.get();
             if dbg_h > 0.0 && y >= dbg_y && y < dbg_y + dbg_h {
+                *self.debug_toolbar_pressed_id.borrow_mut() =
+                    self.debug_toolbar_hovered_id.borrow().clone();
+                self.draw_needed.set(true);
                 let regions = self.debug_toolbar_hit_regions.borrow();
                 for region in regions.iter() {
                     let r_x = region.col as f64;
@@ -8098,6 +8135,11 @@ impl App {
     }
 
     fn handle_mouse_up_msg(&mut self) {
+        if self.debug_toolbar_pressed_id.borrow().is_some() {
+            *self.debug_toolbar_pressed_id.borrow_mut() = None;
+            self.draw_needed.set(true);
+        }
+
         // Phase B.4: clear any active cross-backend drag state. The
         // dispatcher returns a MouseUp event we could forward to the
         // engine later, but today no consumer cares about mouse-up

@@ -1994,62 +1994,6 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Debug toolbar row click ────────────────────────────────────────────────
-    // Resolve via the same StatusBar adapter the renderer uses, so the
-    // hit math can never drift from the visible layout (was: duplicated
-    // walk over DEBUG_BUTTONS that re-derived per-button widths and
-    // separator gaps).
-    if engine.debug_toolbar_visible {
-        // Below the debug toolbar in the v_chunks layout (see
-        // render_impl::draw_frame): sep_status, wildmenu,
-        // global_status, cmd. Quickfix and bottom_panel are ABOVE
-        // the toolbar, so they don't count here. (Legacy formula
-        // mistakenly subtracted them and missed the row entirely
-        // whenever a terminal/debug panel was open.)
-        let wildmenu_rows: u16 = if !engine.wildmenu_items.is_empty() {
-            1
-        } else {
-            0
-        };
-        let global_status_rows: u16 = if engine.settings.window_status_line {
-            0
-        } else {
-            1
-        };
-        let toolbar_row = term_height.saturating_sub(
-            1 // cmd
-                + global_status_rows
-                + wildmenu_rows
-                + sep_status_rows
-                + 1, // the toolbar row itself
-        );
-        if row == toolbar_row && col >= editor_left {
-            let toolbar = render::DebugToolbarData {
-                buttons: render::DEBUG_BUTTONS.to_vec(),
-                session_active: engine.dap_session_active,
-            };
-            // Theme only feeds segment fg/bg here, which resolve_click
-            // ignores — onedark stand-in is fine for hit-test only.
-            let theme = Theme::onedark();
-            let bar = render::debug_toolbar_to_quadraui_status_bar(&toolbar, &theme);
-            // The toolbar is rendered into the right-column rect starting
-            // at editor_left, so its local x=0 corresponds to that
-            // absolute column. Convert the click into bar-local space
-            // before resolving.
-            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let bar_w = term_w.saturating_sub(editor_left) as usize;
-            let local_col = col - editor_left;
-            if let Some(id) = bar.resolve_click(local_col, bar_w) {
-                if let Some(idx) = render::debug_toolbar_action_index(&id) {
-                    if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
-                        let _ = engine.execute_command(btn.action);
-                    }
-                }
-            }
-            return sidebar_width; // click in toolbar row, consume event
-        }
-    }
-
     // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
     {
         let bottom_panel_visible = engine.terminal_open || engine.bottom_panel_open;
