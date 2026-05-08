@@ -9421,12 +9421,10 @@ impl App {
                 button: *button,
                 position: offset(*position),
             },
-            quadraui::UiEvent::MouseMoved { position, buttons } => {
-                quadraui::UiEvent::MouseMoved {
-                    position: offset(*position),
-                    buttons: *buttons,
-                }
-            }
+            quadraui::UiEvent::MouseMoved { position, buttons } => quadraui::UiEvent::MouseMoved {
+                position: offset(*position),
+                buttons: *buttons,
+            },
             quadraui::UiEvent::Scroll {
                 widget,
                 delta,
@@ -9436,12 +9434,10 @@ impl App {
                 delta: *delta,
                 position: offset(*position),
             },
-            quadraui::UiEvent::DoubleClick { widget, position } => {
-                quadraui::UiEvent::DoubleClick {
-                    widget: widget.clone(),
-                    position: offset(*position),
-                }
-            }
+            quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::DoubleClick {
+                widget: widget.clone(),
+                position: offset(*position),
+            },
             other => other.clone(),
         }
     }
