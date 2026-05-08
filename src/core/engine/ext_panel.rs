@@ -1808,6 +1808,121 @@ impl Engine {
         }
     }
 
+    pub fn ext_selected_from_sidebar_system(&self) -> (bool, usize) {
+        let sidebar = self.ext_sidebar_system.borrow();
+        let section = sidebar.active_section().unwrap_or(0);
+        let idx = sidebar
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(0) as usize;
+        (section == 0, idx)
+    }
+
+    pub fn dispatch_ext_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { .. } => {
+                self.ext_open_selected_readme();
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { .. } => true,
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    pub fn dispatch_ext_sidebar_action_key(&mut self, key: &str) -> bool {
+        match key {
+            "Escape" | "q" => {
+                self.ext_sidebar_has_focus = false;
+                self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                true
+            }
+            "/" => {
+                self.ext_sidebar_input_active = true;
+                true
+            }
+            "r" => {
+                self.ext_refresh();
+                true
+            }
+            "i" => {
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = &m.name;
+                        self.message =
+                            format!("Extension '{name}' is already installed. Use d to remove.");
+                    }
+                } else {
+                    let available = self.ext_available_items();
+                    if idx < available.len() {
+                        let base_url = self.resolve_registry_base_url(&available[idx]);
+                        let name = available[idx].name.clone();
+                        let display = if available[idx].display_name.is_empty() {
+                            name.clone()
+                        } else {
+                            available[idx].display_name.clone()
+                        };
+                        self.ext_install_from_registry(&name);
+                        let readme_path = crate::core::paths::vimcode_config_dir()
+                            .join("extensions")
+                            .join(&name)
+                            .join("README.md");
+                        let content = std::fs::read_to_string(&readme_path)
+                            .ok()
+                            .or_else(|| crate::core::registry::fetch_readme(&base_url, &name));
+                        if let Some(content) = content {
+                            self.open_markdown_preview_in_tab(&content, &display);
+                        }
+                        self.ext_sidebar_system.borrow_mut().set_collapsed(0, false);
+                        let new_installed = self.ext_installed_items();
+                        if let Some(pos) = new_installed.iter().position(|m| m.name == name) {
+                            self.ext_sidebar_system
+                                .borrow_mut()
+                                .set_active_section(Some(0));
+                            self.ext_sidebar_system
+                                .borrow_mut()
+                                .set_selected_path(0, Some(vec![pos as u16]));
+                        }
+                    }
+                }
+                true
+            }
+            "d" => {
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = m.name.clone();
+                        self.ext_show_remove_dialog(&name);
+                    }
+                }
+                true
+            }
+            "u" => {
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
+                if in_installed {
+                    let installed = self.ext_installed_items();
+                    if let Some(m) = installed.get(idx) {
+                        let name = m.name.clone();
+                        if self.ext_has_update(&name) {
+                            self.ext_update_one(&name);
+                        } else {
+                            self.message = format!("Extension '{name}' is already up to date");
+                        }
+                    }
+                }
+                true
+            }
+            "Return" => {
+                self.ext_open_selected_readme();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the filtered list of installed extension manifests.
     pub fn ext_installed_items(&self) -> Vec<crate::core::extensions::ExtensionManifest> {
         let q = self.ext_sidebar_query.to_lowercase();

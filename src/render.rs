@@ -6590,6 +6590,83 @@ pub fn populate_dap_sidebar_system(engine: &Engine) {
     sidebar.set_rows(3, bp_rows);
 }
 
+pub fn populate_ext_sidebar_system(engine: &Engine) {
+    use quadraui::{Badge, Decoration, StyledText, TreeRow};
+
+    let manifests = engine.ext_available_manifests();
+    let q = engine.ext_sidebar_query.to_lowercase();
+
+    let installed_rows: Vec<TreeRow> = manifests
+        .iter()
+        .filter(|m| engine.extension_state.is_installed(&m.name))
+        .filter(|m| {
+            q.is_empty()
+                || m.name.to_lowercase().contains(&q)
+                || m.display_name.to_lowercase().contains(&q)
+        })
+        .enumerate()
+        .map(|(i, m)| {
+            let display = if m.display_name.is_empty() {
+                &m.name
+            } else {
+                &m.display_name
+            };
+            let has_update = engine.ext_has_update(&m.name);
+            let label = if has_update {
+                format!("\u{25cf} {} \u{2191}", display)
+            } else {
+                format!("\u{25cf} {}", display)
+            };
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(label),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect();
+
+    let available_rows: Vec<TreeRow> = manifests
+        .iter()
+        .filter(|m| !engine.extension_state.is_installed(&m.name))
+        .filter(|m| {
+            q.is_empty()
+                || m.name.to_lowercase().contains(&q)
+                || m.display_name.to_lowercase().contains(&q)
+        })
+        .enumerate()
+        .map(|(i, m)| {
+            let display = if m.display_name.is_empty() {
+                &m.name
+            } else {
+                &m.display_name
+            };
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("\u{25cb} {}", display)),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect();
+
+    let mut sidebar = engine.ext_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.ext_sidebar_has_focus);
+    if engine.ext_sidebar_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+    sidebar.set_rows(0, installed_rows);
+    sidebar.set_rows(1, available_rows);
+}
+
 /// Populate the `TreeController` on `engine.explorer_tree` with current
 /// row data. Call once per frame before `tree_controller.render()` or
 /// `.handle()`.

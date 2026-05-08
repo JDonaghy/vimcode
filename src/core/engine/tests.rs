@@ -14679,6 +14679,75 @@ fn test_ext_remove_dialog_confirm_remove() {
     assert!(!e.extension_state.is_installed("bash"));
 }
 
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_unfocus() {
+    let mut e = Engine::new();
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    let consumed = e.dispatch_ext_sidebar_action_key("q");
+    assert!(consumed);
+    assert!(!e.ext_sidebar_has_focus);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_search() {
+    let mut e = Engine::new();
+    assert!(!e.ext_sidebar_input_active);
+    let consumed = e.dispatch_ext_sidebar_action_key("/");
+    assert!(consumed);
+    assert!(e.ext_sidebar_input_active);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_remove() {
+    let mut e = Engine::new();
+    e.ext_registry = Some(vec![mock_bash_manifest()]);
+    e.extension_state.mark_installed_version("bash", "1.0.0");
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    let consumed = e.dispatch_ext_sidebar_action_key("d");
+    assert!(consumed);
+    assert!(e.dialog.is_some());
+    assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_event_row_activated() {
+    let mut e = Engine::new();
+    let event = quadraui::SidebarEvent::RowActivated {
+        section: 0,
+        path: vec![0],
+    };
+    let consumed = e.dispatch_ext_sidebar_event(event);
+    assert!(consumed);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_event_ignored() {
+    let mut e = Engine::new();
+    let consumed = e.dispatch_ext_sidebar_event(quadraui::SidebarEvent::Ignored);
+    assert!(!consumed);
+}
+
+#[test]
+fn test_ext_selected_from_sidebar_system() {
+    let mut e = Engine::new();
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(1, Some(vec![3]));
+    let (is_installed, idx) = e.ext_selected_from_sidebar_system();
+    assert!(!is_installed);
+    assert_eq!(idx, 3);
+}
+
 // ─── Spell checking ──────────────────────────────────────────────────
 
 #[test]

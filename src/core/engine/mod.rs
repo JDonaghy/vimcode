@@ -3056,6 +3056,14 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
 
     // --- Extensions sidebar state ---
+    /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
+    /// Installed, Available) selection, scroll, keyboard nav, and mouse
+    /// handling. WholePanel scroll mode. Both TUI and GTK will call
+    /// `render()` and `handle()` once backend migration (#337/#338) lands.
+    pub ext_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// Cached body rect from last render frame — used by handle() in
+    /// event dispatch to pass the same rect that render() used.
+    pub ext_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     /// Whether the Extensions sidebar panel has keyboard focus.
     pub ext_sidebar_has_focus: bool,
     /// Flat selection index across installed + available items.
@@ -3650,6 +3658,17 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            ext_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
+                    quadraui::SidebarSectionDef::new("available", "AVAILABLE"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
+                s.set_allow_collapse(true);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            ext_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             ext_sidebar_has_focus: false,
             ext_sidebar_selected: 0,
             ext_sidebar_query: String::new(),
