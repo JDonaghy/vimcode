@@ -1659,8 +1659,7 @@ impl Engine {
         }
     }
 
-    /// Handle keyboard input for the Extensions sidebar panel.
-    /// Returns `true` if the key was consumed.
+    #[cfg(feature = "win-gui")]
     pub fn handle_ext_sidebar_key(
         &mut self,
         key: &str,
@@ -2026,7 +2025,7 @@ impl Engine {
             .collect()
     }
 
-    /// Total number of flat items in the sidebar (installed + available, respecting collapse).
+    #[cfg(feature = "win-gui")]
     pub(crate) fn ext_flat_item_count(&self) -> usize {
         let installed = if self.ext_sidebar_sections_expanded[0] {
             self.ext_installed_items().len()
@@ -2041,9 +2040,7 @@ impl Engine {
         installed + available
     }
 
-    /// Map the flat selected index to (section, index_within_section),
-    /// accounting for collapsed sections.
-    /// Returns `(true, idx)` for installed items, `(false, idx)` for available.
+    #[cfg(feature = "win-gui")]
     pub(crate) fn ext_selected_to_section(&self, sel: usize) -> (bool, usize) {
         let installed_vis = if self.ext_sidebar_sections_expanded[0] {
             self.ext_installed_items().len()

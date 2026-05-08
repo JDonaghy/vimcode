@@ -507,14 +507,9 @@ impl Engine {
             self.message = format!("Extension '{name}' removed (tools kept on PATH)");
         }
 
-        // Keep sidebar selection in bounds.
-        if self.ext_flat_item_count() == 0 {
-            self.ext_sidebar_sections_expanded[1] = true;
-        }
-        let new_total = self.ext_flat_item_count();
-        if new_total > 0 && self.ext_sidebar_selected >= new_total {
-            self.ext_sidebar_selected = new_total - 1;
-        }
+        // Ensure the available section is visible after removal so the
+        // user can see where the extension moved.
+        self.ext_sidebar_system.borrow_mut().set_collapsed(1, false);
     }
 
     /// Remove LSP/DAP tool binaries installed by an extension.

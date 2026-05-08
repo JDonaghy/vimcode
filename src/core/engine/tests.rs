@@ -14634,13 +14634,16 @@ fn mock_bash_manifest() -> extensions::ExtensionManifest {
 fn test_ext_remove_dialog_shows_on_d() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
-    // Install a single extension so it's the only item at index 0.
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0; // First installed item.
     e.ext_sidebar_has_focus = true;
-    e.handle_ext_sidebar_key("d", false, None);
-    // Dialog should be open with the ext_remove tag.
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
     assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
     assert!(e.pending_ext_remove.is_some());
@@ -14652,14 +14655,17 @@ fn test_ext_remove_dialog_cancel() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("d", false, None);
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
-    // Press Escape to cancel.
     e.handle_key("Escape", None, false);
     assert!(e.dialog.is_none());
-    // Extension should still be installed.
     assert!(e.extension_state.is_installed("bash"));
 }
 
@@ -14668,14 +14674,17 @@ fn test_ext_remove_dialog_confirm_remove() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("d", false, None);
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
-    // Press 'r' for "Remove".
     e.handle_key("", Some('r'), false);
     assert!(e.dialog.is_none());
-    // Extension should be removed.
     assert!(!e.extension_state.is_installed("bash"));
 }
 

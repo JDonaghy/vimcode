@@ -9505,7 +9505,7 @@ impl App {
                     delta: quadraui::ScrollDelta::new(0.0, dy as f32),
                     position: quadraui::Point::new(rect.x + 1.0, rect.y + 1.0),
                 };
-                let sidebar_event = engine.ext_sidebar_system.borrow_mut().handle(
+                let _ = engine.ext_sidebar_system.borrow_mut().handle(
                     &ev,
                     &mut *self.backend.borrow_mut(),
                     rect,
