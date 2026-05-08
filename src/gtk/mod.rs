@@ -957,11 +957,7 @@ enum Msg {
     ScKey(String, bool),
     /// Key press in the Extensions sidebar DrawingArea (key_name, unicode).
     ExtSidebarKey(String, Option<char>),
-    /// Click in the Extensions sidebar DrawingArea (x, y, n_press).
-    ExtSidebarClick(f64, f64, i32),
-    ExtSidebarMouseUp(f64, f64),
-    ExtSidebarMotion(f64, f64),
-    ExtSidebarScroll(f64),
+    ExtSidebarEvent(quadraui::UiEvent),
     /// Key press in the Settings sidebar DrawingArea (key_name, ctrl, unicode).
     SettingsKey(String, bool, Option<char>),
     /// Click in the Settings sidebar DrawingArea (x, y, n_press).
@@ -3281,34 +3277,9 @@ impl SimpleComponent for App {
         }
         {
             let sender_ext = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, x, y| {
-                sender_ext.send(Msg::ExtSidebarClick(x, y, n_press)).ok();
+            quadraui::gtk::wire_da_events(&widgets.ext_sidebar_da, move |ev| {
+                sender_ext.send(Msg::ExtSidebarEvent(ev)).ok();
             });
-            let sender_up = sender.input_sender().clone();
-            gesture.connect_released(move |_, _n, x, y| {
-                sender_up.send(Msg::ExtSidebarMouseUp(x, y)).ok();
-            });
-            widgets.ext_sidebar_da.add_controller(gesture);
-        }
-        {
-            let sender_motion = sender.input_sender().clone();
-            let motion_ctrl = gtk4::EventControllerMotion::new();
-            motion_ctrl.connect_motion(move |_, x, y| {
-                sender_motion.send(Msg::ExtSidebarMotion(x, y)).ok();
-            });
-            widgets.ext_sidebar_da.add_controller(motion_ctrl);
-        }
-        {
-            let sender_scroll = sender.input_sender().clone();
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                sender_scroll.send(Msg::ExtSidebarScroll(dy)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.ext_sidebar_da.add_controller(scroll_ctrl);
         }
         *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
 
@@ -4875,11 +4846,7 @@ impl SimpleComponent for App {
             Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
                 self.handle_sc_sidebar_msg(msg);
             }
-            Msg::ExtSidebarKey(_, _)
-            | Msg::ExtSidebarClick(_, _, _)
-            | Msg::ExtSidebarMouseUp(_, _)
-            | Msg::ExtSidebarMotion(_, _)
-            | Msg::ExtSidebarScroll(_) => {
+            Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarEvent(_) => {
                 self.handle_ext_sidebar_msg(msg);
             }
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
@@ -9426,6 +9393,59 @@ impl App {
         }
     }
 
+    fn offset_ext_sidebar_event(
+        &self,
+        ev: &quadraui::UiEvent,
+        chrome_h: f32,
+        body_y: f32,
+    ) -> quadraui::UiEvent {
+        let offset = |p: quadraui::Point| quadraui::Point::new(p.x, p.y - chrome_h + body_y);
+        match ev {
+            quadraui::UiEvent::MouseDown {
+                widget,
+                button,
+                position,
+                modifiers,
+            } => quadraui::UiEvent::MouseDown {
+                widget: widget.clone(),
+                button: *button,
+                position: offset(*position),
+                modifiers: *modifiers,
+            },
+            quadraui::UiEvent::MouseUp {
+                widget,
+                button,
+                position,
+            } => quadraui::UiEvent::MouseUp {
+                widget: widget.clone(),
+                button: *button,
+                position: offset(*position),
+            },
+            quadraui::UiEvent::MouseMoved { position, buttons } => {
+                quadraui::UiEvent::MouseMoved {
+                    position: offset(*position),
+                    buttons: *buttons,
+                }
+            }
+            quadraui::UiEvent::Scroll {
+                widget,
+                delta,
+                position,
+            } => quadraui::UiEvent::Scroll {
+                widget: widget.clone(),
+                delta: *delta,
+                position: offset(*position),
+            },
+            quadraui::UiEvent::DoubleClick { widget, position } => {
+                quadraui::UiEvent::DoubleClick {
+                    widget: widget.clone(),
+                    position: offset(*position),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
     fn handle_ext_sidebar_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ExtSidebarKey(key_name, unicode) => {
@@ -9451,86 +9471,41 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::ExtSidebarClick(x_click, y_click, n_press) => {
+            Msg::ExtSidebarEvent(ev) => {
                 let mut engine = self.engine.borrow_mut();
                 let line_height = self.cached_ui_line_height.max(1.0);
-                engine.ext_sidebar_has_focus = true;
                 let chrome_h = 2.0 * line_height;
-                if y_click < line_height {
-                    // Panel header — no-op.
-                } else if y_click < chrome_h {
-                    engine.ext_sidebar_input_active = true;
+                let rect = engine.ext_sidebar_body_rect.get();
+                let is_click = matches!(ev, quadraui::UiEvent::MouseDown { .. });
+                let is_double = matches!(ev, quadraui::UiEvent::DoubleClick { .. });
+                let click_y = match &ev {
+                    quadraui::UiEvent::MouseDown { position, .. }
+                    | quadraui::UiEvent::DoubleClick { position, .. } => Some(position.y as f64),
+                    _ => None,
+                };
+                if let Some(y) = click_y {
+                    engine.ext_sidebar_has_focus = true;
+                    if y < line_height as f64 {
+                        // Panel header — no-op.
+                    } else if y < chrome_h {
+                        engine.ext_sidebar_input_active = true;
+                    } else {
+                        let adjusted = self.offset_ext_sidebar_event(&ev, chrome_h as f32, rect.y);
+                        engine.handle_ext_sidebar_ui_event(adjusted);
+                    }
+                    if is_double {
+                        engine.ext_open_selected_readme();
+                    }
                 } else {
-                    let rect = engine.ext_sidebar_body_rect.get();
-                    let click_pos =
-                        quadraui::Point::new(x_click as f32, (y_click - chrome_h) as f32 + rect.y);
-                    let ev = quadraui::UiEvent::MouseDown {
-                        widget: None,
-                        button: quadraui::MouseButton::Left,
-                        position: click_pos,
-                        modifiers: quadraui::Modifiers::default(),
-                    };
-                    engine.handle_ext_sidebar_ui_event(ev);
-                }
-                if n_press >= 2 {
-                    engine.ext_open_selected_readme();
+                    let adjusted = self.offset_ext_sidebar_event(&ev, chrome_h as f32, rect.y);
+                    engine.handle_ext_sidebar_ui_event(adjusted);
                 }
                 let still_focused = engine.ext_sidebar_has_focus;
+                let has_dialog = engine.dialog.is_some();
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
+                if is_click || is_double {
+                    self.focus_editor_if_needed(still_focused && !has_dialog);
                 }
-                self.draw_needed.set(true);
-            }
-            Msg::ExtSidebarMouseUp(x, y) => {
-                let mut engine = self.engine.borrow_mut();
-                let line_height = self.cached_ui_line_height.max(1.0);
-                let chrome_h = 2.0 * line_height;
-                let rect = engine.ext_sidebar_body_rect.get();
-                let pos = quadraui::Point::new(x as f32, (y - chrome_h) as f32 + rect.y);
-                let ev = quadraui::UiEvent::MouseUp {
-                    widget: None,
-                    button: quadraui::MouseButton::Left,
-                    position: pos,
-                };
-                engine.handle_ext_sidebar_ui_event(ev);
-                drop(engine);
-                self.draw_needed.set(true);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-            }
-            Msg::ExtSidebarMotion(x, y) => {
-                let mut engine = self.engine.borrow_mut();
-                let line_height = self.cached_ui_line_height.max(1.0);
-                let chrome_h = 2.0 * line_height;
-                let rect = engine.ext_sidebar_body_rect.get();
-                let pos = quadraui::Point::new(x as f32, (y - chrome_h) as f32 + rect.y);
-                let ev = quadraui::UiEvent::MouseMoved {
-                    position: pos,
-                    buttons: quadraui::ButtonMask {
-                        left: true,
-                        right: false,
-                        middle: false,
-                    },
-                };
-                engine.handle_ext_sidebar_ui_event(ev);
-                drop(engine);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-            }
-            Msg::ExtSidebarScroll(dy) => {
-                let mut engine = self.engine.borrow_mut();
-                let rect = engine.ext_sidebar_body_rect.get();
-                let ev = quadraui::UiEvent::Scroll {
-                    widget: None,
-                    delta: quadraui::ScrollDelta::new(0.0, dy as f32),
-                    position: quadraui::Point::new(rect.x + 1.0, rect.y + 1.0),
-                };
-                engine.handle_ext_sidebar_ui_event(ev);
-                drop(engine);
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
