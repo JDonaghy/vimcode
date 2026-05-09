@@ -2477,8 +2477,7 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Git {
             sidebar.has_focus = true;
-            engine.sc_has_focus = true;
-            engine.sc_sidebar_system.borrow_mut().set_has_focus(true);
+            engine.sc_set_focus(true);
 
             // sidebar_row layout:
             //   0 = header
@@ -2498,16 +2497,10 @@ pub(super) fn handle_mouse(
                 engine.sc_commit_cursor = engine.sc_commit_message.len();
             } else if sidebar_row == btn_row {
                 engine.sc_commit_input_active = false;
-                let rel_col = col.saturating_sub(ab_width);
-                let commit_w = sidebar_width / 2;
-                let btn_idx = if rel_col < commit_w {
-                    0
-                } else {
-                    let icon_w = (sidebar_width - commit_w) / 3;
-                    let x = rel_col - commit_w;
-                    (1 + (x / icon_w.max(1))).min(3) as usize
-                };
-                engine.sc_activate_button(btn_idx);
+                let rel_col = col.saturating_sub(ab_width) as f64;
+                if let Some(idx) = Engine::sc_button_hit_test(rel_col, sidebar_width as f64) {
+                    engine.sc_activate_button(idx);
+                }
             } else if sidebar_row >= section_start {
                 engine.sc_commit_input_active = false;
                 let click_ev = quadraui::UiEvent::MouseDown {
@@ -2649,7 +2642,7 @@ pub(super) fn handle_mouse(
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
     sidebar.toolbar_focused = false;
-    engine.sc_has_focus = false;
+    engine.sc_set_focus(false);
     engine.dap_sidebar_has_focus = false;
     engine.ext_sidebar_has_focus = false;
     engine.ai_has_focus = false;

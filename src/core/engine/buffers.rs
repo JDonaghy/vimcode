@@ -913,6 +913,7 @@ impl Engine {
     /// Returns `true` if the action was fully handled synchronously (the
     /// caller should give focus back to the editor), `false` if a background
     /// diff was requested (the caller should keep SC focus and poll later).
+    #[cfg(feature = "win-gui")]
     pub fn sc_open_selected_async(&mut self) -> bool {
         let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
         if section == 2 {
