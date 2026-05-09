@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 8, 2026 (Session 358 — **Extensions sidebar → SidebarSystem** complete (#336/#337/#338). Three-issue migration: engine infrastructure, TUI backend, GTK backend + cleanup. All keyboard nav, mouse click, scroll, and scrollbar drag dispatch runs through shared engine methods via `handle_cached()` (quadraui#99). GTK uses `wire_da_events` (quadraui#101) for uniform event wiring. Net ~200 lines removed across the migration.)
+**Last updated:** May 8, 2026 (Session 359 — **Source Control panel → SidebarSystem** complete (#321/#339/#340). Three-issue migration mirroring the Extensions sidebar pattern. Unified `dispatch_sc_sidebar_key_unified()` eliminates all per-backend key mapping. `sc_set_focus()` + `sc_button_hit_test()` deduplicate focus sync and button click math. Section badges via quadraui#103 (`set_section_badge`/`set_section_visible`). Net ~340 lines removed across the migration.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -22,20 +22,19 @@
 | [#334](https://github.com/JDonaghy/vimcode/issues/334) | Unify search panel results-mode behavior | Polish |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (358):**
-- **#336 Extensions sidebar: engine + render layer** (Path A) — Added `ext_sidebar_system: Rc<RefCell<SidebarSystem>>` to Engine (WholePanel scroll, Selection nav, vim keys). `populate_ext_sidebar_system()` builds TreeRows from registry data. `dispatch_ext_sidebar_event()` + `dispatch_ext_sidebar_action_key()` for domain actions. 5 new tests.
-- **#337 Extensions sidebar: TUI → SidebarSystem** (Path A) — Replaced bespoke MSV render, click hit-testing (~90 lines), and scroll handling with `SidebarSystem.render()` and `.handle()`. Net -73 lines TUI.
-- **#338 Extensions sidebar: GTK → SidebarSystem + cleanup** (Path A, 4 commits) — GTK backend wired to SidebarSystem. Unified key dispatch via `dispatch_ext_sidebar_key_unified()` + `ExtSidebarKeyResult` eliminates all duplicated key-to-action mapping. `handle_cached()` (quadraui#99) enables backend-free event dispatch from shared engine code. `wire_da_events` (quadraui#101) replaces ~30 lines of manual GTK signal handler wiring. Removed dead fields (`ext_sidebar_body_height`, `ext_sidebar_max_panel_scroll`). Gated old methods behind `#[cfg(win-gui)]`.
-- **Also closed:** #322 (superseded by #336/#337/#338), #326 (duplicate of #322).
-- **quadraui issues filed + resolved:** #93 (WholePanel scroll), #95 (scrollbar fix), #97 (has_focus getter), #99 (backend-free handle_cached), #101 (wire_da_events).
+**Shipped this session (359):**
+- **#321 SC sidebar: engine + render layer** (Path A) — Added `sc_sidebar_system: Rc<RefCell<SidebarSystem>>` with 4 sections (Staged/Changes/Worktrees/Log), WholePanel scroll, Selection nav, collapsible. `populate_sc_sidebar_system(engine, theme)` builds TreeRows with git status colors + section badges. `dispatch_sc_sidebar_key_unified()` + `ScKeyResult` provides single entry point for both backends. `dispatch_sc_sidebar_event()` + `dispatch_sc_action_key()` + `sc_activate_row()` for domain actions. `handle_sc_sidebar_ui_event()` for mouse/scroll. 8 new tests.
+- **#339 SC sidebar: TUI → SidebarSystem** (Path A) — Replaced TreeView section rendering with `SidebarSystem.render()`, 80-line manual key mapping with `dispatch_sc_sidebar_key_unified()`, flat-index scroll/click with `handle_sc_sidebar_ui_event()`. Domain actions read selection from SidebarSystem. Fixed Shift+key with Kitty keyboard enhancement. Net -40 lines TUI.
+- **#340 SC sidebar: GTK → SidebarSystem + dedup** (PR #341) — GTK section rendering, key dispatch (both `Msg::KeyPress` and `Msg::ScKey`), and 60-line click accumulator walk all replaced with SidebarSystem. `wire_da_events` wired for scroll/scrollbar drag. GDK `question`/`slash` key name mapping fixed. `Engine::sc_set_focus(bool)` deduplicates 10+ manual dual-set sites. `Engine::sc_button_hit_test()` shares button layout math. `sc_open_selected_async` gated behind `#[cfg(feature = "win-gui")]`. `sc_stage_all` error now surfaced in status bar. Net -200 lines GTK.
+- **quadraui issues filed + resolved:** #103 (section visibility + header badges).
 
 ---
 
-**Previous sessions (357 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (358 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1946 lib tests passing. All on develop — no active branches.
+Vimcode at 1954 lib tests passing. All on develop — no active branches.
 
-> Sessions 358 and earlier in **SESSION_HISTORY.md**.
+> Sessions 359 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -105,7 +104,7 @@ cell coalescence) remain but are tracked separately.
 | Editor viewport (text + gutter + cursor + selection + diagnostics) | `Editor` | ✅ | ✅ | #276, `5b23718`+ (Phase C Stage 1) |
 | Extension panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #280, `d29d1b4`. Adapter `render::ext_sidebar_to_tree_view`. Click via `TreeViewLayout::hit_test()` on both backends. |
 | Debug sidebar (variables tree, breakpoints, watch) | `MultiSectionView` (4 × `TreeView`) | ✅ | ✅ | #296, `285916b`. Adapter `render::debug_sidebar_to_multi_section_view`. Paint caches layout; click reads verbatim. |
-| Source control panel | `TreeView` (with `Decoration::Header`) | ✅ | ✅ | #282 already shipped — `render::source_control_to_tree_view` adapter + `Backend::draw_tree` on both backends. Table previously claimed bespoke; reconciled here. |
+| Source control panel | `SidebarSystem` (4 sections) | ✅ | ✅ | #321/#339/#340. `populate_sc_sidebar_system` + `SidebarSystem.render()`. Unified dispatch via `dispatch_sc_sidebar_key_unified`. Section badges + visibility (quadraui#103). |
 | Bottom panel tabs (Terminal / Debug Output) | `TabBar` | ✅ | ✅ | #304, `5d7fa09`. Adapter `render::build_bottom_panel_tab_bar`. Click via `Engine::handle_bottom_tab_bar_click`. `show_tab_close: false`, `compact: true`. |
 | Terminal toolbar (find bar + tab strip) | `StatusBar` / `TabBar` | ✅ | ✅ | #305, `08dd916`. Adapter `render::build_terminal_toolbar`. Click via `Engine::resolve_terminal_toolbar_click`. Tab strip uses `compact: true`. |
 | Menu bar labels | `MenuSystem` | ✅ | ✅ | #319. `quadraui::MenuSystem` owns all state + rendering. `MenuOverlay` helper for GTK overlay DA. |
@@ -121,6 +120,7 @@ cell coalescence) remain but are tracked separately.
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
 - `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
 - `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
+- `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338) and source control panel (#321/#339/#340): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
 - `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**

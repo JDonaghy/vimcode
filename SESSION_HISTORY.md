@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 358 archived here.
+All sessions through 359 archived here.
+
+---
+**Session 359 (May 8) — Source Control panel → SidebarSystem (#321/#339/#340):**
+
+Three-issue migration of the SC panel from hand-rolled state management to `quadraui::SidebarSystem`, following the Extensions sidebar pattern from Session 358. Filed quadraui#103 for section visibility + header badges (prerequisite — SC has conditional WORKTREES section + item-count badges). **#321** (engine + render, Path A): Added `sc_sidebar_system: Rc<RefCell<SidebarSystem>>` with 4 sections (Staged Changes, Changes, Worktrees, Recent Commits), WholePanel scroll, Selection nav, collapsible. `populate_sc_sidebar_system(engine, theme)` in render.rs builds TreeRows with git status colors + section badges via `set_section_badge`/`set_section_visible`. Unified `dispatch_sc_sidebar_key_unified()` + `ScKeyResult` enum — single entry point for both backends. `dispatch_sc_sidebar_event()` handles `RowActivated`/`RowSelected`. `dispatch_sc_action_key()` for domain keys (s/S/d/D/c/C/p/P/f/r/b/B/?). `sc_activate_row()` opens files/worktrees/log. `handle_sc_sidebar_ui_event()` for mouse/scroll. `sc_selected_from_sidebar_system()` replaces `sc_flat_to_section_idx(sc_selected)`. 8 new tests. `ScKeyResult` re-exported from engine module. **#339** (TUI, Path A): Section rendering replaced with `SidebarSystem.render()`. 80-line manual key mapping replaced with `dispatch_sc_sidebar_key_unified()`. Flat-index scroll/click replaced with `handle_sc_sidebar_ui_event()`. Fixed: `set_backend_info` missing (handle_cached silently returned Ignored), Shift+key with Kitty keyboard enhancement (Char('s')+SHIFT → resolve to 'S'). `sc_stage_all` error now surfaced in status bar (was `let _ =`). Net -40 lines. **#340** (GTK + dedup, PR #341): GTK rendering, `Msg::ScKey` handler, `Msg::KeyPress` SC branch, and 60-line click accumulator walk all replaced. `wire_da_events` wired for scroll/scrollbar drag. GDK `question`/`slash` key name mapping added to `map_gtk_key_with_unicode`. Cross-backend dedup: `Engine::sc_set_focus(bool)` keeps `sc_has_focus` + SidebarSystem in sync (replaces 10+ manual dual-set sites). `Engine::sc_button_hit_test()` shares button layout math. `sc_open_selected_async` gated behind `#[cfg(feature = "win-gui")]`. Net -200 lines GTK. quadraui#103 filed and resolved (section visibility + header badges).
 
 ---
 **Session 358 (May 8) — Extensions sidebar → SidebarSystem (#336/#337/#338):**
