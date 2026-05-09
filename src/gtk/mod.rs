@@ -955,6 +955,8 @@ enum Msg {
     ScSidebarMotion(f64, f64),
     /// Key press in the Source Control sidebar DrawingArea.
     ScKey(String, bool),
+    /// UiEvent (scroll, mouse) in the SC sidebar DrawingArea.
+    ScSidebarEvent(quadraui::UiEvent),
     /// Key press in the Extensions sidebar DrawingArea (key_name, unicode).
     ExtSidebarKey(String, Option<char>),
     ExtSidebarEvent(quadraui::UiEvent),
@@ -3228,6 +3230,12 @@ impl SimpleComponent for App {
             });
             widgets.git_sidebar_da.add_controller(motion);
         }
+        {
+            let sender_sc = sender.input_sender().clone();
+            quadraui::gtk::wire_da_events(&widgets.git_sidebar_da, move |ev| {
+                sender_sc.send(Msg::ScSidebarEvent(ev)).ok();
+            });
+        }
         *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
 
         // ── Extensions sidebar draw + key setup ───────────────────────────────
@@ -4847,7 +4855,10 @@ impl SimpleComponent for App {
             | Msg::DebugSidebarScroll(_) => {
                 self.handle_debug_sidebar_msg(msg);
             }
-            Msg::ScSidebarClick(_, _, _) | Msg::ScSidebarMotion(_, _) | Msg::ScKey(_, _) => {
+            Msg::ScSidebarClick(_, _, _)
+            | Msg::ScSidebarMotion(_, _)
+            | Msg::ScKey(_, _)
+            | Msg::ScSidebarEvent(_) => {
                 self.handle_sc_sidebar_msg(msg);
             }
             Msg::ExtSidebarKey(_, _) | Msg::ExtSidebarEvent(_) => {
@@ -9251,6 +9262,14 @@ impl App {
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
                 self.focus_editor_if_needed(still_focused);
+                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+            }
+            Msg::ScSidebarEvent(ev) => {
+                let mut engine = self.engine.borrow_mut();
+                engine.handle_sc_sidebar_ui_event(ev);
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
