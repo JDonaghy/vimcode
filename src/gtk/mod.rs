@@ -675,6 +675,11 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
         "Right" => ("Right", None),
         "Home" => ("Home", None),
         "End" => ("End", None),
+        "Tab" | "ISO_Left_Tab" => ("Tab", None),
+        "Page_Up" => ("Page_Up", None),
+        "Page_Down" => ("Page_Down", None),
+        "question" => ("?", Some('?')),
+        "slash" => ("/", Some('/')),
         other => {
             let mut chars = other.chars();
             if let (Some(ch), None) = (chars.next(), chars.next()) {
