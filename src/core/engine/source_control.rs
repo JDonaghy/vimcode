@@ -136,7 +136,9 @@ impl Engine {
     /// Stage all unstaged/untracked files.
     pub fn sc_stage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        let _ = git::stage_path(&dir, ".");
+        if let Err(e) = git::stage_path(&dir, ".") {
+            self.message = format!("stage all: {e}");
+        }
         self.sc_refresh();
     }
 
