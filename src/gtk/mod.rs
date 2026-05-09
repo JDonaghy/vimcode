@@ -3191,6 +3191,7 @@ impl SimpleComponent for App {
                     h,
                     line_height,
                     &backend_d,
+                    &engine,
                 );
             });
         }
@@ -4571,19 +4572,22 @@ impl SimpleComponent for App {
                     self.cached_ui_line_height =
                         (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64;
                     let lh = self.cached_ui_line_height as f32;
+                    let metrics = quadraui::MsvLayoutMetrics {
+                        header_size: (lh * 1.2).round(),
+                        divider_size: 0.0,
+                        scrollbar_size: 8.0,
+                        cell_quantum: 0.0,
+                    };
                     self.engine
                         .borrow()
                         .ext_sidebar_system
                         .borrow_mut()
-                        .set_backend_info(
-                            lh,
-                            quadraui::MsvLayoutMetrics {
-                                header_size: (lh * 1.2).round(),
-                                divider_size: 0.0,
-                                scrollbar_size: 8.0,
-                                cell_quantum: 0.0,
-                            },
-                        );
+                        .set_backend_info(lh, metrics);
+                    self.engine
+                        .borrow()
+                        .sc_sidebar_system
+                        .borrow_mut()
+                        .set_backend_info(lh, metrics);
                 }
                 // Keep shared cells in sync so the resize callback can use accurate values.
                 self.line_height_cell.set(line_height);
@@ -5568,7 +5572,7 @@ impl App {
                 if engine.dialog.is_some() {
                     engine.handle_key(mapped, sc_unicode, ctrl);
                 } else {
-                    engine.handle_sc_key(mapped, ctrl, sc_unicode);
+                    engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
                 }
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
@@ -9018,19 +9022,10 @@ impl App {
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.grab_focus();
                 }
-                // Update selection/focus in one borrow scope.
-                // Returns: Some("Return") = open file, Some("Tab") = toggle expand, None = no-op
-                let action: Option<&'static str> = {
+                {
                     let mut engine = self.engine.borrow_mut();
                     engine.sc_has_focus = true;
-                    // Pixel-based hit zones matching draw_source_control_panel layout:
-                    //   header:  0 .. lh
-                    //   gap:     lh .. lh+gap
-                    //   commit:  lh+gap .. lh+gap+commit_h
-                    //   gap:     .. + gap
-                    //   buttons: .. + lh
-                    //   gap:     .. + gap
-                    //   sections: item_height rows
+                    engine.sc_sidebar_system.borrow_mut().set_has_focus(true);
                     let gap = (lh * 0.3).round();
                     let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
                     let commit_h = commit_rows as f64 * lh;
@@ -9040,20 +9035,14 @@ impl App {
                     let btn_top = commit_bottom + gap;
                     let btn_bottom = btn_top + lh;
                     let section_top = btn_bottom + gap;
-                    let item_height = (lh * 1.4).round();
 
                     if y < header_end {
-                        // Panel header — no-op
                         engine.sc_commit_input_active = false;
-                        None
                     } else if y >= commit_top && y < commit_bottom {
-                        // Commit input row(s)
                         engine.sc_commit_input_active = true;
                         engine.sc_commit_cursor = engine.sc_commit_message.len();
-                        None
                     } else if y >= btn_top && y < btn_bottom {
                         engine.sc_commit_input_active = false;
-                        // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
                         if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                             let da_w = da.width() as f64;
                             let margin = 4.0;
@@ -9070,106 +9059,24 @@ impl App {
                                 engine.sc_activate_button(btn_idx);
                             }
                         }
-                        None
                     } else if y >= section_top {
                         engine.sc_commit_input_active = false;
-                        // Accumulator walk matching draw_source_control_panel layout:
-                        // headers use line_height, items use item_height (1.4×).
-                        let staged_count = engine
-                            .sc_file_statuses
-                            .iter()
-                            .filter(|f| f.staged.is_some())
-                            .count();
-                        let unstaged_count = engine
-                            .sc_file_statuses
-                            .iter()
-                            .filter(|f| f.unstaged.is_some())
-                            .count();
-                        let show_worktrees = engine.sc_worktrees.len() > 1;
-                        let wt_count = engine.sc_worktrees.len();
-                        let log_count = engine.sc_log.len();
-                        let expanded = engine.sc_sections_expanded;
-
-                        // Build section descriptors: (item_count, is_shown, expanded)
-                        let sections: [(usize, bool, bool); 4] = [
-                            (staged_count, true, expanded[0]),
-                            (unstaged_count, true, expanded[1]),
-                            (wt_count, show_worktrees, expanded[2]),
-                            (log_count, true, expanded[3]),
-                        ];
-
-                        let mut ry = section_top;
-                        let mut flat: usize = 0;
-                        let mut result: Option<(usize, bool)> = None;
-
-                        'walk: for &(count, shown, exp) in &sections {
-                            if !shown {
-                                continue;
-                            }
-                            // Section header (line_height)
-                            if y >= ry && y < ry + lh {
-                                result = Some((flat, true));
-                                break 'walk;
-                            }
-                            ry += lh;
-                            let header_flat = flat;
-                            flat += 1;
-                            if exp {
-                                for i in 0..count {
-                                    if y >= ry && y < ry + item_height {
-                                        result = Some((header_flat + 1 + i, false));
-                                        break 'walk;
-                                    }
-                                    ry += item_height;
-                                }
-                                flat += count;
-                            }
-                        }
-
-                        match result {
-                            Some((flat_idx, is_header)) => {
-                                engine.sc_selected = flat_idx;
-                                if is_header {
-                                    Some("Tab")
-                                } else if n_press >= 2 {
-                                    Some("Return")
-                                } else {
-                                    None // single-click: just select
-                                }
-                            }
-                            None => None,
+                        let click_ev = quadraui::UiEvent::MouseDown {
+                            widget: None,
+                            button: quadraui::MouseButton::Left,
+                            position: quadraui::Point::new(x_click as f32, y as f32),
+                            modifiers: quadraui::Modifiers::default(),
+                        };
+                        engine.handle_sc_sidebar_ui_event(click_ev);
+                        if n_press >= 2 {
+                            let double_ev = quadraui::UiEvent::DoubleClick {
+                                widget: None,
+                                position: quadraui::Point::new(x_click as f32, y as f32),
+                            };
+                            engine.handle_sc_sidebar_ui_event(double_ev);
                         }
                     } else {
-                        // Gap/padding area — no-op
                         engine.sc_commit_input_active = false;
-                        None
-                    }
-                };
-                if let Some(key) = action {
-                    if key == "Return" {
-                        // Defer all heavy work (file open + git show) so
-                        // the sidebar repaints the selection highlight first.
-                        let engine_rc = self.engine.clone();
-                        let git_da = self.git_sidebar_da_ref.clone();
-                        let drawing = self.drawing_area.clone();
-                        let draw_needed = self.draw_needed.clone();
-                        gtk4::glib::idle_add_local_once(move || {
-                            let done = engine_rc.borrow_mut().sc_open_selected_async();
-                            if done {
-                                let still_focused = engine_rc.borrow().sc_has_focus;
-                                if !still_focused {
-                                    if let Some(ref da) = *drawing.borrow() {
-                                        da.grab_focus();
-                                    }
-                                }
-                            }
-                            if let Some(ref da) = *git_da.borrow() {
-                                da.queue_draw();
-                            }
-                            draw_needed.set(true);
-                        });
-                    } else {
-                        self.engine.borrow_mut().handle_sc_key(key, false, None);
                     }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
@@ -9339,48 +9246,8 @@ impl App {
                     self.draw_needed.set(true);
                     return;
                 }
-                if engine.sc_commit_input_active
-                    || engine.sc_branch_picker_open
-                    || engine.sc_branch_create_mode
-                    || engine.sc_help_open
-                {
-                    // In input/popup mode, pass everything through.
-                    let (mapped_key, unicode) = map_gtk_key_with_unicode(key_name.as_str());
-                    engine.handle_sc_key(mapped_key, ctrl, unicode);
-                } else {
-                    // Normal navigation: map known keys only.
-                    let mapped = match key_name.as_str() {
-                        "Return" | "KP_Enter" => "Return",
-                        "Escape" => "Escape",
-                        "Tab" => "Tab",
-                        "Down" => "j",
-                        "Up" => "k",
-                        "Left" => "h",
-                        "Right" => "l",
-                        "BackSpace" => "BackSpace",
-                        "j" => "j",
-                        "k" => "k",
-                        "h" => "h",
-                        "l" => "l",
-                        "s" => "s",
-                        "S" => "S",
-                        "d" => "d",
-                        "D" => "D",
-                        "r" => "r",
-                        "q" => "q",
-                        "c" => "c",
-                        "p" => "p",
-                        "P" => "P",
-                        "f" => "f",
-                        "b" => "b",
-                        "B" => "B",
-                        "question" | "?" => "?",
-                        _ => "",
-                    };
-                    if !mapped.is_empty() {
-                        engine.handle_sc_key(mapped, ctrl, None);
-                    }
-                }
+                let (mapped, unicode) = map_gtk_key_with_unicode(key_name.as_str());
+                engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, unicode);
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
                 self.focus_editor_if_needed(still_focused);

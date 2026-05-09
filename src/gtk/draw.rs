@@ -2852,6 +2852,7 @@ pub(super) fn draw_source_control_panel(
     h: f64,
     line_height: f64,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &Engine,
 ) {
     let Some(ref sc) = screen.source_control else {
         return;
@@ -3069,25 +3070,17 @@ pub(super) fn draw_source_control_panel(
         y_commit = btn_y_base + btn_h + btn_pad;
     }
 
-    // Section rendering — migrated to the `quadraui::TreeView` primitive
-    // (Phase A.1b). Adapter builds a TreeView covering the four sections
-    // (Staged / Changes / Worktrees / Log); `quadraui_gtk::draw_tree` renders
-    // it with Cairo + Pango. Row heights match the previous layout
-    // (`line_height` for headers, `line_height * 1.4` for items) so the
-    // click-hit math in `src/gtk/mod.rs::Msg::ScSidebarClick` continues to work.
-    let _ = (add_r, add_g, add_b, del_r, del_g, del_b); // reserved for future diff-tint use
-    let sc_tree = render::source_control_to_tree_view(sc, theme);
+    // Section rendering — migrated to SidebarSystem (#321).
+    let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
     let sections_h = (y + h - y_commit).max(0.0);
-    // Phase B.5b Stage 8: route through `Backend::draw_tree`.
+    let body_rect = quadraui::Rect::new(x as f32, y_commit as f32, w as f32, sections_h as f32);
+    engine.sc_sidebar_body_rect.set(body_rect);
+    render::populate_sc_sidebar_system(engine, theme);
     {
-        use quadraui::Backend;
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            b.draw_tree(
-                quadraui::Rect::new(x as f32, y_commit as f32, w as f32, sections_h as f32),
-                &sc_tree,
-            );
+            engine.sc_sidebar_system.borrow().render(b, body_rect);
         });
     }
 
