@@ -551,8 +551,7 @@ impl Engine {
             }
             // Fully exit SC panel.
             "q" => {
-                self.sc_button_focused = None;
-                self.sc_has_focus = false;
+                self.sc_set_focus(false);
                 true
             }
             _ => true,
@@ -802,9 +801,7 @@ impl Engine {
                                 let _ = self
                                     .open_file_with_mode(&path, crate::core::OpenMode::Permanent);
                             }
-                            // Clear focus so the editor receives keys after opening.
-                            self.sc_has_focus = false;
-                            self.sc_button_focused = None;
+                            self.sc_set_focus(false);
                         }
                     }
                 }
@@ -812,8 +809,7 @@ impl Engine {
                 true
             }
             "q" | "Escape" => {
-                self.sc_has_focus = false;
-                self.sc_button_focused = None;
+                self.sc_set_focus(false);
                 true
             }
             "r" => {
@@ -1165,6 +1161,33 @@ impl Engine {
 
     // ─── SidebarSystem integration ───────────────────────────────────
 
+    /// Set SC panel keyboard focus on both the engine flag and the
+    /// SidebarSystem. Backends should call this instead of setting
+    /// `sc_has_focus` directly to keep the two in sync.
+    pub fn sc_set_focus(&mut self, focused: bool) {
+        self.sc_has_focus = focused;
+        self.sc_sidebar_system.borrow_mut().set_has_focus(focused);
+        if !focused {
+            self.sc_button_focused = None;
+        }
+    }
+
+    /// Compute which SC button (0=Commit, 1=Push, 2=Pull, 3=Sync) was
+    /// clicked given a relative x position and total button-row width.
+    /// Returns `None` if the position is outside the row.
+    pub fn sc_button_hit_test(rel_x: f64, total_width: f64) -> Option<usize> {
+        if rel_x < 0.0 || rel_x >= total_width || total_width <= 0.0 {
+            return None;
+        }
+        let commit_w = total_width / 2.0;
+        Some(if rel_x < commit_w {
+            0
+        } else {
+            let icon_w = (total_width - commit_w) / 3.0;
+            ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
+        })
+    }
+
     /// Read the active section index and selected item index from the
     /// SidebarSystem. Returns `(section, item_idx)` where section is
     /// 0=staged, 1=changes, 2=worktrees, 3=log. Returns `(0, usize::MAX)`
@@ -1245,9 +1268,7 @@ impl Engine {
                             let _ =
                                 self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
                         }
-                        self.sc_has_focus = false;
-                        self.sc_sidebar_system.borrow_mut().set_has_focus(false);
-                        self.sc_button_focused = None;
+                        self.sc_set_focus(false);
                     }
                 }
             }
@@ -1373,9 +1394,7 @@ impl Engine {
         // Domain action keys.
         match key {
             "Escape" | "q" => {
-                self.sc_has_focus = false;
-                self.sc_sidebar_system.borrow_mut().set_has_focus(false);
-                self.sc_button_focused = None;
+                self.sc_set_focus(false);
                 ScKeyResult::Unfocused
             }
             "Return" | "Enter" => {

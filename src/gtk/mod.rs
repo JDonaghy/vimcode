@@ -9040,8 +9040,7 @@ impl App {
                 }
                 {
                     let mut engine = self.engine.borrow_mut();
-                    engine.sc_has_focus = true;
-                    engine.sc_sidebar_system.borrow_mut().set_has_focus(true);
+                    engine.sc_set_focus(true);
                     let gap = (lh * 0.3).round();
                     let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
                     let commit_h = commit_rows as f64 * lh;
@@ -9064,15 +9063,8 @@ impl App {
                             let margin = 4.0;
                             let btn_w = da_w - margin * 2.0;
                             let rel_x = x_click - margin;
-                            if btn_w > 0.0 && rel_x >= 0.0 && rel_x < btn_w {
-                                let commit_w = btn_w / 2.0;
-                                let btn_idx = if rel_x < commit_w {
-                                    0
-                                } else {
-                                    let icon_w = (btn_w - commit_w) / 3.0;
-                                    ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
-                                };
-                                engine.sc_activate_button(btn_idx);
+                            if let Some(idx) = Engine::sc_button_hit_test(rel_x, btn_w) {
+                                engine.sc_activate_button(idx);
                             }
                         }
                     } else if y >= section_top {
@@ -9887,7 +9879,7 @@ impl App {
                     if self.sidebar_visible {
                         match panel {
                             SidebarPanel::Git => {
-                                self.engine.borrow_mut().sc_has_focus = true;
+                                self.engine.borrow_mut().sc_set_focus(true);
                             }
                             SidebarPanel::Extensions => {
                                 self.engine.borrow_mut().ext_sidebar_has_focus = true;
@@ -9923,7 +9915,7 @@ impl App {
                     if self.active_panel == SidebarPanel::Git {
                         let mut engine = self.engine.borrow_mut();
                         engine.sc_refresh();
-                        engine.sc_has_focus = true;
+                        engine.sc_set_focus(true);
                     }
                     // Focus + refresh when switching to Extensions panel
                     if self.active_panel == SidebarPanel::Extensions {

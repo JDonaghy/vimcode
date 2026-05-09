@@ -2278,7 +2278,7 @@ fn event_loop(
                                 sidebar.replace_input_focused = false;
                             }
                             if panel == TuiPanel::Git {
-                                engine.sc_has_focus = true;
+                                engine.sc_set_focus(true);
                                 engine.sc_refresh();
                             }
                             if panel == TuiPanel::Debug {
@@ -2882,8 +2882,7 @@ fn event_loop(
                             && !engine.sc_help_open
                         {
                             sidebar.has_focus = false;
-                            engine.sc_has_focus = false;
-                            engine.sc_sidebar_system.borrow_mut().set_has_focus(false);
+                            engine.sc_set_focus(false);
                             sidebar.toolbar_focused = true;
                             sidebar.toolbar_selected = 4;
                             needs_redraw = true;
@@ -2894,8 +2893,7 @@ fn event_loop(
                             sidebar.visible = false;
                             sidebar.has_focus = false;
                             engine.session.explorer_visible = false;
-                            engine.sc_has_focus = false;
-                            engine.sc_sidebar_system.borrow_mut().set_has_focus(false);
+                            engine.sc_set_focus(false);
                             let _ = engine.session.save();
                             needs_redraw = true;
                             continue;
@@ -3525,7 +3523,7 @@ fn event_loop(
                                     TuiPanel::Explorer => {
                                         engine.explorer_has_focus = true;
                                     }
-                                    TuiPanel::Git => engine.sc_has_focus = true,
+                                    TuiPanel::Git => engine.sc_set_focus(true),
                                     TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
                                     TuiPanel::Extensions => {
                                         engine.ext_sidebar_has_focus = true;
