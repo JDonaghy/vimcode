@@ -5881,16 +5881,7 @@ impl App {
             }
         }
         if self.engine.borrow_mut().poll_project_search() {
-            {
-                let engine = self.engine.borrow();
-                if engine.search_has_focus && !engine.project_search_results.is_empty() {
-                    engine.search_panel_form_focus.replace(None);
-                    engine
-                        .search_sidebar_system
-                        .borrow_mut()
-                        .set_active_section(Some(1));
-                }
-            }
+            self.engine.borrow_mut().search_switch_to_results();
             if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -9861,15 +9852,7 @@ impl App {
                     if self.sidebar_visible {
                         match panel {
                             SidebarPanel::Search => {
-                                let mut engine = self.engine.borrow_mut();
-                                engine.search_has_focus = true;
-                                engine
-                                    .search_panel_form_focus
-                                    .replace(Some("search:query".to_string()));
-                                engine
-                                    .search_sidebar_system
-                                    .borrow_mut()
-                                    .set_active_section(Some(0));
+                                self.engine.borrow_mut().search_set_focus(true);
                             }
                             SidebarPanel::Git => {
                                 self.engine.borrow_mut().sc_set_focus(true);
@@ -9906,15 +9889,7 @@ impl App {
                     self.sidebar_visible = true;
                     // Focus when switching to Search panel
                     if self.active_panel == SidebarPanel::Search {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.search_has_focus = true;
-                        engine
-                            .search_panel_form_focus
-                            .replace(Some("search:query".to_string()));
-                        engine
-                            .search_sidebar_system
-                            .borrow_mut()
-                            .set_active_section(Some(0));
+                        self.engine.borrow_mut().search_set_focus(true);
                     }
                     // Refresh SC data when switching to the Git panel
                     if self.active_panel == SidebarPanel::Git {
@@ -10223,17 +10198,7 @@ impl App {
                 } else {
                     self.active_panel = SidebarPanel::Search;
                     self.sidebar_visible = true;
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.search_has_focus = true;
-                        engine
-                            .search_panel_form_focus
-                            .replace(Some("search:query".to_string()));
-                        engine
-                            .search_sidebar_system
-                            .borrow_mut()
-                            .set_active_section(Some(0));
-                    }
+                    self.engine.borrow_mut().search_set_focus(true);
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }

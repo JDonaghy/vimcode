@@ -831,6 +831,30 @@ impl Engine {
         None
     }
 
+    /// Set search panel focus state. Both backends call this when
+    /// activating/deactivating the search panel.
+    pub fn search_set_focus(&mut self, focused: bool) {
+        self.search_has_focus = focused;
+        if focused {
+            self.search_panel_form_focus
+                .replace(Some("search:query".to_string()));
+            self.search_sidebar_system
+                .borrow_mut()
+                .set_active_section(Some(0));
+        }
+    }
+
+    /// Switch the search panel from form input to results navigation.
+    /// Called when search results arrive.
+    pub fn search_switch_to_results(&mut self) {
+        if self.search_has_focus && !self.project_search_results.is_empty() {
+            self.search_panel_form_focus.replace(None);
+            self.search_sidebar_system
+                .borrow_mut()
+                .set_active_section(Some(1));
+        }
+    }
+
     /// Open the file at the given result index and jump to the match line.
     pub(crate) fn open_search_result(&mut self, result_idx: usize) {
         if let Some(m) = self.project_search_results.get(result_idx) {

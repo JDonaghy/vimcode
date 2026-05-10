@@ -204,13 +204,7 @@ fn dispatch_panel_accelerator(
                 sidebar.visible = true;
                 sidebar.active_panel = TuiPanel::Search;
                 sidebar.has_focus = true;
-                engine
-                    .search_panel_form_focus
-                    .replace(Some("search:query".to_string()));
-                engine
-                    .search_sidebar_system
-                    .borrow_mut()
-                    .set_active_section(Some(0));
+                engine.search_set_focus(true);
             }
             sync_sidebar_focus(sidebar, engine);
             *needs_redraw = true;
@@ -1497,11 +1491,7 @@ fn event_loop(
             }
             if engine.poll_project_search() && !engine.project_search_results.is_empty() {
                 if sidebar.active_panel == TuiPanel::Search {
-                    engine.search_panel_form_focus.replace(None);
-                    engine
-                        .search_sidebar_system
-                        .borrow_mut()
-                        .set_active_section(Some(1));
+                    engine.search_switch_to_results();
                 }
                 needs_redraw = true;
             }
@@ -2281,14 +2271,7 @@ fn event_loop(
                                 engine.explorer_has_focus = true;
                             }
                             if panel == TuiPanel::Search {
-                                engine.search_has_focus = true;
-                                engine
-                                    .search_panel_form_focus
-                                    .replace(Some("search:query".to_string()));
-                                engine
-                                    .search_sidebar_system
-                                    .borrow_mut()
-                                    .set_active_section(Some(0));
+                                engine.search_set_focus(true);
                             }
                             if panel == TuiPanel::Git {
                                 engine.sc_set_focus(true);

@@ -2353,14 +2353,7 @@ pub(super) fn handle_mouse(
                 sidebar.visible = true;
                 if panel == TuiPanel::Search {
                     sidebar.has_focus = true;
-                    engine.search_has_focus = true;
-                    engine
-                        .search_panel_form_focus
-                        .replace(Some("search:query".to_string()));
-                    engine
-                        .search_sidebar_system
-                        .borrow_mut()
-                        .set_active_section(Some(0));
+                    engine.search_set_focus(true);
                 }
                 if panel == TuiPanel::Git {
                     engine.sc_refresh();
@@ -2567,7 +2560,9 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
             sidebar.has_focus = true;
-            engine.search_has_focus = true;
+            if !engine.search_has_focus {
+                engine.search_set_focus(true);
+            }
             let click_x = col as f32;
             let click_y = row as f32 + 0.5;
             let event = quadraui::UiEvent::MouseDown {

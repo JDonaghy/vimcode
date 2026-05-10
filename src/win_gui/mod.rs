@@ -3535,16 +3535,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                             state.engine.ai_input_active = true;
                         }
                         SidebarPanel::Search => {
-                            state.engine.search_has_focus = true;
-                            state
-                                .engine
-                                .search_panel_form_focus
-                                .replace(Some("search:query".to_string()));
-                            state
-                                .engine
-                                .search_sidebar_system
-                                .borrow_mut()
-                                .set_active_section(Some(0));
+                            state.engine.search_set_focus(true);
                         }
                         SidebarPanel::Debug => state.engine.dap_sidebar_has_focus = true,
                         _ => {}
@@ -3748,7 +3739,7 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                     state.engine.ai_input_active = true;
                 }
             } else if state.sidebar.active_panel == SidebarPanel::Search {
-                state.engine.search_has_focus = true;
+                state.engine.search_set_focus(true);
             } else if state.sidebar.active_panel == SidebarPanel::Debug {
                 state.engine.dap_sidebar_has_focus = true;
             }
