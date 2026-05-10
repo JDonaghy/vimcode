@@ -8,6 +8,11 @@ pub enum SearchInputAction {
     Ignored,
 }
 
+pub enum SearchKeyResult {
+    Consumed,
+    Unfocused,
+}
+
 /// Find word boundaries around char position `pos` in `text`.
 /// Returns `(start, end)` where `start..end` is the word range.
 /// A "word" character is alphanumeric or underscore.
@@ -459,7 +464,6 @@ impl Engine {
         let query = self.project_search_query.clone();
         if query.is_empty() {
             self.project_search_results.clear();
-            self.project_search_selected = 0;
             self.message = "Search query is empty".to_string();
             return;
         }
@@ -468,7 +472,6 @@ impl Engine {
             Ok(results) => self.apply_search_results(results, &query),
             Err(e) => {
                 self.project_search_results.clear();
-                self.project_search_selected = 0;
                 self.message = format!("Invalid regex: {}", e.0);
             }
         }
@@ -481,7 +484,6 @@ impl Engine {
         let query = self.project_search_query.clone();
         if query.is_empty() {
             self.project_search_results.clear();
-            self.project_search_selected = 0;
             self.message = "Search query is empty".to_string();
             return;
         }
@@ -519,7 +521,6 @@ impl Engine {
             Ok(results) => self.apply_search_results(results, &query),
             Err(e) => {
                 self.project_search_results.clear();
-                self.project_search_selected = 0;
                 self.message = format!("Invalid regex: {}", e.0);
             }
         }
@@ -550,37 +551,36 @@ impl Engine {
         };
         self.message = status.clone();
         self.project_search_status = status;
-        self.search_file_expanded = vec![true; file_count];
         self.project_search_results = results;
-        self.project_search_selected = 0;
+        self.search_collapsed_files.borrow_mut().clear();
+        self.search_sidebar_system
+            .borrow_mut()
+            .set_selected_path(1, None);
     }
 
-    /// Toggle case-sensitive project search.
+    /// Toggle case-sensitive project search and re-run if a query exists.
     pub fn toggle_project_search_case(&mut self) {
         self.project_search_options.case_sensitive = !self.project_search_options.case_sensitive;
+        self.rerun_project_search_if_active();
     }
 
-    /// Toggle whole-word project search.
+    /// Toggle whole-word project search and re-run if a query exists.
     pub fn toggle_project_search_whole_word(&mut self) {
         self.project_search_options.whole_word = !self.project_search_options.whole_word;
+        self.rerun_project_search_if_active();
     }
 
-    /// Toggle regex project search.
+    /// Toggle regex project search and re-run if a query exists.
     pub fn toggle_project_search_regex(&mut self) {
         self.project_search_options.use_regex = !self.project_search_options.use_regex;
+        self.rerun_project_search_if_active();
     }
 
-    /// Move the project search selection down by one, clamped to the last result.
-    pub fn project_search_select_next(&mut self) {
-        if !self.project_search_results.is_empty() {
-            self.project_search_selected =
-                (self.project_search_selected + 1).min(self.project_search_results.len() - 1);
+    fn rerun_project_search_if_active(&mut self) {
+        if !self.project_search_query.is_empty() && !self.project_search_results.is_empty() {
+            let root = self.cwd.clone();
+            self.start_project_search(root);
         }
-    }
-
-    /// Move the project search selection up by one, clamped to 0.
-    pub fn project_search_select_prev(&mut self) {
-        self.project_search_selected = self.project_search_selected.saturating_sub(1);
     }
 
     pub fn handle_search_input_key(
@@ -745,7 +745,16 @@ impl Engine {
                 }
                 let query = self.project_search_query.clone();
                 let replace = self.project_replace_text.clone();
-                let file_count = self.search_file_expanded.len();
+                let file_count = {
+                    let mut files: Vec<&std::path::Path> = self
+                        .project_search_results
+                        .iter()
+                        .map(|m| m.file.as_path())
+                        .collect();
+                    files.sort();
+                    files.dedup();
+                    files.len()
+                };
                 let match_count = self.project_search_results.len();
                 let replace_display = if replace.is_empty() {
                     "(empty string)".to_string()
@@ -779,8 +788,9 @@ impl Engine {
                 );
             }
             "search:replace_next" => {
-                let idx = self.project_search_selected;
-                self.open_search_result(idx);
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                }
             }
             "search:buttons" => {
                 let root = self.cwd.clone();
@@ -796,24 +806,6 @@ impl Engine {
                     .replace(Some("search:replace".to_string()));
             }
             _ => {}
-        }
-    }
-
-    /// Handle a click on a search-panel tree row.
-    /// `path[0]` = file group index, `path[1]` = match within that file.
-    pub fn handle_search_tree_hit(&mut self, path: &[u16]) {
-        if path.len() == 1 {
-            let fi = path[0] as usize;
-            if fi < self.search_file_expanded.len() {
-                self.search_file_expanded[fi] = !self.search_file_expanded[fi];
-            }
-        } else if path.len() >= 2 {
-            let fi = path[0] as usize;
-            let mi = path[1] as usize;
-            if let Some(result_idx) = self.tree_path_to_result_idx(fi, mi) {
-                self.project_search_selected = result_idx;
-                self.open_search_result(result_idx);
-            }
         }
     }
 
@@ -848,6 +840,201 @@ impl Engine {
             let wid = self.active_window_id();
             self.set_cursor_for_window(wid, line, 0);
             self.ensure_cursor_visible();
+        }
+    }
+
+    // =======================================================================
+    // SidebarSystem unified dispatch
+    // =======================================================================
+
+    pub fn dispatch_search_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        alt: bool,
+        unicode: Option<char>,
+    ) -> SearchKeyResult {
+        // Alt shortcuts work in both form and results mode.
+        if alt {
+            match key {
+                "c" => {
+                    self.toggle_project_search_case();
+                    return SearchKeyResult::Consumed;
+                }
+                "w" => {
+                    self.toggle_project_search_whole_word();
+                    return SearchKeyResult::Consumed;
+                }
+                "r" => {
+                    self.toggle_project_search_regex();
+                    return SearchKeyResult::Consumed;
+                }
+                "h" => {
+                    let root = self.cwd.clone();
+                    self.start_project_replace(root);
+                    return SearchKeyResult::Consumed;
+                }
+                _ => {}
+            }
+        }
+
+        if ctrl && key == "b" {
+            self.search_has_focus = false;
+            return SearchKeyResult::Unfocused;
+        }
+
+        let active = self.search_sidebar_system.borrow().active_section();
+        let form_active = active == Some(0);
+
+        if form_active {
+            let action = self.handle_search_input_key(key, unicode);
+            if let SearchInputAction::Unfocused = action {
+                self.search_panel_form_focus.replace(None);
+                self.search_sidebar_system
+                    .borrow_mut()
+                    .set_active_section(Some(1));
+            }
+            return SearchKeyResult::Consumed;
+        }
+
+        // Results section active — navigation + domain keys.
+        use quadraui::{Key, NamedKey};
+        let nav_key = match key {
+            "j" | "Down" => Some(Key::Named(NamedKey::Down)),
+            "k" | "Up" => Some(Key::Named(NamedKey::Up)),
+            "Home" => Some(Key::Named(NamedKey::Home)),
+            "End" => Some(Key::Named(NamedKey::End)),
+            "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+            "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+            _ => None,
+        };
+        if let Some(k) = nav_key {
+            self.search_sidebar_navigate(k);
+            return SearchKeyResult::Consumed;
+        }
+
+        match key {
+            "Return" | "Enter" => {
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                    self.search_has_focus = false;
+                    return SearchKeyResult::Unfocused;
+                }
+                SearchKeyResult::Consumed
+            }
+            "Tab" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:query".to_string()));
+                self.search_sidebar_system
+                    .borrow_mut()
+                    .set_active_section(Some(0));
+                SearchKeyResult::Consumed
+            }
+            "Escape" | "q" => {
+                self.search_has_focus = false;
+                SearchKeyResult::Unfocused
+            }
+            "h" | "Left" => {
+                self.search_has_focus = false;
+                SearchKeyResult::Unfocused
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    if !ctrl {
+                        self.search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        self.search_input_insert_char(false, ch);
+                        self.search_sidebar_system
+                            .borrow_mut()
+                            .set_active_section(Some(0));
+                        return SearchKeyResult::Consumed;
+                    }
+                }
+                SearchKeyResult::Consumed
+            }
+        }
+    }
+
+    fn search_sidebar_navigate(&mut self, key: quadraui::Key) {
+        let rect = self.search_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self
+            .search_sidebar_system
+            .borrow_mut()
+            .handle_cached(&ev, rect);
+        self.dispatch_search_sidebar_event(sidebar_event);
+    }
+
+    pub fn dispatch_search_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { .. } => {
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                    self.search_has_focus = false;
+                }
+                true
+            }
+            quadraui::SidebarEvent::FormEvent { event, .. } => {
+                use quadraui::FormEvent;
+                match event {
+                    FormEvent::ButtonClicked { id } => {
+                        self.handle_search_form_hit(id.as_str());
+                    }
+                    FormEvent::FocusChanged { id } => {
+                        let id_str = id.as_str();
+                        if id_str == "search:query" || id_str == "search:replace" {
+                            self.search_panel_form_focus
+                                .replace(Some(id_str.to_string()));
+                            self.search_sidebar_system
+                                .borrow_mut()
+                                .set_active_section(Some(0));
+                        }
+                    }
+                    FormEvent::ToggleChanged { id, .. } => {
+                        self.handle_search_form_hit(id.as_str());
+                    }
+                    _ => {}
+                }
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { section, path } => {
+                self.search_panel_form_focus.replace(None);
+                if section == 1 && path.len() == 1 {
+                    let fi = path[0] as usize;
+                    let mut collapsed = self.search_collapsed_files.borrow_mut();
+                    if collapsed.contains(&fi) {
+                        collapsed.remove(&fi);
+                    } else {
+                        collapsed.insert(fi);
+                    }
+                }
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    pub fn handle_search_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        let rect = self.search_sidebar_body_rect.get();
+        let sidebar_event = self
+            .search_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_search_sidebar_event(sidebar_event)
+    }
+
+    pub fn search_selected_result_idx(&self) -> Option<usize> {
+        let sidebar = self.search_sidebar_system.borrow();
+        let path = sidebar.selected_path(1)?;
+        if path.len() >= 2 {
+            self.tree_path_to_result_idx(path[0] as usize, path[1] as usize)
+        } else {
+            None
         }
     }
 
@@ -988,7 +1175,9 @@ impl Engine {
 
         // Clear stale search results since files have changed.
         self.project_search_results.clear();
-        self.project_search_selected = 0;
+        self.search_sidebar_system
+            .borrow_mut()
+            .set_selected_path(1, None);
     }
 }
 

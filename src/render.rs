@@ -17,7 +17,6 @@ use crate::core::dap::DapVariable;
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
-use crate::core::project_search::ProjectMatch;
 use crate::core::settings::LineNumberMode;
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
@@ -3375,312 +3374,6 @@ pub fn build_command_center_view(
     }
 }
 
-/// Build the search panel as a two-section `MultiSectionView`:
-/// Section 0 = Form (query, replace, toggles, buttons, status)
-/// Section 1 = TreeView (file-grouped results)
-pub fn build_search_panel_msv(
-    engine: &Engine,
-    root: &std::path::Path,
-    results_scroll: usize,
-) -> quadraui::MultiSectionView {
-    use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
-    use quadraui::{
-        Badge, Decoration, Form, FormField, MsvAxis, MultiSectionView, ScrollMode, Section,
-        SectionBody, SectionHeader, SectionSize, SelectionMode, StyledSpan, StyledText, TreeRow,
-        TreeStyle, TreeView, WidgetId,
-    };
-
-    let opts = &engine.project_search_options;
-    let results = &engine.project_search_results;
-
-    // ── Section 0: Form (search chrome) ─────────────────────────────────
-    let form_focus = engine.search_panel_form_focus.borrow();
-    let query_focused = form_focus.as_deref() == Some("search:query");
-    let replace_focused = form_focus.as_deref() == Some("search:replace");
-
-    let form = Form {
-        id: WidgetId::new("search-form"),
-        fields: vec![
-            FormField {
-                id: WidgetId::new("search:query"),
-                label: StyledText::default(),
-                kind: FieldKind::TextInput {
-                    value: engine.project_search_query.clone(),
-                    placeholder: "Search…".to_string(),
-                    cursor: if query_focused {
-                        Some(engine.search_query_caret.get())
-                    } else {
-                        None
-                    },
-                    selection_anchor: None,
-                },
-                hint: StyledText::default(),
-                disabled: false,
-            },
-            FormField {
-                id: WidgetId::new("search:replace"),
-                label: StyledText::default(),
-                kind: FieldKind::TextInput {
-                    value: engine.project_replace_text.clone(),
-                    placeholder: "Replace…".to_string(),
-                    cursor: if replace_focused {
-                        Some(engine.replace_text_caret.get())
-                    } else {
-                        None
-                    },
-                    selection_anchor: None,
-                },
-                hint: StyledText::default(),
-                disabled: false,
-            },
-            FormField {
-                id: WidgetId::new("search:toggles"),
-                label: StyledText::default(),
-                kind: FieldKind::ToggleGroup {
-                    toggles: vec![
-                        ToggleGroupItem {
-                            id: WidgetId::new("search:case"),
-                            label: "Aa".to_string(),
-                            value: opts.case_sensitive,
-                        },
-                        ToggleGroupItem {
-                            id: WidgetId::new("search:word"),
-                            label: "Ab|".to_string(),
-                            value: opts.whole_word,
-                        },
-                        ToggleGroupItem {
-                            id: WidgetId::new("search:regex"),
-                            label: ".*".to_string(),
-                            value: opts.use_regex,
-                        },
-                    ],
-                },
-                hint: StyledText::default(),
-                disabled: false,
-            },
-            FormField {
-                id: WidgetId::new("search:buttons"),
-                label: StyledText::default(),
-                kind: FieldKind::ButtonRow {
-                    buttons: vec![
-                        ButtonRowItem {
-                            id: WidgetId::new("search:find_next"),
-                            label: "Find".to_string(),
-                            disabled: engine.project_search_query.is_empty(),
-                        },
-                        ButtonRowItem {
-                            id: WidgetId::new("search:replace_next"),
-                            label: "Repl".to_string(),
-                            disabled: results.is_empty(),
-                        },
-                        ButtonRowItem {
-                            id: WidgetId::new("search:replace_all"),
-                            label: "All".to_string(),
-                            disabled: results.is_empty(),
-                        },
-                    ],
-                },
-                hint: StyledText::default(),
-                disabled: false,
-            },
-            FormField {
-                id: WidgetId::new("search:status"),
-                label: StyledText::default(),
-                kind: FieldKind::ReadOnly {
-                    value: StyledText::plain(if results.is_empty() {
-                        if engine.project_search_query.is_empty() {
-                            "Type to search, Enter to run".to_string()
-                        } else if engine.project_search_status.is_empty() {
-                            String::new()
-                        } else {
-                            engine.project_search_status.clone()
-                        }
-                    } else {
-                        engine.project_search_status.clone()
-                    }),
-                },
-                hint: StyledText::default(),
-                disabled: false,
-            },
-        ],
-        focused_field: form_focus.as_deref().map(WidgetId::new),
-        scroll_offset: 0,
-        has_focus: query_focused || replace_focused,
-    };
-
-    // ── Section 1: TreeView (results grouped by file) ───────────────────
-    let mut tree_rows: Vec<TreeRow> = Vec::new();
-    let mut file_idx: usize = 0;
-    let mut last_file: Option<&std::path::Path> = None;
-    let mut match_within_file: usize = 0;
-
-    for (result_idx, m) in results.iter().enumerate() {
-        if last_file != Some(m.file.as_path()) {
-            if last_file.is_some() {
-                file_idx += 1;
-            }
-            last_file = Some(m.file.as_path());
-            match_within_file = 0;
-
-            let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
-            let expanded = engine
-                .search_file_expanded
-                .get(file_idx)
-                .copied()
-                .unwrap_or(true);
-            tree_rows.push(TreeRow {
-                path: vec![file_idx as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText {
-                    spans: vec![StyledSpan::plain(rel.display().to_string())],
-                },
-                badge: None,
-                is_expanded: Some(expanded),
-                decoration: Decoration::Header,
-                edit: None,
-            });
-        }
-
-        let expanded = engine
-            .search_file_expanded
-            .get(file_idx)
-            .copied()
-            .unwrap_or(true);
-        if expanded {
-            let line_prefix = format!("{:>4}: ", m.line + 1);
-            let is_selected = result_idx == engine.project_search_selected;
-            tree_rows.push(TreeRow {
-                path: vec![file_idx as u16, match_within_file as u16],
-                indent: 1,
-                icon: None,
-                text: StyledText {
-                    spans: vec![
-                        StyledSpan {
-                            text: line_prefix,
-                            fg: Some(quadraui::Color::rgb(100, 100, 100)),
-                            bg: None,
-                            bold: false,
-                            italic: false,
-                            underline: false,
-                        },
-                        StyledSpan::plain(m.line_text.trim().to_string()),
-                    ],
-                },
-                badge: if is_selected {
-                    Some(Badge::plain("←".to_string()))
-                } else {
-                    None
-                },
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
-        }
-        match_within_file += 1;
-    }
-
-    let selected_path = if !results.is_empty() {
-        result_idx_to_tree_path(
-            results,
-            &engine.search_file_expanded,
-            engine.project_search_selected,
-        )
-    } else {
-        None
-    };
-
-    let tree = TreeView {
-        id: WidgetId::new("search-results"),
-        rows: tree_rows,
-        selection_mode: SelectionMode::Single,
-        selected_path,
-        scroll_offset: results_scroll,
-        style: TreeStyle::default(),
-        has_focus: !query_focused && !replace_focused,
-    };
-
-    MultiSectionView {
-        id: WidgetId::new("search-panel"),
-        sections: vec![
-            Section {
-                id: "chrome".into(),
-                header: SectionHeader {
-                    icon: None,
-                    title: StyledText {
-                        spans: vec![StyledSpan::plain("SEARCH".to_string())],
-                    },
-                    badge: None,
-                    actions: vec![],
-                    show_chevron: false,
-                },
-                body: SectionBody::Form(form),
-                aux: None,
-                size: SectionSize::Content,
-                collapsed: false,
-                min_size: None,
-                max_size: None,
-            },
-            Section {
-                id: "results".into(),
-                header: SectionHeader {
-                    icon: None,
-                    title: StyledText::default(),
-                    badge: None,
-                    actions: vec![],
-                    show_chevron: false,
-                },
-                body: SectionBody::Tree(tree),
-                aux: None,
-                size: SectionSize::EqualShare,
-                collapsed: false,
-                min_size: None,
-                max_size: None,
-            },
-        ],
-        active_section: if query_focused || replace_focused {
-            Some(0)
-        } else {
-            Some(1)
-        },
-        axis: MsvAxis::Vertical,
-        allow_resize: false,
-        allow_collapse: false,
-        scroll_mode: ScrollMode::PerSection,
-        has_focus: true,
-        panel_scroll: 0.0,
-    }
-}
-
-/// Map a flat `project_search_selected` index to a tree path `[file_idx, match_within_file]`.
-fn result_idx_to_tree_path(
-    results: &[ProjectMatch],
-    _file_expanded: &[bool],
-    selected: usize,
-) -> Option<Vec<u16>> {
-    if selected >= results.len() {
-        return None;
-    }
-    let mut file_idx: usize = 0;
-    let mut last_file: Option<&std::path::Path> = None;
-    let mut match_within_file: usize = 0;
-
-    for (i, m) in results.iter().enumerate() {
-        if last_file != Some(m.file.as_path()) {
-            if last_file.is_some() {
-                file_idx += 1;
-            }
-            last_file = Some(m.file.as_path());
-            match_within_file = 0;
-        }
-        if i == selected {
-            return Some(vec![file_idx as u16, match_within_file as u16]);
-        }
-        match_within_file += 1;
-    }
-    None
-}
-
 /// A modal dialog displayed over the editor.
 #[derive(Debug, Clone)]
 pub struct DialogPanel {
@@ -6720,6 +6413,211 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     sidebar.set_rows(1, unstaged_rows);
     sidebar.set_rows(2, worktree_rows);
     sidebar.set_rows(3, log_rows);
+}
+
+/// Populate the Search panel's `SidebarSystem` with current form + tree
+/// data. Section 0 is the Form (query/replace/toggles/buttons/status);
+/// Section 1 is the TreeView (results grouped by file). Call once per
+/// frame before `sidebar.render()`.
+pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
+    use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
+    use quadraui::{Badge, Decoration, Form, FormField, StyledSpan, StyledText, TreeRow, WidgetId};
+
+    let opts = &engine.project_search_options;
+    let results = &engine.project_search_results;
+
+    // ── Section 0: Form (search chrome) ─────────────────────────────────
+    let form_focus = engine.search_panel_form_focus.borrow();
+    let query_focused = form_focus.as_deref() == Some("search:query");
+    let replace_focused = form_focus.as_deref() == Some("search:replace");
+
+    let form = Form {
+        id: WidgetId::new("search-form"),
+        fields: vec![
+            FormField {
+                id: WidgetId::new("search:query"),
+                label: StyledText::default(),
+                kind: FieldKind::TextInput {
+                    value: engine.project_search_query.clone(),
+                    placeholder: "Search…".to_string(),
+                    cursor: if query_focused {
+                        Some(engine.search_query_caret.get())
+                    } else {
+                        None
+                    },
+                    selection_anchor: None,
+                },
+                hint: StyledText::default(),
+                disabled: false,
+            },
+            FormField {
+                id: WidgetId::new("search:replace"),
+                label: StyledText::default(),
+                kind: FieldKind::TextInput {
+                    value: engine.project_replace_text.clone(),
+                    placeholder: "Replace…".to_string(),
+                    cursor: if replace_focused {
+                        Some(engine.replace_text_caret.get())
+                    } else {
+                        None
+                    },
+                    selection_anchor: None,
+                },
+                hint: StyledText::default(),
+                disabled: false,
+            },
+            FormField {
+                id: WidgetId::new("search:toggles"),
+                label: StyledText::default(),
+                kind: FieldKind::ToggleGroup {
+                    toggles: vec![
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:case"),
+                            label: "Aa".to_string(),
+                            value: opts.case_sensitive,
+                        },
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:word"),
+                            label: "Ab|".to_string(),
+                            value: opts.whole_word,
+                        },
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:regex"),
+                            label: ".*".to_string(),
+                            value: opts.use_regex,
+                        },
+                    ],
+                },
+                hint: StyledText::default(),
+                disabled: false,
+            },
+            FormField {
+                id: WidgetId::new("search:buttons"),
+                label: StyledText::default(),
+                kind: FieldKind::ButtonRow {
+                    buttons: vec![
+                        ButtonRowItem {
+                            id: WidgetId::new("search:find_next"),
+                            label: "Find".to_string(),
+                            disabled: engine.project_search_query.is_empty(),
+                        },
+                        ButtonRowItem {
+                            id: WidgetId::new("search:replace_next"),
+                            label: "Repl".to_string(),
+                            disabled: results.is_empty(),
+                        },
+                        ButtonRowItem {
+                            id: WidgetId::new("search:replace_all"),
+                            label: "All".to_string(),
+                            disabled: results.is_empty(),
+                        },
+                    ],
+                },
+                hint: StyledText::default(),
+                disabled: false,
+            },
+            FormField {
+                id: WidgetId::new("search:status"),
+                label: StyledText::default(),
+                kind: FieldKind::ReadOnly {
+                    value: StyledText::plain(if results.is_empty() {
+                        if engine.project_search_query.is_empty() {
+                            "Type to search, Enter to run".to_string()
+                        } else if engine.project_search_status.is_empty() {
+                            String::new()
+                        } else {
+                            engine.project_search_status.clone()
+                        }
+                    } else {
+                        engine.project_search_status.clone()
+                    }),
+                },
+                hint: StyledText::default(),
+                disabled: false,
+            },
+        ],
+        focused_field: form_focus.as_deref().map(WidgetId::new),
+        scroll_offset: 0,
+        has_focus: query_focused || replace_focused,
+    };
+
+    // ── Section 1: TreeView (results grouped by file) ───────────────────
+    let collapsed = engine.search_collapsed_files.borrow();
+    let mut tree_rows: Vec<TreeRow> = Vec::new();
+    let mut file_idx: usize = 0;
+    let mut last_file: Option<&std::path::Path> = None;
+    let mut match_within_file: usize = 0;
+    let mut file_match_count: usize = 0;
+
+    for m in results.iter() {
+        if last_file != Some(m.file.as_path()) {
+            if let Some(prev_header) = tree_rows.iter_mut().rev().find(|r| r.path.len() == 1) {
+                prev_header.badge = Some(Badge::plain(format!("({})", file_match_count)));
+            }
+            if last_file.is_some() {
+                file_idx += 1;
+            }
+            last_file = Some(m.file.as_path());
+            match_within_file = 0;
+            file_match_count = 0;
+
+            let expanded = !collapsed.contains(&file_idx);
+            let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
+            tree_rows.push(TreeRow {
+                path: vec![file_idx as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText {
+                    spans: vec![StyledSpan::plain(rel.display().to_string())],
+                },
+                badge: None,
+                is_expanded: Some(expanded),
+                decoration: Decoration::Header,
+                edit: None,
+            });
+        }
+
+        let expanded = !collapsed.contains(&file_idx);
+        if expanded {
+            let line_prefix = format!("{:>4}: ", m.line + 1);
+            tree_rows.push(TreeRow {
+                path: vec![file_idx as u16, match_within_file as u16],
+                indent: 1,
+                icon: None,
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan {
+                            text: line_prefix,
+                            fg: Some(quadraui::Color::rgb(100, 100, 100)),
+                            bg: None,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                        },
+                        StyledSpan::plain(m.line_text.trim().to_string()),
+                    ],
+                },
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+        }
+        match_within_file += 1;
+        file_match_count += 1;
+    }
+    if let Some(prev_header) = tree_rows.iter_mut().rev().find(|r| r.path.len() == 1) {
+        prev_header.badge = Some(Badge::plain(format!("({})", file_match_count)));
+    }
+
+    let mut sidebar = engine.search_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.search_has_focus);
+    sidebar.set_form(0, form);
+    sidebar.set_rows(1, tree_rows);
+
+    if engine.search_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
 }
 
 /// Populate the `TreeController` on `engine.explorer_tree` with current

@@ -2187,119 +2187,33 @@ fn on_key_down(wparam: WPARAM, _lparam: LPARAM) -> bool {
             && state.sidebar.visible
             && state.sidebar.active_panel == SidebarPanel::Search
         {
-            // Alt toggles for search options
-            if alt {
-                match key.key_name.as_str() {
-                    "c" | "C" => {
-                        state.engine.project_search_options.case_sensitive =
-                            !state.engine.project_search_options.case_sensitive;
-                    }
-                    "w" | "W" => {
-                        state.engine.project_search_options.whole_word =
-                            !state.engine.project_search_options.whole_word;
-                    }
-                    "r" | "R" => {
-                        state.engine.project_search_options.use_regex =
-                            !state.engine.project_search_options.use_regex;
-                    }
-                    "h" | "H" => {
-                        // Toggle replace input visibility
-                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
-                    }
-                    _ => {}
-                }
-                unsafe {
-                    let _ = InvalidateRect(Some(state.hwnd), None, false);
-                }
-                return false;
-            }
             // Ctrl+V paste into search/replace input
-            if ctrl && key.key_name == "v" && state.sidebar.search_input_mode {
+            if ctrl && key.key_name == "v" {
                 let text = match state.engine.clipboard_read {
                     Some(ref cb) => cb().ok(),
                     None => None,
                 };
                 if let Some(t) = text {
-                    let line = t.lines().next().unwrap_or("");
-                    for c in line.chars() {
-                        if !c.is_control() {
-                            if state.sidebar.replace_input_focused {
-                                state.engine.project_replace_text.push(c);
-                            } else {
-                                state.engine.project_search_query.push(c);
-                            }
-                        }
-                    }
+                    let is_replace = state.engine.search_panel_form_focus.borrow().as_deref()
+                        == Some("search:replace");
+                    state.engine.search_input_paste(is_replace, &t);
                 }
                 unsafe {
                     let _ = InvalidateRect(Some(state.hwnd), None, false);
                 }
                 return false;
             }
-            if state.sidebar.search_input_mode {
-                // Input mode: typing into search or replace box
-                match key.key_name.as_str() {
-                    "Tab" => {
-                        state.sidebar.replace_input_focused = !state.sidebar.replace_input_focused;
-                    }
-                    "Return" => {
-                        if state.sidebar.replace_input_focused {
-                            let root = state.engine.workspace_root.clone().unwrap_or_default();
-                            state.engine.start_project_replace(root);
-                        } else {
-                            let root = state.engine.workspace_root.clone().unwrap_or_default();
-                            state.engine.start_project_search(root);
-                            state.sidebar.search_scroll_top = 0;
-                        }
-                    }
-                    "BackSpace" => {
-                        if state.sidebar.replace_input_focused {
-                            state.engine.project_replace_text.pop();
-                        } else {
-                            state.engine.project_search_query.pop();
-                        }
-                    }
-                    "Escape" => {
-                        state.sidebar.has_focus = false;
-                        state.engine.search_has_focus = false;
-                    }
-                    "Down"
-                        // Switch to results mode
-                        if !state.engine.project_search_results.is_empty() => {
-                            state.sidebar.search_input_mode = false;
-                        }
-                    _ => {}
-                }
-            } else {
-                // Results navigation mode
-                match key.key_name.as_str() {
-                    "j" | "Down" => {
-                        state.engine.project_search_select_next();
-                    }
-                    "k" | "Up" => {
-                        state.engine.project_search_select_prev();
-                    }
-                    "Return" => {
-                        let idx = state.engine.project_search_selected;
-                        let result = state
-                            .engine
-                            .project_search_results
-                            .get(idx)
-                            .map(|m| (m.file.clone(), m.line));
-                        if let Some((file, line)) = result {
-                            state.engine.open_file_in_tab(&file);
-                            let win_id = state.engine.active_window_id();
-                            state.engine.set_cursor_for_window(win_id, line, 0);
-                            state.engine.ensure_cursor_visible();
-                            state.sidebar.has_focus = false;
-                            state.engine.search_has_focus = false;
-                        }
-                    }
-                    "Escape" => {
-                        state.sidebar.has_focus = false;
-                        state.engine.search_has_focus = false;
-                    }
-                    _ => {}
+            {
+                use crate::core::engine::SearchKeyResult;
+                let alt = key.alt;
+                let result = state.engine.dispatch_search_sidebar_key_unified(
+                    &key.key_name,
+                    ctrl,
+                    alt,
+                    key.unicode,
+                );
+                if matches!(result, SearchKeyResult::Unfocused) {
+                    state.sidebar.has_focus = false;
                 }
             }
             unsafe {
@@ -2873,35 +2787,14 @@ fn on_char(wparam: WPARAM) {
             && state.sidebar.visible
             && state.sidebar.active_panel == SidebarPanel::Search
         {
-            if state.sidebar.search_input_mode {
-                // Printable chars go into search/replace query
-                if !ch.is_control() {
-                    if state.sidebar.replace_input_focused {
-                        state.engine.project_replace_text.push(ch);
-                    } else {
-                        state.engine.project_search_query.push(ch);
-                    }
-                }
-            } else {
-                // Results navigation mode — handle nav keys, rest switches to input
-                match ch {
-                    'j' => {
-                        state.engine.project_search_select_next();
-                    }
-                    'k' => {
-                        state.engine.project_search_select_prev();
-                    }
-                    'q' => {
-                        state.sidebar.has_focus = false;
-                        state.engine.search_has_focus = false;
-                    }
-                    c if !c.is_control() => {
-                        // Any other printable char switches to input mode
-                        state.sidebar.search_input_mode = true;
-                        state.sidebar.replace_input_focused = false;
-                        state.engine.project_search_query.push(c);
-                    }
-                    _ => {}
+            if !ch.is_control() {
+                use crate::core::engine::SearchKeyResult;
+                let result =
+                    state
+                        .engine
+                        .dispatch_search_sidebar_key_unified("", false, false, Some(ch));
+                if matches!(result, SearchKeyResult::Unfocused) {
+                    state.sidebar.has_focus = false;
                 }
             }
             unsafe {
@@ -3643,7 +3536,15 @@ fn on_mouse_down(hwnd: HWND, lparam: LPARAM) {
                         }
                         SidebarPanel::Search => {
                             state.engine.search_has_focus = true;
-                            state.sidebar.search_input_mode = true;
+                            state
+                                .engine
+                                .search_panel_form_focus
+                                .replace(Some("search:query".to_string()));
+                            state
+                                .engine
+                                .search_sidebar_system
+                                .borrow_mut()
+                                .set_active_section(Some(0));
                         }
                         SidebarPanel::Debug => state.engine.dap_sidebar_has_focus = true,
                         _ => {}

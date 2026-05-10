@@ -31,5 +31,4 @@ pub use engine::Engine;
 pub use engine::OpenMode;
 pub use git::GitLineStatus;
 pub use mode::Mode;
-pub use project_search::ProjectMatch;
 pub use window::{WindowId, WindowRect};

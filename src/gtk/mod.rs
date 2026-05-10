@@ -615,7 +615,8 @@ fn map_gtk_key_name(gdk_name: &str) -> &str {
         "Escape" => "Escape",
         "BackSpace" => "BackSpace",
         "Delete" => "Delete",
-        "Tab" | "ISO_Left_Tab" => "Tab",
+        "Tab" => "Tab",
+        "ISO_Left_Tab" => "BackTab",
         "Up" => "Up",
         "Down" => "Down",
         "Left" => "Left",
@@ -718,6 +719,7 @@ enum Msg {
         key_name: String,
         unicode: Option<char>,
         ctrl: bool,
+        alt: bool,
     },
     /// Notify that a resize happened (triggers redraw).
     Resize,
@@ -962,6 +964,7 @@ enum Msg {
     ScKey(String, bool),
     /// UiEvent (scroll, mouse) in the SC sidebar DrawingArea.
     ScSidebarEvent(quadraui::UiEvent),
+    SearchSidebarEvent(quadraui::UiEvent),
     /// Key press in the Extensions sidebar DrawingArea (key_name, unicode).
     ExtSidebarKey(String, Option<char>),
     ExtSidebarEvent(quadraui::UiEvent),
@@ -1515,6 +1518,7 @@ impl SimpleComponent for App {
                                                 key_name: "PasteClipboard".to_string(),
                                                 unicode: None,
                                                 ctrl: false,
+                                                alt: false,
                                             });
                                         }
                                         return gtk4::glib::Propagation::Stop;
@@ -1702,6 +1706,7 @@ impl SimpleComponent for App {
                                                 key_name: "Shift_bracketleft".to_string(),
                                                 unicode: None,
                                                 ctrl: true,
+                                                alt: false,
                                             });
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1710,6 +1715,7 @@ impl SimpleComponent for App {
                                                 key_name: "Shift_bracketright".to_string(),
                                                 unicode: None,
                                                 ctrl: true,
+                                                alt: false,
                                             });
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1719,6 +1725,7 @@ impl SimpleComponent for App {
                                                 key_name: "bracketright".to_string(),
                                                 unicode: None,
                                                 ctrl: true,
+                                                alt: false,
                                             });
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1727,6 +1734,7 @@ impl SimpleComponent for App {
                                                 key_name: "bracketleft".to_string(),
                                                 unicode: None,
                                                 ctrl: true,
+                                                alt: false,
                                             });
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1757,6 +1765,7 @@ impl SimpleComponent for App {
                                                 key_name: name.to_string(),
                                                 unicode: None,
                                                 ctrl: false,
+                                                alt: true,
                                             });
                                             return gtk4::glib::Propagation::Stop;
                                         }
@@ -1782,7 +1791,7 @@ impl SimpleComponent for App {
                                         key_name
                                     };
 
-                                    sender.input(Msg::KeyPress { key_name: effective_key, unicode, ctrl });
+                                    sender.input(Msg::KeyPress { key_name: effective_key, unicode, ctrl, alt });
                                     gtk4::glib::Propagation::Stop
                                 }
                             },
@@ -2329,16 +2338,15 @@ impl SimpleComponent for App {
                     let engine = engine.borrow();
                     let theme = Theme::from_name(&engine.settings.colorscheme);
                     let q_theme = crate::gtk::quadraui_gtk::q_theme(&theme);
-                    let root = engine.cwd.clone();
-                    let view = render::build_search_panel_msv(&engine, &root, 0);
+                    render::populate_search_sidebar_system(&engine, &engine.cwd);
                     let w = da.width() as f64;
                     let h = da.height() as f64;
+                    let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
+                    engine.search_sidebar_body_rect.set(area);
                     let pango_ctx = pangocairo::create_context(cr);
                     let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
                     let pango_layout = pango::Layout::new(&pango_ctx);
                     pango_layout.set_font_description(Some(&font_desc));
-                    let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
-                    use quadraui::Backend;
                     pango_layout.set_text("Xy");
                     let line_height = pango_layout.pixel_size().1 as f64;
                     pango_layout.set_text("M");
@@ -2349,34 +2357,15 @@ impl SimpleComponent for App {
                             b.set_current_theme(q_theme);
                             b.set_current_line_height(line_height);
                             b.set_current_char_width(char_width);
-                            b.draw_multi_section_view(area, &view);
+                            engine.search_sidebar_system.borrow().render(b, area);
                         });
-                    let layout = backend_d.borrow().msv_layout(area, &view);
-                    engine.search_panel_msv_layout.replace(Some(layout));
                 });
         }
         {
-            let sender_click = sender.input_sender().clone();
-            let da_for_click = widgets.search_sidebar_da.clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, y| {
-                da_for_click.grab_focus();
-                sender_click.send(Msg::SearchPanelClick(x, y)).ok();
+            let sender_ev = sender.input_sender().clone();
+            quadraui::gtk::wire_da_events(&widgets.search_sidebar_da, move |ev| {
+                sender_ev.send(Msg::SearchSidebarEvent(ev)).ok();
             });
-            widgets.search_sidebar_da.add_controller(gesture);
-        }
-        {
-            let sender_key = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                sender_key.send(Msg::SearchPanelKey(key_name, unicode)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.search_sidebar_da.set_focusable(true);
-            widgets.search_sidebar_da.add_controller(key_ctrl);
         }
 
         // ── Settings sidebar (Phase A.3c-2: native widgets → DrawingArea) ──────
@@ -4204,8 +4193,9 @@ impl SimpleComponent for App {
                 key_name,
                 unicode,
                 ctrl,
+                alt,
             } => {
-                self.handle_key_press(key_name, unicode, ctrl, &sender);
+                self.handle_key_press(key_name, unicode, ctrl, alt, &sender);
             }
             Msg::ClearYankHighlight => {
                 self.engine.borrow_mut().clear_yank_highlight();
@@ -4601,6 +4591,11 @@ impl SimpleComponent for App {
                         .sc_sidebar_system
                         .borrow_mut()
                         .set_backend_info(lh, metrics);
+                    self.engine
+                        .borrow()
+                        .search_sidebar_system
+                        .borrow_mut()
+                        .set_backend_info(lh, metrics);
                 }
                 // Keep shared cells in sync so the resize callback can use accurate values.
                 self.line_height_cell.set(line_height);
@@ -4744,69 +4739,11 @@ impl SimpleComponent for App {
                 }
                 self.draw_needed.set(true);
             }
-            Msg::SearchPanelClick(x, y) => {
-                let hx = x as f32;
-                let hy = y as f32;
-                let cached = self
-                    .engine
-                    .borrow()
-                    .search_panel_msv_layout
-                    .borrow()
-                    .clone();
-                if let Some(ref layout) = cached {
-                    let root = self.engine.borrow().cwd.clone();
-                    let view = render::build_search_panel_msv(&self.engine.borrow(), &root, 0);
-                    use quadraui::Backend;
-                    let backend = self.backend.borrow();
-                    match layout.hit_test(hx, hy) {
-                        quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
-                            if let Some(sl) = layout.sections.first() {
-                                if let quadraui::SectionBody::Form(ref form) = view.sections[0].body
-                                {
-                                    let form_layout = backend.form_layout(sl.body_bounds, form);
-                                    let local_x = hx - sl.body_bounds.x;
-                                    let local_y = hy - sl.body_bounds.y;
-                                    if let quadraui::FormHit::Field(id) =
-                                        form_layout.hit_test(local_x, local_y)
-                                    {
-                                        drop(backend);
-                                        self.engine
-                                            .borrow_mut()
-                                            .handle_search_form_hit(id.as_str());
-                                    }
-                                }
-                            }
-                        }
-                        quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
-                            if let Some(sl) = layout.sections.get(1) {
-                                if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body
-                                {
-                                    let tree_layout = backend.tree_layout(sl.body_bounds, tree);
-                                    let local_x = hx - sl.body_bounds.x;
-                                    let local_y = hy - sl.body_bounds.y;
-                                    if let quadraui::TreeViewHit::Row(row_idx) =
-                                        tree_layout.hit_test(local_x, local_y)
-                                    {
-                                        let path = tree.rows[row_idx].path.clone();
-                                        drop(backend);
-                                        self.engine.borrow_mut().handle_search_tree_hit(&path);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                self.draw_needed.set(true);
-                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
+            Msg::SearchPanelClick(_, _) | Msg::SearchPanelKey(_, _) => {
+                // Superseded by SearchSidebarEvent via wire_da_events
             }
-            Msg::SearchPanelKey(key_name, unicode) => {
-                let mapped = map_gtk_key_name(key_name.as_str());
-                self.engine
-                    .borrow_mut()
-                    .handle_search_input_key(mapped, unicode);
+            Msg::SearchSidebarEvent(ev) => {
+                self.engine.borrow_mut().handle_search_sidebar_ui_event(ev);
                 self.draw_needed.set(true);
                 if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                     da.queue_draw();
@@ -5392,6 +5329,7 @@ impl App {
         key_name: String,
         unicode: Option<char>,
         ctrl: bool,
+        alt: bool,
         sender: &ComponentSender<Self>,
     ) {
         // Handle Ctrl-Shift-V paste (sent as synthetic "PasteClipboard" key):
@@ -5578,6 +5516,40 @@ impl App {
                 drop(engine);
                 self.focus_editor_if_needed(still_focused && !has_dialog);
                 if let Some(ref da) = *self.settings_da_ref.borrow() {
+                    da.queue_draw();
+                }
+                self.draw_needed.set(true);
+                return;
+            }
+            if engine.search_has_focus {
+                let mapped = map_gtk_key_name(key_name.as_str());
+                if engine.dialog.is_some() {
+                    engine.handle_key(mapped, unicode, ctrl);
+                } else if ctrl && mapped == "v" {
+                    drop(engine);
+                    if let Some(display) = gdk::Display::default() {
+                        let sender = sender.clone();
+                        display.clipboard().read_text_async(
+                            gtk4::gio::Cancellable::NONE,
+                            move |result| {
+                                let text = result
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                sender.input(Msg::ClipboardPasteToInput { text });
+                            },
+                        );
+                    }
+                    self.draw_needed.set(true);
+                    return;
+                } else {
+                    engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
+                }
+                let still_focused = engine.search_has_focus;
+                drop(engine);
+                self.focus_editor_if_needed(still_focused);
+                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
                 self.draw_needed.set(true);
@@ -5909,6 +5881,16 @@ impl App {
             }
         }
         if self.engine.borrow_mut().poll_project_search() {
+            {
+                let engine = self.engine.borrow();
+                if engine.search_has_focus && !engine.project_search_results.is_empty() {
+                    engine.search_panel_form_focus.replace(None);
+                    engine
+                        .search_sidebar_system
+                        .borrow_mut()
+                        .set_active_section(Some(1));
+                }
+            }
             if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -9878,6 +9860,17 @@ impl App {
                     // Set engine focus flags when toggling back to visible
                     if self.sidebar_visible {
                         match panel {
+                            SidebarPanel::Search => {
+                                let mut engine = self.engine.borrow_mut();
+                                engine.search_has_focus = true;
+                                engine
+                                    .search_panel_form_focus
+                                    .replace(Some("search:query".to_string()));
+                                engine
+                                    .search_sidebar_system
+                                    .borrow_mut()
+                                    .set_active_section(Some(0));
+                            }
                             SidebarPanel::Git => {
                                 self.engine.borrow_mut().sc_set_focus(true);
                             }
@@ -9911,6 +9904,18 @@ impl App {
                     }
                     self.active_panel = panel;
                     self.sidebar_visible = true;
+                    // Focus when switching to Search panel
+                    if self.active_panel == SidebarPanel::Search {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.search_has_focus = true;
+                        engine
+                            .search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        engine
+                            .search_sidebar_system
+                            .borrow_mut()
+                            .set_active_section(Some(0));
+                    }
                     // Refresh SC data when switching to the Git panel
                     if self.active_panel == SidebarPanel::Git {
                         let mut engine = self.engine.borrow_mut();
@@ -10211,20 +10216,24 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
-                // Toggle between showing the search panel and returning to the editor.
-                // When "exiting" we keep the sidebar visible (don't touch sidebar_visible)
-                // to avoid a white-area artifact from the Revealer animation — Ctrl+B
-                // closes the sidebar entirely.
-                // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
-                    // Already showing search — return keyboard focus to editor, keep panel open.
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
                 } else {
-                    // Show search panel and return focus to editor (Entry widgets are mouse-driven).
                     self.active_panel = SidebarPanel::Search;
                     self.sidebar_visible = true;
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.search_has_focus = true;
+                        engine
+                            .search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        engine
+                            .search_sidebar_system
+                            .borrow_mut()
+                            .set_active_section(Some(0));
+                    }
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
@@ -10796,6 +10805,17 @@ impl App {
                 // GDK clipboard text arrived for Ctrl-Shift-V paste.
                 use core::Mode;
                 let mut engine = self.engine.borrow_mut();
+                if engine.search_has_focus {
+                    let is_replace = engine.search_panel_form_focus.borrow().as_deref()
+                        == Some("search:replace");
+                    engine.search_input_paste(is_replace, &text);
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    return;
+                }
                 match engine.mode {
                     Mode::Command | Mode::Search => {
                         engine.paste_text_to_input(&text);

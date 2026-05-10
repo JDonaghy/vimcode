@@ -7487,7 +7487,10 @@ fn test_run_project_search_finds_matches() {
         !engine.project_search_results.is_empty(),
         "should find 'hello'"
     );
-    assert_eq!(engine.project_search_selected, 0);
+    assert!(
+        engine.search_selected_result_idx().is_none(),
+        "selection should be empty after fresh search"
+    );
     assert!(engine.message.contains("match"));
 }
 
@@ -7502,16 +7505,69 @@ fn test_run_project_search_empty_query() {
 }
 
 #[test]
-fn test_project_search_select_next_prev() {
-    let dir = make_search_dir("engine_select");
+fn test_search_unified_dispatch_escape_unfocuses() {
     let mut engine = Engine::new();
-    engine.project_search_query = "l".to_string(); // matches both lines
-    engine.run_project_search(&dir);
-    assert!(engine.project_search_results.len() >= 2);
-    engine.project_search_select_next();
-    assert_eq!(engine.project_search_selected, 1);
-    engine.project_search_select_prev();
-    assert_eq!(engine.project_search_selected, 0);
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("Escape", false, false, None);
+    assert!(matches!(result, search::SearchKeyResult::Unfocused));
+    assert!(!engine.search_has_focus);
+}
+
+#[test]
+fn test_search_unified_dispatch_printable_reenters_form() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("", false, false, Some('x'));
+    assert!(matches!(result, search::SearchKeyResult::Consumed));
+    assert_eq!(
+        engine.search_panel_form_focus.borrow().as_deref(),
+        Some("search:query")
+    );
+    assert!(engine.project_search_query.contains('x'));
+}
+
+#[test]
+fn test_search_unified_dispatch_tab_switches_to_form() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("Tab", false, false, None);
+    assert!(matches!(result, search::SearchKeyResult::Consumed));
+    assert_eq!(
+        engine.search_panel_form_focus.borrow().as_deref(),
+        Some("search:query")
+    );
+    assert_eq!(
+        engine.search_sidebar_system.borrow().active_section(),
+        Some(0)
+    );
+}
+
+#[test]
+fn test_search_unified_dispatch_alt_toggles() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    assert!(!engine.project_search_options.case_sensitive);
+    engine.dispatch_search_sidebar_key_unified("c", false, true, None);
+    assert!(engine.project_search_options.case_sensitive);
+    engine.dispatch_search_sidebar_key_unified("w", false, true, None);
+    assert!(engine.project_search_options.whole_word);
+    engine.dispatch_search_sidebar_key_unified("r", false, true, None);
+    assert!(engine.project_search_options.use_regex);
 }
 
 #[test]

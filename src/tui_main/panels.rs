@@ -152,7 +152,7 @@ pub(super) fn render_sidebar(
 
     // Search panel
     if sidebar.active_panel == TuiPanel::Search {
-        render_search_panel(buf, area, sidebar, engine, theme);
+        render_search_panel(backend, frame, area, engine, theme);
         return;
     }
 
@@ -706,54 +706,11 @@ pub(super) fn render_settings_panel(
         });
 }
 
-/// Return the visual display row (0-based, including file-header rows) for a result index.
-pub(super) fn result_idx_to_display_row(
-    results: &[crate::core::ProjectMatch],
-    target_idx: usize,
-) -> usize {
-    let mut row = 0usize;
-    let mut last_file: Option<&std::path::Path> = None;
-    for (idx, m) in results.iter().enumerate() {
-        if last_file != Some(m.file.as_path()) {
-            last_file = Some(m.file.as_path());
-            row += 1; // file-header row
-        }
-        if idx == target_idx {
-            return row;
-        }
-        row += 1;
-    }
-    0
-}
-
-/// Adjust `search_scroll_top` so that `selected_idx` is within the viewport.
-/// Call this after changing the selection via keyboard — not during render.
-pub(super) fn ensure_search_selection_visible(
-    results: &[crate::core::ProjectMatch],
-    selected_idx: usize,
-    scroll_top: &mut usize,
-    results_height: usize,
-) {
-    if results.is_empty() || results_height == 0 {
-        return;
-    }
-    let display_row = result_idx_to_display_row(results, selected_idx);
-    if display_row < *scroll_top {
-        *scroll_top = display_row;
-    } else if display_row >= *scroll_top + results_height {
-        *scroll_top = display_row + 1 - results_height;
-    }
-}
-
-/// Map a visual row index (0-based from top of results area) to a `project_search_results` index.
-///
-/// The results area interleaves file-header rows (not selectable) with result rows.
-/// Returns `None` if the row falls on a file header.
-/// Render the project search panel via quadraui MSV + Form + TreeView.
+/// Render the project search panel via SidebarSystem (Form + TreeView).
 pub(super) fn render_search_panel(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
-    sidebar: &mut TuiSidebar,
     engine: &Engine,
     theme: &Theme,
 ) {
@@ -761,17 +718,6 @@ pub(super) fn render_search_panel(
         return;
     }
 
-    engine
-        .search_panel_form_focus
-        .replace(if sidebar.search_input_mode {
-            if sidebar.replace_input_focused {
-                Some("search:replace".to_string())
-            } else {
-                Some("search:query".to_string())
-            }
-        } else {
-            None
-        });
     let q_len = engine.project_search_query.len();
     if engine.search_query_caret.get() > q_len {
         engine.search_query_caret.set(q_len);
@@ -781,50 +727,19 @@ pub(super) fn render_search_panel(
         engine.replace_text_caret.set(r_len);
     }
 
-    let view = render::build_search_panel_msv(engine, &engine.cwd, sidebar.search_scroll_top);
-    let q_theme = super::quadraui_tui::q_theme(theme);
-    quadraui::tui::draw_multi_section_view(
-        buf,
-        area,
-        &view,
-        &q_theme,
-        crate::icons::nerd_fonts_enabled(),
-    );
-
-    let bounds = quadraui::Rect::new(
+    render::populate_search_sidebar_system(engine, &engine.cwd);
+    let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
     );
-    let metrics = quadraui::MsvLayoutMetrics {
-        header_size: 1.0,
-        divider_size: 0.0,
-        scrollbar_size: 1.0,
-        cell_quantum: 1.0,
-    };
-    let layout = view.layout(bounds, metrics, |i| {
-        let s = &view.sections[i];
-        let aux_size = if s.aux.is_some() { 1.0 } else { 0.0 };
-        let content_size = match &s.body {
-            quadraui::SectionBody::Tree(t) => t.rows.len() as f32,
-            quadraui::SectionBody::Form(f) => f.fields.len() as f32,
-            _ => 0.0,
-        };
-        quadraui::SectionMeasure {
-            content_size,
-            aux_size,
-        }
+    engine.search_sidebar_body_rect.set(q_rect);
+
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        engine.search_sidebar_system.borrow().render(b, q_rect);
     });
-    engine.search_panel_msv_layout.replace(Some(layout));
-    engine
-        .scroll_surfaces
-        .borrow_mut()
-        .push(quadraui::ScrollSurface {
-            id: quadraui::WidgetId::new("tui:search_results"),
-            bounds,
-            scrollbar: None,
-        });
 }
 
 // ─── Wildmenu (command Tab completion bar) ───────────────────────────────────
