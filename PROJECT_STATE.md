@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 8, 2026 (Session 359 — **Source Control panel → SidebarSystem** complete (#321/#339/#340). Three-issue migration mirroring the Extensions sidebar pattern. Unified `dispatch_sc_sidebar_key_unified()` eliminates all per-backend key mapping. `sc_set_focus()` + `sc_button_hit_test()` deduplicate focus sync and button click math. Section badges via quadraui#103 (`set_section_badge`/`set_section_visible`). Net ~340 lines removed across the migration.)
+**Last updated:** May 10, 2026 (Session 360 — **Search panel → SidebarSystem** (#323/#333/#334, PR #342). 2-section SidebarSystem (Form + Tree) via quadraui#105 `SectionKind::Form`. Unified `dispatch_search_sidebar_key_unified()` for all 3 backends. 6 quadraui issues filed and resolved (#105/#107/#109/#110/#112/#116). `search_set_focus()` + `search_switch_to_results()` deduplicate 6 activation sites. Net -120 lines.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -18,23 +18,21 @@
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
-| [#333](https://github.com/JDonaghy/vimcode/issues/333) | TUI: remove duplicate search panel focus state | Cleanup |
-| [#334](https://github.com/JDonaghy/vimcode/issues/334) | Unify search panel results-mode behavior | Polish |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (359):**
-- **#321 SC sidebar: engine + render layer** (Path A) — Added `sc_sidebar_system: Rc<RefCell<SidebarSystem>>` with 4 sections (Staged/Changes/Worktrees/Log), WholePanel scroll, Selection nav, collapsible. `populate_sc_sidebar_system(engine, theme)` builds TreeRows with git status colors + section badges. `dispatch_sc_sidebar_key_unified()` + `ScKeyResult` provides single entry point for both backends. `dispatch_sc_sidebar_event()` + `dispatch_sc_action_key()` + `sc_activate_row()` for domain actions. `handle_sc_sidebar_ui_event()` for mouse/scroll. 8 new tests.
-- **#339 SC sidebar: TUI → SidebarSystem** (Path A) — Replaced TreeView section rendering with `SidebarSystem.render()`, 80-line manual key mapping with `dispatch_sc_sidebar_key_unified()`, flat-index scroll/click with `handle_sc_sidebar_ui_event()`. Domain actions read selection from SidebarSystem. Fixed Shift+key with Kitty keyboard enhancement. Net -40 lines TUI.
-- **#340 SC sidebar: GTK → SidebarSystem + dedup** (PR #341) — GTK section rendering, key dispatch (both `Msg::KeyPress` and `Msg::ScKey`), and 60-line click accumulator walk all replaced with SidebarSystem. `wire_da_events` wired for scroll/scrollbar drag. GDK `question`/`slash` key name mapping fixed. `Engine::sc_set_focus(bool)` deduplicates 10+ manual dual-set sites. `Engine::sc_button_hit_test()` shares button layout math. `sc_open_selected_async` gated behind `#[cfg(feature = "win-gui")]`. `sc_stage_all` error now surfaced in status bar. Net -200 lines GTK.
-- **quadraui issues filed + resolved:** #103 (section visibility + header badges).
+**Shipped this session (360):**
+- **#323 Search panel → SidebarSystem** (PR #342) — 2-section SidebarSystem (Form + Tree) via quadraui#105 `SectionKind::Form`. `populate_search_sidebar_system()` builds Form (query/replace/toggles/buttons/status) + TreeRows (file-grouped results with collapse). Unified `dispatch_search_sidebar_key_unified()` for TUI/GTK/Win-GUI. `search_set_focus()` + `search_switch_to_results()` deduplicate 6 activation sites. Removed `project_search_selected`, `search_file_expanded`, `search_panel_msv_layout`, `build_search_panel_msv()`. Toggles auto-rerun search. GTK: `alt` on `Msg::KeyPress`, `search_has_focus` routing, `wire_da_events`, `ISO_Left_Tab` → `BackTab`. 4 new tests.
+- **#333 TUI duplicate search focus** — `search_input_mode`, `replace_input_focused`, `search_scroll_top` removed from TuiSidebar. Engine `search_panel_form_focus` is single source of truth.
+- **#334 Cross-backend search behavior** — Printable char in results mode re-enters form input on all backends.
+- **quadraui issues filed + resolved:** #105 (Form sections in SidebarSystem), #107 (Form click event semantics), #109 (GTK empty TextInput cursor), #110 (tree header click precision), #112 (ToggleGroup/ButtonRow per-item click), #116 (Form hit region drift).
 
 ---
 
-**Previous sessions (358 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (359 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1954 lib tests passing. All on develop — no active branches.
+Vimcode at 1957 lib tests passing. PR #342 open on `issue-323-search-sidebar-system`.
 
-> Sessions 359 and earlier in **SESSION_HISTORY.md**.
+> Sessions 360 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -109,7 +107,7 @@ cell coalescence) remain but are tracked separately.
 | Terminal toolbar (find bar + tab strip) | `StatusBar` / `TabBar` | ✅ | ✅ | #305, `08dd916`. Adapter `render::build_terminal_toolbar`. Click via `Engine::resolve_terminal_toolbar_click`. Tab strip uses `compact: true`. |
 | Menu bar labels | `MenuSystem` | ✅ | ✅ | #319. `quadraui::MenuSystem` owns all state + rendering. `MenuOverlay` helper for GTK overlay DA. |
 | Command center (nav arrows + search box) | `CommandCenter` | ✅ | ✅ | #310, `b5fdd7d`. Adapter `render::build_command_center_view`. Click via `CommandCenterLayout::hit_test`. |
-| Search panel (chrome + results) | `MSV` + `Form` + `TreeView` | ✅ | ✅ | #302, `de625bb`. Adapter `render::build_search_panel_msv`. Form: query/replace TextInput + ToggleGroup + ButtonRow. Tree: file-grouped results. Click via `backend.form_layout`/`backend.tree_layout`. Replace All has confirmation dialog. |
+| Search panel (chrome + results) | `SidebarSystem` (Form + Tree) | ✅ | ✅ | #323/#333/#334. `populate_search_sidebar_system` + `SidebarSystem.render()`. Unified dispatch via `dispatch_search_sidebar_key_unified`. Form: query/replace TextInput + ToggleGroup + ButtonRow. Tree: file-grouped results with collapse. |
 
 **Cross-backend logic-sharing** (where one implementation drives both backends):
 
@@ -120,7 +118,7 @@ cell coalescence) remain but are tracked separately.
 - All `*_to_form` / `*_to_tree_view` / `lsp_status_for_buffer` adapters in `render.rs` and `core/engine/`.
 - `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
 - `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
-- `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338) and source control panel (#321/#339/#340): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
+- `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338), source control panel (#321/#339/#340), and search panel (#323/#333/#334): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Search panel uses `SectionKind::Form` for the chrome section (quadraui#105). Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
 - `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
@@ -136,4 +134,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 351 and earlier in **SESSION_HISTORY.md**.
+> Sessions 360 and earlier in **SESSION_HISTORY.md**.
