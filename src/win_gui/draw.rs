@@ -3232,7 +3232,7 @@ impl<'a> DrawContext<'a> {
         let mut last_file: Option<&std::path::Path> = None;
         let mut row = 0;
         let mut skip = sidebar.search_scroll_top;
-        let selected = engine.project_search_selected;
+        let selected = engine.search_selected_result_idx().unwrap_or(usize::MAX);
 
         for (idx, m) in results.iter().enumerate() {
             if row >= max_rows {

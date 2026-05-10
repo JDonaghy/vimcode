@@ -204,8 +204,7 @@ fn dispatch_panel_accelerator(
                 sidebar.visible = true;
                 sidebar.active_panel = TuiPanel::Search;
                 sidebar.has_focus = true;
-                sidebar.search_input_mode = true;
-                sidebar.replace_input_focused = false;
+                engine.search_set_focus(true);
             }
             sync_sidebar_focus(sidebar, engine);
             *needs_redraw = true;
@@ -366,12 +365,6 @@ struct TuiSidebar {
     visible: bool,
     has_focus: bool,
     active_panel: TuiPanel,
-    /// True while typing in the search input box (Search panel only).
-    search_input_mode: bool,
-    /// When true and `search_input_mode` is true, the replace input is focused.
-    replace_input_focused: bool,
-    /// Scroll offset for the search results area (written back by render_search_panel).
-    search_scroll_top: usize,
     /// When true, the activity bar (toolbar) has keyboard focus.
     toolbar_focused: bool,
     /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
@@ -388,9 +381,6 @@ impl TuiSidebar {
             visible,
             has_focus: false,
             active_panel: TuiPanel::Explorer,
-            search_input_mode: true,
-            replace_input_focused: false,
-            search_scroll_top: 0,
             toolbar_focused: false,
             toolbar_selected: 1,
             pending_ctrl_w: false,
@@ -886,6 +876,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         },
     );
     engine.sc_sidebar_system.borrow_mut().set_backend_info(
+        1.0,
+        quadraui::MsvLayoutMetrics {
+            header_size: 1.0,
+            divider_size: 0.0,
+            scrollbar_size: 1.0,
+            cell_quantum: 1.0,
+        },
+    );
+    engine.search_sidebar_system.borrow_mut().set_backend_info(
         1.0,
         quadraui::MsvLayoutMetrics {
             header_size: 1.0,
@@ -1491,9 +1490,8 @@ fn event_loop(
                 break;
             }
             if engine.poll_project_search() && !engine.project_search_results.is_empty() {
-                sidebar.search_scroll_top = 0;
                 if sidebar.active_panel == TuiPanel::Search {
-                    sidebar.search_input_mode = false;
+                    engine.search_switch_to_results();
                 }
                 needs_redraw = true;
             }
@@ -2273,9 +2271,7 @@ fn event_loop(
                                 engine.explorer_has_focus = true;
                             }
                             if panel == TuiPanel::Search {
-                                engine.search_has_focus = true;
-                                sidebar.search_input_mode = true;
-                                sidebar.replace_input_focused = false;
+                                engine.search_set_focus(true);
                             }
                             if panel == TuiPanel::Git {
                                 engine.sc_set_focus(true);
@@ -2377,152 +2373,61 @@ fn event_loop(
 
                     // ── Search panel keyboard handling ──────────────────────
                     if sidebar.active_panel == TuiPanel::Search {
-                        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
-                        // Alt+C/W/R/H toggles work in both input and results mode
-                        if alt {
-                            match key_event.code {
-                                KeyCode::Char('c') => {
-                                    engine.toggle_project_search_case();
-                                    continue;
-                                }
-                                KeyCode::Char('w') => {
-                                    engine.toggle_project_search_whole_word();
-                                    continue;
-                                }
-                                KeyCode::Char('r') => {
-                                    engine.toggle_project_search_regex();
-                                    continue;
-                                }
-                                KeyCode::Char('h') => {
-                                    let root = engine.cwd.clone();
-                                    engine.start_project_replace(root);
-                                    continue;
-                                }
-                                _ => {}
+                        // Ctrl+V paste (backend-specific clipboard access)
+                        if ctrl && key_event.code == KeyCode::Char('v') {
+                            let is_replace = engine.search_panel_form_focus.borrow().as_deref()
+                                == Some("search:replace");
+                            if let Some(text) = Engine::clipboard_paste() {
+                                engine.search_input_paste(is_replace, &text);
                             }
+                            needs_redraw = true;
+                            continue;
                         }
-                        match key_event.code {
-                            KeyCode::Esc => {
-                                sidebar.has_focus = false;
-                            }
-                            KeyCode::Char('b') if ctrl => {
-                                sidebar.visible = false;
-                                sidebar.has_focus = false;
-                                engine.session.explorer_visible = false;
-                                let _ = engine.session.save();
-                            }
-                            // Input mode: typing into the search or replace box
-                            _ if sidebar.search_input_mode => {
-                                // Ctrl+V paste is backend-specific (clipboard access)
-                                if key_event.code == KeyCode::Char('v')
-                                    && key_event.modifiers.contains(KeyModifiers::CONTROL)
-                                {
-                                    let is_replace = sidebar.replace_input_focused;
-                                    if let Some(text) = Engine::clipboard_paste() {
-                                        engine.search_input_paste(is_replace, &text);
-                                    }
+                        let key_name = match key_event.code {
+                            KeyCode::Enter => "Return",
+                            KeyCode::Backspace => "BackSpace",
+                            KeyCode::Delete => "Delete",
+                            KeyCode::Left => "Left",
+                            KeyCode::Right => "Right",
+                            KeyCode::Home => "Home",
+                            KeyCode::End => "End",
+                            KeyCode::Up => "Up",
+                            KeyCode::Down => "Down",
+                            KeyCode::Tab => "Tab",
+                            KeyCode::BackTab => "BackTab",
+                            KeyCode::Esc => "Escape",
+                            KeyCode::PageUp => "Page_Up",
+                            KeyCode::PageDown => "Page_Down",
+                            KeyCode::Char(c) => {
+                                // Single-char keys: use the char as the key name
+                                // (handled below via unicode)
+                                if c == 'b' && ctrl {
+                                    "b"
                                 } else {
-                                    let key = match key_event.code {
-                                        KeyCode::Enter => "Return",
-                                        KeyCode::Backspace => "BackSpace",
-                                        KeyCode::Delete => "Delete",
-                                        KeyCode::Left => "Left",
-                                        KeyCode::Right => "Right",
-                                        KeyCode::Home => "Home",
-                                        KeyCode::End => "End",
-                                        KeyCode::Tab => "Tab",
-                                        KeyCode::BackTab => "BackTab",
-                                        KeyCode::Esc => "Escape",
-                                        _ => "",
-                                    };
-                                    let unicode = match key_event.code {
-                                        KeyCode::Char(c)
-                                            if !key_event
-                                                .modifiers
-                                                .contains(KeyModifiers::CONTROL) =>
-                                        {
-                                            Some(c)
-                                        }
-                                        _ => None,
-                                    };
-                                    use crate::core::engine::SearchInputAction;
-                                    let action = engine.handle_search_input_key(key, unicode);
-                                    match action {
-                                        SearchInputAction::StartSearch => {
-                                            sidebar.search_scroll_top = 0;
-                                        }
-                                        SearchInputAction::Unfocused => {
-                                            sidebar.search_input_mode = false;
-                                        }
-                                        _ => {}
-                                    }
-                                    // Sync TUI-local focus flags from engine state
-                                    let focus = engine.search_panel_form_focus.borrow().clone();
-                                    sidebar.replace_input_focused =
-                                        focus.as_deref() == Some("search:replace");
+                                    ""
                                 }
                             }
-                            // Results mode: navigating the results list
-                            _ => {
-                                match key_event.code {
-                                    KeyCode::Char('j') | KeyCode::Down => {
-                                        engine.project_search_select_next();
-                                        if let Ok(size) = terminal.size() {
-                                            let rh = size.height.saturating_sub(7) as usize;
-                                            ensure_search_selection_visible(
-                                                &engine.project_search_results,
-                                                engine.project_search_selected,
-                                                &mut sidebar.search_scroll_top,
-                                                rh,
-                                            );
-                                        }
-                                    }
-                                    KeyCode::Char('k') | KeyCode::Up => {
-                                        engine.project_search_select_prev();
-                                        if let Ok(size) = terminal.size() {
-                                            let rh = size.height.saturating_sub(7) as usize;
-                                            ensure_search_selection_visible(
-                                                &engine.project_search_results,
-                                                engine.project_search_selected,
-                                                &mut sidebar.search_scroll_top,
-                                                rh,
-                                            );
-                                        }
-                                    }
-                                    KeyCode::Enter => {
-                                        let idx = engine.project_search_selected;
-                                        let result = engine
-                                            .project_search_results
-                                            .get(idx)
-                                            .map(|m| (m.file.clone(), m.line));
-                                        if let Some((file, line)) = result {
-                                            engine.open_file_in_tab(&file);
-                                            let win_id = engine.active_window_id();
-                                            engine.set_cursor_for_window(win_id, line, 0);
-                                            engine.ensure_cursor_visible();
-                                            sidebar.has_focus = false;
-                                        }
-                                    }
-                                    // h/Left: switch focus to toolbar
-                                    KeyCode::Char('h') | KeyCode::Left => {
-                                        sidebar.has_focus = false;
-                                        sidebar.toolbar_focused = true;
-                                        sidebar.toolbar_selected = 2; // Search row
-                                    }
-                                    // Any printable char: switch back to input mode
-                                    KeyCode::Char(c)
-                                        if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        sidebar.search_input_mode = true;
-                                        sidebar.replace_input_focused = false;
-                                        engine
-                                            .search_panel_form_focus
-                                            .replace(Some("search:query".to_string()));
-                                        engine.search_input_insert_char(false, c);
-                                    }
-                                    _ => {}
-                                }
+                            _ => "",
+                        };
+                        let unicode = match key_event.code {
+                            KeyCode::Char(c)
+                                if !key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                Some(c)
                             }
+                            _ => None,
+                        };
+                        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+                        let key_str = if key_name.is_empty() {
+                            unicode.map(|c| c.to_string()).unwrap_or_default()
+                        } else {
+                            key_name.to_string()
+                        };
+                        use crate::core::engine::SearchKeyResult;
+                        let result = engine
+                            .dispatch_search_sidebar_key_unified(&key_str, ctrl, alt, unicode);
+                        if matches!(result, SearchKeyResult::Unfocused) {
+                            sidebar.has_focus = false;
                         }
                         needs_redraw = true;
                         continue;
@@ -3747,17 +3652,11 @@ fn event_loop(
                 // Sidebar search / replace input.
                 if sidebar.has_focus
                     && sidebar.active_panel == TuiPanel::Search
-                    && sidebar.search_input_mode
+                    && engine.search_panel_form_focus.borrow().is_some()
                 {
-                    for c in first_line.chars() {
-                        if !c.is_control() {
-                            if sidebar.replace_input_focused {
-                                engine.project_replace_text.push(c);
-                            } else {
-                                engine.project_search_query.push(c);
-                            }
-                        }
-                    }
+                    let is_replace = engine.search_panel_form_focus.borrow().as_deref()
+                        == Some("search:replace");
+                    engine.search_input_paste(is_replace, first_line);
                     needs_redraw = true;
                     continue;
                 }

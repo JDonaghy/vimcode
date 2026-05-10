@@ -71,7 +71,7 @@ fn apply_scrollbar_drag(
     drag_state: &quadraui::DragState,
     point: quadraui::Point,
     engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
+    _sidebar: &mut TuiSidebar,
 ) -> bool {
     let events = quadraui::dispatch_mouse_drag(drag_state, point, Default::default());
     let mut handled = false;
@@ -95,7 +95,6 @@ fn apply_scrollbar_drag(
                     handled = true;
                 }
                 "tui:search_results" => {
-                    sidebar.search_scroll_top = *new_offset;
                     handled = true;
                 }
                 "tui:settings" => {
@@ -922,6 +921,23 @@ pub(super) fn handle_mouse(
             }
             return sidebar_width;
         }
+        MouseEventKind::Drag(MouseButton::Left)
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Search =>
+        {
+            let move_ev = quadraui::UiEvent::MouseMoved {
+                position: quadraui::Point::new(col as f32, row as f32),
+                buttons: quadraui::ButtonMask {
+                    left: true,
+                    right: false,
+                    middle: false,
+                },
+            };
+            engine.handle_search_sidebar_ui_event(move_ev);
+            return sidebar_width;
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
@@ -1143,6 +1159,16 @@ pub(super) fn handle_mouse(
                 }
             }
         }
+        MouseEventKind::Up(MouseButton::Left)
+            if sidebar.visible && sidebar.active_panel == TuiPanel::Search =>
+        {
+            let up_ev = quadraui::UiEvent::MouseUp {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(col as f32, row as f32),
+            };
+            engine.handle_search_sidebar_ui_event(up_ev);
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             // Tab drag-and-drop: execute drop on release.
             if *tab_dragging {
@@ -1239,6 +1265,19 @@ pub(super) fn handle_mouse(
                 engine.handle_sc_sidebar_ui_event(scroll_ev);
                 return sidebar_width;
             }
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Search
+            {
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { -3.0 } else { 3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                engine.handle_search_sidebar_ui_event(scroll_ev);
+                return sidebar_width;
+            }
             // Terminal panel scroll now routes through dispatch_scroll
             // via the registered "tui:terminal_scrollback" surface.
             // Scroll-surface wheel dispatch — routes to registered surfaces.
@@ -1313,12 +1352,7 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:search_results" => {
-                                if down {
-                                    sidebar.search_scroll_top += step;
-                                } else {
-                                    sidebar.search_scroll_top =
-                                        sidebar.search_scroll_top.saturating_sub(step);
-                                }
+                                // SidebarSystem handles scroll internally
                                 return sidebar_width;
                             }
                             other if other.starts_with("debug_sidebar:") => {
@@ -2319,7 +2353,7 @@ pub(super) fn handle_mouse(
                 sidebar.visible = true;
                 if panel == TuiPanel::Search {
                     sidebar.has_focus = true;
-                    sidebar.search_input_mode = true;
+                    engine.search_set_focus(true);
                 }
                 if panel == TuiPanel::Git {
                     engine.sc_refresh();
@@ -2526,78 +2560,20 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
             sidebar.has_focus = true;
-            let msv_layout = engine.search_panel_msv_layout.borrow();
-            if let Some(ref layout) = *msv_layout {
-                let hit_x = col as f32;
-                let hit_y = row as f32 + 0.5;
-                match layout.hit_test(hit_x, hit_y) {
-                    quadraui::MultiSectionViewHit::Body { section: 0, .. } => {
-                        if let Some(sl) = layout.sections.first() {
-                            let local_x = hit_x - sl.body_bounds.x;
-                            let local_y = hit_y - sl.body_bounds.y;
-                            let view = render::build_search_panel_msv(
-                                engine,
-                                &engine.cwd,
-                                sidebar.search_scroll_top,
-                            );
-                            if let quadraui::SectionBody::Form(ref form) = view.sections[0].body {
-                                let form_area = ratatui::layout::Rect {
-                                    x: 0,
-                                    y: 0,
-                                    width: sl.body_bounds.width as u16,
-                                    height: sl.body_bounds.height as u16,
-                                };
-                                let form_layout = quadraui::tui::tui_form_layout(form, form_area);
-                                if let quadraui::FormHit::Field(id) =
-                                    form_layout.hit_test(local_x, local_y)
-                                {
-                                    drop(msv_layout);
-                                    engine.handle_search_form_hit(id.as_str());
-                                    sidebar.search_input_mode = id.as_str() == "search:query"
-                                        || id.as_str() == "search:replace";
-                                    sidebar.replace_input_focused = id.as_str() == "search:replace";
-                                    return sidebar_width;
-                                }
-                            }
-                        }
-                    }
-                    quadraui::MultiSectionViewHit::Body { section: 1, .. } => {
-                        if let Some(sl) = layout.sections.get(1) {
-                            let local_x = hit_x - sl.body_bounds.x;
-                            let local_y = hit_y - sl.body_bounds.y;
-                            let view = render::build_search_panel_msv(
-                                engine,
-                                &engine.cwd,
-                                sidebar.search_scroll_top,
-                            );
-                            if let quadraui::SectionBody::Tree(ref tree) = view.sections[1].body {
-                                let tree_layout = quadraui::tui::tui_tree_layout(
-                                    tree,
-                                    ratatui::layout::Rect {
-                                        x: 0,
-                                        y: 0,
-                                        width: sl.body_bounds.width as u16,
-                                        height: sl.body_bounds.height as u16,
-                                    },
-                                );
-                                if let quadraui::TreeViewHit::Row(row_idx) =
-                                    tree_layout.hit_test(local_x, local_y)
-                                {
-                                    let path = tree.rows[row_idx].path.clone();
-                                    drop(msv_layout);
-                                    sidebar.search_input_mode = false;
-                                    engine.handle_search_tree_hit(&path);
-                                    if path.len() >= 2 {
-                                        sidebar.has_focus = false;
-                                    }
-                                    return sidebar_width;
-                                }
-                            }
-                        }
-                    }
-                    quadraui::MultiSectionViewHit::Header { .. } => {}
-                    _ => {}
-                }
+            if !engine.search_has_focus {
+                engine.search_set_focus(true);
+            }
+            let click_x = col as f32;
+            let click_y = row as f32 + 0.5;
+            let event = quadraui::UiEvent::MouseDown {
+                widget: None,
+                position: quadraui::Point::new(click_x, click_y),
+                button: quadraui::MouseButton::Left,
+                modifiers: quadraui::Modifiers::default(),
+            };
+            engine.handle_search_sidebar_ui_event(event);
+            if !engine.search_has_focus {
+                sidebar.has_focus = false;
             }
         } else if sidebar.active_panel == TuiPanel::Extensions {
             sidebar.has_focus = true;

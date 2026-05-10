@@ -2434,8 +2434,6 @@ pub struct Engine {
     pub project_search_query: String,
     /// Results from the last `run_project_search` call.
     pub project_search_results: Vec<ProjectMatch>,
-    /// Index of the currently highlighted result (0-based).
-    pub project_search_selected: usize,
     /// Search mode toggles (case-sensitive, whole word, regex).
     pub project_search_options: SearchOptions,
     /// Receiver for async search results (set while a search thread is running).
@@ -2454,12 +2452,9 @@ pub struct Engine {
     pub project_replace_running: bool,
     /// Search-specific status message ("N matches in M files").
     pub project_search_status: String,
-    /// Per-file collapse state in search results. Indexed by file group order.
-    pub search_file_expanded: Vec<bool>,
-    /// Cached MSV layout from the last search panel paint. Written at paint time.
-    pub search_panel_msv_layout: std::cell::RefCell<Option<quadraui::MultiSectionViewLayout>>,
+    /// File indices that are collapsed in search results (toggled by clicking headers).
+    pub search_collapsed_files: std::cell::RefCell<std::collections::HashSet<usize>>,
     /// Which form field in the search panel has focus (widget ID string).
-    /// Written at paint time from TUI sidebar state.
     pub search_panel_form_focus: std::cell::RefCell<Option<String>>,
     /// Cursor position (char offset) in the search query input.
     pub search_query_caret: std::cell::Cell<usize>,
@@ -2560,6 +2555,11 @@ pub struct Engine {
     pub explorer_has_focus: bool,
     /// Whether the Search sidebar panel has keyboard focus.
     pub search_has_focus: bool,
+    /// quadraui SidebarSystem — owns Search panel (2 sections: Form chrome +
+    /// Tree results) selection, scroll, keyboard nav, and mouse handling.
+    /// Both TUI and GTK call `render()` and `handle()`.
+    pub search_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    pub search_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- Source Control panel ---
     /// Cached file statuses from the last `sc_refresh()` call.
@@ -3404,7 +3404,6 @@ impl Engine {
             completion_display_only: false,
             project_search_query: String::new(),
             project_search_results: Vec::new(),
-            project_search_selected: 0,
             project_search_options: SearchOptions::default(),
             project_search_receiver: None,
             project_search_running: false,
@@ -3412,8 +3411,7 @@ impl Engine {
             project_replace_receiver: None,
             project_replace_running: false,
             project_search_status: String::new(),
-            search_file_expanded: Vec::new(),
-            search_panel_msv_layout: std::cell::RefCell::new(None),
+            search_collapsed_files: std::cell::RefCell::new(std::collections::HashSet::new()),
             search_panel_form_focus: std::cell::RefCell::new(Some("search:query".to_string())),
             search_query_caret: std::cell::Cell::new(0),
             replace_text_caret: std::cell::Cell::new(0),
@@ -3466,6 +3464,16 @@ impl Engine {
             base_settings: None,
             explorer_has_focus: false,
             search_has_focus: false,
+            search_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::form("chrome", "SEARCH"),
+                    quadraui::SidebarSectionDef::new("results", "RESULTS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_allow_collapse(false);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            search_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
@@ -4513,7 +4521,7 @@ mod panels;
 mod picker;
 mod plugins;
 mod search;
-pub use search::{find_word_boundaries, SearchInputAction};
+pub use search::{find_word_boundaries, SearchKeyResult};
 mod source_control;
 pub use source_control::ScKeyResult;
 mod spell_ops;
