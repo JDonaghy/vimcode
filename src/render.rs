@@ -11555,6 +11555,109 @@ pub struct TabDropOverlay {
     pub ghost_position: (f32, f32),
 }
 
+/// Lightweight group-bounds descriptor for [`build_tab_drop_groups`].
+pub struct DropGroupBounds {
+    pub group_id: GroupId,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub content_height: f32,
+    pub tab_scroll_offset: usize,
+}
+
+/// Build `TabDropGroup`s from a set of group bounds.
+///
+/// `tab_bar_height` is in the same units as the bounds (cells for TUI,
+/// pixels for GTK/Win-GUI). Each group's bounds describe the
+/// **content area** — the function prepends `tab_bar_height` above.
+///
+/// `tab_slots_map` maps `GroupId.0` → visible tab slot positions in
+/// the same coordinate system as the bounds.
+pub fn build_tab_drop_groups(
+    group_bounds: &[DropGroupBounds],
+    engine: &crate::core::engine::Engine,
+    tab_bar_height: f32,
+    tab_slots_map: &std::collections::HashMap<usize, Vec<(f32, f32)>>,
+) -> (Vec<TabDropGroup>, f32) {
+    let mut groups = Vec::new();
+    let breadcrumbs = engine.settings.breadcrumbs;
+
+    for gb in group_bounds {
+        let hidden = engine.is_tab_bar_hidden(gb.group_id);
+        let eff_tbh = if hidden {
+            if breadcrumbs {
+                tab_bar_height / 2.0
+            } else {
+                0.0
+            }
+        } else {
+            tab_bar_height
+        };
+        let tab_slots = if hidden {
+            Vec::new()
+        } else {
+            tab_slots_map
+                .get(&gb.group_id.0)
+                .cloned()
+                .unwrap_or_default()
+        };
+        groups.push(TabDropGroup {
+            group_id: gb.group_id,
+            rect: quadraui::DropGroupRect {
+                bounds: quadraui::Rect::new(
+                    gb.x,
+                    gb.y - eff_tbh,
+                    gb.width,
+                    eff_tbh + gb.content_height,
+                ),
+                tab_slots,
+            },
+            tab_scroll_offset: gb.tab_scroll_offset,
+        });
+    }
+
+    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
+        0.0
+    } else {
+        tab_bar_height
+    };
+    (groups, effective_tbh)
+}
+
+/// Build [`DropGroupBounds`] from a `ScreenLayout`, applying an
+/// editor-area offset. Both TUI and GTK call this when the
+/// `ScreenLayout` is available (draw path, or TUI's cached layout).
+pub fn screen_to_drop_group_bounds(
+    screen: &ScreenLayout,
+    engine: &crate::core::engine::Engine,
+    editor_origin: (f32, f32),
+    editor_size: (f32, f32),
+) -> Vec<DropGroupBounds> {
+    if let Some(ref split) = screen.editor_group_split {
+        split
+            .group_tab_bars
+            .iter()
+            .map(|gtb| DropGroupBounds {
+                group_id: gtb.group_id,
+                x: editor_origin.0 + gtb.bounds.x as f32,
+                y: editor_origin.1 + gtb.bounds.y as f32,
+                width: gtb.bounds.width as f32,
+                content_height: gtb.bounds.height as f32,
+                tab_scroll_offset: gtb.tab_scroll_offset,
+            })
+            .collect()
+    } else {
+        vec![DropGroupBounds {
+            group_id: engine.active_group,
+            x: editor_origin.0,
+            y: editor_origin.1,
+            width: editor_size.0,
+            content_height: editor_size.1,
+            tab_scroll_offset: screen.tab_scroll_offset,
+        }]
+    }
+}
+
 pub fn compute_tab_drop_zone(
     cursor_x: f32,
     cursor_y: f32,

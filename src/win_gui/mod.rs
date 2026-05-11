@@ -6276,52 +6276,37 @@ fn build_win_tab_drop_groups(state: &AppState) -> (Vec<render::TabDropGroup>, f3
     let lh = state.line_height;
     let tab_h = lh * TAB_BAR_HEIGHT_MULT;
 
-    let mut slot_map: HashMap<GroupId, Vec<(f32, f32)>> = HashMap::new();
+    let mut slots_map: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
     for slot in &state.tab_slots {
-        slot_map
-            .entry(slot.group_id)
+        slots_map
+            .entry(slot.group_id.0)
             .or_default()
             .push((slot.x_start, slot.x_end));
     }
 
     let mut seen = std::collections::HashSet::new();
-    let mut groups = Vec::new();
-
+    let mut bounds = Vec::new();
     for cwr in &state.cached_window_rects {
         if !seen.insert(cwr.group_id) {
             continue;
         }
-        let rx = cwr.rect.x as f32;
-        let ry = cwr.rect.y as f32;
-        let rw = cwr.rect.width as f32;
-        let rh = cwr.rect.height as f32;
-        let tab_slots = slot_map.remove(&cwr.group_id).unwrap_or_default();
-        let tab_y = if !tab_slots.is_empty() {
-            state
-                .tab_slots
-                .iter()
-                .find(|s| s.group_id == cwr.group_id)
-                .map_or(ry - tab_h, |s| s.y)
-        } else {
-            ry - tab_h
-        };
         let scroll_off = state
             .engine
             .editor_groups
             .get(&cwr.group_id)
             .map(|g| g.tab_scroll_offset)
             .unwrap_or(0);
-        groups.push(render::TabDropGroup {
+        bounds.push(render::DropGroupBounds {
             group_id: cwr.group_id,
-            rect: quadraui::DropGroupRect {
-                bounds: quadraui::Rect::new(rx, tab_y, rw, (ry + rh) - tab_y),
-                tab_slots,
-            },
+            x: cwr.rect.x as f32,
+            y: cwr.rect.y as f32,
+            width: cwr.rect.width as f32,
+            content_height: cwr.rect.height as f32,
             tab_scroll_offset: scroll_off,
         });
     }
 
-    (groups, tab_h)
+    render::build_tab_drop_groups(&bounds, &state.engine, tab_h, &slots_map)
 }
 
 fn compute_win_tab_drop_zone(state: &AppState, px: f32, py: f32) -> DropZone {

@@ -405,14 +405,16 @@ pub(super) fn handle_mouse_click(
     }
 }
 
-/// Build `TabDropGroup`s for GTK's pixel coordinate system.
-pub(super) fn build_gtk_tab_drop_groups(
+type TabSlotsMap = std::collections::HashMap<usize, Vec<(f32, f32)>>;
+
+/// Build tab slot positions (absolute pixel coords) for each group.
+pub(super) fn build_gtk_tab_slots(
     engine: &Engine,
     width: f64,
     height: f64,
     line_height: f64,
     tab_slot_positions: &TabSlotMap,
-) -> (Vec<render_mod::TabDropGroup>, f32) {
+) -> (Vec<render_mod::DropGroupBounds>, f32, TabSlotsMap) {
     use crate::core::window::WindowRect;
 
     let tbh = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
@@ -423,53 +425,37 @@ pub(super) fn build_gtk_tab_drop_groups(
         .calculate_group_rects(content_bounds, tbh);
     engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tbh);
 
-    let mut groups = Vec::new();
-    for (gid, grect) in &group_rects {
-        let hidden = engine.is_tab_bar_hidden(*gid);
-        let eff_tbh = if hidden {
-            if engine.settings.breadcrumbs {
-                tbh / 2.0
-            } else {
-                0.0
+    let bounds: Vec<render_mod::DropGroupBounds> = group_rects
+        .iter()
+        .map(|(gid, grect)| {
+            let scroll_off = engine
+                .editor_groups
+                .get(gid)
+                .map(|g| g.tab_scroll_offset)
+                .unwrap_or(0);
+            render_mod::DropGroupBounds {
+                group_id: *gid,
+                x: grect.x as f32,
+                y: grect.y as f32,
+                width: grect.width as f32,
+                content_height: grect.height as f32,
+                tab_scroll_offset: scroll_off,
             }
-        } else {
-            tbh
-        };
-        let tab_slots: Vec<(f32, f32)> = if hidden {
-            Vec::new()
-        } else if let Some(slots) = tab_slot_positions.get(&gid.0) {
-            slots
+        })
+        .collect();
+
+    let mut slots_map = std::collections::HashMap::new();
+    for gb in &bounds {
+        if let Some(slots) = tab_slot_positions.get(&gb.group_id.0) {
+            let abs_slots: Vec<(f32, f32)> = slots
                 .iter()
-                .map(|&(s, e)| ((grect.x + s) as f32, (grect.x + e) as f32))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let scroll_off = engine
-            .editor_groups
-            .get(gid)
-            .map(|g| g.tab_scroll_offset)
-            .unwrap_or(0);
-        groups.push(render_mod::TabDropGroup {
-            group_id: *gid,
-            rect: quadraui::DropGroupRect {
-                bounds: quadraui::Rect::new(
-                    grect.x as f32,
-                    (grect.y - eff_tbh) as f32,
-                    grect.width as f32,
-                    (eff_tbh + grect.height) as f32,
-                ),
-                tab_slots,
-            },
-            tab_scroll_offset: scroll_off,
-        });
+                .map(|&(s, e)| (gb.x + s as f32, gb.x + e as f32))
+                .collect();
+            slots_map.insert(gb.group_id.0, abs_slots);
+        }
     }
-    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
-        0.0
-    } else {
-        tbh as f32
-    };
-    (groups, effective_tbh)
+
+    (bounds, tbh as f32, slots_map)
 }
 
 /// Compute the drop zone for a tab drag based on cursor position.
@@ -484,9 +470,10 @@ pub(super) fn compute_tab_drop_zone(
     _char_width: f64,
     tab_slot_positions: &TabSlotMap,
 ) -> crate::core::window::DropZone {
-    let (groups, tbh) =
-        build_gtk_tab_drop_groups(engine, width, height, line_height, tab_slot_positions);
-    render_mod::compute_tab_drop_zone(x as f32, y as f32, &groups, tbh)
+    let (bounds, tbh, slots_map) =
+        build_gtk_tab_slots(engine, width, height, line_height, tab_slot_positions);
+    let (groups, eff_tbh) = render_mod::build_tab_drop_groups(&bounds, engine, tbh, &slots_map);
+    render_mod::compute_tab_drop_zone(x as f32, y as f32, &groups, eff_tbh)
 }
 
 /// Handle mouse double-click — select word at position.

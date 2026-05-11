@@ -1335,68 +1335,45 @@ pub(super) fn tab_tooltip_at_col(
 }
 
 /// Draw the tab drag-and-drop overlay (highlight drop zone + ghost label).
-fn build_tui_tab_drop_groups(
-    engine: &Engine,
-    editor_area: Rect,
+fn build_tui_tab_slots(
     screen: &render::ScreenLayout,
-) -> (Vec<render::TabDropGroup>, f32) {
-    let tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-    let mut groups = Vec::new();
-
+    engine: &Engine,
+    editor_x: f32,
+) -> std::collections::HashMap<usize, Vec<(f32, f32)>> {
+    let mut map = std::collections::HashMap::new();
     if let Some(ref split) = screen.editor_group_split {
         for gtb in &split.group_tab_bars {
-            let gx = gtb.bounds.x as f32;
-            let gw = gtb.bounds.width as f32;
-            let content_h = gtb.bounds.height as f32;
-            let tab_bar_rel = (gtb.bounds.y as u16).saturating_sub(tbh);
-            let abs_x = editor_area.x as f32 + gx;
-            let abs_y = editor_area.y as f32 + tab_bar_rel as f32;
-            let scroll_off = gtb.tab_scroll_offset;
-            let ov = if scroll_off > 0 { 2.0f32 } else { 0.0 };
+            let abs_x = editor_x + gtb.bounds.x as f32;
+            let ov = if gtb.tab_scroll_offset > 0 {
+                2.0f32
+            } else {
+                0.0
+            };
             let mut x = abs_x + ov;
-            let mut tab_slots = Vec::new();
-            for tab in gtb.tabs.iter().skip(scroll_off) {
+            let mut slots = Vec::new();
+            for tab in gtb.tabs.iter().skip(gtb.tab_scroll_offset) {
                 let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
-                tab_slots.push((x, x + tw));
+                slots.push((x, x + tw));
                 x += tw;
             }
-            groups.push(render::TabDropGroup {
-                group_id: gtb.group_id,
-                rect: quadraui::DropGroupRect {
-                    bounds: quadraui::Rect::new(abs_x, abs_y, gw, tbh as f32 + content_h),
-                    tab_slots,
-                },
-                tab_scroll_offset: scroll_off,
-            });
+            map.insert(gtb.group_id.0, slots);
         }
     } else {
-        let group_id = engine.active_group;
-        let scroll_off = screen.tab_scroll_offset;
-        let ov = if scroll_off > 0 { 2.0f32 } else { 0.0 };
-        let abs_x = editor_area.x as f32;
-        let mut x = abs_x + ov;
-        let mut tab_slots = Vec::new();
-        for tab in screen.tab_bar.iter().skip(scroll_off) {
+        let ov = if screen.tab_scroll_offset > 0 {
+            2.0f32
+        } else {
+            0.0
+        };
+        let mut x = editor_x + ov;
+        let mut slots = Vec::new();
+        for tab in screen.tab_bar.iter().skip(screen.tab_scroll_offset) {
             let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
-            tab_slots.push((x, x + tw));
+            slots.push((x, x + tw));
             x += tw;
         }
-        groups.push(render::TabDropGroup {
-            group_id,
-            rect: quadraui::DropGroupRect {
-                bounds: quadraui::Rect::new(
-                    abs_x,
-                    editor_area.y as f32,
-                    editor_area.width as f32,
-                    editor_area.height as f32,
-                ),
-                tab_slots,
-            },
-            tab_scroll_offset: scroll_off,
-        });
+        map.insert(engine.active_group.0, slots);
     }
-
-    (groups, tbh as f32)
+    map
 }
 
 pub(super) fn render_tab_drag_overlay(
@@ -1406,7 +1383,19 @@ pub(super) fn render_tab_drag_overlay(
     screen: &render::ScreenLayout,
     theme: &render::Theme,
 ) {
-    let (groups, tbh) = build_tui_tab_drop_groups(engine, editor_area, screen);
+    let tab_slots = build_tui_tab_slots(screen, engine, editor_area.x as f32);
+    let tbh_f = if engine.settings.breadcrumbs {
+        2.0f32
+    } else {
+        1.0
+    };
+    let bounds = render::screen_to_drop_group_bounds(
+        screen,
+        engine,
+        (editor_area.x as f32, editor_area.y as f32),
+        (editor_area.width as f32, editor_area.height as f32),
+    );
+    let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     let cursor = engine
         .tab_drag_mouse
         .map(|(mx, my)| (mx as f32, my as f32))
@@ -1497,8 +1486,19 @@ pub(super) fn compute_tui_tab_drop_zone(
     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
     let editor_w = ts.width.saturating_sub(editor_left);
     let editor_h = ts.height.saturating_sub(menu_rows + 2);
-    let editor_area = Rect::new(editor_left, menu_rows, editor_w, editor_h);
-    let (groups, tbh) = build_tui_tab_drop_groups(engine, editor_area, layout);
+    let tab_slots = build_tui_tab_slots(layout, engine, editor_left as f32);
+    let tbh_f = if engine.settings.breadcrumbs {
+        2.0f32
+    } else {
+        1.0
+    };
+    let bounds = render::screen_to_drop_group_bounds(
+        layout,
+        engine,
+        (editor_left as f32, menu_rows as f32),
+        (editor_w as f32, editor_h as f32),
+    );
+    let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
 }
 

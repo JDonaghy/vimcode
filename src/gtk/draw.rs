@@ -968,13 +968,10 @@ pub(super) fn draw_tab_drag_overlay(
     pango_layout: &pango::Layout,
     tab_slot_positions: &TabSlotMap,
 ) {
-    let (groups, tbh) = super::click::build_gtk_tab_drop_groups(
-        engine,
-        width,
-        height,
-        line_height,
-        tab_slot_positions,
-    );
+    let (bounds, tbh, slots_map) =
+        super::click::build_gtk_tab_slots(engine, width, height, line_height, tab_slot_positions);
+    let (groups, eff_tbh) = render::build_tab_drop_groups(&bounds, engine, tbh, &slots_map);
+    let tbh = eff_tbh;
     let cursor = engine
         .tab_drag_mouse
         .map(|(mx, my)| (mx as f32, my as f32))
