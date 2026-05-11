@@ -190,13 +190,7 @@ impl Engine {
         }
 
         // Debug sidebar intercepts all keys when it has focus.
-        // TUI and GTK route through SidebarSystem directly; this path
-        // remains for win-gui which hasn't migrated yet.
-        #[cfg(feature = "win-gui")]
-        if self.dap_sidebar_has_focus {
-            return self.handle_debug_sidebar_key(key_name, ctrl);
-        }
-        #[cfg(not(feature = "win-gui"))]
+        // TUI and GTK route through SidebarSystem directly.
         if self.dap_sidebar_has_focus {
             return EngineAction::None;
         }

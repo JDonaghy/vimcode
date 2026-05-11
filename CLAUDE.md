@@ -1,6 +1,6 @@
 ## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
 
-**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/`, `src/tui_main/`, or `src/win_gui/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
+**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/` or `src/tui_main/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
 
 1. Identify what quadraui infrastructure is missing.
 2. File a quadraui issue describing the gap.
@@ -53,19 +53,19 @@ All non-trivial work should be tracked via GitHub Issues.
 
 ## Architecture
 
-**VimCode**: Vim-like code editor in Rust. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI) vs `src/win_gui/` (native Windows). `src/main.rs` is a thin CLI dispatcher.
+**VimCode**: Vim-like code editor in Rust. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
 
-**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm, windows-rs+Direct2D+DirectWrite
+**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 
-**Multi-backend rule:** THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag, layout, click detection, or rendering — check and update ALL backends. See `docs/ARCHITECTURE.md` for directory layout and engine submodule map.
+**Multi-backend rule:** TWO UI backends (GTK, TUI). When fixing bugs or adding features that touch mouse handling, drag, layout, click detection, or rendering — check and update BOTH backends. See `docs/ARCHITECTURE.md` for directory layout and engine submodule map.
 
 ## Commands & Quality Checks
 
 ```bash
 cargo build                       # Compile
-cargo test --no-default-features  # Run all tests (NEVER use --features win-gui)
+cargo test --no-default-features  # Run all tests
 cargo clippy -- -D warnings       # Lint (must pass)
 cargo fmt                         # Format
 ```
@@ -79,11 +79,8 @@ cargo fmt                         # Format
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
 ## Testing (CRITICAL)
-**NEVER run `cargo test` with the `win-gui` feature enabled.** This spawns hundreds of real Win32 windows and locks up the machine.
 - **Full test suite:** `cargo test --no-default-features` — lib + integration tests
 - **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
-- **Build win-gui:** `cargo build --bin vimcode-win --features win-gui --no-default-features`
-- **Clippy win-gui:** `cargo clippy --features win-gui --no-default-features`
 
 ## Branching & Releases
 - All work happens on `develop`; `main` is the release branch
