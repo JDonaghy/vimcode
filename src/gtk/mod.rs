@@ -4032,6 +4032,8 @@ impl SimpleComponent for App {
             let engine_rc = engine.clone();
             let sender_rc = sender.input_sender().clone();
             let lh_rc = line_height_cell.clone();
+            let cw_rc = char_width_cell.clone();
+            let da_rc = model.drawing_area.clone();
             let tab_slots_rc = tab_slot_positions_cell.clone();
             let diff_btn_rc = diff_btn_map_cell.clone();
             let split_btn_rc = split_btn_map_cell.clone();
@@ -4043,17 +4045,30 @@ impl SimpleComponent for App {
             rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
                 let _widget = gesture.widget();
                 let lh = lh_rc.get().max(1.0);
+                let cw = cw_rc.get().max(1.0);
                 let layout_ref = screen_layout_rc.borrow();
                 let Some(ref layout) = *layout_ref else {
                     return;
                 };
                 let mut engine = engine_rc.borrow_mut();
+                let editor_pl = {
+                    let da_ref = da_rc.borrow();
+                    let ctx = da_ref.as_ref().expect("drawing area").pango_context();
+                    let pl = pango::Layout::new(&ctx);
+                    let fd = FontDescription::from_string(&format!(
+                        "{} {}",
+                        engine.settings.font_family, engine.settings.font_size
+                    ));
+                    pl.set_font_description(Some(&fd));
+                    pl
+                };
                 let target = pixel_to_click_target(
                     &mut engine,
                     x,
                     y,
                     lh,
-                    0.0, // char_width not needed for tab bar detection
+                    cw,
+                    &editor_pl,
                     layout,
                     &tab_slots_rc.borrow(),
                     &diff_btn_rc.borrow(),
@@ -4289,12 +4304,14 @@ impl SimpleComponent for App {
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
                     if !engine.picker_open {
+                        let editor_pl = self.editor_pango_layout(&engine);
                         if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                             &mut engine,
                             x,
                             y,
                             self.cached_line_height,
                             self.cached_char_width,
+                            &editor_pl,
                             layout,
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
@@ -4351,6 +4368,7 @@ impl SimpleComponent for App {
                         }
                     }
                     if !bc_handled {
+                        let editor_pl = self.editor_pango_layout(&engine);
                         let layout_ref = self.cached_screen_layout.borrow();
                         if let Some(ref layout) = *layout_ref {
                             handle_mouse_double_click(
@@ -4359,6 +4377,7 @@ impl SimpleComponent for App {
                                 y,
                                 self.cached_line_height,
                                 self.cached_char_width,
+                                &editor_pl,
                                 layout,
                                 &self.tab_slot_positions.borrow(),
                                 &self.diff_btn_map.borrow(),
@@ -6225,6 +6244,20 @@ impl App {
         }
     }
 
+    fn editor_pango_layout(&self, engine: &Engine) -> pango::Layout {
+        let ctx = {
+            let da_ref = self.drawing_area.borrow();
+            da_ref.as_ref().expect("drawing area").pango_context()
+        };
+        let layout = pango::Layout::new(&ctx);
+        let font_desc = FontDescription::from_string(&format!(
+            "{} {}",
+            engine.settings.font_family, engine.settings.font_size
+        ));
+        layout.set_font_description(Some(&font_desc));
+        layout
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(
         &mut self,
@@ -7517,6 +7550,7 @@ impl App {
                         if engine.is_vscode_mode() {
                             engine.vscode_clear_selection();
                         }
+                        let editor_pl = self.editor_pango_layout(&engine);
                         let (click_result, engine_action) = {
                             let layout_ref = self.cached_screen_layout.borrow();
                             if let Some(ref layout) = *layout_ref {
@@ -7527,6 +7561,7 @@ impl App {
                                     alt,
                                     self.cached_line_height,
                                     self.cached_char_width,
+                                    &editor_pl,
                                     layout,
                                     &self.tab_slot_positions.borrow(),
                                     &self.diff_btn_map.borrow(),
@@ -7835,12 +7870,14 @@ impl App {
                     return;
                 };
                 let mut engine = self.engine.borrow_mut();
+                let editor_pl = self.editor_pango_layout(&engine);
                 let target = pixel_to_click_target(
                     &mut engine,
                     sx,
                     sy,
                     self.cached_line_height,
                     self.cached_char_width,
+                    &editor_pl,
                     layout,
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
@@ -7992,12 +8029,14 @@ impl App {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
+                    let editor_pl = self.editor_pango_layout(&engine);
                     handle_mouse_drag(
                         &mut engine,
                         x,
                         y,
                         self.cached_line_height,
                         self.cached_char_width,
+                        &editor_pl,
                         layout,
                         &self.tab_slot_positions.borrow(),
                         &self.diff_btn_map.borrow(),
