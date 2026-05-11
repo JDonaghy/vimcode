@@ -3066,50 +3066,46 @@ pub(super) fn handle_mouse(
                     }
                 }
 
-                // Check gutter area
+                // Check gutter area — shared resolution via render::resolve_gutter_action (#344).
                 let view_row = (editor_row - wy) as usize;
                 if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
                     if let Some(rl) = rw.lines.get(view_row) {
                         let gutter_col = (rel_col - wx) as usize;
-                        let bp_offset: usize = if rw.has_breakpoints { 1 } else { 0 };
-                        let git_col = if rw.has_git_diff {
-                            bp_offset
-                        } else {
-                            usize::MAX
-                        };
-
-                        if rw.has_breakpoints && gutter_col == 0 {
-                            // Breakpoint column (leftmost).
-                            let file = engine
-                                .windows
-                                .get(&rw.window_id)
-                                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                                .and_then(|bs| bs.file_path.as_ref())
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let bp_line = rl.line_idx as u64 + 1;
-                            engine.dap_toggle_breakpoint(&file, bp_line);
-                        } else if gutter_col == git_col {
-                            // Git diff column — open diff peek popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.open_diff_peek();
-                        } else if engine.has_diagnostic_on_line(rl.line_idx) {
-                            // Diagnostic gutter indicator — show hover popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.trigger_editor_hover_for_line(rl.line_idx);
-                        } else if engine.has_code_actions_on_line(rl.line_idx) {
-                            // Code action lightbulb — show code actions popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.show_code_actions_popup();
-                        } else {
-                            let has_fold_indicator =
-                                rl.gutter_text.chars().any(|c| c == '+' || c == '-');
-                            if has_fold_indicator {
-                                engine.toggle_fold_at_line(rl.line_idx);
+                        use crate::render::GutterAction;
+                        match crate::render::resolve_gutter_action(rw, rl.line_idx, gutter_col) {
+                            Some(GutterAction::ToggleBreakpoint(line)) => {
+                                let file = engine
+                                    .windows
+                                    .get(&rw.window_id)
+                                    .and_then(|w| engine.buffer_manager.get(w.buffer_id))
+                                    .and_then(|bs| bs.file_path.as_ref())
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                engine.dap_toggle_breakpoint(&file, line as u64 + 1);
                             }
+                            Some(GutterAction::DiffPeek(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.open_diff_peek();
+                            }
+                            Some(GutterAction::DiagnosticHover(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.trigger_editor_hover_for_line(line);
+                            }
+                            Some(GutterAction::CodeAction(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.show_code_actions_popup();
+                            }
+                            Some(GutterAction::ToggleFold(line)) => {
+                                let has_fold_indicator =
+                                    rl.gutter_text.chars().any(|c| c == '+' || c == '-');
+                                if has_fold_indicator {
+                                    engine.toggle_fold_at_line(line);
+                                }
+                            }
+                            None => {}
                         }
                     }
                     return sidebar_width;

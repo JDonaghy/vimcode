@@ -1566,7 +1566,7 @@ impl Engine {
         serde_json::Value::Array(arr)
     }
 
-    /// Whether any code actions are available on the given line.
+    #[allow(dead_code)]
     pub fn has_code_actions_on_line(&self, line: usize) -> bool {
         let Some(path) = self.active_buffer_path() else {
             return false;

@@ -379,6 +379,9 @@ struct App {
     action_btn_map: Rc<RefCell<ActionBtnMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     status_segment_map: Rc<RefCell<StatusSegmentMap>>,
+    /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
+    /// read this instead of recomputing geometry from engine state (#344).
+    cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
     /// Cached breadcrumb segment pixel hit regions from `draw_breadcrumb_bar`.
     /// Click handler walks this list to translate (x, y) → segment index.
     breadcrumb_hit_regions: Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
@@ -2256,6 +2259,7 @@ impl SimpleComponent for App {
             split_btn_map: split_btn_map_cell.clone(),
             action_btn_map: action_btn_map_cell.clone(),
             status_segment_map: status_segment_map_cell.clone(),
+            cached_screen_layout: Rc::new(RefCell::new(None)),
             breadcrumb_hit_regions: Rc::new(RefCell::new(Vec::new())),
             breadcrumb_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_hit_regions: Rc::new(RefCell::new(Vec::new())),
@@ -3862,6 +3866,7 @@ impl SimpleComponent for App {
         let mouse_pos_for_draw = mouse_pos_cell.clone();
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
         let status_seg_for_draw = model.status_segment_map.clone();
+        let screen_layout_for_draw = model.cached_screen_layout.clone();
         let bc_hits_for_draw = model.breadcrumb_hit_regions.clone();
         let bc_y_for_draw = model.breadcrumb_y_offset.clone();
         let dbg_hits_for_draw = model.debug_toolbar_hit_regions.clone();
@@ -3904,6 +3909,7 @@ impl SimpleComponent for App {
                             mouse_pos_for_draw.get(),
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
+                            &screen_layout_for_draw,
                             &bc_hits_for_draw,
                             &bc_y_for_draw,
                             &dbg_hits_for_draw,
@@ -4031,22 +4037,24 @@ impl SimpleComponent for App {
             let split_btn_rc = split_btn_map_cell.clone();
             let action_btn_rc = action_btn_map_cell.clone();
             let status_seg_rc = status_segment_map_cell.clone();
+            let screen_layout_rc = model.cached_screen_layout.clone();
             let rc_gesture = gtk4::GestureClick::new();
             rc_gesture.set_button(3);
             rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
-                let widget = gesture.widget();
-                let width = widget.width() as f64;
-                let height = widget.height() as f64;
+                let _widget = gesture.widget();
                 let lh = lh_rc.get().max(1.0);
+                let layout_ref = screen_layout_rc.borrow();
+                let Some(ref layout) = *layout_ref else {
+                    return;
+                };
                 let mut engine = engine_rc.borrow_mut();
                 let target = pixel_to_click_target(
                     &mut engine,
                     x,
                     y,
-                    width,
-                    height,
                     lh,
                     0.0, // char_width not needed for tab bar detection
+                    layout,
                     &tab_slots_rc.borrow(),
                     &diff_btn_rc.borrow(),
                     &split_btn_rc.borrow(),
@@ -4274,26 +4282,28 @@ impl SimpleComponent for App {
             Msg::CtrlMouseClick {
                 x,
                 y,
-                width,
-                height,
+                width: _,
+                height: _,
             } => {
-                let mut engine = self.engine.borrow_mut();
-                if !engine.picker_open {
-                    if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
-                        &mut engine,
-                        x,
-                        y,
-                        width,
-                        height,
-                        self.cached_line_height,
-                        self.cached_char_width,
-                        &self.tab_slot_positions.borrow(),
-                        &self.diff_btn_map.borrow(),
-                        &self.split_btn_map.borrow(),
-                        &self.action_btn_map.borrow(),
-                        &self.status_segment_map.borrow(),
-                    ) {
-                        engine.add_cursor_at_pos(line, col);
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(ref layout) = *layout_ref {
+                    let mut engine = self.engine.borrow_mut();
+                    if !engine.picker_open {
+                        if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
+                            &mut engine,
+                            x,
+                            y,
+                            self.cached_line_height,
+                            self.cached_char_width,
+                            layout,
+                            &self.tab_slot_positions.borrow(),
+                            &self.diff_btn_map.borrow(),
+                            &self.split_btn_map.borrow(),
+                            &self.action_btn_map.borrow(),
+                            &self.status_segment_map.borrow(),
+                        ) {
+                            engine.add_cursor_at_pos(line, col);
+                        }
                     }
                 }
                 self.draw_needed.set(true);
@@ -4301,12 +4311,11 @@ impl SimpleComponent for App {
             Msg::MouseDoubleClick {
                 x,
                 y,
-                width,
-                height,
+                width: _,
+                height: _,
             } => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.picker_open {
-                    // Double-click on picker: toggle expand for tree items, or confirm
                     let in_tree_mode = engine.picker_source
                         == crate::core::engine::PickerSource::CommandCenter
                         && engine.picker_query == "@";
@@ -4317,7 +4326,6 @@ impl SimpleComponent for App {
                     }
                     self.draw_needed.set(true);
                 } else {
-                    // Check breadcrumb double-click before falling through
                     let mut bc_handled = false;
                     if engine.settings.breadcrumbs {
                         let lh = self.cached_line_height.max(1.0);
@@ -4326,7 +4334,7 @@ impl SimpleComponent for App {
                             let segments =
                                 crate::render::build_breadcrumbs_for_active_group(&engine);
                             let sep_w = " › ".chars().count() as f64 * cw;
-                            let mut seg_x = cw; // left padding
+                            let mut seg_x = cw;
                             for seg in &segments {
                                 let label_w = seg.label.chars().count() as f64 * cw;
                                 if x >= seg_x && x < seg_x + label_w {
@@ -4343,20 +4351,22 @@ impl SimpleComponent for App {
                         }
                     }
                     if !bc_handled {
-                        handle_mouse_double_click(
-                            &mut engine,
-                            x,
-                            y,
-                            width,
-                            height,
-                            self.cached_line_height,
-                            self.cached_char_width,
-                            &self.tab_slot_positions.borrow(),
-                            &self.diff_btn_map.borrow(),
-                            &self.split_btn_map.borrow(),
-                            &self.action_btn_map.borrow(),
-                            &self.status_segment_map.borrow(),
-                        );
+                        let layout_ref = self.cached_screen_layout.borrow();
+                        if let Some(ref layout) = *layout_ref {
+                            handle_mouse_double_click(
+                                &mut engine,
+                                x,
+                                y,
+                                self.cached_line_height,
+                                self.cached_char_width,
+                                layout,
+                                &self.tab_slot_positions.borrow(),
+                                &self.diff_btn_map.borrow(),
+                                &self.split_btn_map.borrow(),
+                                &self.action_btn_map.borrow(),
+                                &self.status_segment_map.borrow(),
+                            );
+                        }
                     }
                 }
                 self.draw_needed.set(true);
@@ -7504,25 +7514,30 @@ impl App {
                     }
 
                     if !toolbar_handled {
-                        // Clear selection on click in VSCode mode.
                         if engine.is_vscode_mode() {
                             engine.vscode_clear_selection();
                         }
-                        let (click_result, engine_action) = handle_mouse_click(
-                            &mut engine,
-                            x,
-                            y,
-                            width,
-                            height,
-                            alt,
-                            self.cached_line_height,
-                            self.cached_char_width,
-                            &self.tab_slot_positions.borrow(),
-                            &self.diff_btn_map.borrow(),
-                            &self.split_btn_map.borrow(),
-                            &self.action_btn_map.borrow(),
-                            &self.status_segment_map.borrow(),
-                        );
+                        let (click_result, engine_action) = {
+                            let layout_ref = self.cached_screen_layout.borrow();
+                            if let Some(ref layout) = *layout_ref {
+                                handle_mouse_click(
+                                    &mut engine,
+                                    x,
+                                    y,
+                                    alt,
+                                    self.cached_line_height,
+                                    self.cached_char_width,
+                                    layout,
+                                    &self.tab_slot_positions.borrow(),
+                                    &self.diff_btn_map.borrow(),
+                                    &self.split_btn_map.borrow(),
+                                    &self.action_btn_map.borrow(),
+                                    &self.status_segment_map.borrow(),
+                                )
+                            } else {
+                                (None, None)
+                            }
+                        };
                         match engine_action {
                             Some(core::engine::EngineAction::ToggleSidebar) => {
                                 drop(engine);
@@ -7814,16 +7829,19 @@ impl App {
             let dx = x - sx;
             let dy = y - sy;
             if dx * dx + dy * dy > 64.0 {
-                // Determine which tab was clicked using pixel_to_click_target.
+                let layout_ref = self.cached_screen_layout.borrow();
+                let Some(ref layout) = *layout_ref else {
+                    self.tab_drag_start = None;
+                    return;
+                };
                 let mut engine = self.engine.borrow_mut();
                 let target = pixel_to_click_target(
                     &mut engine,
                     sx,
                     sy,
-                    width,
-                    height,
                     self.cached_line_height,
                     self.cached_char_width,
+                    layout,
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
@@ -7971,21 +7989,23 @@ impl App {
                 }
                 self.draw_needed.set(true);
             } else {
-                let mut engine = self.engine.borrow_mut();
-                handle_mouse_drag(
-                    &mut engine,
-                    x,
-                    y,
-                    width,
-                    height,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                    &self.action_btn_map.borrow(),
-                    &self.status_segment_map.borrow(),
-                );
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(ref layout) = *layout_ref {
+                    let mut engine = self.engine.borrow_mut();
+                    handle_mouse_drag(
+                        &mut engine,
+                        x,
+                        y,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        layout,
+                        &self.tab_slot_positions.borrow(),
+                        &self.diff_btn_map.borrow(),
+                        &self.split_btn_map.borrow(),
+                        &self.action_btn_map.borrow(),
+                        &self.status_segment_map.borrow(),
+                    );
+                }
                 self.draw_needed.set(true);
             }
         }

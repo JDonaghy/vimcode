@@ -59,6 +59,7 @@ pub(super) fn draw_editor(
     mouse_pos: (f64, f64),
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
+    screen_layout_out: &Rc<RefCell<Option<render::ScreenLayout>>>,
     breadcrumb_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
     breadcrumb_y_offset_out: &Rc<Cell<f64>>,
     debug_toolbar_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
@@ -911,6 +912,9 @@ pub(super) fn draw_editor(
         line_height,
         mouse_pos,
     );
+
+    // Cache the ScreenLayout for click handlers (#344). Moves, not clones.
+    *screen_layout_out.borrow_mut() = Some(screen);
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
