@@ -11259,6 +11259,8 @@ pub enum GutterAction {
 /// `single_tab_hidden` should be `true` when `hide_single_tab` is active and
 /// there is only one tab — the tab bar row is not rendered and the window rect
 /// extends upward to reclaim the space.
+/// `active_group` is the engine's current active group ID — used as the group
+/// ID for single-group tab bar hits (the ScreenLayout doesn't carry it).
 /// Both backends subtract their own chrome before calling this.
 pub fn screen_zone_hit_test(
     layout: &ScreenLayout,
@@ -11266,6 +11268,7 @@ pub fn screen_zone_hit_test(
     y: f64,
     tab_bar_height: f64,
     single_tab_hidden: bool,
+    active_group: GroupId,
 ) -> ScreenZone {
     // 1. Tab bars — check before windows because tab bars sit just above
     //    the window content area within the same group bounds.
@@ -11288,7 +11291,7 @@ pub fn screen_zone_hit_test(
             .map(|w| w.rect.x + w.rect.width)
             .unwrap_or(0.0);
         return ScreenZone::TabBar {
-            group_id: GroupId(0),
+            group_id: active_group,
             local_x: x,
             bar_width,
         };

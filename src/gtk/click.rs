@@ -30,7 +30,14 @@ pub(super) fn pixel_to_click_target(
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
 
-    match render_mod::screen_zone_hit_test(cached_layout, x, y, tab_bar_height, single_tab_hidden) {
+    match render_mod::screen_zone_hit_test(
+        cached_layout,
+        x,
+        y,
+        tab_bar_height,
+        single_tab_hidden,
+        engine.active_group,
+    ) {
         ScreenZone::TabBar {
             group_id,
             local_x,
