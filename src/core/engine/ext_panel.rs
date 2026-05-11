@@ -890,7 +890,7 @@ impl Engine {
         self.show_editor_hover_at(line, col, true, true);
     }
 
-    /// Check if any diagnostic touches the given line.
+    #[allow(dead_code)]
     pub fn has_diagnostic_on_line(&self, line: usize) -> bool {
         if let Some(path) = self.active_buffer_path() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {

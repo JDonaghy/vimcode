@@ -11184,6 +11184,278 @@ pub enum ClickTarget {
     None,
 }
 
+// ─── Shared screen-level hit-test (#344) ─────────────────────────────────────
+
+/// Top-level screen zone identified by a coordinate hit-test.
+///
+/// Coordinates are in the "editor content bounds" frame — both backends
+/// subtract their chrome (sidebar, menu bar, terminal panel, status bar)
+/// before calling [`screen_zone_hit_test`].
+#[derive(Debug)]
+pub enum ScreenZone {
+    /// Point is in a group's tab bar area.
+    TabBar {
+        group_id: GroupId,
+        local_x: f64,
+        bar_width: f64,
+    },
+    /// Point is on a breadcrumb bar.
+    Breadcrumb {
+        index: usize,
+        local_x: f64,
+        bar_width: f64,
+    },
+    /// Point is on a group divider.
+    GroupDivider { split_index: usize },
+    /// Point is in an editor window.
+    Window {
+        window_id: WindowId,
+        window_idx: usize,
+        rel_x: f64,
+        rel_y: f64,
+    },
+    /// Point is outside all editor zones.
+    None,
+}
+
+/// Sub-zone within an editor window.
+#[derive(Debug)]
+pub enum WindowZone {
+    /// Per-window status bar.
+    StatusBar { local_x: f64, bar_width: f64 },
+    /// Gutter area (breakpoint, git diff, fold indicator columns).
+    Gutter {
+        view_row: usize,
+        gutter_col: usize,
+        line_idx: usize,
+    },
+    /// Vertical scrollbar column.
+    VerticalScrollbar { view_row: usize },
+    /// Horizontal scrollbar row.
+    HorizontalScrollbar { local_x: f64 },
+    /// Text area (editable content).
+    TextArea {
+        view_row: usize,
+        buf_line: usize,
+        seg_col_offset: usize,
+        text_rel_x: f64,
+    },
+}
+
+/// Action to take on a gutter click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GutterAction {
+    ToggleBreakpoint(usize),
+    DiffPeek(usize),
+    DiagnosticHover(usize),
+    CodeAction(usize),
+    ToggleFold(usize),
+}
+
+/// Determine which top-level screen zone a point falls in.
+///
+/// `x` and `y` are in the editor content-bounds coordinate system.
+/// `tab_bar_height` is the height of a tab bar row (in the same unit).
+/// `single_tab_hidden` should be `true` when `hide_single_tab` is active and
+/// there is only one tab — the tab bar row is not rendered and the window rect
+/// extends upward to reclaim the space.
+/// Both backends subtract their own chrome before calling this.
+pub fn screen_zone_hit_test(
+    layout: &ScreenLayout,
+    x: f64,
+    y: f64,
+    tab_bar_height: f64,
+    single_tab_hidden: bool,
+) -> ScreenZone {
+    // 1. Tab bars — check before windows because tab bars sit just above
+    //    the window content area within the same group bounds.
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            let b = &gtb.bounds;
+            let tab_y = b.y - tab_bar_height;
+            if y >= tab_y && y < tab_y + tab_bar_height && x >= b.x && x < b.x + b.width {
+                return ScreenZone::TabBar {
+                    group_id: gtb.group_id,
+                    local_x: x - b.x,
+                    bar_width: b.width,
+                };
+            }
+        }
+    } else if !single_tab_hidden && y >= 0.0 && y < tab_bar_height && !layout.tab_bar.is_empty() {
+        let bar_width = layout
+            .windows
+            .first()
+            .map(|w| w.rect.x + w.rect.width)
+            .unwrap_or(0.0);
+        return ScreenZone::TabBar {
+            group_id: GroupId(0),
+            local_x: x,
+            bar_width,
+        };
+    }
+
+    // 2. Breadcrumbs — sit within the tab-bar area, below the tab row.
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        let b = &bc.bounds;
+        if x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height {
+            return ScreenZone::Breadcrumb {
+                index: i,
+                local_x: x - b.x,
+                bar_width: b.width,
+            };
+        }
+    }
+
+    // 3. Group dividers.
+    if let Some(ref split) = layout.editor_group_split {
+        for div in &split.dividers {
+            let hit = match div.direction {
+                SplitDirection::Vertical => {
+                    let div_x = div.position;
+                    (x - div_x).abs() < 0.5
+                        && y >= div.cross_start
+                        && y < div.cross_start + div.cross_size
+                }
+                SplitDirection::Horizontal => {
+                    let div_y = div.position;
+                    (y - div_y).abs() < 0.5
+                        && x >= div.cross_start
+                        && x < div.cross_start + div.cross_size
+                }
+            };
+            if hit {
+                return ScreenZone::GroupDivider {
+                    split_index: div.split_index,
+                };
+            }
+        }
+    }
+
+    // 4. Windows.
+    for (i, rw) in layout.windows.iter().enumerate() {
+        let r = &rw.rect;
+        if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+            return ScreenZone::Window {
+                window_id: rw.window_id,
+                window_idx: i,
+                rel_x: x - r.x,
+                rel_y: y - r.y,
+            };
+        }
+    }
+
+    ScreenZone::None
+}
+
+/// Determine which sub-zone of a window a point falls in.
+///
+/// `rel_x` and `rel_y` are relative to the window's top-left corner.
+/// `line_height` and `char_width` are in the same coordinate unit as the rect
+/// (pixels for GTK, 1.0 for TUI).
+pub fn window_zone_hit_test(
+    rw: &RenderedWindow,
+    rel_x: f64,
+    rel_y: f64,
+    line_height: f64,
+    char_width: f64,
+) -> WindowZone {
+    let has_status = rw.status_line.is_some();
+    let status_h = if has_status { line_height } else { 0.0 };
+    let content_h = rw.rect.height - status_h;
+    let viewport_lines = (content_h / line_height).floor() as usize;
+
+    // 1. Per-window status bar (bottom row of window).
+    if has_status && rel_y >= content_h {
+        return WindowZone::StatusBar {
+            local_x: rel_x,
+            bar_width: rw.rect.width,
+        };
+    }
+
+    let view_row = (rel_y / line_height).floor() as usize;
+
+    let gutter_w = rw.gutter_char_width as f64 * char_width;
+    let has_v_sb = rw.total_lines > viewport_lines;
+    let sb_w = if has_v_sb { char_width } else { 0.0 };
+    let viewport_cols = if char_width > 0.0 {
+        ((rw.rect.width - sb_w) / char_width).floor() as usize
+    } else {
+        1
+    }
+    .saturating_sub(rw.gutter_char_width)
+    .max(1);
+    let has_h_sb = rw.max_col > viewport_cols && viewport_lines > 1;
+
+    // 2. Vertical scrollbar (rightmost column).
+    if has_v_sb && rel_x >= rw.rect.width - sb_w {
+        return WindowZone::VerticalScrollbar { view_row };
+    }
+
+    // 3. Horizontal scrollbar (bottom content row, above status bar).
+    let h_sb_y = content_h - line_height;
+    if has_h_sb && rel_y >= h_sb_y && rel_y < content_h {
+        return WindowZone::HorizontalScrollbar {
+            local_x: rel_x - gutter_w,
+        };
+    }
+
+    // Resolve view row to buffer line via cached RenderedLine data.
+    let (line_idx, seg_col_offset) = rw
+        .lines
+        .get(view_row)
+        .map(|rl| (rl.line_idx, rl.segment_col_offset))
+        .unwrap_or((rw.scroll_top + view_row, 0));
+
+    // 4. Gutter.
+    if gutter_w > 0.0 && rel_x < gutter_w {
+        let gutter_col = if char_width > 0.0 {
+            (rel_x / char_width).floor() as usize
+        } else {
+            0
+        };
+        return WindowZone::Gutter {
+            view_row,
+            gutter_col,
+            line_idx,
+        };
+    }
+
+    // 5. Text area.
+    let text_rel_x = rel_x - gutter_w;
+    WindowZone::TextArea {
+        view_row,
+        buf_line: line_idx,
+        seg_col_offset,
+        text_rel_x,
+    }
+}
+
+/// Resolve a gutter click to an action based on column and line data.
+pub fn resolve_gutter_action(
+    rw: &RenderedWindow,
+    line_idx: usize,
+    gutter_col: usize,
+) -> Option<GutterAction> {
+    let bp_offset: usize = if rw.has_breakpoints { 1 } else { 0 };
+    let git_col = if rw.has_git_diff {
+        bp_offset
+    } else {
+        usize::MAX
+    };
+
+    if rw.has_breakpoints && gutter_col == 0 {
+        Some(GutterAction::ToggleBreakpoint(line_idx))
+    } else if gutter_col == git_col {
+        Some(GutterAction::DiffPeek(line_idx))
+    } else if rw.diagnostic_gutter.contains_key(&line_idx) {
+        Some(GutterAction::DiagnosticHover(line_idx))
+    } else if rw.code_action_lines.contains(&line_idx) {
+        Some(GutterAction::CodeAction(line_idx))
+    } else {
+        Some(GutterAction::ToggleFold(line_idx))
+    }
+}
+
 /// Compute the tab bar row height in pixels (the row containing tab labels).
 /// Used by GTK and Win-GUI backends.
 pub fn tab_row_height_px(line_height: f64) -> f64 {
