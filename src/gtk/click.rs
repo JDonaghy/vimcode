@@ -66,7 +66,9 @@ pub(super) fn pixel_to_click_target(
                 }
             }
 
-            let rw = &cached_layout.windows[window_idx];
+            let Some(rw) = cached_layout.windows.get(window_idx) else {
+                return ClickTarget::None;
+            };
             match render_mod::window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width) {
                 WindowZone::StatusBar { local_x, .. } => {
                     if let Some(zones) = status_segment_map.get(&window_id.0) {
