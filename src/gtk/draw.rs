@@ -572,18 +572,58 @@ pub(super) fn draw_editor(
                     engine.terminal_toolbar_hits.replace(Some(hits));
                     let content_h = (term_px - 2.0 * line_height).max(0.0);
                     if content_h > 0.0 {
+                        let content_y = toolbar_y + line_height;
                         draw_terminal_panel(
                             cr,
                             &layout,
                             term_panel,
                             &theme,
                             0.0,
-                            toolbar_y + line_height,
+                            content_y,
                             width as f64,
                             content_h,
                             line_height,
                             char_width,
                         );
+                        let visible_rows = (content_h / line_height) as usize;
+                        let geom = render::terminal_scrollbar_geometry(term_panel, visible_rows);
+                        let scrollbar = geom.map(|g| {
+                            const SB_W: f64 = 6.0;
+                            let sb_x = width as f64 - SB_W;
+                            let thumb_t = g.thumb_top_frac * content_h;
+                            let thumb_h = (g.thumb_height_frac * content_h).max(4.0);
+                            quadraui::SurfaceScrollbar {
+                                track_bounds: quadraui::Rect::new(
+                                    sb_x as f32,
+                                    content_y as f32,
+                                    SB_W as f32,
+                                    content_h as f32,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    (sb_x + 1.0) as f32,
+                                    (content_y + thumb_t) as f32,
+                                    (SB_W - 2.0) as f32,
+                                    thumb_h as f32,
+                                ),
+                                total_items: g.total_items,
+                                visible_items: g.visible_items,
+                                scroll_offset: term_panel.scroll_offset,
+                                inverted: true,
+                            }
+                        });
+                        engine
+                            .scroll_surfaces
+                            .borrow_mut()
+                            .push(quadraui::ScrollSurface {
+                                id: quadraui::WidgetId::new("terminal_scrollback"),
+                                bounds: quadraui::Rect::new(
+                                    0.0,
+                                    content_y as f32,
+                                    width as f32,
+                                    content_h as f32,
+                                ),
+                                scrollbar,
+                            });
                     }
                 }
             }
@@ -632,6 +672,7 @@ pub(super) fn draw_editor(
                                 total_items: td.lines.len(),
                                 visible_items: td_layout.visible_lines.len(),
                                 scroll_offset: td_layout.resolved_scroll_offset,
+                                inverted: false,
                             }
                         });
                 engine
@@ -2525,24 +2566,17 @@ pub(super) fn draw_terminal_panel(
     line_height: f64,
     char_width: f64,
 ) {
-    // Scrollbar geometry
     const SB_W: f64 = 6.0;
     let content_y = y;
     let content_h = term_px;
     let rows_to_draw = (term_px / line_height) as usize;
-    let total = panel.scrollback_rows + rows_to_draw;
-    let (thumb_top_px, thumb_bot_px) = if panel.scrollback_rows == 0 {
-        (0.0, content_h) // no scrollback → full bar
+    let geom = render::terminal_scrollbar_geometry(panel, rows_to_draw);
+    let (thumb_top_px, thumb_bot_px) = if let Some(g) = &geom {
+        let t = g.thumb_top_frac * content_h;
+        let h = (g.thumb_height_frac * content_h).max(4.0);
+        (t, t + h)
     } else {
-        let thumb_h = ((rows_to_draw as f64 / total as f64) * content_h).max(4.0);
-        let max_off = panel.scrollback_rows as f64;
-        let frac = if panel.scroll_offset == 0 {
-            1.0 // at live bottom → thumb at bottom
-        } else {
-            1.0 - (panel.scroll_offset as f64 / max_off).min(1.0)
-        };
-        let thumb_t = frac * (content_h - thumb_h);
-        (thumb_t, thumb_t + thumb_h)
+        (0.0, content_h)
     };
 
     // Draw scrollbar track (right edge of whole panel)

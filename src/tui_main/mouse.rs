@@ -40,25 +40,6 @@ fn scrollbar_grab_offset(
     }
 }
 
-/// Look up the `(total_items - visible_rows)` for the currently active
-/// `ScrollbarY` drag. Used by inverted scrollbars (terminal scrollback,
-/// debug output) to flip a forward offset reported by
-/// [`quadraui::dispatch_mouse_drag`] back into the "lines from bottom"
-/// convention those panels store. Returns 0 if no drag is active or
-/// the active drag isn't a `ScrollbarY`.
-fn current_drag_max_scroll(drag_state: &quadraui::DragState) -> usize {
-    if let Some(quadraui::DragTarget::ScrollbarY {
-        total_items,
-        visible_rows,
-        ..
-    }) = drag_state.target()
-    {
-        total_items.saturating_sub(*visible_rows)
-    } else {
-        0
-    }
-}
-
 /// Run [`quadraui::dispatch_mouse_drag`] for an active drag and apply the
 /// resulting `ScrollOffsetChanged` events to the matching scroll-state
 /// fields. Returns `true` if any event was handled (caller can short-circuit).
@@ -105,9 +86,8 @@ fn apply_scrollbar_drag(
                 // content), bottom = 0 (newest). dispatch_mouse_drag
                 // reports the raw forward offset; flip it here.
                 "tui:terminal_scrollback" => {
-                    let max = current_drag_max_scroll(drag_state);
                     if let Some(term) = engine.active_terminal_mut() {
-                        term.set_scroll_offset(max.saturating_sub(*new_offset));
+                        term.set_scroll_offset(*new_offset);
                     }
                     handled = true;
                 }
@@ -776,6 +756,7 @@ pub(super) fn handle_mouse(
                             visible_rows,
                             total_items,
                             grab_offset,
+                            inverted: false,
                         });
                         let events = quadraui::dispatch_mouse_drag(
                             drag_state,
@@ -1893,6 +1874,7 @@ pub(super) fn handle_mouse(
                     visible_rows: sb_hit.visible_rows,
                     total_items: sb_hit.total,
                     grab_offset,
+                    inverted: false,
                 });
                 apply_scrollbar_drag(
                     drag_state,
@@ -2247,6 +2229,7 @@ pub(super) fn handle_mouse(
                         visible_rows: 0,
                         total_items: total,
                         grab_offset: 0.0,
+                        inverted: true,
                     });
                     apply_scrollbar_drag(
                         drag_state,
@@ -2994,6 +2977,7 @@ pub(super) fn handle_mouse(
                         visible_rows: track_visible,
                         total_items: rw.total_lines,
                         grab_offset,
+                        inverted: false,
                     });
                     apply_scrollbar_drag(
                         drag_state,
@@ -3067,6 +3051,7 @@ pub(super) fn handle_mouse(
                             visible_cols: track_visible,
                             total_cols: rw.max_col,
                             grab_offset,
+                            inverted: false,
                         });
                         apply_scrollbar_drag(
                             drag_state,
