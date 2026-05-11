@@ -405,6 +405,59 @@ pub(super) fn handle_mouse_click(
     }
 }
 
+type TabSlotsMap = std::collections::HashMap<usize, Vec<(f32, f32)>>;
+
+/// Build tab slot positions (absolute pixel coords) for each group.
+pub(super) fn build_gtk_tab_slots(
+    engine: &Engine,
+    width: f64,
+    height: f64,
+    line_height: f64,
+    tab_slot_positions: &TabSlotMap,
+) -> (Vec<render_mod::DropGroupBounds>, f32, TabSlotsMap) {
+    use crate::core::window::WindowRect;
+
+    let tbh = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
+    let editor_bottom = gtk_editor_bottom(engine, width, height, line_height);
+    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
+    let mut group_rects = engine
+        .group_layout
+        .calculate_group_rects(content_bounds, tbh);
+    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tbh);
+
+    let bounds: Vec<render_mod::DropGroupBounds> = group_rects
+        .iter()
+        .map(|(gid, grect)| {
+            let scroll_off = engine
+                .editor_groups
+                .get(gid)
+                .map(|g| g.tab_scroll_offset)
+                .unwrap_or(0);
+            render_mod::DropGroupBounds {
+                group_id: *gid,
+                x: grect.x as f32,
+                y: grect.y as f32,
+                width: grect.width as f32,
+                content_height: grect.height as f32,
+                tab_scroll_offset: scroll_off,
+            }
+        })
+        .collect();
+
+    let mut slots_map = std::collections::HashMap::new();
+    for gb in &bounds {
+        if let Some(slots) = tab_slot_positions.get(&gb.group_id.0) {
+            let abs_slots: Vec<(f32, f32)> = slots
+                .iter()
+                .map(|&(s, e)| (gb.x + s as f32, gb.x + e as f32))
+                .collect();
+            slots_map.insert(gb.group_id.0, abs_slots);
+        }
+    }
+
+    (bounds, tbh as f32, slots_map)
+}
+
 /// Compute the drop zone for a tab drag based on cursor position.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compute_tab_drop_zone(
@@ -414,84 +467,13 @@ pub(super) fn compute_tab_drop_zone(
     width: f64,
     height: f64,
     line_height: f64,
-    char_width: f64,
+    _char_width: f64,
     tab_slot_positions: &TabSlotMap,
 ) -> crate::core::window::DropZone {
-    use crate::core::window::{DropZone, SplitDirection, WindowRect};
-
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
-    let editor_bottom = gtk_editor_bottom(engine, width, height, line_height);
-    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
-    let mut group_rects = engine
-        .group_layout
-        .calculate_group_rects(content_bounds, tab_bar_height);
-    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
-
-    for (gid, grect) in &group_rects {
-        let tab_hidden = engine.is_tab_bar_hidden(*gid);
-        let tab_x = grect.x;
-        let group_id = *gid;
-
-        // Check tab bar region (for reorder/center drop) — skip if tab bar is hidden
-        let tab_y = grect.y - tab_bar_height;
-        if !tab_hidden
-            && y >= tab_y
-            && y < tab_y + tab_row_height
-            && x >= tab_x
-            && x < tab_x + grect.width
-        {
-            // Determine insertion index from tab slot positions
-            let local_x = x - tab_x;
-            if let Some(slots) = tab_slot_positions.get(&group_id.0) {
-                for (i, &(slot_start, slot_end)) in slots.iter().enumerate() {
-                    let mid = (slot_start + slot_end) / 2.0;
-                    if local_x < mid {
-                        return DropZone::TabReorder(group_id, i);
-                    }
-                }
-                return DropZone::TabReorder(group_id, slots.len());
-            }
-            return DropZone::Center(group_id);
-        }
-
-        // Check content area with edge margins
-        let content_top = grect.y;
-        let content_left = grect.x;
-        let content_right = grect.x + grect.width;
-        let content_bottom = grect.y + grect.height;
-        if x >= content_left && x < content_right && y >= content_top && y < content_bottom {
-            let w = grect.width;
-            let h = grect.height;
-            let rel_x = x - content_left;
-            let rel_y = y - content_top;
-            let margin = 0.2;
-
-            // Minimum 40px or char_width*5 for edge zones
-            let edge_w = (w * margin).min(char_width * 10.0).max(40.0);
-            let edge_h = (h * margin).min(line_height * 3.0).max(40.0);
-
-            if rel_x < edge_w {
-                return DropZone::Split(group_id, SplitDirection::Vertical, true);
-            }
-            if rel_x > w - edge_w {
-                return DropZone::Split(group_id, SplitDirection::Vertical, false);
-            }
-            if rel_y < edge_h {
-                return DropZone::Split(group_id, SplitDirection::Horizontal, true);
-            }
-            if rel_y > h - edge_h {
-                return DropZone::Split(group_id, SplitDirection::Horizontal, false);
-            }
-            return DropZone::Center(group_id);
-        }
-    }
-
-    DropZone::None
+    let (bounds, tbh, slots_map) =
+        build_gtk_tab_slots(engine, width, height, line_height, tab_slot_positions);
+    let (groups, eff_tbh) = render_mod::build_tab_drop_groups(&bounds, engine, tbh, &slots_map);
+    render_mod::compute_tab_drop_zone(x as f32, y as f32, &groups, eff_tbh)
 }
 
 /// Handle mouse double-click — select word at position.

@@ -1255,7 +1255,7 @@ fn on_paint(hwnd: HWND) {
                 ctx.draw_context_menu(ctxm);
             }
             // Tab drag overlay (drop zone highlight + ghost label)
-            ctx.draw_tab_drag_overlay(&screen, &state.engine);
+            ctx.draw_tab_drag_overlay(&state.engine, state);
             // Menu dropdown on top of sidebar
             if let Some(ref menu) = screen.menu_bar {
                 ctx.draw_menu_dropdown(menu);
@@ -6270,79 +6270,51 @@ fn handle_context_action(
     state.sidebar.dirty = true;
 }
 
-fn compute_win_tab_drop_zone(state: &AppState, px: f32, py: f32) -> DropZone {
-    let source = match &state.engine.tab_drag {
-        Some(td) => (td.source_group, td.source_tab_index),
-        None => return DropZone::None,
-    };
+fn build_win_tab_drop_groups(state: &AppState) -> (Vec<render::TabDropGroup>, f32) {
+    use std::collections::HashMap;
 
     let lh = state.line_height;
     let tab_h = lh * TAB_BAR_HEIGHT_MULT;
 
-    // Check if cursor is over a tab bar → TabReorder
+    let mut slots_map: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
     for slot in &state.tab_slots {
-        if py >= slot.y && py < slot.y + slot.height {
-            if px >= slot.x_start && px < slot.x_end {
-                // Over this tab — insert before or after based on midpoint
-                let mid = (slot.x_start + slot.x_end) / 2.0;
-                let idx = if px < mid {
-                    slot.tab_idx
-                } else {
-                    slot.tab_idx + 1
-                };
-                return DropZone::TabReorder(slot.group_id, idx);
-            }
-            // Over this group's tab bar but past the last tab — append
-            // Use the number of tabs in this group (if available) as the insertion index.
-            let tab_count = state
-                .engine
-                .editor_groups
-                .get(&slot.group_id)
-                .map_or(0, |g| g.tabs.len());
-            return DropZone::TabReorder(slot.group_id, tab_count);
-        }
+        slots_map
+            .entry(slot.group_id.0)
+            .or_default()
+            .push((slot.x_start, slot.x_end));
     }
 
-    // Check if cursor is over an editor area → Center or Split
-    let multi_group = state.engine.editor_groups.len() > 1;
-
+    let mut seen = std::collections::HashSet::new();
+    let mut bounds = Vec::new();
     for cwr in &state.cached_window_rects {
-        let rx = cwr.rect.x as f32;
-        let ry = cwr.rect.y as f32;
-        let rw = cwr.rect.width as f32;
-        let rh = cwr.rect.height as f32;
-
-        if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
-            let gid = cwr.group_id;
-
-            // Edge zone = 20% of dimension, min 30px
-            let edge_x = (rw * 0.2).max(30.0);
-            let edge_y = (rh * 0.2).max(30.0);
-
-            let rel_x = px - rx;
-            let rel_y = py - ry;
-
-            if rel_x < edge_x {
-                return DropZone::Split(gid, SplitDirection::Vertical, true);
-            }
-            if rel_x > rw - edge_x {
-                return DropZone::Split(gid, SplitDirection::Vertical, false);
-            }
-            if rel_y < edge_y {
-                return DropZone::Split(gid, SplitDirection::Horizontal, true);
-            }
-            if rel_y > rh - edge_y {
-                return DropZone::Split(gid, SplitDirection::Horizontal, false);
-            }
-
-            // Center — merge into group (only if multi-group or different group)
-            if multi_group || gid != source.0 {
-                return DropZone::Center(gid);
-            }
+        if !seen.insert(cwr.group_id) {
+            continue;
         }
+        let scroll_off = state
+            .engine
+            .editor_groups
+            .get(&cwr.group_id)
+            .map(|g| g.tab_scroll_offset)
+            .unwrap_or(0);
+        bounds.push(render::DropGroupBounds {
+            group_id: cwr.group_id,
+            x: cwr.rect.x as f32,
+            y: cwr.rect.y as f32,
+            width: cwr.rect.width as f32,
+            content_height: cwr.rect.height as f32,
+            tab_scroll_offset: scroll_off,
+        });
     }
 
-    DropZone::None
+    render::build_tab_drop_groups(&bounds, &state.engine, tab_h, &slots_map)
+}
+
+fn compute_win_tab_drop_zone(state: &AppState, px: f32, py: f32) -> DropZone {
+    if state.engine.tab_drag.is_none() {
+        return DropZone::None;
+    }
+    let (groups, tbh) = build_win_tab_drop_groups(state);
+    render::compute_tab_drop_zone(px, py, &groups, tbh)
 }
 
 // ─── Clipboard ───────────────────────────────────────────────────────────────

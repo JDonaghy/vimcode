@@ -11541,6 +11541,226 @@ pub fn editor_bottom_px(
         - separated_status_height_px(line_height, has_separated_status)
 }
 
+// ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
+
+pub struct TabDropGroup {
+    pub group_id: GroupId,
+    pub rect: quadraui::DropGroupRect,
+    pub tab_scroll_offset: usize,
+}
+
+pub struct TabDropOverlay {
+    pub highlight: Option<quadraui::Rect>,
+    pub insertion_bar: Option<quadraui::Rect>,
+    pub ghost_position: (f32, f32),
+}
+
+/// Lightweight group-bounds descriptor for [`build_tab_drop_groups`].
+pub struct DropGroupBounds {
+    pub group_id: GroupId,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub content_height: f32,
+    pub tab_scroll_offset: usize,
+}
+
+/// Build `TabDropGroup`s from a set of group bounds.
+///
+/// `tab_bar_height` is in the same units as the bounds (cells for TUI,
+/// pixels for GTK/Win-GUI). Each group's bounds describe the
+/// **content area** — the function prepends `tab_bar_height` above.
+///
+/// `tab_slots_map` maps `GroupId.0` → visible tab slot positions in
+/// the same coordinate system as the bounds.
+pub fn build_tab_drop_groups(
+    group_bounds: &[DropGroupBounds],
+    engine: &crate::core::engine::Engine,
+    tab_bar_height: f32,
+    tab_slots_map: &std::collections::HashMap<usize, Vec<(f32, f32)>>,
+) -> (Vec<TabDropGroup>, f32) {
+    let mut groups = Vec::new();
+    let breadcrumbs = engine.settings.breadcrumbs;
+
+    for gb in group_bounds {
+        let hidden = engine.is_tab_bar_hidden(gb.group_id);
+        let eff_tbh = if hidden {
+            if breadcrumbs {
+                tab_bar_height / 2.0
+            } else {
+                0.0
+            }
+        } else {
+            tab_bar_height
+        };
+        let tab_slots = if hidden {
+            Vec::new()
+        } else {
+            tab_slots_map
+                .get(&gb.group_id.0)
+                .cloned()
+                .unwrap_or_default()
+        };
+        groups.push(TabDropGroup {
+            group_id: gb.group_id,
+            rect: quadraui::DropGroupRect {
+                bounds: quadraui::Rect::new(
+                    gb.x,
+                    gb.y - eff_tbh,
+                    gb.width,
+                    eff_tbh + gb.content_height,
+                ),
+                tab_slots,
+            },
+            tab_scroll_offset: gb.tab_scroll_offset,
+        });
+    }
+
+    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
+        0.0
+    } else {
+        tab_bar_height
+    };
+    (groups, effective_tbh)
+}
+
+/// Build [`DropGroupBounds`] from a `ScreenLayout`, applying an
+/// editor-area offset. Both TUI and GTK call this when the
+/// `ScreenLayout` is available (draw path, or TUI's cached layout).
+pub fn screen_to_drop_group_bounds(
+    screen: &ScreenLayout,
+    engine: &crate::core::engine::Engine,
+    editor_origin: (f32, f32),
+    editor_size: (f32, f32),
+) -> Vec<DropGroupBounds> {
+    if let Some(ref split) = screen.editor_group_split {
+        split
+            .group_tab_bars
+            .iter()
+            .map(|gtb| DropGroupBounds {
+                group_id: gtb.group_id,
+                x: editor_origin.0 + gtb.bounds.x as f32,
+                y: editor_origin.1 + gtb.bounds.y as f32,
+                width: gtb.bounds.width as f32,
+                content_height: gtb.bounds.height as f32,
+                tab_scroll_offset: gtb.tab_scroll_offset,
+            })
+            .collect()
+    } else {
+        vec![DropGroupBounds {
+            group_id: engine.active_group,
+            x: editor_origin.0,
+            y: editor_origin.1,
+            width: editor_size.0,
+            content_height: editor_size.1,
+            tab_scroll_offset: screen.tab_scroll_offset,
+        }]
+    }
+}
+
+pub fn compute_tab_drop_zone(
+    cursor_x: f32,
+    cursor_y: f32,
+    groups: &[TabDropGroup],
+    tab_bar_height: f32,
+) -> crate::core::window::DropZone {
+    use crate::core::window::DropZone;
+
+    let rects: Vec<quadraui::DropGroupRect> = groups.iter().map(|g| g.rect.clone()).collect();
+    match quadraui::compute_drop_zone(cursor_x, cursor_y, &rects, tab_bar_height) {
+        Some(qz) => {
+            let g = &groups[qz.group_idx];
+            match qz.kind {
+                quadraui::DropZoneKind::Center => DropZone::Center(g.group_id),
+                quadraui::DropZoneKind::Split(edge) => {
+                    let (dir, new_first) = match edge {
+                        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
+                        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
+                        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
+                        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
+                    };
+                    DropZone::Split(g.group_id, dir, new_first)
+                }
+                quadraui::DropZoneKind::TabReorder(idx) => {
+                    DropZone::TabReorder(g.group_id, g.tab_scroll_offset + idx)
+                }
+            }
+        }
+        None => DropZone::None,
+    }
+}
+
+pub fn compute_tab_drop_overlay(
+    drop_zone: &crate::core::window::DropZone,
+    groups: &[TabDropGroup],
+    cursor: (f32, f32),
+    tab_bar_height: f32,
+    bar_thickness: f32,
+    ghost_offset: f32,
+) -> Option<TabDropOverlay> {
+    use crate::core::window::DropZone;
+
+    let ghost_position = (cursor.0 + ghost_offset, cursor.1);
+
+    match drop_zone {
+        DropZone::None => None,
+        DropZone::Center(gid) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, b.height)),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::Split(gid, dir, new_first) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let h = match (dir, new_first) {
+                (SplitDirection::Vertical, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Vertical, false) => {
+                    quadraui::Rect::new(b.x + b.width / 2.0, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Horizontal, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width, b.height / 2.0)
+                }
+                (SplitDirection::Horizontal, false) => {
+                    quadraui::Rect::new(b.x, b.y + b.height / 2.0, b.width, b.height / 2.0)
+                }
+            };
+            Some(TabDropOverlay {
+                highlight: Some(h),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::TabReorder(gid, abs_idx) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let vis_idx = abs_idx.saturating_sub(g.tab_scroll_offset);
+            let bar_x = if vis_idx < g.rect.tab_slots.len() {
+                g.rect.tab_slots[vis_idx].0
+            } else if let Some(last) = g.rect.tab_slots.last() {
+                last.1
+            } else {
+                b.x
+            };
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, tab_bar_height)),
+                insertion_bar: Some(quadraui::Rect::new(
+                    bar_x - bar_thickness / 2.0,
+                    b.y,
+                    bar_thickness,
+                    tab_bar_height,
+                )),
+                ghost_position,
+            })
+        }
+    }
+}
+
 /// Compute the scrollbar-to-scroll-top mapping from a click position.
 /// Returns the new `scroll_top` value.
 ///
