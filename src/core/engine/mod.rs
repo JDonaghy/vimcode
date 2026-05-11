@@ -2817,14 +2817,10 @@ pub struct Engine {
     pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
     /// Cached viewport row count from last render frame.
     pub explorer_viewport_rows: std::cell::Cell<usize>,
-    #[cfg(feature = "win-gui")]
-    pub menu_open_idx: Option<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
-    #[cfg(feature = "win-gui")]
-    pub menu_highlighted_item: Option<usize>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -3598,12 +3594,8 @@ impl Engine {
             explorer_new_entry_pending: None,
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             explorer_viewport_rows: std::cell::Cell::new(0),
-            #[cfg(feature = "win-gui")]
-            menu_open_idx: None,
             debug_toolbar_visible: false,
             dap_session_active: false,
-            #[cfg(feature = "win-gui")]
-            menu_highlighted_item: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
