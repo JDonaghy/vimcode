@@ -1662,6 +1662,55 @@ pub fn terminal_scrollbar_geometry(
     })
 }
 
+/// Pre-built terminal primitives ready for `Backend::draw_terminal`.
+/// Both backends call `build_terminal_draw_data` and then just do the
+/// backend-specific drawing (clear background, enter frame scope, divider).
+pub struct TerminalDrawData {
+    pub single: Option<quadraui::Terminal>,
+    pub left: Option<quadraui::Terminal>,
+    pub right: Option<quadraui::Terminal>,
+    pub split: Option<quadraui::TerminalSplitLayout>,
+}
+
+pub fn build_terminal_draw_data(
+    panel: &TerminalPanel,
+    area: quadraui::Rect,
+    cell_width: f32,
+    visible_rows: usize,
+    sb_width: Option<u16>,
+) -> TerminalDrawData {
+    let sb = Some(quadraui::TerminalScrollbar {
+        total_lines: panel.scrollback_rows + visible_rows,
+        visible_lines: visible_rows,
+        scroll_offset: panel.scroll_offset,
+        inverted: true,
+        width: sb_width,
+    });
+    if let Some(ref left_rows) = panel.split_left_rows {
+        let split =
+            quadraui::TerminalSplitLayout::new(area, panel.split_left_cols as usize, cell_width);
+        let left =
+            terminal_cells_to_quadraui(left_rows, quadraui::WidgetId::new("terminal:left"), None);
+        let right =
+            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:right"), sb);
+        TerminalDrawData {
+            single: None,
+            left: Some(left),
+            right: Some(right),
+            split: Some(split),
+        }
+    } else {
+        let term =
+            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"), sb);
+        TerminalDrawData {
+            single: Some(term),
+            left: None,
+            right: None,
+            split: None,
+        }
+    }
+}
+
 // ─── Menu bar / debug toolbar ─────────────────────────────────────────────────
 
 /// One item in a menu dropdown.
@@ -10762,6 +10811,7 @@ pub fn resolve_status_bar_click(
 pub fn terminal_cells_to_quadraui(
     rows: &[Vec<TerminalCell>],
     id: quadraui::WidgetId,
+    scrollbar: Option<quadraui::TerminalScrollbar>,
 ) -> quadraui::Terminal {
     let cells = rows
         .iter()
@@ -10782,7 +10832,11 @@ pub fn terminal_cells_to_quadraui(
                 .collect()
         })
         .collect();
-    quadraui::Terminal { id, cells }
+    quadraui::Terminal {
+        id,
+        cells,
+        scrollbar,
+    }
 }
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────

@@ -720,7 +720,7 @@ pub(super) fn draw_frame(
                         width: content_area.width,
                         height: content_area.height.saturating_sub(1),
                     };
-                    render_terminal_panel(frame.buffer_mut(), term_content, term, theme);
+                    render_terminal_panel(frame, backend, term_content, term, theme);
                     // Register terminal content area as a scroll surface.
                     engine
                         .scroll_surfaces
