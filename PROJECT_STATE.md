@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 10, 2026 (Session 361 — **#312 visual selection prepopulates search query** + quadraui#53 API integration fix. `search_set_focus(true)` extracts visual selection text → `project_search_query`. Also added `validation: None` to all `FormField` constructors and migrated extension integration tests from removed `handle_ext_sidebar_key` to `dispatch_ext_sidebar_key_unified`.)
+**Last updated:** May 11, 2026 (Session 362 — **Backend deduplication audit + terminal rendering collapse.** Audited all duplicate code across TUI/GTK, filed 11 issues (#343–#353). Integrated quadraui#121–#124 (inverted scrollbar, palette preview/tree, terminal split layout, tab drop-zone). Extracted `render::terminal_scrollbar_geometry()` + `render::build_terminal_draw_data()` as shared logic. Collapsed terminal rendering to thin wrappers around `Backend::draw_terminal`. Net ~320 lines of bespoke per-backend code removed across 2 PRs (#350, #353).)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -8,21 +8,29 @@
 
 **All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
-**Remaining milestone work** is consolidation and infrastructure:
+**Remaining milestone work** is consolidation, deduplication, and infrastructure:
 
 | # | Title | Category |
 |---|-------|----------|
-| [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low priority) |
+| [#344](https://github.com/JDonaghy/vimcode/issues/344) | Factor shared screen-level hit-test into render.rs | Dedup (medium) |
+| [#345](https://github.com/JDonaghy/vimcode/issues/345) | Factor tab drop-zone computation into render.rs | Dedup (blocked on quadraui#121) |
+| [#343](https://github.com/JDonaghy/vimcode/issues/343) | GTK: adopt DragTarget::ScrollbarX for horizontal scrollbar drag | Cleanup |
+| [#347](https://github.com/JDonaghy/vimcode/issues/347) | Factor tab-bar and breadcrumb-bar render wrappers | Dedup (low) |
+| [#348](https://github.com/JDonaghy/vimcode/issues/348) | Wildmenu: add quadraui adapter | Dedup (low) |
+| [#349](https://github.com/JDonaghy/vimcode/issues/349) | Global status bar: use quadraui StatusBar adapter | Dedup (low) |
+| [#351](https://github.com/JDonaghy/vimcode/issues/351) | Terminal: shared key dispatch (copy vs SIGINT vs paste) | Dedup (medium) |
+| [#352](https://github.com/JDonaghy/vimcode/issues/352) | GTK: click near line end places caret to the right | Bug (pre-existing) |
+| [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low) |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
-| ~~#312~~ | ~~Ctrl-Shift-F visual selection prepopulate~~ | ~~Feature (shipped Session 361)~~ |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (361):**
-- **#312 Visual selection prepopulates search query** — `search_set_focus(true)` checks if engine is in Visual/VisualLine/VisualBlock mode; if so, extracts selection text (first line for multiline), sets `project_search_query` + `search_query_caret`, clears visual mode. 3 new tests.
-- **quadraui#53 API integration** — Added `validation: None` to all 9 `FormField` constructors in `render.rs` (new field from quadraui's TextArea/PasswordInput/SegmentedControl update). Migrated `tests/extensions.rs` (25 call sites) and `tests/markdown_preview.rs` (1 call site) from removed `handle_ext_sidebar_key` to `dispatch_ext_sidebar_key_unified`. Added `ext_sidebar_setup` test helper with proper SidebarSystem initialization (`set_backend_info`, `populate_ext_sidebar_system`, section/path selection). Updated 8 tests to use SidebarSystem API instead of dead `ext_sidebar_selected` field.
+**Shipped this session (362):**
+- **PR #350 — quadraui#121–#124 integration + shared terminal scrollbar geometry (#346):** Integrated 4 new quadraui primitives. Extracted `terminal_scrollbar_geometry()` into render.rs. Migrated GTK terminal from bespoke `terminal_sb_dragging` to quadraui dispatch — fixed wheel scroll, track-click, thumb-drag. Fixed debug_output drag events silently dropped. Net -115 lines.
+- **PR #353 — Terminal rendering collapse (#123/#129/#131):** Both backends' terminal renderers (~230 lines each) replaced by thin wrappers around `Backend::draw_terminal` + `TerminalSplitLayout`. Extracted `build_terminal_draw_data()` in render.rs. Deleted `draw_terminal_panel`, `draw_terminal_cells`, `render_terminal_pane_cells`, `draw_terminal_row`. Terminal scrollbar now themed via quadraui. Fixed GTK dispatch_click consuming terminal clicks + missing char_width. Net -205 lines.
+- **Backend deduplication audit** — inventoried all duplicate code across TUI/GTK. Filed 4 quadraui issues (quadraui#121–#124) and 7 vimcode issues (#343–#349). All quadraui issues resolved.
 
 ---
 
@@ -30,7 +38,7 @@
 
 Vimcode at 1960 lib tests passing, 2048 total (lib+integration).
 
-> Sessions 361 and earlier in **SESSION_HISTORY.md**.
+> Sessions 362 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -83,7 +91,7 @@ cell coalescence) remain but are tracked separately.
 | Form (settings) | `Form` | ✅ | ✅ | hint field exists but unrendered (#202) |
 | Palette (cmd palette + folder picker) | `Palette` | ✅ | ✅ | layout via `PaletteLayout` |
 | Find/replace overlay | shared hit-regions | ✅ | ✅ | engine-side `compute_find_replace_hit_regions` |
-| Terminal cells | `Terminal` | ✅ | ✅ | |
+| Terminal cells + scrollbar + split | `Terminal` + `TerminalSplitLayout` | ✅ | ✅ | #353. `build_terminal_draw_data()` shared; both call `Backend::draw_terminal`. Themed scrollbar via `TerminalScrollbar { inverted: true }`. |
 | LSP hover popup (simple) | `Tooltip` | ✅ | ✅ | slice 1, `e1e76cd` |
 | Signature help popup | `Tooltip{styled_lines}` | ✅ | ✅ | slice 2, `aaa9a3c` |
 | Diff peek popup | `Tooltip{styled_lines}` | ✅ | ✅ | slice 3, `e6650fa` |
@@ -118,6 +126,7 @@ cell coalescence) remain but are tracked separately.
 - `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
 - `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338), source control panel (#321/#339/#340), and search panel (#323/#333/#334): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Search panel uses `SectionKind::Form` for the chrome section (quadraui#105). Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
 - `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
+- `render::build_terminal_draw_data()` + `Backend::draw_terminal` — terminal cell grid + themed scrollbar + split-pane layout. Both backends call one shared builder, then `draw_terminal`. Zero per-backend terminal rendering code (#353).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
@@ -132,4 +141,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 361 and earlier in **SESSION_HISTORY.md**.
+> Sessions 362 and earlier in **SESSION_HISTORY.md**.

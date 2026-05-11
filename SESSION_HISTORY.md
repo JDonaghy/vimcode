@@ -1,7 +1,18 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 361 archived here.
+All sessions through 362 archived here.
+
+---
+**Session 362 (May 10–11) — Backend deduplication audit + terminal rendering collapse (#346/#350/#353):**
+
+Audited all duplicate code across TUI and GTK backends. Filed 4 quadraui issues (#121 tab drag-and-drop, #122 palette preview/tree, #123 terminal split-pane layout, #124 inverted scrollbar) and 7 vimcode issues (#343–#349) in the Cross-Platform UI Crate milestone for systematic deduplication.
+
+**PR #350** (quadraui#121–#124 integration + shared terminal scrollbar geometry): Consumed 4 new quadraui primitives by adding required struct fields (inverted, preview, depth/expandable/expanded, width) across all construction sites. Extracted `render::terminal_scrollbar_geometry()` — shared formula for terminal scrollbar thumb position, replacing duplicate inline math in both backends. Migrated GTK terminal panel from bespoke `terminal_sb_dragging` state machine to quadraui's shared `dispatch_scroll`/`dispatch_click`/`dispatch_mouse_drag` — fixed GTK terminal scroll wheel (was going to editor) and track-click (was not working). Removed dead `current_drag_max_scroll()` helper (quadraui `inverted: true` handles the ratio flip). Fixed GTK `dispatch_mouse_drag` silently dropping `debug_output` scroll events. Net -115 lines bespoke code removed.
+
+**PR #353** (terminal rendering collapse via quadraui#123/#129/#131): Replaced bespoke terminal renderers in both backends with quadraui's `Backend::draw_terminal` (cells + themed scrollbar) + `TerminalSplitLayout` (split-pane geometry). Extracted `render::build_terminal_draw_data()` so both backends share one function for Terminal primitive construction (scrollbar, split layout, cell conversion). Deleted: GTK `draw_terminal_panel` (109 lines), GTK `draw_terminal_cells` wrapper (24 lines), TUI `render_terminal_panel` body (90 lines), TUI `render_terminal_pane_cells` (24 lines), TUI `draw_terminal_row` (42 lines). Terminal scrollbar now uses quadraui's themed `Scrollbar` primitive with `inverted: true` and configurable width. Fixed: GTK dispatch_click consuming all terminal clicks (blocking text selection/focus), missing `set_current_char_width`/`set_current_line_height` on GTK backend (wrong glyph spacing). Net -205 lines. Filed #351 (shared terminal key dispatch) and #352 (GTK click offset near line end).
+
+quadraui issues resolved: #121, #122, #123, #124, #129, #131. Issues filed: #343–#353.
 
 ---
 **Session 361 (May 10) — #312 visual selection prepopulates search query + quadraui#53 integration:**
