@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 363 archived here.
+All sessions through 364 archived here.
+
+---
+**Session 364 (May 11) — Shared screen-level hit-test (#344, PR #356):**
+
+Extracted zone detection + gutter action resolution into shared functions in `render.rs` so both GTK and TUI backends use one source of truth for screen-level hit-testing. Three shared functions: `screen_zone_hit_test` (identifies tab bar, breadcrumb, divider, or window zones from ScreenLayout geometry), `window_zone_hit_test` (identifies status bar, gutter, scrollbar, or text area sub-zones within a RenderedWindow), `resolve_gutter_action` (maps gutter column + line to breakpoint/git/diagnostic/code-action/fold actions using RenderedWindow data). Added `cached_screen_layout: Rc<RefCell<Option<ScreenLayout>>>` to GTK `App` struct — `draw_editor` moves the ScreenLayout into cache at end of frame (O(1), no clone). Click handlers read cached geometry instead of recomputing from engine state via `gtk_editor_bottom`/`calculate_group_window_rects`, eliminating the root cause of zone-boundary disagreement bugs between paint and click. Refactored GTK `pixel_to_click_target` to delegate zone detection to shared functions; extracted `tab_bar_inner_hit_test` helper for Pango-specific tab slot resolution. Refactored TUI gutter handler to use `resolve_gutter_action`. Tab bar inner hit-testing (Pango pixel slots) and buffer position column computation (tab-expansion walk) stay per-backend. Fixed panic from hardcoded `GroupId(0)` in single-group tab bar hit — now uses actual engine `active_group`. Net +247 lines. `render.rs` ~13,632 lines (was ~12,000). `src/gtk/click.rs` ~509 lines (was ~546).
 
 ---
 **Session 363 (May 11) — Tab drop-zone dedup (#345) + Win-GUI removal (#355):**

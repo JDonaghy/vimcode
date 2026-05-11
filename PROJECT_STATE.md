@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 11, 2026 (Session 363 — **Tab drop-zone dedup (#345) + Win-GUI removal (#355).** Factored tab drop-zone computation + overlay geometry into shared `render.rs` functions backed by `quadraui::compute_drop_zone()`. All backends now call `build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()`. Fixed GTK tab scroll offset bug, added GTK insertion bar. Removed the entire Win-GUI backend (11,572 lines of Direct2D/Win32 code) — zero users, broken build, will be rewritten as a thin ~200-line wrapper when the quadraui Win backend ships (quadraui#19–#31). Net -13,300 lines across PRs #354 and #355.)
+**Last updated:** May 11, 2026 (Session 364 — **Shared screen-level hit-test (#344, PR #356).** Extracted zone detection + gutter action resolution into shared functions in `render.rs` (`screen_zone_hit_test`, `window_zone_hit_test`, `resolve_gutter_action`). GTK backend now caches `ScreenLayout` from paint — click handlers read cached geometry instead of recomputing from engine state, eliminating the root cause of zone-boundary disagreement bugs. TUI gutter click handler also migrated to shared `resolve_gutter_action`. Tab bar inner hit-testing (Pango pixel slots) and column computation (tab walk) stay per-backend.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,7 +12,6 @@
 
 | # | Title | Category |
 |---|-------|----------|
-| [#344](https://github.com/JDonaghy/vimcode/issues/344) | Factor shared screen-level hit-test into render.rs | Dedup (medium) |
 | [#343](https://github.com/JDonaghy/vimcode/issues/343) | GTK: adopt DragTarget::ScrollbarX for horizontal scrollbar drag | Cleanup |
 | [#347](https://github.com/JDonaghy/vimcode/issues/347) | Factor tab-bar and breadcrumb-bar render wrappers | Dedup (low) |
 | [#348](https://github.com/JDonaghy/vimcode/issues/348) | Wildmenu: add quadraui adapter | Dedup (low) |
@@ -26,15 +25,14 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (363):**
-- **PR #354 — Factor tab drop-zone computation + overlay into render.rs (#345):** Replaced 3 bespoke per-backend drop-zone implementations with shared `render::compute_tab_drop_zone()` (delegates to `quadraui::compute_drop_zone()`) + `render::compute_tab_drop_overlay()` (shared overlay geometry). Extracted `build_tab_drop_groups()` + `DropGroupBounds` + `screen_to_drop_group_bounds()` so all backends share group iteration, hidden-tab-bar handling, and effective tab_bar_height computation. Each backend now only provides a tab_slots_map (backend-specific measurement) and final paint code (~15-20 lines each). Fixed pre-existing GTK bug where tab reorder indices ignored scroll offset. Added insertion-bar rendering to GTK tab drag. Net -112 lines.
-- **PR #355 — Remove Win-GUI backend (Direct2D/Win32):** Deleted `src/win_gui/` (11,572 lines), `win_gui_bin.rs`, `win-gui` feature flag, `windows` crate dependency, and all `#[cfg(feature = "win-gui")]` gates scattered across core engine code (~1,000 lines of win-gui-only methods, tests, render functions). Updated CLAUDE.md: backend count THREE → TWO. Net -13,093 lines.
+**Shipped this session (364):**
+- **PR #356 — Factor shared screen-level hit-test into render.rs (#344):** Extracted three shared functions into `render.rs`: `screen_zone_hit_test` (tab bar, breadcrumb, divider, window zone detection from ScreenLayout), `window_zone_hit_test` (status bar, gutter, scrollbar, text area sub-zones within a RenderedWindow), `resolve_gutter_action` (maps gutter column + line to breakpoint/git/diagnostic/code-action/fold actions). Added `cached_screen_layout: Rc<RefCell<Option<ScreenLayout>>>` to GTK App struct — `draw_editor` moves the layout into cache at end of frame (O(1), no clone). Refactored GTK `pixel_to_click_target` to delegate zone detection to shared functions, extracted `tab_bar_inner_hit_test` helper for Pango-specific slot resolution. Refactored TUI gutter handler to use `resolve_gutter_action`. Net +247 lines (180 shared code replaces ~250 duplicated lines across backends).
 
 ---
 
 Vimcode at 1960 lib tests passing, 2033 total (lib+integration).
 
-> Sessions 363 and earlier in **SESSION_HISTORY.md**.
+> Sessions 364 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -123,12 +121,13 @@ cell coalescence) remain but are tracked separately.
 - `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
 - `render::build_terminal_draw_data()` + `Backend::draw_terminal` — terminal cell grid + themed scrollbar + split-pane layout. Both backends call one shared builder, then `draw_terminal`. Zero per-backend terminal rendering code (#353).
 - `render::build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()` — tab drag-and-drop drop-zone computation (delegates to `quadraui::compute_drop_zone()`) and overlay geometry (highlight rect, insertion bar, ghost position). Both backends build a `tab_slots_map` (backend-specific measurement) and `DropGroupBounds`, then call shared functions. Zero per-backend drop-zone algorithm code (#345).
+- `render::screen_zone_hit_test()` + `window_zone_hit_test()` + `resolve_gutter_action()` — screen-level click zone detection (tab bar, window, breadcrumb, divider), window sub-zone detection (gutter, status bar, scrollbar, text area), and gutter action resolution. GTK caches `ScreenLayout` from paint; both backends call shared functions for zone detection. Tab bar inner slot resolution (Pango vs char-cell) stays per-backend (#344).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
 - ✅ True for picker / status-bar / tree / dialog / context-menu / tooltip-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
 - ✅ True for **rich-document** popups since #214 shipped + #266 lifted both rasterisers — adding new rich popups means writing a `RichTextDocument` and handlers, never touching Pango/cells.
-- ⚠️ **Hit-test glue still per-backend** (#210) — primitive layouts and `hit_test` methods are shared, but the wires from "mouse moved" → "selected_idx changed" are still hand-rolled in each backend's motion handler. Several bugs across the B.5 wave traced back to this (slice 6 row-height drift, slice 8 hand-rolled char-width math). Structural fix: motion handlers should call `layout.hit_test()` directly. The same shape exists in #211 (debug sidebar) and likely a few other surfaces.
+- ⚠️ **Hit-test glue partially shared** (#210/#344) — screen-level zone detection (tab bar, window, divider, breadcrumb) and window sub-zone detection (gutter, status bar, scrollbar, text area) now shared via `render::screen_zone_hit_test` + `window_zone_hit_test`. GTK caches ScreenLayout from paint (#344). Remaining per-backend: motion-handler → `selected_idx` wiring for primitive surfaces (#210), tab bar inner slot resolution (Pango vs char-cell).
 - ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
 - ⏭️ Win-GUI removed (Session 363). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31).
