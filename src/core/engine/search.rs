@@ -836,6 +836,20 @@ impl Engine {
     pub fn search_set_focus(&mut self, focused: bool) {
         self.search_has_focus = focused;
         if focused {
+            if matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                if let Some((text, _)) = self.get_visual_selection_text() {
+                    let first_line = text.lines().next().unwrap_or("").to_string();
+                    if !first_line.is_empty() {
+                        self.project_search_query = first_line;
+                        self.search_query_caret.set(self.project_search_query.len());
+                    }
+                }
+                self.mode = Mode::Normal;
+                self.visual_anchor = None;
+            }
             self.search_panel_form_focus
                 .replace(Some("search:query".to_string()));
             self.search_sidebar_system

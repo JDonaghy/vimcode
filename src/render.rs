@@ -6449,6 +6449,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                 },
                 hint: StyledText::default(),
                 disabled: false,
+                validation: None,
             },
             FormField {
                 id: WidgetId::new("search:replace"),
@@ -6465,6 +6466,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                 },
                 hint: StyledText::default(),
                 disabled: false,
+                validation: None,
             },
             FormField {
                 id: WidgetId::new("search:toggles"),
@@ -6490,6 +6492,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                 },
                 hint: StyledText::default(),
                 disabled: false,
+                validation: None,
             },
             FormField {
                 id: WidgetId::new("search:buttons"),
@@ -6515,6 +6518,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                 },
                 hint: StyledText::default(),
                 disabled: false,
+                validation: None,
             },
             FormField {
                 id: WidgetId::new("search:status"),
@@ -6534,6 +6538,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                 },
                 hint: StyledText::default(),
                 disabled: false,
+                validation: None,
             },
         ],
         focused_field: form_focus.as_deref().map(WidgetId::new),
@@ -7736,6 +7741,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     kind: FieldKind::Label,
                     hint: StyledText::default(),
                     disabled: false,
+                    validation: None,
                 }
             }
             SettingsRow::ExtCategory(name) => {
@@ -7757,6 +7763,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     kind: FieldKind::Label,
                     hint: StyledText::default(),
                     disabled: false,
+                    validation: None,
                 }
             }
             SettingsRow::CoreSetting(idx) => {
@@ -7776,6 +7783,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     kind,
                     hint: StyledText::default(),
                     disabled: false,
+                    validation: None,
                 }
             }
             SettingsRow::ExtSetting(ext_name, key) => {
@@ -7811,6 +7819,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                     kind,
                     hint: StyledText::default(),
                     disabled: false,
+                    validation: None,
                 }
             }
         };

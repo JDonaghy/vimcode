@@ -7681,6 +7681,56 @@ fn test_search_input_unicode() {
 }
 
 #[test]
+fn test_search_set_focus_prepopulates_from_visual_selection() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world foo bar");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 6;
+    press_char(&mut engine, 'v');
+    for _ in 0..4 {
+        press_char(&mut engine, 'l');
+    }
+    assert!(matches!(engine.mode, Mode::Visual));
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "world");
+    assert_eq!(engine.search_query_caret.get(), 5);
+    assert!(matches!(engine.mode, Mode::Normal));
+    assert!(engine.visual_anchor.is_none());
+    assert!(engine.search_has_focus);
+}
+
+#[test]
+fn test_search_set_focus_multiline_uses_first_line() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "line one\nline two\nline three");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, 'j');
+    assert!(matches!(engine.mode, Mode::VisualLine));
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "line one");
+    assert_eq!(engine.search_query_caret.get(), "line one".len());
+    assert!(matches!(engine.mode, Mode::Normal));
+}
+
+#[test]
+fn test_search_set_focus_no_selection_keeps_existing_query() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.project_search_query = "existing".to_string();
+    engine.search_query_caret.set(8);
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "existing");
+    assert_eq!(engine.search_query_caret.get(), 8);
+}
+
+#[test]
 fn test_start_and_poll_project_search() {
     let dir = make_search_dir("engine_async");
     let mut engine = Engine::new();

@@ -203,7 +203,7 @@ fn extension_readme_opens_in_own_tab() {
     e.ext_sidebar_selected = 0; // First installed item.
 
     let before_tabs = e.active_group().tabs.len();
-    e.handle_ext_sidebar_key("Return", false, None);
+    e.dispatch_ext_sidebar_key_unified("Return", None);
     // Should have opened in a new tab (not a vsplit).
     assert_eq!(
         e.active_group().tabs.len(),
