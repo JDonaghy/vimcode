@@ -392,6 +392,7 @@ pub(super) fn draw_editor(
             line_height,
             char_width,
             &layout,
+            &tab_slot_positions_out.borrow(),
         );
     }
 
@@ -964,110 +965,60 @@ pub(super) fn draw_tab_drag_overlay(
     height: f64,
     line_height: f64,
     _char_width: f64,
-    layout: &pango::Layout,
+    pango_layout: &pango::Layout,
+    tab_slot_positions: &TabSlotMap,
 ) {
-    use crate::core::window::{DropZone, SplitDirection, WindowRect};
-
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
-    let status_bar_height = line_height * global_status_rows + wildmenu_px;
-    let qf_px = if engine.quickfix_open {
-        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
-        (n + 1.0) * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        let target = super::gtk_terminal_target_maximize_rows(engine, height, line_height);
-        (engine.effective_terminal_panel_rows(target) as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
-    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
-    let mut group_rects = engine
-        .group_layout
-        .calculate_group_rects(content_bounds, tab_bar_height);
-    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
-
-    // Helper: effective tab bar height for a group (0 if hidden).
-    let eff_tbh = |gid: crate::core::window::GroupId| -> f64 {
-        if engine.is_tab_bar_hidden(gid) {
-            if engine.settings.breadcrumbs {
-                tab_bar_height / 2.0
-            } else {
-                0.0
-            }
-        } else {
-            tab_bar_height
-        }
+    let (groups, tbh) = super::click::build_gtk_tab_drop_groups(
+        engine,
+        width,
+        height,
+        line_height,
+        tab_slot_positions,
+    );
+    let cursor = engine
+        .tab_drag_mouse
+        .map(|(mx, my)| (mx as f32, my as f32))
+        .unwrap_or((0.0, 0.0));
+    let overlay = match render::compute_tab_drop_overlay(
+        &engine.tab_drop_zone,
+        &groups,
+        cursor,
+        tbh,
+        2.0,
+        12.0,
+    ) {
+        Some(o) => o,
+        None => return,
     };
 
-    // Compute highlight rect from the drop zone.
-    let zone = engine.tab_drop_zone;
-    let highlight: Option<(f64, f64, f64, f64)> = match zone {
-        DropZone::Center(gid) => group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
-            let tbh = eff_tbh(gid);
-            (r.x, r.y - tbh, r.width, r.height + tbh)
-        }),
-        DropZone::Split(gid, dir, new_first) => {
-            group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
-                let tbh = eff_tbh(gid);
-                let full_y = r.y - tbh;
-                let full_h = r.height + tbh;
-                match (dir, new_first) {
-                    (SplitDirection::Vertical, true) => (r.x, full_y, r.width / 2.0, full_h),
-                    (SplitDirection::Vertical, false) => {
-                        (r.x + r.width / 2.0, full_y, r.width / 2.0, full_h)
-                    }
-                    (SplitDirection::Horizontal, true) => (r.x, full_y, r.width, full_h / 2.0),
-                    (SplitDirection::Horizontal, false) => {
-                        (r.x, full_y + full_h / 2.0, r.width, full_h / 2.0)
-                    }
-                }
-            })
-        }
-        DropZone::TabReorder(gid, _idx) => group_rects
-            .iter()
-            .find(|(g, _)| *g == gid)
-            .map(|(_, r)| (r.x, r.y - eff_tbh(gid), r.width, line_height)),
-        DropZone::None => None,
-    };
-
-    // Draw the highlight rectangle.
-    if let Some((hx, hy, hw, hh)) = highlight {
+    if let Some(h) = overlay.highlight {
         let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
         cr.set_source_rgba(cr_r, cr_g, cr_b, 0.15);
-        cr.rectangle(hx, hy, hw, hh);
+        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
         cr.fill().ok();
         cr.set_source_rgba(cr_r, cr_g, cr_b, 0.5);
         cr.set_line_width(2.0);
-        cr.rectangle(hx, hy, hw, hh);
+        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
         cr.stroke().ok();
     }
 
-    // Draw a small ghost label near the cursor.
+    if let Some(bar) = overlay.insertion_bar {
+        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+        cr.set_source_rgb(cr_r, cr_g, cr_b);
+        cr.rectangle(
+            bar.x as f64,
+            bar.y as f64,
+            bar.width as f64,
+            bar.height as f64,
+        );
+        cr.fill().ok();
+    }
+
     if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
         let label = &drag.tab_name;
         if !label.is_empty() {
-            layout.set_text(label);
-            let (tw, th) = layout.pixel_size();
+            pango_layout.set_text(label);
+            let (tw, th) = pango_layout.pixel_size();
             let gx = mx + 12.0;
             let gy = my - th as f64 / 2.0;
             let pad = 4.0;
@@ -1083,7 +1034,7 @@ pub(super) fn draw_tab_drag_overlay(
             let (gfr, gfg, gfb) = theme.foreground.to_cairo();
             cr.set_source_rgba(gfr, gfg, gfb, 0.9);
             cr.move_to(gx, gy);
-            pangocairo::show_layout(cr, layout);
+            pangocairo::show_layout(cr, pango_layout);
         }
     }
 }

@@ -11541,6 +11541,123 @@ pub fn editor_bottom_px(
         - separated_status_height_px(line_height, has_separated_status)
 }
 
+// ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
+
+pub struct TabDropGroup {
+    pub group_id: GroupId,
+    pub rect: quadraui::DropGroupRect,
+    pub tab_scroll_offset: usize,
+}
+
+pub struct TabDropOverlay {
+    pub highlight: Option<quadraui::Rect>,
+    pub insertion_bar: Option<quadraui::Rect>,
+    pub ghost_position: (f32, f32),
+}
+
+pub fn compute_tab_drop_zone(
+    cursor_x: f32,
+    cursor_y: f32,
+    groups: &[TabDropGroup],
+    tab_bar_height: f32,
+) -> crate::core::window::DropZone {
+    use crate::core::window::DropZone;
+
+    let rects: Vec<quadraui::DropGroupRect> = groups.iter().map(|g| g.rect.clone()).collect();
+    match quadraui::compute_drop_zone(cursor_x, cursor_y, &rects, tab_bar_height) {
+        Some(qz) => {
+            let g = &groups[qz.group_idx];
+            match qz.kind {
+                quadraui::DropZoneKind::Center => DropZone::Center(g.group_id),
+                quadraui::DropZoneKind::Split(edge) => {
+                    let (dir, new_first) = match edge {
+                        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
+                        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
+                        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
+                        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
+                    };
+                    DropZone::Split(g.group_id, dir, new_first)
+                }
+                quadraui::DropZoneKind::TabReorder(idx) => {
+                    DropZone::TabReorder(g.group_id, g.tab_scroll_offset + idx)
+                }
+            }
+        }
+        None => DropZone::None,
+    }
+}
+
+pub fn compute_tab_drop_overlay(
+    drop_zone: &crate::core::window::DropZone,
+    groups: &[TabDropGroup],
+    cursor: (f32, f32),
+    tab_bar_height: f32,
+    bar_thickness: f32,
+    ghost_offset: f32,
+) -> Option<TabDropOverlay> {
+    use crate::core::window::DropZone;
+
+    let ghost_position = (cursor.0 + ghost_offset, cursor.1);
+
+    match drop_zone {
+        DropZone::None => None,
+        DropZone::Center(gid) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, b.height)),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::Split(gid, dir, new_first) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let h = match (dir, new_first) {
+                (SplitDirection::Vertical, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Vertical, false) => {
+                    quadraui::Rect::new(b.x + b.width / 2.0, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Horizontal, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width, b.height / 2.0)
+                }
+                (SplitDirection::Horizontal, false) => {
+                    quadraui::Rect::new(b.x, b.y + b.height / 2.0, b.width, b.height / 2.0)
+                }
+            };
+            Some(TabDropOverlay {
+                highlight: Some(h),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::TabReorder(gid, abs_idx) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let vis_idx = abs_idx.saturating_sub(g.tab_scroll_offset);
+            let bar_x = if vis_idx < g.rect.tab_slots.len() {
+                g.rect.tab_slots[vis_idx].0
+            } else if let Some(last) = g.rect.tab_slots.last() {
+                last.1
+            } else {
+                b.x
+            };
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, tab_bar_height)),
+                insertion_bar: Some(quadraui::Rect::new(
+                    bar_x - bar_thickness / 2.0,
+                    b.y,
+                    bar_thickness,
+                    tab_bar_height,
+                )),
+                ghost_position,
+            })
+        }
+    }
+}
+
 /// Compute the scrollbar-to-scroll-top mapping from a click position.
 /// Returns the new `scroll_top` value.
 ///

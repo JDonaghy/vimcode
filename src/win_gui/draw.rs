@@ -990,154 +990,50 @@ impl<'a> DrawContext<'a> {
 
     pub fn draw_tab_drag_overlay(
         &self,
-        layout: &ScreenLayout,
         engine: &crate::core::engine::Engine,
+        state: &super::AppState,
     ) {
-        use crate::core::window::{DropZone, SplitDirection};
-
         let drag = match &engine.tab_drag {
             Some(td) => td,
             None => return,
         };
 
-        let zone = &engine.tab_drop_zone;
+        let (groups, tbh) = super::build_win_tab_drop_groups(state);
         let lh = self.line_height;
-        let tab_h = lh * super::TAB_BAR_HEIGHT_MULT;
+        let cursor = engine
+            .tab_drag_mouse
+            .map(|(mx, my)| (mx as f32, my as f32))
+            .unwrap_or((0.0, 0.0));
+        let overlay = match render::compute_tab_drop_overlay(
+            &engine.tab_drop_zone,
+            &groups,
+            cursor,
+            tbh,
+            2.0,
+            10.0,
+        ) {
+            Some(o) => o,
+            None => return,
+        };
 
-        // Blue overlay for drop zone
         let overlay_color = Color::from_rgb(30, 60, 120);
         let overlay_brush = self.solid_brush(overlay_color);
 
-        // Determine the highlight rectangle based on drop zone
-        if let Some(ref split) = layout.editor_group_split {
-            for gtb in &split.group_tab_bars {
-                let bx = gtb.bounds.x as f32;
-                let by = gtb.bounds.y as f32;
-                let bw = gtb.bounds.width as f32;
-                let bh = gtb.bounds.height as f32;
-                // Account for breadcrumb row when positioning tab bar overlay
-                let has_bc = layout
-                    .breadcrumbs
-                    .iter()
-                    .any(|bc| bc.group_id == gtb.group_id && !bc.segments.is_empty());
-                let bc_offset = if has_bc { lh } else { 0.0 };
-                let tab_bar_y = by - tab_h - bc_offset;
-
-                match zone {
-                    DropZone::Center(gid) if *gid == gtb.group_id => unsafe {
-                        self.rt.FillRectangle(
-                            &rect_f(bx, tab_bar_y, bw, bh + tab_h + bc_offset),
-                            &overlay_brush,
-                        );
-                    },
-                    DropZone::Split(gid, dir, new_first) if *gid == gtb.group_id => {
-                        let (rx, ry, rw, rh) = match (dir, new_first) {
-                            (SplitDirection::Vertical, true) => (bx, by, bw / 2.0, bh),
-                            (SplitDirection::Vertical, false) => (bx + bw / 2.0, by, bw / 2.0, bh),
-                            (SplitDirection::Horizontal, true) => (bx, by, bw, bh / 2.0),
-                            (SplitDirection::Horizontal, false) => {
-                                (bx, by + bh / 2.0, bw, bh / 2.0)
-                            }
-                        };
-                        unsafe {
-                            self.rt
-                                .FillRectangle(&rect_f(rx, ry, rw, rh), &overlay_brush);
-                        }
-                    }
-                    DropZone::TabReorder(gid, idx) if *gid == gtb.group_id => {
-                        // Highlight the tab bar
-                        unsafe {
-                            self.rt
-                                .FillRectangle(&rect_f(bx, tab_bar_y, bw, tab_h), &overlay_brush);
-                        }
-                        // Draw insertion bar
-                        let cw = self.char_width;
-                        let mut x = bx;
-                        for (i, tab) in gtb.tabs.iter().enumerate() {
-                            if i == *idx {
-                                break;
-                            }
-                            x += (tab.name.chars().count() as f32 + 3.0) * cw;
-                        }
-                        let bar_brush = self.solid_brush(self.theme.cursor);
-                        unsafe {
-                            self.rt
-                                .FillRectangle(&rect_f(x - 1.0, tab_bar_y, 2.0, tab_h), &bar_brush);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            // Single group — handle TabReorder insertion bar + Split/Center overlay
-            match zone {
-                DropZone::TabReorder(_, idx) => {
-                    let tab_y = if layout.menu_bar.is_some() {
-                        super::TITLE_BAR_TOP_INSET + lh * super::TITLE_BAR_HEIGHT_MULT
-                    } else {
-                        0.0
-                    };
-                    let cw = self.char_width;
-                    let mut x = self.editor_left;
-                    for (i, tab) in layout.tab_bar.iter().enumerate() {
-                        if i == *idx {
-                            break;
-                        }
-                        x += (tab.name.chars().count() as f32 + 3.0) * cw;
-                    }
-                    let bar_brush = self.solid_brush(self.theme.cursor);
-                    unsafe {
-                        self.rt
-                            .FillRectangle(&rect_f(x - 1.0, tab_y, 2.0, tab_h), &bar_brush);
-                    }
-                }
-                DropZone::Split(_, dir, new_first) => {
-                    // Use the first window rect as the editor area
-                    if let Some(rw) = layout.windows.first() {
-                        let bx = rw.rect.x as f32;
-                        let by = rw.rect.y as f32;
-                        let bw = rw.rect.width as f32;
-                        let bh = rw.rect.height as f32;
-                        let (rx, ry, rw_f, rh_f) = match (dir, new_first) {
-                            (SplitDirection::Vertical, true) => (bx, by, bw / 2.0, bh),
-                            (SplitDirection::Vertical, false) => (bx + bw / 2.0, by, bw / 2.0, bh),
-                            (SplitDirection::Horizontal, true) => (bx, by, bw, bh / 2.0),
-                            (SplitDirection::Horizontal, false) => {
-                                (bx, by + bh / 2.0, bw, bh / 2.0)
-                            }
-                        };
-                        unsafe {
-                            self.rt
-                                .FillRectangle(&rect_f(rx, ry, rw_f, rh_f), &overlay_brush);
-                        }
-                    }
-                }
-                DropZone::Center(_) => {
-                    // Highlight entire editor area
-                    if let Some(rw) = layout.windows.first() {
-                        let tab_y = if layout.menu_bar.is_some() {
-                            super::TITLE_BAR_TOP_INSET + lh * super::TITLE_BAR_HEIGHT_MULT
-                        } else {
-                            0.0
-                        };
-                        unsafe {
-                            self.rt.FillRectangle(
-                                &rect_f(
-                                    rw.rect.x as f32,
-                                    tab_y,
-                                    rw.rect.width as f32,
-                                    rw.rect.height as f32 + rw.rect.y as f32 - tab_y,
-                                ),
-                                &overlay_brush,
-                            );
-                        }
-                    }
-                }
-                DropZone::None => {}
+        if let Some(h) = overlay.highlight {
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(h.x, h.y, h.width, h.height), &overlay_brush);
             }
         }
 
-        // Ghost label near mouse cursor
+        if let Some(bar) = overlay.insertion_bar {
+            let bar_brush = self.solid_brush(self.theme.cursor);
+            unsafe {
+                self.rt
+                    .FillRectangle(&rect_f(bar.x, bar.y, bar.width, bar.height), &bar_brush);
+            }
+        }
+
         if let Some((mx, my)) = engine.tab_drag_mouse {
             let mx = mx as f32;
             let my = my as f32;

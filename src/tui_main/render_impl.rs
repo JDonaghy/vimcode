@@ -1335,6 +1335,70 @@ pub(super) fn tab_tooltip_at_col(
 }
 
 /// Draw the tab drag-and-drop overlay (highlight drop zone + ghost label).
+fn build_tui_tab_drop_groups(
+    engine: &Engine,
+    editor_area: Rect,
+    screen: &render::ScreenLayout,
+) -> (Vec<render::TabDropGroup>, f32) {
+    let tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+    let mut groups = Vec::new();
+
+    if let Some(ref split) = screen.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            let gx = gtb.bounds.x as f32;
+            let gw = gtb.bounds.width as f32;
+            let content_h = gtb.bounds.height as f32;
+            let tab_bar_rel = (gtb.bounds.y as u16).saturating_sub(tbh);
+            let abs_x = editor_area.x as f32 + gx;
+            let abs_y = editor_area.y as f32 + tab_bar_rel as f32;
+            let scroll_off = gtb.tab_scroll_offset;
+            let ov = if scroll_off > 0 { 2.0f32 } else { 0.0 };
+            let mut x = abs_x + ov;
+            let mut tab_slots = Vec::new();
+            for tab in gtb.tabs.iter().skip(scroll_off) {
+                let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
+                tab_slots.push((x, x + tw));
+                x += tw;
+            }
+            groups.push(render::TabDropGroup {
+                group_id: gtb.group_id,
+                rect: quadraui::DropGroupRect {
+                    bounds: quadraui::Rect::new(abs_x, abs_y, gw, tbh as f32 + content_h),
+                    tab_slots,
+                },
+                tab_scroll_offset: scroll_off,
+            });
+        }
+    } else {
+        let group_id = engine.active_group;
+        let scroll_off = screen.tab_scroll_offset;
+        let ov = if scroll_off > 0 { 2.0f32 } else { 0.0 };
+        let abs_x = editor_area.x as f32;
+        let mut x = abs_x + ov;
+        let mut tab_slots = Vec::new();
+        for tab in screen.tab_bar.iter().skip(scroll_off) {
+            let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
+            tab_slots.push((x, x + tw));
+            x += tw;
+        }
+        groups.push(render::TabDropGroup {
+            group_id,
+            rect: quadraui::DropGroupRect {
+                bounds: quadraui::Rect::new(
+                    abs_x,
+                    editor_area.y as f32,
+                    editor_area.width as f32,
+                    editor_area.height as f32,
+                ),
+                tab_slots,
+            },
+            tab_scroll_offset: scroll_off,
+        });
+    }
+
+    (groups, tbh as f32)
+}
+
 pub(super) fn render_tab_drag_overlay(
     frame: &mut ratatui::Frame,
     engine: &Engine,
@@ -1342,82 +1406,30 @@ pub(super) fn render_tab_drag_overlay(
     screen: &render::ScreenLayout,
     theme: &render::Theme,
 ) {
-    use crate::core::window::{DropZone, SplitDirection};
-
-    let tui_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-    let zone = engine.tab_drop_zone;
-
-    // Accent color for the drop zone highlight.
-    let highlight_bg = RColor::Indexed(24); // dark blue
-
-    // Compute the highlight rectangle in absolute terminal coordinates.
-    let highlight: Option<(u16, u16, u16, u16)> = if let Some(ref split) = screen.editor_group_split
-    {
-        match zone {
-            DropZone::Center(gid) => {
-                split
-                    .group_tab_bars
-                    .iter()
-                    .find(|g| g.group_id == gid)
-                    .map(|g| {
-                        let x = editor_area.x + g.bounds.x as u16;
-                        let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
-                        let w = g.bounds.width as u16;
-                        let h = g.bounds.height as u16 + tui_tbh;
-                        (x, y, w, h)
-                    })
-            }
-            DropZone::Split(gid, dir, new_first) => split
-                .group_tab_bars
-                .iter()
-                .find(|g| g.group_id == gid)
-                .map(|g| {
-                    let x = editor_area.x + g.bounds.x as u16;
-                    let full_y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
-                    let w = g.bounds.width as u16;
-                    let full_h = g.bounds.height as u16 + tui_tbh;
-                    match (dir, new_first) {
-                        (SplitDirection::Vertical, true) => (x, full_y, w / 2, full_h),
-                        (SplitDirection::Vertical, false) => (x + w / 2, full_y, w - w / 2, full_h),
-                        (SplitDirection::Horizontal, true) => (x, full_y, w, full_h / 2),
-                        (SplitDirection::Horizontal, false) => {
-                            (x, full_y + full_h / 2, w, full_h - full_h / 2)
-                        }
-                    }
-                }),
-            DropZone::TabReorder(gid, _) => split
-                .group_tab_bars
-                .iter()
-                .find(|g| g.group_id == gid)
-                .map(|g| {
-                    let x = editor_area.x + g.bounds.x as u16;
-                    let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
-                    let w = g.bounds.width as u16;
-                    (x, y, w, 1)
-                }),
-            DropZone::None => None,
-        }
-    } else {
-        let x = editor_area.x;
-        let y = editor_area.y;
-        let w = editor_area.width;
-        let h = editor_area.height;
-        match zone {
-            DropZone::Center(_) => Some((x, y, w, h)),
-            DropZone::Split(_, dir, new_first) => Some(match (dir, new_first) {
-                (SplitDirection::Vertical, true) => (x, y, w / 2, h),
-                (SplitDirection::Vertical, false) => (x + w / 2, y, w - w / 2, h),
-                (SplitDirection::Horizontal, true) => (x, y, w, h / 2),
-                (SplitDirection::Horizontal, false) => (x, y + h / 2, w, h - h / 2),
-            }),
-            DropZone::TabReorder(_, _) => Some((x, y, w, 1)),
-            DropZone::None => None,
-        }
+    let (groups, tbh) = build_tui_tab_drop_groups(engine, editor_area, screen);
+    let cursor = engine
+        .tab_drag_mouse
+        .map(|(mx, my)| (mx as f32, my as f32))
+        .unwrap_or((0.0, 0.0));
+    let overlay = match render::compute_tab_drop_overlay(
+        &engine.tab_drop_zone,
+        &groups,
+        cursor,
+        tbh,
+        1.0,
+        2.0,
+    ) {
+        Some(o) => o,
+        None => return,
     };
 
-    // Draw the highlight area.
-    if let Some((hx, hy, hw, hh)) = highlight {
+    let highlight_bg = RColor::Indexed(24);
+    if let Some(h) = overlay.highlight {
         let buf = frame.buffer_mut();
+        let hx = h.x as u16;
+        let hy = h.y as u16;
+        let hw = h.width as u16;
+        let hh = h.height as u16;
         for dy in 0..hh {
             for dx in 0..hw {
                 let cx = hx + dx;
@@ -1430,57 +1442,24 @@ pub(super) fn render_tab_drag_overlay(
         }
     }
 
-    // For TabReorder, draw a vertical insertion bar at the target position.
-    if let DropZone::TabReorder(gid, idx) = zone {
-        let tab_bar_info: Option<(u16, u16, &[render::TabInfo], usize)> =
-            if let Some(ref split) = screen.editor_group_split {
-                split
-                    .group_tab_bars
-                    .iter()
-                    .find(|g| g.group_id == gid)
-                    .map(|g| {
-                        let x = editor_area.x + g.bounds.x as u16;
-                        let y = editor_area.y + (g.bounds.y as u16).saturating_sub(tui_tbh);
-                        (x, y, g.tabs.as_slice(), g.tab_scroll_offset)
-                    })
-            } else {
-                Some((
-                    editor_area.x,
-                    editor_area.y,
-                    screen.tab_bar.as_slice(),
-                    screen.tab_scroll_offset,
-                ))
-            };
-
-        if let Some((bar_x, bar_y, tabs, scroll_off)) = tab_bar_info {
-            let ov_cols: u16 = if scroll_off > 0 { 2 } else { 0 };
-            let mut insert_x: u16 = ov_cols;
-            for (i, tab) in tabs.iter().enumerate().skip(scroll_off) {
-                if i == idx {
-                    break;
-                }
-                insert_x += tab.name.chars().count() as u16 + TAB_CLOSE_COLS;
-            }
-            let abs_x = bar_x + insert_x;
-            set_cell_styled(
-                frame.buffer_mut(),
-                abs_x,
-                bar_y,
-                '▎',
-                RColor::Indexed(39),
-                rc(theme.tab_bar_bg),
-                Modifier::empty(),
-                None,
-            );
-        }
+    if let Some(bar) = overlay.insertion_bar {
+        set_cell_styled(
+            frame.buffer_mut(),
+            bar.x as u16,
+            bar.y as u16,
+            '▎',
+            RColor::Indexed(39),
+            rc(theme.tab_bar_bg),
+            Modifier::empty(),
+            None,
+        );
     }
 
-    // Draw ghost label near cursor.
-    if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
+    if let (Some(ref drag), Some(_)) = (&engine.tab_drag, engine.tab_drag_mouse) {
         let label = &drag.tab_name;
         if !label.is_empty() {
-            let gx = (mx as u16) + 2;
-            let gy = my as u16;
+            let gx = overlay.ghost_position.0 as u16;
+            let gy = overlay.ghost_position.1 as u16;
             let ghost_fg = RColor::White;
             let ghost_bg = RColor::Indexed(238);
             let buf = frame.buffer_mut();
@@ -1504,132 +1483,23 @@ pub(super) fn compute_tui_tab_drop_zone(
     last_layout: Option<&render::ScreenLayout>,
     terminal_size: Option<Size>,
 ) -> crate::core::window::DropZone {
-    use crate::core::window::{DropZone, SplitDirection};
-
     let layout = match last_layout {
         Some(l) => l,
-        None => return DropZone::None,
+        None => return crate::core::window::DropZone::None,
     };
-
-    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-    let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-
     if col < editor_left {
-        return DropZone::None;
+        return crate::core::window::DropZone::None;
     }
-    let rel_col = col - editor_left;
-
-    if let Some(ref split) = layout.editor_group_split {
-        // Multi-group mode: check each group's tab bar and content area.
-        for gtb in split.group_tab_bars.iter() {
-            let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
-            let gx = gtb.bounds.x as u16;
-            let gw = gtb.bounds.width as u16;
-            let group_id = gtb.group_id;
-
-            // Tab bar region — determine reorder insertion index.
-            if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
-                let local_col = rel_col - gx;
-                let ov_cols: u16 = if gtb.tab_scroll_offset > 0 { 2 } else { 0 };
-                let mut x: u16 = ov_cols;
-                for (i, tab) in gtb.tabs.iter().enumerate().skip(gtb.tab_scroll_offset) {
-                    let name_w = tab.name.chars().count() as u16;
-                    let tab_w = name_w + TAB_CLOSE_COLS;
-                    let mid = x + tab_w / 2;
-                    if local_col < mid {
-                        return DropZone::TabReorder(group_id, i);
-                    }
-                    x += tab_w;
-                }
-                return DropZone::TabReorder(group_id, gtb.tabs.len());
-            }
-
-            // Content area — edge zones for split, center for merge.
-            let content_top = menu_rows + gtb.bounds.y as u16;
-            let content_left = gx;
-            let content_right = gx + gw;
-            let content_h = gtb.bounds.height as u16;
-            let content_bottom = content_top + content_h;
-            if rel_col >= content_left
-                && rel_col < content_right
-                && row >= content_top
-                && row < content_bottom
-            {
-                let w = gw;
-                let h = content_h;
-                let rx = rel_col - content_left;
-                let ry = row - content_top;
-                // Edge zones: ~20% of each dimension, minimum 3 cells.
-                let edge_w = (w / 5).max(3).min(w / 2);
-                let edge_h = (h / 5).max(2).min(h / 2);
-
-                if rx < edge_w {
-                    return DropZone::Split(group_id, SplitDirection::Vertical, true);
-                }
-                if rx >= w - edge_w {
-                    return DropZone::Split(group_id, SplitDirection::Vertical, false);
-                }
-                if ry < edge_h {
-                    return DropZone::Split(group_id, SplitDirection::Horizontal, true);
-                }
-                if ry >= h - edge_h {
-                    return DropZone::Split(group_id, SplitDirection::Horizontal, false);
-                }
-                return DropZone::Center(group_id);
-            }
-        }
-    } else {
-        // Single-group mode: tab bar reorder + content area edge zones for split.
-        let group_id = engine.active_group;
-        if row == menu_rows {
-            let local_col = rel_col;
-            let sg_offset = layout.tab_scroll_offset;
-            let ov_cols: u16 = if sg_offset > 0 { 2 } else { 0 };
-            let mut x: u16 = ov_cols;
-            for (i, tab) in layout.tab_bar.iter().enumerate().skip(sg_offset) {
-                let name_w = tab.name.chars().count() as u16;
-                let tab_w = name_w + TAB_CLOSE_COLS;
-                let mid = x + tab_w / 2;
-                if local_col < mid {
-                    return DropZone::TabReorder(group_id, i);
-                }
-                x += tab_w;
-            }
-            return DropZone::TabReorder(group_id, layout.tab_bar.len());
-        }
-
-        // Content area — edge zones for split, center for merge.
-        if let Some(ts) = terminal_size {
-            let content_top = menu_rows + click_tbh;
-            let editor_w = ts.width.saturating_sub(editor_left);
-            // status + command = 2 rows at bottom
-            let content_bottom = ts.height.saturating_sub(2);
-            if row >= content_top && row < content_bottom && rel_col < editor_w {
-                let w = editor_w;
-                let h = content_bottom - content_top;
-                let rx = rel_col;
-                let ry = row - content_top;
-                let edge_w = (w / 5).max(3).min(w / 2);
-                let edge_h = (h / 5).max(2).min(h / 2);
-
-                if rx < edge_w {
-                    return DropZone::Split(group_id, SplitDirection::Vertical, true);
-                }
-                if rx >= w - edge_w {
-                    return DropZone::Split(group_id, SplitDirection::Vertical, false);
-                }
-                if ry < edge_h {
-                    return DropZone::Split(group_id, SplitDirection::Horizontal, true);
-                }
-                if ry >= h - edge_h {
-                    return DropZone::Split(group_id, SplitDirection::Horizontal, false);
-                }
-                return DropZone::Center(group_id);
-            }
-        }
-    }
-
-    DropZone::None
+    let ts = match terminal_size {
+        Some(s) => s,
+        None => return crate::core::window::DropZone::None,
+    };
+    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    let editor_w = ts.width.saturating_sub(editor_left);
+    let editor_h = ts.height.saturating_sub(menu_rows + 2);
+    let editor_area = Rect::new(editor_left, menu_rows, editor_w, editor_h);
+    let (groups, tbh) = build_tui_tab_drop_groups(engine, editor_area, layout);
+    render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
 }
 
 /// Render the tab bar via `Backend::draw_tab_bar`. Returns the
