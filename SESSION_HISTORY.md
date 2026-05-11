@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 360 archived here.
+All sessions through 361 archived here.
+
+---
+**Session 361 (May 10) — #312 visual selection prepopulates search query + quadraui#53 integration:**
+
+Implemented #312: `search_set_focus(true)` in `src/core/engine/search.rs` now checks if the engine is in Visual/VisualLine/VisualBlock mode. If so, extracts selection text via `get_visual_selection_text()`, takes the first line (for multiline selections), sets `project_search_query` + `search_query_caret`, clears visual mode (`mode = Normal`, `visual_anchor = None`). 3 new unit tests: single-line visual, multiline first-line-only, no-selection preserves existing query. Also fixed quadraui#53 API breakage: `FormField` gained a `validation: Option<ValidationState>` field — added `validation: None` to all 9 constructors in `src/render.rs`. Migrated integration tests from `handle_ext_sidebar_key` (gated behind `#[cfg(feature = "win-gui")]` since Session 358) to `dispatch_ext_sidebar_key_unified`: 25 call sites in `tests/extensions.rs`, 1 in `tests/markdown_preview.rs`. Added `ext_sidebar_setup` test helper that initializes `ext_sidebar_body_rect`, calls `set_backend_info` with `MsvLayoutMetrics`, populates the SidebarSystem, sets focus/active-section/selected-path. Rewrote 8 tests that asserted against dead `ext_sidebar_selected` field to use `ext_selected_from_sidebar_system()` and SidebarSystem's `active_section()`/`is_collapsed()` APIs. All 2048 tests passing (1960 lib + 88 integration). Path A landed to `develop`.
 
 ---
 **Session 360 (May 9–10) — Search panel → SidebarSystem (#323/#333/#334, PR #342):**

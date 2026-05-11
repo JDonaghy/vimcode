@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 10, 2026 (Session 360 — **Search panel → SidebarSystem** (#323/#333/#334, PR #342). 2-section SidebarSystem (Form + Tree) via quadraui#105 `SectionKind::Form`. Unified `dispatch_search_sidebar_key_unified()` for all 3 backends. 6 quadraui issues filed and resolved (#105/#107/#109/#110/#112/#116). `search_set_focus()` + `search_switch_to_results()` deduplicate 6 activation sites. Net -120 lines.)
+**Last updated:** May 10, 2026 (Session 361 — **#312 visual selection prepopulates search query** + quadraui#53 API integration fix. `search_set_focus(true)` extracts visual selection text → `project_search_query`. Also added `validation: None` to all `FormField` constructors and migrated extension integration tests from removed `handle_ext_sidebar_key` to `dispatch_ext_sidebar_key_unified`.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -17,22 +17,20 @@
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
 | [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
-| [#312](https://github.com/JDonaghy/vimcode/issues/312) | Ctrl-Shift-F visual selection prepopulate | Feature |
+| ~~#312~~ | ~~Ctrl-Shift-F visual selection prepopulate~~ | ~~Feature (shipped Session 361)~~ |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (360):**
-- **#323 Search panel → SidebarSystem** (PR #342) — 2-section SidebarSystem (Form + Tree) via quadraui#105 `SectionKind::Form`. `populate_search_sidebar_system()` builds Form (query/replace/toggles/buttons/status) + TreeRows (file-grouped results with collapse). Unified `dispatch_search_sidebar_key_unified()` for TUI/GTK/Win-GUI. `search_set_focus()` + `search_switch_to_results()` deduplicate 6 activation sites. Removed `project_search_selected`, `search_file_expanded`, `search_panel_msv_layout`, `build_search_panel_msv()`. Toggles auto-rerun search. GTK: `alt` on `Msg::KeyPress`, `search_has_focus` routing, `wire_da_events`, `ISO_Left_Tab` → `BackTab`. 4 new tests.
-- **#333 TUI duplicate search focus** — `search_input_mode`, `replace_input_focused`, `search_scroll_top` removed from TuiSidebar. Engine `search_panel_form_focus` is single source of truth.
-- **#334 Cross-backend search behavior** — Printable char in results mode re-enters form input on all backends.
-- **quadraui issues filed + resolved:** #105 (Form sections in SidebarSystem), #107 (Form click event semantics), #109 (GTK empty TextInput cursor), #110 (tree header click precision), #112 (ToggleGroup/ButtonRow per-item click), #116 (Form hit region drift).
+**Shipped this session (361):**
+- **#312 Visual selection prepopulates search query** — `search_set_focus(true)` checks if engine is in Visual/VisualLine/VisualBlock mode; if so, extracts selection text (first line for multiline), sets `project_search_query` + `search_query_caret`, clears visual mode. 3 new tests.
+- **quadraui#53 API integration** — Added `validation: None` to all 9 `FormField` constructors in `render.rs` (new field from quadraui's TextArea/PasswordInput/SegmentedControl update). Migrated `tests/extensions.rs` (25 call sites) and `tests/markdown_preview.rs` (1 call site) from removed `handle_ext_sidebar_key` to `dispatch_ext_sidebar_key_unified`. Added `ext_sidebar_setup` test helper with proper SidebarSystem initialization (`set_backend_info`, `populate_ext_sidebar_system`, section/path selection). Updated 8 tests to use SidebarSystem API instead of dead `ext_sidebar_selected` field.
 
 ---
 
-**Previous sessions (359 and earlier):** in SESSION_HISTORY.md.
+**Previous sessions (360 and earlier):** in SESSION_HISTORY.md.
 
-Vimcode at 1957 lib tests passing. PR #342 open on `issue-323-search-sidebar-system`.
+Vimcode at 1960 lib tests passing, 2048 total (lib+integration).
 
-> Sessions 360 and earlier in **SESSION_HISTORY.md**.
+> Sessions 361 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
@@ -134,4 +132,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 360 and earlier in **SESSION_HISTORY.md**.
+> Sessions 361 and earlier in **SESSION_HISTORY.md**.
