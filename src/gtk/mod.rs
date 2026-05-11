@@ -400,8 +400,6 @@ struct App {
     /// where `action_id` is e.g. `menu:7`. Click + motion handlers
     /// walk this list to map (x, y) → engine-side
     /// `MENU_STRUCTURE.items` index instead of computing row indices
-    /// True while the user is dragging the terminal panel's scrollbar thumb.
-    terminal_sb_dragging: bool,
     /// True while the user drags the terminal header row to resize the panel.
     terminal_resize_dragging: bool,
     /// True while the user drags the terminal split divider left/right.
@@ -2265,7 +2263,6 @@ impl SimpleComponent for App {
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             debug_toolbar_hovered_id: Rc::new(RefCell::new(None)),
             debug_toolbar_pressed_id: Rc::new(RefCell::new(None)),
-            terminal_sb_dragging: false,
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             group_divider_dragging: None,
@@ -2628,6 +2625,7 @@ impl SimpleComponent for App {
                         visible_rows: viewport,
                         total_items: total,
                         grab_offset,
+                        inverted: false,
                     });
 
                 let events = quadraui::dispatch_mouse_drag(
@@ -4477,6 +4475,17 @@ impl SimpleComponent for App {
                                     }
                                     return;
                                 }
+                                "terminal_scrollback" => {
+                                    let step = (delta.y.abs() * 3.0).ceil() as usize;
+                                    if delta.y > 0.0 {
+                                        engine.terminal_scroll_down(step);
+                                    } else {
+                                        engine.terminal_scroll_up(step);
+                                    }
+                                    drop(engine);
+                                    self.draw_needed.set(true);
+                                    return;
+                                }
                                 _ => {}
                             }
                         }
@@ -6252,6 +6261,20 @@ impl App {
                     } if id.as_str() == "debug_output" => {
                         return;
                     }
+                    quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset }
+                        if widget.as_str() == "terminal_scrollback" =>
+                    {
+                        if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
+                            term.set_scroll_offset(*new_offset);
+                        }
+                        self.draw_needed.set(true);
+                        return;
+                    }
+                    quadraui::UiEvent::MouseDown {
+                        widget: Some(id), ..
+                    } if id.as_str() == "terminal_scrollback" => {
+                        return;
+                    }
                     _ => {}
                 }
             }
@@ -6802,6 +6825,7 @@ impl App {
                                 visible_rows,
                                 total_items: total,
                                 grab_offset: 0.0,
+                                inverted: false,
                             });
                     } else if y >= results_top && y < results_bottom {
                         let mut engine = self.engine.borrow_mut();
@@ -6945,6 +6969,7 @@ impl App {
                                     visible_rows: sb_hit.visible_rows,
                                     total_items: sb_hit.total,
                                     grab_offset: 0.0,
+                                    inverted: false,
                                 });
                             self.draw_needed.set(true);
                             return;
@@ -7264,25 +7289,18 @@ impl App {
                         false
                     };
                     if !on_divider {
-                        // 6px scrollbar strip on the right edge — start a scrollbar drag.
-                        if x >= width - SB_W {
-                            self.terminal_sb_dragging = true;
-                        } else {
-                            self.terminal_sb_dragging = false;
-                            self.terminal_resize_dragging = false;
-                            let row = ((y - term_y - 2.0 * self.cached_line_height)
-                                / self.cached_line_height)
-                                as u16;
-                            let col = (x / self.cached_char_width.max(1.0)) as u16;
-                            self.engine.borrow_mut().terminal_scroll_reset();
-                            if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                                term.selection = Some(crate::core::terminal::TermSelection {
-                                    start_row: row,
-                                    start_col: col,
-                                    end_row: row,
-                                    end_col: col,
-                                });
-                            }
+                        self.terminal_resize_dragging = false;
+                        let row = ((y - term_y - 2.0 * self.cached_line_height)
+                            / self.cached_line_height) as u16;
+                        let col = (x / self.cached_char_width.max(1.0)) as u16;
+                        self.engine.borrow_mut().terminal_scroll_reset();
+                        if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
+                            term.selection = Some(crate::core::terminal::TermSelection {
+                                start_row: row,
+                                start_col: col,
+                                end_row: row,
+                                end_col: col,
+                            });
                         }
                     }
                 } else {
@@ -7709,6 +7727,18 @@ impl App {
                                     .editor_hover_set_scroll(*new_offset);
                                 self.draw_needed.set(true);
                             }
+                            "terminal_scrollback" => {
+                                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
+                                    term.set_scroll_offset(*new_offset);
+                                }
+                                self.draw_needed.set(true);
+                            }
+                            "debug_output" => {
+                                let mut engine = self.engine.borrow_mut();
+                                engine.debug_output_scroll = *new_offset;
+                                engine.debug_output_auto_scroll = false;
+                                self.draw_needed.set(true);
+                            }
                             _ => {}
                         }
                     }
@@ -7900,48 +7930,6 @@ impl App {
                 self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
                 self.draw_needed.set(true);
             }
-        } else if self.terminal_sb_dragging {
-            let (term_rows, scrollback_rows) = {
-                let engine = self.engine.borrow();
-                if let Some(term) = engine.active_terminal() {
-                    (term.rows, term.history.len())
-                } else {
-                    (0, 0)
-                }
-            };
-            if term_rows > 0 {
-                let term_px = {
-                    let engine = self.engine.borrow();
-                    let target =
-                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
-                    let effective = engine.effective_terminal_panel_rows(target);
-                    (effective as f64 + 2.0) * self.cached_line_height
-                };
-                let global_status_rows = if self.engine.borrow().settings.window_status_line {
-                    0.0
-                } else {
-                    1.0
-                };
-                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
-                let toolbar_px = if self.engine.borrow().debug_toolbar_visible {
-                    self.cached_line_height
-                } else {
-                    0.0
-                };
-                let term_y = height - status_h - toolbar_px - term_px;
-                let content_y = term_y + 2.0 * self.cached_line_height;
-                let content_h = term_px - 2.0 * self.cached_line_height;
-                if scrollback_rows > 0 && content_h > 0.0 {
-                    let y_rel = (y - content_y).clamp(0.0, content_h);
-                    let frac = y_rel / content_h;
-                    // frac=0 (top) → max scroll; frac=1 (bottom) → live view
-                    let new_offset = ((1.0 - frac) * scrollback_rows as f64) as usize;
-                    if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                        term.set_scroll_offset(new_offset.min(scrollback_rows));
-                    }
-                }
-            }
-            self.draw_needed.set(true);
         } else {
             // Check if drag is in the terminal content area (text selection).
             let in_terminal = if self.cached_line_height > 0.0 {
@@ -8070,7 +8058,6 @@ impl App {
                 }
             }
         }
-        self.terminal_sb_dragging = false;
         if self.terminal_resize_dragging {
             self.terminal_resize_dragging = false;
             let rows = self.engine.borrow().session.terminal_panel_rows;
@@ -9337,7 +9324,7 @@ impl App {
                 };
                 if let Some(y) = click_y {
                     engine.ext_sidebar_has_focus = true;
-                    if y < line_height as f64 {
+                    if y < line_height {
                         // Panel header — no-op.
                     } else if y < chrome_h {
                         engine.ext_sidebar_input_active = true;

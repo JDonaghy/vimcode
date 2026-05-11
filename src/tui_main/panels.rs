@@ -225,6 +225,7 @@ pub(super) fn render_sidebar(
             total_items: total_rows,
             visible_items: visible_rows,
             scroll_offset: scroll_top,
+            inverted: false,
         })
     } else {
         None
@@ -374,6 +375,7 @@ pub(super) fn render_settings_panel(
                 total_items: total,
                 visible_items: content_height,
                 scroll_offset: scroll,
+                inverted: false,
             })
         } else {
             None
@@ -687,6 +689,7 @@ pub(super) fn render_settings_panel(
             total_items: total,
             visible_items: content_height,
             scroll_offset: scroll,
+            inverted: false,
         })
     } else {
         None
@@ -1634,6 +1637,7 @@ pub(super) fn render_ext_panel(
             total_items: total,
             visible_items: content_area_height,
             scroll_offset: scroll,
+            inverted: false,
         })
     } else {
         None
@@ -2514,23 +2518,15 @@ pub(super) fn render_terminal_panel(
     }
     let fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
 
-    // ── Scrollbar geometry ────────────────────────────────────────────────────
     let content_rows = area.height as usize;
     let sb_col = area.x + area.width.saturating_sub(1);
-    // Compute thumb range (row indices into the content area).
-    let total = panel.scrollback_rows + content_rows;
-    let (thumb_start, thumb_end) = if panel.scrollback_rows == 0 || area.width < 2 {
-        (0, content_rows) // no scrollback → full bar
+    let geom = render::terminal_scrollbar_geometry(panel, content_rows);
+    let (thumb_start, thumb_end) = if let Some(g) = &geom {
+        let ts = (g.thumb_top_frac * content_rows as f64) as usize;
+        let th = (g.thumb_height_frac * content_rows as f64).max(1.0) as usize;
+        (ts, (ts + th).min(content_rows))
     } else {
-        let thumb_h = ((content_rows * content_rows) / total).max(1);
-        let max_off = panel.scrollback_rows;
-        // scroll_offset=0 → thumb at bottom (live view); max_off → thumb at top.
-        let max_top = content_rows.saturating_sub(thumb_h);
-        let thumb_top = {
-            let frac = 1.0 - (panel.scroll_offset as f64 / max_off as f64).min(1.0);
-            (frac * max_top as f64) as usize
-        };
-        (thumb_top, (thumb_top + thumb_h).min(content_rows))
+        (0, content_rows)
     };
 
     // ── Split view: left pane | divider | right pane ─────────────────────────

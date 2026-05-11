@@ -780,6 +780,7 @@ pub(super) fn draw_frame(
                                 total_items: td.lines.len(),
                                 visible_items: td_layout.visible_lines.len(),
                                 scroll_offset: td_layout.resolved_scroll_offset,
+                                inverted: false,
                             }
                         });
                 engine
@@ -1272,6 +1273,9 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
                     folder_icon.clone()
                 }),
                 match_positions: Vec::new(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
             }
         })
         .collect();
@@ -1286,6 +1290,7 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
         scroll_offset: picker.scroll_top,
         total_count: picker.all_entries.len(),
         has_focus: true,
+        preview: None,
     }
 }
 

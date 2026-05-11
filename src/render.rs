@@ -1627,6 +1627,41 @@ pub struct TerminalPanel {
     pub maximized: bool,
 }
 
+/// Terminal scrollbar thumb position as fractions of track height.
+/// Both backends use this for painting and `SurfaceScrollbar` registration.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalScrollbarGeom {
+    pub thumb_top_frac: f64,
+    pub thumb_height_frac: f64,
+    pub total_items: usize,
+    pub visible_items: usize,
+}
+
+/// Returns `None` when there's no scrollback (thumb fills entire track).
+pub fn terminal_scrollbar_geometry(
+    panel: &TerminalPanel,
+    visible_rows: usize,
+) -> Option<TerminalScrollbarGeom> {
+    if panel.scrollback_rows == 0 {
+        return None;
+    }
+    let total = panel.scrollback_rows + visible_rows;
+    let thumb_frac = (visible_rows as f64 / total as f64).max(0.01);
+    let max_off = panel.scrollback_rows as f64;
+    let frac = if panel.scroll_offset == 0 {
+        1.0
+    } else {
+        1.0 - (panel.scroll_offset as f64 / max_off).min(1.0)
+    };
+    let thumb_top_frac = frac * (1.0 - thumb_frac);
+    Some(TerminalScrollbarGeom {
+        thumb_top_frac,
+        thumb_height_frac: thumb_frac,
+        total_items: total,
+        visible_items: visible_rows,
+    })
+}
+
 // ─── Menu bar / debug toolbar ─────────────────────────────────────────────────
 
 /// One item in a menu dropdown.
@@ -7681,6 +7716,9 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
             detail: it.detail.as_deref().map(StyledText::plain),
             icon: None,
             match_positions: it.match_positions.clone(),
+            depth: 0,
+            expandable: false,
+            expanded: false,
         })
         .collect();
 
@@ -7694,6 +7732,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
         scroll_offset: picker.scroll_top,
         total_count: picker.total_count,
         has_focus: true,
+        preview: None,
     })
 }
 
