@@ -1,10 +1,10 @@
 # VimCode Project State
 
-**Last updated:** May 11, 2026 (Session 362 — **Backend deduplication audit + terminal rendering collapse.** Audited all duplicate code across TUI/GTK, filed 11 issues (#343–#353). Integrated quadraui#121–#124 (inverted scrollbar, palette preview/tree, terminal split layout, tab drop-zone). Extracted `render::terminal_scrollbar_geometry()` + `render::build_terminal_draw_data()` as shared logic. Collapsed terminal rendering to thin wrappers around `Backend::draw_terminal`. Net ~320 lines of bespoke per-backend code removed across 2 PRs (#350, #353).)
+**Last updated:** May 11, 2026 (Session 363 — **Tab drop-zone dedup (#345) + Win-GUI removal (#355).** Factored tab drop-zone computation + overlay geometry into shared `render.rs` functions backed by `quadraui::compute_drop_zone()`. All backends now call `build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()`. Fixed GTK tab scroll offset bug, added GTK insertion bar. Removed the entire Win-GUI backend (11,572 lines of Direct2D/Win32 code) — zero users, broken build, will be rewritten as a thin ~200-line wrapper when the quadraui Win backend ships (quadraui#19–#31). Net -13,300 lines across PRs #354 and #355.)
 
 ## Active milestone: Cross-Platform UI Crate
 
-**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. Win-GUI is deferred until quadraui implements that backend.
+**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
 
 **All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
@@ -13,7 +13,6 @@
 | # | Title | Category |
 |---|-------|----------|
 | [#344](https://github.com/JDonaghy/vimcode/issues/344) | Factor shared screen-level hit-test into render.rs | Dedup (medium) |
-| [#345](https://github.com/JDonaghy/vimcode/issues/345) | Factor tab drop-zone computation into render.rs | Dedup (blocked on quadraui#121) |
 | [#343](https://github.com/JDonaghy/vimcode/issues/343) | GTK: adopt DragTarget::ScrollbarX for horizontal scrollbar drag | Cleanup |
 | [#347](https://github.com/JDonaghy/vimcode/issues/347) | Factor tab-bar and breadcrumb-bar render wrappers | Dedup (low) |
 | [#348](https://github.com/JDonaghy/vimcode/issues/348) | Wildmenu: add quadraui adapter | Dedup (low) |
@@ -27,21 +26,17 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (362):**
-- **PR #350 — quadraui#121–#124 integration + shared terminal scrollbar geometry (#346):** Integrated 4 new quadraui primitives. Extracted `terminal_scrollbar_geometry()` into render.rs. Migrated GTK terminal from bespoke `terminal_sb_dragging` to quadraui dispatch — fixed wheel scroll, track-click, thumb-drag. Fixed debug_output drag events silently dropped. Net -115 lines.
-- **PR #353 — Terminal rendering collapse (#123/#129/#131):** Both backends' terminal renderers (~230 lines each) replaced by thin wrappers around `Backend::draw_terminal` + `TerminalSplitLayout`. Extracted `build_terminal_draw_data()` in render.rs. Deleted `draw_terminal_panel`, `draw_terminal_cells`, `render_terminal_pane_cells`, `draw_terminal_row`. Terminal scrollbar now themed via quadraui. Fixed GTK dispatch_click consuming terminal clicks + missing char_width. Net -205 lines.
-- **Backend deduplication audit** — inventoried all duplicate code across TUI/GTK. Filed 4 quadraui issues (quadraui#121–#124) and 7 vimcode issues (#343–#349). All quadraui issues resolved.
+**Shipped this session (363):**
+- **PR #354 — Factor tab drop-zone computation + overlay into render.rs (#345):** Replaced 3 bespoke per-backend drop-zone implementations with shared `render::compute_tab_drop_zone()` (delegates to `quadraui::compute_drop_zone()`) + `render::compute_tab_drop_overlay()` (shared overlay geometry). Extracted `build_tab_drop_groups()` + `DropGroupBounds` + `screen_to_drop_group_bounds()` so all backends share group iteration, hidden-tab-bar handling, and effective tab_bar_height computation. Each backend now only provides a tab_slots_map (backend-specific measurement) and final paint code (~15-20 lines each). Fixed pre-existing GTK bug where tab reorder indices ignored scroll offset. Added insertion-bar rendering to GTK tab drag. Net -112 lines.
+- **PR #355 — Remove Win-GUI backend (Direct2D/Win32):** Deleted `src/win_gui/` (11,572 lines), `win_gui_bin.rs`, `win-gui` feature flag, `windows` crate dependency, and all `#[cfg(feature = "win-gui")]` gates scattered across core engine code (~1,000 lines of win-gui-only methods, tests, render functions). Updated CLAUDE.md: backend count THREE → TWO. Net -13,093 lines.
 
 ---
 
-**Previous sessions (360 and earlier):** in SESSION_HISTORY.md.
+Vimcode at 1960 lib tests passing, 2033 total (lib+integration).
 
-Vimcode at 1960 lib tests passing, 2048 total (lib+integration).
-
-> Sessions 362 and earlier in **SESSION_HISTORY.md**.
+> Sessions 363 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
-> Per-session implementation notes through Session 348 are in **SESSION_HISTORY.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
 
 
@@ -127,15 +122,16 @@ cell coalescence) remain but are tracked separately.
 - `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338), source control panel (#321/#339/#340), and search panel (#323/#333/#334): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Search panel uses `SectionKind::Form` for the chrome section (quadraui#105). Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
 - `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
 - `render::build_terminal_draw_data()` + `Backend::draw_terminal` — terminal cell grid + themed scrollbar + split-pane layout. Both backends call one shared builder, then `draw_terminal`. Zero per-backend terminal rendering code (#353).
+- `render::build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()` — tab drag-and-drop drop-zone computation (delegates to `quadraui::compute_drop_zone()`) and overlay geometry (highlight rect, insertion bar, ghost position). Both backends build a `tab_slots_map` (backend-specific measurement) and `DropGroupBounds`, then call shared functions. Zero per-backend drop-zone algorithm code (#345).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
 - ✅ True for picker / status-bar / tree / dialog / context-menu / tooltip-shaped surfaces — adding a new instance means writing data + handlers, never touching Pango/cells.
 - ✅ True for **rich-document** popups since #214 shipped + #266 lifted both rasterisers — adding new rich popups means writing a `RichTextDocument` and handlers, never touching Pango/cells.
 - ⚠️ **Hit-test glue still per-backend** (#210) — primitive layouts and `hit_test` methods are shared, but the wires from "mouse moved" → "selected_idx changed" are still hand-rolled in each backend's motion handler. Several bugs across the B.5 wave traced back to this (slice 6 row-height drift, slice 8 hand-rolled char-width math). Structural fix: motion handlers should call `layout.hit_test()` directly. The same shape exists in #211 (debug sidebar) and likely a few other surfaces.
-- ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO, future Win-GUI `ReadDirectoryChangesW`). Suppress decision is shared (#201) but not the watcher invocation.
+- ❌ No `Backend::watch_file(path) -> Stream<FileEvent>` trait method — every backend rolls its own watcher (TUI poll, GTK GIO). Suppress decision is shared (#201) but not the watcher invocation.
 - ✅ **Editor viewport lifted** (Phase C Stage 1 / #276). Both backends paint through `quadraui::{tui,gtk}::draw_editor`. The vim-motion-suite vision (PLAN.md) is now unblocked at the paint layer; engine-slice extraction (Phase 2 — `editor_core` crate carving out `keys.rs` + buffer + LSP) remains as a separate multi-month wave.
-- ⏭️ Win-GUI has TreeView / Explorer / StatusBar / TabBar but most of B.3+ hasn't reached Windows. "Cross-platform" currently means ~1.5 platforms.
+- ⏭️ Win-GUI removed (Session 363). Will be re-added as a thin wrapper when quadraui ships its Win backend (quadraui#19–#31).
 
 ---
 

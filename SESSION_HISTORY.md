@@ -1,7 +1,14 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 362 archived here.
+All sessions through 363 archived here.
+
+---
+**Session 363 (May 11) — Tab drop-zone dedup (#345) + Win-GUI removal (#355):**
+
+**PR #354** (tab drop-zone computation + overlay into render.rs, #345): Replaced 3 bespoke per-backend drop-zone implementations with shared functions in render.rs backed by `quadraui::compute_drop_zone()`. Added `TabDropGroup`, `DropGroupBounds`, `TabDropOverlay` types. `build_tab_drop_groups()` handles group iteration, hidden-tab-bar logic, and effective tab_bar_height — called by both TUI and GTK (and formerly Win-GUI). `compute_tab_drop_overlay()` centralises highlight rect, insertion bar, and ghost position geometry. `screen_to_drop_group_bounds()` derives group bounds from ScreenLayout for backends that have it cached. Each backend now provides only: (1) a `tab_slots_map` with backend-specific tab measurements, (2) ~15 lines of final paint code. Fixed pre-existing GTK bug where tab reorder indices ignored scroll offset. Added insertion-bar rendering to GTK tab drag (previously only TUI and Win-GUI drew one). Net -112 lines.
+
+**PR #355** (remove Win-GUI backend): Deleted `src/win_gui/` (4 files, 11,572 lines), `src/win_gui_bin.rs` (36 lines), `win-gui` feature flag, `windows` crate dependency (21 Win32 feature gates), and all `#[cfg(feature = "win-gui")]` blocks scattered across 9 core engine files (~1,000 lines of win-gui-only methods including `handle_debug_sidebar_key`, `handle_ext_sidebar_key`, 5 vscode menu methods, 8 dap_ops methods, `sc_open_selected_async`, 3 render.rs adapter functions, 16 win-gui-only tests, and the `UiAction` parity verification test). Updated CLAUDE.md: backend count THREE → TWO, removed win-gui build/test/clippy instructions. Rationale: zero users, broken build (windows-future dep), every milestone PR carried untested Win-GUI overhead, and the backend will be replaced wholesale (~200-line thin wrapper) when the quadraui Win backend ships (quadraui#19–#31). Net -13,093 lines.
 
 ---
 **Session 362 (May 10–11) — Backend deduplication audit + terminal rendering collapse (#346/#350/#353):**
