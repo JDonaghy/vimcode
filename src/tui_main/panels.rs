@@ -2505,10 +2505,10 @@ pub(super) fn render_terminal_toolbar(
     }
 }
 
-/// Render the terminal panel content (cells + scrollbar + split view).
-/// The toolbar row is drawn separately by `render_terminal_toolbar`.
+/// Render the terminal panel content via quadraui's `draw_terminal`.
 pub(super) fn render_terminal_panel(
-    buf: &mut ratatui::buffer::Buffer,
+    frame: &mut ratatui::Frame,
+    backend: &mut quadraui::tui::TuiBackend,
     area: Rect,
     panel: &render::TerminalPanel,
     theme: &Theme,
@@ -2516,142 +2516,46 @@ pub(super) fn render_terminal_panel(
     if area.height == 0 {
         return;
     }
-    let fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
-
     let content_rows = area.height as usize;
-    let sb_col = area.x + area.width.saturating_sub(1);
-    let geom = render::terminal_scrollbar_geometry(panel, content_rows);
-    let (thumb_start, thumb_end) = if let Some(g) = &geom {
-        let ts = (g.thumb_top_frac * content_rows as f64) as usize;
-        let th = (g.thumb_height_frac * content_rows as f64).max(1.0) as usize;
-        (ts, (ts + th).min(content_rows))
-    } else {
-        (0, content_rows)
-    };
+    let fg = RColor::Rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
+    let term_bg = rc(theme.terminal_bg);
+    let q_theme = super::quadraui_tui::q_theme(theme);
 
-    // ── Split view: left pane | divider | right pane ─────────────────────────
-    if let Some(ref left_rows) = panel.split_left_rows {
-        let half_w = panel.split_left_cols; // left-pane column count (may reflect drag state)
-        let div_col = area.x + half_w;
-
-        // A.7: build both panes' `quadraui::Terminal` primitives once before
-        // the row loop. The per-row drawer reads from the primitive's owned
-        // cell vec; building once avoids N allocations per frame for an
-        // N-row terminal.
-        let left_term = render::terminal_cells_to_quadraui(
-            left_rows,
-            quadraui::WidgetId::new("terminal:split-left"),
-        );
-        let right_term = render::terminal_cells_to_quadraui(
-            &panel.rows,
-            quadraui::WidgetId::new("terminal:split-right"),
-        );
-
-        for row_idx in 0..content_rows {
-            let screen_row = area.y + row_idx as u16;
-            if screen_row >= area.y + area.height {
-                break;
-            }
-            let term_bg = rc(theme.terminal_bg);
-
-            // Clear both halves.
-            for x in area.x..area.x + area.width.saturating_sub(1) {
-                set_cell(buf, x, screen_row, ' ', fg, term_bg);
-            }
-
-            // Left pane cells.
-            render_terminal_pane_cells(buf, &left_term, area.x, screen_row, half_w, row_idx, theme);
-
-            // Divider column.
-            let div_fg = rc(theme.separator);
-            set_cell(buf, div_col, screen_row, '│', div_fg, term_bg);
-
-            // Right pane cells.
-            render_terminal_pane_cells(
-                buf,
-                &right_term,
-                div_col + 1,
-                screen_row,
-                half_w,
-                row_idx,
-                theme,
-            );
-
-            // Scrollbar in the last column.
-            let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-                ('█', rc(theme.scrollbar_thumb))
-            } else {
-                ('░', rc(theme.separator))
-            };
-            set_cell(
-                buf,
-                sb_col,
-                screen_row,
-                sb_char,
-                sb_fg,
-                rc(theme.background),
-            );
+    // Clear with terminal background.
+    for row in 0..area.height {
+        for col in area.x..area.x + area.width {
+            set_cell(frame.buffer_mut(), col, area.y + row, ' ', fg, term_bg);
         }
-
-        return;
     }
 
-    // ── Normal single-pane content rows ──────────────────────────────────────
-    let cell_width = area.width.saturating_sub(1); // leave last col for scrollbar
-    let term =
-        render::terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"));
-    for row_idx in 0..content_rows {
-        let screen_row = area.y + row_idx as u16;
-        if screen_row >= area.y + area.height {
-            break;
-        }
-        let term_bg_default = rc(theme.terminal_bg);
-        // Clear row with terminal default background (excluding scrollbar col).
-        for x in area.x..area.x + cell_width {
-            set_cell(buf, x, screen_row, ' ', fg, term_bg_default);
-        }
-
-        render_terminal_pane_cells(buf, &term, area.x, screen_row, cell_width, row_idx, theme);
-
-        // Scrollbar column — same colors as the editor scrollbar.
-        let (sb_char, sb_fg) = if row_idx >= thumb_start && row_idx < thumb_end {
-            ('█', rc(theme.scrollbar_thumb))
-        } else {
-            ('░', rc(theme.separator))
-        };
-        set_cell(
-            buf,
-            sb_col,
-            screen_row,
-            sb_char,
-            sb_fg,
-            rc(theme.background),
-        );
-    }
-}
-
-/// Render one row of terminal pane cells into a ratatui buffer.
-pub(super) fn render_terminal_pane_cells(
-    buf: &mut ratatui::buffer::Buffer,
-    term: &quadraui::Terminal,
-    start_x: u16,
-    screen_row: u16,
-    max_cols: u16,
-    row_idx: usize,
-    theme: &Theme,
-) {
-    // A.7: dispatch into the `quadraui::Terminal` row drawer. The primitive
-    // is built once per terminal per frame in the caller (above), so this
-    // inner loop just walks pre-converted cells.
-    if row_idx >= term.cells.len() {
-        return;
-    }
-    super::quadraui_tui::draw_terminal_row(
-        buf,
-        &term.cells[row_idx],
-        start_x,
-        screen_row,
-        max_cols,
-        theme,
+    let q_area = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
     );
+    let td = render::build_terminal_draw_data(panel, q_area, 1.0, content_rows, None);
+    backend.set_current_theme(q_theme);
+    if let Some(split) = &td.split {
+        let left = td.left.as_ref().unwrap();
+        let right = td.right.as_ref().unwrap();
+        let sl = *split;
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_terminal(sl.left, left);
+            b.draw_terminal(sl.right, right);
+        });
+        quadraui::tui::draw_terminal_divider(
+            frame.buffer_mut(),
+            split.divider_x as u16,
+            area.y,
+            area.height,
+            &q_theme,
+        );
+    } else if let Some(ref term) = td.single {
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_terminal(q_area, term);
+        });
+    }
 }

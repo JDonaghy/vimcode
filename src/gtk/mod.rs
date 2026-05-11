@@ -6270,11 +6270,6 @@ impl App {
                         self.draw_needed.set(true);
                         return;
                     }
-                    quadraui::UiEvent::MouseDown {
-                        widget: Some(id), ..
-                    } if id.as_str() == "terminal_scrollback" => {
-                        return;
-                    }
                     _ => {}
                 }
             }

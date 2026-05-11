@@ -573,36 +573,71 @@ pub(super) fn draw_editor(
                     let content_h = (term_px - 2.0 * line_height).max(0.0);
                     if content_h > 0.0 {
                         let content_y = toolbar_y + line_height;
-                        draw_terminal_panel(
-                            cr,
-                            &layout,
-                            term_panel,
-                            &theme,
-                            0.0,
-                            content_y,
-                            width as f64,
-                            content_h,
-                            line_height,
-                            char_width,
-                        );
                         let visible_rows = (content_h / line_height) as usize;
+                        let q_theme = super::quadraui_gtk::q_theme(&theme);
+                        let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
+                        cr.set_source_rgb(tbgr, tbgg, tbgb);
+                        cr.rectangle(0.0, content_y, width as f64, content_h);
+                        cr.fill().ok();
+                        let q_area = quadraui::Rect::new(
+                            0.0,
+                            content_y as f32,
+                            width as f32,
+                            content_h as f32,
+                        );
+                        let td = render::build_terminal_draw_data(
+                            term_panel,
+                            q_area,
+                            char_width as f32,
+                            visible_rows,
+                            Some(6),
+                        );
+                        {
+                            let mut b = backend.borrow_mut();
+                            b.set_current_theme(q_theme);
+                            b.set_current_line_height(line_height);
+                            b.set_current_char_width(char_width);
+                        }
+                        if let Some(split) = &td.split {
+                            let left = td.left.as_ref().unwrap();
+                            let right = td.right.as_ref().unwrap();
+                            let sl = *split;
+                            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                                use quadraui::Backend;
+                                b.draw_terminal(sl.left, left);
+                                b.draw_terminal(sl.right, right);
+                            });
+                            quadraui::gtk::draw_terminal_divider(
+                                cr,
+                                split.divider_x as f64,
+                                content_y,
+                                content_h,
+                                &q_theme,
+                            );
+                        } else if let Some(ref term) = td.single {
+                            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                                use quadraui::Backend;
+                                b.draw_terminal(q_area, term);
+                            });
+                        }
+                        // Register scroll surface for dispatch.
                         let geom = render::terminal_scrollbar_geometry(term_panel, visible_rows);
-                        let scrollbar = geom.map(|g| {
-                            const SB_W: f64 = 6.0;
-                            let sb_x = width as f64 - SB_W;
+                        let surface_sb = geom.map(|g| {
+                            let sb_w = 6.0;
+                            let sb_x = width as f64 - sb_w;
                             let thumb_t = g.thumb_top_frac * content_h;
                             let thumb_h = (g.thumb_height_frac * content_h).max(4.0);
                             quadraui::SurfaceScrollbar {
                                 track_bounds: quadraui::Rect::new(
                                     sb_x as f32,
                                     content_y as f32,
-                                    SB_W as f32,
+                                    sb_w as f32,
                                     content_h as f32,
                                 ),
                                 thumb_bounds: quadraui::Rect::new(
                                     (sb_x + 1.0) as f32,
                                     (content_y + thumb_t) as f32,
-                                    (SB_W - 2.0) as f32,
+                                    (sb_w - 2.0) as f32,
                                     thumb_h as f32,
                                 ),
                                 total_items: g.total_items,
@@ -622,7 +657,7 @@ pub(super) fn draw_editor(
                                     width as f32,
                                     content_h as f32,
                                 ),
-                                scrollbar,
+                                scrollbar: surface_sb,
                             });
                     }
                 }
@@ -2549,150 +2584,6 @@ pub(super) fn draw_terminal_toolbar(
 
     layout.set_font_description(Some(&saved_font));
     result
-}
-
-/// Draw the integrated terminal bottom panel content (cells + scrollbar).
-/// The toolbar row is drawn separately by `draw_terminal_toolbar`.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_terminal_panel(
-    cr: &Context,
-    layout: &pango::Layout,
-    panel: &render::TerminalPanel,
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    w: f64,
-    term_px: f64,
-    line_height: f64,
-    char_width: f64,
-) {
-    const SB_W: f64 = 6.0;
-    let content_y = y;
-    let content_h = term_px;
-    let rows_to_draw = (term_px / line_height) as usize;
-    let geom = render::terminal_scrollbar_geometry(panel, rows_to_draw);
-    let (thumb_top_px, thumb_bot_px) = if let Some(g) = &geom {
-        let t = g.thumb_top_frac * content_h;
-        let h = (g.thumb_height_frac * content_h).max(4.0);
-        (t, t + h)
-    } else {
-        (0.0, content_h)
-    };
-
-    // Draw scrollbar track (right edge of whole panel)
-    let sb_x = x + w - SB_W;
-    let (tbr, tbg, tbb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(tbr * 1.4, tbg * 1.4, tbb * 1.4); // slightly lighter than header
-    cr.rectangle(sb_x, content_y, SB_W, content_h);
-    cr.fill().ok();
-    // Draw scrollbar thumb
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgba(fr, fg2, fb, 0.5);
-    cr.rectangle(
-        sb_x + 1.0,
-        content_y + thumb_top_px,
-        SB_W - 2.0,
-        thumb_bot_px - thumb_top_px,
-    );
-    cr.fill().ok();
-
-    // ── Split view: draw left pane + divider + right pane ─────────────────────
-    if let Some(ref left_rows) = panel.split_left_rows {
-        let half_w = panel.split_left_cols as f64 * char_width;
-        let div_x = x + half_w;
-
-        // Fill both halves with terminal default bg.
-        let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
-        cr.set_source_rgb(tbgr, tbgg, tbgb);
-        cr.rectangle(x, content_y, w - SB_W, content_h);
-        cr.fill().ok();
-
-        // Draw left pane cells.
-        draw_terminal_cells(
-            cr,
-            layout,
-            left_rows,
-            x,
-            content_y,
-            half_w,
-            line_height,
-            char_width,
-            theme,
-        );
-
-        // Draw divider (1px vertical line).
-        let (dr, dg, db) = theme.separator.to_cairo();
-        cr.set_source_rgb(dr, dg, db);
-        cr.rectangle(div_x, content_y, 1.0, content_h);
-        cr.fill().ok();
-
-        // Draw right pane cells.
-        draw_terminal_cells(
-            cr,
-            layout,
-            &panel.rows,
-            div_x + 1.0,
-            content_y,
-            half_w - 1.0,
-            line_height,
-            char_width,
-            theme,
-        );
-        return;
-    }
-
-    // ── Normal single-pane view ────────────────────────────────────────────────
-    // Content rows (terminal cells)
-    let cell_area_w = w - SB_W;
-
-    // Fill the entire content area with the default terminal background first.
-    let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
-    cr.set_source_rgb(tbgr, tbgg, tbgb);
-    cr.rectangle(x, content_y, cell_area_w, content_h);
-    cr.fill().ok();
-
-    draw_terminal_cells(
-        cr,
-        layout,
-        &panel.rows,
-        x,
-        content_y,
-        cell_area_w,
-        line_height,
-        char_width,
-        theme,
-    );
-}
-
-/// Draw a grid of terminal cells into a rectangular region.
-/// A.7: GTK terminal cell rendering delegates to
-/// `quadraui_gtk::draw_terminal_cells` via the shared adapter. External
-/// signature preserved so callers in `src/gtk/draw.rs` (split + single
-/// pane terminal rendering) are untouched.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_terminal_cells(
-    cr: &Context,
-    layout: &pango::Layout,
-    rows: &[Vec<render::TerminalCell>],
-    x: f64,
-    content_y: f64,
-    cell_area_w: f64,
-    line_height: f64,
-    char_width: f64,
-    theme: &Theme,
-) {
-    let term = render::terminal_cells_to_quadraui(rows, quadraui::WidgetId::new("terminal:gtk"));
-    quadraui::gtk::draw_terminal_cells(
-        cr,
-        layout,
-        &term,
-        x,
-        content_y,
-        cell_area_w,
-        line_height,
-        char_width,
-        &super::quadraui_gtk::q_theme(theme),
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
