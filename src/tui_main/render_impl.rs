@@ -765,6 +765,7 @@ pub(super) fn draw_frame(
                         .map(|(track, thumb)| {
                             let offset_y = q_rect.y;
                             quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
                                 track_bounds: quadraui::Rect::new(
                                     q_rect.x + track.x,
                                     offset_y + track.y,

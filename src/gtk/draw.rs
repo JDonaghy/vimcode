@@ -630,6 +630,7 @@ pub(super) fn draw_editor(
                             let thumb_t = g.thumb_top_frac * content_h;
                             let thumb_h = (g.thumb_height_frac * content_h).max(4.0);
                             quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
                                 track_bounds: quadraui::Rect::new(
                                     sb_x as f32,
                                     content_y as f32,
@@ -694,6 +695,7 @@ pub(super) fn draw_editor(
                         .map(|(track, thumb)| {
                             let offset_y = q_rect.y;
                             quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
                                 track_bounds: quadraui::Rect::new(
                                     q_rect.x + track.x,
                                     offset_y + track.y,

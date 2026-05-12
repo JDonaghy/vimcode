@@ -215,6 +215,7 @@ pub(super) fn render_sidebar(
         let thumb_top = ((scroll_top as f64 / total_rows as f64) * track_h).floor();
         let sb_x = (area.x + area.width - 1) as f32;
         Some(quadraui::SurfaceScrollbar {
+            axis: quadraui::ScrollAxis::Vertical,
             track_bounds: quadraui::Rect::new(sb_x, area.y as f32, 1.0, area.height as f32),
             thumb_bounds: quadraui::Rect::new(
                 sb_x,
@@ -360,6 +361,7 @@ pub(super) fn render_settings_panel(
                 set_cell(buf, sb_col, y, ch, cfp, sb_bg);
             }
             Some(quadraui::SurfaceScrollbar {
+                axis: quadraui::ScrollAxis::Vertical,
                 track_bounds: quadraui::Rect::new(
                     sb_col as f32,
                     content_start as f32,
@@ -674,6 +676,7 @@ pub(super) fn render_settings_panel(
             set_cell(buf, sb_col, y, ch, cfp, sb_bg);
         }
         Some(quadraui::SurfaceScrollbar {
+            axis: quadraui::ScrollAxis::Vertical,
             track_bounds: quadraui::Rect::new(
                 sb_col as f32,
                 content_start as f32,
@@ -1514,6 +1517,7 @@ pub(super) fn render_ext_panel(
         }
         let track_start_y = (area.y + 1 + input_row_count as u16) as f32;
         Some(quadraui::SurfaceScrollbar {
+            axis: quadraui::ScrollAxis::Vertical,
             track_bounds: quadraui::Rect::new(sb_x as f32, track_start_y, 1.0, track_h as f32),
             thumb_bounds: quadraui::Rect::new(
                 sb_x as f32,
