@@ -115,9 +115,8 @@ pub(super) fn pixel_to_click_target(
                     pango_layout.set_attributes(None);
                     let scroll_px = rw.scroll_left as f64 * char_width;
                     let x_pango = ((text_rel_x + scroll_px).max(0.0) * pango::SCALE as f64) as i32;
-                    let (_inside, byte_index, trailing) = pango_layout.xy_to_index(x_pango, 0);
-                    let byte_pos = (byte_index as usize).saturating_add(trailing as usize);
-                    let clamped = byte_pos.min(raw_text.len());
+                    let (_inside, byte_index, _trailing) = pango_layout.xy_to_index(x_pango, 0);
+                    let clamped = (byte_index as usize).min(raw_text.len());
                     let col = raw_text[..clamped].chars().count() + seg_col_offset;
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
