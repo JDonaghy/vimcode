@@ -826,14 +826,18 @@ pub(super) fn draw_frame(
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
-    if !per_window_status {
-        render_status_line(
-            frame.buffer_mut(),
-            status_area,
-            &screen.status_left,
-            &screen.status_right,
-            theme,
+    if let Some(ref bar) = screen.global_status_bar {
+        let q_rect = quadraui::Rect::new(
+            status_area.x as f32,
+            status_area.y as f32,
+            status_area.width as f32,
+            status_area.height as f32,
         );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_status_bar(q_rect, bar, None, None);
+        });
     }
 
     render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);

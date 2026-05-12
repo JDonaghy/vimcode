@@ -1949,21 +1949,8 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Status bar branch click — open branch picker ───────────────────────
-    // (only when global status bar exists — per-window status replaces it)
-    // Skip when click is in the activity bar column (settings button lives there).
+    // Global status bar row — consume click (no interactive segments).
     if row + 2 == term_height && !engine.settings.window_status_line && col >= ab_width {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            if let Some(layout) = last_layout {
-                if let Some((start, end)) = layout.status_branch_range {
-                    let click_col = col as usize;
-                    if click_col >= start && click_col < end {
-                        engine.open_picker(crate::core::engine::PickerSource::GitBranches);
-                        return sidebar_width;
-                    }
-                }
-            }
-        }
         return sidebar_width;
     }
 

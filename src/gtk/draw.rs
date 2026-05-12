@@ -825,17 +825,18 @@ pub(super) fn draw_editor(
     } else {
         // No terminal: original layout with per-window or global status at bottom
         let status_y = height as f64 - status_bar_height;
-        if !per_window_status {
-            draw_status_line(
-                cr,
-                &layout,
-                &theme,
-                &screen.status_left,
-                &screen.status_right,
-                width as f64,
-                status_y,
-                line_height,
-            );
+        if let Some(ref bar) = screen.global_status_bar {
+            use quadraui::Backend;
+            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                b.set_current_line_height(line_height);
+                b.draw_status_bar(
+                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32),
+                    bar,
+                    None,
+                    None,
+                );
+            });
         }
         let mut next_y = if per_window_status {
             status_y
@@ -2536,49 +2537,6 @@ pub(super) fn draw_terminal_toolbar(
 
     layout.set_font_description(Some(&saved_font));
     result
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_status_line(
-    cr: &Context,
-    layout: &pango::Layout,
-    theme: &Theme,
-    left: &str,
-    right: &str,
-    width: f64,
-    y: f64,
-    line_height: f64,
-) {
-    let (br, bg, bb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(0.0, y, width, line_height);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
-
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-
-    // Measure right text first so we can clamp left text width.
-    layout.set_width(-1); // reset to natural width
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-    layout.set_text(right);
-    let (right_w, _) = layout.pixel_size();
-
-    // Draw left text, truncated to not overlap right text.
-    let left_max = (width - right_w as f64 - 8.0).max(0.0);
-    layout.set_text(left);
-    layout.set_width((left_max * pango::SCALE as f64) as i32);
-    layout.set_ellipsize(pango::EllipsizeMode::End);
-    cr.move_to(0.0, y);
-    pangocairo::show_layout(cr, layout);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    // Draw right text, right-aligned.
-    layout.set_text(right);
-    cr.move_to(width - right_w as f64, y);
-    pangocairo::show_layout(cr, layout);
 }
 
 /// Draw a per-window status bar with styled segments.

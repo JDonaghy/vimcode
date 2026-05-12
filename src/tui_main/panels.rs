@@ -810,56 +810,6 @@ pub(super) fn render_wildmenu(
 
 // ─── Status / command line ────────────────────────────────────────────────────
 
-pub(super) fn render_status_line(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    left: &str,
-    right: &str,
-    theme: &Theme,
-) {
-    let fg = rc(theme.status_fg);
-    let bg = rc(theme.status_bg);
-
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', fg, bg);
-    }
-
-    let right_chars: Vec<char> = right.chars().collect();
-    let right_len = right_chars.len() as u16;
-    let right_start = if right_len <= area.width {
-        area.x + area.width - right_len
-    } else {
-        area.x + area.width
-    };
-
-    // Draw left text, stopping 1 col before right text to avoid overlap.
-    let left_limit = if right_start > area.x {
-        right_start - 1
-    } else {
-        area.x
-    };
-    let mut x = area.x;
-    for ch in left.chars() {
-        if x >= left_limit {
-            break;
-        }
-        set_cell(buf, x, area.y, ch, fg, bg);
-        x += 1;
-    }
-
-    // Draw right text, right-aligned.
-    if right_len <= area.width {
-        let mut rx = right_start;
-        for &ch in &right_chars {
-            if rx >= area.x + area.width {
-                break;
-            }
-            set_cell(buf, rx, area.y, ch, fg, bg);
-            rx += 1;
-        }
-    }
-}
-
 pub(super) fn render_command_line(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,

@@ -3301,10 +3301,8 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
 pub struct ScreenLayout {
     pub tab_bar: Vec<TabInfo>,
     pub windows: Vec<RenderedWindow>,
-    pub status_left: String,
-    pub status_right: String,
-    /// Byte range within `status_left` where the git branch name appears (for click detection).
-    pub status_branch_range: Option<(usize, usize)>,
+    /// Global status bar (when per-window status lines are disabled).
+    pub global_status_bar: Option<quadraui::StatusBar>,
     pub command: CommandLineData,
     /// Wildmenu bar (Tab completion in command mode), or `None` when inactive.
     pub wildmenu: Option<WildmenuData>,
@@ -5351,10 +5349,10 @@ pub fn build_screen_layout(
         None
     };
 
-    let (status_left, status_right, status_branch_range) = if per_window_status {
-        (String::new(), String::new(), None)
+    let global_status_bar = if per_window_status {
+        None
     } else {
-        build_status_line(engine)
+        Some(build_global_status_bar(engine, theme))
     };
     let command = build_command_line(engine);
 
@@ -5876,9 +5874,7 @@ pub fn build_screen_layout(
     ScreenLayout {
         tab_bar,
         windows,
-        status_left,
-        status_right,
-        status_branch_range,
+        global_status_bar,
         command,
         wildmenu,
         active_window_id,
@@ -10121,6 +10117,30 @@ fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>
     (left, right, branch_range)
 }
 
+/// Build a quadraui `StatusBar` for the global (bottom-of-screen) status bar.
+pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::StatusBar {
+    let (left, right, _branch_range) = build_status_line(engine);
+    let fg = quadraui::Color::rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
+    let bg = quadraui::Color::rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("status:global"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: left,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![quadraui::StatusBarSegment {
+            text: right,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+    }
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(
@@ -12187,9 +12207,8 @@ mod tests {
             "lines should contain the buffer's actual lines"
         );
 
-        // Global status bar should be empty
-        assert!(layout.status_left.is_empty());
-        assert!(layout.status_right.is_empty());
+        // Global status bar should be None when per-window is on
+        assert!(layout.global_status_bar.is_none());
     }
 
     #[test]
@@ -12210,7 +12229,7 @@ mod tests {
         assert!(layout.windows[0].status_line.is_none());
 
         // Global status bar should be populated
-        assert!(!layout.status_left.is_empty());
+        assert!(layout.global_status_bar.is_some());
     }
 
     #[test]
