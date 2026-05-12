@@ -13,6 +13,10 @@ pub(super) use render_mod::ClickTarget;
 ///
 /// Tab bar inner hit-testing (which specific tab/button) stays here because it
 /// uses Pango-measured pixel slot positions from `draw_tab_bar`.
+///
+/// `pango_layout` must be configured with the editor monospace font — it is
+/// used by `xy_to_index` to convert pixel offsets to character columns,
+/// matching the same glyph positioning the paint code uses (#352).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pixel_to_click_target(
     engine: &mut Engine,
@@ -20,6 +24,7 @@ pub(super) fn pixel_to_click_target(
     y: f64,
     line_height: f64,
     char_width: f64,
+    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
@@ -96,19 +101,23 @@ pub(super) fn pixel_to_click_target(
                     ClickTarget::Gutter
                 }
                 WindowZone::TextArea {
+                    view_row,
                     buf_line,
                     seg_col_offset,
                     text_rel_x,
-                    ..
                 } => {
-                    let col = gtk_text_column(
-                        engine,
-                        window_id,
-                        buf_line,
-                        seg_col_offset,
-                        text_rel_x,
-                        char_width,
-                    );
+                    let raw_text = rw
+                        .lines
+                        .get(view_row)
+                        .map(|rl| rl.raw_text.as_str())
+                        .unwrap_or("");
+                    pango_layout.set_text(raw_text);
+                    pango_layout.set_attributes(None);
+                    let scroll_px = rw.scroll_left as f64 * char_width;
+                    let x_pango = ((text_rel_x + scroll_px).max(0.0) * pango::SCALE as f64) as i32;
+                    let (_inside, byte_index, _trailing) = pango_layout.xy_to_index(x_pango, 0);
+                    let clamped = (byte_index as usize).min(raw_text.len());
+                    let col = raw_text[..clamped].chars().count() + seg_col_offset;
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
                 _ => ClickTarget::None,
@@ -242,51 +251,6 @@ fn execute_gutter_action(
     }
 }
 
-/// Compute the buffer column for a text area click (GTK tab-expansion walk).
-fn gtk_text_column(
-    engine: &Engine,
-    window_id: WindowId,
-    buf_line: usize,
-    seg_col_offset: usize,
-    text_rel_x: f64,
-    char_width: f64,
-) -> usize {
-    let line = engine
-        .windows
-        .get(&window_id)
-        .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-        .map(|bs| buf_line.min(bs.buffer.content.len_lines().saturating_sub(1)))
-        .unwrap_or(buf_line);
-
-    let display_col = if char_width > 0.0 && text_rel_x >= 0.0 {
-        (text_rel_x / char_width) as usize
-    } else {
-        0
-    };
-
-    let line_text = engine
-        .windows
-        .get(&window_id)
-        .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-        .map(|bs| bs.buffer.content.line(line).to_string())
-        .unwrap_or_default();
-
-    let mut col = seg_col_offset;
-    let mut display_pos = 0;
-    for ch in line_text.chars().skip(seg_col_offset) {
-        if display_pos >= display_col {
-            break;
-        }
-        if ch == '\t' {
-            display_pos += 4;
-        } else {
-            display_pos += 1;
-        }
-        col += 1;
-    }
-    col
-}
-
 /// Handle mouse click by converting coordinates to buffer position.
 /// Returns: `(click, engine_action)` where click is `None` = non-buffer click,
 /// `Some(true)` = close-tab on dirty buffer, `Some(false)` = normal buffer click;
@@ -299,6 +263,7 @@ pub(super) fn handle_mouse_click(
     alt: bool,
     line_height: f64,
     char_width: f64,
+    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
@@ -312,6 +277,7 @@ pub(super) fn handle_mouse_click(
         y,
         line_height,
         char_width,
+        pango_layout,
         cached_layout,
         tab_slot_positions,
         diff_btn_map,
@@ -452,6 +418,7 @@ pub(super) fn handle_mouse_double_click(
     y: f64,
     line_height: f64,
     char_width: f64,
+    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
@@ -465,6 +432,7 @@ pub(super) fn handle_mouse_double_click(
         y,
         line_height,
         char_width,
+        pango_layout,
         cached_layout,
         tab_slot_positions,
         diff_btn_map,
@@ -484,6 +452,7 @@ pub(super) fn handle_mouse_drag(
     y: f64,
     line_height: f64,
     char_width: f64,
+    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
@@ -497,6 +466,7 @@ pub(super) fn handle_mouse_drag(
         y,
         line_height,
         char_width,
+        pango_layout,
         cached_layout,
         tab_slot_positions,
         diff_btn_map,
