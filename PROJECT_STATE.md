@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 11, 2026 (Session 364 — **Shared screen-level hit-test (#344, PR #356).** Extracted zone detection + gutter action resolution into shared functions in `render.rs` (`screen_zone_hit_test`, `window_zone_hit_test`, `resolve_gutter_action`). GTK backend now caches `ScreenLayout` from paint — click handlers read cached geometry instead of recomputing from engine state, eliminating the root cause of zone-boundary disagreement bugs. TUI gutter click handler also migrated to shared `resolve_gutter_action`. Tab bar inner hit-testing (Pango pixel slots) and column computation (tab walk) stay per-backend.)
+**Last updated:** May 12, 2026 (Session 365 — **Six milestone items shipped + horizontal scroll fix.** #352 (Pango click-to-column), #351 (shared terminal key dispatch), #343 (h-scrollbar DragTarget::ScrollbarX), #349 (global status bar adapter), #348 (wildmenu adapter), #361 (horizontal scroll in ensure_cursor_visible + exact viewport_cols via Pango measurement). Replaced `approximate_char_width()` with Pango `layout.pixel_size()` at 7 call sites. Filed quadraui#133 (wrap selection), #134 (thumb_length), #136 (h-scroll surface). Filed vimcode #359 (nowsl click bug), #360 (wildmenu Tab), #362 (first-line click).)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,12 +12,7 @@
 
 | # | Title | Category |
 |---|-------|----------|
-| [#343](https://github.com/JDonaghy/vimcode/issues/343) | GTK: adopt DragTarget::ScrollbarX for horizontal scrollbar drag | Cleanup |
 | [#347](https://github.com/JDonaghy/vimcode/issues/347) | Factor tab-bar and breadcrumb-bar render wrappers | Dedup (low) |
-| [#348](https://github.com/JDonaghy/vimcode/issues/348) | Wildmenu: add quadraui adapter | Dedup (low) |
-| [#349](https://github.com/JDonaghy/vimcode/issues/349) | Global status bar: use quadraui StatusBar adapter | Dedup (low) |
-| [#351](https://github.com/JDonaghy/vimcode/issues/351) | Terminal: shared key dispatch (copy vs SIGINT vs paste) | Dedup (medium) |
-| [#352](https://github.com/JDonaghy/vimcode/issues/352) | GTK: click near line end places caret to the right | Bug (pre-existing) |
 | [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low) |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
@@ -25,14 +20,19 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (364):**
-- **PR #356 — Factor shared screen-level hit-test into render.rs (#344):** Extracted three shared functions into `render.rs`: `screen_zone_hit_test` (tab bar, breadcrumb, divider, window zone detection from ScreenLayout), `window_zone_hit_test` (status bar, gutter, scrollbar, text area sub-zones within a RenderedWindow), `resolve_gutter_action` (maps gutter column + line to breakpoint/git/diagnostic/code-action/fold actions). Added `cached_screen_layout: Rc<RefCell<Option<ScreenLayout>>>` to GTK App struct — `draw_editor` moves the layout into cache at end of frame (O(1), no clone). Refactored GTK `pixel_to_click_target` to delegate zone detection to shared functions, extracted `tab_bar_inner_hit_test` helper for Pango-specific slot resolution. Refactored TUI gutter handler to use `resolve_gutter_action`. Net +247 lines (180 shared code replaces ~250 duplicated lines across backends).
+**Shipped this session (365):**
+- **PR #357 — Pango click-to-column (#352):** Replaced `text_rel_x / char_width` with Pango `xy_to_index` in GTK click handler. Eliminated cumulative rounding drift on long lines. Ignored `trailing` for Vim cursor semantics.
+- **PR #358 — Shared terminal key dispatch (#351):** Added `Engine::handle_terminal_key()` + `TerminalKeyAction` enum. Deleted per-backend `gtk_key_to_pty_bytes` and `translate_key_to_pty`. Both backends now call the engine and execute only clipboard I/O. Gained: Ctrl+Shift+C copy and PageUp/PageDown scrollback work in both backends.
+- **#343 — H-scrollbar DragTarget::ScrollbarX:** Replaced bespoke `HScrollDragState` with quadraui's `DragTarget::ScrollbarX` + `dispatch_mouse_drag`. H-scrollbar range bug remains (quadraui#136).
+- **#349 — Global status bar adapter:** `build_global_status_bar()` wraps left/right strings into `quadraui::StatusBar`. Both backends draw via `draw_status_bar`. Deleted `draw_status_line` (GTK) and `render_status_line` (TUI).
+- **#348 — Wildmenu adapter:** `wildmenu_to_status_bar()` maps items to `StatusBarSegment`s. Deleted `draw_wildmenu` (GTK) and `render_wildmenu` (TUI).
+- **PR #363 — Horizontal scroll + exact viewport_cols (#361):** Added horizontal scroll to `ensure_cursor_visible`. Added `text_viewport_cols` to `RenderedWindow` + `paint_viewport_cols` RefCell on Engine (populated at paint time, read during key handling). Replaced all `approximate_char_width()` with Pango `layout.pixel_size()` at 7 GTK call sites.
 
 ---
 
 Vimcode at 1960 lib tests passing, 2033 total (lib+integration).
 
-> Sessions 364 and earlier in **SESSION_HISTORY.md**.
+> Sessions 365 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.

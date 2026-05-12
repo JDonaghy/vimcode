@@ -1,7 +1,26 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 364 archived here.
+All sessions through 365 archived here.
+
+---
+**Session 365 (May 11–12) — Six milestone items + horizontal scroll fix:**
+
+Shipped #352, #351, #343, #349, #348, #361. Net ~-300 lines of per-backend code.
+
+**PR #357 — Pango click-to-column (#352):** Replaced approximate `text_rel_x / char_width` in GTK click handler with Pango's `xy_to_index`, matching the paint code's glyph positioning. Ignored `trailing` for Vim cursor semantics (click anywhere within a glyph selects that character). Deleted `gtk_text_column` function. Added `editor_pango_layout()` helper on GTK App. Updated all 6 click/double-click/drag call sites.
+
+**PR #358 — Shared terminal key dispatch (#351):** Added `Engine::handle_terminal_key(&mut self, key_name, unicode, ctrl, shift, alt) -> TerminalKeyAction` and `TerminalKeyAction` enum (`SendToPty(Vec<u8>)`, `CopySelection`, `PasteClipboard`, `Handled`, `Ignore`). Added shared `key_to_pty_bytes()` in `terminal_ops.rs`. Deleted per-backend `gtk_key_to_pty_bytes` (65 lines) and `translate_key_to_pty` (45 lines). Both backends now call the engine method and execute only clipboard I/O. Behavioral gain: Ctrl+Shift+C copy and PageUp/PageDown scrollback now work in both backends.
+
+**#343 — H-scrollbar DragTarget::ScrollbarX:** Replaced bespoke `HScrollDragState` struct (~50 lines) with quadraui's `DragTarget::ScrollbarX` via `dispatch_mouse_drag`. Bespoke hit-test/drag-begin block (~65 lines) deleted from GTK mouse handler. Added `ScrollOffsetChanged` handler for `editor:h_sb:*` widget IDs. Updated all `SurfaceScrollbar` registrations with `axis: ScrollAxis::Vertical` field (quadraui#136 API). H-scrollbar range issue traced to `viewport_cols` approximation (#361) and quadraui Pango measurement (#138, closed as vimcode-side).
+
+**#349 — Global status bar adapter:** Added `build_global_status_bar()` in render.rs — wraps left/right strings into `quadraui::StatusBar`. Replaced `ScreenLayout.status_left/status_right/status_branch_range` with `global_status_bar: Option<StatusBar>`. Both backends draw via existing `draw_status_bar` path. Deleted `draw_status_line` (GTK, 40 lines) and `render_status_line` (TUI, 50 lines).
+
+**#348 — Wildmenu adapter:** Added `wildmenu_to_status_bar()` — maps each wildmenu item to a `StatusBarSegment` with selected/unselected colors. Deleted `draw_wildmenu` (GTK, 48 lines) and `render_wildmenu` (TUI, 62 lines).
+
+**PR #363 — Horizontal scroll + exact viewport_cols (#361):** Root cause: `ensure_cursor_visible` never adjusted `scroll_left` (horizontal), and `viewport_cols` was approximate (resize handler used `approximate_char_width` with hardcoded gutter estimate). Fix: (1) Added horizontal scroll logic to `ensure_cursor_visible` — adjusts `scroll_left` when cursor is outside `[scroll_left, scroll_left + viewport_cols)`. (2) Added `text_viewport_cols` field to `RenderedWindow` — exact visible text columns from paint-time geometry. (3) Added `paint_viewport_cols: RefCell<HashMap<WindowId, usize>>` on Engine — populated by `build_screen_layout`, read by `ensure_cursor_visible`. (4) Replaced `approximate_char_width()` with Pango `layout.pixel_size()` at 7 GTK call sites (draw.rs + 6 in mod.rs) so `char_width` matches actual glyph positioning.
+
+**Issues filed:** #359 (clicks broken with `nowsl`), #360 (wildmenu Tab cycling), #362 (first-line click in GTK). **quadraui issues filed:** #133 (wrap selection rendering — fixed), #134 (thumb_length API — fixed), #136 (h-scroll surface — shipped).
 
 ---
 **Session 364 (May 11) — Shared screen-level hit-test (#344, PR #356):**

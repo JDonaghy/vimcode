@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-07 (Session 356 — #306 StatusBar hover/press shipped (PR #332). TUI uses `quadraui::StatusBarInteraction`; GTK manual wiring deferred to #331. Next: SidebarSystem migrations (#321/#322/#323/#326), polish (#314/#295/#315), bugs (#329/#318/#292/#288/#287).)
+> **Last updated:** 2026-05-12 (Session 365 — Six milestone items shipped (#352/#351/#343/#349/#348/#361). Horizontal scroll now works in both backends. Next: #347 (tab-bar wrappers), #328 (quadraui scroll conventions), polish (#314/#295/#315), bugs (#359/#360/#362).)
 
 ---
 
