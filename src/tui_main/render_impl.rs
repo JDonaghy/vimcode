@@ -822,7 +822,18 @@ pub(super) fn draw_frame(
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
     if let Some(ref wm) = screen.wildmenu {
-        render_wildmenu(frame.buffer_mut(), wildmenu_area, wm, theme);
+        let bar = render::wildmenu_to_status_bar(wm, theme);
+        let q_rect = quadraui::Rect::new(
+            wildmenu_area.x as f32,
+            wildmenu_area.y as f32,
+            wildmenu_area.width as f32,
+            wildmenu_area.height as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_status_bar(q_rect, &bar, None, None);
+        });
     }
 
     // ── Status / command ──────────────────────────────────────────────────────

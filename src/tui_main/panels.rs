@@ -745,69 +745,6 @@ pub(super) fn render_search_panel(
     });
 }
 
-// ─── Wildmenu (command Tab completion bar) ───────────────────────────────────
-
-pub(super) fn render_wildmenu(
-    buf: &mut ratatui::buffer::Buffer,
-    area: Rect,
-    wm: &WildmenuData,
-    theme: &Theme,
-) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let bg = rc(theme.wildmenu_bg);
-    let fg = rc(theme.wildmenu_fg);
-    let sel_bg = rc(theme.wildmenu_sel_bg);
-    let sel_fg = rc(theme.wildmenu_sel_fg);
-
-    // Fill background
-    for x in area.x..area.x + area.width {
-        let cell = &mut buf[(x, area.y)];
-        cell.set_char(' ').set_fg(fg).set_bg(bg);
-    }
-
-    // Draw items separated by spaces
-    let mut col = area.x;
-    for (i, item) in wm.items.iter().enumerate() {
-        if col >= area.x + area.width {
-            break;
-        }
-        let is_selected = wm.selected == Some(i);
-        let item_fg = if is_selected { sel_fg } else { fg };
-        let item_bg = if is_selected { sel_bg } else { bg };
-
-        // Leading space
-        if col < area.x + area.width {
-            buf[(col, area.y)]
-                .set_char(' ')
-                .set_fg(item_fg)
-                .set_bg(item_bg);
-            col += 1;
-        }
-
-        for ch in item.chars() {
-            if col >= area.x + area.width {
-                break;
-            }
-            buf[(col, area.y)]
-                .set_char(ch)
-                .set_fg(item_fg)
-                .set_bg(item_bg);
-            col += 1;
-        }
-
-        // Trailing space for selected item padding
-        if is_selected && col < area.x + area.width {
-            buf[(col, area.y)]
-                .set_char(' ')
-                .set_fg(item_fg)
-                .set_bg(item_bg);
-            col += 1;
-        }
-    }
-}
-
 // ─── Status / command line ────────────────────────────────────────────────────
 
 pub(super) fn render_command_line(

@@ -790,6 +790,50 @@ pub struct WildmenuData {
     pub selected: Option<usize>,
 }
 
+/// Convert wildmenu data to a quadraui `StatusBar` for shared rendering.
+pub fn wildmenu_to_status_bar(wm: &WildmenuData, theme: &Theme) -> quadraui::StatusBar {
+    let fg = quadraui::Color::rgb(
+        theme.wildmenu_fg.r,
+        theme.wildmenu_fg.g,
+        theme.wildmenu_fg.b,
+    );
+    let bg = quadraui::Color::rgb(
+        theme.wildmenu_bg.r,
+        theme.wildmenu_bg.g,
+        theme.wildmenu_bg.b,
+    );
+    let sel_fg = quadraui::Color::rgb(
+        theme.wildmenu_sel_fg.r,
+        theme.wildmenu_sel_fg.g,
+        theme.wildmenu_sel_fg.b,
+    );
+    let sel_bg = quadraui::Color::rgb(
+        theme.wildmenu_sel_bg.r,
+        theme.wildmenu_sel_bg.g,
+        theme.wildmenu_sel_bg.b,
+    );
+    let segments = wm
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let is_sel = wm.selected == Some(i);
+            quadraui::StatusBarSegment {
+                text: format!(" {} ", item),
+                fg: if is_sel { sel_fg } else { fg },
+                bg: if is_sel { sel_bg } else { bg },
+                bold: is_sel,
+                action_id: None,
+            }
+        })
+        .collect();
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("wildmenu"),
+        left_segments: segments,
+        right_segments: vec![],
+    }
+}
+
 // ─── CompletionMenu ────────────────────────────────────────────────────────────
 
 /// Data needed to render the word-completion popup in insert mode.

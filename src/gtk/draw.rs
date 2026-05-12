@@ -810,7 +810,20 @@ pub(super) fn draw_editor(
             .insert(screen.active_window_id.0, zones);
         let mut next_y = status_y + line_height;
         if let Some(ref wm) = screen.wildmenu {
-            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            let bar = render::wildmenu_to_status_bar(wm, &theme);
+            {
+                use quadraui::Backend;
+                backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
+                });
+            }
             next_y += line_height;
         }
         draw_command_line(
@@ -844,7 +857,20 @@ pub(super) fn draw_editor(
             status_y + line_height
         };
         if let Some(ref wm) = screen.wildmenu {
-            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            let bar = render::wildmenu_to_status_bar(wm, &theme);
+            {
+                use quadraui::Backend;
+                backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
+                });
+            }
             next_y += line_height;
         }
         draw_command_line(
@@ -2581,55 +2607,6 @@ fn draw_window_status_bar(
             let end = start + region.width as f64;
             segment_zones.push((start, end, action));
         }
-    }
-}
-
-pub(super) fn draw_wildmenu(
-    cr: &Context,
-    layout: &pango::Layout,
-    theme: &Theme,
-    wm: &render::WildmenuData,
-    width: f64,
-    y: f64,
-    line_height: f64,
-) {
-    // Fill background
-    let (br, bg, bb) = theme.wildmenu_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(0.0, y, width, line_height);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    let mut x = 0.0;
-    for (i, item) in wm.items.iter().enumerate() {
-        if x >= width {
-            break;
-        }
-        let is_selected = wm.selected == Some(i);
-        let label = format!(" {} ", item);
-        layout.set_text(&label);
-        let (item_w, _) = layout.pixel_size();
-
-        if is_selected {
-            // Draw selected item background
-            let (sbr, sbg, sbb) = theme.wildmenu_sel_bg.to_cairo();
-            cr.set_source_rgb(sbr, sbg, sbb);
-            cr.rectangle(x, y, item_w as f64, line_height);
-            cr.fill().ok();
-            // Selected item foreground
-            let (sfr, sfg, sfb) = theme.wildmenu_sel_fg.to_cairo();
-            cr.set_source_rgb(sfr, sfg, sfb);
-        } else {
-            let (fr, fg, fb) = theme.wildmenu_fg.to_cairo();
-            cr.set_source_rgb(fr, fg, fb);
-        }
-
-        cr.move_to(x, y);
-        pangocairo::show_layout(cr, layout);
-        x += item_w as f64;
     }
 }
 

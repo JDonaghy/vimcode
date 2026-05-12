@@ -90,7 +90,7 @@ use crate::core::engine::EngineAction;
 use crate::core::window::{GroupId, SplitDirection};
 use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::icons;
-use crate::render::{self, build_screen_layout, Color, RenderedWindow, Theme, WildmenuData};
+use crate::render::{self, build_screen_layout, Color, RenderedWindow, Theme};
 
 // ─── Key binding helpers ──────────────────────────────────────────────────────
 
