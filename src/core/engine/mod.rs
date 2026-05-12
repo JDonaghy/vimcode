@@ -2908,6 +2908,10 @@ pub struct Engine {
     /// Scroll surfaces registered at paint time for `dispatch_scroll`.
     /// Cleared at the start of each frame.
     pub scroll_surfaces: std::cell::RefCell<Vec<quadraui::ScrollSurface>>,
+    /// Per-window text viewport columns computed at paint time by
+    /// `build_screen_layout`. `ensure_cursor_visible` reads this
+    /// instead of the stale `view.viewport_cols` for horizontal scroll.
+    pub paint_viewport_cols: std::cell::RefCell<HashMap<WindowId, usize>>,
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -3638,6 +3642,7 @@ impl Engine {
             debug_output_scroll: 0,
             debug_output_auto_scroll: true,
             scroll_surfaces: std::cell::RefCell::new(Vec::new()),
+            paint_viewport_cols: std::cell::RefCell::new(HashMap::new()),
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),
