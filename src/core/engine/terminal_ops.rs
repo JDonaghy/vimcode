@@ -618,4 +618,171 @@ impl Engine {
             self.terminal_find_selected = 0;
         }
     }
+
+    /// Shared terminal key dispatch (#351). The engine decides what a
+    /// keypress means; the backend only needs to execute the returned
+    /// action (clipboard I/O, PTY write). `key_name` uses the same
+    /// canonical names as `handle_key` (e.g. "Return", "Escape", "Up").
+    pub fn handle_terminal_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> TerminalKeyAction {
+        // Alt+1–9: switch terminal tab.
+        if alt && !ctrl && !shift {
+            if let Some(ch) = unicode {
+                if ch.is_ascii_digit() && ch != '0' {
+                    self.terminal_switch_tab((ch as u8 - b'1') as usize);
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // PageUp / PageDown: scroll scrollback.
+        if !ctrl && !alt && !shift {
+            if key_name == "Page_Up" || key_name == "Prior" {
+                self.terminal_scroll_up(12);
+                return TerminalKeyAction::Handled;
+            }
+            if key_name == "Page_Down" || key_name == "Next" {
+                self.terminal_scroll_down(12);
+                return TerminalKeyAction::Handled;
+            }
+        }
+
+        // Ctrl+Y or Ctrl+Shift+C: copy selection.
+        if ctrl && !alt {
+            if let Some(ch) = unicode {
+                if (ch == 'y' || ch == 'Y') && !shift {
+                    return TerminalKeyAction::CopySelection;
+                }
+                if (ch == 'c' || ch == 'C') && shift {
+                    return TerminalKeyAction::CopySelection;
+                }
+            }
+        }
+
+        // Ctrl+V / Ctrl+Shift+V: paste clipboard.
+        if ctrl && !alt {
+            if let Some(ch) = unicode {
+                if ch == 'v' || ch == 'V' {
+                    return TerminalKeyAction::PasteClipboard;
+                }
+            }
+        }
+
+        // Ctrl+F: toggle terminal find bar.
+        if ctrl && !shift && !alt {
+            if let Some(ch) = unicode {
+                if ch == 'f' || ch == 'F' {
+                    if self.terminal_find_active {
+                        self.terminal_find_close();
+                    } else {
+                        self.terminal_find_open();
+                    }
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // Find bar active: intercept all keys for search navigation.
+        if self.terminal_find_active {
+            match key_name {
+                "Escape" => self.terminal_find_close(),
+                "Return" if shift => self.terminal_find_prev(),
+                "Return" => self.terminal_find_next(),
+                "BackSpace" => self.terminal_find_backspace(),
+                _ => {
+                    if !ctrl && !alt {
+                        if let Some(ch) = unicode {
+                            self.terminal_find_char(ch);
+                        }
+                    }
+                }
+            }
+            return TerminalKeyAction::Handled;
+        }
+
+        // Ctrl+W in split mode: switch focus between panes.
+        if ctrl && !shift && !alt && self.terminal_split {
+            if let Some(ch) = unicode {
+                if ch == 'w' || ch == 'W' {
+                    self.terminal_split_switch_focus();
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // Any other key: reset scrollback and forward to PTY.
+        self.terminal_scroll_reset();
+        let data = key_to_pty_bytes(key_name, unicode, ctrl);
+        if data.is_empty() {
+            TerminalKeyAction::Ignore
+        } else {
+            TerminalKeyAction::SendToPty(data)
+        }
+    }
+}
+
+/// Translate a key event to PTY input bytes. Shared by both backends (#351).
+pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
+    if ctrl {
+        if let Some(ch) = unicode {
+            let b = ch as u8;
+            if b.is_ascii() {
+                return vec![b & 0x1f];
+            }
+        }
+        if key_name.len() == 1 {
+            let b = key_name.as_bytes()[0].to_ascii_lowercase();
+            if b.is_ascii_lowercase() {
+                return vec![b & 0x1f];
+            }
+        }
+        return match key_name {
+            "Return" | "KP_Enter" => b"\r".to_vec(),
+            "BackSpace" => b"\x7f".to_vec(),
+            "Tab" => b"\t".to_vec(),
+            _ => vec![],
+        };
+    }
+
+    match key_name {
+        "Return" | "KP_Enter" => b"\r".to_vec(),
+        "BackSpace" => b"\x7f".to_vec(),
+        "Tab" | "ISO_Left_Tab" => b"\t".to_vec(),
+        "Escape" => b"\x1b".to_vec(),
+        "Up" | "KP_Up" => b"\x1b[A".to_vec(),
+        "Down" | "KP_Down" => b"\x1b[B".to_vec(),
+        "Right" | "KP_Right" => b"\x1b[C".to_vec(),
+        "Left" | "KP_Left" => b"\x1b[D".to_vec(),
+        "Home" | "KP_Home" => b"\x1b[H".to_vec(),
+        "End" | "KP_End" => b"\x1b[F".to_vec(),
+        "Delete" | "KP_Delete" => b"\x1b[3~".to_vec(),
+        "Insert" | "KP_Insert" => b"\x1b[2~".to_vec(),
+        "Page_Up" | "KP_Page_Up" | "Prior" => b"\x1b[5~".to_vec(),
+        "Page_Down" | "KP_Page_Down" | "Next" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
+        _ => {
+            if let Some(ch) = unicode {
+                ch.to_string().into_bytes()
+            } else {
+                vec![]
+            }
+        }
+    }
 }

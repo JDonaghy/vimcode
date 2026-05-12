@@ -1493,35 +1493,27 @@ impl SimpleComponent for App {
                                         }
                                     }
 
-                                    // Ctrl-F: terminal find when terminal focused, else engine find/replace
-                                    if ctrl && !shift && unicode == Some('f') {
-                                        if engine.borrow().terminal_has_focus {
-                                            if engine.borrow().terminal_find_active {
-                                                sender.input(Msg::TerminalFindClose);
-                                            } else {
-                                                sender.input(Msg::TerminalFindOpen);
-                                            }
-                                        } else {
-                                            // Pass Ctrl+F to engine (opens find/replace overlay
-                                            // or does page-down based on ctrl_f_action setting)
-                                            engine.borrow_mut().handle_key("f", Some('f'), true);
-                                            sender.input(Msg::SearchPollTick);
-                                        }
+                                    // Ctrl-F without terminal focus: engine find/replace.
+                                    // (Terminal-focused Ctrl+F is handled by handle_terminal_key.)
+                                    if ctrl && !shift && unicode == Some('f')
+                                        && !engine.borrow().terminal_has_focus
+                                    {
+                                        engine.borrow_mut().handle_key("f", Some('f'), true);
+                                        sender.input(Msg::SearchPollTick);
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
-                                    // Ctrl-Shift-V: paste from system clipboard (editor or terminal)
-                                    if ctrl && shift && (key_name == "v" || key_name == "V") {
-                                        if engine.borrow().terminal_has_focus {
-                                            sender.input(Msg::TerminalPasteClipboard);
-                                        } else {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: "PasteClipboard".to_string(),
-                                                unicode: None,
-                                                ctrl: false,
-                                                alt: false,
-                                            });
-                                        }
+                                    // Ctrl-Shift-V without terminal focus: paste to editor.
+                                    // (Terminal-focused paste is handled by handle_terminal_key.)
+                                    if ctrl && shift && (key_name == "v" || key_name == "V")
+                                        && !engine.borrow().terminal_has_focus
+                                    {
+                                        sender.input(Msg::KeyPress {
+                                            key_name: "PasteClipboard".to_string(),
+                                            unicode: None,
+                                            ctrl: false,
+                                            alt: false,
+                                        });
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
@@ -1577,61 +1569,28 @@ impl SimpleComponent for App {
                                             return gtk4::glib::Propagation::Stop;
                                         }
                                     }
-                                    // Terminal key routing: when terminal has focus, all keys
-                                    // are forwarded as PTY bytes without going to the engine.
+                                    // Terminal key routing (#351): engine decides
+                                    // the action, backend executes clipboard I/O.
                                     if engine.borrow().terminal_has_focus {
-                                        // Alt+1–9: switch terminal tab.
-                                        if alt && !ctrl && !shift {
-                                            if let Some(ch) = unicode {
-                                                if ch.is_ascii_digit() && ch != '0' {
-                                                    let idx = (ch as u8 - b'1') as usize;
-                                                    sender.input(Msg::TerminalSwitchTab(idx));
-                                                    return gtk4::glib::Propagation::Stop;
-                                                }
+                                        use core::engine::TerminalKeyAction;
+                                        let action = engine.borrow_mut().handle_terminal_key(
+                                            &key_name, unicode, ctrl, shift, alt,
+                                        );
+                                        match action {
+                                            TerminalKeyAction::CopySelection => {
+                                                sender.input(Msg::TerminalCopySelection);
                                             }
-                                        }
-                                        // Ctrl+Y / Ctrl+Shift+C: copy terminal selection to clipboard.
-                                        if ctrl && !shift && (key_name == "y" || key_name == "Y") {
-                                            sender.input(Msg::TerminalCopySelection);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if ctrl && shift && (key_name == "c" || key_name == "C") {
-                                            sender.input(Msg::TerminalCopySelection);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Terminal find bar key routing.
-                                        if engine.borrow().terminal_find_active {
-                                            match key_name.as_str() {
-                                                "Escape" => sender.input(Msg::TerminalFindClose),
-                                                "Return" if !shift => sender.input(Msg::TerminalFindNext),
-                                                "Return" => sender.input(Msg::TerminalFindPrev),
-                                                "BackSpace" => sender.input(Msg::TerminalFindBackspace),
-                                                _ => {
-                                                    if !ctrl && !alt {
-                                                        if let Some(ch) = unicode {
-                                                            sender.input(Msg::TerminalFindChar(ch));
-                                                        }
-                                                    }
-                                                }
+                                            TerminalKeyAction::PasteClipboard => {
+                                                sender.input(Msg::TerminalPasteClipboard);
                                             }
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Ctrl-W in split mode: switch focus between panes.
-                                        if ctrl && !shift && !alt
-                                            && (key_name == "w" || key_name == "W")
-                                            && engine.borrow().terminal_split
-                                        {
-                                            engine.borrow_mut().terminal_split_switch_focus();
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Ctrl+V (without shift): paste clipboard to PTY (VS Code behavior).
-                                        if ctrl && !shift && (key_name == "v" || key_name == "V") {
-                                            sender.input(Msg::TerminalPasteClipboard);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        let data = gtk_key_to_pty_bytes(&key_name, unicode, ctrl);
-                                        if !data.is_empty() {
-                                            engine.borrow_mut().terminal_write(&data);
+                                            TerminalKeyAction::SendToPty(data) => {
+                                                engine.borrow_mut().terminal_write(&data);
+                                                sender.input(Msg::Resize);
+                                            }
+                                            TerminalKeyAction::Handled => {
+                                                sender.input(Msg::Resize);
+                                            }
+                                            TerminalKeyAction::Ignore => {}
                                         }
                                         return gtk4::glib::Propagation::Stop;
                                     }

@@ -1388,6 +1388,22 @@ pub enum TerminalToolbarAction {
     None,
 }
 
+/// Action returned by [`Engine::handle_terminal_key`] — the engine decides
+/// what a keypress means; the backend executes it (#351).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalKeyAction {
+    /// Send raw bytes to the PTY.
+    SendToPty(Vec<u8>),
+    /// Copy terminal selection — backend reads text and writes to clipboard.
+    CopySelection,
+    /// Paste clipboard text to PTY (bracketed-paste wrapped).
+    PasteClipboard,
+    /// Already handled by the engine (tab switch, find bar, etc.).
+    Handled,
+    /// Key has no terminal mapping — ignore.
+    Ignore,
+}
+
 /// State of an in-progress tab drag operation.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
