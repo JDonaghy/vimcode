@@ -1262,16 +1262,15 @@ fn event_loop(
                 last_layout.as_ref()
             };
 
-            // Update per-window viewport dimensions so ensure_cursor_visible uses
-            // the actual pane width (critical for horizontal scrolling in vsplit).
+            // Update per-window viewport dimensions from paint-time geometry
+            // so ensure_cursor_visible uses exact column counts.
             if let Some(ref layout) = last_layout {
                 for rw in &layout.windows {
-                    let gutter = rw.gutter_char_width as u16;
-                    // -1 for the vertical scrollbar column
-                    let pane_cols =
-                        (rw.rect.width as u16).saturating_sub(gutter + 1).max(1) as usize;
-                    let pane_rows = (rw.rect.height as u16).max(1) as usize;
-                    engine.set_viewport_for_window(rw.window_id, pane_rows, pane_cols);
+                    engine.set_viewport_for_window(
+                        rw.window_id,
+                        rw.lines.len().max(1),
+                        rw.text_viewport_cols.max(1),
+                    );
                 }
             }
 

@@ -731,6 +731,11 @@ pub struct RenderedWindow {
     /// Width of the line-number gutter in *character cells* (0 = no gutter).
     /// GTK backend multiplies by `char_width` to get pixels.
     pub gutter_char_width: usize,
+    /// Exact number of text columns visible (rect width minus gutter minus
+    /// scrollbar, divided by char_width). Backends should feed this back
+    /// to `Engine::set_viewport_for_window` so `ensure_cursor_visible`
+    /// uses accurate geometry.
+    pub text_viewport_cols: usize,
     /// Whether this is the focused window.
     pub is_active: bool,
     /// Whether to render with the slightly-different active-window background
@@ -5378,6 +5383,10 @@ pub fn build_screen_layout(
                     engine, theme, *window_id, is_active,
                 ));
             }
+            engine
+                .paint_viewport_cols
+                .borrow_mut()
+                .insert(*window_id, rw.text_viewport_cols);
             rw
         })
         .collect();
@@ -8488,6 +8497,7 @@ fn build_rendered_window(
         scroll_left: 0,
         total_lines: 0,
         gutter_char_width: 0,
+        text_viewport_cols: 0,
         is_active,
         show_active_bg: false,
         has_git_diff: false,
@@ -9362,6 +9372,7 @@ fn build_rendered_window(
         scroll_left: view.scroll_left,
         total_lines,
         gutter_char_width,
+        text_viewport_cols: render_viewport_cols,
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,

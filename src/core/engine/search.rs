@@ -140,16 +140,32 @@ impl Engine {
             let viewport_lines = self.effective_viewport_lines();
             let cursor_line = self.view().cursor.line;
             let scroll_top = self.view().scroll_top;
-            // Unified path: handle both scrolloff=0 and scrolloff>0 cases
-            // using the effective viewport (#185). Previously the scrolloff=0
-            // branch delegated to `view_mut().ensure_cursor_visible()` which
-            // read the stale `view.viewport_lines` directly.
             if cursor_line < scroll_top + scrolloff {
                 self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
             } else if viewport_lines > 0
                 && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
             {
                 self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+            }
+
+            // Horizontal: keep cursor within the visible column range.
+            // Prefer paint-time viewport_cols (exact) over the resize
+            // handler's approximate value.
+            let wid = self.active_window_id();
+            let viewport_cols = self
+                .paint_viewport_cols
+                .borrow()
+                .get(&wid)
+                .copied()
+                .unwrap_or(self.view().viewport_cols);
+            let cursor_col = self.view().cursor.col;
+            let scroll_left = self.view().scroll_left;
+            if viewport_cols > 0 {
+                if cursor_col < scroll_left {
+                    self.view_mut().scroll_left = cursor_col;
+                } else if cursor_col >= scroll_left + viewport_cols {
+                    self.view_mut().scroll_left = cursor_col + 1 - viewport_cols;
+                }
             }
         }
     }

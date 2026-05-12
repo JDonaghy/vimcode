@@ -2772,8 +2772,10 @@ impl SimpleComponent for App {
                     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
                         / pango::SCALE as f64;
                     lh.set(line_height);
-                    let char_width =
-                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let char_width = {
+                        layout.set_text("0");
+                        layout.pixel_size().0 as f64
+                    };
                     let screen =
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let window_w = da.width() as f64;
@@ -3015,8 +3017,10 @@ impl SimpleComponent for App {
                     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
                         / pango::SCALE as f64;
-                    let char_width =
-                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let char_width = {
+                        layout.set_text("0");
+                        layout.pixel_size().0 as f64
+                    };
                     // Publish line_height for the click / scroll / key
                     // handlers — they can't recompute it themselves
                     // (no cairo context available outside the draw
@@ -3121,7 +3125,10 @@ impl SimpleComponent for App {
                 let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let char_width = {
+                    layout.set_text("0");
+                    layout.pixel_size().0 as f64
+                };
                 let screen =
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
@@ -3196,7 +3203,10 @@ impl SimpleComponent for App {
                 let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let char_width = {
+                    layout.set_text("0");
+                    layout.pixel_size().0 as f64
+                };
                 let screen =
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
@@ -3251,8 +3261,10 @@ impl SimpleComponent for App {
                     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
                         / pango::SCALE as f64;
-                    let char_width =
-                        font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                    let char_width = {
+                        layout.set_text("0");
+                        layout.pixel_size().0 as f64
+                    };
                     let screen =
                         build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                     let w = da.width() as f64;
@@ -3486,7 +3498,10 @@ impl SimpleComponent for App {
                 let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
                 let line_height =
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+                let char_width = {
+                    layout.set_text("0");
+                    layout.pixel_size().0 as f64
+                };
                 let screen =
                     build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
                 let w = da.width() as f64;
@@ -4604,6 +4619,22 @@ impl SimpleComponent for App {
                         let cols = ((da.width() as f64 / char_width) as u16).max(40);
                         let rows = self.engine.borrow().session.terminal_panel_rows;
                         self.engine.borrow_mut().terminal_resize(cols, rows);
+                    }
+                }
+                // Sync per-window viewport_cols from paint-time geometry
+                // so ensure_cursor_visible (run during key handling) uses
+                // exact column counts, not the resize handler's estimate.
+                {
+                    let layout_ref = self.cached_screen_layout.borrow();
+                    if let Some(ref layout) = *layout_ref {
+                        let mut engine = self.engine.borrow_mut();
+                        for rw in &layout.windows {
+                            engine.set_viewport_for_window(
+                                rw.window_id,
+                                rw.lines.len().max(1),
+                                rw.text_viewport_cols.max(1),
+                            );
+                        }
                     }
                 }
             }
@@ -5782,19 +5813,19 @@ impl App {
                     }
                 }
 
-                // Sync per-window viewport dimensions from actual window rects
-                // so ensure_cursor_visible uses accurate heights (not the rough
-                // DrawingArea-based estimate from connect_resize).
+                // Sync per-window viewport dimensions from the paint-time
+                // ScreenLayout so ensure_cursor_visible uses exact geometry.
                 {
-                    let mut engine = self.engine.borrow_mut();
-                    for (wid, rect) in &rects {
-                        let pane_lines = (rect.height / lh).floor() as usize;
-                        let pane_cols = (rect.width / cw).floor() as usize;
-                        engine.set_viewport_for_window(
-                            *wid,
-                            pane_lines.max(1),
-                            pane_cols.saturating_sub(5).max(1),
-                        );
+                    let layout_ref = self.cached_screen_layout.borrow();
+                    if let Some(ref layout) = *layout_ref {
+                        let mut engine = self.engine.borrow_mut();
+                        for rw in &layout.windows {
+                            engine.set_viewport_for_window(
+                                rw.window_id,
+                                rw.lines.len().max(1),
+                                rw.text_viewport_cols.max(1),
+                            );
+                        }
                     }
                 }
 

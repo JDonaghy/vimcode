@@ -103,10 +103,13 @@ pub(super) fn draw_editor(
     let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
-    // Derive line height and char width from font metrics
+    // Derive line height and char width from font metrics.
+    // Use Pango layout measurement for char_width (not approximate_char_width)
+    // so the value matches actual glyph positioning in draw_editor.
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+    layout.set_text("0");
+    let char_width = layout.pixel_size().0 as f64;
 
     // Only send CacheFontMetrics when metrics actually change (e.g. on startup or font change).
     // Sending on every draw creates a feedback loop: draw → message → #[watch] → queue_draw → draw.
