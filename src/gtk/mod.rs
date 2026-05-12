@@ -1585,9 +1585,12 @@ impl SimpleComponent for App {
                                             }
                                             TerminalKeyAction::SendToPty(data) => {
                                                 engine.borrow_mut().terminal_write(&data);
+                                                sender.input(Msg::Resize);
                                             }
-                                            TerminalKeyAction::Handled
-                                            | TerminalKeyAction::Ignore => {}
+                                            TerminalKeyAction::Handled => {
+                                                sender.input(Msg::Resize);
+                                            }
+                                            TerminalKeyAction::Ignore => {}
                                         }
                                         return gtk4::glib::Propagation::Stop;
                                     }
