@@ -7347,31 +7347,29 @@ impl App {
                         let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
                         let geom = win_rect
                             .and_then(|rect| h_scrollbar_geometry(&engine, win_id, &rect, cw, lh));
-                        let (visible_cols, total_cols) = engine
-                            .windows
-                            .get(&win_id)
-                            .map(|w| {
-                                let vc = w.view.viewport_cols.max(1);
-                                let tc = engine
-                                    .buffer_manager
-                                    .get(w.buffer_id)
-                                    .map(|b| b.max_col)
-                                    .unwrap_or(vc);
-                                (vc, tc)
-                            })
-                            .unwrap_or((1, 1));
                         drop(engine);
-                        if let Some((track_x, _ty, track_w, _sb_h, thumb_x, thumb_w, _, _)) = geom {
+                        if let Some((
+                            track_x,
+                            _ty,
+                            track_w,
+                            _sb_h,
+                            thumb_x,
+                            thumb_w,
+                            scroll_range,
+                            _,
+                        )) = geom
+                        {
+                            let max_scroll = scroll_range.round() as usize;
+                            let page_cols = (track_w / cw).floor() as usize;
                             if x < thumb_x {
                                 let mut engine = self.engine.borrow_mut();
-                                let new_left = scroll_left.saturating_sub(visible_cols);
+                                let new_left = scroll_left.saturating_sub(page_cols);
                                 engine.set_scroll_left_for_window(win_id, new_left);
                                 self.draw_needed.set(true);
                                 return;
                             } else if x >= thumb_x + thumb_w {
                                 let mut engine = self.engine.borrow_mut();
-                                let max_left = total_cols.saturating_sub(visible_cols);
-                                let new_left = (scroll_left + visible_cols).min(max_left);
+                                let new_left = (scroll_left + page_cols).min(max_scroll);
                                 engine.set_scroll_left_for_window(win_id, new_left);
                                 self.draw_needed.set(true);
                                 return;
@@ -7388,7 +7386,7 @@ impl App {
                                     track_start: track_x as f32,
                                     track_length: track_w as f32,
                                     thumb_length: thumb_w as f32,
-                                    max_scroll: total_cols.saturating_sub(visible_cols),
+                                    max_scroll,
                                     grab_offset,
                                     inverted: false,
                                 });
