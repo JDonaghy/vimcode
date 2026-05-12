@@ -625,12 +625,11 @@ pub(super) fn handle_mouse(
         // instead of pixels.
         if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
             if drag_state.is_active() {
-                // Capture visible_rows before drop for the selection-clamp below.
                 let visible_rows =
-                    if let Some(quadraui::DragTarget::ScrollbarY { visible_rows, .. }) =
+                    if let Some(quadraui::DragTarget::ScrollbarY { track_length, .. }) =
                         drag_state.target()
                     {
-                        *visible_rows
+                        *track_length as usize
                     } else {
                         0
                     };
@@ -749,12 +748,14 @@ pub(super) fn handle_mouse(
                             total_items,
                             engine.picker_scroll_top,
                         );
+                        let tl = visible_rows as f32;
                         drag_state.begin(quadraui::DragTarget::ScrollbarY {
                             widget: picker_id.clone(),
                             track_start: results_start as f32,
-                            track_length: visible_rows as f32,
-                            visible_rows,
-                            total_items,
+                            track_length: tl,
+                            thumb_length: (tl * visible_rows as f32 / total_items.max(1) as f32)
+                                .max(1.0),
+                            max_scroll: total_items.saturating_sub(visible_rows),
                             grab_offset,
                             inverted: false,
                         });
@@ -1871,8 +1872,8 @@ pub(super) fn handle_mouse(
                     widget: quadraui::WidgetId::new("editor_hover"),
                     track_start: sb_hit.track.y,
                     track_length: sb_hit.track.height,
-                    visible_rows: sb_hit.visible_rows,
-                    total_items: sb_hit.total,
+                    thumb_length: sb_hit.thumb.height,
+                    max_scroll: sb_hit.total.saturating_sub(sb_hit.visible_rows),
                     grab_offset,
                     inverted: false,
                 });
@@ -2222,12 +2223,13 @@ pub(super) fn handle_mouse(
                     // Setting visible_rows = 0 makes dispatch_mouse_drag's
                     // max_scroll = total, so inverting (`max - new_offset`)
                     // reaches the very top of scrollback.
+                    let tl = track_len as f32;
                     drag_state.begin(quadraui::DragTarget::ScrollbarY {
                         widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
                         track_start: track_start as f32,
-                        track_length: track_len as f32,
-                        visible_rows: 0,
-                        total_items: total,
+                        track_length: tl,
+                        thumb_length: (tl / total.max(1) as f32).max(1.0),
+                        max_scroll: total,
                         grab_offset: 0.0,
                         inverted: true,
                     });
@@ -2967,15 +2969,17 @@ pub(super) fn handle_mouse(
                         rw.total_lines,
                         rw.scroll_top,
                     );
+                    let tl = track_len as f32;
                     drag_state.begin(quadraui::DragTarget::ScrollbarY {
                         widget: quadraui::WidgetId::new(format!(
                             "tui:editor:{}:vsb",
                             rw.window_id.0
                         )),
                         track_start: track_abs_start as f32,
-                        track_length: track_len as f32,
-                        visible_rows: track_visible,
-                        total_items: rw.total_lines,
+                        track_length: tl,
+                        thumb_length: (tl * track_visible as f32 / rw.total_lines.max(1) as f32)
+                            .max(1.0),
+                        max_scroll: rw.total_lines.saturating_sub(track_visible),
                         grab_offset,
                         inverted: false,
                     });
@@ -3041,15 +3045,17 @@ pub(super) fn handle_mouse(
                             rw.max_col,
                             rw.scroll_left,
                         );
+                        let tl = track_w as f32;
                         drag_state.begin(quadraui::DragTarget::ScrollbarX {
                             widget: quadraui::WidgetId::new(format!(
                                 "tui:editor:{}:hsb",
                                 rw.window_id.0
                             )),
                             track_start: track_abs_start as f32,
-                            track_length: track_w as f32,
-                            visible_cols: track_visible,
-                            total_cols: rw.max_col,
+                            track_length: tl,
+                            thumb_length: (tl * track_visible as f32 / rw.max_col.max(1) as f32)
+                                .max(1.0),
+                            max_scroll: rw.max_col.saturating_sub(track_visible),
                             grab_offset,
                             inverted: false,
                         });

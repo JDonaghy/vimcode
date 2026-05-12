@@ -361,8 +361,6 @@ struct App {
     /// System clipboard context (copypasta-ext).  None if unavailable.
     // Box<dyn ClipboardProviderExt> is !Send; GTK App lives on main thread only.
     clipboard: Option<Box<dyn ClipboardProviderExt>>,
-    /// Drag state while the user drags a Cairo horizontal scrollbar thumb.
-    h_sb_dragging: Option<HScrollDragState>,
     /// True while the mouse cursor is over any horizontal scrollbar track.
     h_sb_hovered: bool,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
@@ -691,15 +689,6 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
             }
         }
     }
-}
-
-/// Drag state for a Cairo-drawn horizontal scrollbar.
-struct HScrollDragState {
-    window_id: core::WindowId,
-    drag_start_x: f64,
-    scroll_left_at_start: usize,
-    /// pixels per one column unit: `(track_w - thumb_w) / scroll_range`
-    px_per_col: f64,
 }
 
 /// Scrollbars and indicators for a single window.
@@ -2209,7 +2198,6 @@ impl SimpleComponent for App {
             ai_panel_box_ref: ai_panel_box_ref.clone(),
             last_clipboard_content: None,
             clipboard,
-            h_sb_dragging: None,
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: tab_slot_positions_cell.clone(),
@@ -2585,8 +2573,9 @@ impl SimpleComponent for App {
                         widget: quadraui::WidgetId::new("explorer:sb"),
                         track_start: sb_y as f32,
                         track_length: sb_h as f32,
-                        visible_rows: viewport,
-                        total_items: total,
+                        thumb_length: (sb_h as f32 * viewport as f32 / total.max(1) as f32)
+                            .max(1.0),
+                        max_scroll: total.saturating_sub(viewport),
                         grab_offset,
                         inverted: false,
                     });
@@ -6819,8 +6808,10 @@ impl App {
                                 widget: picker_id.clone(),
                                 track_start: results_top as f32,
                                 track_length: rows_h as f32,
-                                visible_rows,
-                                total_items: total,
+                                thumb_length: (rows_h as f32 * visible_rows as f32
+                                    / total.max(1) as f32)
+                                    .max(1.0),
+                                max_scroll: total.saturating_sub(visible_rows),
                                 grab_offset: 0.0,
                                 inverted: false,
                             });
@@ -6963,8 +6954,8 @@ impl App {
                                     widget: quadraui::WidgetId::new("editor_hover"),
                                     track_start: sb_hit.track.y,
                                     track_length: sb_hit.track.height,
-                                    visible_rows: sb_hit.visible_rows,
-                                    total_items: sb_hit.total,
+                                    thumb_length: sb_hit.thumb.height,
+                                    max_scroll: sb_hit.total.saturating_sub(sb_hit.visible_rows),
                                     grab_offset: 0.0,
                                     inverted: false,
                                 });
@@ -7342,76 +7333,69 @@ impl App {
 
                 // ── H scrollbar hit-test (before editor click) ────────────────
                 // If the click lands on a Cairo h scrollbar:
-                //   - on the thumb → start a drag (delta-tracked).
-                //   - on the empty track → page-jump (scroll by one
-                //     viewport-cols toward the click direction).
-                // Either way, consume the click — don't pass it through
-                // to the editor.
+                //   - on the thumb → start a DragTarget::ScrollbarX drag.
+                //   - on the empty track → page-jump toward the click.
+                // Either way, consume the click.
                 {
                     let lh = self.cached_line_height;
                     let cw = self.cached_char_width;
                     let engine = self.engine.borrow();
                     let rects = compute_editor_window_rects(&engine, width, height, lh);
-                    if let Some((win_id, px_per_col, scroll_left)) =
+                    if let Some((win_id, scroll_left)) =
                         h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
                     {
-                        // Detect track-vs-thumb using the same geometry
-                        // the rasteriser paints. Anchor the per-window
-                        // rect for h_scrollbar_geometry, then compare
-                        // the click x to the thumb's pixel range.
                         let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let thumb_hit = win_rect.and_then(|rect| {
-                            h_scrollbar_geometry(&engine, win_id, &rect, cw, lh).map(
-                                |(track_x, _ty, _tw, _sb_h, thumb_x, thumb_w, _, _)| {
-                                    (track_x, thumb_x, thumb_w)
-                                },
-                            )
-                        });
+                        let geom = win_rect
+                            .and_then(|rect| h_scrollbar_geometry(&engine, win_id, &rect, cw, lh));
+                        let (visible_cols, total_cols) = engine
+                            .windows
+                            .get(&win_id)
+                            .map(|w| {
+                                let vc = w.view.viewport_cols.max(1);
+                                let tc = engine
+                                    .buffer_manager
+                                    .get(w.buffer_id)
+                                    .map(|b| b.max_col)
+                                    .unwrap_or(vc);
+                                (vc, tc)
+                            })
+                            .unwrap_or((1, 1));
                         drop(engine);
-                        if let Some((_track_x, thumb_x, thumb_w)) = thumb_hit {
+                        if let Some((track_x, _ty, track_w, _sb_h, thumb_x, thumb_w, _, _)) = geom {
                             if x < thumb_x {
-                                // Track click left of thumb — page-left.
                                 let mut engine = self.engine.borrow_mut();
-                                let viewport_cols = engine
-                                    .windows
-                                    .get(&win_id)
-                                    .map(|w| w.view.viewport_cols.max(1))
-                                    .unwrap_or(1);
-                                let new_left = scroll_left.saturating_sub(viewport_cols);
+                                let new_left = scroll_left.saturating_sub(visible_cols);
                                 engine.set_scroll_left_for_window(win_id, new_left);
                                 self.draw_needed.set(true);
                                 return;
                             } else if x >= thumb_x + thumb_w {
-                                // Track click right of thumb — page-right.
                                 let mut engine = self.engine.borrow_mut();
-                                let (viewport_cols, max_left) =
-                                    if let Some(window) = engine.windows.get(&win_id) {
-                                        let vc = window.view.viewport_cols.max(1);
-                                        let buf_id = window.buffer_id;
-                                        let max = engine
-                                            .buffer_manager
-                                            .get(buf_id)
-                                            .map(|b| b.max_col.saturating_sub(vc))
-                                            .unwrap_or(0);
-                                        (vc, max)
-                                    } else {
-                                        (1, 0)
-                                    };
-                                let new_left = (scroll_left + viewport_cols).min(max_left);
+                                let max_left = total_cols.saturating_sub(visible_cols);
+                                let new_left = (scroll_left + visible_cols).min(max_left);
                                 engine.set_scroll_left_for_window(win_id, new_left);
                                 self.draw_needed.set(true);
                                 return;
                             }
+                            let grab_offset = (x - thumb_x) as f32;
+                            let drag_rc = self.backend.borrow().drag_state_handle();
+                            drag_rc
+                                .borrow_mut()
+                                .begin(quadraui::DragTarget::ScrollbarX {
+                                    widget: quadraui::WidgetId::new(format!(
+                                        "editor:h_sb:{}",
+                                        win_id.0
+                                    )),
+                                    track_start: track_x as f32,
+                                    track_length: track_w as f32,
+                                    thumb_length: thumb_w as f32,
+                                    max_scroll: total_cols.saturating_sub(visible_cols),
+                                    grab_offset,
+                                    inverted: false,
+                                });
+                            self.h_sb_drag_cell.set(Some(win_id));
+                            self.draw_needed.set(true);
+                            return;
                         }
-                        self.h_sb_dragging = Some(HScrollDragState {
-                            window_id: win_id,
-                            drag_start_x: x,
-                            scroll_left_at_start: scroll_left,
-                            px_per_col,
-                        });
-                        self.h_sb_drag_cell.set(Some(win_id));
-                        self.draw_needed.set(true);
-                        return; // consume click; don't send it to the editor
                     }
                 }
 
@@ -7704,18 +7688,12 @@ impl App {
                                 // Nudge selection into view so the
                                 // renderer's selection-anchored clamp
                                 // doesn't snap back.
-                                let vis = {
-                                    let drag_rc = self.backend.borrow().drag_state_handle();
-                                    let drag = drag_rc.borrow();
-                                    if let Some(quadraui::DragTarget::ScrollbarY {
-                                        visible_rows,
-                                        ..
-                                    }) = drag.target()
-                                    {
-                                        *visible_rows
-                                    } else {
-                                        0
-                                    }
+                                let vis = if self.cached_line_height > 0.0 {
+                                    let (_, _, _, ph) =
+                                        self.compute_picker_popup_bounds(width, height);
+                                    (ph / self.cached_line_height).floor() as usize
+                                } else {
+                                    0
                                 };
                                 if engine.picker_selected < *new_offset {
                                     engine.picker_selected = *new_offset;
@@ -7742,6 +7720,17 @@ impl App {
                                 engine.debug_output_scroll = *new_offset;
                                 engine.debug_output_auto_scroll = false;
                                 self.draw_needed.set(true);
+                            }
+                            w if w.starts_with("editor:h_sb:") => {
+                                if let Some(id_str) = w.strip_prefix("editor:h_sb:") {
+                                    if let Ok(id) = id_str.parse::<usize>() {
+                                        let win_id = core::WindowId(id);
+                                        self.engine
+                                            .borrow_mut()
+                                            .set_scroll_left_for_window(win_id, *new_offset);
+                                        self.draw_needed.set(true);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -7866,18 +7855,6 @@ impl App {
                 // Haven't moved enough yet, don't start any drag.
                 return;
             }
-        }
-        // H scrollbar thumb drag — convert pointer delta to scroll_left.
-        if let Some(ref state) = self.h_sb_dragging {
-            if state.px_per_col > 0.0 {
-                let delta_cols = ((x - state.drag_start_x) / state.px_per_col).round() as isize;
-                let new_left = (state.scroll_left_at_start as isize + delta_cols).max(0) as usize;
-                self.engine
-                    .borrow_mut()
-                    .set_scroll_left_for_window(state.window_id, new_left);
-                self.draw_needed.set(true);
-            }
-            return;
         }
         // Editor group divider drag — adjust split ratio.
         if let Some(split_index) = self.group_divider_dragging {
@@ -8087,7 +8064,6 @@ impl App {
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
         }
-        self.h_sb_dragging = None;
         self.h_sb_drag_cell.set(None);
         self.group_divider_dragging = None;
         let mut engine = self.engine.borrow_mut();
@@ -11244,7 +11220,7 @@ fn h_scrollbar_geometry(
     ))
 }
 
-/// Hit-test a point against all h scrollbars. Returns `(window_id, px_per_col,
+/// Hit-test a point against all h scrollbars. Returns `(window_id,
 /// scroll_left_at_click)` when the point is on any h scrollbar track (not only
 /// the thumb), so the caller can decide between thumb-drag and track-click.
 fn h_scrollbar_hit_test(
@@ -11254,18 +11230,10 @@ fn h_scrollbar_hit_test(
     window_rects: &[(core::WindowId, core::WindowRect)],
     char_width: f64,
     line_height: f64,
-) -> Option<(core::WindowId, f64, usize)> {
+) -> Option<(core::WindowId, usize)> {
     for (window_id, rect) in window_rects {
-        if let Some((
-            track_x,
-            track_y,
-            track_w,
-            sb_height,
-            _thumb_x,
-            _thumb_w,
-            _range,
-            px_per_col,
-        )) = h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
+        if let Some((track_x, track_y, track_w, sb_height, _, _, _, _)) =
+            h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
         {
             if x >= track_x && x <= track_x + track_w && y >= track_y && y <= track_y + sb_height {
                 let scroll_left = engine
@@ -11273,7 +11241,7 @@ fn h_scrollbar_hit_test(
                     .get(window_id)
                     .map(|w| w.view.scroll_left)
                     .unwrap_or(0);
-                return Some((*window_id, px_per_col, scroll_left));
+                return Some((*window_id, scroll_left));
             }
         }
     }
