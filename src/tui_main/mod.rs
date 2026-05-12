@@ -2942,122 +2942,84 @@ fn event_loop(
                             continue;
                         }
 
-                        // When terminal has focus, route all keys to PTY
+                        // Terminal key routing (#351): engine decides
+                        // the action, backend executes clipboard I/O.
                         if engine.terminal_has_focus {
-                            // Alt+1–9: switch terminal tab.
-                            if mods.contains(KeyModifiers::ALT) && !ctrl {
-                                if let KeyCode::Char(ch) = code {
-                                    if ch.is_ascii_digit() && ch != '0' {
-                                        engine.terminal_switch_tab((ch as u8 - b'1') as usize);
-                                        needs_redraw = true;
-                                        continue;
+                            use crate::core::engine::TerminalKeyAction;
+                            let mut tui_fn_buf = String::new();
+                            let (kn, uc) = match code {
+                                KeyCode::Enter => ("Return", None),
+                                KeyCode::Backspace => ("BackSpace", None),
+                                KeyCode::Esc => ("Escape", None),
+                                KeyCode::Tab => ("Tab", None),
+                                KeyCode::BackTab => ("ISO_Left_Tab", None),
+                                KeyCode::Up => ("Up", None),
+                                KeyCode::Down => ("Down", None),
+                                KeyCode::Left => ("Left", None),
+                                KeyCode::Right => ("Right", None),
+                                KeyCode::Home => ("Home", None),
+                                KeyCode::End => ("End", None),
+                                KeyCode::Delete => ("Delete", None),
+                                KeyCode::Insert => ("Insert", None),
+                                KeyCode::PageUp => ("Page_Up", None),
+                                KeyCode::PageDown => ("Page_Down", None),
+                                KeyCode::F(n) => {
+                                    tui_fn_buf = format!("F{n}");
+                                    (tui_fn_buf.as_str(), None)
+                                }
+                                KeyCode::Char(c) => ("", Some(c)),
+                                _ => ("", None),
+                            };
+                            let shift = mods.contains(KeyModifiers::SHIFT);
+                            let alt = mods.contains(KeyModifiers::ALT);
+                            let action = engine.handle_terminal_key(kn, uc, ctrl, shift, alt);
+                            match action {
+                                TerminalKeyAction::CopySelection => {
+                                    let text =
+                                        engine.active_terminal().and_then(|t| t.selected_text());
+                                    if let Some(ref text) = text {
+                                        if let Some(ref cb) = engine.clipboard_write {
+                                            let _ = cb(text);
+                                        }
+                                        engine.message = "Copied".to_string();
                                     }
                                 }
-                            }
-                            // PageUp/PageDown scroll through scrollback instead of going to PTY.
-                            if matches!(code, KeyCode::PageUp) {
-                                engine.terminal_scroll_up(12);
-                                needs_redraw = true;
-                                continue;
-                            }
-                            if matches!(code, KeyCode::PageDown) {
-                                engine.terminal_scroll_down(12);
-                                needs_redraw = true;
-                                continue;
-                            }
-                            // Ctrl+Y: copy terminal selection to clipboard.
-                            if ctrl && matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                                let text = engine.active_terminal().and_then(|t| t.selected_text());
-                                if let Some(ref text) = text {
-                                    if let Some(ref cb) = engine.clipboard_write {
-                                        let _ = cb(text);
+                                TerminalKeyAction::PasteClipboard => {
+                                    let paste_text = engine
+                                        .clipboard_read
+                                        .as_ref()
+                                        .and_then(|cb| cb().ok())
+                                        .filter(|t| !t.is_empty())
+                                        .or_else(|| {
+                                            engine
+                                                .registers
+                                                .get(&'+')
+                                                .map(|(t, _)| t.clone())
+                                                .filter(|t| !t.is_empty())
+                                        })
+                                        .or_else(|| {
+                                            engine
+                                                .registers
+                                                .get(&'"')
+                                                .map(|(t, _)| t.clone())
+                                                .filter(|t| !t.is_empty())
+                                        });
+                                    if let Some(text) = paste_text {
+                                        engine.terminal_write(b"\x1b[200~");
+                                        engine.terminal_write(text.as_bytes());
+                                        engine.terminal_write(b"\x1b[201~");
+                                        engine.poll_terminal();
+                                    } else {
+                                        engine.message = "Nothing to paste".to_string();
                                     }
-                                    engine.message = "Copied".to_string();
                                 }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            // Ctrl+V / Ctrl+Shift+V: paste clipboard to PTY (VS Code behavior).
-                            if ctrl && matches!(code, KeyCode::Char('v') | KeyCode::Char('V')) {
-                                // Try system clipboard first, fall back to VimCode
-                                // registers ("+ then ") so yanked text is always available.
-                                let paste_text = engine
-                                    .clipboard_read
-                                    .as_ref()
-                                    .and_then(|cb| cb().ok())
-                                    .filter(|t| !t.is_empty())
-                                    .or_else(|| {
-                                        engine
-                                            .registers
-                                            .get(&'+')
-                                            .map(|(t, _)| t.clone())
-                                            .filter(|t| !t.is_empty())
-                                    })
-                                    .or_else(|| {
-                                        engine
-                                            .registers
-                                            .get(&'"')
-                                            .map(|(t, _)| t.clone())
-                                            .filter(|t| !t.is_empty())
-                                    });
-                                if let Some(text) = paste_text {
-                                    // Wrap in bracketed paste so the inner shell
-                                    // treats multi-line content as a single paste.
-                                    engine.terminal_write(b"\x1b[200~");
-                                    engine.terminal_write(text.as_bytes());
-                                    engine.terminal_write(b"\x1b[201~");
+                                TerminalKeyAction::SendToPty(data) => {
+                                    engine.terminal_write(&data);
                                     engine.poll_terminal();
-                                } else {
-                                    engine.message = "Nothing to paste".to_string();
                                 }
-                                needs_redraw = true;
-                                continue;
+                                TerminalKeyAction::Handled | TerminalKeyAction::Ignore => {}
                             }
-                            // Ctrl+F: toggle terminal inline find bar.
-                            if ctrl && matches!(code, KeyCode::Char('f') | KeyCode::Char('F')) {
-                                if engine.terminal_find_active {
-                                    engine.terminal_find_close();
-                                } else {
-                                    engine.terminal_find_open();
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            // Terminal find bar key routing (all other keys go here when active).
-                            if engine.terminal_find_active {
-                                match code {
-                                    KeyCode::Esc => engine.terminal_find_close(),
-                                    KeyCode::Enter if mods.contains(KeyModifiers::SHIFT) => {
-                                        engine.terminal_find_prev()
-                                    }
-                                    KeyCode::Enter => engine.terminal_find_next(),
-                                    KeyCode::Backspace => engine.terminal_find_backspace(),
-                                    KeyCode::Char(ch) if !ctrl => engine.terminal_find_char(ch),
-                                    _ => {}
-                                }
-                                needs_redraw = true;
-                                continue;
-                            }
-                            // Ctrl-W in split mode: switch focus between panes.
-                            if ctrl
-                                && engine.terminal_split
-                                && matches!(code, KeyCode::Char('w') | KeyCode::Char('W'))
-                            {
-                                engine.terminal_split_switch_focus();
-                                needs_redraw = true;
-                                continue;
-                            }
-                            // Any other key resets scroll (returns to live view) and forwards.
-                            engine.terminal_scroll_reset();
-                            let data = translate_key_to_pty(key_event);
-                            if !data.is_empty() {
-                                engine.terminal_write(&data);
-                                // Poll PTY output immediately so held keys (e.g.
-                                // backspace) show feedback each frame instead of
-                                // batching until the key is released.
-                                engine.poll_terminal();
-                                needs_redraw = true;
-                            }
+                            needs_redraw = true;
                             continue;
                         }
 
@@ -3948,52 +3910,6 @@ fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Op
         KeyCode::PageDown => Some(("Page_Down".to_string(), None, false)),
         KeyCode::F(n) => Some((format!("F{}", n), None, false)),
         _ => None,
-    }
-}
-
-// ─── Terminal PTY key translation ────────────────────────────────────────────
-
-/// Translate a crossterm key event to PTY input bytes.
-/// Returns an empty vec for keys with no PTY mapping.
-fn translate_key_to_pty(event: KeyEvent) -> Vec<u8> {
-    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-    match event.code {
-        KeyCode::Char(c) if ctrl => {
-            let b = c.to_ascii_lowercase() as u8;
-            if b.is_ascii() {
-                vec![b & 0x1f]
-            } else {
-                vec![]
-            }
-        }
-        KeyCode::Char(c) => c.to_string().into_bytes(),
-        KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Backspace => b"\x7f".to_vec(),
-        KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::Esc => b"\x1b".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::F(1) => b"\x1bOP".to_vec(),
-        KeyCode::F(2) => b"\x1bOQ".to_vec(),
-        KeyCode::F(3) => b"\x1bOR".to_vec(),
-        KeyCode::F(4) => b"\x1bOS".to_vec(),
-        KeyCode::F(5) => b"\x1b[15~".to_vec(),
-        KeyCode::F(6) => b"\x1b[17~".to_vec(),
-        KeyCode::F(7) => b"\x1b[18~".to_vec(),
-        KeyCode::F(8) => b"\x1b[19~".to_vec(),
-        KeyCode::F(9) => b"\x1b[20~".to_vec(),
-        KeyCode::F(10) => b"\x1b[21~".to_vec(),
-        KeyCode::F(11) => b"\x1b[23~".to_vec(),
-        KeyCode::F(12) => b"\x1b[24~".to_vec(),
-        _ => vec![],
     }
 }
 
