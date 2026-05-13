@@ -356,7 +356,8 @@ pub(super) fn draw_frame(
                     width: bc_w,
                     height: 1,
                 };
-                draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
+                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
+                *bc.draw_layout.borrow_mut() = Some(layout);
             }
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -401,7 +402,8 @@ pub(super) fn draw_frame(
                     width: editor_area.width,
                     height: 1,
                 };
-                draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
+                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
+                *bc.draw_layout.borrow_mut() = Some(layout);
             }
         }
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
@@ -769,7 +771,7 @@ pub(super) fn draw_frame(
                 debug_toolbar_interaction.pressed_id(),
             )
         });
-        debug_toolbar_interaction.set_hit_regions(hits);
+        debug_toolbar_interaction.set_layout(hits);
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -1501,13 +1503,14 @@ pub(super) fn render_tab_bar(
 ///
 /// The pre-built `quadraui::StatusBar` primitive comes from
 /// `ScreenLayout` (built by `render::build_screen_layout`).
+/// Returns the `StatusBarLayout` for click-time hit testing.
 pub(super) fn draw_breadcrumb_bar(
     backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
     bar: &quadraui::StatusBar,
     theme: &Theme,
-) {
+) -> quadraui::StatusBarLayout {
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1517,8 +1520,8 @@ pub(super) fn draw_breadcrumb_bar(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(q_rect, bar, None, None);
-    });
+        b.draw_status_bar(q_rect, bar, None, None)
+    })
 }
 
 // ─── Editor windows ───────────────────────────────────────────────────────────

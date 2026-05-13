@@ -2450,9 +2450,17 @@ pub(super) fn handle_mouse(
 
             if sidebar_row < 2 {
                 // Chrome rows (title + action button).
-                let hits = engine.dap_sidebar_action_hits.borrow();
-                let matched = hits.iter().any(|r| col >= r.col && col < r.col + r.width);
-                drop(hits);
+                let guard = engine.dap_sidebar_action_hits.borrow();
+                let matched = guard
+                    .as_ref()
+                    .map(|l| {
+                        matches!(
+                            l.hit_test(col as f32, 0.0),
+                            quadraui::StatusBarHit::Segment(_)
+                        )
+                    })
+                    .unwrap_or(false);
+                drop(guard);
                 if matched {
                     if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
                         engine.dap_continue();
@@ -2607,33 +2615,24 @@ pub(super) fn handle_mouse(
     // ── Breadcrumb click ────────────────────────────────────────────────────
     if engine.settings.breadcrumbs {
         if let Some(layout) = last_layout {
-            for bc in &layout.breadcrumbs {
-                let bc_row = menu_rows + bc.bounds.y as u16;
-                let bc_x = editor_left + bc.bounds.x as u16;
-                let bc_w = bc.bounds.width as u16;
-                if row == bc_row && col >= bc_x && col < bc_x + bc_w {
-                    if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        return sidebar_width; // consume non-click events on breadcrumb row
-                    }
-                    // Theme only feeds segment fg/bg here, which resolve_click
-                    // ignores — onedark stand-in is fine for hit-test only.
-                    let theme = Theme::onedark();
-                    let bar = render::breadcrumbs_to_quadraui_status_bar(
-                        &bc.segments,
-                        &theme,
-                        engine.breadcrumb_focus,
-                        engine.breadcrumb_selected,
-                    );
-                    let local_col = col - bc_x;
-                    if let Some(id) = bar.resolve_click(local_col, bc_w as usize) {
-                        if let Some(idx) = render::breadcrumb_action_index(&id) {
-                            engine.rebuild_breadcrumb_segments();
-                            engine.breadcrumb_selected = idx;
-                            engine.breadcrumb_open_scoped();
-                        }
-                    }
+            let bc_x = (col - editor_left) as f64;
+            let bc_y = (row - menu_rows) as f64;
+            let on_bc_row = layout
+                .breadcrumbs
+                .iter()
+                .any(|bc| !bc.segments.is_empty() && bc_y == bc.bounds.y.floor());
+            if on_bc_row {
+                if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                     return sidebar_width;
                 }
+                if let Some(idx) =
+                    render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0)
+                {
+                    engine.rebuild_breadcrumb_segments();
+                    engine.breadcrumb_selected = idx;
+                    engine.breadcrumb_open_scoped();
+                }
+                return sidebar_width;
             }
         }
     }

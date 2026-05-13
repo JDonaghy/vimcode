@@ -2898,9 +2898,9 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
-    /// Cached hit regions for the debug sidebar action-button row.
-    /// Paint fills; click reads verbatim (paint↔click pattern).
-    pub dap_sidebar_action_hits: std::cell::RefCell<Vec<quadraui::StatusBarHitRegion>>,
+    /// Cached layout for the debug sidebar action-button row.
+    /// Paint fills; click reads via `hit_test()` (paint↔click pattern).
+    pub dap_sidebar_action_hits: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
     /// Forward-indexed scroll offset for the debug output panel (0 = top/oldest).
     pub debug_output_scroll: usize,
     /// When true, debug output auto-scrolls to show newest lines.
@@ -3638,7 +3638,7 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
-            dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
+            dap_sidebar_action_hits: std::cell::RefCell::new(None),
             debug_output_scroll: 0,
             debug_output_auto_scroll: true,
             scroll_surfaces: std::cell::RefCell::new(Vec::new()),
