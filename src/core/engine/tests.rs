@@ -17611,15 +17611,13 @@ fn test_breadcrumb_click_directory_opens_file_picker() {
 }
 
 #[test]
-fn test_breadcrumb_click_file_opens_symbol_picker() {
+fn test_breadcrumb_click_file_opens_sibling_files() {
     let mut e = engine_with_text("hello");
     let file = std::env::temp_dir().join("vimcode_test_bc_file.rs");
     std::fs::write(&file, "fn foo() {}").unwrap();
-    // Clicking a file segment should open the @ symbol picker
     e.breadcrumb_click(false, Some(&file));
     assert!(e.picker_open, "breadcrumb file click should open picker");
-    assert_eq!(e.picker_source, PickerSource::CommandCenter);
-    assert_eq!(e.picker_query, "@");
+    assert_eq!(e.picker_source, PickerSource::Files);
     let _ = std::fs::remove_file(&file);
 }
 
