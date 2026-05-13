@@ -11300,13 +11300,7 @@ fn tab_close_hit_test(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let editor_bottom = da_h - status_bar_height;
+    let editor_bottom = gtk_editor_bottom(engine, da_w, da_h, line_height);
     let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
     let mut group_rects = engine
         .group_layout
@@ -11354,13 +11348,7 @@ fn tab_tooltip_hit_test(
     } else {
         tab_row_height
     };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let status_bar_height = line_height * 2.0 + wildmenu_px;
-    let editor_bottom = da_h - status_bar_height;
+    let editor_bottom = gtk_editor_bottom(engine, da_w, da_h, line_height);
     let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
     let mut group_rects = engine
         .group_layout

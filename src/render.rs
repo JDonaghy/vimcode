@@ -5897,7 +5897,10 @@ pub fn build_screen_layout(
                     min_y = 0.0;
                     max_x = 0.0;
                 }
-                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, line_height);
+                // Place bounds at the actual breadcrumb row (one line_height
+                // above the window content top).
+                let bc_y = (min_y - line_height).max(0.0);
+                let bounds = WindowRect::new(min_x, bc_y, max_x - min_x, line_height);
                 BreadcrumbBar {
                     group_id: gid,
                     segments,
@@ -13702,5 +13705,50 @@ mod tests {
         // Fallback: 3 spans (leading-pad, whole-label, trailing-pad).
         assert_eq!(styled.spans.len(), 3);
         assert_eq!(styled.spans[1].text, "fn foo(x: i32)");
+    }
+
+    #[test]
+    fn test_breadcrumb_bounds_do_not_overlap_first_line() {
+        use crate::core::engine::Engine;
+        use crate::core::window::{GroupId, WindowRect};
+
+        let mut engine = Engine::new();
+        engine.settings.breadcrumbs = true;
+        engine.buffer_mut().insert(0, "line 1\nline 2\nline 3\n");
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let tbh = tab_bar_height_px(line_height, true);
+        let wid = engine.active_window_id();
+        let rects = vec![(wid, WindowRect::new(0.0, tbh, 800.0, 600.0 - tbh))];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+
+        assert!(!layout.breadcrumbs.is_empty());
+        let bc = &layout.breadcrumbs[0];
+        // Breadcrumb bounds must sit ABOVE the window content, not overlap it.
+        let window_top = layout.windows[0].rect.y;
+        assert!(
+            bc.bounds.y + bc.bounds.height <= window_top,
+            "breadcrumb bottom ({}) must not exceed window top ({})",
+            bc.bounds.y + bc.bounds.height,
+            window_top,
+        );
+
+        // Clicking at the window top (line 1) must return Window, not Breadcrumb.
+        let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
+        let zone = screen_zone_hit_test(
+            &layout,
+            100.0,
+            window_top,
+            tbh,
+            single_tab_hidden,
+            engine.active_group,
+        );
+        assert!(
+            matches!(zone, ScreenZone::Window { .. }),
+            "click at window_top should hit Window zone, got {:?}",
+            zone,
+        );
     }
 }

@@ -412,3 +412,30 @@ fn trailing_space_item_clears_wildmenu_for_next_tab() {
         "should show setting completions"
     );
 }
+
+// ── :set  + Tab cycles through settings (#360) ──────────────────────────
+
+#[test]
+fn set_tab_cycles_through_settings() {
+    let mut e = engine_with("hello\n");
+    press(&mut e, ':');
+    type_chars(&mut e, "set ");
+    press_key(&mut e, "Tab"); // opens wildmenu
+
+    assert!(!e.wildmenu_items.is_empty(), "wildmenu should open");
+    assert_mode(&e, Mode::Command);
+
+    let items = e.wildmenu_items.clone();
+
+    // Second Tab: select first item
+    press_key(&mut e, "Tab");
+    assert_mode(&e, Mode::Command);
+    assert_eq!(e.wildmenu_selected, Some(0));
+    assert_eq!(e.command_buffer, items[0]);
+
+    // Third Tab: select second item
+    press_key(&mut e, "Tab");
+    assert_mode(&e, Mode::Command);
+    assert_eq!(e.wildmenu_selected, Some(1));
+    assert_eq!(e.command_buffer, items[1]);
+}

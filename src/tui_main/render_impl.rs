@@ -365,13 +365,7 @@ pub(super) fn draw_frame(
             }
             let bc_x = bc.bounds.x as u16 + editor_area.x;
             let bc_w = bc.bounds.width as u16;
-            // Breadcrumb bar is one row above the window content (bounds.y - 1 in
-            // breadcrumb coordinates, which is one row below the tab bar).
             let bc_y = editor_area.y + bc.bounds.y as u16;
-            // In multi-group with breadcrumbs, bounds.y points to the breadcrumb row
-            // (tab_bar_height=2 means row 0=tab, row 1=breadcrumb, row 2+=windows).
-            // The breadcrumb bounds.y is window min_y, so the bc sits 1 above.
-            let bc_y = bc_y.saturating_sub(1);
             if bc_w > 0 {
                 let bc_rect = Rect {
                     x: bc_x,
