@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 12, 2026 (Session 365 — **Six milestone items shipped + horizontal scroll fix.** #352 (Pango click-to-column), #351 (shared terminal key dispatch), #343 (h-scrollbar DragTarget::ScrollbarX), #349 (global status bar adapter), #348 (wildmenu adapter), #361 (horizontal scroll in ensure_cursor_visible + exact viewport_cols via Pango measurement). Replaced `approximate_char_width()` with Pango `layout.pixel_size()` at 7 call sites. Filed quadraui#133 (wrap selection), #134 (thumb_length), #136 (h-scroll surface). Filed vimcode #359 (nowsl click bug), #360 (wildmenu Tab), #362 (first-line click).)
+**Last updated:** May 12, 2026 (Session 366 — **Three bug-fix issues resolved.** PR #364: fixed #362 (first-line click swallowed by wrong breadcrumb bounds), fixed #359 (tab hit-test hardcoded status height + confirmed nowsl clicks work). Closed #360 (wildmenu Tab cycling — not a bug, `:set` output confused with wildmenu). Closed shipped #343.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -20,19 +20,14 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (365):**
-- **PR #357 — Pango click-to-column (#352):** Replaced `text_rel_x / char_width` with Pango `xy_to_index` in GTK click handler. Eliminated cumulative rounding drift on long lines. Ignored `trailing` for Vim cursor semantics.
-- **PR #358 — Shared terminal key dispatch (#351):** Added `Engine::handle_terminal_key()` + `TerminalKeyAction` enum. Deleted per-backend `gtk_key_to_pty_bytes` and `translate_key_to_pty`. Both backends now call the engine and execute only clipboard I/O. Gained: Ctrl+Shift+C copy and PageUp/PageDown scrollback work in both backends.
-- **#343 — H-scrollbar DragTarget::ScrollbarX:** Replaced bespoke `HScrollDragState` with quadraui's `DragTarget::ScrollbarX` + `dispatch_mouse_drag`. H-scrollbar range bug remains (quadraui#136).
-- **#349 — Global status bar adapter:** `build_global_status_bar()` wraps left/right strings into `quadraui::StatusBar`. Both backends draw via `draw_status_bar`. Deleted `draw_status_line` (GTK) and `render_status_line` (TUI).
-- **#348 — Wildmenu adapter:** `wildmenu_to_status_bar()` maps items to `StatusBarSegment`s. Deleted `draw_wildmenu` (GTK) and `render_wildmenu` (TUI).
-- **PR #363 — Horizontal scroll + exact viewport_cols (#361):** Added horizontal scroll to `ensure_cursor_visible`. Added `text_viewport_cols` to `RenderedWindow` + `paint_viewport_cols` RefCell on Engine (populated at paint time, read during key handling). Replaced all `approximate_char_width()` with Pango `layout.pixel_size()` at 7 GTK call sites.
+**Shipped this session (366):**
+- **PR #364 — First-line click + tab hit-test + wildmenu test (#362, #359, #360):** Fixed `BreadcrumbBar.bounds.y` in `ScreenLayout` — was set to window content top instead of actual breadcrumb row position. `screen_zone_hit_test` returned `ScreenZone::Breadcrumb` for first-line clicks, which mapped to `ClickTarget::None`. Fixed at source in render.rs; removed per-backend workaround subtractions in GTK draw.rs, TUI render_impl.rs, and TUI mouse.rs. Also fixed `tab_close_hit_test` and `tab_tooltip_hit_test` which hardcoded `status_bar_height` to `2.0 * line_height` — replaced with `gtk_editor_bottom()`. Closed #360 as not-a-bug (`:set` output confused with wildmenu). Closed shipped #343.
 
 ---
 
-Vimcode at 1960 lib tests passing, 2033 total (lib+integration).
+Vimcode at 1960 lib tests passing, 2057 total (lib+integration).
 
-> Sessions 365 and earlier in **SESSION_HISTORY.md**.
+> Sessions 366 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -136,4 +131,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 362 and earlier in **SESSION_HISTORY.md**.
+> Sessions 365 and earlier in **SESSION_HISTORY.md**.

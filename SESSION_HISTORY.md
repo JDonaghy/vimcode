@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 365 archived here.
+All sessions through 366 archived here.
+
+---
+**Session 366 (May 12) — Three bug-fix issues resolved:**
+
+PR #364 shipped three fixes. **#362 (first-line click):** `BreadcrumbBar.bounds.y` in `ScreenLayout` was set to window content top (`min_y`) instead of actual breadcrumb row (`min_y - line_height`). `screen_zone_hit_test` returned `ScreenZone::Breadcrumb` for clicks at `y = window_top`, which `pixel_to_click_target` mapped to `ClickTarget::None` — silently swallowing the click. Fixed bounds computation in `build_screen_layout` to `(min_y - line_height).max(0.0)`; removed compensating `- line_height` in GTK `draw.rs`, `.saturating_sub(1)` in TUI `render_impl.rs`, and `- 1` in TUI `mouse.rs`. Added regression test `test_breadcrumb_bounds_do_not_overlap_first_line`. **#359 (nowsl click):** `tab_close_hit_test` and `tab_tooltip_hit_test` hardcoded `status_bar_height = line_height * 2.0`, ignoring `window_status_line` setting. Replaced with `gtk_editor_bottom()`. Smoke-confirmed gutter/text clicks work with `:set nowsl`. **#360 (wildmenu Tab):** Investigated exhaustively — all 24 wildmenu tests pass. Live debugging with `eprintln!` showed Tab arriving with `mode=Normal` — user was pressing Enter after `:set ` (executing the command and exiting command mode) then pressing Tab. Closed as not-a-bug. Also closed shipped #343 (h-scrollbar DragTarget::ScrollbarX from Session 365).
 
 ---
 **Session 365 (May 11–12) — Six milestone items + horizontal scroll fix:**
