@@ -1801,6 +1801,40 @@ fn event_loop(
             }
         }
 
+        // ── Explorer DoubleClick → TreeController ─────────────────────
+        if let quadraui::UiEvent::DoubleClick { position, .. } = &ui_event {
+            let rect = engine.explorer_tree_rect.get();
+            if sidebar.visible
+                && sidebar.active_panel == TuiPanel::Explorer
+                && rect.width > 0.0
+                && rect.contains(*position)
+            {
+                engine.explorer_has_focus = true;
+                sidebar.has_focus = true;
+                render::populate_explorer_tree_controller(engine, &theme);
+                let event = engine
+                    .explorer_tree
+                    .borrow_mut()
+                    .handle(&ui_event, &mut backend, rect);
+                engine.dispatch_explorer_tree_event(event);
+                needs_redraw = true;
+                continue;
+            }
+        }
+
+        // Convert DoubleClick to MouseDown for legacy crossterm handlers
+        // (editor word-select, extension panel, etc.) that still use
+        // timer-based double-click detection.
+        let ui_event = match ui_event {
+            quadraui::UiEvent::DoubleClick { position, .. } => quadraui::UiEvent::MouseDown {
+                button: quadraui::MouseButton::Left,
+                position,
+                modifiers: quadraui::Modifiers::default(),
+                widget: None,
+            },
+            other => other,
+        };
+
         let ui_event_saved = ui_event.clone();
         let crossterm_event = match events::uievent_to_crossterm(ui_event) {
             Some(e) => e,

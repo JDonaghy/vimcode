@@ -2431,17 +2431,7 @@ pub(super) fn handle_mouse(
                     engine.explorer_toggle_dir(tree_row);
                 } else {
                     let path = engine.explorer_rows[tree_row].path.clone();
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
-                    if is_double {
-                        engine.open_file_in_tab(&path);
-                    } else {
-                        engine.open_file_preview(&path);
-                    }
+                    engine.open_file_preview(&path);
                 }
             }
         } else if sidebar.active_panel == TuiPanel::Debug {
