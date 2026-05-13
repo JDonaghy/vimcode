@@ -11016,6 +11016,94 @@ pub fn to_quadraui_color(c: Color) -> quadraui::Color {
     quadraui::Color::rgb(c.r, c.g, c.b)
 }
 
+/// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
+/// `render::Theme`. Shared by both TUI and GTK backends — every
+/// `draw_*` delegate and `Backend::set_current_theme` call site uses
+/// this single source of truth.
+pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
+    let chrome = to_quadraui_theme_chrome(theme);
+    to_quadraui_theme_editor(theme, chrome)
+}
+
+fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
+    let q = to_quadraui_color;
+    quadraui::Theme {
+        background: q(theme.background),
+        foreground: q(theme.foreground),
+        tab_bar_bg: q(theme.tab_bar_bg),
+        tab_active_bg: q(theme.tab_active_bg),
+        tab_active_fg: q(theme.tab_active_fg),
+        tab_inactive_fg: q(theme.tab_inactive_fg),
+        tab_preview_active_fg: q(theme.tab_preview_active_fg),
+        tab_preview_inactive_fg: q(theme.tab_preview_inactive_fg),
+        separator: q(theme.separator),
+        surface_bg: q(theme.fuzzy_bg),
+        surface_fg: q(theme.fuzzy_fg),
+        selected_bg: q(theme.fuzzy_selected_bg),
+        border_fg: q(theme.fuzzy_border),
+        title_fg: q(theme.fuzzy_title_fg),
+        header_bg: q(theme.status_bg),
+        header_fg: q(theme.status_fg),
+        muted_fg: q(theme.line_number_fg),
+        error_fg: q(theme.diagnostic_error),
+        warning_fg: q(theme.diagnostic_warning),
+        query_fg: q(theme.fuzzy_query_fg),
+        match_fg: q(theme.fuzzy_match_fg),
+        accent_fg: q(theme.cursor),
+        hover_bg: q(theme.hover_bg),
+        hover_fg: q(theme.hover_fg),
+        hover_border: q(theme.hover_border),
+        input_bg: q(theme.completion_bg),
+        inactive_fg: q(theme.status_inactive_fg),
+        selection_bg: q(theme.selection),
+        link_fg: q(theme.md_link),
+        completion_bg: q(theme.completion_bg),
+        completion_fg: q(theme.completion_fg),
+        completion_border: q(theme.completion_border),
+        completion_selected_bg: q(theme.completion_selected_bg),
+        accent_bg: q(theme.tab_active_accent),
+        scrollbar_track: q(theme.separator),
+        scrollbar_thumb: q(theme.scrollbar_thumb),
+        ..quadraui::Theme::default()
+    }
+}
+
+fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui::Theme {
+    let q = to_quadraui_color;
+    quadraui::Theme {
+        editor_active_background: q(theme.active_background),
+        cursorline_bg: q(theme.cursorline_bg),
+        dap_stopped_bg: q(theme.dap_stopped_bg),
+        colorcolumn_bg: q(theme.colorcolumn_bg),
+        diff_added_bg: q(theme.diff_added_bg),
+        diff_removed_bg: q(theme.diff_removed_bg),
+        diff_padding_bg: q(theme.diff_padding_bg),
+        line_number_fg: q(theme.line_number_fg),
+        line_number_active_fg: q(theme.line_number_active_fg),
+        diagnostic_error: q(theme.diagnostic_error),
+        diagnostic_warning: q(theme.diagnostic_warning),
+        diagnostic_info: q(theme.diagnostic_info),
+        diagnostic_hint: q(theme.diagnostic_hint),
+        git_added: q(theme.git_added),
+        git_modified: q(theme.git_modified),
+        git_deleted: q(theme.git_deleted),
+        lightbulb: q(theme.lightbulb),
+        spell_error: q(theme.spell_error),
+        cursor: q(theme.cursor),
+        cursor_normal_alpha: theme.cursor_normal_alpha as f32,
+        selection: q(theme.selection),
+        selection_alpha: theme.selection_alpha as f32,
+        yank_highlight_bg: q(theme.yank_highlight_bg),
+        yank_highlight_alpha: theme.yank_highlight_alpha as f32,
+        bracket_match_bg: q(theme.bracket_match_bg),
+        indent_guide_fg: q(theme.indent_guide_fg),
+        indent_guide_active_fg: q(theme.indent_guide_active_fg),
+        annotation_fg: q(theme.annotation_fg),
+        ghost_text_fg: q(theme.ghost_text_fg),
+        ..chrome
+    }
+}
+
 // ─── quadraui::Editor adapter (#276 Stage 1C) ────────────────────────────────
 //
 // Convert a vimcode `RenderedWindow` (engine-side IR) into a
