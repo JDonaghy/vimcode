@@ -252,10 +252,6 @@ pub(super) fn draw_editor(
             let tab_y = gtb.bounds.y - tab_bar_height;
             let tab_x = gtb.bounds.x;
             let tab_w = gtb.bounds.width;
-            let is_active = gtb.group_id == split.active_group;
-            // In diff mode, show split buttons on all groups so clicking
-            // an inactive group's toolbar doesn't cause a visual shift.
-            let show_split = is_active || engine.is_in_diff_view();
             cr.save().ok();
             cr.rectangle(tab_x, tab_y, tab_w, tab_row_height);
             cr.clip();
@@ -267,25 +263,16 @@ pub(super) fn draw_editor(
                     None
                 }
             });
-            let accent = if is_active {
-                Some(theme.tab_active_accent)
-            } else {
-                None
-            };
             let (positions, close_b, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
                 backend,
                 cr,
                 &layout,
                 &theme,
-                &gtb.tabs,
+                &gtb.bar,
                 tab_w,
                 line_height,
                 0.0,
-                show_split,
                 hover_idx,
-                gtb.diff_toolbar.as_ref(),
-                gtb.tab_scroll_offset,
-                accent,
             );
             tab_slot_positions_out
                 .borrow_mut()
@@ -315,15 +302,11 @@ pub(super) fn draw_editor(
             cr,
             &layout,
             &theme,
-            &screen.tab_bar,
+            &screen.tab_bar_primitive,
             width as f64,
             line_height,
             0.0,
-            true,
             hover_idx,
-            screen.diff_toolbar.as_ref(),
-            screen.tab_scroll_offset,
-            Some(theme.tab_active_accent),
         );
         // Use group_id 0 for single-group mode
         tab_slot_positions_out
@@ -368,12 +351,10 @@ pub(super) fn draw_editor(
             cr,
             &layout,
             &theme,
-            &bc.segments,
+            &bc.bar,
             bc_w,
             line_height,
             bc_y,
-            engine.breadcrumb_focus,
-            engine.breadcrumb_selected,
             breadcrumb_hit_regions_out,
         );
         cr.restore().ok();
@@ -1070,11 +1051,10 @@ pub(super) fn draw_tab_drag_overlay(
     }
 }
 
-/// A.6d / B5c.2: GTK tab bar renders via `Backend::draw_tab_bar`.
+/// GTK tab bar renders via `Backend::draw_tab_bar`.
 ///
-/// Builds the shared `quadraui::TabBar` primitive via
-/// `render::build_tab_bar_primitive`, routes through the trait, and
-/// reshapes `TabBarHits.right_segment_bounds` (keyed by `WidgetId`)
+/// Takes a pre-built `quadraui::TabBar` primitive (from `ScreenLayout`)
+/// and reshapes `TabBarHits.right_segment_bounds` (keyed by `WidgetId`)
 /// into the vimcode-specific (diff_btns, split_btns, action_btn)
 /// groupings the click handler consumes. The vimcode UI font is set
 /// on the Pango layout before the trait call and restored afterwards
@@ -1085,26 +1065,13 @@ pub(super) fn draw_tab_bar(
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
-    tabs: &[TabInfo],
+    bar: &quadraui::TabBar,
     width: f64,
     line_height: f64,
     y_offset: f64,
-    show_split_btn: bool,
     hovered_close_tab: Option<usize>,
-    diff_toolbar: Option<&render::DiffToolbarData>,
-    tab_scroll_offset: usize,
-    accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
     use pango::FontDescription;
-
-    let accent = accent_color.map(render::to_quadraui_color);
-    let bar = render::build_tab_bar_primitive(
-        tabs,
-        show_split_btn,
-        diff_toolbar,
-        tab_scroll_offset,
-        accent,
-    );
 
     // The rasteriser uses whatever font is on the layout. Vimcode renders
     // tabs in the UI sans-serif, not the editor monospace; set it before
@@ -1120,7 +1087,7 @@ pub(super) fn draw_tab_bar(
         let tab_row_h = (line_height * 1.6).ceil();
         b.draw_tab_bar(
             quadraui::Rect::new(0.0, y_offset as f32, width as f32, tab_row_h as f32),
-            &bar,
+            bar,
             hovered_close_tab,
         )
     });
@@ -1177,29 +1144,29 @@ pub(super) fn draw_tab_bar(
     )
 }
 
+/// Draw the breadcrumb bar via `Backend::draw_status_bar`.
+///
+/// The pre-built `quadraui::StatusBar` primitive comes from
+/// `ScreenLayout` (built by `render::build_screen_layout`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_breadcrumb_bar(
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
-    segments: &[render::BreadcrumbSegment],
+    bar: &quadraui::StatusBar,
     width: f64,
     line_height: f64,
     y_offset: f64,
-    focus_active: bool,
-    focus_selected: usize,
     hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
 ) {
-    let bar =
-        render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
     use quadraui::Backend;
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
         let hits = b.draw_status_bar(
             quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
-            &bar,
+            bar,
             None,
             None,
         );

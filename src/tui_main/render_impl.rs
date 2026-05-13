@@ -328,8 +328,6 @@ pub(super) fn draw_frame(
             }
             let tab_x = gtb.bounds.x as u16 + editor_area.x;
             let tab_w = gtb.bounds.width as u16;
-            let is_active = gtb.group_id == split.active_group;
-            let show_split = is_active;
             if tab_w > 0 {
                 let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
                 let g_tab = Rect {
@@ -338,22 +336,7 @@ pub(super) fn draw_frame(
                     width: tab_w,
                     height: 1,
                 };
-                let accent = if is_active {
-                    Some(rc(theme.tab_active_accent))
-                } else {
-                    None
-                };
-                let vis = render_tab_bar(
-                    backend,
-                    frame,
-                    g_tab,
-                    &gtb.tabs,
-                    theme,
-                    show_split,
-                    gtb.diff_toolbar.as_ref(),
-                    gtb.tab_scroll_offset,
-                    accent,
-                );
+                let vis = render_tab_bar(backend, frame, g_tab, &gtb.bar, theme);
                 tab_visible_counts_out.push((gtb.group_id, vis));
             }
         }
@@ -373,15 +356,7 @@ pub(super) fn draw_frame(
                     width: bc_w,
                     height: 1,
                 };
-                draw_breadcrumb_bar(
-                    backend,
-                    frame,
-                    bc_rect,
-                    &bc.segments,
-                    theme,
-                    engine.breadcrumb_focus,
-                    engine.breadcrumb_selected,
-                );
+                draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
             }
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -408,17 +383,7 @@ pub(super) fn draw_frame(
                 width: editor_area.width,
                 height: 1,
             };
-            let vis = render_tab_bar(
-                backend,
-                frame,
-                tab_rect,
-                &screen.tab_bar,
-                theme,
-                true,
-                screen.diff_toolbar.as_ref(),
-                screen.tab_scroll_offset,
-                Some(rc(theme.tab_active_accent)),
-            );
+            let vis = render_tab_bar(backend, frame, tab_rect, &screen.tab_bar_primitive, theme);
             tab_visible_counts_out.push((engine.active_group, vis));
         }
         // Draw breadcrumb bar for the single group. Hidden while the terminal
@@ -436,15 +401,7 @@ pub(super) fn draw_frame(
                     width: editor_area.width,
                     height: 1,
                 };
-                draw_breadcrumb_bar(
-                    backend,
-                    frame,
-                    bc_rect,
-                    &bc.segments,
-                    theme,
-                    engine.breadcrumb_focus,
-                    engine.breadcrumb_selected,
-                );
+                draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
             }
         }
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
@@ -1517,31 +1474,15 @@ pub(super) fn compute_tui_tab_drop_zone(
 /// `set_tab_visible_count` (misnamed; it's the bar width used by
 /// `ensure_active_tab_visible` to derive scroll offsets).
 ///
-/// B5c.2: routes through the trait. The Backend impl computes layout
-/// internally with the cell measurer.
-#[allow(clippy::too_many_arguments)]
+/// The pre-built `quadraui::TabBar` primitive comes from `ScreenLayout`
+/// (built by `render::build_screen_layout`).
 pub(super) fn render_tab_bar(
     backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
-    tabs: &[render::TabInfo],
+    bar: &quadraui::TabBar,
     theme: &Theme,
-    show_split_btns: bool,
-    diff_toolbar: Option<&render::DiffToolbarData>,
-    tab_scroll_offset: usize,
-    focused_accent: Option<ratatui::style::Color>,
 ) -> usize {
-    let accent = focused_accent.and_then(|c| match c {
-        ratatui::style::Color::Rgb(r, g, b) => Some(quadraui::Color::rgb(r, g, b)),
-        _ => None,
-    });
-    let bar = render::build_tab_bar_primitive(
-        tabs,
-        show_split_btns,
-        diff_toolbar,
-        tab_scroll_offset,
-        accent,
-    );
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1551,27 +1492,22 @@ pub(super) fn render_tab_bar(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     let hits = backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        b.draw_tab_bar(q_rect, &bar, None)
+        b.draw_tab_bar(q_rect, bar, None)
     });
     hits.available_cols
 }
 
 /// Draw the breadcrumb bar via the D6 StatusBar pipeline.
 ///
-/// B5c.1: routes through `Backend::draw_status_bar`. Breadcrumbs have
-/// no right segments so the trait method's internal `MIN_GAP_CELLS` is
-/// inert.
+/// The pre-built `quadraui::StatusBar` primitive comes from
+/// `ScreenLayout` (built by `render::build_screen_layout`).
 pub(super) fn draw_breadcrumb_bar(
     backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
     area: Rect,
-    segments: &[render::BreadcrumbSegment],
+    bar: &quadraui::StatusBar,
     theme: &Theme,
-    focus_active: bool,
-    focus_selected: usize,
 ) {
-    let bar =
-        render::breadcrumbs_to_quadraui_status_bar(segments, theme, focus_active, focus_selected);
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1581,7 +1517,7 @@ pub(super) fn draw_breadcrumb_bar(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     backend.enter_frame_scope(frame, |b| {
         use quadraui::Backend;
-        let _ = b.draw_status_bar(q_rect, &bar, None, None);
+        let _ = b.draw_status_bar(q_rect, bar, None, None);
     });
 }
 

@@ -23,7 +23,7 @@ use crate::render;
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
 use core::{Engine, OpenMode, WindowRect};
-use render::{build_screen_layout, CommandLineData, RenderedWindow, TabInfo, Theme};
+use render::{build_screen_layout, CommandLineData, RenderedWindow, Theme};
 
 use copypasta_ext::ClipboardProviderExt;
 use std::collections::HashMap;
