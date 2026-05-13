@@ -2462,13 +2462,7 @@ pub(super) fn handle_mouse(
                     .unwrap_or(false);
                 drop(guard);
                 if matched {
-                    if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                        engine.dap_continue();
-                    } else if engine.dap_session_active {
-                        engine.execute_command("stop");
-                    } else {
-                        engine.execute_command("debug");
-                    }
+                    engine.handle_dap_sidebar_action_click();
                 }
             } else {
                 // Route body click through SidebarSystem.
@@ -2617,22 +2611,18 @@ pub(super) fn handle_mouse(
         if let Some(layout) = last_layout {
             let bc_x = (col - editor_left) as f64;
             let bc_y = (row - menu_rows) as f64;
-            let on_bc_row = layout
-                .breadcrumbs
-                .iter()
-                .any(|bc| !bc.segments.is_empty() && bc_y == bc.bounds.y.floor());
-            if on_bc_row {
-                if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            match render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0) {
+                render::BreadcrumbClickResult::Hit(idx) => {
+                    if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        return sidebar_width;
+                    }
+                    engine.handle_breadcrumb_click(idx);
                     return sidebar_width;
                 }
-                if let Some(idx) =
-                    render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0)
-                {
-                    engine.rebuild_breadcrumb_segments();
-                    engine.breadcrumb_selected = idx;
-                    engine.breadcrumb_open_scoped();
+                render::BreadcrumbClickResult::OnBar => {
+                    return sidebar_width;
                 }
-                return sidebar_width;
+                render::BreadcrumbClickResult::Miss => {}
             }
         }
     }

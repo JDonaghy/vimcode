@@ -6870,25 +6870,14 @@ impl App {
             if engine.settings.breadcrumbs {
                 let lh = self.cached_line_height.max(1.0);
                 if let Some(ref screen) = *self.cached_screen_layout.borrow() {
-                    if let Some(idx) =
-                        render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh)
-                    {
-                        drop(engine);
-                        self.engine.borrow_mut().rebuild_breadcrumb_segments();
-                        let mut engine = self.engine.borrow_mut();
-                        engine.breadcrumb_selected = idx;
-                        engine.breadcrumb_open_scoped();
-                        return;
-                    }
-                    let on_bc_row = screen.breadcrumbs.iter().any(|bc| {
-                        !bc.segments.is_empty()
-                            && y >= bc.bounds.y
-                            && y < bc.bounds.y + lh
-                            && x >= bc.bounds.x
-                            && x < bc.bounds.x + bc.bounds.width
-                    });
-                    if on_bc_row {
-                        return;
+                    match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
+                        render::BreadcrumbClickResult::Hit(idx) => {
+                            drop(engine);
+                            self.engine.borrow_mut().handle_breadcrumb_click(idx);
+                            return;
+                        }
+                        render::BreadcrumbClickResult::OnBar => return,
+                        render::BreadcrumbClickResult::Miss => {}
                     }
                 }
             }
@@ -8858,13 +8847,7 @@ impl App {
                         .unwrap_or(false);
                     drop(guard);
                     if matched {
-                        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                            engine.dap_continue();
-                        } else if engine.dap_session_active {
-                            engine.execute_command("stop");
-                        } else {
-                            engine.execute_command("debug");
-                        }
+                        engine.handle_dap_sidebar_action_click();
                     }
                 } else {
                     let rect = engine.dap_sidebar_body_rect.get();

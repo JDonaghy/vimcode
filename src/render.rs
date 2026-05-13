@@ -672,11 +672,21 @@ pub fn breadcrumb_action_index(id: &quadraui::WidgetId) -> Option<usize> {
     id.as_str().strip_prefix("bc:")?.parse().ok()
 }
 
+/// Result of resolving a breadcrumb click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreadcrumbClickResult {
+    /// A clickable segment was hit — carries the segment index.
+    Hit(usize),
+    /// Click landed on a breadcrumb bar but not on a segment.
+    OnBar,
+    /// Click was not on any breadcrumb bar.
+    Miss,
+}
+
 /// Resolve a breadcrumb click at `(x, y)` across all editor groups.
 ///
 /// Iterates each group's `BreadcrumbBar`, checks bounds, then delegates to
-/// the cached `StatusBarLayout::hit_test()` for segment resolution. Returns
-/// the segment index if a clickable breadcrumb was hit.
+/// the cached `StatusBarLayout::hit_test()` for segment resolution.
 ///
 /// Both backends call this — zero per-backend breadcrumb click code.
 pub fn resolve_breadcrumb_click(
@@ -684,7 +694,7 @@ pub fn resolve_breadcrumb_click(
     x: f64,
     y: f64,
     line_height: f64,
-) -> Option<usize> {
+) -> BreadcrumbClickResult {
     for bc in breadcrumbs {
         if bc.segments.is_empty() {
             continue;
@@ -698,13 +708,15 @@ pub fn resolve_breadcrumb_click(
             let guard = bc.draw_layout.borrow();
             if let Some(ref layout) = *guard {
                 if let quadraui::StatusBarHit::Segment(ref id) = layout.hit_test(local_x, local_y) {
-                    return breadcrumb_action_index(id);
+                    if let Some(idx) = breadcrumb_action_index(id) {
+                        return BreadcrumbClickResult::Hit(idx);
+                    }
                 }
             }
-            return None;
+            return BreadcrumbClickResult::OnBar;
         }
     }
-    None
+    BreadcrumbClickResult::Miss
 }
 
 /// Present when the editor area is split into two or more independent groups.

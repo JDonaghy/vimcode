@@ -389,6 +389,18 @@ impl Engine {
         self.message = format!("DAP: starting {} debug session\u{2026}", config.name);
     }
 
+    /// Handle the debug sidebar action button click (play/stop/debug).
+    /// Both backends call this — zero per-backend dispatch logic.
+    pub fn handle_dap_sidebar_action_click(&mut self) {
+        if self.dap_session_active && self.dap_stopped_thread.is_some() {
+            self.dap_continue();
+        } else if self.dap_session_active {
+            self.execute_command("stop");
+        } else {
+            self.execute_command("debug");
+        }
+    }
+
     /// Continue execution of the stopped thread.
     pub fn dap_continue(&mut self) {
         let tid = self.dap_stopped_thread.unwrap_or(0);
