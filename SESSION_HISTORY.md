@@ -1,7 +1,12 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 366 archived here.
+All sessions through 367 archived here.
+
+---
+**Session 367 (May 12) — Tab bar + breadcrumb render wrapper dedup (#347):**
+
+PR #365: Pre-built `quadraui::TabBar` and `quadraui::StatusBar` primitives in `ScreenLayout`. Added `bar` field to `GroupTabBar` and `BreadcrumbBar`, `tab_bar_primitive` to `ScreenLayout`. All built in `build_screen_layout()`. Backend wrappers (`render_tab_bar`, `draw_tab_bar`, `draw_breadcrumb_bar`) simplified to take pre-built primitives instead of raw data + adapter params. Unified `show_split_btns` cross-backend divergence (TUI had `is_active`, GTK had `is_active || is_in_diff_view()` — now shared via render.rs). Net -61 lines. Filed #366: pre-existing GTK bug — breadcrumb clicks broken on non-first editor group in multi-group layout.
 
 ---
 **Session 366 (May 12) — Three bug-fix issues resolved:**

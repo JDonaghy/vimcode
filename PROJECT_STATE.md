@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 12, 2026 (Session 366 — **Three bug-fix issues resolved.** PR #364: fixed #362 (first-line click swallowed by wrong breadcrumb bounds), fixed #359 (tab hit-test hardcoded status height + confirmed nowsl clicks work). Closed #360 (wildmenu Tab cycling — not a bug, `:set` output confused with wildmenu). Closed shipped #343.)
+**Last updated:** May 12, 2026 (Session 367 — **Tab bar + breadcrumb wrapper dedup (#347).** Pre-built `quadraui::TabBar` and `quadraui::StatusBar` primitives in `ScreenLayout` — both backends now draw pre-built primitives instead of calling adapter functions. Unified `show_split_btns` cross-backend divergence. Filed #366 (pre-existing GTK multi-group breadcrumb click bug).)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,7 +12,6 @@
 
 | # | Title | Category |
 |---|-------|----------|
-| [#347](https://github.com/JDonaghy/vimcode/issues/347) | Factor tab-bar and breadcrumb-bar render wrappers | Dedup (low) |
 | [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low) |
 | [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
 | [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
@@ -20,14 +19,15 @@
 | [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
 | [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
 
-**Shipped this session (366):**
-- **PR #364 — First-line click + tab hit-test + wildmenu test (#362, #359, #360):** Fixed `BreadcrumbBar.bounds.y` in `ScreenLayout` — was set to window content top instead of actual breadcrumb row position. `screen_zone_hit_test` returned `ScreenZone::Breadcrumb` for first-line clicks, which mapped to `ClickTarget::None`. Fixed at source in render.rs; removed per-backend workaround subtractions in GTK draw.rs, TUI render_impl.rs, and TUI mouse.rs. Also fixed `tab_close_hit_test` and `tab_tooltip_hit_test` which hardcoded `status_bar_height` to `2.0 * line_height` — replaced with `gtk_editor_bottom()`. Closed #360 as not-a-bug (`:set` output confused with wildmenu). Closed shipped #343.
+**Shipped this session (367):**
+- **PR #365 — Tab bar + breadcrumb render wrapper dedup (#347):** Added `bar: quadraui::TabBar` to `GroupTabBar`, `bar: quadraui::StatusBar` to `BreadcrumbBar`, and `tab_bar_primitive: quadraui::TabBar` to `ScreenLayout`. Pre-built in `build_screen_layout()` — both backends now draw directly from pre-built primitives. Simplified `render_tab_bar`/`draw_tab_bar`/`draw_breadcrumb_bar` signatures (removed 5-8 params each). Unified `show_split_btns`: TUI had `is_active`, GTK had `is_active || engine.is_in_diff_view()` — now both use the GTK logic via render.rs. Net -61 lines.
+- **#366 filed:** Pre-existing GTK bug — breadcrumb clicks broken on non-first editor group in multi-group layout (single shared `breadcrumb_hit_regions` overwritten per loop iteration + translated coordinates not adjusted).
 
 ---
 
 Vimcode at 1960 lib tests passing, 2057 total (lib+integration).
 
-> Sessions 366 and earlier in **SESSION_HISTORY.md**.
+> Sessions 367 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -117,6 +117,7 @@ cell coalescence) remain but are tracked separately.
 - `render::build_terminal_draw_data()` + `Backend::draw_terminal` — terminal cell grid + themed scrollbar + split-pane layout. Both backends call one shared builder, then `draw_terminal`. Zero per-backend terminal rendering code (#353).
 - `render::build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()` — tab drag-and-drop drop-zone computation (delegates to `quadraui::compute_drop_zone()`) and overlay geometry (highlight rect, insertion bar, ghost position). Both backends build a `tab_slots_map` (backend-specific measurement) and `DropGroupBounds`, then call shared functions. Zero per-backend drop-zone algorithm code (#345).
 - `render::screen_zone_hit_test()` + `window_zone_hit_test()` + `resolve_gutter_action()` — screen-level click zone detection (tab bar, window, breadcrumb, divider), window sub-zone detection (gutter, status bar, scrollbar, text area), and gutter action resolution. GTK caches `ScreenLayout` from paint; both backends call shared functions for zone detection. Tab bar inner slot resolution (Pango vs char-cell) stays per-backend (#344).
+- `render::build_tab_bar_primitive()` + `breadcrumbs_to_quadraui_status_bar()` — tab bar and breadcrumb bar primitives pre-built in `ScreenLayout` (#347). Both backends draw directly from `GroupTabBar.bar` / `BreadcrumbBar.bar` / `ScreenLayout.tab_bar_primitive`. Zero per-backend adapter construction or `show_split` logic.
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
