@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 12, 2026 (Session 367 — **Tab bar + breadcrumb wrapper dedup (#347).** Pre-built `quadraui::TabBar` and `quadraui::StatusBar` primitives in `ScreenLayout` — both backends now draw pre-built primitives instead of calling adapter functions. Unified `show_split_btns` cross-backend divergence. Filed #366 (pre-existing GTK multi-group breadcrumb click bug).)
+**Last updated:** May 13, 2026 (Session 368 — **Adopt quadraui#77/#78/#79 (#328) + close stale milestone issues.** Used `TreeController::scroll_by()` in explorer, fixed TUI scroll delta convention (3 sidebar panels had inverted scroll), routed TUI explorer double-click through `TreeController::handle()` via quadraui#147 `DoubleClick` synthesis. Verified and closed #295, #314, #315, #331 — all already working.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -8,20 +8,11 @@
 
 **All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
-**Remaining milestone work** is consolidation, deduplication, and infrastructure:
+**All vimcode-side milestone work is complete.** Remaining open issues in the milestone are quadraui-side infrastructure (#294, #168, #167, #149, #145, #144, #140, #139, #169) — primitives, research, and validation apps that live in the quadraui repo.
 
-| # | Title | Category |
-|---|-------|----------|
-| [#328](https://github.com/JDonaghy/vimcode/issues/328) | Adopt quadraui#77/#78/#79 (scroll_by, double-click, scroll convention) | Cleanup (low) |
-| [#314](https://github.com/JDonaghy/vimcode/issues/314) | Search panel MSV scrollbar click/drag | Polish |
-| [#295](https://github.com/JDonaghy/vimcode/issues/295) | TUI MSV scrollbar drag-to-scroll | Polish |
-| [#315](https://github.com/JDonaghy/vimcode/issues/315) | GTK MSV scrollbar drag-to-scroll | Polish |
-| [#294](https://github.com/JDonaghy/vimcode/issues/294) | quadraui MSV horizontal axis rasterisers | Infrastructure |
-| [#331](https://github.com/JDonaghy/vimcode/issues/331) | GTK debug toolbar → StatusBarInteraction | Cleanup (blocked on GTK UiEvent migration) |
-
-**Shipped this session (367):**
-- **PR #365 — Tab bar + breadcrumb render wrapper dedup (#347):** Added `bar: quadraui::TabBar` to `GroupTabBar`, `bar: quadraui::StatusBar` to `BreadcrumbBar`, and `tab_bar_primitive: quadraui::TabBar` to `ScreenLayout`. Pre-built in `build_screen_layout()` — both backends now draw directly from pre-built primitives. Simplified `render_tab_bar`/`draw_tab_bar`/`draw_breadcrumb_bar` signatures (removed 5-8 params each). Unified `show_split_btns`: TUI had `is_active`, GTK had `is_active || engine.is_in_diff_view()` — now both use the GTK logic via render.rs. Net -61 lines.
-- **#366 filed:** Pre-existing GTK bug — breadcrumb clicks broken on non-first editor group in multi-group layout (single shared `breadcrumb_hit_regions` overwritten per loop iteration + translated coordinates not adjusted).
+**Shipped this session (368):**
+- **#328 — Adopt quadraui#77/#78/#79:** `explorer_scroll()` delegates to `TreeController::scroll_by()`. Removed TUI scroll-delta negation workaround in DAP sidebar; fixed SC and search sidebar scroll sign to match quadraui's positive-y = up convention. Routed TUI explorer double-click through `TreeController::handle()` → `RowActivated` (using quadraui#147 `DoubleClick` synthesis). Added `DoubleClick → MouseDown` fallback shim for legacy crossterm handlers.
+- **#295, #314, #315, #331 verified and closed:** MSV scrollbar drag-to-scroll (TUI + GTK), search panel scrollbar click/drag, and GTK debug toolbar hover/press all already working — likely fixed by earlier `SidebarSystem`/`dispatch_scroll` migrations.
 
 ---
 
