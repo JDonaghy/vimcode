@@ -2608,13 +2608,7 @@ pub(super) fn handle_mouse(
     if engine.settings.breadcrumbs {
         if let Some(layout) = last_layout {
             for bc in &layout.breadcrumbs {
-                // Match the renderer: bc_y = editor_area.y + bounds.y - 1
-                // where editor_area.y == menu_rows in TUI coordinates.
-                let bc_row = if bc.bounds.y >= 1.0 {
-                    menu_rows + bc.bounds.y as u16 - 1
-                } else {
-                    menu_rows
-                };
+                let bc_row = menu_rows + bc.bounds.y as u16;
                 let bc_x = editor_left + bc.bounds.x as u16;
                 let bc_w = bc.bounds.width as u16;
                 if row == bc_row && col >= bc_x && col < bc_x + bc_w {

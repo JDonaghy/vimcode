@@ -358,9 +358,7 @@ pub(super) fn draw_editor(
         if bc.segments.is_empty() || engine.terminal_maximized {
             continue;
         }
-        // Breadcrumb bar sits one line_height above the window content (bc.bounds.y)
-        // and one line_height below the tab bar.
-        let bc_y = bc.bounds.y - line_height;
+        let bc_y = bc.bounds.y;
         let bc_x = bc.bounds.x;
         let bc_w = bc.bounds.width;
         cr.save().ok();
