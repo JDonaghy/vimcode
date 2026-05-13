@@ -427,6 +427,8 @@ pub struct GroupTabBar {
         crate::core::engine::TabBarHitRegion,
         crate::core::engine::TabBarClickTarget,
     )>,
+    /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
+    pub bar: quadraui::TabBar,
 }
 
 // ── Tab bar hit region constants (char-cell units) ──────────────────────────
@@ -589,6 +591,8 @@ pub struct BreadcrumbBar {
     pub group_id: GroupId,
     pub segments: Vec<BreadcrumbSegment>,
     pub bounds: WindowRect,
+    /// Pre-built quadraui `StatusBar` primitive — backends draw this directly.
+    pub bar: quadraui::StatusBar,
 }
 
 /// Convert a slice of `BreadcrumbSegment` plus the focus state into a
@@ -3408,6 +3412,8 @@ pub struct ScreenLayout {
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
     pub tab_scroll_offset: usize,
+    /// Pre-built quadraui `TabBar` primitive for the single-group tab bar.
+    pub tab_bar_primitive: quadraui::TabBar,
     /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
     /// above the terminal panel. When `Some`, per-window `status_line` fields on
@@ -5829,6 +5835,18 @@ pub fn build_screen_layout(
                     diff_label_cols,
                     has_split,
                 );
+                let accent = if is_active {
+                    Some(to_quadraui_color(theme.tab_active_accent))
+                } else {
+                    None
+                };
+                let bar = build_tab_bar_primitive(
+                    &tabs,
+                    has_split,
+                    diff_toolbar.as_ref(),
+                    tab_scroll_offset,
+                    accent,
+                );
                 GroupTabBar {
                     group_id: gid,
                     tabs,
@@ -5836,6 +5854,7 @@ pub fn build_screen_layout(
                     diff_toolbar,
                     tab_scroll_offset,
                     hit_regions,
+                    bar,
                 }
             })
             .collect();
@@ -5901,10 +5920,17 @@ pub fn build_screen_layout(
                 // above the window content top).
                 let bc_y = (min_y - line_height).max(0.0);
                 let bounds = WindowRect::new(min_x, bc_y, max_x - min_x, line_height);
+                let bar = breadcrumbs_to_quadraui_status_bar(
+                    &segments,
+                    theme,
+                    engine.breadcrumb_focus,
+                    engine.breadcrumb_selected,
+                );
                 BreadcrumbBar {
                     group_id: gid,
                     segments,
                     bounds,
+                    bar,
                 }
             })
             .collect()
@@ -5926,6 +5952,19 @@ pub fn build_screen_layout(
     } else {
         None
     };
+
+    let tab_scroll_offset_single = engine
+        .editor_groups
+        .get(&engine.active_group)
+        .map(|g| g.tab_scroll_offset)
+        .unwrap_or(0);
+    let tab_bar_primitive = build_tab_bar_primitive(
+        &tab_bar,
+        true,
+        diff_toolbar.as_ref(),
+        tab_scroll_offset_single,
+        Some(to_quadraui_color(theme.tab_active_accent)),
+    );
 
     ScreenLayout {
         tab_bar,
@@ -6126,11 +6165,8 @@ pub fn build_screen_layout(
             None
         },
         tab_tooltip: engine.tab_hover_tooltip.clone(),
-        tab_scroll_offset: engine
-            .editor_groups
-            .get(&engine.active_group)
-            .map(|g| g.tab_scroll_offset)
-            .unwrap_or(0),
+        tab_scroll_offset: tab_scroll_offset_single,
+        tab_bar_primitive,
         separated_status_line,
     }
 }
