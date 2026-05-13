@@ -178,10 +178,19 @@ impl Engine {
                 };
                 self.picker_filter();
                 self.picker_load_preview();
-            } else {
-                // File segment (the last path component): open symbol picker
-                self.open_picker(PickerSource::CommandCenter);
-                self.picker_query = "@".to_string();
+            } else if let Some(parent) = path.parent() {
+                // File segment: show sibling files in the same directory.
+                self.open_picker(PickerSource::Files);
+                let rel = parent
+                    .strip_prefix(&self.cwd)
+                    .unwrap_or(parent)
+                    .to_string_lossy()
+                    .to_string();
+                self.picker_query = if rel.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", rel)
+                };
                 self.picker_filter();
                 self.picker_load_preview();
             }
