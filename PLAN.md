@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-12 (Session 365 — Six milestone items shipped (#352/#351/#343/#349/#348/#361). Horizontal scroll now works in both backends. Next: #347 (tab-bar wrappers), #328 (quadraui scroll conventions), polish (#314/#295/#315), bugs (#359/#360/#362).)
+> **Last updated:** 2026-05-13 (Session 368 — #328 adopted (scroll_by, scroll convention, double-click routing). #295, #314, #315, #331 verified working and closed. All vimcode-side milestone work complete; remaining issues are quadraui-side infrastructure.)
 
 ---
 

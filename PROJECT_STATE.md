@@ -10,15 +10,11 @@
 
 **All vimcode-side milestone work is complete.** Remaining open issues in the milestone are quadraui-side infrastructure (#294, #168, #167, #149, #145, #144, #140, #139, #169) — primitives, research, and validation apps that live in the quadraui repo.
 
-**Shipped this session (368):**
-- **#328 — Adopt quadraui#77/#78/#79:** `explorer_scroll()` delegates to `TreeController::scroll_by()`. Removed TUI scroll-delta negation workaround in DAP sidebar; fixed SC and search sidebar scroll sign to match quadraui's positive-y = up convention. Routed TUI explorer double-click through `TreeController::handle()` → `RowActivated` (using quadraui#147 `DoubleClick` synthesis). Added `DoubleClick → MouseDown` fallback shim for legacy crossterm handlers.
-- **#295, #314, #315, #331 verified and closed:** MSV scrollbar drag-to-scroll (TUI + GTK), search panel scrollbar click/drag, and GTK debug toolbar hover/press all already working — likely fixed by earlier `SidebarSystem`/`dispatch_scroll` migrations.
-
 ---
 
 Vimcode at 1960 lib tests passing, 2057 total (lib+integration).
 
-> Sessions 367 and earlier in **SESSION_HISTORY.md**.
+> Sessions 368 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -104,7 +100,7 @@ cell coalescence) remain but are tracked separately.
 - `quadraui::MenuSystem` — menu bar + dropdown lifecycle (open/close, keyboard nav, hover-to-switch, modal stack). Both backends call `render()` and `handle()` with zero per-backend menu logic. GTK uses `MenuOverlay` helper for the titlebar DA overlay wiring.
 - `quadraui::TreeController` — explorer file tree: selection, scroll, keyboard nav, inline editing (rename + new-file/folder). Both backends call `render()` for drawing and `_via` methods for keyboard editing. All domain logic in `engine/explorer_ops.rs`.
 - `quadraui::SidebarSystem` — extensions sidebar (#336/#337/#338), source control panel (#321/#339/#340), and search panel (#323/#333/#334): section selection, scroll, keyboard nav, mouse handling, collapse, badges, visibility. Search panel uses `SectionKind::Form` for the chrome section (quadraui#105). Both backends call `populate_*()` + `render()` and `dispatch_*_key_unified()`. Zero per-backend nav/click code.
-- `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK still manual (#331).
+- `quadraui::StatusBarInteraction` — debug toolbar hover/press state. TUI uses it via UiEvent intercept; GTK manual wiring produces identical results (#331 verified and closed).
 - `render::build_terminal_draw_data()` + `Backend::draw_terminal` — terminal cell grid + themed scrollbar + split-pane layout. Both backends call one shared builder, then `draw_terminal`. Zero per-backend terminal rendering code (#353).
 - `render::build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()` — tab drag-and-drop drop-zone computation (delegates to `quadraui::compute_drop_zone()`) and overlay geometry (highlight rect, insertion bar, ghost position). Both backends build a `tab_slots_map` (backend-specific measurement) and `DropGroupBounds`, then call shared functions. Zero per-backend drop-zone algorithm code (#345).
 - `render::screen_zone_hit_test()` + `window_zone_hit_test()` + `resolve_gutter_action()` — screen-level click zone detection (tab bar, window, breadcrumb, divider), window sub-zone detection (gutter, status bar, scrollbar, text area), and gutter action resolution. GTK caches `ScreenLayout` from paint; both backends call shared functions for zone detection. Tab bar inner slot resolution (Pango vs char-cell) stays per-backend (#344).
@@ -123,4 +119,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 365 and earlier in **SESSION_HISTORY.md**.
+> Sessions 366 and earlier in **SESSION_HISTORY.md**.

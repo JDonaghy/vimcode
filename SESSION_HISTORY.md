@@ -1,7 +1,14 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 367 archived here.
+All sessions through 368 archived here.
+
+---
+**Session 368 (May 13) — Adopt quadraui#77/#78/#79 (#328) + close stale milestone issues:**
+
+**#328 — Adopt quadraui#77/#78/#79:** `explorer_scroll()` delegates to `TreeController::scroll_by()` (quadraui#77). Removed TUI scroll-delta negation workaround in DAP sidebar; fixed SC and search sidebar scroll sign to match quadraui's positive-y = up convention (quadraui#79). Routed TUI explorer double-click through `TreeController::handle()` → `RowActivated` using quadraui#147 `DoubleClick` synthesis. Added `DoubleClick → MouseDown` fallback shim in mod.rs for legacy crossterm handlers (editor word-select, extension panel, etc.). Filed quadraui#147 for TUI DoubleClick synthesis, confirmed landed same session. Net -20 lines (first commit) + net +24 lines (second commit, DoubleClick routing). Files: `explorer_ops.rs`, `tui_main/mod.rs`, `tui_main/mouse.rs`.
+
+**#295, #314, #315, #331 verified and closed:** MSV scrollbar drag-to-scroll (TUI + GTK), search panel scrollbar click/drag, and GTK debug toolbar hover/press all confirmed working during smoke tests — likely fixed by earlier `SidebarSystem`/`dispatch_scroll` migrations. All vimcode-side milestone work now complete; remaining milestone issues are quadraui-side infrastructure.
 
 ---
 **Session 367 (May 12) — Tab bar + breadcrumb render wrapper dedup (#347):**
