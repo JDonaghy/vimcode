@@ -586,13 +586,16 @@ pub struct BreadcrumbSegment {
 }
 
 /// Breadcrumb bar data for one editor group.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BreadcrumbBar {
     pub group_id: GroupId,
     pub segments: Vec<BreadcrumbSegment>,
     pub bounds: WindowRect,
     /// Pre-built quadraui `StatusBar` primitive — backends draw this directly.
     pub bar: quadraui::StatusBar,
+    /// Cached layout from `Backend::draw_status_bar` — set at draw time,
+    /// read by `resolve_breadcrumb_click` at click time.
+    pub draw_layout: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
 }
 
 /// Convert a slice of `BreadcrumbSegment` plus the focus state into a
@@ -667,6 +670,53 @@ pub fn breadcrumbs_to_quadraui_status_bar(
 /// doesn't match the `bc:N` pattern.
 pub fn breadcrumb_action_index(id: &quadraui::WidgetId) -> Option<usize> {
     id.as_str().strip_prefix("bc:")?.parse().ok()
+}
+
+/// Result of resolving a breadcrumb click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreadcrumbClickResult {
+    /// A clickable segment was hit — carries the segment index.
+    Hit(usize),
+    /// Click landed on a breadcrumb bar but not on a segment.
+    OnBar,
+    /// Click was not on any breadcrumb bar.
+    Miss,
+}
+
+/// Resolve a breadcrumb click at `(x, y)` across all editor groups.
+///
+/// Iterates each group's `BreadcrumbBar`, checks bounds, then delegates to
+/// the cached `StatusBarLayout::hit_test()` for segment resolution.
+///
+/// Both backends call this — zero per-backend breadcrumb click code.
+pub fn resolve_breadcrumb_click(
+    breadcrumbs: &[BreadcrumbBar],
+    x: f64,
+    y: f64,
+    line_height: f64,
+) -> BreadcrumbClickResult {
+    for bc in breadcrumbs {
+        if bc.segments.is_empty() {
+            continue;
+        }
+        let bx = bc.bounds.x;
+        let by = bc.bounds.y;
+        let bw = bc.bounds.width;
+        if y >= by && y < by + line_height && x >= bx && x < bx + bw {
+            let local_x = (x - bx) as f32;
+            let local_y = (y - by) as f32;
+            let guard = bc.draw_layout.borrow();
+            if let Some(ref layout) = *guard {
+                if let quadraui::StatusBarHit::Segment(ref id) = layout.hit_test(local_x, local_y) {
+                    if let Some(idx) = breadcrumb_action_index(id) {
+                        return BreadcrumbClickResult::Hit(idx);
+                    }
+                }
+            }
+            return BreadcrumbClickResult::OnBar;
+        }
+    }
+    BreadcrumbClickResult::Miss
 }
 
 /// Present when the editor area is split into two or more independent groups.
@@ -5931,6 +5981,7 @@ pub fn build_screen_layout(
                     segments,
                     bounds,
                     bar,
+                    draw_layout: std::cell::RefCell::new(None),
                 }
             })
             .collect()

@@ -2272,7 +2272,7 @@ pub(super) fn render_debug_sidebar(
         use quadraui::Backend;
         b.draw_status_bar(action_rect, &action_bar, None, None)
     });
-    engine.dap_sidebar_action_hits.replace(hits);
+    engine.dap_sidebar_action_hits.replace(Some(hits));
 
     // ── SidebarSystem body (the four sections). ──
     if area.height < 3 {

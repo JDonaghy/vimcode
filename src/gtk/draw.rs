@@ -60,9 +60,7 @@ pub(super) fn draw_editor(
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
     screen_layout_out: &Rc<RefCell<Option<render::ScreenLayout>>>,
-    breadcrumb_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
-    breadcrumb_y_offset_out: &Rc<Cell<f64>>,
-    debug_toolbar_hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    debug_toolbar_layout_out: &Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
     debug_toolbar_y_offset_out: &Rc<Cell<f64>>,
     debug_toolbar_height_out: &Rc<Cell<f64>>,
     // Phase B.5 Stage 3: shared `quadraui::Backend` impl. Routed
@@ -346,7 +344,7 @@ pub(super) fn draw_editor(
         let bc_w = bc.bounds.width;
         cr.save().ok();
         cr.translate(bc_x, 0.0);
-        draw_breadcrumb_bar(
+        let bar_layout = draw_breadcrumb_bar(
             backend,
             cr,
             &layout,
@@ -355,13 +353,9 @@ pub(super) fn draw_editor(
             bc_w,
             line_height,
             bc_y,
-            breadcrumb_hit_regions_out,
         );
         cr.restore().ok();
-        // Cache the y-offset (in DA-coords, accounting for the bc_x translate
-        // we just did — y_offset is a pure y, x is captured via the
-        // hit_regions' col).
-        breadcrumb_y_offset_out.set(bc_y);
+        *bc.draw_layout.borrow_mut() = Some(bar_layout);
     }
 
     // 5. Draw tab drag overlay (drop zone highlight + ghost label).
@@ -720,7 +714,7 @@ pub(super) fn draw_editor(
             toolbar_y,
             width as f64,
             line_height,
-            debug_toolbar_hit_regions_out,
+            debug_toolbar_layout_out,
             debug_toolbar_hovered_id,
             debug_toolbar_pressed_id,
         );
@@ -1158,20 +1152,26 @@ pub(super) fn draw_breadcrumb_bar(
     width: f64,
     line_height: f64,
     y_offset: f64,
-    hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
-) {
+) -> quadraui::StatusBarLayout {
     use quadraui::Backend;
+    let mut result = quadraui::StatusBarLayout {
+        bar_width: 0.0,
+        bar_height: 0.0,
+        visible_segments: Vec::new(),
+        hit_regions: Vec::new(),
+        resolved_right_start: 0,
+    };
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
-        let hits = b.draw_status_bar(
+        result = b.draw_status_bar(
             quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
             bar,
             None,
             None,
         );
-        *hit_regions_out.borrow_mut() = hits;
     });
+    result
 }
 
 /// Render one editor window (pane) onto `cr`.
@@ -2380,7 +2380,7 @@ pub(super) fn draw_debug_sidebar(
     line_height: f64,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     engine: &crate::core::engine::Engine,
-) -> Vec<quadraui::StatusBarHitRegion> {
+) -> quadraui::StatusBarLayout {
     let sidebar = &screen.debug_sidebar;
 
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
@@ -2559,7 +2559,7 @@ fn draw_window_status_bar(
     let bar =
         render::window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
     use quadraui::Backend;
-    let regions = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+    let bar_layout = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
         b.draw_status_bar(
@@ -2571,11 +2571,13 @@ fn draw_window_status_bar(
     });
 
     segment_zones.clear();
-    for region in regions {
-        if let Some(action) = render::status_action_from_id(region.id.as_str()) {
-            let start = region.col as f64;
-            let end = start + region.width as f64;
-            segment_zones.push((start, end, action));
+    for (rect, hit) in &bar_layout.hit_regions {
+        if let quadraui::StatusBarHit::Segment(ref id) = hit {
+            if let Some(action) = render::status_action_from_id(id.as_str()) {
+                let start = rect.x as f64;
+                let end = start + rect.width as f64;
+                segment_zones.push((start, end, action));
+            }
         }
     }
 }
@@ -4198,7 +4200,7 @@ pub(super) fn draw_debug_toolbar(
     y: f64,
     width: f64,
     height: f64,
-    hit_regions_out: &Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    hit_layout_out: &Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
     hovered_id: Option<&quadraui::WidgetId>,
     pressed_id: Option<&quadraui::WidgetId>,
 ) {
@@ -4209,7 +4211,7 @@ pub(super) fn draw_debug_toolbar(
 
     let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
     use quadraui::Backend;
-    let hits = backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+    let bar_layout = backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(height);
         b.draw_status_bar(
@@ -4219,5 +4221,5 @@ pub(super) fn draw_debug_toolbar(
             pressed_id,
         )
     });
-    *hit_regions_out.borrow_mut() = hits;
+    *hit_layout_out.borrow_mut() = Some(bar_layout);
 }

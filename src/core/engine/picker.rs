@@ -285,6 +285,14 @@ impl Engine {
 
     /// Open a scoped picker for the currently selected breadcrumb segment.
     /// Path segments open the file picker for that directory.
+    /// Handle a breadcrumb segment click from either backend.
+    /// Rebuilds segments, selects the clicked index, and opens scoped.
+    pub fn handle_breadcrumb_click(&mut self, idx: usize) {
+        self.rebuild_breadcrumb_segments();
+        self.breadcrumb_selected = idx;
+        self.breadcrumb_open_scoped();
+    }
+
     /// Symbol segments open the `@` symbol picker filtered to siblings
     /// within the parent scope.
     pub(crate) fn breadcrumb_open_scoped(&mut self) {

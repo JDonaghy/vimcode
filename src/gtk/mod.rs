@@ -380,14 +380,8 @@ struct App {
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
-    /// Cached breadcrumb segment pixel hit regions from `draw_breadcrumb_bar`.
-    /// Click handler walks this list to translate (x, y) → segment index.
-    breadcrumb_hit_regions: Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
-    /// Pixel y-offset where the breadcrumb bar was last drawn.
-    /// Click handler uses this with `breadcrumb_hit_regions` for hit-test.
-    breadcrumb_y_offset: Rc<Cell<f64>>,
-    /// Cached debug toolbar button hit regions from `draw_debug_toolbar`.
-    debug_toolbar_hit_regions: Rc<RefCell<Vec<quadraui::StatusBarHitRegion>>>,
+    /// Cached debug toolbar layout from `draw_debug_toolbar`.
+    debug_toolbar_layout: Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
     /// Pixel y-offset where the debug toolbar was last drawn.
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
@@ -2207,9 +2201,7 @@ impl SimpleComponent for App {
             action_btn_map: action_btn_map_cell.clone(),
             status_segment_map: status_segment_map_cell.clone(),
             cached_screen_layout: Rc::new(RefCell::new(None)),
-            breadcrumb_hit_regions: Rc::new(RefCell::new(Vec::new())),
-            breadcrumb_y_offset: Rc::new(Cell::new(0.0)),
-            debug_toolbar_hit_regions: Rc::new(RefCell::new(Vec::new())),
+            debug_toolbar_layout: Rc::new(RefCell::new(None)),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             debug_toolbar_hovered_id: Rc::new(RefCell::new(None)),
@@ -3047,7 +3039,7 @@ impl SimpleComponent for App {
                         &backend_d,
                         &engine,
                     );
-                    engine.dap_sidebar_action_hits.replace(action_hits);
+                    engine.dap_sidebar_action_hits.replace(Some(action_hits));
                 });
         }
         // ── Debug sidebar click handler ────────────────────────────────────────
@@ -3830,9 +3822,7 @@ impl SimpleComponent for App {
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
         let status_seg_for_draw = model.status_segment_map.clone();
         let screen_layout_for_draw = model.cached_screen_layout.clone();
-        let bc_hits_for_draw = model.breadcrumb_hit_regions.clone();
-        let bc_y_for_draw = model.breadcrumb_y_offset.clone();
-        let dbg_hits_for_draw = model.debug_toolbar_hit_regions.clone();
+        let dbg_layout_for_draw = model.debug_toolbar_layout.clone();
         let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
         let dbg_h_for_draw = model.debug_toolbar_height.clone();
         let dbg_hovered_for_draw = model.debug_toolbar_hovered_id.clone();
@@ -3873,9 +3863,7 @@ impl SimpleComponent for App {
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
                             &screen_layout_for_draw,
-                            &bc_hits_for_draw,
-                            &bc_y_for_draw,
-                            &dbg_hits_for_draw,
+                            &dbg_layout_for_draw,
                             &dbg_y_for_draw,
                             &dbg_h_for_draw,
                             &backend_for_draw,
@@ -5794,14 +5782,11 @@ impl App {
                     let dbg_y = self.debug_toolbar_y_offset.get();
                     let dbg_h = self.debug_toolbar_height.get();
                     let new_hover = if dbg_h > 0.0 && my >= dbg_y && my < dbg_y + dbg_h {
-                        let regions = self.debug_toolbar_hit_regions.borrow();
-                        regions.iter().find_map(|region| {
-                            let r_x = region.col as f64;
-                            let r_w = region.width as f64;
-                            if mx >= r_x && mx < r_x + r_w {
-                                Some(region.id.clone())
-                            } else {
-                                None
+                        let guard = self.debug_toolbar_layout.borrow();
+                        guard.as_ref().and_then(|l| {
+                            match l.hit_test(mx as f32, (my - dbg_y) as f32) {
+                                quadraui::StatusBarHit::Segment(id) => Some(id),
+                                quadraui::StatusBarHit::Empty => None,
                             }
                         })
                     } else {
@@ -6879,43 +6864,28 @@ impl App {
             }
         }
 
-        // Breadcrumb click: walk the cached `StatusBarHitRegion` list
-        // (populated by `draw_breadcrumb_bar` via the shared
-        // `quadraui_gtk::draw_status_bar`). Each region's `id` is
-        // `bc:N` — translated back to the segment index via
-        // `render::breadcrumb_action_index`.
+        // Breadcrumb click: shared resolution via cached StatusBarLayout.
         {
             let engine = self.engine.borrow();
             if engine.settings.breadcrumbs {
                 let lh = self.cached_line_height.max(1.0);
-                let bc_y = self.breadcrumb_y_offset.get();
-                if y >= bc_y && y < bc_y + lh {
-                    drop(engine);
-                    self.engine.borrow_mut().rebuild_breadcrumb_segments();
-                    let regions = self.breadcrumb_hit_regions.borrow();
-                    for region in regions.iter() {
-                        let r_x = region.col as f64;
-                        let r_w = region.width as f64;
-                        if x >= r_x && x < r_x + r_w {
-                            if let Some(idx) = render::breadcrumb_action_index(&region.id) {
-                                drop(regions);
-                                let mut engine = self.engine.borrow_mut();
-                                engine.breadcrumb_selected = idx;
-                                engine.breadcrumb_open_scoped();
-                                return;
-                            }
+                if let Some(ref screen) = *self.cached_screen_layout.borrow() {
+                    match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
+                        render::BreadcrumbClickResult::Hit(idx) => {
+                            drop(engine);
+                            self.engine.borrow_mut().handle_breadcrumb_click(idx);
+                            return;
                         }
+                        render::BreadcrumbClickResult::OnBar => return,
+                        render::BreadcrumbClickResult::Miss => {}
                     }
-                    return; // clicked on breadcrumb row but not a segment
                 }
             }
         }
 
-        // Debug toolbar click: walk the cached `StatusBarHitRegion` list
-        // (populated by `draw_debug_toolbar`). Each region's `id` is
-        // `debug:btn:N` — translated to the action via
-        // `render::debug_toolbar_action_index`, then dispatched to the
-        // engine via the same path the keyboard hotkey uses.
+        // Debug toolbar click: resolve via cached StatusBarLayout.
+        // Each region's `id` is `debug:btn:N` — translated to the
+        // action via `render::debug_toolbar_action_index`.
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
             let dbg_h = self.debug_toolbar_height.get();
@@ -6923,14 +6893,16 @@ impl App {
                 *self.debug_toolbar_pressed_id.borrow_mut() =
                     self.debug_toolbar_hovered_id.borrow().clone();
                 self.draw_needed.set(true);
-                let regions = self.debug_toolbar_hit_regions.borrow();
-                for region in regions.iter() {
-                    let r_x = region.col as f64;
-                    let r_w = region.width as f64;
-                    if x >= r_x && x < r_x + r_w {
-                        if let Some(idx) = render::debug_toolbar_action_index(&region.id) {
+                let guard = self.debug_toolbar_layout.borrow();
+                if let Some(ref bar_layout) = *guard {
+                    let local_x = x as f32;
+                    let local_y = (y - dbg_y) as f32;
+                    if let quadraui::StatusBarHit::Segment(ref id) =
+                        bar_layout.hit_test(local_x, local_y)
+                    {
+                        if let Some(idx) = render::debug_toolbar_action_index(id) {
                             if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
-                                drop(regions);
+                                drop(guard);
                                 let _ = self.engine.borrow_mut().execute_command(btn.action);
                                 return;
                             }
@@ -8863,20 +8835,19 @@ impl App {
                 engine.dap_sidebar_has_focus = true;
 
                 if y < 2.0 * lh {
-                    let hits = engine.dap_sidebar_action_hits.borrow();
-                    let matched = hits.iter().any(|r| {
-                        let rx = r.col as f64;
-                        click_x >= rx && click_x < rx + r.width as f64
-                    });
-                    drop(hits);
+                    let guard = engine.dap_sidebar_action_hits.borrow();
+                    let matched = guard
+                        .as_ref()
+                        .map(|l| {
+                            matches!(
+                                l.hit_test(click_x as f32, 0.0),
+                                quadraui::StatusBarHit::Segment(_)
+                            )
+                        })
+                        .unwrap_or(false);
+                    drop(guard);
                     if matched {
-                        if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                            engine.dap_continue();
-                        } else if engine.dap_session_active {
-                            engine.execute_command("stop");
-                        } else {
-                            engine.execute_command("debug");
-                        }
+                        engine.handle_dap_sidebar_action_click();
                     }
                 } else {
                     let rect = engine.dap_sidebar_body_rect.get();
