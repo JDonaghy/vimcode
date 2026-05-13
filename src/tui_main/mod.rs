@@ -2490,11 +2490,13 @@ fn event_loop(
                                     _ => "",
                                 },
                                 KeyCode::F(n @ 5..=11) => match n {
-                                    5 => "F5",
+                                    5 | 9 | 10 | 11 => {
+                                        let name = format!("F{n}");
+                                        engine.handle_key(&name, None, false);
+                                        needs_redraw = true;
+                                        continue;
+                                    }
                                     6 => "F6",
-                                    9 => "F9",
-                                    10 => "F10",
-                                    11 => "F11",
                                     _ => "",
                                 },
                                 _ => "",
