@@ -189,10 +189,15 @@ impl Engine {
             return self.handle_quickfix_key(&qf_key, ctrl);
         }
 
-        // Debug sidebar intercepts all keys when it has focus.
-        // TUI and GTK route through SidebarSystem directly.
+        // Debug sidebar intercepts all keys when it has focus
+        // (TUI and GTK route through SidebarSystem directly),
+        // EXCEPT debug F-keys which must always reach the engine.
         if self.dap_sidebar_has_focus {
-            return EngineAction::None;
+            if !ctrl && matches!(key_name, "F5" | "F9" | "F10" | "F11") {
+                // Fall through to the global F-key handler below.
+            } else {
+                return EngineAction::None;
+            }
         }
 
         // Extension panel input field intercepts keys when active.
@@ -287,6 +292,34 @@ impl Engine {
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
         let pre_mode = self.mode;
+
+        // Debug F-keys work from any mode (global debugger commands).
+        if !ctrl {
+            match key_name {
+                "F5" => {
+                    let cmd = if self.dap_session_active {
+                        "continue"
+                    } else {
+                        "debug"
+                    };
+                    let _ = self.execute_command(cmd);
+                    return EngineAction::None;
+                }
+                "F9" => {
+                    let _ = self.execute_command("brkpt");
+                    return EngineAction::None;
+                }
+                "F10" => {
+                    let _ = self.execute_command("stepover");
+                    return EngineAction::None;
+                }
+                "F11" => {
+                    let _ = self.execute_command("stepin");
+                    return EngineAction::None;
+                }
+                _ => {}
+            }
+        }
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         if ctrl
@@ -1661,26 +1694,9 @@ impl Engine {
                     self.open_picker(PickerSource::Commands);
                     return EngineAction::None;
                 }
-                // Debug / DAP function keys
-                "F5" => {
-                    let cmd = if self.dap_session_active {
-                        "continue"
-                    } else {
-                        "debug"
-                    };
-                    let _ = self.execute_command(cmd);
-                }
+                // F5/F9/F10/F11 handled globally before mode dispatch.
                 "F6" => {
                     let _ = self.execute_command("pause");
-                }
-                "F9" => {
-                    let _ = self.execute_command("brkpt");
-                }
-                "F10" => {
-                    let _ = self.execute_command("stepover");
-                }
-                "F11" => {
-                    let _ = self.execute_command("stepin");
                 }
                 _ => {}
             },

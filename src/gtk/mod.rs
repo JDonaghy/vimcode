@@ -4150,6 +4150,46 @@ impl SimpleComponent for App {
             }
         }
 
+        // Intercept F10 at the window level before GTK's built-in
+        // menubar activation shortcut can swallow it.
+        {
+            let sender_fkey = sender.input_sender().clone();
+            let fkey_ctrl = gtk4::EventControllerKey::new();
+            fkey_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            fkey_ctrl.connect_key_pressed(move |_, key, _, modifier| {
+                let name = key.name().map(|s| s.to_string()).unwrap_or_default();
+                let dominated = modifier.contains(gdk::ModifierType::CONTROL_MASK)
+                    || modifier.contains(gdk::ModifierType::ALT_MASK);
+                if !dominated && matches!(name.as_str(), "F5" | "F9" | "F10" | "F11") {
+                    sender_fkey
+                        .send(Msg::KeyPress {
+                            key_name: name,
+                            unicode: None,
+                            ctrl: false,
+                            alt: false,
+                        })
+                        .ok();
+                    return gtk4::glib::Propagation::Stop;
+                }
+                if modifier.contains(gdk::ModifierType::SHIFT_MASK)
+                    && !dominated
+                    && matches!(name.as_str(), "F5" | "F11")
+                {
+                    sender_fkey
+                        .send(Msg::KeyPress {
+                            key_name: name,
+                            unicode: None,
+                            ctrl: false,
+                            alt: false,
+                        })
+                        .ok();
+                    return gtk4::glib::Propagation::Stop;
+                }
+                gtk4::glib::Propagation::Proceed
+            });
+            root.add_controller(fkey_ctrl);
+        }
+
         ComponentParts { model, widgets }
     }
 
@@ -5453,6 +5493,22 @@ impl App {
                     }
                 }
                 // Fall through — handle_key() will execute the paste.
+            }
+        }
+
+        // Debug F-keys must reach the engine regardless of which panel
+        // has focus — F5 (continue), F9 (breakpoint), F10 (step over),
+        // F11 (step in) are global debugger commands.
+        if !ctrl && !alt {
+            match key_name.as_str() {
+                "F5" | "F9" | "F10" | "F11" => {
+                    let mapped = map_gtk_key_name(&key_name);
+                    let action = self.engine.borrow_mut().handle_key(mapped, None, false);
+                    self.dispatch_engine_action(action, sender, false);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -11431,6 +11487,10 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
         app.activate();
         0
     });
+    // Unbind F10 from GTK's built-in "activate-menubar" action so it
+    // reaches our key controller (used for DAP step-over).
+    gtk_app.set_accels_for_action("win.show-help-overlay", &[]);
+    gtk_app.set_accels_for_action("win.activate-menubar", &[]);
     let app = RelmApp::from_app(gtk_app);
     app.run::<App>(file_path);
 }

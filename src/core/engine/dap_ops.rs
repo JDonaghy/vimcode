@@ -773,26 +773,8 @@ impl Engine {
                 self.dispatch_dap_sidebar_delete();
                 false
             }
-            "F5" => {
-                self.execute_command("debug");
-                false
-            }
-            "F6" => {
-                self.execute_command("pause");
-                false
-            }
-            "F9" => {
-                self.execute_command("brkpt");
-                false
-            }
-            "F10" => {
-                self.execute_command("stepover");
-                false
-            }
-            "F11" => {
-                self.execute_command("stepin");
-                false
-            }
+            // F5/F9/F10/F11 handled globally in handle_key() before
+            // the dap_sidebar_has_focus guard.
             _ => false,
         }
     }
