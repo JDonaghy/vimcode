@@ -1241,7 +1241,7 @@ pub(super) fn handle_mouse(
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
-                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { -3.0 } else { 3.0 }),
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
                     position: quadraui::Point::new(col as f32, row as f32),
                 };
                 engine.handle_sc_sidebar_ui_event(scroll_ev);
@@ -1254,7 +1254,7 @@ pub(super) fn handle_mouse(
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
-                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { -3.0 } else { 3.0 }),
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
                     position: quadraui::Point::new(col as f32, row as f32),
                 };
                 engine.handle_search_sidebar_ui_event(scroll_ev);

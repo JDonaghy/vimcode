@@ -101,12 +101,8 @@ impl Engine {
     }
 
     pub fn explorer_scroll(&mut self, delta: isize) {
-        let mut tree = self.explorer_tree.borrow_mut();
         let viewport = self.explorer_viewport_rows.get();
-        let max = self.explorer_rows.len().saturating_sub(viewport);
-        let cur = tree.scroll_offset() as isize;
-        let new = (cur + delta).max(0).min(max as isize) as usize;
-        tree.set_scroll_offset(new);
+        self.explorer_tree.borrow_mut().scroll_by(delta, viewport);
     }
 
     pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {

@@ -1747,27 +1747,11 @@ fn event_loop(
                     engine.dap_sidebar_has_focus = true;
                 }
                 render::populate_dap_sidebar_system(engine);
-                // Negate scroll delta — quadraui convention is positive-y = up,
-                // but SidebarSystem expects positive = scroll-down.
-                let adjusted_event = if let quadraui::UiEvent::Scroll {
-                    widget,
-                    delta,
-                    position,
-                } = &ui_event
-                {
-                    quadraui::UiEvent::Scroll {
-                        widget: widget.clone(),
-                        delta: quadraui::ScrollDelta::new(delta.x, -delta.y),
-                        position: *position,
-                    }
-                } else {
-                    ui_event.clone()
-                };
-                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                    &adjusted_event,
-                    &mut backend,
-                    rect,
-                );
+                let sidebar_event =
+                    engine
+                        .dap_sidebar_system
+                        .borrow_mut()
+                        .handle(&ui_event, &mut backend, rect);
                 if engine.dispatch_dap_sidebar_event(sidebar_event) {
                     needs_redraw = true;
                     continue;
