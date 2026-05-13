@@ -163,37 +163,21 @@ impl Engine {
             self.picker_filter();
             self.picker_load_preview();
         } else if let Some(path) = path_prefix {
-            if path.is_dir() {
-                // Directory segment: open file picker filtered to that directory
-                self.open_picker(PickerSource::Files);
-                let rel = path
-                    .strip_prefix(&self.cwd)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-                self.picker_query = if rel.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", rel)
-                };
-                self.picker_filter();
-                self.picker_load_preview();
-            } else if let Some(parent) = path.parent() {
-                // File segment: show sibling files in the same directory.
-                self.open_picker(PickerSource::Files);
-                let rel = parent
-                    .strip_prefix(&self.cwd)
-                    .unwrap_or(parent)
-                    .to_string_lossy()
-                    .to_string();
-                self.picker_query = if rel.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", rel)
-                };
-                self.picker_filter();
-                self.picker_load_preview();
-            }
+            // Path segment: show peers (sibling entries in the parent directory).
+            let parent = path.parent().unwrap_or(path);
+            self.open_picker(PickerSource::Files);
+            let rel = parent
+                .strip_prefix(&self.cwd)
+                .unwrap_or(parent)
+                .to_string_lossy()
+                .to_string();
+            self.picker_query = if rel.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", rel)
+            };
+            self.picker_filter();
+            self.picker_load_preview();
         }
     }
 
