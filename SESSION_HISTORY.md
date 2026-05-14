@@ -1,7 +1,21 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 370 archived here.
+All sessions through 371 archived here.
+
+---
+**Session 371 (May 14) — Backend dedup audit + Engine::poll_idle() (#373):**
+
+**Backend dedup audit:** Systematic audit of TUI (~14k lines across mod.rs, mouse.rs, panels.rs, render_impl.rs) and GTK (~17k lines across mod.rs, click.rs, draw.rs) backends. Cross-referenced findings to identify duplicated logic. Produced a prioritized 4-tier extraction plan:
+
+- **Tier 1 (engine methods):** 13 issues filed (#373–#385) — `poll_idle`, `tab_switcher_cycle`, `handle_quit_confirm`, `handle_context_menu_key`, `picker_scroll`, `scroll_with_cursor_follow`, `select_all_occurrences`, `route_paste`, `check_settings_reload`, `activate_group_for_window`, clipboard-before-paste dedup, `execute_terminal_toolbar_action`, sidebar state ownership. Estimated ~500 lines removable per backend.
+- **Tier 2 (render helpers):** 3 issues filed (#386–#388) — `compute_editor_layout()`, `resolve_window_at_point()`, shared SC button layout.
+- **Tier 3 (quadraui primitives):** 6 issues filed (quadraui#161–#166) — two-pane picker preview, tab switcher popup, SC commit input + buttons, branch picker, multi-line dialog body, folder picker.
+- **Tier 4 (architectural):** quadraui#167 — `AppShell` compose widget (activity bar + sidebar panel container). Prerequisite for vimcode#385 (sidebar state ownership).
+
+**#373 — Engine::poll_idle():** Consolidated 20+ `poll_*/tick_*` calls from both backends into `Engine::poll_idle() -> bool`. Moved 2-second `check_file_changes` timer into engine (`idle_last_file_check` field). Removed `last_file_check` from both backends. Backend-specific follow-ups (format-save-quit, terminal commands, sidebar gating) remain as thin post-`poll_idle()` checks. Net -181 lines (71 added, 252 removed).
+
+**#389 filed:** Extension registry fetch fails on startup ("Registry fetch failed — try again later").
 
 ---
 **Session 370 (May 14) — #232 fixed: explorer reveal on tab switch + Engine::startup() extraction:**
