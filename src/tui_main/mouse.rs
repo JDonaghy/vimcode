@@ -1418,13 +1418,8 @@ pub(super) fn handle_mouse(
             // "tui:editor_viewport" surface above — fallback to active window
             // for scroll events that don't hit any registered surface.
             if col >= editor_left && row + 2 < term_height {
-                // Fallback: scroll active window
-                if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                    engine.scroll_up_visible(3);
-                } else {
-                    engine.scroll_down_visible(3);
-                }
-                engine.ensure_cursor_visible();
+                let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+                engine.scroll_viewport_with_cursor(dir, 3);
                 engine.sync_scroll_binds();
             }
             return sidebar_width;

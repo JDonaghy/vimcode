@@ -398,6 +398,29 @@ impl Engine {
         self.view_mut().scroll_top = new_top;
     }
 
+    /// Scroll the active window's viewport and adjust the cursor to stay
+    /// visible, respecting `scrolloff`. Positive `delta` = down.
+    pub fn scroll_viewport_with_cursor(&mut self, delta: isize, count: usize) {
+        let lines = self.buffer().len_lines().saturating_sub(1);
+        if delta > 0 {
+            self.scroll_down_visible(count);
+        } else {
+            self.scroll_up_visible(count);
+        }
+        let scrolloff = self.settings.scrolloff;
+        let vp = self.view().viewport_lines.max(1);
+        let cur = self.view().cursor.line;
+        let new_top = self.view().scroll_top;
+        if cur < new_top + scrolloff {
+            self.view_mut().cursor.line = (new_top + scrolloff).min(lines);
+            self.clamp_cursor_col();
+        } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+            self.view_mut().cursor.line =
+                (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
+            self.clamp_cursor_col();
+        }
+    }
+
     /// Scroll a specific window down by `count` visible lines (fold-aware).
     pub fn scroll_down_visible_for_window(&mut self, window_id: WindowId, count: usize) {
         if let Some(window) = self.windows.get(&window_id) {

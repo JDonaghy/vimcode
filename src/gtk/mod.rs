@@ -4550,25 +4550,8 @@ impl SimpleComponent for App {
                     let active_id = engine.active_window_id();
                     let target = hovered_window_id.unwrap_or(active_id);
                     if target == active_id {
-                        let lines = engine.buffer().len_lines().saturating_sub(1);
-                        if delta_y > 0.0 {
-                            engine.scroll_down_visible(scroll_count);
-                        } else {
-                            engine.scroll_up_visible(scroll_count);
-                        }
-                        // Move cursor into viewport instead of snapping scroll back.
-                        let scrolloff = engine.settings.scrolloff;
-                        let vp = engine.view().viewport_lines.max(1);
-                        let cur = engine.view().cursor.line;
-                        let new_top = engine.view().scroll_top;
-                        if cur < new_top + scrolloff {
-                            engine.view_mut().cursor.line = (new_top + scrolloff).min(lines);
-                            engine.clamp_cursor_col();
-                        } else if cur >= new_top + vp.saturating_sub(scrolloff) {
-                            engine.view_mut().cursor.line =
-                                (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
-                            engine.clamp_cursor_col();
-                        }
+                        let dir = if delta_y > 0.0 { 1 } else { -1 };
+                        engine.scroll_viewport_with_cursor(dir, scroll_count);
                     } else if delta_y > 0.0 {
                         engine.scroll_down_visible_for_window(target, scroll_count);
                     } else {
