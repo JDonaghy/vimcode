@@ -7794,6 +7794,17 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
     }
 }
 
+/// Populate the engine's `settings_form_controller` with current form
+/// data and scroll state. Call before `FormController::render()` or
+/// `FormController::handle()`.
+pub fn populate_settings_form_controller(engine: &Engine) {
+    let form = settings_to_form(engine);
+    let mut fc = engine.settings_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.settings_scroll_top);
+    fc.set_has_focus(engine.settings_has_focus);
+}
+
 /// Adapt the quickfix panel data into a generic `quadraui::ListView`.
 ///
 /// The quickfix panel is a simple flat list of pre-formatted strings

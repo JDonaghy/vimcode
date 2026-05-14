@@ -3096,18 +3096,17 @@ pub(super) fn draw_settings_panel(
     let sb_w = if need_sb { 8.0 } else { 0.0 };
     let form_w = (w - sb_w).max(0.0);
 
-    // Form rendering via the shared primitive.
-    // Phase B.5b Stage 8: route through `Backend::draw_form`.
-    let form = render::settings_to_form(engine);
+    // Form + scrollbar via FormController.
+    render::populate_settings_form_controller(engine);
     {
-        use quadraui::Backend;
+        let q_rect = quadraui::Rect::new(x as f32, body_y as f32, w as f32, body_h as f32);
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            b.draw_form(
-                quadraui::Rect::new(x as f32, body_y as f32, form_w as f32, body_h as f32),
-                &form,
-            );
+            engine
+                .settings_form_controller
+                .borrow_mut()
+                .render_and_cache(b, q_rect);
         });
     }
 
@@ -3179,28 +3178,6 @@ pub(super) fn draw_settings_panel(
                 cr.fill().ok();
             }
         }
-    }
-
-    // ── Scrollbar ───────────────────────────────────────────────────────────
-    if need_sb {
-        let sb_x = x + form_w;
-        let track_len = body_h;
-        let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
-        let max_scroll = total.saturating_sub(visible_rows) as f64;
-        let scroll_ratio = if max_scroll > 0.0 {
-            engine.settings_scroll_top as f64 / max_scroll
-        } else {
-            0.0
-        };
-        let thumb_y = body_y + scroll_ratio * (track_len - thumb_len);
-        // Track.
-        cr.set_source_rgb(bg_r, bg_g, bg_b);
-        cr.rectangle(sb_x, body_y, sb_w, track_len);
-        cr.fill().ok();
-        // Thumb.
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        cr.rectangle(sb_x + 2.0, thumb_y, sb_w - 4.0, thumb_len);
-        cr.fill().ok();
     }
 
     // ── Footer: "Open settings.json" ───────────────────────────────────────

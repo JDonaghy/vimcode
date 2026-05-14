@@ -317,84 +317,20 @@ pub(super) fn render_settings_panel(
     let has_inline_edit =
         engine.settings_editing.is_some() || engine.ext_settings_editing.is_some();
     if !has_inline_edit {
-        let form = render::settings_to_form(engine);
-        // Reserve rightmost column for the scrollbar.
-        let form_area = Rect {
-            x: area.x,
-            y: content_start,
-            width: area.width.saturating_sub(1),
-            height: content_height as u16,
-        };
-        // B5c.4: route through the trait. The scrollbar/chrome below
-        // re-borrows `buf` from `frame` after the trait call.
+        render::populate_settings_form_controller(engine);
         let q_rect = quadraui::Rect::new(
-            form_area.x as f32,
-            form_area.y as f32,
-            form_area.width as f32,
-            form_area.height as f32,
+            area.x as f32,
+            content_start as f32,
+            area.width as f32,
+            content_height as f32,
         );
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
         backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_form(q_rect, &form);
+            engine
+                .settings_form_controller
+                .borrow_mut()
+                .render_and_cache(b, q_rect);
         });
-        let buf = frame.buffer_mut();
-
-        // Scrollbar (mirrors the legacy renderer below).
-        let total = engine.settings_flat_list().len();
-        let scroll = engine.settings_scroll_top;
-        let settings_scrollbar = if total > content_height && content_height > 0 {
-            let sb_col = area.x + area.width - 1;
-            let track_len = content_height;
-            let thumb_len = (content_height * content_height / total).max(1);
-            let thumb_start = scroll * track_len / total;
-            let sb_thumb = rc(theme.scrollbar_thumb);
-            let sb_track = rc(theme.scrollbar_track);
-            let sb_bg = rc(theme.background);
-            for i in 0..track_len {
-                let y = content_start + i as u16;
-                let (ch, cfp) = if i >= thumb_start && i < thumb_start + thumb_len {
-                    ('█', sb_thumb)
-                } else {
-                    ('░', sb_track)
-                };
-                set_cell(buf, sb_col, y, ch, cfp, sb_bg);
-            }
-            Some(quadraui::SurfaceScrollbar {
-                axis: quadraui::ScrollAxis::Vertical,
-                track_bounds: quadraui::Rect::new(
-                    sb_col as f32,
-                    content_start as f32,
-                    1.0,
-                    track_len as f32,
-                ),
-                thumb_bounds: quadraui::Rect::new(
-                    sb_col as f32,
-                    content_start as f32 + thumb_start as f32,
-                    1.0,
-                    thumb_len as f32,
-                ),
-                total_items: total,
-                visible_items: content_height,
-                scroll_offset: scroll,
-                inverted: false,
-            })
-        } else {
-            None
-        };
-        engine
-            .scroll_surfaces
-            .borrow_mut()
-            .push(quadraui::ScrollSurface {
-                id: quadraui::WidgetId::new("tui:settings"),
-                bounds: quadraui::Rect::new(
-                    area.x as f32,
-                    content_start as f32,
-                    area.width as f32,
-                    content_height as f32,
-                ),
-                scrollbar: settings_scrollbar,
-            });
         return;
     }
 
