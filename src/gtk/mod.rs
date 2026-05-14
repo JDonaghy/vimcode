@@ -225,13 +225,7 @@ fn dispatch_gtk_panel_accelerator(
             true
         }
         ACC_SELECT_ALL_MATCHES => {
-            let mut eng = engine.borrow_mut();
-            if eng.is_vscode_mode() {
-                eng.vscode_select_all_occurrences();
-            } else {
-                eng.select_all_word_occurrences();
-            }
-            drop(eng);
+            engine.borrow_mut().select_all_occurrences();
             sender.input(Msg::Resize);
             true
         }
@@ -4466,21 +4460,9 @@ impl SimpleComponent for App {
                 // least one row, and the `5.0` amplification is closer
                 // to native-app conventions for wheel notches.
                 if engine.picker_open && delta_y.abs() > 0.01 {
-                    let step = (delta_y.abs() * 5.0).ceil() as usize;
-                    let max = engine.picker_items.len().saturating_sub(1);
-                    if delta_y > 0.0 {
-                        engine.picker_selected = (engine.picker_selected + step).min(max);
-                    } else {
-                        engine.picker_selected = engine.picker_selected.saturating_sub(step);
-                    }
-                    let visible = 20usize;
-                    if engine.picker_selected >= engine.picker_scroll_top + visible {
-                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
-                    }
-                    if engine.picker_selected < engine.picker_scroll_top {
-                        engine.picker_scroll_top = engine.picker_selected;
-                    }
-                    engine.picker_load_preview();
+                    let step = (delta_y.abs() * 5.0).ceil() as isize;
+                    let delta = if delta_y > 0.0 { step } else { -step };
+                    engine.picker_scroll(delta, 20);
                     drop(engine);
                     self.draw_needed.set(true);
                     return;

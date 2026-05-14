@@ -1617,6 +1617,16 @@ impl Engine {
         self.tab_switcher_open = false;
     }
 
+    /// Set `active_group` to the group that owns the given window.
+    pub fn activate_group_for_window(&mut self, window_id: WindowId) {
+        for (&gid, group) in &self.editor_groups {
+            if group.tabs.iter().any(|t| t.window_ids().contains(&window_id)) {
+                self.active_group = gid;
+                return;
+            }
+        }
+    }
+
     /// Handle a click on a tab bar hit region.
     /// `group_id` identifies which group's tab bar was clicked.
     /// Returns `true` if a close-dirty-tab confirmation is needed.

@@ -1613,6 +1613,24 @@ impl Engine {
         }
     }
 
+    /// Scroll the picker selection by `delta` rows (positive = down).
+    /// `visible_rows` is the number of visible result rows in the popup.
+    pub fn picker_scroll(&mut self, delta: isize, visible_rows: usize) {
+        let max = self.picker_items.len().saturating_sub(1);
+        if delta > 0 {
+            self.picker_selected = (self.picker_selected + delta as usize).min(max);
+        } else {
+            self.picker_selected = self.picker_selected.saturating_sub((-delta) as usize);
+        }
+        if self.picker_selected >= self.picker_scroll_top + visible_rows {
+            self.picker_scroll_top = self.picker_selected + 1 - visible_rows;
+        }
+        if self.picker_selected < self.picker_scroll_top {
+            self.picker_scroll_top = self.picker_selected;
+        }
+        self.picker_load_preview();
+    }
+
     /// Load preview context for the currently selected picker item.
     pub(crate) fn picker_load_preview(&mut self) {
         self.picker_preview = None;

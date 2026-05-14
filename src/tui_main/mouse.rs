@@ -827,14 +827,7 @@ pub(super) fn handle_mouse(
                     engine.picker_preview_scroll =
                         (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
                 } else {
-                    let step = 3;
-                    let max = engine.picker_items.len().saturating_sub(1);
-                    engine.picker_selected = (engine.picker_selected + step).min(max);
-                    let visible = 20usize;
-                    if engine.picker_selected >= engine.picker_scroll_top + visible {
-                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
-                    }
-                    engine.picker_load_preview();
+                    engine.picker_scroll(3, 20);
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -852,15 +845,9 @@ pub(super) fn handle_mouse(
                     0
                 };
                 if has_preview && col > popup_x + left_w {
-                    // Scroll the preview pane.
                     engine.picker_preview_scroll = engine.picker_preview_scroll.saturating_sub(3);
                 } else {
-                    let step = 3;
-                    engine.picker_selected = engine.picker_selected.saturating_sub(step);
-                    if engine.picker_selected < engine.picker_scroll_top {
-                        engine.picker_scroll_top = engine.picker_selected;
-                    }
-                    engine.picker_load_preview();
+                    engine.picker_scroll(-3, 20);
                 }
             }
             _ => {} // consume all other events

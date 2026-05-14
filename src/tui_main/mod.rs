@@ -268,11 +268,7 @@ fn dispatch_panel_accelerator(
             true
         }
         ACC_SELECT_ALL_MATCHES => {
-            if engine.is_vscode_mode() {
-                engine.vscode_select_all_occurrences();
-            } else {
-                engine.select_all_word_occurrences();
-            }
+            engine.select_all_occurrences();
             *needs_redraw = true;
             true
         }

@@ -601,6 +601,14 @@ impl Engine {
 
     /// Add secondary cursors at *every* occurrence of the word under the
     /// primary cursor.  Called by backends when `select_all_matches` is pressed.
+    pub fn select_all_occurrences(&mut self) {
+        if self.is_vscode_mode() {
+            self.vscode_select_all_occurrences();
+        } else {
+            self.select_all_word_occurrences();
+        }
+    }
+
     pub fn select_all_word_occurrences(&mut self) -> EngineAction {
         let word = match self.word_under_cursor() {
             Some(w) => w,

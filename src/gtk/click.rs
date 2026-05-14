@@ -66,17 +66,7 @@ pub(super) fn pixel_to_click_target(
             rel_x,
             rel_y,
         } => {
-            // Update active_group for the clicked window.
-            for (&gid, group) in &engine.editor_groups {
-                if group
-                    .tabs
-                    .iter()
-                    .any(|t| t.window_ids().contains(&window_id))
-                {
-                    engine.active_group = gid;
-                    break;
-                }
-            }
+            engine.activate_group_for_window(window_id);
 
             let Some(rw) = cached_layout.windows.get(window_idx) else {
                 return ClickTarget::None;
