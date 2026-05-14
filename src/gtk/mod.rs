@@ -2372,6 +2372,32 @@ impl SimpleComponent for App {
             });
             widgets.settings_da.add_controller(scroll_ctrl);
         }
+        {
+            let drag_rc = model.backend.borrow().drag_state_handle();
+            let engine_drag = engine.clone();
+            let sender_drag = sender.input_sender().clone();
+            let gesture = gtk4::GestureDrag::new();
+            gesture.set_button(1);
+            gesture.connect_drag_update(move |g, dx, dy| {
+                let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
+                let pt = quadraui::Point::new((sx + dx) as f32, (sy + dy) as f32);
+                let drag = drag_rc.borrow_mut();
+                let buttons = quadraui::ButtonMask {
+                    left: true,
+                    middle: false,
+                    right: false,
+                };
+                let events = quadraui::dispatch_mouse_drag(&drag, pt, buttons);
+                drop(drag);
+                for ev in &events {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
+                        engine_drag.borrow_mut().settings_scroll_top = *new_offset;
+                        sender_drag.send(Msg::SettingsScroll(0.0)).ok();
+                    }
+                }
+            });
+            widgets.settings_da.add_controller(gesture);
+        }
         *settings_da_ref.borrow_mut() = Some(widgets.settings_da.clone());
 
         // ── Explorer sidebar — TreeController render ─────────────────────────
@@ -9463,6 +9489,73 @@ impl App {
                 let sb_w = if need_sb { 8.0 } else { 0.0 };
                 let form_right = (panel_w - sb_w).max(0.0);
 
+                // Route scrollbar clicks through quadraui dispatch
+                // (handles both track-click-jump and thumb-drag-start).
+                if need_sb && x_click >= form_right {
+                    let sb_w_f = 8.0_f64;
+                    let sb_x = form_right;
+                    let track_len = body_h;
+                    let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
+                    let max_scroll = total.saturating_sub(visible_rows) as f64;
+                    let scroll_ratio = if max_scroll > 0.0 {
+                        engine.settings_scroll_top as f64 / max_scroll
+                    } else {
+                        0.0
+                    };
+                    let thumb_y = body_top + scroll_ratio * (track_len - thumb_len);
+                    let surface = quadraui::ScrollSurface {
+                        id: quadraui::WidgetId::new("gtk:settings"),
+                        bounds: quadraui::Rect::new(
+                            0.0,
+                            body_top as f32,
+                            panel_w as f32,
+                            body_h as f32,
+                        ),
+                        scrollbar: Some(quadraui::SurfaceScrollbar {
+                            axis: quadraui::ScrollAxis::Vertical,
+                            track_bounds: quadraui::Rect::new(
+                                sb_x as f32,
+                                body_top as f32,
+                                sb_w_f as f32,
+                                track_len as f32,
+                            ),
+                            thumb_bounds: quadraui::Rect::new(
+                                (sb_x + 2.0) as f32,
+                                thumb_y as f32,
+                                (sb_w_f - 4.0) as f32,
+                                thumb_len as f32,
+                            ),
+                            total_items: total,
+                            visible_items: visible_rows,
+                            scroll_offset: engine.settings_scroll_top,
+                            inverted: false,
+                        }),
+                    };
+                    let surfaces = [surface];
+                    let modal = self.backend.borrow().modal_stack_handle().borrow().clone();
+                    let mut drag = self.backend.borrow().drag_state_handle().borrow().clone();
+                    let click_events = quadraui::dispatch_click(
+                        &modal,
+                        &surfaces,
+                        &mut drag,
+                        quadraui::Point::new(x_click as f32, y_click as f32),
+                        quadraui::MouseButton::Left,
+                        Default::default(),
+                    );
+                    *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
+                    for ev in &click_events {
+                        if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
+                            engine.settings_scroll_top = *new_offset;
+                        }
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    if let Some(ref da) = *self.settings_da_ref.borrow() {
+                        da.queue_draw();
+                    }
+                    return;
+                }
+
                 if y_click < line_height {
                     // Header row — no-op.
                 } else if y_click < body_top {
@@ -9479,18 +9572,6 @@ impl App {
                         .new_tab(Some(Path::new(&settings_path)));
                     self.draw_needed.set(true);
                     return;
-                } else if need_sb && x_click >= form_right {
-                    // Scrollbar track — jump-scroll so the click position maps
-                    // to the centre of the thumb (same behaviour as TUI).
-                    let track_len = body_h;
-                    let max_scroll = total.saturating_sub(visible_rows);
-                    let rel = (y_click - body_top).clamp(0.0, track_len);
-                    let ratio = if track_len > 0.0 {
-                        rel / track_len
-                    } else {
-                        0.0
-                    };
-                    engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
                 } else if row_h > 0.0 {
                     // Body row.
                     let local = ((y_click - body_top) / row_h) as usize;
