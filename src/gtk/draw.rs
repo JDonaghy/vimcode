@@ -885,13 +885,14 @@ pub(super) fn draw_editor(
         backend,
     );
 
-    tab_switcher_popup_rect_out.set(draw_tab_switcher_popup(
-        cr,
+    tab_switcher_popup_rect_out.set(draw_tab_switcher_popup_list(
         &screen,
-        &theme,
         width as f64,
         height as f64,
         line_height,
+        backend,
+        cr,
+        &layout,
     ));
 
     let (btn_rects, popup_rect) = draw_dialog_popup(
@@ -2014,103 +2015,38 @@ pub(super) fn draw_picker_popup(
 /// popup's `(x, y, w, h)` if drawn, `None` otherwise — the caller
 /// caches this for `ModalStack` registration in the click handler
 /// (B.5b Stage 7).
-pub(super) fn draw_tab_switcher_popup(
-    cr: &Context,
+fn draw_tab_switcher_popup_list(
     screen: &render::ScreenLayout,
-    theme: &Theme,
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    cr: &Context,
+    layout: &pango::Layout,
 ) -> Option<(f64, f64, f64, f64)> {
     let ts = screen.tab_switcher.as_ref()?;
     if ts.items.is_empty() {
         return None;
     }
 
-    let item_count = ts.items.len();
     let max_visible = ((editor_height * 0.6) / line_height) as usize;
-    let visible = item_count.min(max_visible).min(20);
-
+    let visible = ts.items.len().min(max_visible).min(20);
     let popup_w = (editor_width * 0.40).clamp(350.0, 600.0);
-    let popup_h = (visible as f64 + 1.5) * line_height; // items + title
-
+    let popup_h = (visible as f64 + 1.5) * line_height;
     let popup_x = (editor_width - popup_w) / 2.0;
     let popup_y = (editor_height - popup_h) / 2.0;
 
-    // Background
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Use sans-serif UI font (same as VSCode tabs)
-    let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(&UI_FONT());
-    let layout = pango::Layout::new(&pango_ctx);
-    layout.set_font_description(Some(&ui_font_desc));
-
-    // Title
-    let title = " Open Tabs";
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(title);
-    layout.set_attributes(None);
-    cr.move_to(popup_x + 4.0, popup_y);
-    pangocairo::show_layout(cr, &layout);
-
-    // Scroll offset
-    let scroll = if ts.selected_idx >= visible {
-        ts.selected_idx - visible + 1
-    } else {
-        0
-    };
-
-    let items_y = popup_y + line_height * 1.2;
-    for i in 0..visible {
-        let item_idx = scroll + i;
-        if item_idx >= item_count {
-            break;
-        }
-        let item_y = items_y + i as f64 * line_height;
-        let is_selected = item_idx == ts.selected_idx;
-
-        if is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x + 1.0, item_y, popup_w - 2.0, line_height);
-            cr.fill().ok();
-        }
-
-        let (name, path, dirty) = &ts.items[item_idx];
-        let dirty_mark = if *dirty { " \u{25cf}" } else { "" }; // ●
-        let prefix = if is_selected { "\u{25b6} " } else { "  " }; // ▶
-        let label = format!("{}{}{}", prefix, name, dirty_mark);
-
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&label);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + 4.0, item_y);
-        pangocairo::show_layout(cr, &layout);
-
-        // Path right-aligned (dimmed)
-        if !path.is_empty() {
-            let (r, g, b) = theme.fuzzy_border.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            layout.set_text(path);
-            layout.set_attributes(None);
-            let (pw, _) = layout.pixel_size();
-            cr.move_to(popup_x + popup_w - pw as f64 - 8.0, item_y);
-            pangocairo::show_layout(cr, &layout);
-        }
-    }
+    let list = render::tab_switcher_to_quadraui_list_view(ts, visible);
+    let q_rect = quadraui::Rect::new(
+        popup_x as f32,
+        popup_y as f32,
+        popup_w as f32,
+        popup_h as f32,
+    );
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        use quadraui::Backend;
+        b.draw_list(q_rect, &list);
+    });
 
     Some((popup_x, popup_y, popup_w, popup_h))
 }
