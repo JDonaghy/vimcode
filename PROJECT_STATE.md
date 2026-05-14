@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 14, 2026 (Session 371 — **Backend dedup audit + #373 Engine::poll_idle().** Systematic audit of TUI (~14k lines) and GTK (~17k lines) backends. Filed 16 vimcode issues (#373–#388) for engine method extractions, render helpers, and architectural changes. Filed 7 quadraui issues (#161–#167) for primitive gaps and AppShell compose widget. Implemented #373: `Engine::poll_idle()` consolidates 20+ `poll_*/tick_*` calls from both backends into one engine method. Net -181 lines. Also filed #389 for extension registry fetch failure.)
+**Last updated:** May 14, 2026 (Session 372 — **Continued backend dedup: 6 engine extractions + quadraui compat + GTK tab switcher migration.** Closed #384 `select_all_occurrences`, #378 `activate_group_for_window`, #380 `picker_scroll`, #382 `scroll_viewport_with_cursor` (+ `_for_window` variant fixing pre-existing TUI scroll bug), #374 `tab_switcher_cycle`. Adapted to quadraui API changes (ButtonRowItem.icon, Palette show_query/create_label/preview, Dialog.body Vec). GTK tab switcher popup migrated from ~85 lines bespoke Cairo to shared `ListView`. Filed #389 registry fetch, #390 TUI cursor color, #391 TUI picker scroll.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 371 and earlier in **SESSION_HISTORY.md**.
+> Sessions 372 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -119,4 +119,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 371 and earlier in **SESSION_HISTORY.md**.
+> Sessions 372 and earlier in **SESSION_HISTORY.md**.

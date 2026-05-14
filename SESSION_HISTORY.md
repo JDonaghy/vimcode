@@ -1,7 +1,26 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 371 archived here.
+All sessions through 372 archived here.
+
+---
+**Session 372 (May 14) — Continued backend dedup: trivial extractions + quadraui compat + tab switcher migration:**
+
+**Trivial engine extractions (4 issues):**
+- #384: `Engine::select_all_occurrences()` — wraps vscode/vim mode check. Both backends reduced to one call.
+- #378: `Engine::activate_group_for_window(wid)` — iterates editor_groups to find owning group. Replaced GTK click.rs loop.
+- #380: `Engine::picker_scroll(delta, visible_rows)` — selection movement + scroll clamping + preview load. Replaced identical arithmetic in both backends.
+- #382: `Engine::scroll_viewport_with_cursor(delta, count)` + `scroll_viewport_with_cursor_for_window(wid, delta, count)` — scrolls viewport and clamps cursor to stay visible respecting scrolloff. Fixed pre-existing TUI bug where cursor went off-screen during mouse-wheel scroll (main dispatch_scroll path had no cursor adjustment). Uses `effective_viewport_lines()` for robust viewport size.
+
+**Quadraui API compat:** Adapted to quadraui changes — `ButtonRowItem.icon`, `Palette { show_query, create_label, preview }`, `Dialog.body: Vec<StyledText>`. All additive with serde defaults.
+
+**#374: `Engine::tab_switcher_cycle(forward)`** — both backends duplicated open-if-needed + cycling arithmetic for Ctrl+Tab, Ctrl+Shift+Tab, Alt+t (3 entry points each). Extracted into one engine method. Net -43 lines.
+
+**GTK tab switcher popup → quadraui `ListView`:** Replaced ~85 lines of bespoke Cairo rendering (background, border, title, scroll, selection highlight, name + path) with `Backend::draw_list` using the same `tab_switcher_to_quadraui_list_view` adapter the TUI already uses. Both backends now render identically through the shared primitive.
+
+**Bugs filed:** #389 (extension registry fetch failure), #390 (TUI cursor color after scroll), #391 (TUI picker selection disappears scrolling down — pre-existing, hardcoded `visible_rows = 20`).
+
+**Total session:** +138/-320, net -182 lines removed from backends.
 
 ---
 **Session 371 (May 14) — Backend dedup audit + Engine::poll_idle() (#373):**
