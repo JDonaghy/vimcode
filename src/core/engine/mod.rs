@@ -3810,6 +3810,23 @@ impl Engine {
         engine
     }
 
+    /// Shared post-construction startup: load plugins, fetch extension
+    /// registry, then either open the CLI-supplied path or restore the
+    /// previous session.  Both TUI and GTK call this identically.
+    pub fn startup(&mut self, file_path: Option<&Path>) {
+        self.plugin_init();
+        self.ext_refresh();
+        if let Some(path) = file_path {
+            if path.is_dir() {
+                self.open_folder(path);
+            } else {
+                let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+            }
+        } else {
+            self.restore_session_files();
+        }
+    }
+
     /// Create an engine with a file loaded (or empty buffer for new file).
     #[cfg(test)]
     pub fn open(path: &Path) -> Self {

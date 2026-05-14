@@ -1902,20 +1902,7 @@ impl SimpleComponent for App {
         let engine = {
             let mut e = Engine::new();
             icons::set_nerd_fonts(e.settings.use_nerd_fonts);
-            e.plugin_init();
-            // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
-            e.ext_refresh();
-            if let Some(ref path) = file_path {
-                // CLI argument: open only the specified file/directory, skip session restore
-                if path.is_dir() {
-                    e.open_folder(path);
-                } else {
-                    // Load file into the initial window (reuses the scratch buffer's tab).
-                    let _ = e.open_file_with_mode(path, crate::core::engine::OpenMode::Permanent);
-                }
-            } else {
-                e.restore_session_files();
-            }
+            e.startup(file_path.as_deref());
             e
         };
 

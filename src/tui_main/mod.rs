@@ -900,23 +900,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         engine.settings.use_nerd_fonts = false;
     }
     icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
-    engine.plugin_init();
-    // Fetch fresh extension registry in background (updates ignore_error_sources, etc.)
-    engine.ext_refresh();
-    // Nerd font message is set right before event_loop to survive async overwrites.
-    if let Some(path) = file_path {
-        // CLI argument: open only the specified file/directory, skip session restore
-        if path.is_dir() {
-            debug_log!("Opening directory from CLI: {:?}", path);
-            engine.open_folder(&path);
-        } else {
-            // Load file into the initial window (reuses the scratch buffer's tab).
-            debug_log!("Opening file from CLI: {:?}", path);
-            let _ = engine.open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
-        }
-    } else {
-        engine.restore_session_files();
-    }
+    engine.startup(file_path.as_deref());
 
     setup_tui_clipboard(&mut engine);
 
