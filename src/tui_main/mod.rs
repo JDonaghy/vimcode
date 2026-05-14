@@ -1046,7 +1046,6 @@ fn event_loop(
         engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
     };
     let mut sidebar = TuiSidebar::new(initial_visible);
-    engine.explorer_rebuild_rows();
 
     // Optional active prompt (for sidebar CRUD operations)
 
