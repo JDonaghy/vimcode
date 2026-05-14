@@ -1382,57 +1382,19 @@ impl SimpleComponent for App {
 
                                     // Ctrl+Tab / Ctrl+Shift+Tab: MRU tab switcher
                                     if ctrl && !alt && key_name == "Tab" {
-                                        let mut eng = engine.borrow_mut();
-                                        if eng.tab_switcher_open {
-                                            let len = eng.tab_mru.len();
-                                            if len > 0 {
-                                                eng.tab_switcher_selected =
-                                                    (eng.tab_switcher_selected + 1) % len;
-                                            }
-                                        } else {
-                                            eng.open_tab_switcher();
-                                        }
-                                        drop(eng);
+                                        engine.borrow_mut().tab_switcher_cycle(true);
                                         sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
                                     if ctrl && !alt && key_name == "ISO_Left_Tab" {
-                                        let mut eng = engine.borrow_mut();
-                                        if eng.tab_switcher_open {
-                                            let len = eng.tab_mru.len();
-                                            if len > 0 {
-                                                eng.tab_switcher_selected =
-                                                    if eng.tab_switcher_selected == 0 {
-                                                        len - 1
-                                                    } else {
-                                                        eng.tab_switcher_selected - 1
-                                                    };
-                                            }
-                                        } else {
-                                            eng.open_tab_switcher();
-                                            let len = eng.tab_mru.len();
-                                            if len > 0 {
-                                                eng.tab_switcher_selected = len - 1;
-                                            }
-                                        }
-                                        drop(eng);
+                                        engine.borrow_mut().tab_switcher_cycle(false);
                                         sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }
 
                                     // Alt+t: MRU tab switcher (open or cycle forward)
                                     if alt && !ctrl && !shift && unicode == Some('t') {
-                                        let mut eng = engine.borrow_mut();
-                                        if eng.tab_switcher_open {
-                                            let len = eng.tab_mru.len();
-                                            if len > 0 {
-                                                eng.tab_switcher_selected =
-                                                    (eng.tab_switcher_selected + 1) % len;
-                                            }
-                                        } else {
-                                            eng.open_tab_switcher();
-                                        }
-                                        drop(eng);
+                                        engine.borrow_mut().tab_switcher_cycle(true);
                                         sender.input(Msg::Resize);
                                         return gtk4::glib::Propagation::Stop;
                                     }

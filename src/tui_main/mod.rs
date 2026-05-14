@@ -1866,42 +1866,20 @@ fn event_loop(
                     let alt = key_event.modifiers.contains(KeyModifiers::ALT);
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
                     match key_event.code {
-                        // Alt+t or Ctrl+Tab or plain Tab: cycle forward
                         KeyCode::Char('t') if alt => {
-                            let len = engine.tab_mru.len();
-                            if len > 0 {
-                                engine.tab_switcher_selected =
-                                    (engine.tab_switcher_selected + 1) % len;
-                            }
+                            engine.tab_switcher_cycle(true);
                             tab_switcher_last_cycle = Some(Instant::now());
                         }
                         KeyCode::Tab if ctrl => {
-                            let len = engine.tab_mru.len();
-                            if len > 0 {
-                                engine.tab_switcher_selected =
-                                    (engine.tab_switcher_selected + 1) % len;
-                            }
+                            engine.tab_switcher_cycle(true);
                             tab_switcher_last_cycle = Some(Instant::now());
                         }
                         KeyCode::Tab => {
-                            let len = engine.tab_mru.len();
-                            if len > 0 {
-                                engine.tab_switcher_selected =
-                                    (engine.tab_switcher_selected + 1) % len;
-                            }
+                            engine.tab_switcher_cycle(true);
                             tab_switcher_last_cycle = Some(Instant::now());
                         }
-                        // Shift+Tab or Ctrl+Shift+Tab: cycle backward
                         KeyCode::BackTab => {
-                            let len = engine.tab_mru.len();
-                            if len > 0 {
-                                engine.tab_switcher_selected = if engine.tab_switcher_selected == 0
-                                {
-                                    len - 1
-                                } else {
-                                    engine.tab_switcher_selected - 1
-                                };
-                            }
+                            engine.tab_switcher_cycle(false);
                             tab_switcher_last_cycle = Some(Instant::now());
                         }
                         KeyCode::Esc => {
@@ -1930,29 +1908,18 @@ fn event_loop(
                 if key_event.kind != KeyEventKind::Release {
                     let ctrl_held = key_event.modifiers.contains(KeyModifiers::CONTROL);
                     let alt_held = key_event.modifiers.contains(KeyModifiers::ALT);
-                    // Ctrl+Tab
-                    if ctrl_held && key_event.code == KeyCode::Tab {
-                        engine.open_tab_switcher();
+                    // Ctrl+Tab / Alt+t: open or cycle forward
+                    if (ctrl_held && key_event.code == KeyCode::Tab)
+                        || (alt_held && !ctrl_held && key_event.code == KeyCode::Char('t'))
+                    {
+                        engine.tab_switcher_cycle(true);
                         tab_switcher_last_cycle = Some(Instant::now());
                         needs_redraw = true;
                         continue;
                     }
-                    // Ctrl+Shift+Tab
+                    // Ctrl+Shift+Tab: open or cycle backward
                     if ctrl_held && key_event.code == KeyCode::BackTab {
-                        engine.open_tab_switcher();
-                        if engine.tab_switcher_open {
-                            let len = engine.tab_mru.len();
-                            if len > 0 {
-                                engine.tab_switcher_selected = len - 1;
-                            }
-                        }
-                        tab_switcher_last_cycle = Some(Instant::now());
-                        needs_redraw = true;
-                        continue;
-                    }
-                    // Alt+t (handled here for the initial open; cycling handled above)
-                    if alt_held && !ctrl_held && key_event.code == KeyCode::Char('t') {
-                        engine.open_tab_switcher();
+                        engine.tab_switcher_cycle(false);
                         tab_switcher_last_cycle = Some(Instant::now());
                         needs_redraw = true;
                         continue;

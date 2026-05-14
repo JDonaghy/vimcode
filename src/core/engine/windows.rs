@@ -1596,6 +1596,34 @@ impl Engine {
         self.tab_switcher_selected = 1; // Start on the second item (previous tab)
     }
 
+    /// Open the tab switcher if not already open, then cycle the selection.
+    /// `forward`: true = next (Alt+t, Ctrl+Tab), false = previous (Shift+Tab).
+    pub fn tab_switcher_cycle(&mut self, forward: bool) {
+        if !self.tab_switcher_open {
+            self.open_tab_switcher();
+            if !forward && self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = len - 1;
+                }
+            }
+            return;
+        }
+        let len = self.tab_mru.len();
+        if len == 0 {
+            return;
+        }
+        if forward {
+            self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+        } else {
+            self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                len - 1
+            } else {
+                self.tab_switcher_selected - 1
+            };
+        }
+    }
+
     /// Confirm the tab switcher selection and close the popup.
     pub fn tab_switcher_confirm(&mut self) {
         if !self.tab_switcher_open {
