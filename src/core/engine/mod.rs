@@ -3322,6 +3322,9 @@ pub struct Engine {
     /// they dispatch via [`Engine::handle_ui_event`] with backend-supplied
     /// viewport context. See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11.
     pub accelerators: Vec<RegisteredAccelerator>,
+
+    /// Rate-limiting timer for `check_file_changes` inside `poll_idle`.
+    idle_last_file_check: std::time::Instant,
 }
 
 impl Engine {
@@ -3790,6 +3793,7 @@ impl Engine {
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
             accelerators: Vec::new(),
+            idle_last_file_check: std::time::Instant::now(),
         };
         // Initialize file watcher
         engine.init_file_watcher();
@@ -3825,6 +3829,51 @@ impl Engine {
         } else {
             self.restore_session_files();
         }
+    }
+
+    /// Run all periodic background work. Call once per idle tick from either
+    /// backend. Returns `true` if a redraw is needed.
+    ///
+    /// Backend-specific follow-ups that remain outside this method:
+    /// - `format_save_quit_ready` — backends must check and trigger exit
+    /// - `pending_terminal_command` — needs backend-supplied terminal size
+    /// - `dap_wants_sidebar` / `ext_panel_focus_pending` — sidebar state (#385)
+    /// - `explorer_needs_refresh` — GTK sends Msg::RefreshFileTree
+    /// - SC/explorer periodic auto-refresh — gated on sidebar visibility (#385)
+    /// - Settings file auto-reload (#376)
+    pub fn poll_idle(&mut self) -> bool {
+        let mut redraw = false;
+        redraw |= self.flush_cursor_move_hook();
+        self.lsp_flush_changes();
+        redraw |= self.poll_lsp();
+        if self.poll_project_search() {
+            self.search_switch_to_results();
+            redraw = true;
+        }
+        redraw |= self.poll_project_replace();
+        redraw |= self.poll_terminal();
+        redraw |= self.poll_dap();
+        redraw |= self.poll_ext_registry();
+        redraw |= self.poll_sc_diff();
+        redraw |= self.poll_ai();
+        redraw |= self.poll_async_shells();
+        redraw |= self.poll_panel_hover();
+        redraw |= self.poll_editor_hover();
+        redraw |= self.poll_blame();
+        redraw |= self.tick_ai_completion();
+        redraw |= self.tick_syntax_debounce();
+        self.tick_swap_files();
+        self.tick_file_watcher();
+        redraw |= self.tick_git_branch();
+        if !self.notifications.is_empty() {
+            redraw = true;
+        }
+        self.tick_notifications();
+        if self.idle_last_file_check.elapsed() >= std::time::Duration::from_secs(2) {
+            self.idle_last_file_check = std::time::Instant::now();
+            redraw |= self.check_file_changes();
+        }
+        redraw
     }
 
     /// Create an engine with a file loaded (or empty buffer for new file).

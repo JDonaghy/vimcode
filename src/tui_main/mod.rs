@@ -1131,8 +1131,6 @@ fn event_loop(
         .unwrap_or_else(Instant::now);
     // Auto-refresh sidebar to reflect external filesystem changes.
     let mut last_sidebar_refresh = Instant::now();
-    // Auto-reload buffers whose files changed on disk.
-    let mut last_file_check = Instant::now();
     // mtime of settings.json at last check — used to auto-reload when user edits the file.
     let mut settings_mtime: Option<std::time::SystemTime> = {
         let path = crate::core::settings::Settings::settings_file_path();
@@ -1438,26 +1436,7 @@ fn event_loop(
                 continue;
             }
             // No input — good time to do background work without blocking typing.
-            // Flush debounced cursor_move hook (plugin events + code action requests).
-            if engine.flush_cursor_move_hook() {
-                needs_redraw = true;
-            }
-            let idle_t0 = std::time::Instant::now();
-            // Flush LSP didChange (may block briefly on pipe write for large buffers).
-            engine.lsp_flush_changes();
-            let lsp_flush_ms = idle_t0.elapsed().as_secs_f64() * 1000.0;
-            let poll_t0 = std::time::Instant::now();
-            if engine.poll_lsp() {
-                needs_redraw = true;
-            }
-            let lsp_poll_ms = poll_t0.elapsed().as_secs_f64() * 1000.0;
-            if lsp_flush_ms > 5.0 || lsp_poll_ms > 5.0 {
-                debug_log!(
-                    "PERF idle: lsp_flush={:.1}ms lsp_poll={:.1}ms",
-                    lsp_flush_ms,
-                    lsp_poll_ms
-                );
-            }
+            needs_redraw |= engine.poll_idle();
             // Format-on-save + :wq/:x deferred quit
             if engine.format_save_quit_ready {
                 engine.format_save_quit_ready = false;
@@ -1465,15 +1444,6 @@ fn event_loop(
                 engine.lsp_shutdown();
                 save_session(engine);
                 break;
-            }
-            if engine.poll_project_search() && !engine.project_search_results.is_empty() {
-                if sidebar.active_panel == TuiPanel::Search {
-                    engine.search_switch_to_results();
-                }
-                needs_redraw = true;
-            }
-            if engine.poll_project_replace() {
-                needs_redraw = true;
             }
             // Auto-refresh explorer and SC panel to reflect external filesystem changes.
             if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
@@ -1486,18 +1456,7 @@ fn event_loop(
                 last_sidebar_refresh = Instant::now();
                 needs_redraw = true;
             }
-            // Auto-reload buffers whose files changed on disk.
-            if last_file_check.elapsed() >= Duration::from_secs(2) {
-                last_file_check = Instant::now();
-                if engine.check_file_changes() {
-                    needs_redraw = true;
-                }
-            }
-            // Auto-reload settings.json when its mtime changes (e.g. after :w in the editor).
-            // Use the save-revision counter to tell external edits from self-saves
-            // (e.g. `:set`): self-saves keep settings already in sync, so we just
-            // refresh our cached mtime silently — no reload, no "Settings reloaded"
-            // message that would clobber `:set`'s own confirmation.
+            // Auto-reload settings.json when its mtime changes.
             {
                 let path = crate::core::settings::Settings::settings_file_path();
                 if let Ok(meta) = fs::metadata(&path) {
@@ -1522,18 +1481,10 @@ fn event_loop(
                     }
                 }
             }
-            // Terminal: drain PTY output and refresh display if new data arrived.
-            if engine.poll_terminal() {
-                needs_redraw = true;
-            }
-            // Run pending terminal commands (e.g. extension installs).
+            // Run pending terminal commands (needs backend-supplied terminal size).
             if let Some(cmd) = engine.pending_terminal_command.take() {
                 let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
                 engine.terminal_run_command(&cmd, cols, engine.session.terminal_panel_rows);
-                needs_redraw = true;
-            }
-            // DAP: drain adapter events (breakpoint hits, stops, output)
-            if engine.poll_dap() {
                 needs_redraw = true;
             }
             // Auto-switch to Debug sidebar when a session starts.
@@ -1543,23 +1494,7 @@ fn event_loop(
                 sidebar.visible = true;
                 needs_redraw = true;
             }
-            // Poll for completed extension registry fetch.
-            if engine.poll_ext_registry() {
-                needs_redraw = true;
-            }
-            // Poll for completed SC diff background request.
-            if engine.poll_sc_diff() {
-                needs_redraw = true;
-            }
-            if engine.poll_ai() {
-                needs_redraw = true;
-            }
-            // Poll for completed async shell tasks (plugin background commands).
-            if engine.poll_async_shells() {
-                needs_redraw = true;
-            }
-            // Show startup message after async init completes (overrides
-            // "Extension registry updated" etc.)
+            // Show startup message after async init completes.
             if let Some(msg) = pending_startup_msg.take() {
                 engine.message = msg;
                 needs_redraw = true;
@@ -1571,42 +1506,6 @@ fn event_loop(
                 sidebar.has_focus = true;
                 needs_redraw = true;
             }
-            // Poll panel hover dwell timer (shows popup after brief mouse hover).
-            if engine.poll_panel_hover() {
-                needs_redraw = true;
-            }
-            // Poll editor hover dwell / delayed dismiss timers.
-            if engine.poll_editor_hover() {
-                needs_redraw = true;
-            }
-            // Poll async blame results.
-            if engine.poll_blame() {
-                needs_redraw = true;
-            }
-            // Tick AI inline completion debounce counter each event-loop frame.
-            if engine.tick_ai_completion() {
-                needs_redraw = true;
-            }
-            // Debounced syntax refresh during insert mode — after 150ms of no
-            // keystrokes, re-parse + re-extract highlights so stale byte offsets
-            // don't cause wrong colors near edited regions.
-            if engine.tick_syntax_debounce() {
-                needs_redraw = true;
-            }
-            // Tick swap file writes (only does work when updatetime elapsed).
-            engine.tick_swap_files();
-            // Check for externally modified files.
-            engine.tick_file_watcher();
-            // Poll for external git branch changes (rate-limited to once per 2s).
-            if engine.tick_git_branch() {
-                needs_redraw = true;
-            }
-            // Auto-dismiss completed notifications after timeout.
-            // Force redraw every idle tick when notifications are visible (spinner animation).
-            if !engine.notifications.is_empty() {
-                needs_redraw = true;
-            }
-            engine.tick_notifications();
             continue;
         }
 

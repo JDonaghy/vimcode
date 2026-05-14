@@ -409,8 +409,6 @@ struct App {
     window: gtk4::Window,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
-    /// Last time check_file_changes() was called for auto-reload detection.
-    last_file_check: std::time::Instant,
     /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
     last_tree_indicator_update: std::time::Instant,
     /// Full-window overlay DrawingArea that draws the menu dropdown.
@@ -2199,7 +2197,6 @@ impl SimpleComponent for App {
             tab_dragging: false,
             tab_drag_start: None,
             last_sc_refresh: std::time::Instant::now(),
-            last_file_check: std::time::Instant::now(),
             last_tree_indicator_update: std::time::Instant::now(),
             menu_dropdown_da: menu_dropdown_da_ref.clone(),
             panel_hover_da: panel_hover_da_ref.clone(),
@@ -5953,42 +5950,16 @@ impl App {
                 }
             }
         }
-        if self.engine.borrow_mut().poll_project_search() {
-            self.engine.borrow_mut().search_switch_to_results();
-            if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
+        // Run all periodic background work (LSP, DAP, terminal, search, etc.)
+        if self.engine.borrow_mut().poll_idle() {
             self.draw_needed.set(true);
         }
-        if self.engine.borrow_mut().poll_project_replace() {
-            if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
-            self.draw_needed.set(true);
+        // Format-on-save + :wq/:x deferred quit
+        if self.engine.borrow().format_save_quit_ready {
+            self.engine.borrow_mut().format_save_quit_ready = false;
+            sender.input(Msg::QuitConfirmed);
         }
-        // LSP: flush debounced didChange notifications and poll for events
-        {
-            let mut engine = self.engine.borrow_mut();
-            // Flush debounced cursor_move hook (plugin events + code action requests).
-            if engine.flush_cursor_move_hook() {
-                self.draw_needed.set(true);
-            }
-            engine.lsp_flush_changes();
-            if engine.poll_lsp() {
-                self.draw_needed.set(true);
-            }
-            // Format-on-save + :wq/:x deferred quit
-            if engine.format_save_quit_ready {
-                engine.format_save_quit_ready = false;
-                drop(engine);
-                sender.input(Msg::QuitConfirmed);
-            }
-        }
-        // Terminal: drain PTY output and refresh display if needed
-        if self.engine.borrow_mut().poll_terminal() {
-            self.draw_needed.set(true);
-        }
-        // Run pending terminal commands (e.g. extension installs).
+        // Run pending terminal commands (needs backend-supplied terminal size).
         if self.engine.borrow().pending_terminal_command.is_some() {
             let cmd = self
                 .engine
@@ -5998,13 +5969,9 @@ impl App {
                 .unwrap();
             sender.input(Msg::RunCommandInTerminal(cmd));
         }
-        // DAP: drain adapter events (breakpoint hits, stops, output)
+        // Auto-switch to Debug sidebar when a session starts.
         {
             let mut engine = self.engine.borrow_mut();
-            if engine.poll_dap() {
-                self.draw_needed.set(true);
-            }
-            // Auto-switch to Debug sidebar when a session starts.
             if engine.dap_wants_sidebar {
                 engine.dap_wants_sidebar = false;
                 self.active_panel = SidebarPanel::Debug;
@@ -6019,19 +5986,12 @@ impl App {
                 da.queue_draw();
             }
         }
-        // Explorer refresh after confirmed file move. Phase A.2b-2 removed
-        // the inline cell-editor, so there's no widget-destruction race to
-        // defer around any more — refresh whenever the engine asks for it.
+        // Explorer refresh after confirmed file move.
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
             sender.input(Msg::RefreshFileTree);
         }
-        // Auto-refresh SC panel periodically to pick up external git
-        // changes. Runs four `git` subprocesses (~1 s on a non-trivial
-        // workspace) on a background thread — blocking the main thread
-        // on this used to peg CPU at ~100 % (see #153). Only spawn when
-        // a panel actually needs the data; drain the receiver every
-        // tick so the snapshot arrives on the next draw.
+        // Auto-refresh SC panel periodically (gated on sidebar visibility).
         if self.sidebar_visible
             && (self.active_panel == SidebarPanel::Git
                 || self.active_panel == SidebarPanel::Explorer)
@@ -6049,117 +6009,28 @@ impl App {
             }
             self.draw_needed.set(true);
         }
-        // Auto-reload buffers whose files changed on disk.
-        if self.last_file_check.elapsed() >= std::time::Duration::from_secs(2) {
-            self.last_file_check = std::time::Instant::now();
-            if self.engine.borrow_mut().check_file_changes() {
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll for completed extension registry fetch.
-        {
-            let mut engine = self.engine.borrow_mut();
-            if engine.poll_ext_registry() {
-                drop(engine);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll for completed SC diff background request.
-        {
-            if self.engine.borrow_mut().poll_sc_diff() {
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll for completed async shell tasks (plugin background commands).
-        {
-            if self.engine.borrow_mut().poll_async_shells() {
-                self.draw_needed.set(true);
-            }
-        }
         // Check for panel reveal request from plugins.
         {
             let engine = self.engine.borrow_mut();
             if let Some(panel_name) = engine.ext_panel_focus_pending.clone() {
                 drop(engine);
-                // Switch directly — don't go through SwitchPanel which
-                // would toggle visibility or reset selection set by reveal.
                 self.active_panel = SidebarPanel::ExtPanel(panel_name);
                 self.sidebar_visible = true;
                 self.engine.borrow_mut().ext_panel_focus_pending = None;
                 self.draw_needed.set(true);
             }
         }
-        // Poll for completed AI response.
-        {
-            let mut engine = self.engine.borrow_mut();
-            if engine.poll_ai() {
-                drop(engine);
-                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-                self.draw_needed.set(true);
+        // GTK-specific: queue redraws on individual sidebar DAs whose
+        // content may have changed from the polls above.
+        if self.active_panel == SidebarPanel::Explorer {
+            if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+                da.queue_draw();
             }
         }
-        // Tick AI inline completions debounce counter.
+        // Panel hover overlay redraw.
         {
-            if self.engine.borrow_mut().tick_ai_completion() {
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll for panel hover popup (dwell detection).
-        {
-            let had_hover = self.engine.borrow().panel_hover.is_some();
-            let changed = self.engine.borrow_mut().poll_panel_hover();
-            let has_hover = self.engine.borrow().panel_hover.is_some();
-            if changed || (had_hover && !has_hover) {
-                if let Some(ref da) = *self.panel_hover_da.borrow() {
-                    da.queue_draw();
-                }
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll for editor hover popup (dwell detection / delayed dismiss).
-        {
-            let changed = self.engine.borrow_mut().poll_editor_hover();
-            if changed {
-                self.draw_needed.set(true);
-            }
-        }
-        // Poll async blame results.
-        {
-            let changed = self.engine.borrow_mut().poll_blame();
-            if changed {
-                self.draw_needed.set(true);
-            }
-        }
-        // Debounced syntax refresh during insert mode — after 150ms of no
-        // keystrokes, re-parse + re-extract highlights so stale byte offsets
-        // don't cause wrong colors near edited regions.
-        if self.engine.borrow_mut().tick_syntax_debounce() {
-            self.draw_needed.set(true);
-        }
-        // Tick swap file writes (only does work when updatetime elapsed).
-        self.engine.borrow_mut().tick_swap_files();
-        // Poll for external git branch changes (rate-limited to once per 2s inside).
-        if self.engine.borrow_mut().tick_git_branch() {
-            self.draw_needed.set(true);
-        }
-        // Auto-dismiss completed notifications after timeout; force redraw for spinner animation.
-        {
-            let mut engine = self.engine.borrow_mut();
-            if engine.has_active_notifications() {
-                self.draw_needed.set(true);
-            }
-            let had_notifs = !engine.notifications.is_empty();
-            engine.tick_notifications();
-            if had_notifs && engine.notifications.is_empty() {
-                self.draw_needed.set(true);
+            if let Some(ref da) = *self.panel_hover_da.borrow() {
+                da.queue_draw();
             }
         }
         // Explorer tree indicators (modified/diagnostics) are pulled by
