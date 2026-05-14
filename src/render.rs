@@ -3601,7 +3601,7 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
         title: quadraui::StyledText::plain(panel.title.clone()),
         // Body is multi-line — join with newlines. Backends split on
         // `\n` when rendering.
-        body: quadraui::StyledText::plain(panel.body.join("\n")),
+        body: panel.body.iter().map(|l| quadraui::StyledText::plain(l.clone())).collect(),
         buttons,
         severity: None,
         vertical_buttons: panel.vertical_buttons,
@@ -6726,16 +6726,19 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                             id: WidgetId::new("search:find_next"),
                             label: "Find".to_string(),
                             disabled: engine.project_search_query.is_empty(),
+                            icon: None,
                         },
                         ButtonRowItem {
                             id: WidgetId::new("search:replace_next"),
                             label: "Repl".to_string(),
                             disabled: results.is_empty(),
+                            icon: None,
                         },
                         ButtonRowItem {
                             id: WidgetId::new("search:replace_all"),
                             label: "All".to_string(),
                             disabled: results.is_empty(),
+                            icon: None,
                         },
                     ],
                 },
@@ -7650,6 +7653,8 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
         scroll_offset: picker.scroll_top,
         total_count: picker.total_count,
         has_focus: true,
+        show_query: true,
+        create_label: None,
         preview: None,
     })
 }

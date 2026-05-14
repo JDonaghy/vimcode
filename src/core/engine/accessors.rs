@@ -408,7 +408,7 @@ impl Engine {
             self.scroll_up_visible(count);
         }
         let scrolloff = self.settings.scrolloff;
-        let vp = self.view().viewport_lines.max(1);
+        let vp = self.effective_viewport_lines().max(1);
         let cur = self.view().cursor.line;
         let new_top = self.view().scroll_top;
         if cur < new_top + scrolloff {

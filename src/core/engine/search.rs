@@ -87,7 +87,7 @@ impl Engine {
     /// positioned into what used to be the visible area but is now
     /// hidden behind the new panel. Compute an effective viewport
     /// that subtracts the currently-visible bottom chrome here.
-    fn effective_viewport_lines(&self) -> usize {
+    pub(crate) fn effective_viewport_lines(&self) -> usize {
         let cached = self.view().viewport_lines;
         let bottom_chrome = self.bottom_chrome_rows_since_last_draw();
         cached.saturating_sub(bottom_chrome)

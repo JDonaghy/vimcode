@@ -1077,7 +1077,7 @@ pub(super) fn build_quit_confirm_dialog(
     let dialog = quadraui::Dialog {
         id: quadraui::WidgetId::new("quit_confirm"),
         title: quadraui::StyledText::plain("Unsaved Changes"),
-        body: quadraui::StyledText::plain("You have unsaved changes. Quit anyway?"),
+        body: vec![quadraui::StyledText::plain("You have unsaved changes. Quit anyway?")],
         buttons: vec![
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("quit:save_all"),
@@ -1133,7 +1133,7 @@ pub(super) fn build_close_tab_dialog(
     let dialog = quadraui::Dialog {
         id: quadraui::WidgetId::new("close_tab_confirm"),
         title: quadraui::StyledText::plain("Unsaved Changes"),
-        body: quadraui::StyledText::plain("This file has unsaved changes."),
+        body: vec![quadraui::StyledText::plain("This file has unsaved changes.")],
         buttons: vec![
             quadraui::DialogButton {
                 id: quadraui::WidgetId::new("close_tab:save"),
@@ -1259,6 +1259,8 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
         scroll_offset: picker.scroll_top,
         total_count: picker.all_entries.len(),
         has_focus: true,
+        show_query: true,
+        create_label: None,
         preview: None,
     }
 }

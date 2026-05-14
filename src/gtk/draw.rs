@@ -2161,19 +2161,18 @@ pub(super) fn draw_dialog_popup(
     ui_layout.set_text(&title_text);
     let (title_w, _) = ui_layout.pixel_size();
 
-    let body_text = dialog
+    let body_lines: Vec<String> = dialog
         .body
-        .spans
         .iter()
-        .map(|s| s.text.as_str())
-        .collect::<String>();
+        .map(|st| st.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+        .collect();
     let mut body_max_w = 0.0f64;
-    for line in body_text.split('\n') {
+    for line in &body_lines {
         layout.set_text(line);
         let (w, _) = layout.pixel_size();
         body_max_w = body_max_w.max(w as f64);
     }
-    let body_lines = body_text.split('\n').count();
+    let body_line_count = body_lines.len();
 
     // Measure horizontal-button widths uniformly (max of formatted
     // labels) so layout's `button_width` is consistent.
@@ -2196,7 +2195,7 @@ pub(super) fn draw_dialog_popup(
     } else {
         line_height * 1.5
     };
-    let body_height = body_lines as f64 * line_height;
+    let body_height = body_line_count as f64 * line_height;
     let input_height = if dialog.input.is_some() {
         line_height + 4.0
     } else {
