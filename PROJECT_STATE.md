@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 13, 2026 (Session 368 — **Adopt quadraui#77/#78/#79 (#328) + close stale milestone issues.** Used `TreeController::scroll_by()` in explorer, fixed TUI scroll delta convention (3 sidebar panels had inverted scroll), routed TUI explorer double-click through `TreeController::handle()` via quadraui#147 `DoubleClick` synthesis. Verified and closed #295, #314, #315, #331 — all already working.)
+**Last updated:** May 14, 2026 (Session 369 — **Bug fixes + platform dedup.** Theme conversion deduped to `render::to_quadraui_theme()` (-123 lines). #292 fixed: F5/F9/F10/F11 work from any panel/mode in both backends via single engine handler. #255 fixed: settings scrollbar via `FormController::render_and_cache()` + `handle_cached()` — zero per-backend scrollbar code. Verified/closed #253, #243, #245. Platform audit found backends well-maintained with minimal dead code.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1960 lib tests passing, 2057 total (lib+integration).
 
-> Sessions 368 and earlier in **SESSION_HISTORY.md**.
+> Sessions 369 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -119,4 +119,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 366 and earlier in **SESSION_HISTORY.md**.
+> Sessions 367 and earlier in **SESSION_HISTORY.md**.

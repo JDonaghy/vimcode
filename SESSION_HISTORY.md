@@ -1,7 +1,20 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 368 archived here.
+All sessions through 369 archived here.
+
+---
+**Session 369 (May 13–14) — Bug fixes, platform audit, theme dedup, FormController migration:**
+
+**Theme dedup (-123 lines):** Moved `q_theme_chrome()` + `q_theme_editor()` from both `tui_main/quadraui_tui.rs` and `gtk/quadraui_gtk.rs` into `render::to_quadraui_theme()`. Both backends now delegate to this single function.
+
+**#292 — F5/F9/F10/F11 from any panel and mode (PR #371):** Three layers fixed: (1) GTK toolkit intercepted F10 as "activate-menubar" — added window-level capture controller. (2) GTK `handle_key_press` sidebar routing consumed F-keys — added early intercept. (3) Engine `dap_sidebar_has_focus` guard blocked F-keys — exempted F5/F9/F10/F11. Moved F-key handling to `engine.handle_key()` before mode dispatch. Both TUI and GTK now route through this single handler, removing duplicate from `dispatch_dap_sidebar_action_key()`. Also fixed pre-existing F5 bug (sidebar handler always called "debug" instead of "continue").
+
+**#255 — Settings scrollbar via FormController (PR #372):** Migrated settings panel to `quadraui::FormController` (quadraui#155). Both backends use `render_and_cache()` for form+scrollbar rendering and `handle_cached()` (quadraui#157) for scroll wheel, track-click, and thumb-drag — zero per-backend scrollbar code. Removed manual scrollbar drawing, `ScrollSurface` registration, and `dispatch_click`/`dispatch_drag` wiring. Net -20 lines.
+
+**Verified and closed (already working):** #253 (GTK completion popup), #243 (GTK debug sidebar scrollbar drag), #245 (inverted scrollbar thumb-grab).
+
+**Platform audit:** Thorough inventory of TUI (~12k lines) and GTK (~17k lines) backends. Found minimal dead code, one dedup opportunity (theme conversion, fixed), and noted future quadraui lift candidates (scrollbar_grab_offset, directory picker, char_col_to_visual).
 
 ---
 **Session 368 (May 13) — Adopt quadraui#77/#78/#79 (#328) + close stale milestone issues:**

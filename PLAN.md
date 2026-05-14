@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-13 (Session 368 — #328 adopted (scroll_by, scroll convention, double-click routing). #295, #314, #315, #331 verified working and closed. All vimcode-side milestone work complete; remaining issues are quadraui-side infrastructure.)
+> **Last updated:** 2026-05-14 (Session 369 — Bug fixes + platform dedup. Theme dedup (-123 lines). #292 F-key routing (PR #371). #255 settings FormController (PR #372). Verified/closed #253, #243, #245. Now working through non-milestone bug backlog.)
 
 ---
 
