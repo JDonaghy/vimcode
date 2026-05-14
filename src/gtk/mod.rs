@@ -5318,62 +5318,24 @@ impl App {
             return;
         }
 
-        // Dismiss context menu on any key press (Escape, or j/k for nav, Enter to confirm).
+        // Context menu key dispatch — shared engine method handles nav, confirm, dismiss.
         if self.engine.borrow().context_menu.is_some() {
             let mut engine = self.engine.borrow_mut();
-            match key_name.as_str() {
-                "Escape" => {
-                    engine.close_context_menu();
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
+            let (consumed, _action) = engine.handle_context_menu_key(key_name.as_str());
+            if consumed {
+                let needs_refresh = engine.explorer_needs_refresh;
+                if needs_refresh {
+                    engine.explorer_needs_refresh = false;
                 }
-                "Return" => {
-                    let _act = engine.context_menu_confirm();
-                    let needs_refresh = engine.explorer_needs_refresh;
-                    if needs_refresh {
-                        engine.explorer_needs_refresh = false;
-                    }
-                    drop(engine);
-                    if needs_refresh {
-                        sender.input(Msg::RefreshFileTree);
-                    }
-                    self.draw_needed.set(true);
-                    return;
+                drop(engine);
+                if needs_refresh {
+                    sender.input(Msg::RefreshFileTree);
                 }
-                "j" | "Down" => {
-                    if let Some(ref mut cm) = engine.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = (cm.selected + 1) % len;
-                        }
-                    }
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                "k" | "Up" => {
-                    if let Some(ref mut cm) = engine.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = if cm.selected > 0 {
-                                cm.selected - 1
-                            } else {
-                                len - 1
-                            };
-                        }
-                    }
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                _ => {
-                    engine.close_context_menu();
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    // Fall through to normal key handling
-                }
+                self.draw_needed.set(true);
+                return;
             }
+            drop(engine);
+            self.draw_needed.set(true);
         }
 
         // Dismiss any panel hover popup on key press.
