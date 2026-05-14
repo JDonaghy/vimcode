@@ -1401,7 +1401,9 @@ pub(super) fn handle_mouse(
                                 if let Some(rw) = target {
                                     let dir = if down { 1 } else { -1 };
                                     engine.scroll_viewport_with_cursor_for_window(
-                                        rw.window_id, dir, step,
+                                        rw.window_id,
+                                        dir,
+                                        step,
                                     );
                                     engine.sync_scroll_binds();
                                 }
@@ -1417,7 +1419,11 @@ pub(super) fn handle_mouse(
             // "tui:editor_viewport" surface above — fallback to active window
             // for scroll events that don't hit any registered surface.
             if col >= editor_left && row + 2 < term_height {
-                let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+                let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
                 engine.scroll_viewport_with_cursor(dir, 3);
                 engine.sync_scroll_binds();
             }
@@ -2164,39 +2170,19 @@ pub(super) fn handle_mouse(
             if row == term_strip_top {
                 // Header row — dispatch through cached toolbar hit regions.
                 engine.terminal_has_focus = true;
-                use crate::core::engine::TerminalToolbarAction;
-                match engine.resolve_terminal_toolbar_click(col as f64) {
-                    TerminalToolbarAction::SwitchTab(idx) => {
-                        engine.terminal_switch_tab(idx);
-                    }
-                    TerminalToolbarAction::CloseTab => {
-                        engine.terminal_close_active_tab();
-                    }
-                    TerminalToolbarAction::ToggleMaximize => {
-                        let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
-                        let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                        engine.toggle_terminal_maximize();
-                        let target = super::terminal_target_maximize_rows_tui(engine, screen_h);
-                        let effective = engine.effective_terminal_panel_rows(target);
-                        engine.terminal_resize(full_cols, effective);
-                    }
-                    TerminalToolbarAction::ToggleSplit => {
-                        let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                        let rows = engine.session.terminal_panel_rows;
-                        engine.terminal_toggle_split(full_cols, rows);
-                    }
-                    TerminalToolbarAction::AddTab => {
-                        let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                        let rows = engine.session.terminal_panel_rows;
-                        engine.terminal_new_tab(cols, rows);
-                    }
-                    TerminalToolbarAction::CloseFindBar => {
-                        engine.terminal_find_active = false;
-                    }
-                    TerminalToolbarAction::StartResize => {
+                let action = engine.resolve_terminal_toolbar_click(col as f64);
+                let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+                let ctx = crate::core::engine::UiEventContext {
+                    terminal_cols: terminal_size.map(|s| s.width).unwrap_or(80),
+                    terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
+                };
+                if !engine.execute_terminal_toolbar_action(action, ctx) {
+                    if matches!(
+                        action,
+                        crate::core::engine::TerminalToolbarAction::StartResize
+                    ) {
                         *dragging_terminal_resize = true;
                     }
-                    TerminalToolbarAction::None => {}
                 }
             } else {
                 // Content row — focus split pane or start divider drag.

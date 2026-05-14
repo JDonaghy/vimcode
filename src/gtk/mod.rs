@@ -4516,9 +4516,7 @@ impl SimpleComponent for App {
                         engine.scroll_viewport_with_cursor(dir, scroll_count);
                     } else {
                         let dir = if delta_y > 0.0 { 1 } else { -1 };
-                        engine.scroll_viewport_with_cursor_for_window(
-                            target, dir, scroll_count,
-                        );
+                        engine.scroll_viewport_with_cursor_for_window(target, dir, scroll_count);
                     }
                     engine.sync_scroll_binds();
                 }
@@ -7163,30 +7161,22 @@ impl App {
                     }
                 } else {
                     // Header row — dispatch through cached toolbar hit regions.
-                    use crate::core::engine::TerminalToolbarAction;
-                    match self.engine.borrow().resolve_terminal_toolbar_click(x) {
-                        TerminalToolbarAction::SwitchTab(idx) => {
-                            sender.input(Msg::TerminalSwitchTab(idx));
-                        }
-                        TerminalToolbarAction::CloseTab => {
-                            sender.input(Msg::TerminalCloseActiveTab);
-                        }
-                        TerminalToolbarAction::ToggleMaximize => {
-                            sender.input(Msg::ToggleTerminalMaximize);
-                        }
-                        TerminalToolbarAction::ToggleSplit => {
-                            sender.input(Msg::TerminalToggleSplit);
-                        }
-                        TerminalToolbarAction::AddTab => {
-                            sender.input(Msg::NewTerminalTab);
-                        }
-                        TerminalToolbarAction::CloseFindBar => {
-                            self.engine.borrow_mut().terminal_find_active = false;
-                        }
-                        TerminalToolbarAction::StartResize => {
+                    let action = self.engine.borrow().resolve_terminal_toolbar_click(x);
+                    let ctx = crate::core::engine::UiEventContext {
+                        terminal_cols: self.terminal_cols(),
+                        terminal_max_rows: self.terminal_target_maximize_rows(),
+                    };
+                    if !self
+                        .engine
+                        .borrow_mut()
+                        .execute_terminal_toolbar_action(action, ctx)
+                    {
+                        if matches!(
+                            action,
+                            crate::core::engine::TerminalToolbarAction::StartResize
+                        ) {
                             self.terminal_resize_dragging = true;
                         }
-                        TerminalToolbarAction::None => {}
                     }
                 }
                 self.draw_needed.set(true);
