@@ -2373,27 +2373,43 @@ impl SimpleComponent for App {
             widgets.settings_da.add_controller(scroll_ctrl);
         }
         {
-            let drag_rc = model.backend.borrow().drag_state_handle();
             let engine_drag = engine.clone();
             let sender_drag = sender.input_sender().clone();
+            let settings_da_drag = model.settings_da_ref.clone();
             let gesture = gtk4::GestureDrag::new();
             gesture.set_button(1);
             gesture.connect_drag_update(move |g, dx, dy| {
                 let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
                 let pt = quadraui::Point::new((sx + dx) as f32, (sy + dy) as f32);
-                let drag = drag_rc.borrow_mut();
-                let buttons = quadraui::ButtonMask {
-                    left: true,
-                    middle: false,
-                    right: false,
+                let da_h = settings_da_drag
+                    .borrow()
+                    .as_ref()
+                    .map(|da| da.height() as f32)
+                    .unwrap_or(0.0);
+                let event = quadraui::UiEvent::MouseMoved {
+                    position: pt,
+                    buttons: quadraui::ButtonMask {
+                        left: true,
+                        middle: false,
+                        right: false,
+                    },
                 };
-                let events = quadraui::dispatch_mouse_drag(&drag, pt, buttons);
-                drop(drag);
-                for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                        engine_drag.borrow_mut().settings_scroll_top = *new_offset;
-                        sender_drag.send(Msg::SettingsScroll(0.0)).ok();
-                    }
+                let q_rect = quadraui::Rect::new(0.0, 0.0, 1.0, da_h);
+                let eng = engine_drag.borrow();
+                render::populate_settings_form_controller(&eng);
+                let result = eng
+                    .settings_form_controller
+                    .borrow_mut()
+                    .handle_cached(&event, q_rect);
+                if matches!(
+                    result,
+                    quadraui::FormControllerEvent::ScrollChanged
+                        | quadraui::FormControllerEvent::Consumed
+                ) {
+                    let new_offset = eng.settings_form_controller.borrow().scroll_offset();
+                    drop(eng);
+                    engine_drag.borrow_mut().settings_scroll_top = new_offset;
+                    sender_drag.send(Msg::SettingsScroll(0.0)).ok();
                 }
             });
             widgets.settings_da.add_controller(gesture);
@@ -9489,64 +9505,28 @@ impl App {
                 let sb_w = if need_sb { 8.0 } else { 0.0 };
                 let form_right = (panel_w - sb_w).max(0.0);
 
-                // Route scrollbar clicks through quadraui dispatch
-                // (handles both track-click-jump and thumb-drag-start).
+                // Route scrollbar clicks through FormController.
                 if need_sb && x_click >= form_right {
-                    let sb_w_f = 8.0_f64;
-                    let sb_x = form_right;
-                    let track_len = body_h;
-                    let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
-                    let max_scroll = total.saturating_sub(visible_rows) as f64;
-                    let scroll_ratio = if max_scroll > 0.0 {
-                        engine.settings_scroll_top as f64 / max_scroll
-                    } else {
-                        0.0
+                    let q_rect =
+                        quadraui::Rect::new(0.0, body_top as f32, panel_w as f32, body_h as f32);
+                    render::populate_settings_form_controller(&engine);
+                    let event = quadraui::UiEvent::MouseDown {
+                        button: quadraui::MouseButton::Left,
+                        position: quadraui::Point::new(x_click as f32, y_click as f32),
+                        modifiers: Default::default(),
+                        widget: None,
                     };
-                    let thumb_y = body_top + scroll_ratio * (track_len - thumb_len);
-                    let surface = quadraui::ScrollSurface {
-                        id: quadraui::WidgetId::new("gtk:settings"),
-                        bounds: quadraui::Rect::new(
-                            0.0,
-                            body_top as f32,
-                            panel_w as f32,
-                            body_h as f32,
-                        ),
-                        scrollbar: Some(quadraui::SurfaceScrollbar {
-                            axis: quadraui::ScrollAxis::Vertical,
-                            track_bounds: quadraui::Rect::new(
-                                sb_x as f32,
-                                body_top as f32,
-                                sb_w_f as f32,
-                                track_len as f32,
-                            ),
-                            thumb_bounds: quadraui::Rect::new(
-                                (sb_x + 2.0) as f32,
-                                thumb_y as f32,
-                                (sb_w_f - 4.0) as f32,
-                                thumb_len as f32,
-                            ),
-                            total_items: total,
-                            visible_items: visible_rows,
-                            scroll_offset: engine.settings_scroll_top,
-                            inverted: false,
-                        }),
-                    };
-                    let surfaces = [surface];
-                    let modal = self.backend.borrow().modal_stack_handle().borrow().clone();
-                    let mut drag = self.backend.borrow().drag_state_handle().borrow().clone();
-                    let click_events = quadraui::dispatch_click(
-                        &modal,
-                        &surfaces,
-                        &mut drag,
-                        quadraui::Point::new(x_click as f32, y_click as f32),
-                        quadraui::MouseButton::Left,
-                        Default::default(),
-                    );
-                    *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
-                    for ev in &click_events {
-                        if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                            engine.settings_scroll_top = *new_offset;
-                        }
+                    let result = engine
+                        .settings_form_controller
+                        .borrow_mut()
+                        .handle_cached(&event, q_rect);
+                    if matches!(
+                        result,
+                        quadraui::FormControllerEvent::ScrollChanged
+                            | quadraui::FormControllerEvent::Consumed
+                    ) {
+                        let new_offset = engine.settings_form_controller.borrow().scroll_offset();
+                        engine.settings_scroll_top = new_offset;
                     }
                     drop(engine);
                     self.draw_needed.set(true);

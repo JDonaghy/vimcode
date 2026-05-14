@@ -3118,6 +3118,8 @@ pub struct Engine {
     pub settings_selected: usize,
     /// Scroll offset for the settings panel content.
     pub settings_scroll_top: usize,
+    /// Form scroll/scrollbar controller for the settings panel.
+    pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -3710,6 +3712,9 @@ impl Engine {
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
+            settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
+                "settings".to_string(),
+            )),
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,

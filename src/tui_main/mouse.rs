@@ -78,10 +78,6 @@ fn apply_scrollbar_drag(
                 "tui:search_results" => {
                     handled = true;
                 }
-                "tui:settings" => {
-                    engine.settings_scroll_top = *new_offset;
-                    handled = true;
-                }
                 // Inverted scrollbars: top of track = max offset (oldest
                 // content), bottom = 0 (newest). dispatch_mouse_drag
                 // reports the raw forward offset; flip it here.
@@ -920,6 +916,39 @@ pub(super) fn handle_mouse(
             engine.handle_search_sidebar_ui_event(move_ev);
             return sidebar_width;
         }
+        MouseEventKind::Drag(MouseButton::Left)
+            if sidebar.visible
+                && sidebar.active_panel == TuiPanel::Settings
+                && col >= ab_width
+                && col < ab_width + sidebar_width =>
+        {
+            let content_start = 2_u16;
+            let content_height = term_height.saturating_sub(4);
+            let q_rect = quadraui::Rect::new(
+                ab_width as f32,
+                content_start as f32,
+                sidebar_width as f32,
+                content_height as f32,
+            );
+            let move_ev = quadraui::UiEvent::MouseMoved {
+                position: quadraui::Point::new(col as f32, row as f32),
+                buttons: quadraui::ButtonMask {
+                    left: true,
+                    middle: false,
+                    right: false,
+                },
+            };
+            render::populate_settings_form_controller(engine);
+            let result = engine
+                .settings_form_controller
+                .borrow_mut()
+                .handle_cached(&move_ev, q_rect);
+            if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                engine.settings_scroll_top =
+                    engine.settings_form_controller.borrow().scroll_offset();
+            }
+            return sidebar_width;
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
@@ -999,7 +1028,7 @@ pub(super) fn handle_mouse(
             // Widget id routes the resulting `ScrollOffsetChanged` to the
             // matching scroll-state field. Sites covered:
             // - `explorer:sb`, `ext_panel:sb`, `editor_hover` (Stage 5a)
-            // - `tui:search_results`, `tui:settings`, `tui:debug_sidebar:N` (5c)
+            // - `tui:search_results`, `tui:debug_sidebar:N` (5c)
             // - `tui:terminal_scrollback`, `tui:debug_output` (5c, inverted)
             if drag_state.is_active() {
                 let point = quadraui::Point {
@@ -1260,6 +1289,35 @@ pub(super) fn handle_mouse(
                 engine.handle_search_sidebar_ui_event(scroll_ev);
                 return sidebar_width;
             }
+            if sidebar.visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && sidebar.active_panel == TuiPanel::Settings
+            {
+                let content_start = 2_u16;
+                let content_height = term_height.saturating_sub(4);
+                let q_rect = quadraui::Rect::new(
+                    ab_width as f32,
+                    content_start as f32,
+                    sidebar_width as f32,
+                    content_height as f32,
+                );
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                render::populate_settings_form_controller(engine);
+                let result = engine
+                    .settings_form_controller
+                    .borrow_mut()
+                    .handle_cached(&scroll_ev, q_rect);
+                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                    engine.settings_scroll_top =
+                        engine.settings_form_controller.borrow().scroll_offset();
+                }
+                return sidebar_width;
+            }
             // Terminal panel scroll now routes through dispatch_scroll
             // via the registered "tui:terminal_scrollback" surface.
             // Scroll-surface wheel dispatch — routes to registered surfaces.
@@ -1317,19 +1375,6 @@ pub(super) fn handle_mouse(
                                 } else {
                                     engine.ext_panel_scroll_top =
                                         engine.ext_panel_scroll_top.saturating_sub(step);
-                                }
-                                return sidebar_width;
-                            }
-                            "tui:settings" => {
-                                let flat = engine.settings_flat_list();
-                                let content_height = term_height.saturating_sub(4) as usize;
-                                let max_scroll = flat.len().saturating_sub(content_height);
-                                if down {
-                                    engine.settings_scroll_top =
-                                        (engine.settings_scroll_top + step).min(max_scroll);
-                                } else {
-                                    engine.settings_scroll_top =
-                                        engine.settings_scroll_top.saturating_sub(step);
                                 }
                                 return sidebar_width;
                             }
@@ -2068,7 +2113,7 @@ pub(super) fn handle_mouse(
                 }
                 quadraui::UiEvent::MouseDown {
                     widget: Some(id), ..
-                } if matches!(id.as_str(), "explorer:sb" | "ext_panel:sb" | "tui:settings")
+                } if matches!(id.as_str(), "explorer:sb" | "ext_panel:sb")
                     && drag_state.is_active() =>
                 {
                     return sidebar_width;
@@ -2553,7 +2598,33 @@ pub(super) fn handle_mouse(
             engine.settings_has_focus = true;
             let flat_total = engine.settings_flat_list().len();
 
-            if sidebar_row == 0 {
+            // Route scrollbar clicks through FormController.
+            let sb_col = ab_width + sidebar_width - 1;
+            if col == sb_col && sidebar_row >= 2 {
+                let content_start = 2_u16;
+                let content_height = term_height.saturating_sub(4);
+                let q_rect = quadraui::Rect::new(
+                    ab_width as f32,
+                    content_start as f32,
+                    sidebar_width as f32,
+                    content_height as f32,
+                );
+                let click_ev = quadraui::UiEvent::MouseDown {
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: Default::default(),
+                    widget: None,
+                };
+                render::populate_settings_form_controller(engine);
+                let result = engine
+                    .settings_form_controller
+                    .borrow_mut()
+                    .handle_cached(&click_ev, q_rect);
+                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                    engine.settings_scroll_top =
+                        engine.settings_form_controller.borrow().scroll_offset();
+                }
+            } else if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
                 // Search box — activate search input
