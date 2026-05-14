@@ -421,6 +421,48 @@ impl Engine {
         }
     }
 
+    /// Scroll a specific window's viewport and adjust its cursor to stay
+    /// visible, respecting `scrolloff`. Positive `delta` = down.
+    pub fn scroll_viewport_with_cursor_for_window(
+        &mut self,
+        window_id: WindowId,
+        delta: isize,
+        count: usize,
+    ) {
+        if delta > 0 {
+            self.scroll_down_visible_for_window(window_id, count);
+        } else {
+            self.scroll_up_visible_for_window(window_id, count);
+        }
+        let scrolloff = self.settings.scrolloff;
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        let Some(bs) = self.buffer_manager.get(buf_id) else {
+            return;
+        };
+        let lines = bs.buffer.len_lines().saturating_sub(1);
+        let vp = window.view.viewport_lines.max(1);
+        let cur = window.view.cursor.line;
+        let top = window.view.scroll_top;
+        let new_line = if cur < top + scrolloff {
+            Some((top + scrolloff).min(lines))
+        } else if cur >= top + vp.saturating_sub(scrolloff) {
+            Some((top + vp.saturating_sub(scrolloff + 1)).min(lines))
+        } else {
+            None
+        };
+        if let Some(line) = new_line {
+            let max_col = bs.buffer.line_len_chars(line).saturating_sub(1);
+            let window = self.windows.get_mut(&window_id).unwrap();
+            window.view.cursor.line = line;
+            if window.view.cursor.col > max_col {
+                window.view.cursor.col = max_col;
+            }
+        }
+    }
+
     /// Scroll a specific window down by `count` visible lines (fold-aware).
     pub fn scroll_down_visible_for_window(&mut self, window_id: WindowId, count: usize) {
         if let Some(window) = self.windows.get(&window_id) {

@@ -4552,10 +4552,11 @@ impl SimpleComponent for App {
                     if target == active_id {
                         let dir = if delta_y > 0.0 { 1 } else { -1 };
                         engine.scroll_viewport_with_cursor(dir, scroll_count);
-                    } else if delta_y > 0.0 {
-                        engine.scroll_down_visible_for_window(target, scroll_count);
                     } else {
-                        engine.scroll_up_visible_for_window(target, scroll_count);
+                        let dir = if delta_y > 0.0 { 1 } else { -1 };
+                        engine.scroll_viewport_with_cursor_for_window(
+                            target, dir, scroll_count,
+                        );
                     }
                     engine.sync_scroll_binds();
                 }

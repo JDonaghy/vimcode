@@ -1399,11 +1399,10 @@ pub(super) fn handle_mouse(
                                     })
                                 });
                                 if let Some(rw) = target {
-                                    if down {
-                                        engine.scroll_down_visible_for_window(rw.window_id, step);
-                                    } else {
-                                        engine.scroll_up_visible_for_window(rw.window_id, step);
-                                    }
+                                    let dir = if down { 1 } else { -1 };
+                                    engine.scroll_viewport_with_cursor_for_window(
+                                        rw.window_id, dir, step,
+                                    );
                                     engine.sync_scroll_binds();
                                 }
                                 return sidebar_width;
