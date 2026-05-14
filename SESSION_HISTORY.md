@@ -1,7 +1,20 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 369 archived here.
+All sessions through 370 archived here.
+
+---
+**Session 370 (May 14) — #232 fixed: explorer reveal on tab switch + Engine::startup() extraction:**
+
+**#232 — Explorer tree highlights file on tab switch:** Root cause: `explorer_reveal_path` was called from 7 per-backend locations (4 TUI, 3 GTK) but never from the engine. The tab-click path was broken — folder expanded but file not highlighted. Fix: added `explorer_reveal_active_file()` helper in `explorer_ops.rs`, wired into `goto_tab()`, `tab_nav_switch_to()`, `open_file_in_tab()` (3 exit paths), `open_file_preview()` (2 exit paths), `open_file_with_mode()` (2 exit paths), and `restore_session_files()` (both tree and flat paths). Removed 7 redundant backend calls. Also removed TUI-only `explorer_rebuild_rows()` after session restore that was wiping the selection set by the reveal. `explorer_reveal_path` now also expands the root dir (defensive no-op in normal use).
+
+**quadraui#159 — Unfocused tree selection highlight:** Filed and consumed. The quadraui `draw_tree` code gated selection highlight on `tree.has_focus` — when clicking a tab, the explorer doesn't have focus so the selection was invisible. quadraui#159 added dimmed/inactive selection rendering when `!has_focus && selected_path` is set.
+
+**Engine::startup() extraction:** Both TUI and GTK had identical `plugin_init()` + `ext_refresh()` + CLI-or-session-restore sequences (~20 lines each). Extracted into `Engine::startup(file_path: Option<&Path>)`. Each backend now calls one method.
+
+**3 new tests:** `test_goto_tab_reveals_file_in_explorer`, `test_handle_tab_bar_click_reveals_file_in_explorer`, `test_open_file_in_tab_reveals_file_in_explorer`. Tests use `explorer_selected_file()` helper that reads `TreeController.selected_path` directly (avoids needing render-frame population of `TreeController.rows`).
+
+**Files changed:** `explorer_ops.rs` (+7), `mod.rs` (+17), `windows.rs` (+9), `buffers.rs` (+2), `tests.rs` (+79), `gtk/mod.rs` (-55), `tui_main/mod.rs` (-30), `tui_main/mouse.rs` (-7). Net +118/-88.
 
 ---
 **Session 369 (May 13–14) — Bug fixes, platform audit, theme dedup, FormController migration:**

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 14, 2026 (Session 369 — **Bug fixes + platform dedup.** Theme conversion deduped to `render::to_quadraui_theme()` (-123 lines). #292 fixed: F5/F9/F10/F11 work from any panel/mode in both backends via single engine handler. #255 fixed: settings scrollbar via `FormController::render_and_cache()` + `handle_cached()` — zero per-backend scrollbar code. Verified/closed #253, #243, #245. Platform audit found backends well-maintained with minimal dead code.)
+**Last updated:** May 14, 2026 (Session 370 — **#232 fixed: explorer reveal on tab switch + startup dedup.** Moved all `explorer_reveal_path` calls from backends into the engine — `goto_tab`, `tab_nav_switch_to`, `open_file_in_tab`, `open_file_preview`, `open_file_with_mode`, `restore_session_files` all reveal the active file. Removed 7 per-backend reveal calls (4 TUI, 3 GTK). Extracted `Engine::startup()` from duplicated TUI/GTK init sequences. Filed + consumed quadraui#159 for unfocused tree selection highlight.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,9 +12,9 @@
 
 ---
 
-Vimcode at 1960 lib tests passing, 2057 total (lib+integration).
+Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 369 and earlier in **SESSION_HISTORY.md**.
+> Sessions 370 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -119,4 +119,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 367 and earlier in **SESSION_HISTORY.md**.
+> Sessions 370 and earlier in **SESSION_HISTORY.md**.
