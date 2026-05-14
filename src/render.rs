@@ -3601,7 +3601,11 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
         title: quadraui::StyledText::plain(panel.title.clone()),
         // Body is multi-line — join with newlines. Backends split on
         // `\n` when rendering.
-        body: panel.body.iter().map(|l| quadraui::StyledText::plain(l.clone())).collect(),
+        body: panel
+            .body
+            .iter()
+            .map(|l| quadraui::StyledText::plain(l.clone()))
+            .collect(),
         buttons,
         severity: None,
         vertical_buttons: panel.vertical_buttons,

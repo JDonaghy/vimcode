@@ -415,8 +415,7 @@ impl Engine {
             self.view_mut().cursor.line = (new_top + scrolloff).min(lines);
             self.clamp_cursor_col();
         } else if cur >= new_top + vp.saturating_sub(scrolloff) {
-            self.view_mut().cursor.line =
-                (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
+            self.view_mut().cursor.line = (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
             self.clamp_cursor_col();
         }
     }

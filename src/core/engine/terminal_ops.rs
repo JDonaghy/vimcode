@@ -276,6 +276,42 @@ impl Engine {
         }
     }
 
+    /// Execute a terminal toolbar action. Returns `false` for `StartResize`
+    /// (backend-local drag state) and `None`; returns `true` for all other
+    /// actions handled internally.
+    pub fn execute_terminal_toolbar_action(
+        &mut self,
+        action: TerminalToolbarAction,
+        ctx: UiEventContext,
+    ) -> bool {
+        match action {
+            TerminalToolbarAction::SwitchTab(idx) => self.terminal_switch_tab(idx),
+            TerminalToolbarAction::CloseTab => self.terminal_close_active_tab(),
+            TerminalToolbarAction::ToggleMaximize => {
+                self.toggle_terminal_maximize();
+                let effective = self.effective_terminal_panel_rows(ctx.terminal_max_rows);
+                if self.terminal_panes.is_empty() {
+                    self.terminal_new_tab(ctx.terminal_cols, effective);
+                } else {
+                    self.terminal_resize(ctx.terminal_cols, effective);
+                }
+            }
+            TerminalToolbarAction::ToggleSplit => {
+                let rows = self.session.terminal_panel_rows;
+                self.terminal_toggle_split(ctx.terminal_cols, rows);
+            }
+            TerminalToolbarAction::AddTab => {
+                let rows = self.session.terminal_panel_rows;
+                self.terminal_new_tab(ctx.terminal_cols, rows);
+            }
+            TerminalToolbarAction::CloseFindBar => {
+                self.terminal_find_active = false;
+            }
+            TerminalToolbarAction::StartResize | TerminalToolbarAction::None => return false,
+        }
+        true
+    }
+
     /// Toggle "terminal maximized" state.
     ///
     /// This only flips `terminal_maximized`; the stored user-preferred panel
