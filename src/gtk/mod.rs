@@ -450,13 +450,6 @@ struct App {
     css_provider: gtk4::CssProvider,
     /// Colorscheme name at the time the CSS was last applied.
     last_colorscheme: String,
-    /// Save-revision of `settings.json` at the last GIO file-watcher event.
-    /// Compared against `core::settings::save_revision()` to tell self-saves
-    /// (SettingChanged from the panel, `:set` from the command line, anything
-    /// that calls `Settings::save`) apart from external edits. Self-saves
-    /// refresh the cached revision silently; external edits trigger reload +
-    /// the "Settings reloaded from disk" message.
-    settings_save_revision: u64,
     /// Active context-menu popover (explorer or tab). Kept alive so we can
     /// unparent it before creating a new one (avoids GTK CSS node assertions).
     active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
@@ -2167,7 +2160,6 @@ impl SimpleComponent for App {
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
-            settings_save_revision: core::settings::save_revision(),
             active_ctx_popover: active_ctx_popover_ref.clone(),
             backend: backend.clone(),
         };
@@ -4630,28 +4622,7 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SettingsFileChanged => {
-                // If the save revision advanced since our last check, the
-                // file change came from us (SettingChanged, `:set`, etc.) —
-                // we already have the correct in-memory state. Refresh the
-                // cached revision and skip the reload + message.
-                let cur_rev = core::settings::save_revision();
-                if cur_rev != self.settings_save_revision {
-                    self.settings_save_revision = cur_rev;
-                    return;
-                }
-
-                // External edit: reload from disk.
-                // Use load_with_validation (not load) to avoid writing back to the file,
-                // which would trigger the watcher again and cause an infinite reload loop.
-                // Silently ignore errors — the file may be mid-write.
-                if let Ok(new_settings) = core::settings::Settings::load_with_validation() {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.settings = new_settings;
-                    engine.ensure_spell_checker();
-                    engine.message = "Settings reloaded from disk".to_string();
-                    drop(engine);
-
-                    // Force redraw to apply new font/line number settings
+                if self.engine.borrow_mut().check_settings_reload() {
                     if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
                         drawing_area.queue_draw();
                     }
@@ -7170,13 +7141,12 @@ impl App {
                         .engine
                         .borrow_mut()
                         .execute_terminal_toolbar_action(action, ctx)
-                    {
-                        if matches!(
+                        && matches!(
                             action,
                             crate::core::engine::TerminalToolbarAction::StartResize
-                        ) {
-                            self.terminal_resize_dragging = true;
-                        }
+                        )
+                    {
+                        self.terminal_resize_dragging = true;
                     }
                 }
                 self.draw_needed.set(true);
