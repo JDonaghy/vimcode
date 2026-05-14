@@ -2381,6 +2381,10 @@ pub struct Engine {
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
     pub settings: Settings,
+    /// mtime of settings.json at last check — poll-based reload detection.
+    settings_mtime: Option<std::time::SystemTime>,
+    /// save_revision at last check — distinguishes self-saves from external edits.
+    settings_save_revision: u64,
 
     // --- Session state (history, window geometry, etc.) ---
     /// Session state persisted across restarts
@@ -3399,6 +3403,13 @@ impl Engine {
                 Settings::ensure_exists().ok();
                 Settings::load()
             },
+            settings_mtime: {
+                let path = Settings::settings_file_path();
+                std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+            },
+            settings_save_revision: crate::core::settings::save_revision(),
             session: SessionState::load(),
             history: HistoryState::load(),
             command_history_index: None,
@@ -4107,6 +4118,35 @@ impl Engine {
                     self.terminal_resize(ctx.terminal_cols, effective);
                 }
             }
+        }
+    }
+
+    /// Poll settings.json for changes and reload if modified externally.
+    /// Returns `true` if settings were reloaded (caller should redraw).
+    /// Self-saves (`:set`, settings panel) are detected via save_revision
+    /// and skipped.
+    pub fn check_settings_reload(&mut self) -> bool {
+        let path = Settings::settings_file_path();
+        let mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if mtime.is_none() || mtime == self.settings_mtime {
+            return false;
+        }
+        self.settings_mtime = mtime;
+        let cur_rev = crate::core::settings::save_revision();
+        let is_self_save = cur_rev != self.settings_save_revision;
+        self.settings_save_revision = cur_rev;
+        if is_self_save {
+            return false;
+        }
+        if let Ok(new_settings) = Settings::load_with_validation() {
+            self.settings = new_settings;
+            self.ensure_spell_checker();
+            self.message = "Settings reloaded".to_string();
+            true
+        } else {
+            false
         }
     }
 

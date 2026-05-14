@@ -2176,13 +2176,13 @@ pub(super) fn handle_mouse(
                     terminal_cols: terminal_size.map(|s| s.width).unwrap_or(80),
                     terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
                 };
-                if !engine.execute_terminal_toolbar_action(action, ctx) {
-                    if matches!(
+                if !engine.execute_terminal_toolbar_action(action, ctx)
+                    && matches!(
                         action,
                         crate::core::engine::TerminalToolbarAction::StartResize
-                    ) {
-                        *dragging_terminal_resize = true;
-                    }
+                    )
+                {
+                    *dragging_terminal_resize = true;
                 }
             } else {
                 // Content row — focus split pane or start divider drag.

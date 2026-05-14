@@ -13,7 +13,6 @@
     clippy::explicit_counter_loop
 )]
 
-use std::fs;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1127,14 +1126,6 @@ fn event_loop(
         .unwrap_or_else(Instant::now);
     // Auto-refresh sidebar to reflect external filesystem changes.
     let mut last_sidebar_refresh = Instant::now();
-    // mtime of settings.json at last check — used to auto-reload when user edits the file.
-    let mut settings_mtime: Option<std::time::SystemTime> = {
-        let path = crate::core::settings::Settings::settings_file_path();
-        fs::metadata(&path).ok().and_then(|m| m.modified().ok())
-    };
-    // Save-revision at last check — distinguishes self-saves (e.g. :set) from
-    // external edits, so the watcher doesn't overwrite :set's result message.
-    let mut settings_save_revision: u64 = crate::core::settings::save_revision();
     // Deadline to clear the yank highlight flash.
     let mut yank_hl_deadline: Option<Instant> = None;
     // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
@@ -1452,30 +1443,8 @@ fn event_loop(
                 last_sidebar_refresh = Instant::now();
                 needs_redraw = true;
             }
-            // Auto-reload settings.json when its mtime changes.
-            {
-                let path = crate::core::settings::Settings::settings_file_path();
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mtime) = meta.modified() {
-                        let mtime_changed = settings_mtime != Some(mtime);
-                        if mtime_changed {
-                            settings_mtime = Some(mtime);
-                            let cur_rev = crate::core::settings::save_revision();
-                            let self_save = cur_rev != settings_save_revision;
-                            settings_save_revision = cur_rev;
-                            if !self_save {
-                                if let Ok(new_settings) =
-                                    crate::core::settings::Settings::load_with_validation()
-                                {
-                                    engine.settings = new_settings;
-                                    engine.ensure_spell_checker();
-                                    engine.message = "Settings reloaded".to_string();
-                                    needs_redraw = true;
-                                }
-                            }
-                        }
-                    }
-                }
+            if engine.check_settings_reload() {
+                needs_redraw = true;
             }
             // Run pending terminal commands (needs backend-supplied terminal size).
             if let Some(cmd) = engine.pending_terminal_command.take() {
