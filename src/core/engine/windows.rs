@@ -1478,6 +1478,7 @@ impl Engine {
                 self.tab_mru_touch(); // update MRU but skip nav push (navigating=true)
                 self.lsp_ensure_active_buffer();
                 self.ensure_active_tab_visible();
+                self.explorer_reveal_active_file();
                 self.tab_nav_navigating = false;
                 return;
             }
@@ -1698,6 +1699,7 @@ impl Engine {
             self.tab_nav_push();
             self.lsp_ensure_active_buffer();
             self.ensure_active_tab_visible();
+            self.explorer_reveal_active_file();
         }
     }
 
@@ -2206,6 +2208,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2229,6 +2232,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2257,6 +2261,7 @@ impl Engine {
             self.message = format!("\"{}\"", path.display());
         }
         self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
 
         // Swap file check: detect stale swaps and offer recovery.
         self.swap_check_on_open(buffer_id);
@@ -2301,6 +2306,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2359,6 +2365,7 @@ impl Engine {
         self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
         self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
     }
 
     // =======================================================================

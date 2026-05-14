@@ -66,9 +66,16 @@ impl Engine {
         self.explorer_rebuild_rows();
     }
 
+    pub fn explorer_reveal_active_file(&mut self) {
+        if let Some(path) = self.file_path().cloned() {
+            self.explorer_reveal_path(&path);
+        }
+    }
+
     pub fn explorer_reveal_path(&mut self, target: &Path) {
         let root = self.cwd.clone();
         if let Ok(rel) = target.strip_prefix(&root) {
+            self.explorer_expanded.insert(root.clone());
             let mut accum = root.clone();
             for component in rel.parent().into_iter().flat_map(|p| p.components()) {
                 accum.push(component);

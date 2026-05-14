@@ -2966,6 +2966,7 @@ impl Engine {
             }
             self.switch_window_buffer(buffer_id);
             self.message = format!("\"{}\"", path.display());
+            self.explorer_reveal_path(path);
             return Ok(());
         }
 
@@ -3002,6 +3003,7 @@ impl Engine {
         self.lsp_did_open(buffer_id);
         // Watch the file for external changes
         self.watch_file(path);
+        self.explorer_reveal_path(path);
         Ok(())
     }
 }

@@ -1163,11 +1163,6 @@ fn event_loop(
     // Timestamp of the last Alt+t press (for tab switcher auto-confirm on timeout).
     let mut tab_switcher_last_cycle: Option<Instant> = None;
 
-    // Reveal the active file in the explorer sidebar at startup (session restore).
-    if let Some(path) = engine.file_path().cloned() {
-        engine.explorer_reveal_path(&path);
-    }
-
     loop {
         // Refresh theme in case :colorscheme was run.
         theme = Theme::from_name(&engine.settings.colorscheme);
@@ -3296,7 +3291,6 @@ fn event_loop(
                         }
                     }
 
-                    let prev_tab = engine.active_group().active_tab;
                     if !paste_intercepted {
                         debug_log!(
                             "handle_key: key_name={:?} unicode={:?} ctrl={} groups={} active_group={:?}",
@@ -3458,11 +3452,6 @@ fn event_loop(
                     if engine.yank_highlight.is_some() {
                         yank_hl_deadline = Some(Instant::now() + Duration::from_millis(200));
                         needs_redraw = true;
-                    }
-                    if engine.active_group().active_tab != prev_tab {
-                        if let Some(path) = engine.file_path().cloned() {
-                            engine.explorer_reveal_path(&path);
-                        }
                     }
                     // Adjust quickfix scroll to keep selected item visible
                     if engine.quickfix_open {

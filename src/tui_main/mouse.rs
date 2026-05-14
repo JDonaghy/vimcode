@@ -2747,9 +2747,6 @@ pub(super) fn handle_mouse(
                                 *close_tab_confirm_focus = 0;
                             }
                             *tab_drag_start = Some((col, row));
-                            if let Some(path) = engine.file_path().cloned() {
-                                engine.explorer_reveal_path(&path);
-                            }
                         }
                         TabBarClickTarget::CloseTab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
@@ -2810,10 +2807,6 @@ pub(super) fn handle_mouse(
                     if i < engine.active_group().tabs.len() {
                         engine.goto_tab(i);
                         *tab_drag_start = Some((col, row));
-                        engine.lsp_ensure_active_buffer();
-                        if let Some(path) = engine.file_path().cloned() {
-                            engine.explorer_reveal_path(&path);
-                        }
                     }
                 }
                 quadraui::TabBarHit::TabClose(i) => {

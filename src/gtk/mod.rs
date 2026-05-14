@@ -5092,7 +5092,6 @@ impl App {
                 match engine.open_file_with_mode(&path, OpenMode::Permanent) {
                     Ok(()) => {
                         drop(engine);
-                        self.reveal_path_in_explorer(&path);
                         if let Some(ref drawing) = *self.drawing_area.borrow() {
                             drawing.grab_focus();
                         }
@@ -5742,16 +5741,15 @@ impl App {
             }
         }
 
-        let (action, prev_tab) = {
+        let action = {
             let mut engine = self.engine.borrow_mut();
-            let prev = engine.active_group().active_tab;
             let a = engine.handle_key(&key_name, unicode, ctrl);
             // After any key press in insert mode, reset the AI completion
             // debounce timer so a new suggestion fires after idle.
             if engine.mode == crate::core::Mode::Insert && engine.settings.ai_completions {
                 engine.ai_completion_reset_timer();
             }
-            (a, prev)
+            a
         };
 
         self.dispatch_engine_action(action, sender, false);
@@ -5768,18 +5766,6 @@ impl App {
 
             if !has_more {
                 break;
-            }
-        }
-
-        // Reveal the active file in the sidebar when tab changed (gt/gT/:tabn/:tabp)
-        {
-            let engine = self.engine.borrow();
-            if engine.active_group().active_tab != prev_tab {
-                let file_path = engine.file_path().cloned();
-                drop(engine);
-                if let Some(path) = file_path {
-                    self.reveal_path_in_explorer(&path);
-                }
             }
         }
 
@@ -7289,9 +7275,6 @@ impl App {
                 }
             }
 
-            // Snapshot the active file path before processing the click so we
-            // can detect tab switches (and only then highlight in the tree).
-            let file_before_click = self.engine.borrow().file_path().cloned();
             // Clicking in the editor clears every sidebar's keyboard focus.
             // Without this, focus stays on whichever sidebar grabbed it last
             // (Source Control, Extensions, Settings, AI, DAP, …) and the
@@ -7668,14 +7651,7 @@ impl App {
                                 // Tab bar / split button click — skip hooks.
                                 // Record drag start position for tab drag-and-drop.
                                 self.tab_drag_start = Some((x, y));
-                                // Defer sidebar tree highlight so tab switch renders instantly.
-                                let new_file_path = engine.file_path().cloned();
                                 drop(engine);
-                                if new_file_path != file_before_click {
-                                    if let Some(path) = new_file_path {
-                                        self.reveal_path_in_explorer(&path);
-                                    }
-                                }
                                 self.draw_needed.set(true);
                                 return;
                             }
@@ -7685,17 +7661,7 @@ impl App {
                     // Fire cursor_move hook so plugins (e.g. git-insights blame)
                     // see the new cursor position after a mouse click.
                     engine.fire_cursor_move_hook();
-
-                    // Reveal the active file in the sidebar tree only when the
-                    // active file actually changed (e.g. tab click), NOT on every
-                    // editor click.
-                    let new_file_path = engine.file_path().cloned();
                     drop(engine);
-                    if new_file_path != file_before_click {
-                        if let Some(path) = new_file_path {
-                            self.reveal_path_in_explorer(&path);
-                        }
-                    }
                     self.draw_needed.set(true);
                 }
             }
@@ -10110,7 +10076,6 @@ impl App {
                     engine.open_file_in_tab(&path);
                     engine.explorer_has_focus = false;
                 }
-                self.reveal_path_in_explorer(&path);
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }
@@ -10133,7 +10098,6 @@ impl App {
                 // Single-click: open as a preview tab (replaceable by next single-click).
                 engine.open_file_preview(&path);
                 drop(engine);
-                self.reveal_path_in_explorer(&path);
                 if let Some(ref drawing) = *self.drawing_area.borrow() {
                     drawing.grab_focus();
                 }

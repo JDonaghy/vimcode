@@ -26496,6 +26496,85 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
     assert_eq!(engine.active_group().tabs.len(), 2);
 }
 
+// --- Explorer reveal on tab switch (#232) ---
+
+fn explorer_selected_file(engine: &Engine) -> Option<std::path::PathBuf> {
+    let tree = engine.explorer_tree.borrow();
+    let path = tree.selected_path()?;
+    let idx = path[0] as usize;
+    engine.explorer_rows.get(idx).map(|r| r.path.clone())
+}
+
+#[test]
+fn test_goto_tab_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_goto_tab_reveal");
+    let sub = dir.join("subdir");
+    let _ = std::fs::create_dir_all(&sub);
+    let file_a = dir.join("a.txt");
+    let file_b = sub.join("b.txt");
+    std::fs::write(&file_a, "aaa").unwrap();
+    std::fs::write(&file_b, "bbb").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file_a);
+    engine.open_file_in_tab(&file_b);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    engine.goto_tab(1);
+    assert_eq!(explorer_selected_file(&engine), Some(file_a.clone()));
+
+    engine.goto_tab(2);
+    assert!(engine.explorer_expanded.contains(&sub));
+    assert_eq!(explorer_selected_file(&engine), Some(file_b.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_handle_tab_bar_click_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_tab_bar_click_reveal");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+    std::fs::write(&file_a, "aaa").unwrap();
+    std::fs::write(&file_b, "bbb").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file_a);
+    engine.open_file_in_tab(&file_b);
+
+    let group_id = engine.active_group;
+    engine.handle_tab_bar_click(group_id, TabBarClickTarget::Tab(1));
+    assert_eq!(explorer_selected_file(&engine), Some(file_a.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_open_file_in_tab_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_open_file_reveal");
+    let sub = dir.join("deep");
+    let _ = std::fs::create_dir_all(&sub);
+    let file = sub.join("nested.txt");
+    std::fs::write(&file, "content").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file);
+    assert!(engine.explorer_expanded.contains(&sub));
+    assert_eq!(explorer_selected_file(&engine), Some(file.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- Ctrl-]: tag jump (LSP go-to-definition) ---
 
 #[test]
