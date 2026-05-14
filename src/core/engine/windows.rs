@@ -2532,6 +2532,7 @@ impl Engine {
         // New tree format takes priority if present.
         if let Some(ref tree_layout) = ws_session.group_layout {
             self.restore_session_from_tree(tree_layout, &ws_session.active_file);
+            self.explorer_reveal_active_file();
             return;
         }
 
@@ -2658,6 +2659,7 @@ impl Engine {
 
         // Check all restored buffers for stale swap files.
         self.swap_check_all_buffers();
+        self.explorer_reveal_active_file();
     }
 
     /// Restore session from the recursive tree format.
