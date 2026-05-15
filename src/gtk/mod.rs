@@ -8869,17 +8869,7 @@ impl App {
                     let margin = 4.0;
                     let btn_w = da_w - margin * 2.0;
                     let rel_x = mx - margin;
-                    if rel_x < 0.0 || rel_x >= btn_w {
-                        engine.sc_button_hovered = None;
-                    } else {
-                        let commit_w = btn_w / 2.0;
-                        engine.sc_button_hovered = Some(if rel_x < commit_w {
-                            0
-                        } else {
-                            let icon_w = (btn_w - commit_w) / 3.0;
-                            ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
-                        });
-                    }
+                    engine.sc_button_hovered = Engine::sc_button_hit_test(rel_x, btn_w);
                 } else {
                     engine.sc_button_hovered = None;
                 }
