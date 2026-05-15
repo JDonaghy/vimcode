@@ -1,11 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
-assertion_line: 4362
+assertion_line: 1937
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜  1: [No Name] ×                                  󰤲   ⋯
- 
-   buffer content
+ 󰍜   1: [No Name] ×                                 󰤲   ⋯
+▎
+    buffer content
  
  
  
@@ -13,5 +13,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-    COMMAND  [No Name]    󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
-  :set
+     COMMAND  [No Name]  issue-385-appshell-sid Ln 1, Col 1
+   :set

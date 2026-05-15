@@ -1,11 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
-assertion_line: 4340
+assertion_line: 1915
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜  1: [No Name] ×                                  󰤲   ⋯
- 
-   hello world
+ 󰍜   1: [No Name] ×                                 󰤲   ⋯
+▎
+    hello world
  
  
  
@@ -13,5 +13,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-    INSERT  [No Name]     󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
+     INSERT  [No Name]  issue-385-appshell-side Ln 1, Col 1
  

@@ -98,7 +98,6 @@ pub(super) fn draw_context_menu(
 ) -> Vec<(f64, f64, f64, f64, quadraui::WidgetId)> {
     quadraui::gtk::draw_context_menu(cr, layout, menu, menu_layout, line_height, &q_theme(theme))
 }
-
 /// Visible width of the rich-text-popup scrollbar in pixels. Wider
 /// than the layout's 1px border so the bar is paint+click-friendly.
 /// Shared with `draw_editor_hover_popup` so paint and hit-test

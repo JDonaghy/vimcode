@@ -1,17 +1,17 @@
 ---
 source: src/tui_main/render_impl.rs
-assertion_line: 4332
+assertion_line: 1907
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜  1: [No Name] ×                                  󰤲   ⋯
- 
-  -fn main() {
-   │   println!("hello");
-   }
+ 󰍜   1: [No Name] ×                                 󰤲   ⋯
+▎
+   -fn main() {
+    │   println!("hello");
+    }
  
  
 
 
 
-    NORMAL  [No Name]     󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
+     NORMAL  [No Name]  issue-385-appshell-side Ln 1, Col 1
  

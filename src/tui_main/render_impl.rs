@@ -6,7 +6,7 @@ pub(super) fn build_screen_for_tui(
     engine: &Engine,
     theme: &Theme,
     area: Rect,
-    sidebar: &TuiSidebar,
+    _sidebar: &TuiSidebar,
     sidebar_width: u16,
 ) -> render::ScreenLayout {
     // Global bottom rows: status(1) + cmd(1).  The tab bar row is included in
@@ -41,12 +41,9 @@ pub(super) fn build_screen_for_tui(
             + wildmenu_height
             + separated_status_rows,
     ); // cmd(1) + optional status(1) + panels + separated status
-    let sidebar_cols = if sidebar.visible {
-        sidebar_width + 1
-    } else {
-        0
-    }; // +1 sep
-    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+    let sv = engine.app_shell.sidebar_visible();
+    let sidebar_cols = if sv { sidebar_width + 1 } else { 0 }; // +1 sep
+    let ab_width = if engine.settings.autohide_panels && !sv {
         0
     } else {
         ACTIVITY_BAR_WIDTH
@@ -131,12 +128,13 @@ pub(super) fn draw_frame(
 
     // ── Horizontal split: [activity_bar] [sidebar?] [editor_col] ─
     // Activity bar and sidebar span full height (like GTK layout).
-    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+    let sv2 = engine.app_shell.sidebar_visible();
+    let ab_width = if engine.settings.autohide_panels && !sv2 {
         0
     } else {
         ACTIVITY_BAR_WIDTH
     };
-    let sidebar_constraint = if sidebar.visible {
+    let sidebar_constraint = if sv2 {
         Constraint::Length(sidebar_width + 1) // +1 for separator
     } else {
         Constraint::Length(0)
@@ -258,7 +256,7 @@ pub(super) fn draw_frame(
     );
 
     // ── Render sidebar + separator ────────────────────────────────────────────
-    if sidebar.visible && sidebar_sep_area.width > 1 {
+    if engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1 {
         let sidebar_area = Rect {
             x: sidebar_sep_area.x,
             y: sidebar_sep_area.y,
@@ -821,9 +819,9 @@ pub(super) fn draw_frame(
     // ── Panel hover popup (drawn after editor so it's not overwritten) ─────
     hover_link_rects_out.clear();
     *hover_popup_rect_out = None;
-    if sidebar.visible && sidebar_sep_area.width > 1 {
+    if engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1 {
         let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
-        if sidebar.ext_panel_name.is_some() || sidebar.active_panel == TuiPanel::Git {
+        if sidebar.ext_panel_name.is_some() || engine.active_panel_is(PANEL_GIT) {
             let (rects, popup_rect) = render_panel_hover_popup(
                 frame,
                 screen,
@@ -1671,15 +1669,7 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = crate::render::Theme::onedark();
-        let mut sidebar = TuiSidebar {
-            visible: false,
-            has_focus: false,
-            active_panel: TuiPanel::Explorer,
-            toolbar_focused: false,
-            toolbar_selected: 0,
-            pending_ctrl_w: false,
-            ext_panel_name: None,
-        };
+        let mut sidebar = TuiSidebar::new();
         let sidebar_width = 0u16;
         let area = Rect {
             x: 0,

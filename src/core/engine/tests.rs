@@ -18583,8 +18583,10 @@ fn test_status_action_toggle_menu_bar() {
 #[test]
 fn test_status_action_toggle_sidebar_returns_engine_action() {
     let mut e = Engine::new();
+    let was_visible = e.app_shell.sidebar_visible();
     let result = e.handle_status_action(&StatusAction::ToggleSidebar);
-    assert_eq!(result, Some(EngineAction::ToggleSidebar));
+    assert_eq!(result, None);
+    assert_ne!(e.app_shell.sidebar_visible(), was_visible);
 }
 
 #[test]

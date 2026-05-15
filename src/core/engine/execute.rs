@@ -1991,7 +1991,10 @@ impl Engine {
                 self.find_replace_show_replace = true;
                 EngineAction::None
             }
-            "sidebar" => EngineAction::ToggleSidebar,
+            "sidebar" => {
+                self.toggle_sidebar();
+                EngineAction::None
+            }
             "zoomin" => {
                 self.settings.font_size = (self.settings.font_size + 1).min(72);
                 let _ = self.settings.save();
@@ -3287,7 +3290,7 @@ impl Engine {
                 let _ = self.execute_command("LspInfo");
             }
             StatusAction::ToggleSidebar => {
-                return Some(EngineAction::ToggleSidebar);
+                self.toggle_sidebar();
             }
             StatusAction::TogglePanel => {
                 if self.terminal_panes.is_empty() {
