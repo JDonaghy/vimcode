@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 14, 2026 (Session 373 — **Backend dedup batch: 7 issues addressed, ~580 lines removed.** Landed #383 `execute_terminal_toolbar_action`, #376 `check_settings_reload`, #375 `route_paste`, #377 `handle_quit_confirm`+`handle_close_tab_confirm`, #388 SC button hover dedup, #387 `find_window_at`+`window_zone_hit_test` for TUI mouse. Closed #379 as N/A (GTK context menu keys dead code). Filed #395 (migrate GTK native popovers to quadraui ContextMenu). TUI quit/close-tab confirms migrated to engine dialog system. Added `show_quit_confirm()`/`show_close_tab_confirm()`, `route_paste()`, `check_settings_reload()`, `execute_terminal_toolbar_action()`, `find_window_at()`, `resolve_text_position()`.)
+**Last updated:** May 15, 2026 (Session 374 — **Picker dedup: 3 PRs, ~520 lines removed.** Fixed #391 picker scroll `visible_rows` hardcoded to 20. Extracted `PickerGeometry` + `PickerSizing` into `render.rs` (#401) — single source of truth for popup bounds across 5 call sites. Migrated ALL pickers (file/symbol/command) from legacy per-backend renderers to `quadraui::Palette` (#402) — `picker_panel_to_palette()` now handles preview panes + tree items. Fixed scrollbar mouse handlers: column alignment with rasteriser, `effective_offset` clamping, f32→u16 rounding (`.round()` vs truncation), thumb-drag vs track-paging, GTK RefCell double-borrow crash. Filed quadraui#177 (TUI cursor color), quadraui#178 (PaletteLayout scrollbar — closed), quadraui#180 (GTK scrollbar width). `#390` root-caused to quadraui TUI rasteriser.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 373 and earlier in **SESSION_HISTORY.md**.
+> Sessions 374 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -64,7 +64,7 @@ cell coalescence) remain but are tracked separately.
 | Tree view (explorer + SC) | `TreeView` | ✅ | ✅ | layout via `TreeViewLayout` |
 | List view (quickfix + tab switcher) | `ListView` | ✅ | ✅ | layout via `ListViewLayout` |
 | Form (settings) | `Form` | ✅ | ✅ | hint field exists but unrendered (#202) |
-| Palette (cmd palette + folder picker) | `Palette` | ✅ | ✅ | layout via `PaletteLayout` |
+| Palette (all pickers: file/symbol/cmd/branch) | `Palette` | ✅ | ✅ | #402: all pickers route through `picker_panel_to_palette()` → `quadraui::Palette`. Preview panes + tree items. `PaletteLayout` for hit-test. `PickerGeometry` for popup bounds. |
 | Find/replace overlay | shared hit-regions | ✅ | ✅ | engine-side `compute_find_replace_hit_regions` |
 | Terminal cells + scrollbar + split | `Terminal` + `TerminalSplitLayout` | ✅ | ✅ | #353. `build_terminal_draw_data()` shared; both call `Backend::draw_terminal`. Themed scrollbar via `TerminalScrollbar { inverted: true }`. |
 | LSP hover popup (simple) | `Tooltip` | ✅ | ✅ | slice 1, `e1e76cd` |
@@ -105,6 +105,7 @@ cell coalescence) remain but are tracked separately.
 - `render::build_tab_drop_groups()` + `compute_tab_drop_zone()` + `compute_tab_drop_overlay()` — tab drag-and-drop drop-zone computation (delegates to `quadraui::compute_drop_zone()`) and overlay geometry (highlight rect, insertion bar, ghost position). Both backends build a `tab_slots_map` (backend-specific measurement) and `DropGroupBounds`, then call shared functions. Zero per-backend drop-zone algorithm code (#345).
 - `render::screen_zone_hit_test()` + `window_zone_hit_test()` + `resolve_gutter_action()` — screen-level click zone detection (tab bar, window, breadcrumb, divider), window sub-zone detection (gutter, status bar, scrollbar, text area), and gutter action resolution. GTK caches `ScreenLayout` from paint; both backends call shared functions for zone detection. Tab bar inner slot resolution (Pango vs char-cell) stays per-backend (#344).
 - `render::build_tab_bar_primitive()` + `breadcrumbs_to_quadraui_status_bar()` — tab bar and breadcrumb bar primitives pre-built in `ScreenLayout` (#347). Both backends draw directly from `GroupTabBar.bar` / `BreadcrumbBar.bar` / `ScreenLayout.tab_bar_primitive`. Zero per-backend adapter construction or `show_split` logic.
+- `render::picker_panel_to_palette()` + `PickerGeometry` — ALL picker types (file/symbol/command/branch, with/without preview, flat/tree) route through one adapter to `quadraui::Palette`. `PickerGeometry::compute()` + `PickerSizing` constants give a single source of truth for popup bounds. Zero per-backend picker rendering code (#402).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
@@ -119,4 +120,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 373 and earlier in **SESSION_HISTORY.md**.
+> Sessions 374 and earlier in **SESSION_HISTORY.md**.

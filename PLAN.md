@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-14 (Session 369 — Bug fixes + platform dedup. Theme dedup (-123 lines). #292 F-key routing (PR #371). #255 settings FormController (PR #372). Verified/closed #253, #243, #245. Now working through non-milestone bug backlog.)
+> **Last updated:** 2026-05-15 (Session 374 — Picker dedup complete. All pickers migrated to quadraui Palette. PickerGeometry extraction. ~520 lines removed.)
 
 ---
 

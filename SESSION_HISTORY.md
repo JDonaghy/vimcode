@@ -1,7 +1,29 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 373 archived here.
+All sessions through 374 archived here.
+
+---
+**Session 374 (May 15) — Picker dedup: 3 PRs, ~520 lines removed:**
+
+**Landed PRs:**
+- #400: Fix picker scroll `visible_rows` hardcoded to 20 (#391) — `engine.picker_scroll(3, 20)` replaced with actual computed `visible_rows` from terminal geometry in both ScrollDown and ScrollUp handlers.
+- #403: Extract `PickerGeometry` + `PickerSizing` into `render.rs` (#401) — single source of truth for picker popup bounds (sizing, centering, visible_rows, left pane split). Both backends + all mouse handlers call `PickerGeometry::compute()` with backend-specific `PickerSizing` constants. Eliminates the class of bug where one of 5 geometry copies drifts out of sync.
+- #404: Migrate ALL pickers to `quadraui::Palette` (#402) — `picker_panel_to_palette()` now handles preview panes + tree items (was returning `None` for these). Removes ~520 lines of legacy per-backend rendering (title/query rows, item prefix, match highlighting, scrollbar, preview pane) from `render_impl.rs` and `draw.rs`. Fixed scrollbar mouse handlers: column alignment (`list_w - 1` not `popup_w - 2`), `effective_offset` clamping (matches rasteriser's selection-anchored scroll), f32→u16 rounding (`.round()` not truncation), thumb-drag vs track-page-scroll separation, GTK RefCell double-borrow crash (drag handler called `compute_picker_popup_bounds` while engine mutably borrowed).
+
+**Filed:**
+- quadraui#177: TUI cursor color — block cursor uses fg/bg swap instead of `theme.cursor` (#390 root cause)
+- quadraui#178: `PaletteLayout` scrollbar hit-region geometry (closed — landed by quadraui agent)
+- quadraui#180: GTK palette scrollbar too narrow (6px)
+- vimcode#401: `PickerGeometry` extraction (closed)
+- vimcode#402: Full picker migration to Palette primitive (closed)
+
+**Key architectural changes:**
+- `render::PickerGeometry` struct + `PickerSizing` config — replaces 5 independent geometry computations
+- `render::TUI_PICKER_SIZING` / `render::gtk_picker_sizing(line_height)` — backend-specific constants
+- `picker_panel_to_palette()` signature changed: `Option<Palette>` → `Palette` (always succeeds)
+- `PalettePreview` conversion: `Vec<(usize, String, bool)>` → `PalettePreview { lines, scroll_offset, highlight_line }`
+- TUI/GTK `render_picker_popup` / `draw_picker_popup` collapsed to thin geometry + `draw_palette` delegation
 
 ---
 **Session 373 (May 14) — Backend dedup batch: 7 issues addressed, ~580 lines removed:**
