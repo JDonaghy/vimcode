@@ -1588,14 +1588,8 @@ pub(super) fn handle_mouse(
             let btn_row = 1 + commit_rows + 1; // header + commit + pad_above
             if sidebar_row == btn_row {
                 let rel_col = col.saturating_sub(ab_width);
-                let commit_w = sidebar_width / 2;
-                let btn_idx = if rel_col < commit_w {
-                    0
-                } else {
-                    let icon_w = (sidebar_width - commit_w) / 3;
-                    (1 + ((rel_col - commit_w) / icon_w.max(1))).min(3) as usize
-                };
-                engine.sc_button_hovered = Some(btn_idx);
+                engine.sc_button_hovered =
+                    Engine::sc_button_hit_test(rel_col as f64, sidebar_width as f64);
             } else {
                 engine.sc_button_hovered = None;
                 // SC item hover dwell tracking (sections area).
