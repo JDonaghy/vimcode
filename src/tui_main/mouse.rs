@@ -965,31 +965,26 @@ pub(super) fn handle_mouse(
                 if let Some(layout) = last_layout {
                     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                     let editor_row = row.saturating_sub(menu_rows);
-                    for rw in &layout.windows {
-                        let wx = rw.rect.x as u16;
-                        let wy = rw.rect.y as u16;
-                        let ww = rw.rect.width as u16;
-                        let wh = rw.rect.height as u16;
-                        let gutter = rw.gutter_char_width as u16;
-                        let rel_col = col - editor_left;
-                        if rel_col >= wx
-                            && rel_col < wx + ww
-                            && editor_row >= wy
-                            && editor_row < wy + wh
+                    let rel_col = col - editor_left;
+                    if let Some(idx) =
+                        render::find_window_at(layout, rel_col as f64, editor_row as f64)
+                    {
+                        let rw = &layout.windows[idx];
+                        let zone = render::window_zone_hit_test(
+                            rw,
+                            (rel_col as f64) - rw.rect.x,
+                            (editor_row as f64) - rw.rect.y,
+                            1.0,
+                            1.0,
+                        );
+                        if let render::WindowZone::TextArea {
+                            buf_line,
+                            seg_col_offset,
+                            text_rel_x,
+                            ..
+                        } = zone
                         {
-                            // Skip per-window status bar row
-                            if rw.status_line.is_some() && wh > 1 && editor_row == wy + wh - 1 {
-                                break;
-                            }
-                            let view_row = (editor_row - wy) as usize;
-                            let drag_rl = rw.lines.get(view_row);
-                            let buf_line = drag_rl
-                                .map(|l| l.line_idx)
-                                .unwrap_or_else(|| rw.scroll_top + view_row);
-                            let seg_offset = drag_rl.map(|l| l.segment_col_offset).unwrap_or(0);
-                            let col_in_text = (rel_col - wx).saturating_sub(gutter) as usize
-                                + rw.scroll_left
-                                + seg_offset;
+                            let col_in_text = text_rel_x as usize + rw.scroll_left + seg_col_offset;
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -1265,16 +1260,12 @@ pub(super) fn handle_mouse(
                                 let editor_row = row.saturating_sub(scroll_menu_rows);
                                 let rel_col = col.saturating_sub(editor_left);
                                 let target = last_layout.and_then(|layout| {
-                                    layout.windows.iter().find(|rw| {
-                                        let wx = rw.rect.x as u16;
-                                        let wy = rw.rect.y as u16;
-                                        let ww = rw.rect.width as u16;
-                                        let wh = rw.rect.height as u16;
-                                        rel_col >= wx
-                                            && rel_col < wx + ww
-                                            && editor_row >= wy
-                                            && editor_row < wy + wh
-                                    })
+                                    render::find_window_at(
+                                        layout,
+                                        rel_col as f64,
+                                        editor_row as f64,
+                                    )
+                                    .map(|idx| &layout.windows[idx])
                                 });
                                 if let Some(rw) = target {
                                     let dir = if down { 1 } else { -1 };
@@ -1699,29 +1690,27 @@ pub(super) fn handle_mouse(
         if let Some(layout) = last_layout {
             let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
             let editor_row = row.saturating_sub(menu_rows);
+            let rel_col = col - editor_left;
             let mut found = false;
-            for rw in &layout.windows {
-                let wx = rw.rect.x as u16;
-                let wy = rw.rect.y as u16;
-                let ww = rw.rect.width as u16;
-                let wh = rw.rect.height as u16;
-                let gutter = rw.gutter_char_width as u16;
-                let rel_col = col - editor_left;
-                if rel_col >= wx + gutter
-                    && rel_col < wx + ww
-                    && editor_row >= wy
-                    && editor_row < wy + wh
+            if let Some(idx) = render::find_window_at(layout, rel_col as f64, editor_row as f64) {
+                let rw = &layout.windows[idx];
+                let zone = render::window_zone_hit_test(
+                    rw,
+                    (rel_col as f64) - rw.rect.x,
+                    (editor_row as f64) - rw.rect.y,
+                    1.0,
+                    1.0,
+                );
+                if let render::WindowZone::TextArea {
+                    buf_line,
+                    seg_col_offset,
+                    text_rel_x,
+                    ..
+                } = zone
                 {
-                    let view_row = (editor_row - wy) as usize;
-                    let buf_line = rw
-                        .lines
-                        .get(view_row)
-                        .map(|l| l.line_idx)
-                        .unwrap_or_else(|| rw.scroll_top + view_row);
-                    let text_col = (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
+                    let text_col = text_rel_x as usize + rw.scroll_left + seg_col_offset;
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
-                    break;
                 }
             }
             if !found
