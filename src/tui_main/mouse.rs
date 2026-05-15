@@ -681,14 +681,20 @@ pub(super) fn handle_mouse(
                 drag_state.end();
             }
             MouseEventKind::ScrollDown => {
-                // Check if scroll is over the preview pane (right side).
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
                 let popup_w = if has_preview {
                     (term_cols * 4 / 5).max(60)
                 } else {
                     (term_cols * 55 / 100).max(55)
                 };
+                let popup_h = if has_preview {
+                    (term_rows * 65 / 100).max(18)
+                } else {
+                    (term_rows * 60 / 100).max(16)
+                };
+                let visible_rows = popup_h.saturating_sub(4) as usize;
                 let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
                 let left_w = if has_preview {
                     (popup_w as usize * 35 / 100) as u16
@@ -696,7 +702,6 @@ pub(super) fn handle_mouse(
                     0
                 };
                 if has_preview && col > popup_x + left_w {
-                    // Scroll the preview pane.
                     let max = engine
                         .picker_preview
                         .as_ref()
@@ -705,17 +710,24 @@ pub(super) fn handle_mouse(
                     engine.picker_preview_scroll =
                         (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
                 } else {
-                    engine.picker_scroll(3, 20);
+                    engine.picker_scroll(3, visible_rows);
                 }
             }
             MouseEventKind::ScrollUp => {
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
                 let popup_w = if has_preview {
                     (term_cols * 4 / 5).max(60)
                 } else {
                     (term_cols * 55 / 100).max(55)
                 };
+                let popup_h = if has_preview {
+                    (term_rows * 65 / 100).max(18)
+                } else {
+                    (term_rows * 60 / 100).max(16)
+                };
+                let visible_rows = popup_h.saturating_sub(4) as usize;
                 let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
                 let left_w = if has_preview {
                     (popup_w as usize * 35 / 100) as u16
@@ -725,7 +737,7 @@ pub(super) fn handle_mouse(
                 if has_preview && col > popup_x + left_w {
                     engine.picker_preview_scroll = engine.picker_preview_scroll.saturating_sub(3);
                 } else {
-                    engine.picker_scroll(-3, 20);
+                    engine.picker_scroll(-3, visible_rows);
                 }
             }
             _ => {} // consume all other events
