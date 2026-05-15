@@ -11623,6 +11623,31 @@ pub fn screen_zone_hit_test(
     ScreenZone::None
 }
 
+/// Find which window contains a point and return its index.
+///
+/// Coordinates are in the same frame as `screen_zone_hit_test` — editor
+/// content bounds, after subtracting sidebar/menu/terminal chrome.
+pub fn find_window_at(layout: &ScreenLayout, x: f64, y: f64) -> Option<usize> {
+    layout.windows.iter().position(|rw| {
+        let r = &rw.rect;
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    })
+}
+
+/// Resolve a view-row + relative column to `(buf_line, text_col)` using
+/// the pre-computed `RenderedLine` data.
+pub fn resolve_text_position(
+    rw: &RenderedWindow,
+    view_row: usize,
+    text_rel_col: usize,
+) -> (usize, usize) {
+    let rl = rw.lines.get(view_row);
+    let buf_line = rl.map(|l| l.line_idx).unwrap_or(rw.scroll_top + view_row);
+    let seg_offset = rl.map(|l| l.segment_col_offset).unwrap_or(0);
+    let text_col = text_rel_col + rw.scroll_left + seg_offset;
+    (buf_line, text_col)
+}
+
 /// Determine which sub-zone of a window a point falls in.
 ///
 /// `rel_x` and `rel_y` are relative to the window's top-left corner.
