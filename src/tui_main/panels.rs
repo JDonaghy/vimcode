@@ -31,6 +31,7 @@ fn build_activity_bar_primitive(
 ) -> quadraui::ActivityBar {
     let kbd_sel = |idx: u16| sidebar.toolbar_focused && sidebar.toolbar_selected == idx;
     let sb_visible = engine.app_shell.sidebar_visible();
+    let has_ext_panel = sidebar.ext_panel_name.is_some();
     let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
 
     let mut top = Vec::new();
@@ -69,7 +70,7 @@ fn build_activity_bar_primitive(
             id: quadraui::WidgetId::new(activity_id),
             icon: icon.to_string(),
             tooltip: tooltip.to_string(),
-            is_active: sb_visible && active_id == Some(panel_id),
+            is_active: sb_visible && !has_ext_panel && active_id == Some(panel_id),
             is_keyboard_selected: kbd_sel(idx),
         });
     }
@@ -93,7 +94,7 @@ fn build_activity_bar_primitive(
         id: quadraui::WidgetId::new("activity:settings"),
         icon: crate::icons::SETTINGS.c().to_string(),
         tooltip: "Settings".to_string(),
-        is_active: sb_visible && active_id == Some(PANEL_SETTINGS),
+        is_active: sb_visible && !has_ext_panel && active_id == Some(PANEL_SETTINGS),
         is_keyboard_selected: kbd_sel(7),
     }];
 

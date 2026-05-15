@@ -3843,15 +3843,15 @@ impl Engine {
                             tooltip: "AI".to_string(),
                             title: "AI".to_string(),
                         },
+                        PanelDefinition {
+                            id: WidgetId::new("bottom:settings"),
+                            icon: "".to_string(),
+                            tooltip: "Settings".to_string(),
+                            title: "SETTINGS".to_string(),
+                        },
                     ],
                     30.0,
                 )
-                .with_bottom_items(vec![PanelDefinition {
-                    id: WidgetId::new("bottom:settings"),
-                    icon: "".to_string(),
-                    tooltip: "Settings".to_string(),
-                    title: "SETTINGS".to_string(),
-                }])
             },
             file_watcher: None,
             file_watcher_rx: None,
