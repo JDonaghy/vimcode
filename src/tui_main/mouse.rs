@@ -547,10 +547,10 @@ pub(super) fn handle_mouse(
                     has_preview,
                     &render::TUI_PICKER_SIZING,
                 );
-                let popup_x = geo.popup_x as u16;
-                let popup_y = geo.popup_y as u16;
-                let popup_w = geo.popup_w as u16;
-                let popup_h = geo.popup_h as u16;
+                let popup_x = geo.popup_x.round() as u16;
+                let popup_y = geo.popup_y.round() as u16;
+                let popup_w = geo.popup_w.round() as u16;
+                let popup_h = geo.popup_h.round() as u16;
                 let total_items = engine.picker_items.len();
 
                 let list_w = if has_preview {
@@ -697,8 +697,8 @@ pub(super) fn handle_mouse(
                     has_preview,
                     &render::TUI_PICKER_SIZING,
                 );
-                let popup_x = geo.popup_x as u16;
-                let left_w = geo.left_pane_w as u16;
+                let popup_x = geo.popup_x.round() as u16;
+                let left_w = geo.left_pane_w.round() as u16;
                 let scroll_down = matches!(ev.kind, MouseEventKind::ScrollDown);
                 if has_preview && col > popup_x + left_w {
                     if scroll_down {
