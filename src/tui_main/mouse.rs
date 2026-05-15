@@ -147,10 +147,6 @@ pub(super) fn handle_mouse(
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
-    quit_confirm: &mut bool,
-    quit_confirm_focus: &mut usize,
-    close_tab_confirm: &mut bool,
-    close_tab_confirm_focus: &mut usize,
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
     should_quit: &mut bool,
@@ -173,124 +169,6 @@ pub(super) fn handle_mouse(
     // ── Quit-confirm overlay click interception ─────────────────────────────
     // Route clicks through DialogLayout::hit_test. Swallow all clicks while
     // the overlay is visible so they don't fall through to the editor.
-    if *quit_confirm {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let term_size =
-                terminal_size.unwrap_or_else(|| ratatui::layout::Size::new(term_height, 80));
-            let area = ratatui::layout::Rect {
-                x: 0,
-                y: 0,
-                width: term_size.width,
-                height: term_size.height,
-            };
-            // Focus index doesn't matter for hit-testing (button positions
-            // don't depend on which one is focused); pass 0.
-            let (_dialog, layout) = super::render_impl::build_quit_confirm_dialog(area, 0);
-            match layout.hit_test(col as f32, row as f32) {
-                quadraui::DialogHit::Button(id) => match id.as_str() {
-                    "quit:save_all" => {
-                        engine.save_all_dirty();
-                        engine.cleanup_all_swaps();
-                        engine.lsp_shutdown();
-                        save_session(engine);
-                        *quit_confirm = false;
-                        *quit_confirm_focus = 0;
-                        *should_quit = true;
-                    }
-                    "quit:force" => {
-                        engine.cleanup_all_swaps();
-                        engine.lsp_shutdown();
-                        save_session(engine);
-                        *quit_confirm = false;
-                        *quit_confirm_focus = 0;
-                        *should_quit = true;
-                    }
-                    "quit:cancel" => {
-                        *quit_confirm = false;
-                        *quit_confirm_focus = 0;
-                    }
-                    _ => {}
-                },
-                quadraui::DialogHit::Outside => {
-                    // Click outside dialog: dismiss (same as pressing Escape).
-                    *quit_confirm = false;
-                    *quit_confirm_focus = 0;
-                }
-                quadraui::DialogHit::Body => {
-                    // Click on dialog body (not a button): swallow.
-                }
-            }
-        }
-        // Swallow all other mouse events while the overlay is up.
-        return sidebar_width;
-    }
-
-    // ── Close-tab confirm overlay click interception ────────────────────────
-    // Route clicks through DialogLayout::hit_test. Swallow all clicks while
-    // the overlay is visible so they don't fall through to the editor.
-    if *close_tab_confirm {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let term_size =
-                terminal_size.unwrap_or_else(|| ratatui::layout::Size::new(term_height, 80));
-            let area = ratatui::layout::Rect {
-                x: 0,
-                y: 0,
-                width: term_size.width,
-                height: term_size.height,
-            };
-            // Focus index doesn't matter for hit-testing (button positions
-            // don't depend on which one is focused); pass 0.
-            let (_dialog, layout) = super::render_impl::build_close_tab_dialog(area, 0);
-            match layout.hit_test(col as f32, row as f32) {
-                quadraui::DialogHit::Button(id) => match id.as_str() {
-                    "close_tab:save" => {
-                        // Save + quit. `execute_command("quit")` handles
-                        // the last-window case (returns EngineAction::Quit)
-                        // automatically. Since we just saved, the dirty
-                        // check inside "quit" is satisfied.
-                        engine.escape_to_normal();
-                        let _ = engine.save();
-                        let action = engine.execute_command("quit");
-                        *close_tab_confirm = false;
-                        if action == crate::core::engine::EngineAction::Quit
-                            && handle_action(engine, action)
-                        {
-                            *should_quit = true;
-                        }
-                    }
-                    "close_tab:discard" => {
-                        // Force-quit semantics via `quit!`. Handles the
-                        // last-window case (returns EngineAction::Quit)
-                        // and drops the buffer regardless of dirty flag.
-                        engine.escape_to_normal();
-                        let action = engine.execute_command("quit!");
-                        *close_tab_confirm = false;
-                        if action == crate::core::engine::EngineAction::Quit
-                            && handle_action(engine, action)
-                        {
-                            *should_quit = true;
-                        }
-                    }
-                    "close_tab:cancel" => {
-                        engine.escape_to_normal();
-                        *close_tab_confirm = false;
-                    }
-                    _ => {}
-                },
-                quadraui::DialogHit::Outside => {
-                    // Click outside dialog: dismiss (same as pressing Escape).
-                    engine.escape_to_normal();
-                    *close_tab_confirm = false;
-                }
-                quadraui::DialogHit::Body => {
-                    // Click on dialog body (not a button): swallow.
-                }
-            }
-        }
-        // Swallow all other mouse events while the overlay is up.
-        return sidebar_width;
-    }
-
     let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
         0
     } else {
@@ -2710,16 +2588,14 @@ pub(super) fn handle_mouse(
                         TabBarClickTarget::Tab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
-                                *close_tab_confirm = true;
-                                *close_tab_confirm_focus = 0;
+                                engine.show_close_tab_confirm();
                             }
                             *tab_drag_start = Some((col, row));
                         }
                         TabBarClickTarget::CloseTab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
-                                *close_tab_confirm = true;
-                                *close_tab_confirm_focus = 0;
+                                engine.show_close_tab_confirm();
                             }
                         }
                         TabBarClickTarget::ActionMenu => {
@@ -2781,8 +2657,7 @@ pub(super) fn handle_mouse(
                         engine.active_group_mut().active_tab = i;
                         engine.line_annotations.clear();
                         if engine.dirty() {
-                            *close_tab_confirm = true;
-                            *close_tab_confirm_focus = 0;
+                            engine.show_close_tab_confirm();
                         } else {
                             engine.close_tab();
                         }
