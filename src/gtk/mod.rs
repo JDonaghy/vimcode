@@ -5681,10 +5681,17 @@ impl App {
             }
         }
 
-        // Ctrl-W h/l overflow: engine sets focus flags + sidebar visibility.
-        let nav_overflow = self.engine.borrow_mut().handle_nav_overflow();
-        if let Some(false) = nav_overflow {
-            self.sync_sidebar_from_engine();
+        // Ctrl-W h/l overflow: show sidebar and focus the active panel.
+        {
+            let overflow = self.engine.borrow_mut().window_nav_overflow.take();
+            if let Some(false) = overflow {
+                let panel_id = self
+                    .active_panel
+                    .to_panel_id()
+                    .unwrap_or(crate::core::engine::sidebar::PANEL_EXPLORER);
+                self.engine.borrow_mut().focus_sidebar_panel(panel_id);
+                self.sync_sidebar_from_engine();
+            }
         }
 
         // Sync the unnamed register to the system clipboard if it changed.
@@ -9633,9 +9640,8 @@ impl App {
         }
     }
 
-    /// Sync local sidebar cache fields from engine AppShell state, update
-    /// GTK widget visibility (revealer + panel boxes), grab focus on the
-    /// active panel DA, and mirror to the activity bar draw callback.
+    /// Sync local sidebar cache fields from engine AppShell state, then
+    /// update GTK widgets.
     fn sync_sidebar_from_engine(&mut self) {
         let engine = self.engine.borrow();
         self.sidebar_visible = engine.app_shell.sidebar_visible();
@@ -9644,9 +9650,16 @@ impl App {
             .active_panel_id()
             .map(|id| SidebarPanel::from_panel_id(id.as_str()))
             .unwrap_or(SidebarPanel::Explorer);
+        drop(engine);
+        self.sync_sidebar_widgets();
+    }
+
+    /// Update GTK widget visibility (revealer + panel boxes), grab focus on
+    /// the active panel DA, and mirror to the activity bar draw callback.
+    /// Reads from `self.sidebar_visible` and `self.active_panel` (local cache).
+    fn sync_sidebar_widgets(&mut self) {
         let show = self.sidebar_visible;
         let p = self.active_panel.clone();
-        drop(engine);
 
         if let Some(ref r) = *self.sidebar_revealer.borrow() {
             r.set_reveal_child(show);
@@ -9747,8 +9760,11 @@ impl App {
                     let _ = engine.session.save();
                     drop(engine);
                     // Sync local cache — active_panel stays as ExtPanel for widget visibility.
+                    // Do NOT call sync_sidebar_from_engine() — it would overwrite active_panel
+                    // with the engine's fixed-panel ID, losing the ExtPanel variant.
                     self.sidebar_visible = self.engine.borrow().app_shell.sidebar_visible();
                     self.active_panel = panel;
+                    self.sync_sidebar_widgets();
                 } else if let Some(panel_id) = panel.to_panel_id() {
                     // Clear ext panel state when switching to a built-in panel.
                     {
@@ -9757,8 +9773,8 @@ impl App {
                         engine.ext_panel_active = None;
                         engine.toggle_sidebar_panel(panel_id);
                     }
+                    self.sync_sidebar_from_engine();
                 }
-                self.sync_sidebar_from_engine();
             }
             _ => unreachable!(),
         }
