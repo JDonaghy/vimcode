@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 14, 2026 (Session 372 — **Continued backend dedup: 6 engine extractions + quadraui compat + GTK tab switcher migration.** Closed #384 `select_all_occurrences`, #378 `activate_group_for_window`, #380 `picker_scroll`, #382 `scroll_viewport_with_cursor` (+ `_for_window` variant fixing pre-existing TUI scroll bug), #374 `tab_switcher_cycle`. Adapted to quadraui API changes (ButtonRowItem.icon, Palette show_query/create_label/preview, Dialog.body Vec). GTK tab switcher popup migrated from ~85 lines bespoke Cairo to shared `ListView`. Filed #389 registry fetch, #390 TUI cursor color, #391 TUI picker scroll.)
+**Last updated:** May 14, 2026 (Session 373 — **Backend dedup batch: 4 engine extractions, ~549 lines removed.** Closed #383 `execute_terminal_toolbar_action`, #376 `check_settings_reload`, #375 `route_paste`, #377 `handle_quit_confirm`+`handle_close_tab_confirm`. Closed #379 as N/A (GTK context menu keys are dead code — GTK uses native PopoverMenu). Filed #395 (migrate GTK popovers to quadraui ContextMenu) and quadraui#175. TUI quit/close-tab confirms migrated from local variables to engine dialog system. Added `show_quit_confirm()`/`show_close_tab_confirm()` convenience methods. Fixed dialog button overflow + last-tab close-confirm exit.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 372 and earlier in **SESSION_HISTORY.md**.
+> Sessions 373 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -119,4 +119,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 372 and earlier in **SESSION_HISTORY.md**.
+> Sessions 373 and earlier in **SESSION_HISTORY.md**.
