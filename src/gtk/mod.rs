@@ -5920,13 +5920,21 @@ impl App {
             self.draw_needed.set(true);
         }
         // Check for panel reveal request from plugins.
-        if let Some(panel_name) = self.engine.borrow_mut().ext_panel_focus_pending.take() {
-            self.active_panel = SidebarPanel::ExtPanel(panel_name);
-            if !self.engine.borrow().app_shell.sidebar_visible() {
-                self.engine.borrow_mut().toggle_sidebar();
+        // Extract into a separate binding so the RefMut drops before the
+        // re-borrows inside the body (Rust 2021 temporary lifetime rule).
+        let pending_panel = self.engine.borrow_mut().ext_panel_focus_pending.take();
+        if let Some(panel_name) = pending_panel {
+            {
+                let mut engine = self.engine.borrow_mut();
+                if !engine.app_shell.sidebar_visible() {
+                    engine.app_shell.toggle_sidebar();
+                }
+                engine.ext_panel_has_focus = true;
+                engine.ext_panel_active = Some(panel_name.clone());
             }
+            self.active_panel = SidebarPanel::ExtPanel(panel_name);
             self.sidebar_visible = true;
-            self.draw_needed.set(true);
+            self.sync_sidebar_widgets();
         }
         // GTK-specific: queue redraws on individual sidebar DAs whose
         // content may have changed from the polls above.
@@ -9631,11 +9639,18 @@ impl App {
     fn sync_sidebar_from_engine(&mut self) {
         let engine = self.engine.borrow();
         self.sidebar_visible = engine.app_shell.sidebar_visible();
-        self.active_panel = engine
-            .app_shell
-            .active_panel_id()
-            .map(|id| SidebarPanel::from_panel_id(id.as_str()))
-            .unwrap_or(SidebarPanel::Explorer);
+        // Extension panels bypass AppShell (no dynamic registration).
+        // If an ext panel is active, preserve it instead of falling back
+        // to AppShell's panel ID (which would default to Explorer).
+        if let Some(ref name) = engine.ext_panel_active {
+            self.active_panel = SidebarPanel::ExtPanel(name.clone());
+        } else {
+            self.active_panel = engine
+                .app_shell
+                .active_panel_id()
+                .map(|id| SidebarPanel::from_panel_id(id.as_str()))
+                .unwrap_or(SidebarPanel::Explorer);
+        }
         drop(engine);
         self.sync_sidebar_widgets();
     }
