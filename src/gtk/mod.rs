@@ -43,48 +43,14 @@ use css::*;
 use draw::*;
 use util::*;
 
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Variants used in later phases
-enum SidebarPanel {
-    Explorer,
-    Search,
-    Debug,
-    Git,
-    Extensions,
-    Settings,
-    Ai,
-    ExtPanel(String),
-    None,
+use crate::core::engine::sidebar::*;
+
+fn is_ext_panel_id(id: &str) -> bool {
+    id.starts_with("ext:")
 }
 
-impl SidebarPanel {
-    fn to_panel_id(&self) -> Option<&'static str> {
-        use crate::core::engine::sidebar::*;
-        match self {
-            SidebarPanel::Explorer => Some(PANEL_EXPLORER),
-            SidebarPanel::Search => Some(PANEL_SEARCH),
-            SidebarPanel::Debug => Some(PANEL_DEBUG),
-            SidebarPanel::Git => Some(PANEL_GIT),
-            SidebarPanel::Extensions => Some(PANEL_EXTENSIONS),
-            SidebarPanel::Ai => Some(PANEL_AI),
-            SidebarPanel::Settings => Some(PANEL_SETTINGS),
-            _ => None,
-        }
-    }
-
-    fn from_panel_id(id: &str) -> SidebarPanel {
-        use crate::core::engine::sidebar::*;
-        match id {
-            PANEL_EXPLORER => SidebarPanel::Explorer,
-            PANEL_SEARCH => SidebarPanel::Search,
-            PANEL_DEBUG => SidebarPanel::Debug,
-            PANEL_GIT => SidebarPanel::Git,
-            PANEL_EXTENSIONS => SidebarPanel::Extensions,
-            PANEL_AI => SidebarPanel::Ai,
-            PANEL_SETTINGS => SidebarPanel::Settings,
-            _ => SidebarPanel::None,
-        }
-    }
+fn ext_panel_name(id: &str) -> Option<&str> {
+    id.strip_prefix("ext:")
 }
 
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
@@ -289,7 +255,7 @@ struct App {
     /// This prevents the 20/sec SearchPollTick timer from unconditionally calling queue_draw().
     draw_needed: Rc<Cell<bool>>,
     sidebar_visible: bool,
-    active_panel: SidebarPanel,
+    active_panel_id: String,
     /// DrawingArea for the file explorer sidebar (Phase A.2b-2: native
     /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
     /// `draw_explorer_panel`).
@@ -297,8 +263,6 @@ struct App {
     /// A.6f: activity bar DA handle; used to queue redraws when panel
     /// state or extension registrations change.
     activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    /// A.6f: shared `active_panel` mirror — lets the draw func read the
-    /// current panel without borrowing `&self`. Updated in `Msg::SwitchPanel`.
 
     /// Row height actually used by the most recent explorer draw call.
     /// The draw callback writes this each frame from the same Pango
@@ -590,20 +554,19 @@ fn build_gtk_activity_bar_primitive(
     }
 }
 
-/// A.6f: decode a `WidgetId` from `build_gtk_activity_bar_primitive` into
-/// the engine-side `SidebarPanel` enum used by `Msg::SwitchPanel`.
-fn activity_id_to_panel(id: &str) -> Option<SidebarPanel> {
+/// Decode an activity bar widget ID into a panel ID for `Msg::SwitchPanel`.
+fn activity_id_to_panel_id(id: &str) -> Option<String> {
     match id {
-        "activity:explorer" => Some(SidebarPanel::Explorer),
-        "activity:search" => Some(SidebarPanel::Search),
-        "activity:debug" => Some(SidebarPanel::Debug),
-        "activity:git" => Some(SidebarPanel::Git),
-        "activity:extensions" => Some(SidebarPanel::Extensions),
-        "activity:ai" => Some(SidebarPanel::Ai),
-        "activity:settings" => Some(SidebarPanel::Settings),
+        "activity:explorer" => Some(PANEL_EXPLORER.to_string()),
+        "activity:search" => Some(PANEL_SEARCH.to_string()),
+        "activity:debug" => Some(PANEL_DEBUG.to_string()),
+        "activity:git" => Some(PANEL_GIT.to_string()),
+        "activity:extensions" => Some(PANEL_EXTENSIONS.to_string()),
+        "activity:ai" => Some(PANEL_AI.to_string()),
+        "activity:settings" => Some(PANEL_SETTINGS.to_string()),
         other => other
             .strip_prefix("activity:ext:")
-            .map(|name| SidebarPanel::ExtPanel(name.to_string())),
+            .map(|name| format!("ext:{name}")),
     }
 }
 
@@ -724,7 +687,7 @@ enum Msg {
     /// Toggle sidebar visibility.
     ToggleSidebar,
     /// Switch to a different sidebar panel.
-    SwitchPanel(SidebarPanel),
+    SwitchPanel(String),
     /// Open file from sidebar tree view (switches to existing tab or opens new permanent tab).
     /// Used for double-click.
     OpenFileFromSidebar(PathBuf),
@@ -1151,7 +1114,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["sidebar"],
 
                             #[watch]
-                            set_visible: model.active_panel == SidebarPanel::Explorer,
+                            set_visible: model.active_panel_id == PANEL_EXPLORER,
 
                             #[name = "explorer_da"]
                             gtk4::DrawingArea {
@@ -1186,10 +1149,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel == SidebarPanel::Search {
+                                if model.active_panel_id == PANEL_SEARCH {
                                     search_sidebar_da.queue_draw();
                                 }
-                                model.active_panel == SidebarPanel::Search
+                                model.active_panel_id == PANEL_SEARCH
                             },
 
                             #[name = "search_sidebar_da"]
@@ -1206,10 +1169,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel == SidebarPanel::Debug {
+                                if model.active_panel_id == PANEL_DEBUG {
                                     debug_sidebar_da.queue_draw();
                                 }
-                                model.active_panel == SidebarPanel::Debug
+                                model.active_panel_id == PANEL_DEBUG
                             },
 
                             #[name = "debug_sidebar_da"]
@@ -1226,10 +1189,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel == SidebarPanel::Git {
+                                if model.active_panel_id == PANEL_GIT {
                                     git_sidebar_da.queue_draw();
                                 }
-                                model.active_panel == SidebarPanel::Git
+                                model.active_panel_id == PANEL_GIT
                             },
 
                             #[name = "git_sidebar_da"]
@@ -1246,10 +1209,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel == SidebarPanel::Extensions {
+                                if model.active_panel_id == PANEL_EXTENSIONS {
                                     ext_sidebar_da.queue_draw();
                                 }
-                                model.active_panel == SidebarPanel::Extensions
+                                model.active_panel_id == PANEL_EXTENSIONS
                             },
 
                             #[name = "ext_sidebar_da"]
@@ -1266,10 +1229,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if matches!(model.active_panel, SidebarPanel::ExtPanel(_)) {
+                                if is_ext_panel_id(&model.active_panel_id) {
                                     ext_dyn_panel_da.queue_draw();
                                 }
-                                matches!(model.active_panel, SidebarPanel::ExtPanel(_))
+                                is_ext_panel_id(&model.active_panel_id)
                             },
 
                             #[name = "ext_dyn_panel_da"]
@@ -1286,10 +1249,10 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel == SidebarPanel::Ai {
+                                if model.active_panel_id == PANEL_AI {
                                     ai_sidebar_da.queue_draw();
                                 }
-                                model.active_panel == SidebarPanel::Ai
+                                model.active_panel_id == PANEL_AI
                             },
 
                             #[name = "ai_sidebar_da"]
@@ -2100,7 +2063,7 @@ impl SimpleComponent for App {
             engine: engine.clone(),
             sidebar_visible,
             window: root.clone(),
-            active_panel: SidebarPanel::Explorer,
+            active_panel_id: PANEL_EXPLORER.to_string(),
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             activity_bar_da_ref: activity_bar_da_ref.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
@@ -3210,7 +3173,7 @@ impl SimpleComponent for App {
                 *hits_d.borrow_mut() = hits;
             });
         }
-        // Left-click: resolve row → SidebarPanel → Msg::SwitchPanel.
+        // Left-click: resolve row → panel_id → Msg::SwitchPanel.
         {
             let sender_c = sender.input_sender().clone();
             let hits_c = activity_bar_hits.clone();
@@ -3220,8 +3183,8 @@ impl SimpleComponent for App {
                 let hits = hits_c.borrow();
                 for hit in hits.iter() {
                     if y >= hit.y_start && y < hit.y_end {
-                        if let Some(panel) = activity_id_to_panel(hit.id.as_str()) {
-                            let _ = sender_c.send(Msg::SwitchPanel(panel));
+                        if let Some(pid) = activity_id_to_panel_id(hit.id.as_str()) {
+                            let _ = sender_c.send(Msg::SwitchPanel(pid));
                         }
                         return;
                     }
@@ -5471,10 +5434,11 @@ impl App {
         {
             let overflow = self.engine.borrow_mut().window_nav_overflow.take();
             if let Some(false) = overflow {
-                let panel_id = self
-                    .active_panel
-                    .to_panel_id()
-                    .unwrap_or(crate::core::engine::sidebar::PANEL_EXPLORER);
+                let panel_id = if is_ext_panel_id(&self.active_panel_id) {
+                    PANEL_EXPLORER
+                } else {
+                    &self.active_panel_id
+                };
                 self.engine.borrow_mut().focus_sidebar_panel(panel_id);
                 self.sync_sidebar_from_engine();
             }
@@ -5691,7 +5655,7 @@ impl App {
         }
         // Explicitly redraw the debug sidebar if it's active so the
         // Run/Stop button text and section data stay in sync.
-        if self.active_panel == SidebarPanel::Debug {
+        if self.active_panel_id == PANEL_DEBUG {
             if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -5703,8 +5667,7 @@ impl App {
         }
         // Auto-refresh SC panel periodically (gated on sidebar visibility).
         if self.sidebar_visible
-            && (self.active_panel == SidebarPanel::Git
-                || self.active_panel == SidebarPanel::Explorer)
+            && (self.active_panel_id == PANEL_GIT || self.active_panel_id == PANEL_EXPLORER)
             && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
             self.engine.borrow_mut().sc_refresh_async();
@@ -5732,13 +5695,13 @@ impl App {
                 engine.ext_panel_has_focus = true;
                 engine.ext_panel_active = Some(panel_name.clone());
             }
-            self.active_panel = SidebarPanel::ExtPanel(panel_name);
+            self.active_panel_id = format!("ext:{panel_name}");
             self.sidebar_visible = true;
             self.sync_sidebar_widgets();
         }
         // GTK-specific: queue redraws on individual sidebar DAs whose
         // content may have changed from the polls above.
-        if self.active_panel == SidebarPanel::Explorer {
+        if self.active_panel_id == PANEL_EXPLORER {
             if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -5754,7 +5717,7 @@ impl App {
         // trigger a redraw on a 1 Hz cadence to pick up background changes.
         if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tree_indicator_update = std::time::Instant::now();
-            if self.active_panel == SidebarPanel::Explorer {
+            if self.active_panel_id == PANEL_EXPLORER {
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -9304,10 +9267,9 @@ impl App {
             Msg::ExtPanelMouseMove(x_move, y_move) => {
                 // Determine which flat item the mouse is over (row 0 is the header).
                 let line_height = self.cached_line_height.max(1.0);
-                let panel_name = if let SidebarPanel::ExtPanel(ref name) = self.active_panel {
-                    name.clone()
-                } else {
-                    return;
+                let panel_name = match ext_panel_name(&self.active_panel_id) {
+                    Some(name) => name.to_string(),
+                    None => return,
                 };
                 // Header row occupies row 0; content rows start at line_height.
                 if y_move < line_height {
@@ -9463,81 +9425,68 @@ impl App {
         // If an ext panel is active, preserve it instead of falling back
         // to AppShell's panel ID (which would default to Explorer).
         if let Some(ref name) = engine.ext_panel_active {
-            self.active_panel = SidebarPanel::ExtPanel(name.clone());
+            self.active_panel_id = format!("ext:{name}");
         } else {
-            self.active_panel = engine
+            self.active_panel_id = engine
                 .app_shell
                 .active_panel_id()
-                .map(|id| SidebarPanel::from_panel_id(id.as_str()))
-                .unwrap_or(SidebarPanel::Explorer);
+                .map(|id| id.as_str().to_string())
+                .unwrap_or_else(|| PANEL_EXPLORER.to_string());
         }
         drop(engine);
         self.sync_sidebar_widgets();
     }
 
     /// Update GTK widget visibility (revealer + panel boxes), grab focus on
-    /// the active panel DA, and mirror to the activity bar draw callback.
-    /// Reads from `self.sidebar_visible` and `self.active_panel` (local cache).
+    /// the active panel DA, and queue an activity bar redraw.
+    /// Reads from `self.sidebar_visible` and `self.active_panel_id` (local cache).
     fn sync_sidebar_widgets(&mut self) {
         let show = self.sidebar_visible;
-        let p = self.active_panel.clone();
+        let id = &self.active_panel_id;
+        let is_ext = is_ext_panel_id(id);
 
         if let Some(ref r) = *self.sidebar_revealer.borrow() {
             r.set_reveal_child(show);
         }
-        for (which, panel_ref) in [
-            (SidebarPanel::Explorer, &self.explorer_panel_box),
-            (SidebarPanel::Debug, &self.debug_panel_box),
-            (SidebarPanel::Git, &self.git_panel_box),
-            (SidebarPanel::Extensions, &self.ext_panel_box),
-            (SidebarPanel::Settings, &self.settings_panel_box),
-            (SidebarPanel::Ai, &self.ai_panel_box_ref),
-        ] {
-            if let Some(ref b) = *panel_ref.borrow() {
-                b.set_visible(show && p == which);
+        let panel_boxes: [(&str, &Rc<RefCell<Option<gtk4::Box>>>); 6] = [
+            (PANEL_EXPLORER, &self.explorer_panel_box),
+            (PANEL_DEBUG, &self.debug_panel_box),
+            (PANEL_GIT, &self.git_panel_box),
+            (PANEL_EXTENSIONS, &self.ext_panel_box),
+            (PANEL_SETTINGS, &self.settings_panel_box),
+            (PANEL_AI, &self.ai_panel_box_ref),
+        ];
+        for (panel_id, box_ref) in &panel_boxes {
+            if let Some(ref b) = *box_ref.borrow() {
+                b.set_visible(show && !is_ext && id.as_str() == *panel_id);
             }
         }
         if let Some(ref b) = *self.ext_dyn_panel_box.borrow() {
-            b.set_visible(show && matches!(p, SidebarPanel::ExtPanel(_)));
+            b.set_visible(show && is_ext);
         }
         if show && self.engine.borrow().sidebar_has_focus() {
-            match p {
-                SidebarPanel::Git => {
-                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+            let da_refs: [(&str, &Rc<RefCell<Option<gtk4::DrawingArea>>>); 7] = [
+                (PANEL_EXPLORER, &self.explorer_sidebar_da_ref),
+                (PANEL_SEARCH, &self.search_sidebar_da_ref),
+                (PANEL_DEBUG, &self.debug_sidebar_da_ref),
+                (PANEL_GIT, &self.git_sidebar_da_ref),
+                (PANEL_EXTENSIONS, &self.ext_sidebar_da_ref),
+                (PANEL_SETTINGS, &self.settings_da_ref),
+                (PANEL_AI, &self.ai_sidebar_da_ref),
+            ];
+            let target = if is_ext { "ext:" } else { id.as_str() };
+            for (panel_id, da_ref) in &da_refs {
+                if *panel_id == target {
+                    if let Some(ref da) = *da_ref.borrow() {
                         da.grab_focus();
                     }
+                    break;
                 }
-                SidebarPanel::Extensions => {
-                    if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                        da.grab_focus();
-                    }
+            }
+            if is_ext {
+                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                    da.grab_focus();
                 }
-                SidebarPanel::Debug => {
-                    if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                }
-                SidebarPanel::Ai => {
-                    if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                }
-                SidebarPanel::ExtPanel(_) => {
-                    if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                }
-                SidebarPanel::Settings => {
-                    if let Some(ref da) = *self.settings_da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                }
-                SidebarPanel::Explorer => {
-                    if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                }
-                _ => {}
             }
         }
         if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
@@ -9552,8 +9501,8 @@ impl App {
                 self.engine.borrow_mut().toggle_sidebar();
                 self.sync_sidebar_from_engine();
             }
-            Msg::SwitchPanel(panel) => {
-                if let SidebarPanel::ExtPanel(ref name) = panel {
+            Msg::SwitchPanel(panel_id) => {
+                if let Some(name) = ext_panel_name(&panel_id) {
                     // Extension panels bypass AppShell (no dynamic registration).
                     let mut engine = self.engine.borrow_mut();
                     let same = engine.ext_panel_active.as_deref() == Some(name)
@@ -9568,7 +9517,7 @@ impl App {
                         }
                         let already = engine.ext_panel_active.as_deref() == Some(name);
                         engine.ext_panel_has_focus = true;
-                        engine.ext_panel_active = Some(name.clone());
+                        engine.ext_panel_active = Some(name.to_string());
                         if !already {
                             engine.ext_panel_selected = 0;
                             engine.plugin_event("panel_focus", name);
@@ -9577,19 +9526,15 @@ impl App {
                     engine.session.explorer_visible = engine.app_shell.sidebar_visible();
                     let _ = engine.session.save();
                     drop(engine);
-                    // Sync local cache — active_panel stays as ExtPanel for widget visibility.
-                    // Do NOT call sync_sidebar_from_engine() — it would overwrite active_panel
-                    // with the engine's fixed-panel ID, losing the ExtPanel variant.
                     self.sidebar_visible = self.engine.borrow().app_shell.sidebar_visible();
-                    self.active_panel = panel;
+                    self.active_panel_id = panel_id;
                     self.sync_sidebar_widgets();
-                } else if let Some(panel_id) = panel.to_panel_id() {
-                    // Clear ext panel state when switching to a built-in panel.
+                } else {
                     {
                         let mut engine = self.engine.borrow_mut();
                         engine.ext_panel_has_focus = false;
                         engine.ext_panel_active = None;
-                        engine.toggle_sidebar_panel(panel_id);
+                        engine.toggle_sidebar_panel(&panel_id);
                     }
                     self.sync_sidebar_from_engine();
                 }
@@ -9746,7 +9691,7 @@ impl App {
             }
             Msg::FocusExplorer => {
                 self.sidebar_visible = true;
-                self.active_panel = SidebarPanel::Explorer;
+                self.active_panel_id = PANEL_EXPLORER.to_string();
                 self.engine.borrow_mut().explorer_has_focus = true;
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                     da.grab_focus();
@@ -9769,7 +9714,7 @@ impl App {
                     }
                 } else {
                     self.sidebar_visible = true;
-                    self.active_panel = SidebarPanel::Explorer;
+                    self.active_panel_id = PANEL_EXPLORER.to_string();
                     self.engine.borrow_mut().explorer_has_focus = true;
                     if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                         da.grab_focus();
@@ -9779,12 +9724,12 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
-                if self.active_panel == SidebarPanel::Search && self.sidebar_visible {
+                if self.active_panel_id == PANEL_SEARCH && self.sidebar_visible {
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
                 } else {
-                    self.active_panel = SidebarPanel::Search;
+                    self.active_panel_id = PANEL_SEARCH.to_string();
                     self.sidebar_visible = true;
                     self.engine.borrow_mut().search_set_focus(true);
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
