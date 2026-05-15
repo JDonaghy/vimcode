@@ -422,11 +422,11 @@ impl Engine {
                     "save_close" => {
                         self.escape_to_normal();
                         let _ = self.save();
-                        self.close_tab();
+                        return self.execute_command("quit");
                     }
                     "discard" => {
                         self.escape_to_normal();
-                        self.close_tab();
+                        return self.execute_command("quit!");
                     }
                     _ => {} // cancel — do nothing
                 }

@@ -1004,6 +1004,13 @@ pub(super) fn draw_frame(
             .max(dialog.title.chars().count() + 4)
             .max(btn_row_len);
         let width = (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
+        let n_buttons = dialog.buttons.len().max(1) as f32;
+        let inner = width - 2.0;
+        let capped_btn_w = if dialog.vertical_buttons {
+            btn_max_label as f32
+        } else {
+            (btn_max_label as f32).min(inner / n_buttons)
+        };
         let measure = quadraui::DialogMeasure {
             width,
             title_height: 1.0,
@@ -1014,7 +1021,7 @@ pub(super) fn draw_frame(
             } else {
                 1.0
             },
-            button_width: btn_max_label as f32,
+            button_width: capped_btn_w,
             button_gap: 0.0,
             padding: 1.0,
         };
