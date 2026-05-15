@@ -119,6 +119,14 @@ impl Engine {
         Some(direction)
     }
 
+    /// Returns true if the sidebar should be auto-hidden (autohide setting
+    /// is on, sidebar is visible, and no panel has focus).
+    pub fn should_autohide_sidebar(&self) -> bool {
+        self.settings.autohide_panels
+            && self.app_shell.sidebar_visible()
+            && !self.sidebar_has_focus()
+    }
+
     /// Toggle sidebar visibility without changing the active panel.
     pub fn toggle_sidebar(&mut self) {
         self.app_shell.toggle_sidebar();
