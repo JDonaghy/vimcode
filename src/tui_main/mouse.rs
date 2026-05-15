@@ -547,22 +547,35 @@ pub(super) fn handle_mouse(
                     has_preview,
                     &render::TUI_PICKER_SIZING,
                 );
-                let popup_x = geo.popup_x as u16;
-                let popup_y = geo.popup_y as u16;
-                let popup_w = geo.popup_w as u16;
-                let results_start = popup_y + 3;
-                let results_end = results_start + geo.visible_rows as u16;
-                let visible_rows = geo.visible_rows;
+                let popup_x = geo.popup_x.round() as u16;
+                let popup_y = geo.popup_y.round() as u16;
+                let popup_w = geo.popup_w.round() as u16;
+                let popup_h = geo.popup_h.round() as u16;
                 let total_items = engine.picker_items.len();
 
-                // Phase B.4: route the click through quadraui's modal
-                // stack + dispatcher to decide in-modal vs backdrop.
-                // Same shape GTK uses (0f3e0d0 + a02eff9): push the
-                // popup's bounds, call `dispatch_mouse_down`, branch
-                // on the returned `UiEvent`s. TUI uses whole cells as
-                // the unit; GTK uses pixels; the dispatcher doesn't
-                // care — it works in whichever f32 space the backend
-                // supplies.
+                let list_w = if has_preview {
+                    ((popup_w as f32) * 0.4).round() as u16
+                } else {
+                    popup_w
+                };
+                let items_row0 = popup_y + 3;
+                let items_row_end = popup_y + popup_h - 1;
+                let visible_rows = items_row_end.saturating_sub(items_row0) as usize;
+
+                let max_offset = total_items.saturating_sub(visible_rows);
+                let effective_offset = if visible_rows == 0 {
+                    0
+                } else if engine.picker_selected < engine.picker_scroll_top {
+                    engine.picker_selected
+                } else if engine.picker_selected
+                    >= engine.picker_scroll_top + visible_rows
+                {
+                    engine.picker_selected + 1 - visible_rows
+                } else {
+                    engine.picker_scroll_top
+                }
+                .min(max_offset);
+
                 let picker_id = quadraui::WidgetId::new("picker");
                 modal_stack.push(
                     picker_id.clone(),
@@ -599,61 +612,80 @@ pub(super) fn handle_mouse(
                 }
 
                 if hit_modal {
-                    // Click inside popup — inner hit-test (scrollbar,
-                    // then result row) drives what the click does.
-                    let has_scrollbar = !has_preview && total_items > visible_rows && popup_w >= 2;
-                    let sb_col = popup_x + popup_w - 2;
+                    let has_scrollbar = total_items > visible_rows;
+                    let sb_col = popup_x + list_w - 1;
                     let on_scrollbar = has_scrollbar
-                        && col >= sb_col
-                        && col < popup_x + popup_w
-                        && row >= results_start
-                        && row < results_end
+                        && col == sb_col
+                        && row >= items_row0
+                        && row < items_row_end
                         && visible_rows > 0;
 
                     if on_scrollbar {
+                        let tl = visible_rows as f32;
+                        let thumb_len =
+                            (tl * visible_rows as f32 / total_items.max(1) as f32).max(1.0);
+                        let max_scroll = total_items.saturating_sub(visible_rows);
                         let grab_offset = scrollbar_grab_offset(
                             row as f32,
-                            results_start as f32,
-                            visible_rows as f32,
+                            items_row0 as f32,
+                            tl,
                             visible_rows,
                             total_items,
-                            engine.picker_scroll_top,
+                            effective_offset,
                         );
-                        let tl = visible_rows as f32;
-                        drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                            widget: picker_id.clone(),
-                            track_start: results_start as f32,
-                            track_length: tl,
-                            thumb_length: (tl * visible_rows as f32 / total_items.max(1) as f32)
-                                .max(1.0),
-                            max_scroll: total_items.saturating_sub(visible_rows),
-                            grab_offset,
-                            inverted: false,
-                        });
-                        let events = quadraui::dispatch_mouse_drag(
-                            drag_state,
-                            quadraui::Point {
-                                x: col as f32,
-                                y: row as f32,
-                            },
-                            Default::default(),
-                        );
-                        for ev in &events {
-                            if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                                engine.picker_scroll_top = *new_offset;
-                                if engine.picker_selected < *new_offset {
-                                    engine.picker_selected = *new_offset;
-                                } else if engine.picker_selected >= *new_offset + visible_rows {
-                                    engine.picker_selected = *new_offset + visible_rows - 1;
-                                }
-                                engine.picker_load_preview();
+                        let on_thumb = grab_offset > 0.0
+                            || {
+                                let eff_track = (tl - thumb_len).max(1.0);
+                                let ratio = if max_scroll == 0 {
+                                    0.0
+                                } else {
+                                    effective_offset as f32 / max_scroll as f32
+                                };
+                                let thumb_top = items_row0 as f32 + ratio * eff_track;
+                                let dy = row as f32 - thumb_top;
+                                dy >= 0.0 && dy < thumb_len
+                            };
+
+                        if on_thumb {
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: picker_id.clone(),
+                                track_start: items_row0 as f32,
+                                track_length: tl,
+                                thumb_length: thumb_len,
+                                max_scroll,
+                                grab_offset,
+                                inverted: false,
+                            });
+                        } else {
+                            let click_above_thumb = {
+                                let eff_track = (tl - thumb_len).max(1.0);
+                                let ratio = if max_scroll == 0 {
+                                    0.0
+                                } else {
+                                    effective_offset as f32 / max_scroll as f32
+                                };
+                                let thumb_top = items_row0 as f32 + ratio * eff_track;
+                                (row as f32) < thumb_top
+                            };
+                            let page = visible_rows.max(1);
+                            let new_offset = if click_above_thumb {
+                                effective_offset.saturating_sub(page)
+                            } else {
+                                (effective_offset + page).min(max_scroll)
+                            };
+                            engine.picker_scroll_top = new_offset;
+                            if engine.picker_selected < new_offset {
+                                engine.picker_selected = new_offset;
+                            } else if engine.picker_selected >= new_offset + visible_rows {
+                                engine.picker_selected = new_offset + visible_rows - 1;
                             }
+                            engine.picker_load_preview();
                         }
-                    } else if row >= results_start && row < results_end {
-                        let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
+                    } else if row >= items_row0 && row < items_row_end {
+                        let clicked_idx =
+                            effective_offset + (row - items_row0) as usize;
                         if clicked_idx < engine.picker_items.len() {
                             if engine.picker_selected == clicked_idx {
-                                // Second click on same item — toggle expand or confirm
                                 let in_tree_mode = engine.picker_source
                                     == crate::core::engine::PickerSource::CommandCenter
                                     && engine.picker_query == "@";
@@ -687,8 +719,8 @@ pub(super) fn handle_mouse(
                     has_preview,
                     &render::TUI_PICKER_SIZING,
                 );
-                let popup_x = geo.popup_x as u16;
-                let left_w = geo.left_pane_w as u16;
+                let popup_x = geo.popup_x.round() as u16;
+                let left_w = geo.left_pane_w.round() as u16;
                 let scroll_down = matches!(ev.kind, MouseEventKind::ScrollDown);
                 if has_preview && col > popup_x + left_w {
                     if scroll_down {

@@ -7699,15 +7699,8 @@ pub use crate::core::engine::ExplorerRow;
 /// When `Some(Palette)` is returned, the backend can render the full
 /// modal via `quadraui_tui::draw_palette` (TUI) or `quadraui_gtk::draw_palette`
 /// (GTK, when A.4b ships).
-pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette> {
-    use quadraui::{Palette, PaletteItem, StyledText, WidgetId};
-
-    if picker.preview.is_some() {
-        return None;
-    }
-    if picker.items.iter().any(|it| it.depth > 0 || it.expandable) {
-        return None;
-    }
+pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
+    use quadraui::{Palette, PaletteItem, PalettePreview, StyledText, WidgetId};
 
     let items: Vec<PaletteItem> = picker
         .items
@@ -7717,13 +7710,26 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
             detail: it.detail.as_deref().map(StyledText::plain),
             icon: None,
             match_positions: it.match_positions.clone(),
-            depth: 0,
-            expandable: false,
-            expanded: false,
+            depth: it.depth,
+            expandable: it.expandable,
+            expanded: it.expanded,
         })
         .collect();
 
-    Some(Palette {
+    let preview = picker.preview.as_ref().map(|lines| {
+        let highlight_line = lines.iter().position(|&(_, _, hl)| hl);
+        PalettePreview {
+            lines: lines
+                .iter()
+                .map(|(line_num, text, _)| StyledText::plain(format!("{line_num:4}: {text}")))
+                .collect(),
+            title: None,
+            scroll_offset: picker.preview_scroll,
+            highlight_line,
+        }
+    });
+
+    Palette {
         id: WidgetId::new("picker"),
         title: picker.title.clone(),
         query: picker.query.clone(),
@@ -7735,8 +7741,8 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> Option<quadraui::Palette
         has_focus: true,
         show_query: true,
         create_label: None,
-        preview: None,
-    })
+        preview,
+    }
 }
 
 /// Convert `Engine`'s settings state into a generic `quadraui::Form`
