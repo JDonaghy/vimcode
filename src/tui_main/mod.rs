@@ -1091,18 +1091,6 @@ fn event_loop(
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
-    // True when the quit-confirm overlay is shown (unsaved changes on exit).
-    let mut quit_confirm = false;
-    // Which button is keyboard-focused in the quit-confirm dialog.
-    // 0 = Save All & Quit, 1 = Quit Anyway, 2 = Cancel. Reset to 0 whenever
-    // the dialog opens. Tab / Right arrow advance; Shift-Tab / Left arrow retreat.
-    let mut quit_confirm_focus: usize = 0;
-    // True when the close-tab-confirm overlay is shown (unsaved changes on tab close).
-    let mut close_tab_confirm = false;
-    // Which button is keyboard-focused in the close-tab-confirm dialog.
-    // 0 = Save, 1 = Discard, 2 = Cancel. Reset to 0 whenever the dialog
-    // opens. Tab / Right arrow advance; Shift-Tab / Left arrow retreat.
-    let mut close_tab_confirm_focus: usize = 0;
 
     let mut needs_redraw = true;
     // Track whether a large overlay popup was visible last frame so we can
@@ -1271,10 +1259,6 @@ fn event_loop(
                             sidebar_width,
                             quickfix_scroll_top,
                             folder_picker.as_ref(),
-                            quit_confirm,
-                            quit_confirm_focus,
-                            close_tab_confirm,
-                            close_tab_confirm_focus,
                             cmd_sel,
                             drop_target,
                             &mut hover_link_rects,
@@ -1325,10 +1309,6 @@ fn event_loop(
                                     sidebar_width,
                                     quickfix_scroll_top,
                                     folder_picker.as_ref(),
-                                    quit_confirm,
-                                    quit_confirm_focus,
-                                    close_tab_confirm,
-                                    close_tab_confirm_focus,
                                     cmd_sel,
                                     drop_target,
                                     &mut hover_link_rects,
@@ -1481,10 +1461,10 @@ fn event_loop(
 
         // Phase B.4 Stage 6: dispatch panel-key accelerators centrally.
         // Each id corresponds to a `pk.*` setting; the action mirrors what
-        // the legacy `matches_tui_key` arms did. Skipped during the
-        // quit-confirm overlay so the modal keeps its full key intercept.
+        // the legacy `matches_tui_key` arms did. Skipped during a modal
+        // dialog overlay so the modal keeps its full key intercept.
         if let quadraui::UiEvent::Accelerator(ref acc_id, acc_mods) = ui_event {
-            if !quit_confirm
+            if engine.dialog.is_none()
                 && dispatch_panel_accelerator(
                     acc_id.as_str(),
                     acc_mods,
@@ -1548,8 +1528,7 @@ fn event_loop(
                                 ));
                             }
                             EngineAction::QuitWithUnsaved => {
-                                quit_confirm = true;
-                                quit_confirm_focus = 0;
+                                engine.show_quit_confirm();
                             }
                             EngineAction::ToggleSidebar => {
                                 sidebar.visible = !sidebar.visible;
@@ -1686,226 +1665,16 @@ fn event_loop(
         };
         match crossterm_event {
             Event::Key(key_event) => {
-                // ── Quit confirm overlay — intercept all keys ───────────────
-                if quit_confirm && key_event.kind != KeyEventKind::Release {
-                    // Helper: activate the button at `idx`. Returns Some(true)
-                    // when the app should quit, Some(false) when the dialog
-                    // just dismisses, None when the index is out of range.
-                    let activate_focused = |engine: &mut Engine, idx: usize| -> Option<bool> {
-                        match idx {
-                            0 => {
-                                engine.save_all_dirty();
-                                engine.cleanup_all_swaps();
-                                engine.lsp_shutdown();
-                                save_session(engine);
-                                Some(true)
-                            }
-                            1 => {
-                                engine.cleanup_all_swaps();
-                                engine.lsp_shutdown();
-                                save_session(engine);
-                                Some(true)
-                            }
-                            2 => Some(false),
-                            _ => None,
-                        }
-                    };
-                    match key_event.code {
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
-                            quit_confirm = false;
-                            if let Some(true) = activate_focused(engine, 0) {
-                                return;
-                            }
-                        }
-                        KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            quit_confirm = false;
-                            if let Some(true) = activate_focused(engine, 1) {
-                                return;
-                            }
-                        }
-                        KeyCode::Esc
-                        | KeyCode::Char('c')
-                        | KeyCode::Char('C')
-                        | KeyCode::Char('n')
-                        | KeyCode::Char('N') => {
-                            quit_confirm = false;
-                            let _ = activate_focused(engine, 2);
-                        }
-                        KeyCode::Enter => {
-                            quit_confirm = false;
-                            if let Some(true) = activate_focused(engine, quit_confirm_focus) {
-                                return;
-                            }
-                        }
-                        KeyCode::Tab | KeyCode::Right => {
-                            quit_confirm_focus =
-                                (quit_confirm_focus + 1) % render_impl::QUIT_CONFIRM_BTN_COUNT;
-                        }
-                        KeyCode::BackTab | KeyCode::Left => {
-                            quit_confirm_focus =
-                                (quit_confirm_focus + render_impl::QUIT_CONFIRM_BTN_COUNT - 1)
-                                    % render_impl::QUIT_CONFIRM_BTN_COUNT;
-                        }
-                        _ => {}
-                    }
-                    // Reset focus to 0 once the dialog closes so the next open
-                    // starts on Save All & Quit.
-                    if !quit_confirm {
-                        quit_confirm_focus = 0;
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
-                // ── Close-tab confirm overlay — intercept all keys ─────────
-                if close_tab_confirm && key_event.kind != KeyEventKind::Release {
-                    // Helper: activate the button at `focus_idx`.
-                    let activate_focused = |engine: &mut Engine, idx: usize| -> Option<bool> {
-                        // Returns Some(true) when the app should quit (main
-                        // loop should `return;`), Some(false) when the dialog
-                        // just dismisses, None when the focus index is out of
-                        // range (should not happen).
-                        match idx {
-                            0 => {
-                                engine.escape_to_normal();
-                                let _ = engine.save();
-                                let a = engine.execute_command("quit");
-                                Some(a == EngineAction::Quit && handle_action(engine, a))
-                            }
-                            1 => {
-                                engine.escape_to_normal();
-                                let a = engine.execute_command("quit!");
-                                Some(a == EngineAction::Quit && handle_action(engine, a))
-                            }
-                            2 => {
-                                engine.escape_to_normal();
-                                Some(false)
-                            }
-                            _ => None,
-                        }
-                    };
-                    match key_event.code {
-                        KeyCode::Char('s') | KeyCode::Char('S') => {
-                            close_tab_confirm = false;
-                            if let Some(true) = activate_focused(engine, 0) {
-                                return;
-                            }
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            close_tab_confirm = false;
-                            if let Some(true) = activate_focused(engine, 1) {
-                                return;
-                            }
-                        }
-                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                            close_tab_confirm = false;
-                            let _ = activate_focused(engine, 2);
-                        }
-                        KeyCode::Enter => {
-                            close_tab_confirm = false;
-                            if let Some(true) = activate_focused(engine, close_tab_confirm_focus) {
-                                return;
-                            }
-                        }
-                        KeyCode::Tab | KeyCode::Right => {
-                            close_tab_confirm_focus =
-                                (close_tab_confirm_focus + 1) % render_impl::CLOSE_TAB_BTN_COUNT;
-                        }
-                        KeyCode::BackTab | KeyCode::Left => {
-                            close_tab_confirm_focus =
-                                (close_tab_confirm_focus + render_impl::CLOSE_TAB_BTN_COUNT - 1)
-                                    % render_impl::CLOSE_TAB_BTN_COUNT;
-                        }
-                        _ => {}
-                    }
-                    // Reset focus to 0 once the dialog closes so the next open
-                    // starts on Save.
-                    if !close_tab_confirm {
-                        close_tab_confirm_focus = 0;
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-
-                // ── MRU tab switcher ──────────────────────────────────────
-                // When open, intercept all press events. Alt+t / Ctrl+Tab
-                // cycle; release events and non-cycling keys are swallowed.
-                // Auto-confirm happens via poll timeout (400ms with no input).
-                if engine.tab_switcher_open && key_event.kind != KeyEventKind::Release {
-                    let alt = key_event.modifiers.contains(KeyModifiers::ALT);
-                    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-                    match key_event.code {
-                        KeyCode::Char('t') if alt => {
-                            engine.tab_switcher_cycle(true);
-                            tab_switcher_last_cycle = Some(Instant::now());
-                        }
-                        KeyCode::Tab if ctrl => {
-                            engine.tab_switcher_cycle(true);
-                            tab_switcher_last_cycle = Some(Instant::now());
-                        }
-                        KeyCode::Tab => {
-                            engine.tab_switcher_cycle(true);
-                            tab_switcher_last_cycle = Some(Instant::now());
-                        }
-                        KeyCode::BackTab => {
-                            engine.tab_switcher_cycle(false);
-                            tab_switcher_last_cycle = Some(Instant::now());
-                        }
-                        KeyCode::Esc => {
-                            engine.tab_switcher_open = false;
-                            tab_switcher_last_cycle = None;
-                        }
-                        KeyCode::Enter => {
-                            engine.tab_switcher_confirm();
-                            tab_switcher_last_cycle = None;
-                        }
-                        _ => {
-                            // Any other press confirms immediately
-                            engine.tab_switcher_confirm();
-                            tab_switcher_last_cycle = None;
-                        }
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-                // Swallow release events while tab switcher is open
-                if engine.tab_switcher_open && key_event.kind == KeyEventKind::Release {
-                    continue;
-                }
-
-                // Tab switcher openers (only on Press, not Release)
-                if key_event.kind != KeyEventKind::Release {
-                    let ctrl_held = key_event.modifiers.contains(KeyModifiers::CONTROL);
-                    let alt_held = key_event.modifiers.contains(KeyModifiers::ALT);
-                    // Ctrl+Tab / Alt+t: open or cycle forward
-                    if (ctrl_held && key_event.code == KeyCode::Tab)
-                        || (alt_held && !ctrl_held && key_event.code == KeyCode::Char('t'))
-                    {
-                        engine.tab_switcher_cycle(true);
-                        tab_switcher_last_cycle = Some(Instant::now());
-                        needs_redraw = true;
-                        continue;
-                    }
-                    // Ctrl+Shift+Tab: open or cycle backward
-                    if ctrl_held && key_event.code == KeyCode::BackTab {
-                        engine.tab_switcher_cycle(false);
-                        tab_switcher_last_cycle = Some(Instant::now());
-                        needs_redraw = true;
-                        continue;
-                    }
-                }
-
                 // ── Modal dialog intercepts ALL keys ──────────────────────
                 if engine.dialog.is_some() {
                     if let Some((key_name, unicode, ctrl)) =
                         translate_key(key_event, keyboard_enhanced)
                     {
                         let action = engine.handle_key(&key_name, unicode, ctrl);
-                        if action == EngineAction::Quit {
+                        if handle_action(engine, action) {
                             return;
                         }
                     } else if key_event.kind != KeyEventKind::Release {
-                        // translate_key doesn't map Tab — handle it directly.
                         match key_event.code {
                             KeyCode::Tab => {
                                 engine.handle_key("Tab", None, false);
@@ -3193,8 +2962,7 @@ fn event_loop(
                             engine.save_workspace_as(&ws_path);
                             needs_redraw = true;
                         } else if action == EngineAction::QuitWithUnsaved {
-                            quit_confirm = true;
-                            quit_confirm_focus = 0;
+                            engine.show_quit_confirm();
                             needs_redraw = true;
                         } else if action == EngineAction::ToggleSidebar {
                             sidebar.visible = !sidebar.visible;
@@ -3309,10 +3077,6 @@ fn event_loop(
                                 &mut last_click_pos,
                                 &mut mouse_text_drag,
                                 &mut folder_picker,
-                                &mut quit_confirm,
-                                &mut quit_confirm_focus,
-                                &mut close_tab_confirm,
-                                &mut close_tab_confirm_focus,
                                 &mut cmd_sel,
                                 &mut cmd_dragging,
                                 &mut mouse_should_quit,
@@ -3358,10 +3122,6 @@ fn event_loop(
                     &mut last_click_pos,
                     &mut mouse_text_drag,
                     &mut folder_picker,
-                    &mut quit_confirm,
-                    &mut quit_confirm_focus,
-                    &mut close_tab_confirm,
-                    &mut close_tab_confirm_focus,
                     &mut cmd_sel,
                     &mut cmd_dragging,
                     &mut mouse_should_quit,

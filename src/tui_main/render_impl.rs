@@ -101,10 +101,6 @@ pub(super) fn draw_frame(
     sidebar_width: u16,
     quickfix_scroll_top: usize,
     folder_picker: Option<&FolderPickerState>,
-    quit_confirm: bool,
-    quit_confirm_focus: usize,
-    close_tab_confirm: bool,
-    close_tab_confirm_focus: usize,
     cmd_sel: Option<(usize, usize)>,
     explorer_drop_target: Option<usize>,
     hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
@@ -1008,6 +1004,13 @@ pub(super) fn draw_frame(
             .max(dialog.title.chars().count() + 4)
             .max(btn_row_len);
         let width = (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
+        let n_buttons = dialog.buttons.len().max(1) as f32;
+        let inner = width - 2.0;
+        let capped_btn_w = if dialog.vertical_buttons {
+            btn_max_label as f32
+        } else {
+            (btn_max_label as f32).min(inner / n_buttons)
+        };
         let measure = quadraui::DialogMeasure {
             width,
             title_height: 1.0,
@@ -1018,7 +1021,7 @@ pub(super) fn draw_frame(
             } else {
                 1.0
             },
-            button_width: btn_max_label as f32,
+            button_width: capped_btn_w,
             button_gap: 0.0,
             padding: 1.0,
         };
@@ -1038,151 +1041,6 @@ pub(super) fn draw_frame(
             engine.menu_system.borrow().render(b, bar_rect);
         });
     }
-
-    // ── Quit confirm overlay — rendered on top of absolutely everything ───────
-    if quit_confirm {
-        let (dialog, layout) = build_quit_confirm_dialog(area, quit_confirm_focus);
-        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
-    }
-
-    // ── Close-tab confirm overlay ──────────────────────────────────────────────
-    if close_tab_confirm {
-        let (dialog, layout) = build_close_tab_dialog(area, close_tab_confirm_focus);
-        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
-    }
-}
-
-/// Build the close-tab-confirm Dialog primitive + its resolved layout.
-/// Shared between the draw site (`render_window` above) and the mouse
-/// hit-test site (`mouse.rs`) so a button's visual rect and its click
-/// rect are identical by construction.
-/// Button indices in the close-tab confirm dialog. Tab / arrow keys
-/// cycle `focus_idx` through these in order.
-pub(super) const CLOSE_TAB_BTN_COUNT: usize = 3;
-
-/// Button indices in the quit-confirm dialog (unsaved-changes-on-exit).
-/// Tab / arrow keys cycle `focus_idx` through these in order:
-/// 0 = Save All & Quit, 1 = Quit Anyway, 2 = Cancel.
-pub(super) const QUIT_CONFIRM_BTN_COUNT: usize = 3;
-
-/// Build the quit-confirm Dialog primitive + its resolved layout.
-/// Shared between the draw site (`render_window` above) and the mouse
-/// hit-test site (`mouse.rs`) so a button's visual rect and its click
-/// rect are identical by construction.
-pub(super) fn build_quit_confirm_dialog(
-    area: Rect,
-    focus_idx: usize,
-) -> (quadraui::Dialog, quadraui::DialogLayout) {
-    let focus = focus_idx.min(QUIT_CONFIRM_BTN_COUNT - 1);
-    let dialog = quadraui::Dialog {
-        id: quadraui::WidgetId::new("quit_confirm"),
-        title: quadraui::StyledText::plain("Unsaved Changes"),
-        body: vec![quadraui::StyledText::plain(
-            "You have unsaved changes. Quit anyway?",
-        )],
-        buttons: vec![
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("quit:save_all"),
-                label: "[S] Save All & Quit".to_string(),
-                is_default: focus == 0,
-                is_cancel: false,
-                tint: None,
-            },
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("quit:force"),
-                label: "[Q] Quit Anyway".to_string(),
-                is_default: focus == 1,
-                is_cancel: false,
-                tint: None,
-            },
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("quit:cancel"),
-                label: "[Esc] Cancel".to_string(),
-                is_default: focus == 2,
-                is_cancel: true,
-                tint: None,
-            },
-        ],
-        severity: Some(quadraui::DialogSeverity::Warning),
-        vertical_buttons: false,
-        input: None,
-    };
-    let viewport = quadraui::Rect::new(
-        area.x as f32,
-        area.y as f32,
-        area.width as f32,
-        area.height as f32,
-    );
-    let measure = quadraui::DialogMeasure {
-        width: 58.0,
-        title_height: 1.0,
-        body_height: 1.0,
-        input_height: 0.0,
-        button_row_height: 1.0,
-        button_width: 22.0,
-        button_gap: 2.0,
-        padding: 1.0,
-    };
-    let layout = dialog.layout(viewport, measure);
-    (dialog, layout)
-}
-
-pub(super) fn build_close_tab_dialog(
-    area: Rect,
-    focus_idx: usize,
-) -> (quadraui::Dialog, quadraui::DialogLayout) {
-    let focus = focus_idx.min(CLOSE_TAB_BTN_COUNT - 1);
-    let dialog = quadraui::Dialog {
-        id: quadraui::WidgetId::new("close_tab_confirm"),
-        title: quadraui::StyledText::plain("Unsaved Changes"),
-        body: vec![quadraui::StyledText::plain(
-            "This file has unsaved changes.",
-        )],
-        buttons: vec![
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("close_tab:save"),
-                label: "[S] Save".to_string(),
-                is_default: focus == 0,
-                is_cancel: false,
-                tint: None,
-            },
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("close_tab:discard"),
-                label: "[D] Discard".to_string(),
-                is_default: focus == 1,
-                is_cancel: false,
-                tint: None,
-            },
-            quadraui::DialogButton {
-                id: quadraui::WidgetId::new("close_tab:cancel"),
-                label: "[Esc] Cancel".to_string(),
-                is_default: focus == 2,
-                is_cancel: true,
-                tint: None,
-            },
-        ],
-        severity: Some(quadraui::DialogSeverity::Warning),
-        vertical_buttons: false,
-        input: None,
-    };
-    let viewport = quadraui::Rect::new(
-        area.x as f32,
-        area.y as f32,
-        area.width as f32,
-        area.height as f32,
-    );
-    let measure = quadraui::DialogMeasure {
-        width: 54.0,
-        title_height: 1.0,
-        body_height: 1.0,
-        input_height: 0.0,
-        button_row_height: 1.0,
-        button_width: 14.0,
-        button_gap: 2.0,
-        padding: 1.0,
-    };
-    let layout = dialog.layout(viewport, measure);
-    (dialog, layout)
 }
 
 /// Convert a TUI-local `FolderPickerState` into a `quadraui::Palette`.
@@ -2169,14 +2027,10 @@ mod tests {
                     &mut sidebar,
                     engine,
                     sidebar_width,
-                    0,     // quickfix_scroll_top
-                    None,  // folder_picker
-                    false, // quit_confirm
-                    0,     // quit_confirm_focus
-                    false, // close_tab_confirm
-                    0,     // close_tab_confirm_focus
-                    None,  // cmd_sel
-                    None,  // explorer_drop_target
+                    0,    // quickfix_scroll_top
+                    None, // folder_picker
+                    None, // cmd_sel
+                    None, // explorer_drop_target
                     &mut hover_link_rects,
                     &mut hover_popup_rect,
                     &mut editor_hover_popup_rect,

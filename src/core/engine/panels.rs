@@ -26,6 +26,61 @@ impl Engine {
         });
     }
 
+    /// Show the quit-with-unsaved-changes confirm dialog.
+    pub fn show_quit_confirm(&mut self) {
+        self.show_dialog(
+            "quit_unsaved",
+            "Unsaved Changes",
+            vec![
+                "You have unsaved changes.".to_string(),
+                "Do you want to save before quitting?".to_string(),
+            ],
+            vec![
+                DialogButton {
+                    label: "Save All & Quit".into(),
+                    hotkey: 's',
+                    action: "save_quit".into(),
+                },
+                DialogButton {
+                    label: "Quit Without Saving".into(),
+                    hotkey: 'q',
+                    action: "discard_quit".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
+    /// Show the close-tab-with-unsaved-changes confirm dialog.
+    pub fn show_close_tab_confirm(&mut self) {
+        self.show_dialog(
+            "close_tab_confirm",
+            "Unsaved Changes",
+            vec!["This file has unsaved changes.".to_string()],
+            vec![
+                DialogButton {
+                    label: "Save & Close".into(),
+                    hotkey: 's',
+                    action: "save_close".into(),
+                },
+                DialogButton {
+                    label: "Discard & Close".into(),
+                    hotkey: 'd',
+                    action: "discard".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
     /// Convenience: show an error dialog with a single OK button.
     #[allow(dead_code)]
     pub fn show_error_dialog(&mut self, title: &str, message: &str) {
@@ -367,11 +422,11 @@ impl Engine {
                     "save_close" => {
                         self.escape_to_normal();
                         let _ = self.save();
-                        self.close_tab();
+                        return self.execute_command("quit");
                     }
                     "discard" => {
                         self.escape_to_normal();
-                        self.close_tab();
+                        return self.execute_command("quit!");
                     }
                     _ => {} // cancel — do nothing
                 }
