@@ -1418,32 +1418,21 @@ pub(super) fn render_picker_popup(
     theme: &Theme,
     backend: &mut super::backend::TuiBackend,
 ) {
-    let term_cols = term_area.width;
-    let term_rows = term_area.height;
     let has_preview = picker.preview.is_some();
+    let geo = render::PickerGeometry::compute(
+        term_area.width as f32,
+        term_area.height as f32,
+        has_preview,
+        &render::TUI_PICKER_SIZING,
+    );
+    let x = geo.popup_x as u16;
+    let y = geo.popup_y as u16;
+    let width = geo.popup_w as u16;
+    let height = geo.popup_h as u16;
+    let left_w = geo.left_pane_w as u16;
 
-    // Phase A.4 migration: flat-list palettes (no preview pane, no tree
-    // depth) render through the shared `quadraui::Palette` primitive.
-    // File and symbol pickers fall through to the legacy renderer below
-    // because the primitive doesn't carry preview / tree indent yet.
     if let Some(palette) = render::picker_panel_to_palette(picker) {
-        let width = (term_cols * 55 / 100).max(55);
-        let height = (term_rows * 60 / 100).max(16);
-        let x = (term_cols.saturating_sub(width)) / 2;
-        let y = (term_rows.saturating_sub(height)) / 2;
-        let area = Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-        // Phase B.4 Stage 2: route through `Backend::draw_palette`.
-        let q_rect = quadraui::Rect::new(
-            area.x as f32,
-            area.y as f32,
-            area.width as f32,
-            area.height as f32,
-        );
+        let q_rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
         backend.enter_frame_scope(frame, |b| {
             use quadraui::Backend;
@@ -1451,21 +1440,6 @@ pub(super) fn render_picker_popup(
         });
         return;
     }
-
-    // Size adapts based on whether we have a preview pane
-    let width = if has_preview {
-        (term_cols * 4 / 5).max(60)
-    } else {
-        (term_cols * 55 / 100).max(55)
-    };
-    let height = if has_preview {
-        (term_rows * 65 / 100).max(18)
-    } else {
-        (term_rows * 60 / 100).max(16)
-    };
-
-    let x = (term_cols.saturating_sub(width)) / 2;
-    let y = (term_rows.saturating_sub(height)) / 2;
 
     let bg_color = rc(theme.fuzzy_bg);
     let sel_bg_color = rc(theme.fuzzy_selected_bg);
@@ -1477,8 +1451,6 @@ pub(super) fn render_picker_popup(
 
     let buf = frame.buffer_mut();
 
-    // Clear popup background so stale characters from previous content
-    // (e.g. cycling through files with different preview lengths) don't persist.
     for row in y..y + height {
         for col in x..x + width {
             if col < term_area.width && row < term_area.height {
@@ -1486,13 +1458,6 @@ pub(super) fn render_picker_popup(
             }
         }
     }
-
-    // Left pane width for two-pane mode
-    let left_w = if has_preview {
-        (width as usize * 35 / 100) as u16
-    } else {
-        0
-    };
 
     // Row 0: top border ╭─ Title ── N/M ──╮
     let title_text = format!(
@@ -1567,10 +1532,9 @@ pub(super) fn render_picker_popup(
         }
     }
 
-    // Result rows
     let results_start = y + 3;
-    let results_end = y + height - 1;
-    let visible_rows = (results_end.saturating_sub(results_start)) as usize;
+    let results_end = results_start + geo.visible_rows as u16;
+    let visible_rows = geo.visible_rows;
 
     // Determine effective item width for the left pane
     let item_end_col = if has_preview { left_w } else { width - 1 };

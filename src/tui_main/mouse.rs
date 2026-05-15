@@ -541,21 +541,18 @@ pub(super) fn handle_mouse(
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
                 let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_h = if has_preview {
-                    (term_rows * 65 / 100).max(18)
-                } else {
-                    (term_rows * 60 / 100).max(16)
-                };
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
+                let geo = render::PickerGeometry::compute(
+                    term_cols as f32,
+                    term_rows as f32,
+                    has_preview,
+                    &render::TUI_PICKER_SIZING,
+                );
+                let popup_x = geo.popup_x as u16;
+                let popup_y = geo.popup_y as u16;
+                let popup_w = geo.popup_w as u16;
                 let results_start = popup_y + 3;
-                let results_end = popup_y + popup_h - 1;
-                let visible_rows = results_end.saturating_sub(results_start) as usize;
+                let results_end = results_start + geo.visible_rows as u16;
+                let visible_rows = geo.visible_rows;
                 let total_items = engine.picker_items.len();
 
                 // Phase B.4: route the click through quadraui's modal
@@ -570,10 +567,10 @@ pub(super) fn handle_mouse(
                 modal_stack.push(
                     picker_id.clone(),
                     quadraui::Rect {
-                        x: popup_x as f32,
-                        y: popup_y as f32,
-                        width: popup_w as f32,
-                        height: popup_h as f32,
+                        x: geo.popup_x,
+                        y: geo.popup_y,
+                        width: geo.popup_w,
+                        height: geo.popup_h,
                     },
                 );
                 let events = quadraui::dispatch_mouse_down(
@@ -680,64 +677,35 @@ pub(super) fn handle_mouse(
             MouseEventKind::Up(MouseButton::Left) => {
                 drag_state.end();
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
                 let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_h = if has_preview {
-                    (term_rows * 65 / 100).max(18)
-                } else {
-                    (term_rows * 60 / 100).max(16)
-                };
-                let visible_rows = popup_h.saturating_sub(4) as usize;
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let left_w = if has_preview {
-                    (popup_w as usize * 35 / 100) as u16
-                } else {
-                    0
-                };
+                let geo = render::PickerGeometry::compute(
+                    term_cols as f32,
+                    term_rows as f32,
+                    has_preview,
+                    &render::TUI_PICKER_SIZING,
+                );
+                let popup_x = geo.popup_x as u16;
+                let left_w = geo.left_pane_w as u16;
+                let scroll_down = matches!(ev.kind, MouseEventKind::ScrollDown);
                 if has_preview && col > popup_x + left_w {
-                    let max = engine
-                        .picker_preview
-                        .as_ref()
-                        .map(|p| p.lines.len())
-                        .unwrap_or(0);
-                    engine.picker_preview_scroll =
-                        (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
+                    if scroll_down {
+                        let max = engine
+                            .picker_preview
+                            .as_ref()
+                            .map(|p| p.lines.len())
+                            .unwrap_or(0);
+                        engine.picker_preview_scroll =
+                            (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
+                    } else {
+                        engine.picker_preview_scroll =
+                            engine.picker_preview_scroll.saturating_sub(3);
+                    }
                 } else {
-                    engine.picker_scroll(3, visible_rows);
-                }
-            }
-            MouseEventKind::ScrollUp => {
-                let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
-                let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_h = if has_preview {
-                    (term_rows * 65 / 100).max(18)
-                } else {
-                    (term_rows * 60 / 100).max(16)
-                };
-                let visible_rows = popup_h.saturating_sub(4) as usize;
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let left_w = if has_preview {
-                    (popup_w as usize * 35 / 100) as u16
-                } else {
-                    0
-                };
-                if has_preview && col > popup_x + left_w {
-                    engine.picker_preview_scroll = engine.picker_preview_scroll.saturating_sub(3);
-                } else {
-                    engine.picker_scroll(-3, visible_rows);
+                    let delta = if scroll_down { 3 } else { -3 };
+                    engine.picker_scroll(delta, geo.visible_rows);
                 }
             }
             _ => {} // consume all other events

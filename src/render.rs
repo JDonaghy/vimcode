@@ -1342,6 +1342,82 @@ pub struct PickerPanel {
     pub preview_scroll: usize,
 }
 
+// ─── PickerGeometry ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct PickerSizing {
+    pub min_w: (f32, f32),
+    pub min_h: (f32, f32),
+    pub left_pane_ratio: f32,
+    pub header_h: f32,
+    pub line_h: f32,
+}
+
+pub const TUI_PICKER_SIZING: PickerSizing = PickerSizing {
+    min_w: (55.0, 60.0),
+    min_h: (16.0, 18.0),
+    left_pane_ratio: 0.35,
+    header_h: 4.0,
+    line_h: 1.0,
+};
+
+pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
+    PickerSizing {
+        min_w: (500.0, 600.0),
+        min_h: (350.0, 400.0),
+        left_pane_ratio: 0.40,
+        header_h: 2.0 * line_height + 2.0,
+        line_h: line_height,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PickerGeometry {
+    pub popup_x: f32,
+    pub popup_y: f32,
+    pub popup_w: f32,
+    pub popup_h: f32,
+    pub left_pane_w: f32,
+    pub visible_rows: usize,
+}
+
+impl PickerGeometry {
+    pub fn compute(
+        viewport_w: f32,
+        viewport_h: f32,
+        has_preview: bool,
+        sizing: &PickerSizing,
+    ) -> Self {
+        let popup_w = if has_preview {
+            (viewport_w * 0.8).max(sizing.min_w.1)
+        } else {
+            (viewport_w * 0.55).max(sizing.min_w.0)
+        };
+        let popup_h = if has_preview {
+            (viewport_h * 0.65).max(sizing.min_h.1)
+        } else {
+            (viewport_h * 0.60).max(sizing.min_h.0)
+        };
+        let popup_x = (viewport_w - popup_w) / 2.0;
+        let popup_y = (viewport_h - popup_h) / 2.0;
+        let left_pane_w = if has_preview {
+            popup_w * sizing.left_pane_ratio
+        } else {
+            0.0
+        };
+        let results_h = (popup_h - sizing.header_h).max(0.0);
+        let visible_rows = (results_h / sizing.line_h) as usize;
+        PickerGeometry {
+            popup_x,
+            popup_y,
+            popup_w,
+            popup_h,
+            left_pane_w,
+            visible_rows,
+        }
+    }
+}
+
 // ─── TabSwitcherPanel ─────────────────────────────────────────────────────
 
 /// Data needed to render the tab switcher popup (Ctrl+Tab MRU list).

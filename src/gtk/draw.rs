@@ -1733,50 +1733,29 @@ pub(super) fn draw_picker_popup(
     };
 
     let has_preview = picker.preview.is_some();
+    let geo = render::PickerGeometry::compute(
+        editor_width as f32,
+        editor_height as f32,
+        has_preview,
+        &render::gtk_picker_sizing(line_height as f32),
+    );
+    let popup_x = geo.popup_x as f64;
+    let popup_y = geo.popup_y as f64;
+    let popup_w = geo.popup_w as f64;
+    let popup_h = geo.popup_h as f64;
 
-    // Phase A.4b migration: flat-list palettes (no preview pane, no tree
-    // depth) render through the shared `quadraui::Palette` primitive.
-    // File and symbol pickers fall through to the legacy renderer below
-    // because the primitive doesn't carry preview / tree indent yet.
-    //
-    // Phase B.5b Stage 8: route through `Backend::draw_palette` instead
-    // of the direct `quadraui_gtk::draw_palette` shim.
     if let Some(palette) = render::picker_panel_to_palette(picker) {
-        let popup_w = (editor_width * 0.55).max(500.0);
-        let popup_h = (editor_height * 0.60).max(350.0);
-        let popup_x = (editor_width - popup_w) / 2.0;
-        let popup_y = (editor_height - popup_h) / 2.0;
         use quadraui::Backend;
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
             b.draw_palette(
-                quadraui::Rect::new(
-                    popup_x as f32,
-                    popup_y as f32,
-                    popup_w as f32,
-                    popup_h as f32,
-                ),
+                quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h),
                 &palette,
             );
         });
         return;
     }
-
-    // Size adapts based on whether we have a preview pane
-    let popup_w = if has_preview {
-        (editor_width * 0.8).max(600.0)
-    } else {
-        (editor_width * 0.55).max(500.0)
-    };
-    let popup_h = if has_preview {
-        (editor_height * 0.65).max(400.0)
-    } else {
-        (editor_height * 0.60).max(350.0)
-    };
-
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
 
     // Background
     let (r, g, b) = theme.fuzzy_bg.to_cairo();
@@ -1823,18 +1802,20 @@ pub(super) fn draw_picker_popup(
     cr.line_to(popup_x + popup_w, sep_y);
     cr.stroke().ok();
 
-    // Two-pane layout
-    let left_pane_w = if has_preview { popup_w * 0.4 } else { popup_w };
+    let left_pane_w = if has_preview {
+        geo.left_pane_w as f64
+    } else {
+        popup_w
+    };
 
     if has_preview {
-        // Vertical separator
         cr.move_to(popup_x + left_pane_w, sep_y);
         cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
         cr.stroke().ok();
     }
 
     let rows_area_h = popup_h - 2.0 * line_height - 2.0;
-    let visible_rows = (rows_area_h / line_height) as usize;
+    let visible_rows = geo.visible_rows;
 
     // Scrollbar geometry (single-pane only)
     let total_items = picker.items.len();
