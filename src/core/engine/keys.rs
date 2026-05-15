@@ -7751,7 +7751,8 @@ impl Engine {
         if self.sc_commit_input_active {
             for c in first_line.chars() {
                 if !c.is_control() {
-                    self.sc_commit_message.push(c);
+                    self.sc_commit_message.insert(self.sc_commit_cursor, c);
+                    self.sc_commit_cursor += c.len_utf8();
                 }
             }
             return;
