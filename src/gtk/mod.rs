@@ -7504,18 +7504,17 @@ impl App {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
                         match widget.as_str() {
                             "picker" => {
+                                let lh = self.cached_line_height.max(1.0);
+                                let has_preview = self.engine.borrow().picker_preview.is_some();
+                                let geo = render::PickerGeometry::compute(
+                                    width as f32,
+                                    height as f32,
+                                    has_preview,
+                                    &render::gtk_picker_sizing(lh as f32),
+                                );
+                                let vis = geo.visible_rows;
                                 let mut engine = self.engine.borrow_mut();
                                 engine.picker_scroll_top = *new_offset;
-                                // Nudge selection into view so the
-                                // renderer's selection-anchored clamp
-                                // doesn't snap back.
-                                let vis = if self.cached_line_height > 0.0 {
-                                    let (_, _, _, ph) =
-                                        self.compute_picker_popup_bounds(width, height);
-                                    (ph / self.cached_line_height).floor() as usize
-                                } else {
-                                    0
-                                };
                                 if engine.picker_selected < *new_offset {
                                     engine.picker_selected = *new_offset;
                                 } else if vis > 0 && engine.picker_selected >= *new_offset + vis {
