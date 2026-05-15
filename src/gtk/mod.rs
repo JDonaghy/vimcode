@@ -7421,19 +7421,18 @@ impl App {
         let engine = self.engine.borrow();
         let has_preview = engine.picker_preview.is_some();
         drop(engine);
-        let popup_w = if has_preview {
-            (width * 0.8).max(600.0)
-        } else {
-            (width * 0.55).max(500.0)
+        let sizing = render::PickerSizing {
+            header_h: 0.0,
+            line_h: 1.0,
+            ..render::gtk_picker_sizing(1.0)
         };
-        let popup_h = if has_preview {
-            (height * 0.65).max(400.0)
-        } else {
-            (height * 0.60).max(350.0)
-        };
-        let popup_x = (width - popup_w) / 2.0;
-        let popup_y = (height - popup_h) / 2.0;
-        (popup_x, popup_y, popup_w, popup_h)
+        let geo = render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
+        (
+            geo.popup_x as f64,
+            geo.popup_y as f64,
+            geo.popup_w as f64,
+            geo.popup_h as f64,
+        )
     }
 
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
