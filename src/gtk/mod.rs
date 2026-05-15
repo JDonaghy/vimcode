@@ -6608,46 +6608,57 @@ impl App {
                 }
 
                 if hit_modal {
-                    // Click inside picker: drive inner hit math.
-                    // Results region starts below title + query + separator.
                     let lh = self.cached_line_height.max(1.0);
+                    let has_preview = self.engine.borrow().picker_preview.is_some();
+                    let list_w = if has_preview {
+                        (popup_w * 0.4_f64).round()
+                    } else {
+                        popup_w
+                    };
                     let results_top = popup_y + lh * 2.0 + 1.0;
                     let results_bottom = popup_y + popup_h;
-
-                    // Scrollbar hit-test (right-edge column, same as
-                    // `draw_palette`). When overflowing rows exist,
-                    // clicking the track jump-scrolls and begins a
-                    // drag so mouse-move updates the offset. Fixes #190.
                     const BOTTOM_INSET: f64 = 4.0;
                     let rows_h_raw = (results_bottom - results_top - BOTTOM_INSET).max(0.0);
                     let visible_rows = (rows_h_raw / lh) as usize;
                     let rows_h = visible_rows as f64 * lh;
-                    let (total, has_scrollbar) = {
+                    let (total, scroll_top, selected) = {
                         let engine = self.engine.borrow();
-                        let t = engine.picker_items.len();
-                        (t, t > visible_rows)
+                        (
+                            engine.picker_items.len(),
+                            engine.picker_scroll_top,
+                            engine.picker_selected,
+                        )
                     };
+                    let has_scrollbar = total > visible_rows;
+
+                    let max_offset = total.saturating_sub(visible_rows);
+                    let effective_offset = if visible_rows == 0 {
+                        0
+                    } else if selected < scroll_top {
+                        selected
+                    } else if selected >= scroll_top + visible_rows {
+                        selected + 1 - visible_rows
+                    } else {
+                        scroll_top
+                    }
+                    .min(max_offset);
+
                     const SB_W: f64 = 6.0;
-                    let sb_x = popup_x + popup_w - SB_W;
+                    let sb_x = popup_x + list_w - SB_W;
                     let on_scrollbar = has_scrollbar
                         && visible_rows > 0
                         && x >= sb_x
-                        && x < popup_x + popup_w
+                        && x < popup_x + list_w
                         && y >= results_top
                         && y < results_top + rows_h;
 
                     if on_scrollbar {
-                        // Jump-scroll to clicked position AND begin
-                        // drag so mouse-move updates offset live.
                         let rel = ((y - results_top) / rows_h).clamp(0.0, 1.0);
                         let max_scroll = total.saturating_sub(visible_rows);
                         let new_offset = (rel * max_scroll as f64).round() as usize;
                         {
                             let mut engine = self.engine.borrow_mut();
                             engine.picker_scroll_top = new_offset;
-                            // Nudge selection into the new viewport so
-                            // the renderer's selection-anchored clamp
-                            // doesn't snap the scroll back.
                             if engine.picker_selected < new_offset {
                                 engine.picker_selected = new_offset;
                             } else if engine.picker_selected >= new_offset + visible_rows {
@@ -6673,7 +6684,7 @@ impl App {
                     } else if y >= results_top && y < results_bottom {
                         let mut engine = self.engine.borrow_mut();
                         let clicked_idx =
-                            engine.picker_scroll_top + ((y - results_top) / lh) as usize;
+                            effective_offset + ((y - results_top) / lh) as usize;
                         if clicked_idx < engine.picker_items.len() {
                             engine.picker_selected = clicked_idx;
                             engine.picker_load_preview();
