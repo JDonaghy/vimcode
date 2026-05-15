@@ -7701,11 +7701,94 @@ impl Engine {
         }
     }
 
-    /// Pre-load clipboard text into the `+` and `*` registers.
-    /// Called by GTK backend after an async GDK clipboard read, before paste.
-    pub fn load_clipboard_register(&mut self, text: String) {
-        self.registers.insert('+', (text.clone(), false));
-        self.registers.insert('*', (text, false));
+    /// Route pasted text to the correct input context.
+    ///
+    /// Checks active contexts in priority order (terminal, picker, search,
+    /// SC commit, extension sidebar, AI chat) before falling through to
+    /// mode-based dispatch. Both backends call this instead of reimplementing
+    /// the priority chain.
+    pub fn route_paste(&mut self, text: &str) {
+        let first_line = text.lines().next().unwrap_or("");
+
+        if self.terminal_has_focus {
+            if self.terminal_find_active {
+                for ch in first_line.chars() {
+                    if !ch.is_control() {
+                        self.terminal_find_char(ch);
+                    }
+                }
+            } else if !text.is_empty() {
+                self.terminal_write(b"\x1b[200~");
+                self.terminal_write(text.as_bytes());
+                self.terminal_write(b"\x1b[201~");
+                self.poll_terminal();
+            }
+            return;
+        }
+
+        if self.picker_open {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.picker_query.push(c);
+                }
+            }
+            self.picker_selected = 0;
+            self.picker_scroll_top = 0;
+            self.picker_filter();
+            self.picker_load_preview();
+            return;
+        }
+
+        if self.search_has_focus {
+            let focus_id = self.search_panel_form_focus.borrow().clone();
+            if focus_id.is_some() {
+                let is_replace = focus_id.as_deref() == Some("search:replace");
+                self.search_input_paste(is_replace, first_line);
+                return;
+            }
+        }
+
+        if self.sc_commit_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.sc_commit_message.push(c);
+                }
+            }
+            return;
+        }
+
+        if self.ext_sidebar_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.ext_sidebar_query.push(c);
+                }
+            }
+            return;
+        }
+
+        if self.ai_has_focus && self.ai_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.ai_input.push(c);
+                }
+            }
+            return;
+        }
+
+        match self.mode {
+            Mode::Command | Mode::Search => {
+                self.paste_text_to_input(text);
+            }
+            Mode::Insert | Mode::Replace => {
+                self.paste_in_insert_mode(text);
+            }
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                if !text.is_empty() {
+                    self.load_clipboard_for_paste(text.to_string());
+                    self.handle_key("p", Some('p'), false);
+                }
+            }
+        }
     }
 
     /// Pre-load clipboard text into `"`, `+`, and `*` before a p/P keypress.

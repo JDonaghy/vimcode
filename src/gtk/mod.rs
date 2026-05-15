@@ -10570,34 +10570,7 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ClipboardPasteToInput { text } => {
-                // GDK clipboard text arrived for Ctrl-Shift-V paste.
-                use core::Mode;
-                let mut engine = self.engine.borrow_mut();
-                if engine.search_has_focus {
-                    let is_replace = engine.search_panel_form_focus.borrow().as_deref()
-                        == Some("search:replace");
-                    engine.search_input_paste(is_replace, &text);
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                        da.queue_draw();
-                    }
-                    return;
-                }
-                match engine.mode {
-                    Mode::Command | Mode::Search => {
-                        engine.paste_text_to_input(&text);
-                    }
-                    Mode::Insert | Mode::Replace => {
-                        engine.paste_in_insert_mode(&text);
-                    }
-                    Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                        if !text.is_empty() {
-                            engine.load_clipboard_for_paste(text);
-                            engine.handle_key("", Some('p'), false);
-                        }
-                    }
-                }
+                self.engine.borrow_mut().route_paste(&text);
                 self.draw_needed.set(true);
             }
             Msg::WindowClosing { width, height } => {
