@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 14, 2026 (Session 373 — **Backend dedup batch: 4 engine extractions, ~549 lines removed.** Closed #383 `execute_terminal_toolbar_action`, #376 `check_settings_reload`, #375 `route_paste`, #377 `handle_quit_confirm`+`handle_close_tab_confirm`. Closed #379 as N/A (GTK context menu keys are dead code — GTK uses native PopoverMenu). Filed #395 (migrate GTK popovers to quadraui ContextMenu) and quadraui#175. TUI quit/close-tab confirms migrated from local variables to engine dialog system. Added `show_quit_confirm()`/`show_close_tab_confirm()` convenience methods. Fixed dialog button overflow + last-tab close-confirm exit.)
+**Last updated:** May 14, 2026 (Session 373 — **Backend dedup batch: 7 issues addressed, ~580 lines removed.** Landed #383 `execute_terminal_toolbar_action`, #376 `check_settings_reload`, #375 `route_paste`, #377 `handle_quit_confirm`+`handle_close_tab_confirm`, #388 SC button hover dedup, #387 `find_window_at`+`window_zone_hit_test` for TUI mouse. Closed #379 as N/A (GTK context menu keys dead code). Filed #395 (migrate GTK native popovers to quadraui ContextMenu). TUI quit/close-tab confirms migrated to engine dialog system. Added `show_quit_confirm()`/`show_close_tab_confirm()`, `route_paste()`, `check_settings_reload()`, `execute_terminal_toolbar_action()`, `find_window_at()`, `resolve_text_position()`.)
 
 ## Active milestone: Cross-Platform UI Crate
 

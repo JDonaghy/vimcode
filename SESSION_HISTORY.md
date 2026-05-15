@@ -4,13 +4,15 @@ Detailed per-session implementation notes archived from PROJECT_STATE.md.
 All sessions through 373 archived here.
 
 ---
-**Session 373 (May 14) — Backend dedup batch: 4 engine extractions, ~549 lines removed:**
+**Session 373 (May 14) — Backend dedup batch: 7 issues addressed, ~580 lines removed:**
 
 **Landed PRs:**
 - #392: `Engine::execute_terminal_toolbar_action(action, ctx)` (#383) — both backends' ~30-line match dispatch → one engine method. `StartResize` stays backend-local.
 - #393: `Engine::check_settings_reload()` (#376) — engine owns `settings_mtime` + `settings_save_revision`. TUI ~23 lines + GTK ~20 lines → 1 call each.
 - #396: `Engine::route_paste(text)` (#375) — paste routing (terminal/picker/search/SC/ext/AI/mode-based) moved to engine. TUI ~108 lines + GTK ~30 lines removed. Fixed GTK missing paste for picker/SC/ext/AI contexts. Removed unused `load_clipboard_register`. Fixed SC commit paste to insert at cursor position.
 - #397: TUI quit/close-tab confirms use engine dialog system (#377) — migrated TUI from local `quit_confirm`/`close_tab_confirm` flags + custom key/mouse/render handlers (~460 lines) to engine's `show_dialog`/`handle_dialog_key`/`process_dialog_result`. Added `Engine::show_quit_confirm()`/`show_close_tab_confirm()` convenience methods. Fixed dialog button overflow (capped `button_width` to fit dialog). Fixed `close_tab_confirm` save/discard to use `execute_command("quit"/"quit!")` so last-tab case exits app.
+- #398: SC button hover uses `Engine::sc_button_hit_test` (#388) — TUI + GTK hover handlers replaced inline `commit_w/icon_w` formula with existing engine method. -16 lines.
+- #399: TUI mouse uses shared `find_window_at` + `window_zone_hit_test` (#387) — added `render::find_window_at()` + `resolve_text_position()`. Migrated 3 TUI mouse sites (drag, scroll-dispatch, hover) from inline window walks. Main click handler (site 4) left for future restructure.
 
 **Closed without merge:**
 - #379: `handle_context_menu_key` — discovered GTK context menu key handling is dead code. GTK uses native `PopoverMenu` widgets, opens engine `context_menu` only to clone items then immediately closes it. Engine's `handle_context_menu_key` never reached on GTK.
