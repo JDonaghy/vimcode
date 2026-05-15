@@ -299,7 +299,7 @@ struct App {
     activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// A.6f: shared `active_panel` mirror — lets the draw func read the
     /// current panel without borrowing `&self`. Updated in `Msg::SwitchPanel`.
-    activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>>,
+
     /// Row height actually used by the most recent explorer draw call.
     /// The draw callback writes this each frame from the same Pango
     /// context it renders with, so click and scroll handlers hit-test with
@@ -512,64 +512,59 @@ struct App {
 /// draw function via a separate `hovered_idx` parameter.
 fn build_gtk_activity_bar_primitive(
     engine: &crate::core::engine::Engine,
-    active: &SidebarPanel,
     theme: &crate::render::Theme,
 ) -> quadraui::ActivityBar {
+    use crate::core::engine::sidebar::*;
+    let sb_visible = engine.app_shell.sidebar_visible();
+    let has_ext = engine.ext_panel_active.is_some();
+    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
+
     let fixed = [
         (
-            SidebarPanel::Explorer,
+            PANEL_EXPLORER,
             icons::EXPLORER.nerd,
             "Explorer (Ctrl+Shift+E)",
             "activity:explorer",
         ),
         (
-            SidebarPanel::Search,
+            PANEL_SEARCH,
             icons::SEARCH_COD.nerd,
             "Search (Ctrl+Shift+F)",
             "activity:search",
         ),
+        (PANEL_DEBUG, icons::DEBUG.nerd, "Debug", "activity:debug"),
         (
-            SidebarPanel::Debug,
-            icons::DEBUG.nerd,
-            "Debug",
-            "activity:debug",
-        ),
-        (
-            SidebarPanel::Git,
+            PANEL_GIT,
             icons::GIT_BRANCH.nerd,
             "Source Control",
             "activity:git",
         ),
         (
-            SidebarPanel::Extensions,
+            PANEL_EXTENSIONS,
             icons::EXTENSIONS.nerd,
             "Extensions",
             "activity:extensions",
         ),
-        (
-            SidebarPanel::Ai,
-            icons::AI_CHAT.nerd,
-            "AI Assistant",
-            "activity:ai",
-        ),
+        (PANEL_AI, icons::AI_CHAT.nerd, "AI Assistant", "activity:ai"),
     ];
 
     let mut top: Vec<quadraui::ActivityItem> = fixed
         .iter()
-        .map(|(panel, icon, tooltip, id)| quadraui::ActivityItem {
-            id: quadraui::WidgetId::new(*id),
-            icon: (*icon).to_string(),
-            tooltip: (*tooltip).to_string(),
-            is_active: active == panel,
-            is_keyboard_selected: false,
-        })
+        .map(
+            |(panel_id, icon, tooltip, activity_id)| quadraui::ActivityItem {
+                id: quadraui::WidgetId::new(*activity_id),
+                icon: (*icon).to_string(),
+                tooltip: (*tooltip).to_string(),
+                is_active: sb_visible && !has_ext && active_id == Some(*panel_id),
+                is_keyboard_selected: false,
+            },
+        )
         .collect();
 
-    // Dynamic extension panels (sorted by name).
     let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
     ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
     for panel in ext_panels {
-        let is_active = matches!(active, SidebarPanel::ExtPanel(n) if n == &panel.name);
+        let is_active = sb_visible && engine.ext_panel_active.as_deref() == Some(&panel.name);
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
             icon: panel.resolved_icon().to_string(),
@@ -583,7 +578,7 @@ fn build_gtk_activity_bar_primitive(
         id: quadraui::WidgetId::new("activity:settings"),
         icon: icons::SETTINGS.nerd.to_string(),
         tooltip: "Settings".to_string(),
-        is_active: matches!(active, SidebarPanel::Settings),
+        is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
         is_keyboard_selected: false,
     }];
 
@@ -1941,8 +1936,7 @@ impl SimpleComponent for App {
         let activity_bar_hits: Rc<RefCell<Vec<quadraui::ActivityBarRowHit>>> =
             Rc::new(RefCell::new(Vec::new()));
         let activity_bar_hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-        let activity_bar_active_panel: Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>> =
-            Rc::new(RefCell::new(None));
+
         let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
         let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         #[allow(clippy::type_complexity)]
@@ -2114,7 +2108,6 @@ impl SimpleComponent for App {
             active_panel: SidebarPanel::Explorer,
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             activity_bar_da_ref: activity_bar_da_ref.clone(),
-            activity_bar_active_panel: activity_bar_active_panel.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
             explorer_scrollbar_rect: explorer_scrollbar_rect.clone(),
@@ -3378,19 +3371,12 @@ impl SimpleComponent for App {
             let engine_d = engine.clone();
             let hits_d = activity_bar_hits.clone();
             let hover_d = activity_bar_hover.clone();
-            let active_panel_d = Rc::new(RefCell::new(SidebarPanel::Explorer));
-            let active_panel_write = active_panel_d.clone();
-            // Mirror the current `active_panel` into the refcell via an update-time hook.
-            // Done below in `update()` — this refcell is published here so the draw func
-            // can read it without borrowing `self`.
-            *activity_bar_active_panel.borrow_mut() = Some(active_panel_d);
             widgets.activity_bar.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
-                let active = active_panel_write.borrow().clone();
-                let bar = build_gtk_activity_bar_primitive(&engine, &active, &theme);
+                let bar = build_gtk_activity_bar_primitive(&engine, &theme);
                 let hovered = hover_d.get();
                 let hits = quadraui::gtk::draw_activity_bar(
                     cr,
@@ -9718,9 +9704,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-        if let Some(mirror) = self.activity_bar_active_panel.borrow().as_ref() {
-            *mirror.borrow_mut() = self.active_panel.clone();
         }
         if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
             da.queue_draw();
