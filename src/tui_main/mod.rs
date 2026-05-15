@@ -2918,11 +2918,7 @@ fn event_loop(
                     }
 
                     // Auto-hide sidebar when focus returns to editor
-                    if engine.settings.autohide_panels
-                        && engine.app_shell.sidebar_visible()
-                        && !sidebar.has_focus
-                        && !sidebar.toolbar_focused
-                    {
+                    if engine.should_autohide_sidebar() && !sidebar.toolbar_focused {
                         engine.app_shell.hide_sidebar();
                     }
 
