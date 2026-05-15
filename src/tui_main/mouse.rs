@@ -169,17 +169,13 @@ pub(super) fn handle_mouse(
     // ── Quit-confirm overlay click interception ─────────────────────────────
     // Route clicks through DialogLayout::hit_test. Swallow all clicks while
     // the overlay is visible so they don't fall through to the editor.
-    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+    let sb_visible = engine.app_shell.sidebar_visible();
+    let ab_width = if engine.settings.autohide_panels && !sb_visible {
         0
     } else {
         ACTIVITY_BAR_WIDTH
     };
-    let editor_left = ab_width
-        + if sidebar.visible {
-            sidebar_width + 1
-        } else {
-            0
-        };
+    let editor_left = ab_width + if sb_visible { sidebar_width + 1 } else { 0 };
 
     // Bottom chrome rows: rows below the terminal panel.
     let has_separated = last_layout
@@ -567,9 +563,7 @@ pub(super) fn handle_mouse(
                     0
                 } else if engine.picker_selected < engine.picker_scroll_top {
                     engine.picker_selected
-                } else if engine.picker_selected
-                    >= engine.picker_scroll_top + visible_rows
-                {
+                } else if engine.picker_selected >= engine.picker_scroll_top + visible_rows {
                     engine.picker_selected + 1 - visible_rows
                 } else {
                     engine.picker_scroll_top
@@ -633,18 +627,17 @@ pub(super) fn handle_mouse(
                             total_items,
                             effective_offset,
                         );
-                        let on_thumb = grab_offset > 0.0
-                            || {
-                                let eff_track = (tl - thumb_len).max(1.0);
-                                let ratio = if max_scroll == 0 {
-                                    0.0
-                                } else {
-                                    effective_offset as f32 / max_scroll as f32
-                                };
-                                let thumb_top = items_row0 as f32 + ratio * eff_track;
-                                let dy = row as f32 - thumb_top;
-                                dy >= 0.0 && dy < thumb_len
+                        let on_thumb = grab_offset > 0.0 || {
+                            let eff_track = (tl - thumb_len).max(1.0);
+                            let ratio = if max_scroll == 0 {
+                                0.0
+                            } else {
+                                effective_offset as f32 / max_scroll as f32
                             };
+                            let thumb_top = items_row0 as f32 + ratio * eff_track;
+                            let dy = row as f32 - thumb_top;
+                            dy >= 0.0 && dy < thumb_len
+                        };
 
                         if on_thumb {
                             drag_state.begin(quadraui::DragTarget::ScrollbarY {
@@ -682,8 +675,7 @@ pub(super) fn handle_mouse(
                             engine.picker_load_preview();
                         }
                     } else if row >= items_row0 && row < items_row_end {
-                        let clicked_idx =
-                            effective_offset + (row - items_row0) as usize;
+                        let clicked_idx = effective_offset + (row - items_row0) as usize;
                         if clicked_idx < engine.picker_items.len() {
                             if engine.picker_selected == clicked_idx {
                                 let in_tree_mode = engine.picker_source
@@ -752,9 +744,9 @@ pub(super) fn handle_mouse(
     }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
-    let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
+    let sep_col = ab_width + if sb_visible { sidebar_width } else { 0 };
     match ev.kind {
-        MouseEventKind::Down(MouseButton::Left) if sidebar.visible && col == sep_col => {
+        MouseEventKind::Down(MouseButton::Left) if sb_visible && col == sep_col => {
             *dragging_sidebar = true;
             return sidebar_width;
         }
@@ -777,10 +769,10 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         }
         MouseEventKind::Drag(MouseButton::Left)
-            if sidebar.visible
+            if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
-                && sidebar.active_panel == TuiPanel::Search =>
+                && engine.active_panel_is(PANEL_SEARCH) =>
         {
             let move_ev = quadraui::UiEvent::MouseMoved {
                 position: quadraui::Point::new(col as f32, row as f32),
@@ -794,8 +786,8 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         }
         MouseEventKind::Drag(MouseButton::Left)
-            if sidebar.visible
-                && sidebar.active_panel == TuiPanel::Settings
+            if sb_visible
+                && engine.active_panel_is(PANEL_SETTINGS)
                 && col >= ab_width
                 && col < ab_width + sidebar_width =>
         {
@@ -830,8 +822,8 @@ pub(super) fn handle_mouse(
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                if sidebar.visible
-                    && sidebar.active_panel == TuiPanel::Explorer
+                if sb_visible
+                    && engine.active_panel_is(PANEL_EXPLORER)
                     && col >= ab_width
                     && col < ab_width + sidebar_width
                 {
@@ -1043,7 +1035,7 @@ pub(super) fn handle_mouse(
             }
         }
         MouseEventKind::Up(MouseButton::Left)
-            if sidebar.visible && sidebar.active_panel == TuiPanel::Search =>
+            if sb_visible && engine.active_panel_is(PANEL_SEARCH) =>
         {
             let up_ev = quadraui::UiEvent::MouseUp {
                 widget: None,
@@ -1126,19 +1118,19 @@ pub(super) fn handle_mouse(
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let scroll_up = matches!(ev.kind, MouseEventKind::ScrollUp);
-            if sidebar.visible
+            if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
-                && sidebar.active_panel == TuiPanel::Explorer
+                && engine.active_panel_is(PANEL_EXPLORER)
             {
                 let delta = if scroll_up { -3_isize } else { 3 };
                 engine.explorer_scroll(delta);
                 return sidebar_width;
             }
-            if sidebar.visible
+            if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
-                && sidebar.active_panel == TuiPanel::Git
+                && engine.active_panel_is(PANEL_GIT)
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
@@ -1148,10 +1140,10 @@ pub(super) fn handle_mouse(
                 engine.handle_sc_sidebar_ui_event(scroll_ev);
                 return sidebar_width;
             }
-            if sidebar.visible
+            if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
-                && sidebar.active_panel == TuiPanel::Search
+                && engine.active_panel_is(PANEL_SEARCH)
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
                     widget: None,
@@ -1161,10 +1153,10 @@ pub(super) fn handle_mouse(
                 engine.handle_search_sidebar_ui_event(scroll_ev);
                 return sidebar_width;
             }
-            if sidebar.visible
+            if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
-                && sidebar.active_panel == TuiPanel::Settings
+                && engine.active_panel_is(PANEL_SETTINGS)
             {
                 let content_start = 2_u16;
                 let content_height = term_height.saturating_sub(4);
@@ -1334,8 +1326,8 @@ pub(super) fn handle_mouse(
         let menu_rows = if engine.menu_bar_visible { 1_u16 } else { 0 };
 
         // Right-click on explorer sidebar → open explorer context menu
-        if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-            if sidebar.active_panel == TuiPanel::Explorer {
+        if sb_visible && col >= ab_width && col < ab_width + sidebar_width {
+            if engine.active_panel_is(PANEL_EXPLORER) {
                 let sidebar_row = row.saturating_sub(menu_rows);
                 let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
                 if tree_row < engine.explorer_rows.len() {
@@ -1581,8 +1573,8 @@ pub(super) fn handle_mouse(
     // ── SC button hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        if sidebar.visible
-            && sidebar.active_panel == TuiPanel::Git
+        if sb_visible
+            && engine.active_panel_is(PANEL_GIT)
             && col >= ab_width
             && col < ab_width + sidebar_width
         {
@@ -1623,7 +1615,7 @@ pub(super) fn handle_mouse(
     // ── Ext panel hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        if sidebar.visible
+        if sb_visible
             && sidebar.ext_panel_name.is_some()
             && col >= ab_width
             && col < ab_width + sidebar_width
@@ -2008,7 +2000,7 @@ pub(super) fn handle_mouse(
                             use crate::core::engine::EngineAction;
                             match ea {
                                 EngineAction::ToggleSidebar => {
-                                    sidebar.visible = !sidebar.visible;
+                                    // Engine handles this internally now.
                                 }
                                 EngineAction::OpenTerminal => {
                                     let cols =
@@ -2165,80 +2157,56 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
             Some(ActivityBarTarget::ExtensionPanel(name)) => {
-                if sidebar.ext_panel_name.as_deref() == Some(&name) && sidebar.visible {
-                    sidebar.visible = false;
+                if sidebar.ext_panel_name.as_deref() == Some(&name)
+                    && engine.app_shell.sidebar_visible()
+                {
+                    engine.app_shell.hide_sidebar();
                     sidebar.ext_panel_name = None;
                     engine.ext_panel_has_focus = false;
                     engine.ext_panel_active = None;
                 } else {
                     sidebar.ext_panel_name = Some(name.clone());
-                    sidebar.visible = true;
+                    if !engine.app_shell.sidebar_visible() {
+                        engine.toggle_sidebar();
+                    }
                     sidebar.has_focus = true;
                     engine.ext_panel_active = Some(name.clone());
                     engine.ext_panel_has_focus = true;
                     engine.ext_panel_selected = 0;
                     engine.plugin_event("panel_focus", &name);
                 }
-                engine.session.explorer_visible = sidebar.visible;
+                engine.session.explorer_visible = engine.app_shell.sidebar_visible();
                 let _ = engine.session.save();
                 return sidebar_width;
             }
             _ => {}
         }
-        // Map shared SidebarPanel to TUI-local TuiPanel
-        let target_panel = match ab_target {
-            Some(ActivityBarTarget::Panel(p)) => match p {
-                SidebarPanel::Explorer => Some(TuiPanel::Explorer),
-                SidebarPanel::Search => Some(TuiPanel::Search),
-                SidebarPanel::Debug => Some(TuiPanel::Debug),
-                SidebarPanel::Git => Some(TuiPanel::Git),
-                SidebarPanel::Extensions => Some(TuiPanel::Extensions),
-                SidebarPanel::Ai => Some(TuiPanel::Ai),
-            },
-            Some(ActivityBarTarget::Settings) => Some(TuiPanel::Settings),
+        let target_panel_id = match ab_target {
+            Some(ActivityBarTarget::Panel(p)) => Some(match p {
+                SidebarPanel::Explorer => PANEL_EXPLORER,
+                SidebarPanel::Search => PANEL_SEARCH,
+                SidebarPanel::Debug => PANEL_DEBUG,
+                SidebarPanel::Git => PANEL_GIT,
+                SidebarPanel::Extensions => PANEL_EXTENSIONS,
+                SidebarPanel::Ai => PANEL_AI,
+            }),
+            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS),
             _ => None,
         };
-        if let Some(panel) = target_panel {
-            // Clear extension panel state when switching to a built-in panel
+        if let Some(panel_id) = target_panel_id {
             sidebar.ext_panel_name = None;
             engine.ext_panel_has_focus = false;
             engine.ext_panel_active = None;
-            if sidebar.active_panel == panel && sidebar.visible {
-                sidebar.visible = false;
-            } else {
-                sidebar.active_panel = panel;
-                sidebar.visible = true;
-                if panel == TuiPanel::Search {
-                    sidebar.has_focus = true;
-                    engine.search_set_focus(true);
-                }
-                if panel == TuiPanel::Git {
-                    engine.sc_refresh();
-                }
-                if panel == TuiPanel::Extensions {
-                    engine.ext_sidebar_has_focus = true;
-                    if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
-                        engine.ext_refresh();
-                    }
-                    sidebar.has_focus = true;
-                }
-                if panel == TuiPanel::Ai {
-                    engine.ai_has_focus = true;
-                    sidebar.has_focus = true;
-                }
-                if panel == TuiPanel::Settings {
-                    engine.settings_has_focus = true;
-                    sidebar.has_focus = true;
-                }
+            engine.toggle_sidebar_panel(panel_id);
+            if engine.app_shell.sidebar_visible() {
+                sidebar.has_focus = true;
             }
-            engine.session.explorer_visible = sidebar.visible;
-            let _ = engine.session.save();
         }
         return sidebar_width;
     }
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
-    if sidebar.visible && col < ab_width + sidebar_width {
+    if engine.app_shell.sidebar_visible() && col < ab_width + sidebar_width {
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
@@ -2300,7 +2268,7 @@ pub(super) fn handle_mouse(
                     engine.handle_ext_panel_key("Return", false, None);
                 }
             }
-        } else if sidebar.active_panel == TuiPanel::Explorer {
+        } else if engine.active_panel_is(PANEL_EXPLORER) {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
 
@@ -2319,7 +2287,7 @@ pub(super) fn handle_mouse(
                     engine.open_file_preview(&path);
                 }
             }
-        } else if sidebar.active_panel == TuiPanel::Debug {
+        } else if engine.active_panel_is(PANEL_DEBUG) {
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
@@ -2358,7 +2326,7 @@ pub(super) fn handle_mouse(
                 engine.dispatch_dap_sidebar_event(sidebar_event);
             }
             return sidebar_width;
-        } else if sidebar.active_panel == TuiPanel::Git {
+        } else if engine.active_panel_is(PANEL_GIT) {
             sidebar.has_focus = true;
             engine.sc_set_focus(true);
 
@@ -2407,7 +2375,7 @@ pub(super) fn handle_mouse(
                 }
             }
             return sidebar_width;
-        } else if sidebar.active_panel == TuiPanel::Search {
+        } else if engine.active_panel_is(PANEL_SEARCH) {
             sidebar.has_focus = true;
             if !engine.search_has_focus {
                 engine.search_set_focus(true);
@@ -2424,7 +2392,7 @@ pub(super) fn handle_mouse(
             if !engine.search_has_focus {
                 sidebar.has_focus = false;
             }
-        } else if sidebar.active_panel == TuiPanel::Extensions {
+        } else if engine.active_panel_is(PANEL_EXTENSIONS) {
             sidebar.has_focus = true;
             engine.ext_sidebar_has_focus = true;
             if sidebar_row == 0 {
@@ -2433,7 +2401,7 @@ pub(super) fn handle_mouse(
                 engine.ext_sidebar_input_active = true;
             }
             // Rows 2+ handled by SidebarSystem mouse intercept in main loop
-        } else if sidebar.active_panel == TuiPanel::Settings {
+        } else if engine.active_panel_is(PANEL_SETTINGS) {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
             let flat_total = engine.settings_flat_list().len();
@@ -2743,7 +2711,7 @@ pub(super) fn handle_mouse(
                                 use crate::core::engine::EngineAction;
                                 match ea {
                                     EngineAction::ToggleSidebar => {
-                                        sidebar.visible = !sidebar.visible;
+                                        // Engine handles this internally now.
                                     }
                                     EngineAction::OpenTerminal => {
                                         let cols =

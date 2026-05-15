@@ -6683,8 +6683,7 @@ impl App {
                             });
                     } else if y >= results_top && y < results_bottom {
                         let mut engine = self.engine.borrow_mut();
-                        let clicked_idx =
-                            effective_offset + ((y - results_top) / lh) as usize;
+                        let clicked_idx = effective_offset + ((y - results_top) / lh) as usize;
                         if clicked_idx < engine.picker_items.len() {
                             engine.picker_selected = clicked_idx;
                             engine.picker_load_preview();
@@ -7437,7 +7436,8 @@ impl App {
             line_h: 1.0,
             ..render::gtk_picker_sizing(1.0)
         };
-        let geo = render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
+        let geo =
+            render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
         (
             geo.popup_x as f64,
             geo.popup_y as f64,

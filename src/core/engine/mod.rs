@@ -3312,6 +3312,9 @@ pub struct Engine {
     /// a temporary editable row is inserted in the tree under `parent_dir`.
     pub explorer_new_entry: Option<ExplorerNewEntryState>,
 
+    // --- AppShell (activity bar + sidebar state) ---
+    pub app_shell: quadraui::AppShell,
+
     // --- File watching (external modification detection) ---
     /// Cross-platform file watcher (notify crate). Watches open buffer files for changes.
     file_watcher: Option<notify::RecommendedWatcher>,
@@ -3800,13 +3803,70 @@ impl Engine {
             explorer_needs_refresh: false,
             explorer_rename: None,
             explorer_new_entry: None,
+            app_shell: {
+                use quadraui::{AppShell, PanelDefinition, WidgetId};
+                AppShell::new(
+                    vec![
+                        PanelDefinition {
+                            id: WidgetId::new("panel:explorer"),
+                            icon: "".to_string(),
+                            tooltip: "Explorer".to_string(),
+                            title: "EXPLORER".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:search"),
+                            icon: "".to_string(),
+                            tooltip: "Search".to_string(),
+                            title: "SEARCH".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:debug"),
+                            icon: "".to_string(),
+                            tooltip: "Run and Debug".to_string(),
+                            title: "RUN AND DEBUG".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:git"),
+                            icon: "".to_string(),
+                            tooltip: "Source Control".to_string(),
+                            title: "SOURCE CONTROL".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:extensions"),
+                            icon: "".to_string(),
+                            tooltip: "Extensions".to_string(),
+                            title: "EXTENSIONS".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:ai"),
+                            icon: "".to_string(),
+                            tooltip: "AI".to_string(),
+                            title: "AI".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("bottom:settings"),
+                            icon: "".to_string(),
+                            tooltip: "Settings".to_string(),
+                            title: "SETTINGS".to_string(),
+                        },
+                    ],
+                    30.0,
+                )
+            },
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
             accelerators: Vec::new(),
             idle_last_file_check: std::time::Instant::now(),
         };
-        // Initialize file watcher
+        let show_sidebar = if engine.settings.autohide_panels {
+            false
+        } else {
+            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
+        };
+        if !show_sidebar {
+            engine.app_shell.hide_sidebar();
+        }
         engine.init_file_watcher();
         // Register Phase B.2 accelerators (terminal maximize for now).
         engine.register_default_accelerators();
@@ -3848,12 +3908,13 @@ impl Engine {
     /// Backend-specific follow-ups that remain outside this method:
     /// - `format_save_quit_ready` — backends must check and trigger exit
     /// - `pending_terminal_command` — needs backend-supplied terminal size
-    /// - `dap_wants_sidebar` / `ext_panel_focus_pending` — sidebar state (#385)
+    /// - `ext_panel_focus_pending` — extension panel reveals (needs dynamic AppShell panels)
     /// - `explorer_needs_refresh` — GTK sends Msg::RefreshFileTree
-    /// - SC/explorer periodic auto-refresh — gated on sidebar visibility (#385)
+    /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
     pub fn poll_idle(&mut self) -> bool {
         let mut redraw = false;
+        redraw |= self.process_pending_sidebar();
         redraw |= self.flush_cursor_move_hook();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
@@ -4646,6 +4707,7 @@ mod picker;
 mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
+pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;
 mod spell_ops;

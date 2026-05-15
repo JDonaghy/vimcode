@@ -30,7 +30,9 @@ fn build_activity_bar_primitive(
     theme: &Theme,
 ) -> quadraui::ActivityBar {
     let kbd_sel = |idx: u16| sidebar.toolbar_focused && sidebar.toolbar_selected == idx;
-    let active = |panel: TuiPanel| sidebar.visible && sidebar.active_panel == panel;
+    let sb_visible = engine.app_shell.sidebar_visible();
+    let has_ext_panel = sidebar.ext_panel_name.is_some();
+    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
 
     let mut top = Vec::new();
     top.push(quadraui::ActivityItem {
@@ -41,44 +43,34 @@ fn build_activity_bar_primitive(
         is_keyboard_selected: kbd_sel(0),
     });
 
-    let fixed = [
-        (
-            1u16,
-            TuiPanel::Explorer,
-            crate::icons::EXPLORER.c(),
-            "Explorer",
-        ),
-        (2, TuiPanel::Search, crate::icons::SEARCH.c(), "Search"),
-        (3, TuiPanel::Debug, crate::icons::DEBUG.c(), "Debug"),
-        (
-            4,
-            TuiPanel::Git,
-            crate::icons::GIT_BRANCH.c(),
-            "Source Control",
-        ),
+    let fixed: [(u16, &str, char, &str); 6] = [
+        (1, PANEL_EXPLORER, crate::icons::EXPLORER.c(), "Explorer"),
+        (2, PANEL_SEARCH, crate::icons::SEARCH.c(), "Search"),
+        (3, PANEL_DEBUG, crate::icons::DEBUG.c(), "Debug"),
+        (4, PANEL_GIT, crate::icons::GIT_BRANCH.c(), "Source Control"),
         (
             5,
-            TuiPanel::Extensions,
+            PANEL_EXTENSIONS,
             crate::icons::EXTENSIONS.c(),
             "Extensions",
         ),
-        (6, TuiPanel::Ai, crate::icons::AI_CHAT.c(), "AI Assistant"),
+        (6, PANEL_AI, crate::icons::AI_CHAT.c(), "AI Assistant"),
     ];
-    for (idx, panel, icon, tooltip) in fixed {
-        let id_str = match panel {
-            TuiPanel::Explorer => "activity:explorer",
-            TuiPanel::Search => "activity:search",
-            TuiPanel::Debug => "activity:debug",
-            TuiPanel::Git => "activity:git",
-            TuiPanel::Extensions => "activity:extensions",
-            TuiPanel::Ai => "activity:ai",
+    for (idx, panel_id, icon, tooltip) in fixed {
+        let activity_id = match panel_id {
+            PANEL_EXPLORER => "activity:explorer",
+            PANEL_SEARCH => "activity:search",
+            PANEL_DEBUG => "activity:debug",
+            PANEL_GIT => "activity:git",
+            PANEL_EXTENSIONS => "activity:extensions",
+            PANEL_AI => "activity:ai",
             _ => "activity:unknown",
         };
         top.push(quadraui::ActivityItem {
-            id: quadraui::WidgetId::new(id_str),
+            id: quadraui::WidgetId::new(activity_id),
             icon: icon.to_string(),
             tooltip: tooltip.to_string(),
-            is_active: active(panel),
+            is_active: sb_visible && !has_ext_panel && active_id == Some(panel_id),
             is_keyboard_selected: kbd_sel(idx),
         });
     }
@@ -88,7 +80,7 @@ fn build_activity_bar_primitive(
     ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
     for (i, panel) in ext_panels.iter().enumerate() {
         let toolbar_idx = 8 + i as u16;
-        let is_active = sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sidebar.visible;
+        let is_active = sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sb_visible;
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
             icon: panel.resolved_icon().to_string(),
@@ -102,7 +94,7 @@ fn build_activity_bar_primitive(
         id: quadraui::WidgetId::new("activity:settings"),
         icon: crate::icons::SETTINGS.c().to_string(),
         tooltip: "Settings".to_string(),
-        is_active: active(TuiPanel::Settings),
+        is_active: sb_visible && !has_ext_panel && active_id == Some(PANEL_SETTINGS),
         is_keyboard_selected: kbd_sel(7),
     }];
 
@@ -144,40 +136,33 @@ pub(super) fn render_sidebar(
         return;
     }
 
-    // Settings panel
-    if sidebar.active_panel == TuiPanel::Settings {
-        render_settings_panel(backend, frame, area, theme, engine);
-        return;
-    }
-
-    // Search panel
-    if sidebar.active_panel == TuiPanel::Search {
-        render_search_panel(backend, frame, area, engine, theme);
-        return;
-    }
-
-    // Debug panel
-    if sidebar.active_panel == TuiPanel::Debug {
-        render_debug_sidebar(backend, frame, area, engine, theme);
-        return;
-    }
-
-    // Source Control panel
-    if sidebar.active_panel == TuiPanel::Git {
-        render_source_control(backend, frame, area, engine, theme);
-        return;
-    }
-
-    // Extensions panel
-    if sidebar.active_panel == TuiPanel::Extensions {
-        render_ext_sidebar(backend, frame, area, engine, theme);
-        return;
-    }
-
-    // AI assistant panel
-    if sidebar.active_panel == TuiPanel::Ai {
-        render_ai_sidebar(buf, area, engine, theme);
-        return;
+    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
+    match active_id {
+        Some(PANEL_SETTINGS) => {
+            render_settings_panel(backend, frame, area, theme, engine);
+            return;
+        }
+        Some(PANEL_SEARCH) => {
+            render_search_panel(backend, frame, area, engine, theme);
+            return;
+        }
+        Some(PANEL_DEBUG) => {
+            render_debug_sidebar(backend, frame, area, engine, theme);
+            return;
+        }
+        Some(PANEL_GIT) => {
+            render_source_control(backend, frame, area, engine, theme);
+            return;
+        }
+        Some(PANEL_EXTENSIONS) => {
+            render_ext_sidebar(backend, frame, area, engine, theme);
+            return;
+        }
+        Some(PANEL_AI) => {
+            render_ai_sidebar(buf, area, engine, theme);
+            return;
+        }
+        _ => {}
     }
 
     // ── Background fill — covers empty space below tree rows ────────────

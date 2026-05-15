@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 15, 2026 (Session 374 — **Picker dedup: 3 PRs, ~520 lines removed.** Fixed #391 picker scroll `visible_rows` hardcoded to 20. Extracted `PickerGeometry` + `PickerSizing` into `render.rs` (#401) — single source of truth for popup bounds across 5 call sites. Migrated ALL pickers (file/symbol/command) from legacy per-backend renderers to `quadraui::Palette` (#402) — `picker_panel_to_palette()` now handles preview panes + tree items. Fixed scrollbar mouse handlers: column alignment with rasteriser, `effective_offset` clamping, f32→u16 rounding (`.round()` vs truncation), thumb-drag vs track-paging, GTK RefCell double-borrow crash. Filed quadraui#177 (TUI cursor color), quadraui#178 (PaletteLayout scrollbar — closed), quadraui#180 (GTK scrollbar width). `#390` root-caused to quadraui TUI rasteriser.)
+**Last updated:** May 15, 2026 (Session 375 — **AppShell sidebar: engine owns sidebar state, TUI migrated (#385).** New `sidebar.rs` with engine-owned sidebar management. TUI fully migrated: removed `TuiPanel` enum, `TuiSidebar.visible`/`active_panel`, `sync_sidebar_focus()`. All sidebar reads go through `engine.app_shell`. Engine handles `ToggleSidebar` + `dap_wants_sidebar` internally. GTK migration deferred to next session.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -106,6 +106,7 @@ cell coalescence) remain but are tracked separately.
 - `render::screen_zone_hit_test()` + `window_zone_hit_test()` + `resolve_gutter_action()` — screen-level click zone detection (tab bar, window, breadcrumb, divider), window sub-zone detection (gutter, status bar, scrollbar, text area), and gutter action resolution. GTK caches `ScreenLayout` from paint; both backends call shared functions for zone detection. Tab bar inner slot resolution (Pango vs char-cell) stays per-backend (#344).
 - `render::build_tab_bar_primitive()` + `breadcrumbs_to_quadraui_status_bar()` — tab bar and breadcrumb bar primitives pre-built in `ScreenLayout` (#347). Both backends draw directly from `GroupTabBar.bar` / `BreadcrumbBar.bar` / `ScreenLayout.tab_bar_primitive`. Zero per-backend adapter construction or `show_split` logic.
 - `render::picker_panel_to_palette()` + `PickerGeometry` — ALL picker types (file/symbol/command/branch, with/without preview, flat/tree) route through one adapter to `quadraui::Palette`. `PickerGeometry::compute()` + `PickerSizing` constants give a single source of truth for popup bounds. Zero per-backend picker rendering code (#402).
+- `quadraui::AppShell` + `engine::sidebar` — sidebar visibility and active panel owned by the engine (#385). TUI reads all state from `engine.app_shell`; panel switching, focus flags, and session persistence handled by engine methods (`toggle_sidebar_panel`, `focus_sidebar_panel`, `handle_nav_overflow`). GTK migration pending.
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 
@@ -120,4 +121,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 374 and earlier in **SESSION_HISTORY.md**.
+> Sessions 375 and earlier in **SESSION_HISTORY.md**.

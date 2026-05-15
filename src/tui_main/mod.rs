@@ -174,38 +174,32 @@ fn dispatch_panel_accelerator(
 ) -> bool {
     match id {
         ACC_TOGGLE_SIDEBAR => {
-            sidebar.visible = !sidebar.visible;
-            if !sidebar.visible {
+            engine.toggle_sidebar();
+            if !engine.app_shell.sidebar_visible() {
                 sidebar.has_focus = false;
             }
-            engine.session.explorer_visible = sidebar.visible;
-            sync_sidebar_focus(sidebar, engine);
-            let _ = engine.session.save();
             *needs_redraw = true;
             true
         }
         ACC_FOCUS_EXPLORER => {
-            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Explorer {
+            if sidebar.has_focus && engine.explorer_has_focus {
                 sidebar.has_focus = false;
+                engine.clear_sidebar_focus();
             } else {
-                sidebar.visible = true;
-                sidebar.active_panel = TuiPanel::Explorer;
+                engine.toggle_sidebar_panel(PANEL_EXPLORER);
                 sidebar.has_focus = true;
             }
-            sync_sidebar_focus(sidebar, engine);
             *needs_redraw = true;
             true
         }
         ACC_FOCUS_SEARCH => {
-            if sidebar.has_focus && sidebar.active_panel == TuiPanel::Search {
+            if sidebar.has_focus && engine.search_has_focus {
                 sidebar.has_focus = false;
+                engine.clear_sidebar_focus();
             } else {
-                sidebar.visible = true;
-                sidebar.active_panel = TuiPanel::Search;
+                engine.toggle_sidebar_panel(PANEL_SEARCH);
                 sidebar.has_focus = true;
-                engine.search_set_focus(true);
             }
-            sync_sidebar_focus(sidebar, engine);
             *needs_redraw = true;
             true
         }
@@ -343,23 +337,12 @@ const ACTIVITY_BAR_WIDTH: u16 = 3;
 
 // ─── Activity bar panels ──────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
-enum TuiPanel {
-    Explorer,
-    Search,
-    Settings,
-    Debug,
-    Git,
-    Extensions,
-    Ai,
-}
+use crate::core::engine::sidebar::*;
 
 // ─── Sidebar data structures ──────────────────────────────────────────────────
 
 struct TuiSidebar {
-    visible: bool,
     has_focus: bool,
-    active_panel: TuiPanel,
     /// When true, the activity bar (toolbar) has keyboard focus.
     toolbar_focused: bool,
     /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
@@ -371,11 +354,9 @@ struct TuiSidebar {
 }
 
 impl TuiSidebar {
-    fn new(visible: bool) -> Self {
+    fn new() -> Self {
         TuiSidebar {
-            visible,
             has_focus: false,
-            active_panel: TuiPanel::Explorer,
             toolbar_focused: false,
             toolbar_selected: 1,
             pending_ctrl_w: false,
@@ -384,12 +365,22 @@ impl TuiSidebar {
     }
 }
 
-/// Sync the engine's `explorer_has_focus` and `search_has_focus` fields from the
-/// TUI-local sidebar state.  Called after any key/mouse event that may change focus.
-fn sync_sidebar_focus(sidebar: &TuiSidebar, engine: &mut Engine) {
-    let in_fixed_panel = sidebar.has_focus && sidebar.ext_panel_name.is_none();
-    engine.explorer_has_focus = in_fixed_panel && sidebar.active_panel == TuiPanel::Explorer;
-    engine.search_has_focus = in_fixed_panel && sidebar.active_panel == TuiPanel::Search;
+fn toolbar_idx_for_panel(engine: &Engine) -> u16 {
+    let id = engine
+        .app_shell
+        .active_panel_id()
+        .map(|w| w.as_str())
+        .unwrap_or("");
+    match id {
+        PANEL_EXPLORER => 1,
+        PANEL_SEARCH => 2,
+        PANEL_DEBUG => 3,
+        PANEL_GIT => 4,
+        PANEL_EXTENSIONS => 5,
+        PANEL_AI => 6,
+        PANEL_SETTINGS => 7,
+        _ => 1,
+    }
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -1018,13 +1009,7 @@ fn event_loop(
     // TUI menu bar can be fully hidden (unlike GTK where it's the title bar).
     engine.menu_bar_toggleable = true;
 
-    // Initialise sidebar from session/settings
-    let initial_visible = if engine.settings.autohide_panels {
-        false
-    } else {
-        engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
-    };
-    let mut sidebar = TuiSidebar::new(initial_visible);
+    let mut sidebar = TuiSidebar::new();
 
     // Optional active prompt (for sidebar CRUD operations)
 
@@ -1145,12 +1130,9 @@ fn event_loop(
                 .height
                 .saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row + wm_row); // status + cmd + panels (tab bar inside content bounds)
             let gutter_approx = 4u16;
-            let sidebar_cols = if sidebar.visible {
-                sidebar_width + 1
-            } else {
-                0
-            };
-            let ab_w = if engine.settings.autohide_panels && !sidebar.visible {
+            let sb_visible = engine.app_shell.sidebar_visible();
+            let sidebar_cols = if sb_visible { sidebar_width + 1 } else { 0 };
+            let ab_w = if engine.settings.autohide_panels && !sb_visible {
                 0
             } else {
                 ACTIVITY_BAR_WIDTH
@@ -1181,7 +1163,7 @@ fn event_loop(
 
         if needs_redraw && last_draw.elapsed() >= min_frame {
             // Keep engine focus flags in sync with TUI sidebar state before rendering.
-            sync_sidebar_focus(&sidebar, engine);
+
             let redraw_t0 = std::time::Instant::now();
             // Build layout before drawing so mouse handler can use it
             let screen = if let Ok(size) = terminal.size() {
@@ -1413,11 +1395,11 @@ fn event_loop(
                 break;
             }
             // Auto-refresh explorer and SC panel to reflect external filesystem changes.
-            if sidebar.visible && last_sidebar_refresh.elapsed() >= Duration::from_secs(2) {
+            if engine.app_shell.sidebar_visible()
+                && last_sidebar_refresh.elapsed() >= Duration::from_secs(2)
+            {
                 engine.explorer_rebuild_rows();
-                if sidebar.active_panel == TuiPanel::Git
-                    || sidebar.active_panel == TuiPanel::Explorer
-                {
+                if engine.active_panel_is(PANEL_GIT) || engine.active_panel_is(PANEL_EXPLORER) {
                     engine.sc_refresh();
                 }
                 last_sidebar_refresh = Instant::now();
@@ -1432,13 +1414,6 @@ fn event_loop(
                 engine.terminal_run_command(&cmd, cols, engine.session.terminal_panel_rows);
                 needs_redraw = true;
             }
-            // Auto-switch to Debug sidebar when a session starts.
-            if engine.dap_wants_sidebar {
-                engine.dap_wants_sidebar = false;
-                sidebar.active_panel = TuiPanel::Debug;
-                sidebar.visible = true;
-                needs_redraw = true;
-            }
             // Show startup message after async init completes.
             if let Some(msg) = pending_startup_msg.take() {
                 engine.message = msg;
@@ -1447,7 +1422,9 @@ fn event_loop(
             // Check for panel reveal request from plugins.
             if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
                 sidebar.ext_panel_name = Some(panel_name);
-                sidebar.visible = true;
+                if !engine.app_shell.sidebar_visible() {
+                    engine.toggle_sidebar();
+                }
                 sidebar.has_focus = true;
                 needs_redraw = true;
             }
@@ -1515,7 +1492,7 @@ fn event_loop(
                                 ));
                             }
                             EngineAction::OpenWorkspaceDialog => {
-                                sidebar = TuiSidebar::new(sidebar.visible);
+                                sidebar = TuiSidebar::new();
                                 engine.explorer_rebuild_rows();
                             }
                             EngineAction::SaveWorkspaceAsDialog => {
@@ -1529,9 +1506,6 @@ fn event_loop(
                             }
                             EngineAction::QuitWithUnsaved => {
                                 engine.show_quit_confirm();
-                            }
-                            EngineAction::ToggleSidebar => {
-                                sidebar.visible = !sidebar.visible;
                             }
                             act => {
                                 if handle_action(engine, act) {
@@ -1552,7 +1526,7 @@ fn event_loop(
         }
 
         // ── SidebarSystem intercept for mouse/scroll in debug sidebar ──
-        if sidebar.visible && sidebar.active_panel == TuiPanel::Debug {
+        if engine.app_shell.sidebar_visible() && engine.active_panel_is(PANEL_DEBUG) {
             let rect = engine.dap_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
                 && match &ui_event {
@@ -1581,7 +1555,7 @@ fn event_loop(
         }
 
         // ── SidebarSystem intercept for mouse/scroll in extensions sidebar ──
-        if sidebar.visible && sidebar.active_panel == TuiPanel::Extensions {
+        if engine.app_shell.sidebar_visible() && engine.active_panel_is(PANEL_EXTENSIONS) {
             let rect = engine.ext_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
                 && match &ui_event {
@@ -1625,8 +1599,8 @@ fn event_loop(
         // ── Explorer DoubleClick → TreeController ─────────────────────
         if let quadraui::UiEvent::DoubleClick { position, .. } = &ui_event {
             let rect = engine.explorer_tree_rect.get();
-            if sidebar.visible
-                && sidebar.active_panel == TuiPanel::Explorer
+            if engine.app_shell.sidebar_visible()
+                && engine.active_panel_is(PANEL_EXPLORER)
                 && rect.width > 0.0
                 && rect.contains(*position)
             {
@@ -1703,7 +1677,7 @@ fn event_loop(
                                 if let Some(path) = picker.filtered.get(picker.selected).cloned() {
                                     folder_picker = None;
                                     engine.open_folder(&path);
-                                    sidebar = TuiSidebar::new(sidebar.visible);
+                                    sidebar = TuiSidebar::new();
                                     engine.explorer_rebuild_rows();
                                     if let Some(fp) = engine.file_path().cloned() {
                                         engine.explorer_reveal_path(&fp);
@@ -1726,7 +1700,7 @@ fn event_loop(
                                         }
                                         FolderPickerMode::OpenRecent => {}
                                     }
-                                    sidebar = TuiSidebar::new(sidebar.visible);
+                                    sidebar = TuiSidebar::new();
                                     engine.explorer_rebuild_rows();
                                     if let Some(path) = engine.file_path().cloned() {
                                         engine.explorer_reveal_path(&path);
@@ -1809,7 +1783,7 @@ fn event_loop(
                         }
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                             // Activate the selected panel
-                            let panel = match sidebar.toolbar_selected {
+                            let panel_id = match sidebar.toolbar_selected {
                                 0 => {
                                     engine.toggle_menu_bar();
                                     if !engine.menu_bar_visible {
@@ -1819,13 +1793,13 @@ fn event_loop(
                                     needs_redraw = true;
                                     continue;
                                 }
-                                1 => TuiPanel::Explorer,
-                                2 => TuiPanel::Search,
-                                3 => TuiPanel::Debug,
-                                4 => TuiPanel::Git,
-                                5 => TuiPanel::Extensions,
-                                6 => TuiPanel::Ai,
-                                7 => TuiPanel::Settings,
+                                1 => PANEL_EXPLORER,
+                                2 => PANEL_SEARCH,
+                                3 => PANEL_DEBUG,
+                                4 => PANEL_GIT,
+                                5 => PANEL_EXTENSIONS,
+                                6 => PANEL_AI,
+                                7 => PANEL_SETTINGS,
                                 idx if idx >= 8 => {
                                     // Extension panel activation
                                     let ext_idx = (idx - 8) as usize;
@@ -1836,13 +1810,13 @@ fn event_loop(
                                         let name = ext_names[ext_idx].clone();
                                         sidebar.toolbar_focused = false;
                                         sidebar.ext_panel_name = Some(name.clone());
-                                        sidebar.visible = true;
+                                        if !engine.app_shell.sidebar_visible() {
+                                            engine.toggle_sidebar();
+                                        }
                                         sidebar.has_focus = true;
                                         engine.ext_panel_active = Some(name.clone());
                                         engine.ext_panel_has_focus = true;
                                         engine.ext_panel_selected = 0;
-                                        engine.session.explorer_visible = true;
-                                        let _ = engine.session.save();
                                         engine.plugin_event("panel_focus", &name);
                                     }
                                     needs_redraw = true;
@@ -1857,36 +1831,8 @@ fn event_loop(
                             sidebar.ext_panel_name = None;
                             engine.ext_panel_has_focus = false;
                             engine.ext_panel_active = None;
-                            sidebar.active_panel = panel;
-                            sidebar.visible = true;
+                            engine.focus_sidebar_panel(panel_id);
                             sidebar.has_focus = true;
-                            engine.session.explorer_visible = true;
-                            let _ = engine.session.save();
-                            if panel == TuiPanel::Explorer {
-                                engine.explorer_has_focus = true;
-                            }
-                            if panel == TuiPanel::Search {
-                                engine.search_set_focus(true);
-                            }
-                            if panel == TuiPanel::Git {
-                                engine.sc_set_focus(true);
-                                engine.sc_refresh();
-                            }
-                            if panel == TuiPanel::Debug {
-                                engine.dap_sidebar_has_focus = true;
-                            }
-                            if panel == TuiPanel::Extensions {
-                                engine.ext_sidebar_has_focus = true;
-                                if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
-                                    engine.ext_refresh();
-                                }
-                            }
-                            if panel == TuiPanel::Ai {
-                                engine.ai_has_focus = true;
-                            }
-                            if panel == TuiPanel::Settings {
-                                engine.settings_has_focus = true;
-                            }
                         }
                         KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                             // Leave toolbar, return focus to editor
@@ -1895,7 +1841,8 @@ fn event_loop(
                         KeyCode::Char('q') => {
                             // Collapse sidebar from toolbar
                             sidebar.toolbar_focused = false;
-                            sidebar.visible = false;
+                            engine.app_shell.hide_sidebar();
+                            engine.clear_sidebar_focus();
                             sidebar.has_focus = false;
                             engine.session.explorer_visible = false;
                             let _ = engine.session.save();
@@ -1945,15 +1892,7 @@ fn event_loop(
                                 sidebar.has_focus = false;
                                 engine.clear_sidebar_focus();
                                 sidebar.toolbar_focused = true;
-                                sidebar.toolbar_selected = match sidebar.active_panel {
-                                    TuiPanel::Explorer => 1,
-                                    TuiPanel::Search => 2,
-                                    TuiPanel::Debug => 3,
-                                    TuiPanel::Git => 4,
-                                    TuiPanel::Extensions => 5,
-                                    TuiPanel::Ai => 6,
-                                    TuiPanel::Settings => 7,
-                                };
+                                sidebar.toolbar_selected = toolbar_idx_for_panel(engine);
                             }
                             KeyCode::Char('l') | KeyCode::Right => {
                                 // Panel → editor
@@ -1967,7 +1906,7 @@ fn event_loop(
                     }
 
                     // ── Search panel keyboard handling ──────────────────────
-                    if sidebar.active_panel == TuiPanel::Search {
+                    if engine.active_panel_is(PANEL_SEARCH) {
                         // Ctrl+V paste (backend-specific clipboard access)
                         if ctrl && key_event.code == KeyCode::Char('v') {
                             let is_replace = engine.search_panel_form_focus.borrow().as_deref()
@@ -2029,7 +1968,7 @@ fn event_loop(
                     }
 
                     // ── Debug panel keyboard handling ──────────────────────
-                    if sidebar.active_panel == TuiPanel::Debug {
+                    if engine.active_panel_is(PANEL_DEBUG) {
                         // h/Left: switch focus to toolbar
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2058,10 +1997,10 @@ fn event_loop(
                                     'x' => "x",
                                     'd' => "d",
                                     'b' if ctrl => {
-                                        sidebar.visible = false;
+                                        engine.app_shell.hide_sidebar();
                                         sidebar.has_focus = false;
+                                        engine.clear_sidebar_focus();
                                         engine.session.explorer_visible = false;
-                                        engine.dap_sidebar_has_focus = false;
                                         let _ = engine.session.save();
                                         ""
                                     }
@@ -2157,7 +2096,7 @@ fn event_loop(
                     }
 
                     // ── Extensions panel keyboard handling ──────────────────
-                    if sidebar.active_panel == TuiPanel::Extensions {
+                    if engine.active_panel_is(PANEL_EXTENSIONS) {
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
                             && !engine.ext_sidebar_input_active
@@ -2208,7 +2147,7 @@ fn event_loop(
                     }
 
                     // ── Settings panel keyboard handling ──────────────────────
-                    if sidebar.active_panel == TuiPanel::Settings {
+                    if engine.active_panel_is(PANEL_SETTINGS) {
                         // h/Left: switch focus to toolbar (only when not editing/searching)
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2304,7 +2243,7 @@ fn event_loop(
                     }
 
                     // ── AI assistant panel keyboard handling ─────────────────
-                    if sidebar.active_panel == TuiPanel::Ai {
+                    if engine.active_panel_is(PANEL_AI) {
                         // h/Left: switch focus to toolbar (only when not typing)
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2373,7 +2312,7 @@ fn event_loop(
                     }
 
                     // ── Source Control panel keyboard handling ──────────────
-                    if sidebar.active_panel == TuiPanel::Git {
+                    if engine.active_panel_is(PANEL_GIT) {
                         // h/Left → switch focus to activity bar toolbar.
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
@@ -2392,10 +2331,10 @@ fn event_loop(
                         }
                         // Ctrl+b → toggle sidebar visibility.
                         if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
-                            sidebar.visible = false;
+                            engine.app_shell.hide_sidebar();
                             sidebar.has_focus = false;
+                            engine.clear_sidebar_focus();
                             engine.session.explorer_visible = false;
-                            engine.sc_set_focus(false);
                             let _ = engine.session.save();
                             needs_redraw = true;
                             continue;
@@ -2467,8 +2406,9 @@ fn event_loop(
                     {
                         use crate::core::engine::ExplorerKeyResult;
                         if ctrl && key_event.code == KeyCode::Char('b') {
-                            sidebar.visible = false;
+                            engine.app_shell.hide_sidebar();
                             sidebar.has_focus = false;
+                            engine.clear_sidebar_focus();
                             engine.session.explorer_visible = false;
                             let _ = engine.session.save();
                         } else {
@@ -2953,7 +2893,7 @@ fn event_loop(
                         } else if action == EngineAction::OpenWorkspaceDialog {
                             // open_workspace_from_file() already ran in the engine;
                             // just refresh the sidebar to reflect the new cwd.
-                            sidebar = TuiSidebar::new(sidebar.visible);
+                            sidebar = TuiSidebar::new();
                             engine.explorer_rebuild_rows();
                             needs_redraw = true;
                         } else if action == EngineAction::SaveWorkspaceAsDialog {
@@ -2964,52 +2904,26 @@ fn event_loop(
                         } else if action == EngineAction::QuitWithUnsaved {
                             engine.show_quit_confirm();
                             needs_redraw = true;
-                        } else if action == EngineAction::ToggleSidebar {
-                            sidebar.visible = !sidebar.visible;
-                            needs_redraw = true;
                         } else if handle_action(engine, action) {
                             break;
                         }
                     }
                     // Ctrl-W h/l overflow: move focus to sidebar/toolbar
-                    if let Some(direction) = engine.window_nav_overflow.take() {
-                        if !direction {
-                            // Left overflow (Ctrl-W h): show sidebar if autohide
-                            if !sidebar.visible && engine.settings.autohide_panels {
-                                sidebar.visible = true;
-                            }
-                            // Left overflow → sidebar panel (if visible) or toolbar
-                            if sidebar.visible {
-                                sidebar.has_focus = true;
-                                match sidebar.active_panel {
-                                    TuiPanel::Explorer => {
-                                        engine.explorer_has_focus = true;
-                                    }
-                                    TuiPanel::Git => engine.sc_set_focus(true),
-                                    TuiPanel::Debug => engine.dap_sidebar_has_focus = true,
-                                    TuiPanel::Extensions => {
-                                        engine.ext_sidebar_has_focus = true;
-                                    }
-                                    TuiPanel::Ai => engine.ai_has_focus = true,
-                                    TuiPanel::Settings => {
-                                        engine.settings_has_focus = true;
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                sidebar.toolbar_focused = true;
-                            }
+                    if let Some(false) = engine.handle_nav_overflow() {
+                        if engine.app_shell.sidebar_visible() {
+                            sidebar.has_focus = true;
+                        } else {
+                            sidebar.toolbar_focused = true;
                         }
-                        // Right overflow: no action (nothing to the right of editor)
                     }
 
                     // Auto-hide sidebar when focus returns to editor
                     if engine.settings.autohide_panels
-                        && sidebar.visible
+                        && engine.app_shell.sidebar_visible()
                         && !sidebar.has_focus
                         && !sidebar.toolbar_focused
                     {
-                        sidebar.visible = false;
+                        engine.app_shell.hide_sidebar();
                     }
 
                     // Any keypress warrants a redraw (e.g. :set wrap returns None but
@@ -3092,7 +3006,7 @@ fn event_loop(
                                 &mut hover_selecting,
                                 &mut fr_input_dragging,
                             );
-                            sync_sidebar_focus(&sidebar, engine);
+
                             if mouse_should_quit {
                                 return;
                             }
@@ -3137,7 +3051,7 @@ fn event_loop(
                     &mut hover_selecting,
                     &mut fr_input_dragging,
                 );
-                sync_sidebar_focus(&sidebar, engine);
+
                 if mouse_should_quit {
                     return;
                 }
@@ -3413,7 +3327,7 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
         | EngineAction::SaveWorkspaceAsDialog
         | EngineAction::OpenRecentDialog => false, // handled by caller
         EngineAction::QuitWithUnsaved => false, // handled by caller (shows quit confirm overlay)
-        EngineAction::ToggleSidebar => false,   // handled by caller (has access to sidebar state)
+        EngineAction::ToggleSidebar => false,   // engine handles internally; no-op here
         EngineAction::QuitWithError => {
             engine.cleanup_all_swaps();
             engine.lsp_shutdown();
