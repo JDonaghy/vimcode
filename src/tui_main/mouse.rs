@@ -621,43 +621,65 @@ pub(super) fn handle_mouse(
                         && visible_rows > 0;
 
                     if on_scrollbar {
+                        let tl = visible_rows as f32;
+                        let thumb_len =
+                            (tl * visible_rows as f32 / total_items.max(1) as f32).max(1.0);
+                        let max_scroll = total_items.saturating_sub(visible_rows);
                         let grab_offset = scrollbar_grab_offset(
                             row as f32,
                             items_row0 as f32,
-                            visible_rows as f32,
+                            tl,
                             visible_rows,
                             total_items,
                             effective_offset,
                         );
-                        let tl = visible_rows as f32;
-                        drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                            widget: picker_id.clone(),
-                            track_start: items_row0 as f32,
-                            track_length: tl,
-                            thumb_length: (tl * visible_rows as f32 / total_items.max(1) as f32)
-                                .max(1.0),
-                            max_scroll: total_items.saturating_sub(visible_rows),
-                            grab_offset,
-                            inverted: false,
-                        });
-                        let events = quadraui::dispatch_mouse_drag(
-                            drag_state,
-                            quadraui::Point {
-                                x: col as f32,
-                                y: row as f32,
-                            },
-                            Default::default(),
-                        );
-                        for ev in &events {
-                            if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                                engine.picker_scroll_top = *new_offset;
-                                if engine.picker_selected < *new_offset {
-                                    engine.picker_selected = *new_offset;
-                                } else if engine.picker_selected >= *new_offset + visible_rows {
-                                    engine.picker_selected = *new_offset + visible_rows - 1;
-                                }
-                                engine.picker_load_preview();
+                        let on_thumb = grab_offset > 0.0
+                            || {
+                                let eff_track = (tl - thumb_len).max(1.0);
+                                let ratio = if max_scroll == 0 {
+                                    0.0
+                                } else {
+                                    effective_offset as f32 / max_scroll as f32
+                                };
+                                let thumb_top = items_row0 as f32 + ratio * eff_track;
+                                let dy = row as f32 - thumb_top;
+                                dy >= 0.0 && dy < thumb_len
+                            };
+
+                        if on_thumb {
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: picker_id.clone(),
+                                track_start: items_row0 as f32,
+                                track_length: tl,
+                                thumb_length: thumb_len,
+                                max_scroll,
+                                grab_offset,
+                                inverted: false,
+                            });
+                        } else {
+                            let click_above_thumb = {
+                                let eff_track = (tl - thumb_len).max(1.0);
+                                let ratio = if max_scroll == 0 {
+                                    0.0
+                                } else {
+                                    effective_offset as f32 / max_scroll as f32
+                                };
+                                let thumb_top = items_row0 as f32 + ratio * eff_track;
+                                (row as f32) < thumb_top
+                            };
+                            let page = visible_rows.max(1);
+                            let new_offset = if click_above_thumb {
+                                effective_offset.saturating_sub(page)
+                            } else {
+                                (effective_offset + page).min(max_scroll)
+                            };
+                            engine.picker_scroll_top = new_offset;
+                            if engine.picker_selected < new_offset {
+                                engine.picker_selected = new_offset;
+                            } else if engine.picker_selected >= new_offset + visible_rows {
+                                engine.picker_selected = new_offset + visible_rows - 1;
                             }
+                            engine.picker_load_preview();
                         }
                     } else if row >= items_row0 && row < items_row_end {
                         let clicked_idx =
