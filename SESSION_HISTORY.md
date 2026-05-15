@@ -1,39 +1,34 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 375 archived here.
+All sessions through 376 archived here.
+
+---
+**Session 376 (May 15) — AppShell sidebar: GTK migration + full follow-up sweep (#385, #408–#411):**
+
+Completed the sidebar state centralization started in Session 375. GTK backend migrated, then all follow-up dedup issues landed in the same session.
+
+**Landed PRs:**
+- #407: GTK sidebar migration — `Msg::SwitchPanel` collapsed from ~160 to ~30 lines. New `sync_sidebar_from_engine()` + `sync_sidebar_widgets()`. Removed `dap_wants_sidebar`/`window_nav_overflow` consumption from GTK poll loop. `EngineAction::ToggleSidebar` handled by engine internally.
+- #412: `Engine::should_autohide_sidebar()` (#411) + removed `activity_bar_active_panel` RefCell mirror (#410). Activity bar draw callback reads from `engine.app_shell` directly. Eliminated triple-nested `Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>>`.
+- #414: Removed `SidebarPanel` enum (#408) + panel-ID lookup table (#409). `active_panel_id: String` replaces `active_panel: SidebarPanel`. `#[watch]` expressions use string constants. `sync_sidebar_widgets()` uses lookup-table arrays. `Msg::SwitchPanel(String)` carries panel ID. Extension panels use `"ext:"` prefix.
+
+**Filed:**
+- #406: GTK Ctrl-W h/l in sidebar panels doesn't navigate to editor (pre-existing, not a regression)
+- #413: GTK RefCell double-borrow crash during drag-end in poll tick (pre-existing)
+
+**Net across both sessions (375+376): ~234 lines removed.** `TuiPanel` + `SidebarPanel` enums eliminated. All sidebar state centralized in the engine via `quadraui::AppShell` + `engine::sidebar`.
+
+**Remaining:** quadraui#187 integration (dynamic panel registration for extension panels) would let ext panels route through `toggle_sidebar_panel()` too.
 
 ---
 **Session 375 (May 15) — AppShell sidebar: engine owns sidebar state, TUI migrated (#385):**
 
-Moved sidebar visibility and active panel state from per-backend local fields into the engine via `quadraui::AppShell`. TUI backend fully migrated; GTK deferred to next session.
+See Session 376 for the combined summary. TUI-specific details:
 
-**New file:** `src/core/engine/sidebar.rs` — engine-owned sidebar management:
-- `toggle_sidebar_panel(panel_id)` — toggle or switch panel, sets focus flags + session persistence
-- `focus_sidebar_panel(panel_id)` — programmatic reveal (DAP, plugins)
-- `handle_nav_overflow()` — Ctrl-W h/l past window boundary
-- `toggle_sidebar()` — visibility flip without panel switch
-- `process_pending_sidebar()` — consumes `dap_wants_sidebar` in `poll_idle()`
-- `active_panel_is(panel_id)` — convenience check
-- Panel ID constants: `PANEL_EXPLORER`, `PANEL_SEARCH`, `PANEL_DEBUG`, `PANEL_GIT`, `PANEL_EXTENSIONS`, `PANEL_AI`, `PANEL_SETTINGS`
+**New file:** `src/core/engine/sidebar.rs` — `toggle_sidebar_panel()`, `focus_sidebar_panel()`, `handle_nav_overflow()`, `toggle_sidebar()`, `process_pending_sidebar()`, `active_panel_is()`, `should_autohide_sidebar()`. Panel ID constants: `PANEL_EXPLORER` through `PANEL_SETTINGS`.
 
-**TUI migration (net ~170 lines removed):**
-- Removed `TuiPanel` enum and `TuiSidebar.visible` / `TuiSidebar.active_panel` fields
-- Removed `sync_sidebar_focus()` — engine methods handle focus flags directly
-- All `sidebar.visible` reads → `engine.app_shell.sidebar_visible()`
-- All `sidebar.active_panel == TuiPanel::X` → `engine.active_panel_is(PANEL_X)`
-- Activity bar click handler uses `engine.toggle_sidebar_panel()` / `engine.focus_sidebar_panel()`
-- Panel rendering dispatch in `panels.rs` uses `engine.app_shell.active_panel_id()` match
-- `EngineAction::ToggleSidebar` handled internally by engine (returns `None`)
-
-**Bugfixes found during smoke testing:**
-- Settings panel was registered as `bottom_item` in AppShell but `show_panel()` only searches main `panels` vec — moved Settings into main panels vec
-- Extension panel click left previous fixed-panel highlighted — added `!has_ext_panel` guard to activity bar `is_active` check
-
-**Not yet migrated (GTK — next session):**
-- GTK `SidebarPanel` enum, `sidebar_visible`, `active_panel` local fields still in place
-- GTK `dap_wants_sidebar` / `ext_panel_focus_pending` / `window_nav_overflow` consumption still local
-- Extension panel dynamic registration not in AppShell (deferred follow-up)
+**TUI migration:** Removed `TuiPanel` enum, `TuiSidebar.visible`/`active_panel`, `sync_sidebar_focus()`. Activity bar + panel rendering dispatch uses engine panel IDs.
 
 ---
 **Session 374 (May 15) — Picker dedup: 3 PRs, ~520 lines removed:**

@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 15, 2026 (Session 375 — **AppShell sidebar: engine owns sidebar state, TUI migrated (#385).** New `sidebar.rs` with engine-owned sidebar management. TUI fully migrated: removed `TuiPanel` enum, `TuiSidebar.visible`/`active_panel`, `sync_sidebar_focus()`. All sidebar reads go through `engine.app_shell`. Engine handles `ToggleSidebar` + `dap_wants_sidebar` internally. GTK migration deferred to next session.)
+**Last updated:** May 15, 2026 (Session 376 — **AppShell sidebar complete.** 4 PRs (#405/#407/#412/#414), ~234 lines removed. Both TUI + GTK migrated to engine-owned sidebar state. `TuiPanel` + `SidebarPanel` enums eliminated. `activity_bar_active_panel` RefCell mirror removed. Widget sync uses lookup-table arrays. `Engine::should_autohide_sidebar()` added. Remaining: quadraui#187 integration for dynamic extension panels.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -121,4 +121,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 375 and earlier in **SESSION_HISTORY.md**.
+> Sessions 376 and earlier in **SESSION_HISTORY.md**.

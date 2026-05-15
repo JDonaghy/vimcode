@@ -6,25 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-15 (Session 375 — AppShell sidebar: engine owns sidebar state. TUI migrated, GTK next.)
-
----
-
-## 🔧 In-flight: #385 AppShell sidebar (branch `issue-385-appshell-sidebar`)
-
-**Status:** TUI migration complete (3 commits), GTK migration pending.
-
-**Branch has:** `engine::sidebar` module with panel management methods. TUI reads all sidebar state from `engine.app_shell`. `TuiPanel` enum removed, `TuiSidebar` slimmed to focus/toolbar state only.
-
-**Next session (GTK migration):**
-1. Replace `SidebarPanel` enum, `self.sidebar_visible`, `self.active_panel` with engine reads
-2. Replace `Msg::SwitchPanel` handler body with `engine.toggle_sidebar_panel()` + widget sync
-3. Remove `activity_id_to_panel()` — use panel_id strings
-4. Remove `dap_wants_sidebar` / `window_nav_overflow` consumption from GTK poll loop
-5. Add `sync_sidebar_widgets()` helper for revealer + panel box visibility + focus grab
-6. `#[watch]` expressions read from `engine.app_shell` (or keep thin cache fields)
-
-**Plan file:** `.claude/plans/indexed-wandering-floyd.md` has the detailed design.
+> **Last updated:** 2026-05-15 (Session 376 — AppShell sidebar complete. All follow-ups landed.)
 
 ---
 
