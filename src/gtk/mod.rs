@@ -341,9 +341,6 @@ struct App {
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
-    /// System clipboard context (copypasta-ext).  None if unavailable.
-    // Box<dyn ClipboardProviderExt> is !Send; GTK App lives on main thread only.
-    clipboard: Option<Box<dyn ClipboardProviderExt>>,
     /// True while the mouse cursor is over any horizontal scrollbar track.
     h_sb_hovered: bool,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
@@ -651,6 +648,56 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
             }
         }
     }
+}
+
+/// Set up system clipboard callbacks on the engine via copypasta_ext.
+///
+/// On X11 we prefer `x11_bin` (xclip/xsel subprocesses) over `try_context`'s
+/// default `x11_fork`: the fork variant opens its own in-process X11 connection
+/// and contends with GTK's main-thread X11 event loop. Subprocess reads do not.
+fn setup_gtk_clipboard(engine: &mut Engine) {
+    let ctx: Option<Box<dyn ClipboardProviderExt>> = {
+        #[cfg(all(
+            unix,
+            not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+        ))]
+        if copypasta_ext::display::is_x11() {
+            copypasta_ext::x11_bin::ClipboardContext::new()
+                .ok()
+                .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
+                .or_else(copypasta_ext::try_context)
+        } else {
+            copypasta_ext::try_context()
+        }
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+        )))]
+        copypasta_ext::try_context()
+    };
+
+    let Some(ctx) = ctx else { return };
+    // `engine.clipboard_{read,write}` are `Fn` (shared-ref callbacks), but
+    // `ClipboardProviderExt::{get,set}_contents` take `&mut self`. Wrap the
+    // provider in `Rc<RefCell<…>>` so both closures can share it and acquire
+    // a mutable borrow at call time.
+    let ctx = Rc::new(RefCell::new(ctx));
+
+    let read_ctx = ctx.clone();
+    engine.clipboard_read = Some(Box::new(move || {
+        read_ctx
+            .borrow_mut()
+            .get_contents()
+            .map_err(|e| format!("clipboard read: {e}"))
+    }));
+
+    let write_ctx = ctx;
+    engine.clipboard_write = Some(Box::new(move |text: &str| {
+        write_ctx
+            .borrow_mut()
+            .set_contents(text.to_string())
+            .map_err(|e| format!("clipboard write: {e}"))
+    }));
 }
 
 /// Scrollbars and indicators for a single window.
@@ -1832,12 +1879,17 @@ impl SimpleComponent for App {
         // requiring the user to install a Nerd Font system-wide.
         install_bundled_icon_font();
 
-        let engine = {
+        let mut engine = {
             let mut e = Engine::new();
             icons::set_nerd_fonts(e.settings.use_nerd_fonts);
             e.startup(file_path.as_deref());
             e
         };
+
+        // Wire system clipboard callbacks onto the engine so paste, yank, and
+        // hover-copy paths all route through `engine.clipboard_{read,write}`
+        // instead of a per-backend ClipboardCtx.
+        setup_gtk_clipboard(&mut engine);
 
         // Load CSS after engine so we can read the saved colorscheme setting.
         let initial_theme = Theme::from_name(&engine.settings.colorscheme);
@@ -1848,30 +1900,6 @@ impl SimpleComponent for App {
         if let Some(gtk_settings) = gtk4::Settings::default() {
             gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
         }
-
-        // On X11 use x11_bin (xclip/xsel subprocesses) explicitly: try_context() picks
-        // x11_fork first, whose get_contents() uses X11ClipboardContext directly and
-        // competes with GTK's X11 event loop.  Subprocess reads open their own X11
-        // connection per call and have no such conflict.
-        let clipboard: Option<Box<dyn ClipboardProviderExt>> = {
-            #[cfg(all(
-                unix,
-                not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-            ))]
-            if copypasta_ext::display::is_x11() {
-                copypasta_ext::x11_bin::ClipboardContext::new()
-                    .ok()
-                    .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
-                    .or_else(copypasta_ext::try_context)
-            } else {
-                copypasta_ext::try_context()
-            }
-            #[cfg(not(all(
-                unix,
-                not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-            )))]
-            copypasta_ext::try_context()
-        };
 
         // Set window title based on file
         let title = match engine.file_path() {
@@ -2105,7 +2133,6 @@ impl SimpleComponent for App {
             settings_da_ref: settings_da_ref.clone(),
             ai_panel_box_ref: ai_panel_box_ref.clone(),
             last_clipboard_content: None,
-            clipboard,
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: tab_slot_positions_cell.clone(),
@@ -4862,12 +4889,12 @@ impl App {
                     .filter(|(s, _)| !s.is_empty())
                     .map(|(s, _)| s.clone())
             });
-        drop(engine);
 
         if new_content != self.last_clipboard_content {
-            if let (Some(ref content), Some(ref mut ctx)) = (&new_content, &mut self.clipboard) {
-                let _ = ctx.set_contents(content.clone());
+            if let (Some(ref content), Some(ref cb)) = (&new_content, &engine.clipboard_write) {
+                let _ = cb(content.as_str());
             }
+            drop(engine);
             self.last_clipboard_content = new_content;
         }
     }
@@ -5192,9 +5219,11 @@ impl App {
             .needs_clipboard_for_paste(&key_name, unicode, ctrl)
         {
             let text = self
-                .clipboard
-                .as_mut()
-                .and_then(|ctx| ctx.get_contents().ok());
+                .engine
+                .borrow()
+                .clipboard_read
+                .as_ref()
+                .and_then(|cb| cb().ok());
             self.engine.borrow_mut().prepare_paste_clipboard(text);
         }
 
@@ -5382,18 +5411,18 @@ impl App {
             }
         }
 
-        // Hover popup copy: intercept y/Ctrl-C when hover is focused
-        // because GTK doesn't set clipboard_write on the engine.
+        // Hover popup copy: intercept y/Ctrl-C when hover is focused so the
+        // engine's clipboard_write callback is invoked with the hover selection.
         {
             let engine = self.engine.borrow();
             let is_hover_copy = engine.editor_hover_has_focus
                 && (key_name == "y" || key_name == "Y" || (ctrl && key_name == "c"));
             if is_hover_copy {
                 if let Some(text) = engine.hover_selection_text() {
-                    drop(engine);
-                    if let Some(ref mut ctx) = self.clipboard {
-                        let _ = ctx.set_contents(text);
+                    if let Some(ref cb) = engine.clipboard_write {
+                        let _ = cb(text.as_str());
                     }
+                    drop(engine);
                     let mut engine = self.engine.borrow_mut();
                     engine.message = "Hover text copied".to_string();
                     self.draw_needed.set(true);
@@ -8289,17 +8318,19 @@ impl App {
             }
             Msg::TerminalCopySelection => {
                 if let Some(text) = self.engine.borrow_mut().terminal_copy_selection() {
-                    if let Some(ref mut ctx) = self.clipboard {
-                        let _ = ctx.set_contents(text);
+                    let engine = self.engine.borrow();
+                    if let Some(ref cb) = engine.clipboard_write {
+                        let _ = cb(text.as_str());
                     }
                 }
             }
             Msg::TerminalPasteClipboard => {
-                let text = if let Some(ref mut ctx) = self.clipboard {
-                    ctx.get_contents().ok()
-                } else {
-                    None
-                };
+                let text = self
+                    .engine
+                    .borrow()
+                    .clipboard_read
+                    .as_ref()
+                    .and_then(|cb| cb().ok());
                 if let Some(text) = text {
                     self.engine.borrow_mut().terminal_write(text.as_bytes());
                 }
@@ -9373,11 +9404,15 @@ impl App {
                 }
                 // Ctrl-V: paste from system clipboard into AI input.
                 if ctrl && key_name == "v" {
-                    if let Some(ref mut ctx) = self.clipboard {
-                        let text = ctx.get_contents().unwrap_or_default();
-                        if !text.is_empty() {
-                            self.engine.borrow_mut().ai_insert_text(&text);
-                        }
+                    let text = self
+                        .engine
+                        .borrow()
+                        .clipboard_read
+                        .as_ref()
+                        .and_then(|cb| cb().ok())
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        self.engine.borrow_mut().ai_insert_text(&text);
                     }
                     if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                         da.queue_draw();
