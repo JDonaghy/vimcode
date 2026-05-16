@@ -154,12 +154,8 @@ pub(super) fn draw_editor(
     // Triggered by either a live terminal OR the debug output panel being shown.
     // When maximized, the effective row count is derived from the current DA
     // height each frame so window resizes take effect immediately.
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        let target = super::gtk_terminal_target_maximize_rows(engine, height as f64, line_height);
-        (engine.effective_terminal_panel_rows(target) as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
+    let term_px =
+        crate::render::compute_editor_layout(engine, height as f64, line_height, false).terminal_h;
 
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height

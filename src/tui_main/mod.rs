@@ -95,45 +95,14 @@ use crate::render::{self, build_screen_layout, Color, RenderedWindow, Theme};
 
 /// Returns true if the given crossterm key event matches a panel_keys binding string.
 /// Binding strings use Vim notation: `<C-b>`, `<C-S-e>`, `<A-x>`.
-/// Compute the target `terminal_panel_rows` when maximizing in the TUI: the
-/// panel takes every editor row it can. We intentionally **don't** reserve
-/// space for the editor's own tab bar / breadcrumbs — when the panel is
-/// maximized those are hidden behind the terminal (matching VSCode's
-/// "Maximize Panel Size"). Only status bar, command line, bottom-panel tabs,
-/// terminal toolbar, plus any menu/qf/dbg/wildmenu rows are reserved.
 /// Return the effective content-row count for the terminal panel in the TUI.
-/// Equivalent to `engine.effective_terminal_panel_rows(target)` where `target`
-/// is derived from the current screen height.
 pub(super) fn effective_terminal_panel_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
-    let target = terminal_target_maximize_rows_tui(engine, screen_h);
-    engine.effective_terminal_panel_rows(target)
+    render::compute_editor_layout(engine, screen_h as f64, 1.0, true).terminal_content_rows
 }
 
+/// Max target rows for terminal maximize — delegates to shared layout.
 pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) -> u16 {
-    // Build a PanelChromeDesc in native TUI row units and let the engine own
-    // the arithmetic. `tab_bar_rows = 1` keeps the editor tab row visible
-    // (matches GTK). Breadcrumbs are still suppressed in `render_impl.rs`
-    // when `terminal_maximized` is true, so reserving 1 row is sufficient.
-    let per_window = engine.settings.window_status_line;
-    crate::core::engine::PanelChromeDesc {
-        viewport_rows: screen_h,
-        menu_rows: if engine.menu_bar_visible { 1 } else { 0 },
-        quickfix_rows: if engine.quickfix_open { 6 } else { 0 },
-        debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
-        wildmenu_rows: if !engine.wildmenu_items.is_empty() {
-            1
-        } else {
-            0
-        },
-        tab_bar_rows: 1,
-        separated_status_rows: 0,
-        // per-window status on → only cmd line remains global.
-        // per-window status off → global status + cmd line.
-        status_cmd_rows: if per_window { 1 } else { 2 },
-        panel_chrome_rows: 2, // bottom-panel tabs + terminal toolbar
-        min_content_rows: 5,
-    }
-    .max_panel_content_rows()
+    render::compute_editor_layout(engine, screen_h as f64, 1.0, true).terminal_max_target_rows
 }
 
 // ─── Phase B.4 Stage 6: panel-key accelerator registry ──────────────────────

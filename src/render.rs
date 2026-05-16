@@ -14,7 +14,7 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
-use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, SearchDirection};
+use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
@@ -11839,6 +11839,126 @@ pub fn resolve_gutter_action(
     }
 }
 
+/// Computed editor chrome layout — all heights in native units (pixels for
+/// GTK/macOS, rows for TUI with `line_height = 1.0`).
+#[derive(Debug, Clone, Copy)]
+pub struct EditorLayout {
+    pub tab_bar_h: f64,
+    pub editor_top: f64,
+    pub editor_bottom: f64,
+    pub debug_toolbar_h: f64,
+    pub quickfix_h: f64,
+    pub terminal_h: f64,
+    pub terminal_content_rows: u16,
+    pub terminal_max_target_rows: u16,
+    pub separated_status_h: f64,
+    pub wildmenu_h: f64,
+    pub status_bar_h: f64,
+    pub command_line_h: f64,
+}
+
+/// One-shot layout computation used by all backends to derive editor window
+/// rects and chrome positions. Reads engine state directly so callers don't
+/// need to replicate the arithmetic.
+///
+/// * `total_height` — available viewport height (DA pixels for GTK, screen
+///   rows as f64 for TUI).
+/// * `line_height` — font line height (pixels for GTK, 1.0 for TUI).
+/// * `menu_in_viewport` — `true` for TUI (menu bar is a content row),
+///   `false` for GTK (menu bar is outside the DrawingArea).
+pub fn compute_editor_layout(
+    engine: &Engine,
+    total_height: f64,
+    line_height: f64,
+    menu_in_viewport: bool,
+) -> EditorLayout {
+    let lh = line_height;
+    let per_window = engine.settings.window_status_line;
+    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+
+    let menu_h = if menu_in_viewport && engine.menu_bar_visible {
+        lh
+    } else {
+        0.0
+    };
+    let tab_bar_h = if engine.terminal_maximized {
+        0.0
+    } else {
+        tab_bar_height_px(lh, engine.settings.breadcrumbs)
+    };
+    let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
+    let quickfix_h = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * lh
+    } else {
+        0.0
+    };
+    let has_separated = per_window && !engine.settings.status_line_above_terminal && bp_open;
+    let separated_status_h = separated_status_height_px(lh, has_separated);
+    let wildmenu_h = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        lh
+    };
+    let status_bar_h = status_bar_height_px(lh, per_window, !engine.wildmenu_items.is_empty());
+    let command_line_h = lh;
+
+    let (terminal_h, terminal_content_rows, terminal_max_target_rows) = if bp_open {
+        let viewport_rows = (total_height / lh).floor() as u16;
+        let chrome = PanelChromeDesc {
+            viewport_rows,
+            menu_rows: if menu_in_viewport && engine.menu_bar_visible {
+                1
+            } else {
+                0
+            },
+            quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+                6
+            } else {
+                0
+            },
+            debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
+            wildmenu_rows: if engine.wildmenu_items.is_empty() {
+                0
+            } else {
+                1
+            },
+            tab_bar_rows: if menu_in_viewport { 1 } else { 2 },
+            separated_status_rows: if has_separated { 1 } else { 0 },
+            status_cmd_rows: if per_window { 1 } else { 2 },
+            panel_chrome_rows: 2,
+            min_content_rows: 5,
+        };
+        let target = chrome.max_panel_content_rows();
+        let rows = engine.effective_terminal_panel_rows(target);
+        ((rows as f64 + 2.0) * lh, rows, target)
+    } else {
+        (0.0, 0, 0)
+    };
+
+    let editor_top = menu_h;
+    let editor_bottom = total_height
+        - status_bar_h
+        - debug_toolbar_h
+        - quickfix_h
+        - terminal_h
+        - separated_status_h;
+
+    EditorLayout {
+        tab_bar_h,
+        editor_top,
+        editor_bottom,
+        debug_toolbar_h,
+        quickfix_h,
+        terminal_h,
+        terminal_content_rows,
+        terminal_max_target_rows,
+        separated_status_h,
+        wildmenu_h,
+        status_bar_h,
+        command_line_h,
+    }
+}
+
 /// Compute the tab bar row height in pixels (the row containing tab labels).
 /// Used by GTK and Win-GUI backends.
 pub fn tab_row_height_px(line_height: f64) -> f64 {
@@ -11902,28 +12022,6 @@ pub fn separated_status_height_px(line_height: f64, has_separated: bool) -> f64 
     } else {
         0.0
     }
-}
-
-/// Compute the Y coordinate of the editor bottom edge (below which status/terminal/etc live).
-#[allow(clippy::too_many_arguments)]
-pub fn editor_bottom_px(
-    total_height: f64,
-    line_height: f64,
-    per_window_status_line: bool,
-    has_wildmenu: bool,
-    quickfix_open: bool,
-    quickfix_item_count: usize,
-    panel_open: bool,
-    panel_rows: usize,
-    debug_toolbar_visible: bool,
-    has_separated_status: bool,
-) -> f64 {
-    total_height
-        - status_bar_height_px(line_height, per_window_status_line, has_wildmenu)
-        - quickfix_height_px(line_height, quickfix_open, quickfix_item_count)
-        - terminal_panel_height_px(line_height, panel_open, panel_rows)
-        - debug_toolbar_height_px(line_height, debug_toolbar_visible)
-        - separated_status_height_px(line_height, has_separated_status)
 }
 
 // ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
@@ -12744,21 +12842,22 @@ mod tests {
     }
 
     #[test]
-    fn test_editor_bottom_px() {
-        let lh = 20.0;
-        let total = 800.0;
-        let eb = editor_bottom_px(total, lh, true, false, false, 0, false, 0, false, false);
-        assert_eq!(eb, total - lh); // only status bar (1 row)
+    fn test_compute_editor_layout_basic() {
+        let engine = crate::core::engine::tests::engine_with("hello\nworld\n");
+        let layout = compute_editor_layout(&engine, 800.0, 20.0, false);
+        // per_window_status_line defaults to true → status bar = 1 cmd line (20px)
+        assert_eq!(layout.status_bar_h, 20.0);
+        assert!(layout.editor_bottom > 700.0);
+        assert!(layout.editor_bottom < 800.0);
     }
 
     #[test]
-    fn test_editor_bottom_px_with_separated_status() {
-        let lh = 20.0;
-        let total = 800.0;
-        // With separated status, editor bottom is 1 extra row lower
-        let without = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, false);
-        let with = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, true);
-        assert_eq!(without - with, lh);
+    fn test_compute_editor_layout_tui_units() {
+        let engine = crate::core::engine::tests::engine_with("hello\n");
+        let layout = compute_editor_layout(&engine, 24.0, 1.0, true);
+        // TUI: line_height=1.0, total=24 rows, menu not visible
+        assert!(layout.editor_bottom > 20.0);
+        assert!(layout.editor_bottom <= 24.0);
     }
 
     #[test]

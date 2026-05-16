@@ -6873,24 +6873,34 @@ impl App {
             let in_terminal = if self.cached_line_height > 0.0 {
                 let engine = self.engine.borrow();
                 if engine.terminal_open || engine.bottom_panel_open {
-                    // Must use the *effective* rows so hit-testing lines up
-                    // with where the panel is actually drawn when maximized.
-                    let target =
-                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
-                    let effective_rows = engine.effective_terminal_panel_rows(target);
-                    let term_px = (effective_rows as f64 + 2.0) * self.cached_line_height;
-                    let global_status_rows = if engine.settings.window_status_line {
+                    // Pixel-exact terminal Y must match the draw function's
+                    // special-case snapping for maximize (#386). The draw
+                    // function caches hit regions on engine but this handler
+                    // predates that — kept as-is until migrated to cached hits.
+                    let lh = self.cached_line_height;
+                    let tab_row_h = (lh * 1.6).ceil();
+                    let per_window = engine.settings.window_status_line;
+                    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+                    let has_sep =
+                        per_window && !engine.settings.status_line_above_terminal && bp_open;
+                    let sep_px = if has_sep { lh } else { 0.0 };
+                    let wild_px = if engine.wildmenu_items.is_empty() {
                         0.0
                     } else {
-                        1.0
+                        lh
                     };
-                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
-                    let toolbar_px = if engine.debug_toolbar_visible {
-                        self.cached_line_height
+                    let status_h = lh * if per_window { 1.0 } else { 2.0 } + wild_px;
+                    let dbg_px = if engine.debug_toolbar_visible {
+                        lh
                     } else {
                         0.0
                     };
-                    let term_y = height - status_h - toolbar_px - term_px;
+                    let term_y = if engine.terminal_maximized {
+                        tab_row_h
+                    } else {
+                        let el = render::compute_editor_layout(&engine, height, lh, false);
+                        height - status_h - dbg_px - sep_px - el.terminal_h
+                    };
                     if y >= term_y {
                         // 0 = tab bar, 1 = toolbar, 2 = content
                         let zone = if y >= term_y + 2.0 * self.cached_line_height {
@@ -7559,24 +7569,34 @@ impl App {
             let in_terminal = if self.cached_line_height > 0.0 {
                 let engine = self.engine.borrow();
                 if engine.terminal_open || engine.bottom_panel_open {
-                    // Must use the *effective* rows so hit-testing lines up
-                    // with where the panel is actually drawn when maximized.
-                    let target =
-                        gtk_terminal_target_maximize_rows(&engine, height, self.cached_line_height);
-                    let effective_rows = engine.effective_terminal_panel_rows(target);
-                    let term_px = (effective_rows as f64 + 2.0) * self.cached_line_height;
-                    let global_status_rows = if engine.settings.window_status_line {
+                    // Pixel-exact terminal Y must match the draw function's
+                    // special-case snapping for maximize (#386). The draw
+                    // function caches hit regions on engine but this handler
+                    // predates that — kept as-is until migrated to cached hits.
+                    let lh = self.cached_line_height;
+                    let tab_row_h = (lh * 1.6).ceil();
+                    let per_window = engine.settings.window_status_line;
+                    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+                    let has_sep =
+                        per_window && !engine.settings.status_line_above_terminal && bp_open;
+                    let sep_px = if has_sep { lh } else { 0.0 };
+                    let wild_px = if engine.wildmenu_items.is_empty() {
                         0.0
                     } else {
-                        1.0
+                        lh
                     };
-                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
-                    let toolbar_px = if engine.debug_toolbar_visible {
-                        self.cached_line_height
+                    let status_h = lh * if per_window { 1.0 } else { 2.0 } + wild_px;
+                    let dbg_px = if engine.debug_toolbar_visible {
+                        lh
                     } else {
                         0.0
                     };
-                    let term_y = height - status_h - toolbar_px - term_px;
+                    let term_y = if engine.terminal_maximized {
+                        tab_row_h
+                    } else {
+                        let el = render::compute_editor_layout(&engine, height, lh, false);
+                        height - status_h - dbg_px - sep_px - el.terminal_h
+                    };
                     if y >= term_y + 2.0 * self.cached_line_height {
                         Some(term_y)
                     } else {
@@ -10609,7 +10629,8 @@ impl App {
     fn terminal_target_maximize_rows(&self) -> u16 {
         let lh = self.cached_line_height.max(1.0);
         if let Some(da) = self.drawing_area.borrow().as_ref() {
-            gtk_terminal_target_maximize_rows(&self.engine.borrow(), da.height() as f64, lh)
+            render::compute_editor_layout(&self.engine.borrow(), da.height() as f64, lh, false)
+                .terminal_max_target_rows
         } else {
             10
         }
@@ -10646,84 +10667,8 @@ fn calculate_gutter_width(mode: LineNumberMode, total_lines: usize, char_width: 
 /// (2 chrome rows = bottom-panel tab bar + terminal toolbar). Editor tab bar
 /// stays visible (1 row reserved); breadcrumbs are suppressed elsewhere so
 /// we don't reserve a row for them here. Called every frame from `draw_frame`
-/// and `gtk_editor_bottom`, so window resize automatically re-derives the
-/// maximized panel size.
-pub(super) fn gtk_terminal_target_maximize_rows(
-    engine: &Engine,
-    da_height: f64,
-    line_height: f64,
-) -> u16 {
-    // Convert GTK's pixel-based chrome into row units, then hand off to the
-    // shared `PanelChromeDesc::max_panel_content_rows`. The editor tab row is
-    // `1.6 * lh`, which rounds up to 2 row-units when reserved — the
-    // clamping in `max_panel_content_rows` absorbs that ≤0.4 lh of slack.
-    let lh = line_height.max(1.0);
-    let viewport_rows = (da_height / lh).floor() as u16;
-    let per_window = engine.settings.window_status_line;
-    let has_separated = per_window && !engine.settings.status_line_above_terminal;
-    crate::core::engine::PanelChromeDesc {
-        viewport_rows,
-        menu_rows: 0, // GTK menu bar lives outside the DrawingArea.
-        quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-            6
-        } else {
-            0
-        },
-        debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
-        wildmenu_rows: if engine.wildmenu_items.is_empty() {
-            0
-        } else {
-            1
-        },
-        // 1.6 lh for tab row → reserve 2 row-units (ceiling).
-        tab_bar_rows: 2,
-        separated_status_rows: if has_separated { 1 } else { 0 },
-        // per-window: cmd(1); otherwise: status + cmd (2).
-        status_cmd_rows: if per_window { 1 } else { 2 },
-        panel_chrome_rows: 2,
-        min_content_rows: 5,
-    }
-    .max_panel_content_rows()
-}
-
 fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let bp_open = engine.terminal_open || engine.bottom_panel_open;
-    let has_separated = engine.settings.window_status_line
-        && !engine.settings.status_line_above_terminal
-        && bp_open;
-    let global_status_rows = if engine.settings.window_status_line {
-        1.0
-    } else {
-        2.0
-    };
-    let status_bar_height = line_height * global_status_rows + wildmenu_px;
-    let qf_px = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * line_height
-    } else {
-        0.0
-    };
-    let term_px = if bp_open {
-        let target = gtk_terminal_target_maximize_rows(engine, da_height, line_height);
-        (engine.effective_terminal_panel_rows(target) as f64 + 2.0) * line_height
-    } else {
-        0.0
-    };
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let separated_status_px = if has_separated {
-        line_height // status row below terminal (cmd already in status_bar_height)
-    } else {
-        0.0
-    };
-    da_height - status_bar_height - debug_toolbar_px - qf_px - term_px - separated_status_px
+    render::compute_editor_layout(engine, da_height, line_height, false).editor_bottom
 }
 
 /// Compute editor window rects with the same formula used by draw_editor and
