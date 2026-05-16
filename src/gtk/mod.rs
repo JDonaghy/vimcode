@@ -8122,7 +8122,8 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::TerminalCopySelection => {
-                if let Some(text) = self.engine.borrow_mut().terminal_copy_selection() {
+                let text = self.engine.borrow_mut().terminal_copy_selection();
+                if let Some(text) = text {
                     let engine = self.engine.borrow();
                     if let Some(ref cb) = engine.clipboard_write {
                         let _ = cb(text.as_str());

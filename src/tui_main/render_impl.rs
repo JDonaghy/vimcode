@@ -635,7 +635,9 @@ pub(super) fn draw_frame(
             .replace(Some(crate::core::engine::BottomPanelGeometry {
                 top_y: bottom_panel_area.y as f64,
                 height: bottom_panel_area.height as f64,
-                row_h: 1.0,
+                toolbar_y: 1.0,
+                content_y: 2.0,
+                content_row_h: 1.0,
             }));
         // Tab bar (first row)
         let tab_bar_area = Rect {

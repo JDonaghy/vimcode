@@ -190,18 +190,20 @@ impl Engine {
     /// what the backend wrote into [`BottomPanelGeometry`] at paint time.
     pub fn resolve_bottom_panel_zone(&self, y: f64) -> Option<BottomPanelZone> {
         let g = (*self.bottom_panel_geometry.borrow())?;
-        if y < g.top_y || y >= g.top_y + g.height || g.row_h <= 0.0 {
+        if y < g.top_y || y >= g.top_y + g.height {
             return None;
         }
-        let rows_in = (y - g.top_y) / g.row_h;
-        let zone = if rows_in < 1.0 {
+        let rel = y - g.top_y;
+        let zone = if rel < g.toolbar_y {
             BottomPanelZone::TabBar
-        } else if rows_in < 2.0 {
+        } else if rel < g.content_y {
             BottomPanelZone::Toolbar
-        } else {
+        } else if g.content_row_h > 0.0 {
             BottomPanelZone::Content {
-                row_offset: (rows_in - 2.0) as u16,
+                row_offset: ((rel - g.content_y) / g.content_row_h) as u16,
             }
+        } else {
+            BottomPanelZone::Content { row_offset: 0 }
         };
         Some(zone)
     }

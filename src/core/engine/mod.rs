@@ -1398,14 +1398,18 @@ pub enum TerminalToolbarHits {
 pub struct BottomPanelGeometry {
     /// Top edge of the tab-bar row (= panel top).
     pub top_y: f64,
-    /// Total panel height in the same unit as `top_y`. Clicks at
-    /// `y >= top_y + height` are *below* the panel (on chrome) and resolve
-    /// to `None`.
+    /// Total panel height in the same unit as `top_y`.
     pub height: f64,
-    /// Height of one row in the click handler's units (line height for GTK,
-    /// `1.0` for TUI). Used to split `[top, top+row, top+2*row, …]` into
-    /// tab-bar / toolbar / content zones.
-    pub row_h: f64,
+    /// Y offset of the toolbar row relative to `top_y`.
+    /// GTK: `(line_height * 1.6).ceil()` (tab bar is taller than a normal row).
+    /// TUI: `1.0`.
+    pub toolbar_y: f64,
+    /// Y offset of the content area relative to `top_y`.
+    /// GTK: `toolbar_y + line_height`. TUI: `2.0`.
+    pub content_y: f64,
+    /// Height of one content row (line_height for GTK, 1.0 for TUI).
+    /// Used to compute `row_offset` within the content zone.
+    pub content_row_h: f64,
 }
 
 /// Click zone within the bottom panel as resolved by

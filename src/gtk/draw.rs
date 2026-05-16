@@ -512,7 +512,9 @@ pub(super) fn draw_editor(
             .replace(Some(crate::core::engine::BottomPanelGeometry {
                 top_y: term_y,
                 height: term_px,
-                row_h: line_height,
+                toolbar_y: line_height,
+                content_y: 2.0 * line_height,
+                content_row_h: line_height,
             }));
         // Tab bar row (1 line high) at the top of the bottom panel area.
         let hits = draw_bottom_panel_tabs(

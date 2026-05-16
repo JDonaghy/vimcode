@@ -2042,9 +2042,8 @@ pub(super) fn handle_mouse(
                 engine.terminal_has_focus = true;
                 if col == sb_col {
                     // Scrollbar column — start drag through shared state.
-                    // Content area = panel minus tab-bar (1) and toolbar (1) rows.
-                    let track_start = (geom.top_y as u16).saturating_add(2);
-                    let track_len = (geom.height as u16).saturating_sub(2);
+                    let track_start = (geom.top_y + geom.content_y) as u16;
+                    let track_len = (geom.height - geom.content_y).max(0.0) as u16;
                     // Cap total to one screenful (vt100 API limit) so the drag range
                     // [0, total] exactly matches what set_scroll_offset can deliver.
                     let total = engine
