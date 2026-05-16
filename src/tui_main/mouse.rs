@@ -1088,7 +1088,8 @@ pub(super) fn handle_mouse(
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
                 let rows = engine.session.terminal_panel_rows;
-                let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                let cols = screen_w.saturating_sub(editor_left);
                 engine.terminal_resize(cols, rows);
                 let _ = engine.session.save();
             }
@@ -1096,9 +1097,9 @@ pub(super) fn handle_mouse(
                 *dragging_terminal_split = false;
                 let left_cols = engine.terminal_split_left_cols;
                 if left_cols > 0 {
-                    let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let sb_col = term_width.saturating_sub(1);
-                    let right_cols = sb_col.saturating_sub(left_cols).saturating_sub(1);
+                    let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let panel_w = screen_w.saturating_sub(editor_left);
+                    let right_cols = panel_w.saturating_sub(left_cols).saturating_sub(1);
                     let rows = engine.session.terminal_panel_rows;
                     engine.terminal_split_finalize_drag(left_cols, right_cols, rows);
                 }
@@ -2006,8 +2007,12 @@ pub(super) fn handle_mouse(
                 engine.terminal_has_focus = true;
                 let action = engine.resolve_terminal_toolbar_click(col as f64);
                 let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+                let panel_cols = terminal_size
+                    .map(|s| s.width)
+                    .unwrap_or(80)
+                    .saturating_sub(editor_left);
                 let ctx = crate::core::engine::UiEventContext {
-                    terminal_cols: terminal_size.map(|s| s.width).unwrap_or(80),
+                    terminal_cols: panel_cols,
                     terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
                 };
                 if !engine.execute_terminal_toolbar_action(action, ctx)
