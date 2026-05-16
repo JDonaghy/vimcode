@@ -109,6 +109,7 @@ pub(super) fn draw_frame(
     debug_toolbar_interaction: &quadraui::StatusBarInteraction,
     debug_toolbar_rect_out: &mut quadraui::Rect,
     completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
+    context_menu_layout_out: &mut Option<quadraui::ContextMenuLayout>,
     // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
     // Set once per frame by the caller (cached theme); the migrated
     // call sites wrap their access in `backend.enter_frame_scope`.
@@ -964,6 +965,7 @@ pub(super) fn draw_frame(
             |_| quadraui::ContextMenuItemMeasure::new(1.0),
         );
         super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
+        *context_menu_layout_out = Some(layout);
     }
 
     // ── Modal dialog (highest z-order after quit confirm) ────────────────────
@@ -1690,6 +1692,7 @@ mod tests {
         let dbg_toolbar_interaction = quadraui::StatusBarInteraction::new();
         let mut dbg_toolbar_rect = quadraui::Rect::default();
         let mut completion_layout = None;
+        let mut context_menu_layout = None;
         let mut backend = super::backend::TuiBackend::new();
 
         terminal
@@ -1714,6 +1717,7 @@ mod tests {
                     &dbg_toolbar_interaction,
                     &mut dbg_toolbar_rect,
                     &mut completion_layout,
+                    &mut context_menu_layout,
                     &mut backend,
                 );
             })

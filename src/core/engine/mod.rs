@@ -1176,6 +1176,7 @@ pub struct TabBarHitRegion {
 // ── Context menu hit regions ────────────────────────────────────────────────
 
 /// Result of resolving a click against a context menu popup.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuClickResult {
     /// Click on a menu item at this index.
@@ -1186,6 +1187,20 @@ pub enum ContextMenuClickResult {
     Outside,
 }
 
+/// Parse a `ContextMenuHit::Item(id)` back to the engine-side item index.
+/// The adapter (`context_menu_panel_to_quadraui_context_menu`) synthesises
+/// ids as `"context:N"` where N is the engine index.
+pub fn context_menu_hit_to_idx(hit: &quadraui::ContextMenuHit) -> Option<usize> {
+    if let quadraui::ContextMenuHit::Item(id) = hit {
+        id.as_str()
+            .strip_prefix("context:")
+            .and_then(|s| s.parse::<usize>().ok())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
 /// Compute the context menu popup bounds and resolve a click position.
 ///
 /// `items` — the menu items (separator_after items add an extra visual row).

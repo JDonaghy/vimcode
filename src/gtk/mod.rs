@@ -408,6 +408,9 @@ struct App {
     /// Completion popup layout — set during draw, used for hit-test in
     /// the click handler. None when the popup isn't visible.
     completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
+    /// Context menu layout — set during draw, used for hit-test in
+    /// both click and motion handlers. None when no menu is visible.
+    context_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
     /// Tab-switcher popup bounding rect (x, y, w, h) — set during
     /// draw, used for `ModalStack` registration in the click
     /// handler. (B.5b Stage 7.)
@@ -1949,6 +1952,8 @@ impl SimpleComponent for App {
             Rc::new(Cell::new(None));
         let completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>> =
             Rc::new(RefCell::new(None));
+        let context_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>> =
+            Rc::new(RefCell::new(None));
         #[allow(clippy::type_complexity)]
         let tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
@@ -2157,6 +2162,7 @@ impl SimpleComponent for App {
             panel_hover_popup_rect: panel_hover_popup_rect.clone(),
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
             completion_layout: completion_layout.clone(),
+            context_menu_layout: context_menu_layout.clone(),
             tab_switcher_popup_rect: tab_switcher_popup_rect.clone(),
             dialog_popup_rect: dialog_popup_rect.clone(),
             editor_hover_link_rects: editor_hover_link_rects.clone(),
@@ -3612,6 +3618,7 @@ impl SimpleComponent for App {
         let dialog_popup_for_draw = model.dialog_popup_rect.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
         let completion_layout_for_draw = model.completion_layout.clone();
+        let context_menu_layout_for_draw = model.context_menu_layout.clone();
         let tab_switcher_rect_for_draw = model.tab_switcher_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let editor_hover_sb_for_draw = model.editor_hover_scrollbar.clone();
@@ -3653,6 +3660,7 @@ impl SimpleComponent for App {
                             &dialog_popup_for_draw,
                             &editor_hover_rect_for_draw,
                             &completion_layout_for_draw,
+                            &context_menu_layout_for_draw,
                             &tab_switcher_rect_for_draw,
                             &editor_hover_links_for_draw,
                             &editor_hover_sb_for_draw,
@@ -3730,8 +3738,7 @@ impl SimpleComponent for App {
             let pos_cell = mouse_pos_cell.clone();
             let pos_cell_leave = mouse_pos_cell.clone();
             let engine_motion = engine.clone();
-            let lh_motion = line_height_cell.clone();
-            let cw_motion = char_width_cell.clone();
+            let cm_layout_motion = model.context_menu_layout.clone();
             let da_motion = widgets.drawing_area.clone();
             let mc = gtk4::EventControllerMotion::new();
             mc.connect_motion(move |_, x, y| {
@@ -3742,25 +3749,9 @@ impl SimpleComponent for App {
                 // function computes hover from mouse_pos directly.
                 if let Ok(mut eng) = engine_motion.try_borrow_mut() {
                     if eng.context_menu.is_some() {
-                        let lh = lh_motion.get();
-                        let cw = cw_motion.get();
-                        if lh >= 1.0 && cw >= 1.0 {
-                            let col = (x / cw) as u16;
-                            let row = (y / lh) as u16;
-                            let tw = (da_motion.width() as f64 / cw) as u16;
-                            let th = (da_motion.height() as f64 / lh) as u16;
-                            let cm = eng.context_menu.as_ref().unwrap();
-                            if let crate::core::engine::ContextMenuClickResult::Item(idx) =
-                                crate::core::engine::resolve_context_menu_click(
-                                    &cm.items,
-                                    cm.screen_x,
-                                    cm.screen_y,
-                                    tw,
-                                    th,
-                                    col,
-                                    row,
-                                )
-                            {
+                        if let Some(ref layout) = *cm_layout_motion.borrow() {
+                            let hit = layout.hit_test(x as f32, y as f32);
+                            if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
                                 eng.context_menu.as_mut().unwrap().selected = idx;
                             }
                         }
@@ -6029,54 +6020,9 @@ impl App {
         // "+1 row top border" layout. Driving both off the same
         // `ContextMenuLayout` eliminates drift by construction.
         if self.engine.borrow().context_menu.is_some() {
-            let cw = self.cached_char_width.max(1.0);
-            let lh = self.cached_line_height.max(1.0);
             let cm_id = quadraui::WidgetId::new("context_menu");
 
-            // Build a `quadraui::ContextMenu` + `ContextMenuLayout`
-            // identical to what the renderer computes. Mirrors
-            // `draw.rs::draw_context_menu_popup` so any future
-            // sizing/positioning change there propagates here without
-            // a parallel update.
-            let menu_layout = {
-                let engine = self.engine.borrow();
-                let cm = engine.context_menu.as_ref().unwrap();
-                if cm.items.is_empty() {
-                    None
-                } else {
-                    let panel = crate::render::ContextMenuPanel {
-                        items: cm
-                            .items
-                            .iter()
-                            .map(|item| crate::render::ContextMenuRenderItem {
-                                label: item.label.clone(),
-                                shortcut: item.shortcut.clone(),
-                                separator_after: item.separator_after,
-                                enabled: item.enabled,
-                            })
-                            .collect(),
-                        selected_idx: cm.selected,
-                        screen_col: cm.screen_x,
-                        screen_row: cm.screen_y,
-                    };
-                    let menu = crate::render::context_menu_panel_to_quadraui_context_menu(&panel);
-                    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(lh as f32);
-                    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-                    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-                    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
-                    let menu_w = content_cols as f64 * cw;
-                    let anchor_x = cm.screen_x as f64 * cw;
-                    let anchor_y = cm.screen_y as f64 * lh;
-                    let viewport = quadraui::Rect::new(0.0, 0.0, width as f32, height as f32);
-                    Some(menu.layout(
-                        anchor_x as f32,
-                        anchor_y as f32,
-                        viewport,
-                        menu_w as f32,
-                        item_height,
-                    ))
-                }
-            };
+            let menu_layout = self.context_menu_layout.borrow().clone();
 
             let Some(menu_layout) = menu_layout else {
                 // Empty items list — close defensively.
