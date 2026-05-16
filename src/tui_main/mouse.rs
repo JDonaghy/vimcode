@@ -162,6 +162,7 @@ pub(super) fn handle_mouse(
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
     completion_layout: Option<&quadraui::CompletionsLayout>,
+    context_menu_layout: Option<&quadraui::ContextMenuLayout>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -1487,42 +1488,44 @@ pub(super) fn handle_mouse(
 
     // ── Context menu click intercept ────────────────────────────────────────────
     if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
-        if let Some(ref cm) = engine.context_menu {
-            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let result = crate::core::engine::resolve_context_menu_click(
-                &cm.items,
-                cm.screen_x,
-                cm.screen_y,
-                term_w,
-                term_height,
-                col,
-                row,
-            );
-            use crate::core::engine::ContextMenuClickResult;
-            match result {
-                ContextMenuClickResult::Item(idx) => {
-                    engine.context_menu.as_mut().unwrap().selected = idx;
-                    let ctx = engine.context_menu_target_path();
-                    if let Some(act) = engine.context_menu_confirm() {
-                        if let Some((ctx_path, ctx_is_dir)) = ctx {
-                            handle_explorer_context_action(
-                                &act,
-                                engine,
-                                sidebar,
-                                *terminal_size,
-                                ctx_path,
-                                ctx_is_dir,
-                            );
+        if let Some(cl) = context_menu_layout {
+            let hit = cl.hit_test(col as f32, row as f32);
+            match hit {
+                quadraui::ContextMenuHit::Item(_) => {
+                    if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
+                        engine.context_menu.as_mut().unwrap().selected = idx;
+                        let ctx = engine.context_menu_target_path();
+                        if let Some(act) = engine.context_menu_confirm() {
+                            if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                handle_explorer_context_action(
+                                    &act,
+                                    engine,
+                                    sidebar,
+                                    *terminal_size,
+                                    ctx_path,
+                                    ctx_is_dir,
+                                );
+                            }
                         }
                     }
                     return sidebar_width;
                 }
-                ContextMenuClickResult::InsidePopup => {
+                quadraui::ContextMenuHit::Inert => {
                     return sidebar_width;
                 }
-                ContextMenuClickResult::Outside => {
+                quadraui::ContextMenuHit::Empty => {
+                    // Check if click is on the 1-cell border around the
+                    // inner layout bounds (TUI rasteriser draws border
+                    // outside layout.bounds).
+                    let b = &cl.bounds;
+                    let on_border = col as f32 >= b.x - 1.0
+                        && (col as f32) < b.x + b.width + 1.0
+                        && row as f32 >= b.y - 1.0
+                        && (row as f32) < b.y + b.height + 1.0;
+                    if on_border {
+                        return sidebar_width;
+                    }
                     engine.close_context_menu();
-                    // Fall through to process the click normally
                 }
             }
         } else {
@@ -1532,38 +1535,12 @@ pub(super) fn handle_mouse(
 
     // ── Context menu mouse hover ──────────────────────────────────────────────
     if engine.context_menu.is_some() && matches!(ev.kind, MouseEventKind::Moved) {
-        // Compute hit item by examining the menu geometry.
-        let mut hit_idx: Option<usize> = None;
-        if let Some(ref cm) = engine.context_menu {
-            let sep_count = cm.items.iter().filter(|i| i.separator_after).count() as u16;
-            let popup_h = cm.items.len() as u16 + sep_count + 2;
-            let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-            let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-            let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
-            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let px = cm.screen_x.min(term_w.saturating_sub(popup_w));
-            let py = cm.screen_y.min(term_height.saturating_sub(popup_h));
-
-            if col >= px && col < px + popup_w && row >= py && row < py + popup_h {
-                let inner_row = row - py;
-                if inner_row >= 1 && inner_row < popup_h - 1 {
-                    let mut visual_row: u16 = 1;
-                    for (idx, item) in cm.items.iter().enumerate() {
-                        if visual_row == inner_row && item.enabled {
-                            hit_idx = Some(idx);
-                            break;
-                        }
-                        visual_row += 1;
-                        if item.separator_after {
-                            visual_row += 1;
-                        }
-                    }
+        if let Some(cl) = context_menu_layout {
+            let hit = cl.hit_test(col as f32, row as f32);
+            if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
+                if let Some(ref mut cm) = engine.context_menu {
+                    cm.selected = idx;
                 }
-            }
-        }
-        if let Some(idx) = hit_idx {
-            if let Some(ref mut cm) = engine.context_menu {
-                cm.selected = idx;
             }
         }
         return sidebar_width;

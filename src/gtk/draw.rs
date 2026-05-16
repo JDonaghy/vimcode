@@ -53,6 +53,7 @@ pub(super) fn draw_editor(
     dialog_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     completion_layout_out: &Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
+    context_menu_layout_out: &Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
     tab_switcher_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
@@ -902,7 +903,7 @@ pub(super) fn draw_editor(
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
     dialog_popup_rect_out.set(popup_rect);
 
-    draw_context_menu_popup(
+    *context_menu_layout_out.borrow_mut() = draw_context_menu_popup(
         cr,
         &layout,
         &screen,
@@ -1914,12 +1915,12 @@ pub(super) fn draw_context_menu_popup(
     char_width: f64,
     line_height: f64,
     mouse_pos: (f64, f64),
-) {
+) -> Option<quadraui::ContextMenuLayout> {
     let Some(cm) = &screen.context_menu else {
-        return;
+        return None;
     };
     if cm.items.is_empty() {
-        return;
+        return None;
     }
 
     let pango_ctx = pangocairo::create_context(cr);
@@ -1974,6 +1975,8 @@ pub(super) fn draw_context_menu_popup(
     }
 
     super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
+
+    Some(menu_layout)
 }
 
 /// Draw the tab bar for the bottom panel (Terminal / Debug Output) via

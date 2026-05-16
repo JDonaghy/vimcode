@@ -1023,6 +1023,8 @@ fn event_loop(
     let mut editor_hover_scrollbar: Option<render::PopupScrollbarHit> = None;
     // Cached completion popup layout for mouse hit-testing (#288).
     let mut completion_layout: Option<quadraui::CompletionsLayout> = None;
+    // Cached context menu layout for mouse hit-testing (#210).
+    let mut context_menu_layout: Option<quadraui::ContextMenuLayout> = None;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
     let min_frame = Duration::from_millis(16);
     let mut last_draw = Instant::now()
@@ -1183,6 +1185,7 @@ fn event_loop(
                             &debug_toolbar_interaction,
                             &mut debug_toolbar_rect,
                             &mut completion_layout,
+                            &mut context_menu_layout,
                             &mut backend,
                         );
                     }
@@ -1234,6 +1237,7 @@ fn event_loop(
                                     &debug_toolbar_interaction,
                                     &mut debug_toolbar_rect,
                                     &mut completion_layout,
+                                    &mut context_menu_layout,
                                     &mut backend,
                                 );
                             }
@@ -2959,6 +2963,7 @@ fn event_loop(
                                 &mut hover_selecting,
                                 &mut fr_input_dragging,
                                 completion_layout.as_ref(),
+                                context_menu_layout.as_ref(),
                             );
 
                             if mouse_should_quit {
@@ -3005,6 +3010,7 @@ fn event_loop(
                     &mut hover_selecting,
                     &mut fr_input_dragging,
                     completion_layout.as_ref(),
+                    context_menu_layout.as_ref(),
                 );
 
                 if mouse_should_quit {
