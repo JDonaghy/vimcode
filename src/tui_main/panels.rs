@@ -189,33 +189,8 @@ pub(super) fn render_sidebar(
         engine.explorer_tree.borrow().render(b, q_rect);
     });
 
-    let total_rows = engine.explorer_rows.len();
-    let visible_rows = area.height as usize;
-    let scroll_top = engine.explorer_tree.borrow().scroll_offset();
-    let scrollbar = if total_rows > visible_rows && area.width >= 2 {
-        let track_h = visible_rows as f64;
-        let thumb_size = ((visible_rows as f64 / total_rows as f64) * track_h)
-            .ceil()
-            .max(1.0);
-        let thumb_top = ((scroll_top as f64 / total_rows as f64) * track_h).floor();
-        let sb_x = (area.x + area.width - 1) as f32;
-        Some(quadraui::SurfaceScrollbar {
-            axis: quadraui::ScrollAxis::Vertical,
-            track_bounds: quadraui::Rect::new(sb_x, area.y as f32, 1.0, area.height as f32),
-            thumb_bounds: quadraui::Rect::new(
-                sb_x,
-                area.y as f32 + thumb_top as f32,
-                1.0,
-                thumb_size as f32,
-            ),
-            total_items: total_rows,
-            visible_items: visible_rows,
-            scroll_offset: scroll_top,
-            inverted: false,
-        })
-    } else {
-        None
-    };
+    // TreeController.render() draws the scrollbar internally.
+    // Register a ScrollSurface for scroll-wheel dispatch only.
     engine
         .scroll_surfaces
         .borrow_mut()
@@ -227,7 +202,7 @@ pub(super) fn render_sidebar(
                 area.width as f32,
                 area.height as f32,
             ),
-            scrollbar,
+            scrollbar: None,
         });
 }
 

@@ -112,6 +112,27 @@ impl Engine {
         self.explorer_tree.borrow_mut().scroll_by(delta, viewport);
     }
 
+    /// Handle a TreeController event originating from a mouse click.
+    /// Single-click toggles dirs / previews files; double-click opens.
+    /// Returns `true` if the event was consumed.
+    pub fn handle_explorer_mouse_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
+        match event {
+            quadraui::TreeControllerEvent::RowSelected { ref path } => {
+                let idx = path[0] as usize;
+                if idx < self.explorer_rows.len() {
+                    if self.explorer_rows[idx].is_dir {
+                        self.explorer_toggle_dir(idx);
+                    } else {
+                        let file_path = self.explorer_rows[idx].path.clone();
+                        self.open_file_preview(&file_path);
+                    }
+                }
+                true
+            }
+            other => self.dispatch_explorer_tree_event(other),
+        }
+    }
+
     pub fn dispatch_explorer_tree_event(&mut self, event: quadraui::TreeControllerEvent) -> bool {
         match event {
             quadraui::TreeControllerEvent::RowActivated { ref path } => {

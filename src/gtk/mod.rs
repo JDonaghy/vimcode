@@ -310,11 +310,6 @@ struct App {
     /// scroll event is silently dropped.
     explorer_scroll_accum: Rc<Cell<f64>>,
     /// Most recent scrollbar rect in DA-local coords, published by
-    /// `draw_explorer_panel` each frame: `Some((x, y, w, h))` when a
-    /// scrollbar is visible, `None` otherwise. Used by the click/drag
-    /// handlers to hit-test scrollbar interactions.
-    #[allow(clippy::type_complexity)]
-    explorer_scrollbar_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -768,6 +763,9 @@ enum Msg {
     },
     /// Mouse-wheel on the explorer DrawingArea. Positive dy scrolls down.
     ExplorerScroll(f64),
+    /// UiEvent (scroll, mouse) on the explorer DrawingArea — routed
+    /// through TreeController.handle() for scrollbar interaction.
+    ExplorerUiEvent(quadraui::UiEvent),
     /// Prompt the user for a filename to rename `path` to. Dialog fallback
     /// used by GTK since inline TextInput editing on `draw_tree` rows is
     /// deferred until a future primitive stage.
@@ -1939,9 +1937,6 @@ impl SimpleComponent for App {
 
         let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
         let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
-        #[allow(clippy::type_complexity)]
-        let explorer_scrollbar_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
-            Rc::new(Cell::new(None));
         let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
             Rc::new(RefCell::new(None));
         let drawing_area_ref = Rc::new(RefCell::new(None));
@@ -2110,7 +2105,6 @@ impl SimpleComponent for App {
             activity_bar_da_ref: activity_bar_da_ref.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
-            explorer_scrollbar_rect: explorer_scrollbar_rect.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
             debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
@@ -2375,7 +2369,6 @@ impl SimpleComponent for App {
         {
             let engine_d = engine.clone();
             let row_h_cell = explorer_row_height_cell.clone();
-            let sb_rect_cell = explorer_scrollbar_rect.clone();
             let backend_d = backend.clone();
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
@@ -2404,42 +2397,15 @@ impl SimpleComponent for App {
 
                 crate::render::populate_explorer_tree_controller(&engine, &theme);
 
-                let total = engine.explorer_rows.len();
-                let need_sb = visible_rows > 0 && total > visible_rows;
-                let sb_w_px = if need_sb { 8.0 } else { 0.0 };
-                let tree_w = (w - sb_w_px).max(0.0);
-                let tree_rect = quadraui::Rect::new(0.0, 0.0, tree_w as f32, h as f32);
-
+                engine
+                    .explorer_tree
+                    .borrow_mut()
+                    .set_scrollbar_width(Some(8.0));
                 backend_d.borrow_mut().enter_frame_scope(cr, &layout, |b| {
                     b.set_current_theme(crate::gtk::quadraui_gtk::q_theme(&theme));
                     b.set_current_line_height(line_height);
-                    engine.explorer_tree.borrow().render(b, tree_rect);
+                    engine.explorer_tree.borrow().render(b, q_rect);
                 });
-
-                if need_sb {
-                    let sb_x = tree_w;
-                    let scroll_top = engine.explorer_tree.borrow().scroll_offset();
-                    let track_len = h;
-                    let thumb_len = (track_len * visible_rows as f64 / total as f64).max(8.0);
-                    let max_scroll = total.saturating_sub(visible_rows) as f64;
-                    let scroll_ratio = if max_scroll > 0.0 {
-                        scroll_top as f64 / max_scroll
-                    } else {
-                        0.0
-                    };
-                    let thumb_y = scroll_ratio * (track_len - thumb_len);
-                    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
-                    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-                    cr.set_source_rgb(bg_r, bg_g, bg_b);
-                    cr.rectangle(sb_x, 0.0, sb_w_px, track_len);
-                    cr.fill().ok();
-                    cr.set_source_rgb(dim_r, dim_g, dim_b);
-                    cr.rectangle(sb_x + 2.0, thumb_y, sb_w_px - 4.0, thumb_len);
-                    cr.fill().ok();
-                    sb_rect_cell.set(Some((sb_x, 0.0, sb_w_px, track_len)));
-                } else {
-                    sb_rect_cell.set(None);
-                }
             });
         }
         {
@@ -2460,15 +2426,8 @@ impl SimpleComponent for App {
             });
             widgets.explorer_da.add_controller(key_ctrl);
         }
-        {
-            let sender_ex = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, x, y| {
-                sender_ex.send(Msg::ExplorerClick { x, y, n_press }).ok();
-            });
-            widgets.explorer_da.add_controller(gesture);
-        }
+        // Right-click context menu (kept separate — TreeController returns
+        // ContextMenuRequested but the menu-open logic lives in the GTK handler).
         {
             let sender_ex = sender.input_sender().clone();
             let right_click = gtk4::GestureClick::new();
@@ -2478,152 +2437,13 @@ impl SimpleComponent for App {
             });
             widgets.explorer_da.add_controller(right_click);
         }
+        // Wire all mouse/scroll events through TreeController.handle() for
+        // unified click, scrollbar, and scroll-wheel handling.
         {
-            let sender_ex = sender.input_sender().clone();
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                sender_ex.send(Msg::ExplorerScroll(dy)).ok();
-                gtk4::glib::Propagation::Stop
+            let sender_ev = sender.input_sender().clone();
+            quadraui::gtk::wire_da_events(&widgets.explorer_da, move |ev| {
+                sender_ev.send(Msg::ExplorerUiEvent(ev)).ok();
             });
-            widgets.explorer_da.add_controller(scroll_ctrl);
-        }
-        // Scrollbar thumb drag: a dedicated `GestureDrag` on the explorer
-        // DA watches for drags that start inside the scrollbar track and
-        // translates vertical motion into `scroll_top` updates. Claiming
-        // the gesture on begin prevents the ancestor sidebar-resize
-        // `GestureDrag` on `main_hbox` from interpreting a thumb drag as
-        // a panel-width resize (the scrollbar lives right at the sidebar
-        // edge, so the ambiguity is real).
-        //
-        // Drag math goes through `quadraui::dispatch_mouse_drag` (same code
-        // path TUI uses) — this gives correct thumb-length compensation
-        // (#204) so the thumb tracks 1:1 with the mouse instead of feeling
-        // sluggish, and makes the picker / sidebar / palette scrollbars all
-        // share one math implementation. Click-on-track jump-scroll happens
-        // here in `connect_drag_begin` rather than in the click handler so
-        // it fires reliably even when GTK claims the drag sequence and
-        // suppresses the click (#199).
-        {
-            let sb_rect_begin = explorer_scrollbar_rect.clone();
-            let engine_begin = engine.clone();
-            let row_h_begin = explorer_row_height_cell.clone();
-            let da_begin = widgets.explorer_da.clone();
-            let drag_state_begin = model.backend.borrow().drag_state_handle();
-
-            let engine_update = engine.clone();
-            let da_update = widgets.explorer_da.clone();
-            let drag_state_update = model.backend.borrow().drag_state_handle();
-
-            let drag_state_end = model.backend.borrow().drag_state_handle();
-            let da_end = widgets.explorer_da.clone();
-
-            let gesture = gtk4::GestureDrag::new();
-            gesture.set_button(1);
-            gesture.connect_drag_begin(move |g, x_start, y_start| {
-                let Some((sb_x, sb_y, sb_w, sb_h)) = sb_rect_begin.get() else {
-                    return;
-                };
-                if x_start < sb_x || x_start > sb_x + sb_w {
-                    return;
-                }
-                g.set_state(gtk4::EventSequenceState::Claimed);
-
-                let eng = engine_begin.borrow();
-                let total = eng.explorer_rows.len();
-                let item_h = row_h_begin.get().max(1.0);
-                let viewport = (da_begin.height() as f64 / item_h).floor().max(0.0) as usize;
-                let max_scroll = total.saturating_sub(viewport);
-                if max_scroll == 0 || sb_h <= 0.0 {
-                    return;
-                }
-
-                let thumb_ratio = (viewport as f32 / total as f32).min(1.0);
-                let thumb_length = (sb_h as f32 * thumb_ratio).max(1.0);
-                let effective_track = (sb_h as f32 - thumb_length).max(1.0);
-                let scroll_top = eng.explorer_tree.borrow().scroll_offset();
-                let scroll_ratio = if max_scroll == 0 {
-                    0.0
-                } else {
-                    (scroll_top as f32 / max_scroll as f32).clamp(0.0, 1.0)
-                };
-                let thumb_top = sb_y as f32 + scroll_ratio * effective_track;
-                let dy = y_start as f32 - thumb_top;
-                let grab_offset = if dy >= 0.0 && dy < thumb_length {
-                    dy
-                } else {
-                    0.0
-                };
-                drop(eng);
-
-                drag_state_begin
-                    .borrow_mut()
-                    .begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new("explorer:sb"),
-                        track_start: sb_y as f32,
-                        track_length: sb_h as f32,
-                        thumb_length: (sb_h as f32 * viewport as f32 / total.max(1) as f32)
-                            .max(1.0),
-                        max_scroll: total.saturating_sub(viewport),
-                        grab_offset,
-                        inverted: false,
-                    });
-
-                let events = quadraui::dispatch_mouse_drag(
-                    &drag_state_begin.borrow(),
-                    quadraui::Point {
-                        x: x_start as f32,
-                        y: y_start as f32,
-                    },
-                    Default::default(),
-                );
-                for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
-                        engine_begin
-                            .borrow()
-                            .explorer_tree
-                            .borrow_mut()
-                            .set_scroll_offset(*new_offset);
-                    }
-                }
-
-                da_begin.queue_draw();
-            });
-            gesture.connect_drag_update(move |g, dx, dy| {
-                let Some((start_x, start_y)) = g.start_point() else {
-                    return;
-                };
-                let drag = drag_state_update.borrow();
-                if !drag.is_active() {
-                    return;
-                }
-                let events = quadraui::dispatch_mouse_drag(
-                    &drag,
-                    quadraui::Point {
-                        x: (start_x + dx) as f32,
-                        y: (start_y + dy) as f32,
-                    },
-                    Default::default(),
-                );
-                drop(drag);
-                for ev in &events {
-                    if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        if widget.as_str() == "explorer:sb" {
-                            engine_update
-                                .borrow()
-                                .explorer_tree
-                                .borrow_mut()
-                                .set_scroll_offset(*new_offset);
-                            da_update.queue_draw();
-                        }
-                    }
-                }
-            });
-            gesture.connect_drag_end(move |_, _, _| {
-                drag_state_end.borrow_mut().end();
-                da_end.queue_draw();
-            });
-            widgets.explorer_da.add_controller(gesture);
         }
 
         // Drag-and-drop from the explorer was part of the native
@@ -4797,6 +4617,7 @@ impl SimpleComponent for App {
             | Msg::ExplorerClick { .. }
             | Msg::ExplorerRightClick { .. }
             | Msg::ExplorerScroll(_)
+            | Msg::ExplorerUiEvent(_)
             | Msg::PromptRenameFile(_)
             | Msg::PromptNewFile(_)
             | Msg::PromptNewFolder(_) => {
@@ -10017,6 +9838,62 @@ impl App {
                 self.engine.borrow_mut().explorer_scroll(step);
                 self.queue_explorer_draw();
             }
+            Msg::ExplorerUiEvent(ev) => {
+                let dominated = matches!(
+                    ev,
+                    quadraui::UiEvent::MouseDown { .. }
+                        | quadraui::UiEvent::DoubleClick { .. }
+                        | quadraui::UiEvent::MouseUp { .. }
+                        | quadraui::UiEvent::Scroll { .. }
+                ) || matches!(
+                    ev,
+                    quadraui::UiEvent::MouseMoved {
+                        buttons: quadraui::ButtonMask { left: true, .. },
+                        ..
+                    }
+                );
+                if dominated {
+                    let rect = self.engine.borrow().explorer_tree_rect.get();
+                    if rect.width > 0.0 {
+                        let theme = {
+                            let eng = self.engine.borrow();
+                            render::Theme::from_name(&eng.settings.colorscheme)
+                        };
+                        crate::render::populate_explorer_tree_controller(
+                            &self.engine.borrow(),
+                            &theme,
+                        );
+                        let tree_event = {
+                            let mut b = self.backend.borrow_mut();
+                            self.engine
+                                .borrow()
+                                .explorer_tree
+                                .borrow_mut()
+                                .handle(&ev, &mut *b, rect)
+                        };
+                        let is_scrollbar =
+                            matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
+                        if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
+                            self.engine
+                                .borrow_mut()
+                                .dispatch_explorer_tree_event(tree_event);
+                        } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
+                            self.engine
+                                .borrow_mut()
+                                .handle_explorer_mouse_event(tree_event);
+                        }
+                        // Scrollbar interaction should not steal keyboard
+                        // focus from the editor.
+                        if is_scrollbar {
+                            if let Some(ref da) = *self.drawing_area.borrow() {
+                                da.grab_focus();
+                            }
+                        }
+                        self.queue_explorer_draw();
+                        self.draw_needed.set(true);
+                    }
+                }
+            }
             Msg::PromptRenameFile(_) | Msg::PromptNewFile(_) | Msg::PromptNewFolder(_) => {
                 // Explorer CRUD now uses inline editing via TreeController.
                 // These dialog paths are kept as Msg variants for backwards
@@ -10112,34 +9989,9 @@ impl App {
         }
     }
 
-    fn explorer_jump_scroll(&self, click_y: f64, sb_y: f64, sb_h: f64) {
-        let engine = self.engine.borrow();
-        let total = engine.explorer_rows.len();
-        let viewport = engine.explorer_viewport_rows.get();
-        let max_scroll = total.saturating_sub(viewport);
-        if max_scroll == 0 || sb_h <= 0.0 {
-            return;
-        }
-        let thumb_ratio = (viewport as f64 / total as f64).min(1.0);
-        let thumb_h = (sb_h * thumb_ratio).max(1.0);
-        let effective_track = (sb_h - thumb_h).max(1.0);
-        let scroll_top = engine.explorer_tree.borrow().scroll_offset();
-        let scroll_ratio = (scroll_top as f64 / max_scroll.max(1) as f64).clamp(0.0, 1.0);
-        let thumb_top = sb_y + scroll_ratio * effective_track;
-        if click_y >= thumb_top && click_y < thumb_top + thumb_h {
-            return;
-        }
-        let rel = ((click_y - sb_y) / effective_track).clamp(0.0, 1.0);
-        let new_top = (rel * max_scroll as f64).round() as usize;
-        engine
-            .explorer_tree
-            .borrow_mut()
-            .set_scroll_offset(new_top.min(max_scroll));
-    }
-
     fn handle_explorer_da_click(
         &mut self,
-        x: f64,
+        _x: f64,
         y: f64,
         n_press: i32,
         sender: &ComponentSender<Self>,
@@ -10148,14 +10000,6 @@ impl App {
             da.grab_focus();
         }
         self.engine.borrow_mut().explorer_has_focus = true;
-
-        if let Some((sb_x, sb_y, sb_w, sb_h)) = self.explorer_scrollbar_rect.get() {
-            if x >= sb_x && x <= sb_x + sb_w && y >= sb_y && y <= sb_y + sb_h {
-                self.explorer_jump_scroll(y, sb_y, sb_h);
-                self.queue_explorer_draw();
-                return;
-            }
-        }
 
         let Some(idx) = self.explorer_row_at(y) else {
             return;

@@ -1065,6 +1065,8 @@ fn event_loop(
     // Command-line mouse text selection: (start_col, end_col) in the rendered row.
     let mut cmd_sel: Option<(usize, usize)> = None;
     let mut cmd_dragging = false;
+    // Explorer scrollbar thumb drag via TreeController (set on MouseDown in scrollbar area).
+    let mut explorer_sb_dragging = false;
     // Explorer drag-and-drop: row index where mouse-down occurred (potential drag source).
     let mut explorer_drag_src: Option<usize> = None;
     // Active explorer drag state: (source row index, current target row index or None).
@@ -1596,22 +1598,56 @@ fn event_loop(
             }
         }
 
-        // ── Explorer DoubleClick → TreeController ─────────────────────
-        if let quadraui::UiEvent::DoubleClick { position, .. } = &ui_event {
-            let rect = engine.explorer_tree_rect.get();
-            if engine.app_shell.sidebar_visible()
-                && engine.active_panel_is(PANEL_EXPLORER)
-                && rect.width > 0.0
-                && rect.contains(*position)
-            {
-                engine.explorer_has_focus = true;
-                sidebar.has_focus = true;
+        // ── Explorer mouse events → TreeController ────────────────────
+        // Route mouse events through TreeController.handle() so the
+        // built-in scrollbar (click, thumb drag, track page) works.
+        // MouseDown/DoubleClick for row selection; MouseMoved (left held)
+        // and MouseUp for scrollbar drag lifecycle.
+        {
+            let is_explorer_event = match &ui_event {
+                quadraui::UiEvent::MouseDown { position, .. }
+                | quadraui::UiEvent::DoubleClick { position, .. } => {
+                    let rect = engine.explorer_tree_rect.get();
+                    engine.app_shell.sidebar_visible()
+                        && engine.active_panel_is(PANEL_EXPLORER)
+                        && rect.width > 0.0
+                        && rect.contains(*position)
+                }
+                quadraui::UiEvent::MouseMoved { .. } | quadraui::UiEvent::MouseUp { .. } => {
+                    explorer_sb_dragging
+                }
+                _ => false,
+            };
+            if is_explorer_event {
+                let rect = engine.explorer_tree_rect.get();
                 render::populate_explorer_tree_controller(engine, &theme);
-                let event = engine
-                    .explorer_tree
-                    .borrow_mut()
-                    .handle(&ui_event, &mut backend, rect);
-                engine.dispatch_explorer_tree_event(event);
+                let tree_event =
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .handle(&ui_event, &mut backend, rect);
+                let is_scrollbar =
+                    matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
+                match &ui_event {
+                    quadraui::UiEvent::DoubleClick { .. } => {
+                        engine.explorer_has_focus = true;
+                        sidebar.has_focus = true;
+                        engine.dispatch_explorer_tree_event(tree_event);
+                    }
+                    quadraui::UiEvent::MouseDown { .. } => {
+                        if is_scrollbar {
+                            explorer_sb_dragging = true;
+                        } else {
+                            engine.explorer_has_focus = true;
+                            sidebar.has_focus = true;
+                        }
+                        engine.handle_explorer_mouse_event(tree_event);
+                    }
+                    quadraui::UiEvent::MouseUp { .. } => {
+                        explorer_sb_dragging = false;
+                    }
+                    _ => {} // MouseMoved — TreeController drag_to() handles internally
+                }
                 needs_redraw = true;
                 continue;
             }
