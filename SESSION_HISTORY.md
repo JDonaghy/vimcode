@@ -1,7 +1,20 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 376 archived here.
+All sessions through 377 archived here.
+
+---
+**Session 377 (May 15) — Explorer scrollbar migration + clipboard dedup (#413, #415, #381):**
+
+Three commits landed on develop, net ~160 lines removed across 5 files.
+
+**#413 fix (eccf986):** RefCell double-borrow crash in GTK poll tick + ExtPanel sidebar flickering. Rust 2021 temporary lifetime fix: extracted `borrow_mut().take()` out of `if let`. `ext_panel_focus_pending` handler now sets `engine.ext_panel_active` / `ext_panel_has_focus` and calls `sync_sidebar_widgets()`. `sync_sidebar_from_engine()` checks `ext_panel_active` before defaulting to Explorer.
+
+**#415 scrollbar migration (d564ad3):** Explorer scrollbar fully owned by quadraui `TreeController` (quadraui#193). GTK: `wire_da_events` on explorer DA → `ExplorerUiEvent` → `TreeController.handle()`. Removed manual Cairo scrollbar drawing (~25 lines), `GestureDrag` scrollbar handler (~120 lines), `explorer_scrollbar_rect` field, `explorer_jump_scroll()`, scrollbar hit-test in click handler. `set_scrollbar_width(Some(8.0))` in GTK draw func. TUI: removed manual `SurfaceScrollbar` geometry computation (~30 lines). Routes MouseDown/DoubleClick/MouseMoved/MouseUp through `TreeController.handle()` with `explorer_sb_dragging` flag. Default scrollbar width (line_height=1.0) correct for TUI. New engine method `handle_explorer_mouse_event()` — single-click toggles dirs / previews files. TUI editor-area click now clears `explorer_has_focus` (missing from focus-clear block). Scrollbar clicks don't steal keyboard focus (GTK: `grab_focus()` on drawing_area after `ScrollChanged`; TUI: only sets `explorer_has_focus` for row clicks). Filed quadraui#193 during earlier investigation, closed after quadraui shipped `set_scrollbar_width` + `set_show_scrollbar`.
+
+**#381 clipboard dedup (ff8cf6a):** Clipboard-before-paste wiring deduplicated. Two new engine methods: `needs_clipboard_for_paste(key, unicode, ctrl) -> bool` (pure query) and `prepare_paste_clipboard(clipboard_text)` (loads registers, handles VSCode mode). GTK: ~35 lines → 3-line call. TUI: removed `intercept_paste_key` function (~37 lines), replaced VSCode Ctrl+V block + call site.
+
+**Filed:** #416 (GTK extension install prompts steal keyboard focus on startup — pre-existing, confirmed on develop).
 
 ---
 **Session 376 (May 15) — AppShell sidebar: GTK migration + full follow-up sweep (#385, #408–#411):**
