@@ -41,13 +41,13 @@ All non-trivial work should be tracked via GitHub Issues.
 
 **For all other changes:**
 
-1. **Always work on a local branch off `develop`.** Never commit code directly to `develop`. Branch naming: `issue-{number}-{short-description}` or `{kind}-{short-description}`.
-2. Do the work on that branch, committing as you go.
-3. **Do NOT push the branch yet.** Keep it local until the user has run smoke tests or explicitly agreed testing is not needed.
+1. **Claim the issue before starting work.** Multiple agents may be active concurrently — claim publicly so nobody picks up the same issue. Run `gh issue edit <N> --add-assignee @me`, create the feature branch from `develop` (`issue-{number}-{short-description}`), and push it empty so it appears on the remote as the claim signal. Pushing an empty branch is NOT opening a PR.
+2. **Work on that branch**, committing as you go. Never commit code directly to `develop`. For non-issue work, use `{kind}-{short-description}` naming and you may skip the claim step.
+3. **Do NOT open a PR yet.** Keep the branch in "commits pushed, no PR" state until the user has run smoke tests or explicitly agreed testing is not needed. Subsequent pushes to the claim branch are fine.
 4. **Once approved, ask the user which landing path:**
    - **Path A — merge locally + push.** For small/trivial changes: `git merge --ff-only <branch>`, push `develop`, delete the branch.
-   - **Path B — push branch + open PR.** For normal feature/bugfix work: push the branch, open a PR to `develop`. Reference "Closes #{number}" if it closes an issue.
-5. **When the user confirms a merge that closes an issue**, immediately `gh issue close <number>`.
+   - **Path B — open PR.** For normal feature/bugfix work: open a PR to `develop` against the already-pushed branch. Reference "Closes #{number}" if it closes an issue.
+5. **When the user confirms a merge that closes an issue**, immediately `gh issue close <number>` and unassign yourself.
 
 **Creating issues:** Include full design context in the body — file paths, API details, expected behavior. Issues should be self-contained so a new session can pick one up.
 

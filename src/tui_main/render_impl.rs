@@ -630,6 +630,15 @@ pub(super) fn draw_frame(
 
     // ── Bottom panel (tab bar + terminal or debug output) ────────────────────
     if bottom_panel_area.height > 0 {
+        engine
+            .bottom_panel_geometry
+            .replace(Some(crate::core::engine::BottomPanelGeometry {
+                top_y: bottom_panel_area.y as f64,
+                height: bottom_panel_area.height as f64,
+                toolbar_y: 1.0,
+                content_y: 2.0,
+                content_row_h: 1.0,
+            }));
         // Tab bar (first row)
         let tab_bar_area = Rect {
             x: bottom_panel_area.x,
@@ -744,6 +753,8 @@ pub(super) fn draw_frame(
                     });
             }
         }
+    } else {
+        engine.bottom_panel_geometry.replace(None);
     }
 
     // ── Debug toolbar strip (if visible) ────────────────────────────────────

@@ -1,4 +1,4 @@
-# src/core/engine/mod.rs — 3,943 lines
+# src/core/engine/mod.rs — 4,756 lines
 
 Core engine definition. Contains the `Engine` struct (all editor state), enums, types, `new()` constructor, free functions, and `mod` declarations for all submodules.
 
@@ -20,6 +20,7 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `ContextMenuState` / `ContextMenuItem` / `ContextMenuTarget` — context menus (Tab, ExplorerFile, ExplorerDir, Editor, EditorActionMenu, ExtPanel)
 - `PanelHoverPopup` / `EditorHoverPopup` — hover popup state
 - `EditorGroup` — tab group with own tab list + `tab_scroll_offset` for overflow scrolling
+- `BottomPanelGeometry` / `BottomPanelZone` — cached panel top_y/height/row_h + zone enum (TabBar/Toolbar/Content) for click dispatch via `resolve_bottom_panel_zone()` (#418)
 - `UserKeymap` — user-defined key remapping
 - `DiffPeekState` — inline diff peek popup state
 - `SwapRecovery` — crash recovery swap file state

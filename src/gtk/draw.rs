@@ -372,14 +372,8 @@ pub(super) fn draw_editor(
 
     // 5b. Draw completion popup (on top of everything else). Cache
     //     the layout so the click handler can hit-test items.
-    *completion_layout_out.borrow_mut() = draw_completion_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        line_height,
-        char_width,
-    );
+    *completion_layout_out.borrow_mut() =
+        draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
 
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(
@@ -513,6 +507,15 @@ pub(super) fn draw_editor(
             let y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
             (y, term_px)
         };
+        engine
+            .bottom_panel_geometry
+            .replace(Some(crate::core::engine::BottomPanelGeometry {
+                top_y: term_y,
+                height: term_px,
+                toolbar_y: line_height,
+                content_y: 2.0 * line_height,
+                content_row_h: line_height,
+            }));
         // Tab bar row (1 line high) at the top of the bottom panel area.
         let hits = draw_bottom_panel_tabs(
             backend,
@@ -696,6 +699,8 @@ pub(super) fn draw_editor(
                     });
             }
         }
+    } else {
+        engine.bottom_panel_geometry.replace(None);
     }
 
     // 5h. Draw debug toolbar strip if visible (above status bar)

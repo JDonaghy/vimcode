@@ -1390,6 +1390,41 @@ pub enum TerminalToolbarHits {
     TabStrip(quadraui::TabBarHits),
 }
 
+/// Cached vertical geometry of the bottom panel (tab bar + toolbar + content),
+/// written at paint time so click handlers don't have to recompute the snapped
+/// panel top from chrome/status/wildmenu heights. Units match the backend's
+/// click coordinates: pixels for GTK, character rows for TUI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomPanelGeometry {
+    /// Top edge of the tab-bar row (= panel top).
+    pub top_y: f64,
+    /// Total panel height in the same unit as `top_y`.
+    pub height: f64,
+    /// Y offset of the toolbar row relative to `top_y`.
+    /// GTK: `(line_height * 1.6).ceil()` (tab bar is taller than a normal row).
+    /// TUI: `1.0`.
+    pub toolbar_y: f64,
+    /// Y offset of the content area relative to `top_y`.
+    /// GTK: `toolbar_y + line_height`. TUI: `2.0`.
+    pub content_y: f64,
+    /// Height of one content row (line_height for GTK, 1.0 for TUI).
+    /// Used to compute `row_offset` within the content zone.
+    pub content_row_h: f64,
+}
+
+/// Click zone within the bottom panel as resolved by
+/// [`Engine::resolve_bottom_panel_zone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottomPanelZone {
+    /// Row 0 — the shared "TERMINAL / DEBUG CONSOLE" tab strip.
+    TabBar,
+    /// Row 1 — the per-terminal toolbar (tab strip or find bar).
+    Toolbar,
+    /// Row 2+ — the panel content. `row_offset` is the row index relative
+    /// to the top of the content area (0 = first content row).
+    Content { row_offset: u16 },
+}
+
 /// Action resolved from a terminal toolbar click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalToolbarAction {
@@ -2947,6 +2982,10 @@ pub struct Engine {
     /// Cached hit data from the last paint of the terminal toolbar (find bar
     /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
     pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
+    /// Cached vertical geometry of the bottom panel from the last paint.
+    /// Written at paint time by both backends; read by `resolve_bottom_panel_zone`
+    /// so click handlers don't recompute the snapped panel top (#418).
+    pub bottom_panel_geometry: std::cell::RefCell<Option<BottomPanelGeometry>>,
     /// Cached layout from the last paint of the command center (nav arrows + search box).
     /// Written at paint time; read by click handlers.
     pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
@@ -3684,6 +3723,7 @@ impl Engine {
             bottom_panel_kind: BottomPanelKind::Terminal,
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
             terminal_toolbar_hits: std::cell::RefCell::new(None),
+            bottom_panel_geometry: std::cell::RefCell::new(None),
             command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,

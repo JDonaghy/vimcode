@@ -183,6 +183,31 @@ impl Engine {
         self.terminal_has_focus = false;
     }
 
+    /// Resolve which zone of the bottom panel contains the click y-coordinate
+    /// using the geometry cached at paint time. Returns `None` if the panel
+    /// isn't currently painted or `y` is above the panel top. `y` is in the
+    /// caller's unit (pixels for GTK, character rows for TUI) — must match
+    /// what the backend wrote into [`BottomPanelGeometry`] at paint time.
+    pub fn resolve_bottom_panel_zone(&self, y: f64) -> Option<BottomPanelZone> {
+        let g = (*self.bottom_panel_geometry.borrow())?;
+        if y < g.top_y || y >= g.top_y + g.height {
+            return None;
+        }
+        let rel = y - g.top_y;
+        let zone = if rel < g.toolbar_y {
+            BottomPanelZone::TabBar
+        } else if rel < g.content_y {
+            BottomPanelZone::Toolbar
+        } else if g.content_row_h > 0.0 {
+            BottomPanelZone::Content {
+                row_offset: ((rel - g.content_y) / g.content_row_h) as u16,
+            }
+        } else {
+            BottomPanelZone::Content { row_offset: 0 }
+        };
+        Some(zone)
+    }
+
     /// Dispatch a click on the bottom panel tab bar using the cached
     /// `TabBarHits` from the last paint. Returns `true` if the click
     /// was consumed (tab switch or panel close).
