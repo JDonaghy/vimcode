@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 15, 2026 (Session 378 — **macOS readiness dedup sweep.** 6 commits (#413/#415/#381/#416/#389/#386). Explorer scrollbar → quadraui TreeController. Clipboard paste detection → shared engine methods. GTK startup focus fix. Registry fetch fallback. Editor layout arithmetic → shared `render::compute_editor_layout()`. Filed #417 clipboard read/write dedup, #418 terminal hit region migration.)
+**Last updated:** May 16, 2026 (Session 379 — **PR maintenance + clipboard dedup landing.** Rebased PR #414 (SidebarPanel enum removal) onto develop, resolved 3 merge conflicts in `src/gtk/mod.rs` preserving both the string-based panel ID refactor and develop's borrow-safety/ext-panel/focus-guard fixes. Merged. Rebased PR #419 (clipboard dedup), found and fixed RefCell double-borrow crash in `TerminalCopySelection` handler (Rust 2021 temporary lifetime). Merged. Closed #408, #409, #417.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 374 and earlier in **SESSION_HISTORY.md**.
+> Sessions 378 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -107,9 +107,10 @@ cell coalescence) remain but are tracked separately.
 - `render::build_tab_bar_primitive()` + `breadcrumbs_to_quadraui_status_bar()` — tab bar and breadcrumb bar primitives pre-built in `ScreenLayout` (#347). Both backends draw directly from `GroupTabBar.bar` / `BreadcrumbBar.bar` / `ScreenLayout.tab_bar_primitive`. Zero per-backend adapter construction or `show_split` logic.
 - `render::picker_panel_to_palette()` + `PickerGeometry` — ALL picker types (file/symbol/command/branch, with/without preview, flat/tree) route through one adapter to `quadraui::Palette`. `PickerGeometry::compute()` + `PickerSizing` constants give a single source of truth for popup bounds. Zero per-backend picker rendering code (#402).
 - `Engine::needs_clipboard_for_paste()` + `prepare_paste_clipboard()` — paste-key detection and clipboard register loading (#381). Both backends call the same two engine methods before `handle_key()`. Zero per-backend paste detection logic.
+- `Engine::clipboard_read` + `clipboard_write` callbacks — clipboard access routed through engine-owned closures (#417). GTK `setup_gtk_clipboard()` wires `gdk4::Display` clipboard once at startup; TUI wires `copypasta` provider. Six GTK call sites (yank sync, paste prep, hover-popup copy, terminal copy/paste, AI panel Ctrl-V) consolidated. Zero per-backend clipboard logic beyond the one-time provider setup.
 - `Engine::handle_explorer_mouse_event()` — single-click row dispatch (toggle dir / preview file) for explorer TreeController events (#415). Both backends route mouse events through `TreeController.handle()` → `handle_explorer_mouse_event()`.
 - `render::compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot layout computation for all chrome heights (#386). GTK passes pixel units, TUI passes `line_height=1.0` for row units. Replaces `gtk_editor_bottom`, `gtk_terminal_target_maximize_rows`, TUI `terminal_target_maximize_rows_tui`, and the unused `editor_bottom_px`. Terminal click handlers still use bespoke maximize-snap math (#418).
-- `quadraui::AppShell` + `engine::sidebar` — sidebar visibility and active panel owned by the engine (#385). TUI reads all state from `engine.app_shell`; panel switching, focus flags, and session persistence handled by engine methods (`toggle_sidebar_panel`, `focus_sidebar_panel`, `handle_nav_overflow`). GTK `sync_sidebar_from_engine()` reads engine state; `sync_sidebar_widgets()` updates GTK widget visibility. ExtPanel panels bypass AppShell — `sync_sidebar_from_engine()` checks `ext_panel_active` (#413).
+- `quadraui::AppShell` + `engine::sidebar` — sidebar visibility and active panel owned by the engine (#385). TUI reads all state from `engine.app_shell`; panel switching, focus flags, and session persistence handled by engine methods (`toggle_sidebar_panel`, `focus_sidebar_panel`, `handle_nav_overflow`). GTK `sync_sidebar_from_engine()` reads engine state; `sync_sidebar_widgets()` updates GTK widget visibility via `active_panel_id: String` + lookup-table arrays (#408/#409 removed `SidebarPanel` enum). ExtPanel panels bypass AppShell — `sync_sidebar_from_engine()` checks `ext_panel_active` (#413).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
 

@@ -1,7 +1,16 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 378 archived here.
+All sessions through 379 archived here.
+
+---
+**Session 379 (May 16) — PR maintenance + clipboard dedup landing (#414, #419):**
+
+Rebased and merged two open PRs.
+
+**PR #414 — SidebarPanel enum removal (#408, #409):** Branch `issue-408-409-sidebar-panel-cleanup` had merge conflicts against develop after Session 378 commits. Rebased onto develop, resolved 3 conflicts in `src/gtk/mod.rs`: (1) plugin panel reveal — kept develop's separate-binding borrow-safety pattern + `ext_panel_has_focus`/`ext_panel_active` engine fields, combined with PR's `active_panel_id` string; (2) `sync_sidebar_from_engine` — kept develop's ext-panel-active bypass logic, converted to string IDs; (3) `sync_sidebar_widgets` focus grab — kept PR's lookup-table approach, added develop's `sidebar_has_focus()` guard. Force-pushed, merged. Issues #408/#409 already auto-closed.
+
+**PR #419 — clipboard dedup (#417):** Branch `issue-417-clipboard-dedup` rebased cleanly. Smoke test revealed RefCell double-borrow crash in `TerminalCopySelection` handler — `if let Some(text) = self.engine.borrow_mut().terminal_copy_selection()` kept `RefMut` alive for entire block (Rust 2021 temporary lifetime), then `self.engine.borrow()` for `clipboard_write` panicked. Fixed by extracting to `let text = ...` binding. Merged. Closed #417.
 
 ---
 **Session 378 (May 15) — macOS readiness dedup sweep (#416, #389, #386):**
