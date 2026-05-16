@@ -946,9 +946,10 @@ pub(super) fn handle_mouse(
             }
             // Terminal split divider drag — update visual column position (no PTY resize yet).
             if *dragging_terminal_split {
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let sb_col = term_width.saturating_sub(1);
-                let left_cols = col.clamp(5, sb_col.saturating_sub(5));
+                let panel_col = col.saturating_sub(editor_left);
+                let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                let panel_w = screen_w.saturating_sub(editor_left);
+                let left_cols = panel_col.clamp(5, panel_w.saturating_sub(6));
                 engine.terminal_split_set_drag_cols(left_cols);
                 return sidebar_width;
             }
@@ -2025,6 +2026,7 @@ pub(super) fn handle_mouse(
                 }
             } else if let BottomPanelZone::Content { row_offset } = zone {
                 // Content row — focus split pane or start divider drag.
+                let panel_col = col.saturating_sub(editor_left);
                 if engine.terminal_split && engine.terminal_panes.len() >= 2 {
                     // Mirror render.rs: use drag-override if set, else actual PTY cols.
                     let div_col = if engine.terminal_split_left_cols > 0 {
@@ -2033,12 +2035,12 @@ pub(super) fn handle_mouse(
                         engine.terminal_panes[0].cols
                     };
                     // Allow clicking within ±1 column of the divider to start a resize drag.
-                    if col.abs_diff(div_col) <= 1 {
+                    if panel_col.abs_diff(div_col) <= 1 {
                         engine.terminal_has_focus = true;
                         *dragging_terminal_split = true;
                         return sidebar_width; // skip selection start
                     } else {
-                        engine.terminal_active = if col < div_col { 0 } else { 1 };
+                        engine.terminal_active = if panel_col < div_col { 0 } else { 1 };
                     }
                 }
                 // Check for scrollbar click first.
