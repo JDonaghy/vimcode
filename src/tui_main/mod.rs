@@ -105,6 +105,20 @@ pub(super) fn terminal_target_maximize_rows_tui(engine: &Engine, screen_h: u16) 
     render::compute_editor_layout(engine, screen_h as f64, 1.0, true).terminal_max_target_rows
 }
 
+/// Terminal panel column count (editor column width, excluding sidebar +
+/// activity bar). Matches GTK's `terminal_cols()` which divides the drawing
+/// area pixel width by char advance.
+pub(super) fn terminal_panel_cols(engine: &Engine, screen_w: u16, sidebar_width: u16) -> u16 {
+    let sv = engine.app_shell.sidebar_visible();
+    let ab = if engine.settings.autohide_panels && !sv {
+        0
+    } else {
+        ACTIVITY_BAR_WIDTH
+    };
+    let sb = if sv { sidebar_width + 1 } else { 0 };
+    screen_w.saturating_sub(ab + sb)
+}
+
 // ─── Phase B.4 Stage 6: panel-key accelerator registry ──────────────────────
 //
 // Stable accelerator IDs for the `panel_keys` settings. The TUI event loop
@@ -139,6 +153,7 @@ fn dispatch_panel_accelerator(
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
     terminal: &Terminal<CrosstermBackend<Stdout>>,
+    sidebar_width: u16,
     needs_redraw: &mut bool,
 ) -> bool {
     match id {
@@ -193,7 +208,8 @@ fn dispatch_panel_accelerator(
             } else if engine.terminal_open {
                 engine.terminal_has_focus = true;
             } else {
-                let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                let screen_w = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
                 if engine.terminal_panes.is_empty() {
                     engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                 } else {
@@ -207,8 +223,9 @@ fn dispatch_panel_accelerator(
             // The engine already owns the toggle/resize sequence (Phase B.2).
             // Re-use that path so the action stays single-source.
             let size = terminal.size().ok();
+            let screen_w = size.map(|s| s.width).unwrap_or(80);
             let ctx = crate::core::engine::UiEventContext {
-                terminal_cols: size.map(|s| s.width).unwrap_or(80),
+                terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
                 terminal_max_rows: terminal_target_maximize_rows_tui(
                     engine,
                     size.map(|s| s.height).unwrap_or(24),
@@ -1385,6 +1402,7 @@ fn event_loop(
                     engine,
                     &mut sidebar,
                     terminal,
+                    sidebar_width,
                     &mut needs_redraw,
                 )
             {
@@ -2804,7 +2822,8 @@ fn event_loop(
                         }
                         // Handle OpenTerminal specially (needs terminal size info)
                         if action == EngineAction::OpenTerminal {
-                            let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                            let screen_w = terminal.size().ok().map(|s| s.width).unwrap_or(80);
+                            let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
                             engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
                             needs_redraw = true;
                         } else if action == EngineAction::ToggleTerminalMaximize {
@@ -2814,8 +2833,9 @@ fn event_loop(
                             // command + toolbar click still return the
                             // EngineAction; B.4 may collapse them too.
                             let size = terminal.size().ok();
+                            let screen_w = size.map(|s| s.width).unwrap_or(80);
                             let ctx = crate::core::engine::UiEventContext {
-                                terminal_cols: size.map(|s| s.width).unwrap_or(80),
+                                terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
                                 terminal_max_rows: terminal_target_maximize_rows_tui(
                                     engine,
                                     size.map(|s| s.height).unwrap_or(24),
