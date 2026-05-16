@@ -1875,29 +1875,15 @@ pub(super) fn handle_mouse(
     }
 
     // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
+    // Geometry is cached at paint time on engine.bottom_panel_geometry (#418).
+    if col >= editor_left
+        && matches!(
+            engine.resolve_bottom_panel_zone(row as f64),
+            Some(crate::core::engine::BottomPanelZone::TabBar)
+        )
     {
-        let bottom_panel_visible = engine.terminal_open || engine.bottom_panel_open;
-        if bottom_panel_visible && col >= editor_left {
-            let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let wildmenu_rows: u16 = if !engine.wildmenu_items.is_empty() {
-                1
-            } else {
-                0
-            };
-            let global_status_rows: u16 = if engine.settings.window_status_line {
-                0
-            } else {
-                1
-            };
-            let panel_height = super::effective_terminal_panel_rows_tui(engine, term_height) + 2;
-            // Bottom panel y = term_height - cmd(1) - status - wildmenu - debug_toolbar - panel
-            let tab_bar_row = term_height
-                .saturating_sub(1 + global_status_rows + wildmenu_rows + dt_rows + panel_height);
-            if row == tab_bar_row {
-                engine.handle_bottom_tab_bar_click(col as f64);
-                return sidebar_width;
-            }
-        }
+        engine.handle_bottom_tab_bar_click(col as f64);
+        return sidebar_width;
     }
 
     // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
@@ -2006,21 +1992,16 @@ pub(super) fn handle_mouse(
         }
     }
     // ── Terminal panel click ───────────────────────────────────────────────────
-    {
-        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open {
-            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
-        } else {
-            0
-        };
-        let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-        if engine.terminal_open
-            && strip_rows > 0
-            && col >= editor_left
-            && row >= term_strip_top
-            && row < term_strip_top + strip_rows
-        {
-            if row == term_strip_top {
+    // Zone resolved from cached geometry written at paint time (#418). Toolbar
+    // and content rows live inside the bottom panel area; their absolute y
+    // (e.g. for the scrollbar track) is recovered from the cached top_y.
+    if engine.terminal_open && col >= editor_left {
+        let zone = engine.resolve_bottom_panel_zone(row as f64);
+        let geom = *engine.bottom_panel_geometry.borrow();
+        if let (Some(zone), Some(geom)) = (zone, geom) {
+            use crate::core::engine::BottomPanelZone;
+            // Tab bar was already dispatched above; only Toolbar / Content land here.
+            if matches!(zone, BottomPanelZone::Toolbar) {
                 // Header row — dispatch through cached toolbar hit regions.
                 engine.terminal_has_focus = true;
                 let action = engine.resolve_terminal_toolbar_click(col as f64);
@@ -2037,7 +2018,7 @@ pub(super) fn handle_mouse(
                 {
                     *dragging_terminal_resize = true;
                 }
-            } else {
+            } else if let BottomPanelZone::Content { row_offset } = zone {
                 // Content row — focus split pane or start divider drag.
                 if engine.terminal_split && engine.terminal_panes.len() >= 2 {
                     // Mirror render.rs: use drag-override if set, else actual PTY cols.
@@ -2061,10 +2042,11 @@ pub(super) fn handle_mouse(
                 engine.terminal_has_focus = true;
                 if col == sb_col {
                     // Scrollbar column — start drag through shared state.
-                    let track_start = term_strip_top + 1;
-                    let track_len = strip_rows.saturating_sub(1); // content rows
-                                                                  // Cap total to one screenful (vt100 API limit) so the drag range
-                                                                  // [0, total] exactly matches what set_scroll_offset can deliver.
+                    // Content area = panel minus tab-bar (1) and toolbar (1) rows.
+                    let track_start = (geom.top_y as u16).saturating_add(2);
+                    let track_len = (geom.height as u16).saturating_sub(2);
+                    // Cap total to one screenful (vt100 API limit) so the drag range
+                    // [0, total] exactly matches what set_scroll_offset can deliver.
                     let total = engine
                         .active_terminal()
                         .map(|t| t.history.len())
@@ -2096,7 +2078,7 @@ pub(super) fn handle_mouse(
                     );
                 } else {
                     // Content area — start a selection.
-                    let term_row = row - term_strip_top - 1;
+                    let term_row = row_offset;
                     let term_col = col.saturating_sub(editor_left);
                     engine.terminal_scroll_reset();
                     if let Some(term) = engine.active_terminal_mut() {

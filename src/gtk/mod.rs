@@ -6752,64 +6752,17 @@ impl App {
             self.engine.borrow_mut().clear_sidebar_focus();
             // Check if click lands in the terminal panel before general handling.
             // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
-            let in_terminal = if self.cached_line_height > 0.0 {
-                let engine = self.engine.borrow();
-                if engine.terminal_open || engine.bottom_panel_open {
-                    // Pixel-exact terminal Y must match the draw function's
-                    // special-case snapping for maximize (#386). The draw
-                    // function caches hit regions on engine but this handler
-                    // predates that — kept as-is until migrated to cached hits.
-                    let lh = self.cached_line_height;
-                    let tab_row_h = (lh * 1.6).ceil();
-                    let per_window = engine.settings.window_status_line;
-                    let bp_open = engine.terminal_open || engine.bottom_panel_open;
-                    let has_sep =
-                        per_window && !engine.settings.status_line_above_terminal && bp_open;
-                    let sep_px = if has_sep { lh } else { 0.0 };
-                    let wild_px = if engine.wildmenu_items.is_empty() {
-                        0.0
-                    } else {
-                        lh
-                    };
-                    let status_h = lh * if per_window { 1.0 } else { 2.0 } + wild_px;
-                    let dbg_px = if engine.debug_toolbar_visible {
-                        lh
-                    } else {
-                        0.0
-                    };
-                    let term_y = if engine.terminal_maximized {
-                        tab_row_h
-                    } else {
-                        let el = render::compute_editor_layout(&engine, height, lh, false);
-                        height - status_h - dbg_px - sep_px - el.terminal_h
-                    };
-                    if y >= term_y {
-                        // 0 = tab bar, 1 = toolbar, 2 = content
-                        let zone = if y >= term_y + 2.0 * self.cached_line_height {
-                            2
-                        } else if y >= term_y + self.cached_line_height {
-                            1
-                        } else {
-                            0
-                        };
-                        Some((term_y, zone))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some((term_y, zone)) = in_terminal {
-                if zone == 0 {
+            // Geometry is cached at paint time on engine.bottom_panel_geometry (#418).
+            let zone = self.engine.borrow().resolve_bottom_panel_zone(y);
+            if let Some(zone) = zone {
+                use crate::core::engine::BottomPanelZone;
+                if matches!(zone, BottomPanelZone::TabBar) {
                     self.engine.borrow_mut().handle_bottom_tab_bar_click(x);
                     sender.input(Msg::Resize);
                     return;
                 }
                 self.engine.borrow_mut().terminal_has_focus = true;
-                if zone == 2 {
+                if let BottomPanelZone::Content { row_offset } = zone {
                     const SB_W: f64 = 6.0;
                     // In split mode: detect a click on the divider (start drag)
                     // or set keyboard focus to the appropriate pane.
@@ -6838,8 +6791,7 @@ impl App {
                     };
                     if !on_divider {
                         self.terminal_resize_dragging = false;
-                        let row = ((y - term_y - 2.0 * self.cached_line_height)
-                            / self.cached_line_height) as u16;
+                        let row = row_offset;
                         let col = (x / self.cached_char_width.max(1.0)) as u16;
                         self.engine.borrow_mut().terminal_scroll_reset();
                         if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
@@ -7447,52 +7399,15 @@ impl App {
                 self.draw_needed.set(true);
             }
         } else {
-            // Check if drag is in the terminal content area (text selection).
-            let in_terminal = if self.cached_line_height > 0.0 {
-                let engine = self.engine.borrow();
-                if engine.terminal_open || engine.bottom_panel_open {
-                    // Pixel-exact terminal Y must match the draw function's
-                    // special-case snapping for maximize (#386). The draw
-                    // function caches hit regions on engine but this handler
-                    // predates that — kept as-is until migrated to cached hits.
-                    let lh = self.cached_line_height;
-                    let tab_row_h = (lh * 1.6).ceil();
-                    let per_window = engine.settings.window_status_line;
-                    let bp_open = engine.terminal_open || engine.bottom_panel_open;
-                    let has_sep =
-                        per_window && !engine.settings.status_line_above_terminal && bp_open;
-                    let sep_px = if has_sep { lh } else { 0.0 };
-                    let wild_px = if engine.wildmenu_items.is_empty() {
-                        0.0
-                    } else {
-                        lh
-                    };
-                    let status_h = lh * if per_window { 1.0 } else { 2.0 } + wild_px;
-                    let dbg_px = if engine.debug_toolbar_visible {
-                        lh
-                    } else {
-                        0.0
-                    };
-                    let term_y = if engine.terminal_maximized {
-                        tab_row_h
-                    } else {
-                        let el = render::compute_editor_layout(&engine, height, lh, false);
-                        height - status_h - dbg_px - sep_px - el.terminal_h
-                    };
-                    if y >= term_y + 2.0 * self.cached_line_height {
-                        Some(term_y)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+            // Drag in the terminal content area (text selection). Geometry is
+            // cached at paint time on engine.bottom_panel_geometry (#418).
+            let content_row = match self.engine.borrow().resolve_bottom_panel_zone(y) {
+                Some(crate::core::engine::BottomPanelZone::Content { row_offset }) => {
+                    Some(row_offset)
                 }
-            } else {
-                None
+                _ => None,
             };
-            if let Some(term_y) = in_terminal {
-                let row =
-                    ((y - term_y - 2.0 * self.cached_line_height) / self.cached_line_height) as u16;
+            if let Some(row) = content_row {
                 let col = (x / self.cached_char_width.max(1.0)) as u16;
                 if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                     if let Some(ref mut sel) = term.selection {
