@@ -2299,6 +2299,7 @@ pub(super) fn render_terminal_panel(
     area: Rect,
     panel: &render::TerminalPanel,
     theme: &Theme,
+    engine: &Engine,
 ) {
     if area.height == 0 {
         return;
@@ -2321,7 +2322,8 @@ pub(super) fn render_terminal_panel(
         area.width as f32,
         area.height as f32,
     );
-    let td = render::build_terminal_draw_data(panel, q_area, 1.0, content_rows, None);
+    let td = render::build_terminal_draw_data(panel, q_area, 1.0, 1.0, content_rows, None);
+    engine.terminal_split_layout.replace(td.split);
     backend.set_current_theme(q_theme);
     if let Some(split) = &td.split {
         let left = td.left.as_ref().unwrap();
