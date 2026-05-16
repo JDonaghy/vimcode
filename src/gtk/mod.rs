@@ -405,11 +405,9 @@ struct App {
     /// Editor hover popup bounding rect (x, y, w, h) — set during draw, used for click hit-testing.
     #[allow(clippy::type_complexity)]
     editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Completion popup bounding rect (x, y, w, h) — set during draw,
-    /// used for `ModalStack` registration in the click handler. None
-    /// when the popup isn't visible. (B.5b Stage 5.)
-    #[allow(clippy::type_complexity)]
-    completion_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Completion popup layout — set during draw, used for hit-test in
+    /// the click handler. None when the popup isn't visible.
+    completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
     /// Tab-switcher popup bounding rect (x, y, w, h) — set during
     /// draw, used for `ModalStack` registration in the click
     /// handler. (B.5b Stage 7.)
@@ -1949,9 +1947,8 @@ impl SimpleComponent for App {
         #[allow(clippy::type_complexity)]
         let editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
-        #[allow(clippy::type_complexity)]
-        let completion_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
-            Rc::new(Cell::new(None));
+        let completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>> =
+            Rc::new(RefCell::new(None));
         #[allow(clippy::type_complexity)]
         let tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
             Rc::new(Cell::new(None));
@@ -2159,7 +2156,7 @@ impl SimpleComponent for App {
             panel_hover_link_rects: panel_hover_link_rects.clone(),
             panel_hover_popup_rect: panel_hover_popup_rect.clone(),
             editor_hover_popup_rect: editor_hover_popup_rect.clone(),
-            completion_popup_rect: completion_popup_rect.clone(),
+            completion_layout: completion_layout.clone(),
             tab_switcher_popup_rect: tab_switcher_popup_rect.clone(),
             dialog_popup_rect: dialog_popup_rect.clone(),
             editor_hover_link_rects: editor_hover_link_rects.clone(),
@@ -3614,7 +3611,7 @@ impl SimpleComponent for App {
         let dialog_btn_for_draw = model.dialog_btn_rects.clone();
         let dialog_popup_for_draw = model.dialog_popup_rect.clone();
         let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
-        let completion_rect_for_draw = model.completion_popup_rect.clone();
+        let completion_layout_for_draw = model.completion_layout.clone();
         let tab_switcher_rect_for_draw = model.tab_switcher_popup_rect.clone();
         let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
         let editor_hover_sb_for_draw = model.editor_hover_scrollbar.clone();
@@ -3655,7 +3652,7 @@ impl SimpleComponent for App {
                             &dialog_btn_for_draw,
                             &dialog_popup_for_draw,
                             &editor_hover_rect_for_draw,
-                            &completion_rect_for_draw,
+                            &completion_layout_for_draw,
                             &tab_switcher_rect_for_draw,
                             &editor_hover_links_for_draw,
                             &editor_hover_sb_for_draw,
@@ -6004,71 +6001,18 @@ impl App {
         // candidate-row pixel — clicking on the popup shouldn't move
         // the cursor through it. Click-OUTSIDE simply dismisses and
         // falls through; the editor click then proceeds normally.
-        //
-        // The popup is keyboard-driven (Tab to cycle, Enter to commit)
-        // so this stage doesn't add row-level click-to-select; the
-        // bounds registration on `ModalStack` exists so future
-        // `is_modal_open()` consumers (e.g. B5b.6 hover-trigger gate)
-        // see the popup correctly.
         if self.engine.borrow().completion_idx.is_some() {
-            let completion_id = quadraui::WidgetId::new("completion");
-            let inside = if let Some((px, py, pw, ph)) = self.completion_popup_rect.get() {
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .push(
-                        completion_id.clone(),
-                        quadraui::Rect {
-                            x: px as f32,
-                            y: py as f32,
-                            width: pw as f32,
-                            height: ph as f32,
-                        },
-                    );
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                let events = quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                );
-                events.iter().any(|ev| {
-                    matches!(
-                        ev,
-                        quadraui::UiEvent::MouseDown { widget: Some(id), .. }
-                            if *id == completion_id
-                    )
-                })
-            } else {
-                false
-            };
-
-            // Either way, dismiss the popup — it's transient.
-            self.engine.borrow_mut().dismiss_completion();
-            self.backend
+            let hit = self
+                .completion_layout
                 .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&completion_id);
-
-            if inside {
-                self.draw_needed.set(true);
+                .as_ref()
+                .map(|cl| cl.hit_test(x as f32, y as f32))
+                .unwrap_or(quadraui::CompletionsHit::Empty);
+            let consumed = self.engine.borrow_mut().handle_completion_click(hit);
+            self.draw_needed.set(true);
+            if consumed {
                 return;
             }
-            // Fall through so the editor's click (cursor move) proceeds.
-        } else {
-            // Defensive cleanup: completion may have been dismissed
-            // without us seeing a click. Pop any stale entry.
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&quadraui::WidgetId::new("completion"));
         }
 
         // ── Context menu click handling (engine-drawn) ──

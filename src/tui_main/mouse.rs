@@ -161,6 +161,7 @@ pub(super) fn handle_mouse(
     editor_hover_scrollbar: Option<crate::render::PopupScrollbarHit>,
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
+    completion_layout: Option<&quadraui::CompletionsLayout>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -1472,6 +1473,16 @@ pub(super) fn handle_mouse(
         }
 
         return sidebar_width;
+    }
+
+    // ── Completion popup click intercept ──────────────────────────────────────────
+    if engine.completion_idx.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
+        let hit = completion_layout
+            .map(|cl| cl.hit_test(col as f32, row as f32))
+            .unwrap_or(quadraui::CompletionsHit::Empty);
+        if engine.handle_completion_click(hit) {
+            return sidebar_width;
+        }
     }
 
     // ── Context menu click intercept ────────────────────────────────────────────

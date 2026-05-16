@@ -3200,6 +3200,26 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    /// Handle a mouse click on the completion popup.
+    /// Returns `true` if the click was consumed (inside the popup).
+    pub fn handle_completion_click(&mut self, hit: quadraui::CompletionsHit) -> bool {
+        match hit {
+            quadraui::CompletionsHit::Item(idx) => {
+                self.apply_completion_candidate(idx);
+                self.dismiss_completion();
+                true
+            }
+            quadraui::CompletionsHit::Inert => {
+                self.dismiss_completion();
+                true
+            }
+            quadraui::CompletionsHit::Empty => {
+                self.dismiss_completion();
+                false
+            }
+        }
+    }
+
     /// Dismiss the completion popup and cancel any pending LSP completion request.
     /// This ensures that a late-arriving LSP response cannot re-show a popup
     /// after the user has already dismissed it (e.g. by pressing Escape or

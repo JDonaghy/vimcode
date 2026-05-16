@@ -52,7 +52,7 @@ pub(super) fn draw_editor(
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
     dialog_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    completion_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    completion_layout_out: &Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
     tab_switcher_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
@@ -370,16 +370,15 @@ pub(super) fn draw_editor(
     }
 
     // 5b. Draw completion popup (on top of everything else). Cache
-    //     the bounds so the click handler can register the popup on
-    //     the modal stack (B.5b Stage 5).
-    completion_popup_rect_out.set(draw_completion_popup(
+    //     the layout so the click handler can hit-test items.
+    *completion_layout_out.borrow_mut() = draw_completion_popup(
         cr,
         &layout,
         &screen,
         &theme,
         line_height,
         char_width,
-    ));
+    );
 
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(
@@ -1259,9 +1258,8 @@ pub(super) fn draw_window_separators(
 /// shared `render::completion_menu_to_quadraui_completions` adapter,
 /// computes the popup placement via `Completions::layout()`, then
 /// forwards to the lifted rasteriser through the
-/// `quadraui_gtk::draw_completions` shim. Returns the resolved popup
-/// bounds (x, y, w, h) so the existing `completion_popup_rect_out`
-/// integration keeps working unchanged.
+/// `quadraui_gtk::draw_completions` shim. Returns the resolved
+/// `CompletionsLayout` so the click handler can hit-test items.
 pub(super) fn draw_completion_popup(
     cr: &Context,
     layout: &pango::Layout,
@@ -1269,7 +1267,7 @@ pub(super) fn draw_completion_popup(
     theme: &Theme,
     line_height: f64,
     char_width: f64,
-) -> Option<(f64, f64, f64, f64)> {
+) -> Option<quadraui::CompletionsLayout> {
     let menu = screen.completion.as_ref()?;
     let active_win = screen
         .windows
@@ -1310,12 +1308,7 @@ pub(super) fn draw_completion_popup(
 
     super::quadraui_gtk::draw_completions(cr, layout, &completions, &q_layout, theme);
 
-    Some((
-        q_layout.bounds.x as f64,
-        q_layout.bounds.y as f64,
-        q_layout.bounds.width as f64,
-        q_layout.bounds.height as f64,
-    ))
+    Some(q_layout)
 }
 
 #[allow(clippy::too_many_arguments)]

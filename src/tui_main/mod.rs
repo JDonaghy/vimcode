@@ -1021,6 +1021,8 @@ fn event_loop(
     let mut editor_hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
     // Scrollbar geometry for the editor hover popup (#215).
     let mut editor_hover_scrollbar: Option<render::PopupScrollbarHit> = None;
+    // Cached completion popup layout for mouse hit-testing (#288).
+    let mut completion_layout: Option<quadraui::CompletionsLayout> = None;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
     let min_frame = Duration::from_millis(16);
     let mut last_draw = Instant::now()
@@ -1180,6 +1182,7 @@ fn event_loop(
                             &mut tab_visible_counts,
                             &debug_toolbar_interaction,
                             &mut debug_toolbar_rect,
+                            &mut completion_layout,
                             &mut backend,
                         );
                     }
@@ -1230,6 +1233,7 @@ fn event_loop(
                                     &mut tab_visible_counts2,
                                     &debug_toolbar_interaction,
                                     &mut debug_toolbar_rect,
+                                    &mut completion_layout,
                                     &mut backend,
                                 );
                             }
@@ -2954,6 +2958,7 @@ fn event_loop(
                                 editor_hover_scrollbar,
                                 &mut hover_selecting,
                                 &mut fr_input_dragging,
+                                completion_layout.as_ref(),
                             );
 
                             if mouse_should_quit {
@@ -2999,6 +3004,7 @@ fn event_loop(
                     editor_hover_scrollbar,
                     &mut hover_selecting,
                     &mut fr_input_dragging,
+                    completion_layout.as_ref(),
                 );
 
                 if mouse_should_quit {
