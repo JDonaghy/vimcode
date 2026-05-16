@@ -2631,6 +2631,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
                             label: quadraui::StyledText::default(),
                             detail: None,
                             disabled: false,
+                            ..Default::default()
                         };
                     }
                     let shortcut = if is_vscode_mode && !item.vscode_shortcut.is_empty() {
@@ -2647,6 +2648,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
                             Some(quadraui::StyledText::plain(shortcut.to_string()))
                         },
                         disabled: !item.enabled,
+                        ..Default::default()
                     }
                 })
                 .collect(),
@@ -3594,6 +3596,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
                 Some(quadraui::StyledText::plain(item.shortcut.clone()))
             },
             disabled: !item.enabled,
+            ..Default::default()
         });
         if item.separator_after {
             items.push(quadraui::ContextMenuItem {
@@ -3601,6 +3604,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
                 label: quadraui::StyledText::default(),
                 detail: None,
                 disabled: false,
+                ..Default::default()
             });
         }
     }
