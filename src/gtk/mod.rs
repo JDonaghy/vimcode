@@ -6762,43 +6762,26 @@ impl App {
                     return;
                 }
                 self.engine.borrow_mut().terminal_has_focus = true;
-                if let BottomPanelZone::Content { row_offset } = zone {
-                    const SB_W: f64 = 6.0;
-                    // In split mode: detect a click on the divider (start drag)
-                    // or set keyboard focus to the appropriate pane.
-                    let on_divider = if self.engine.borrow().terminal_split
-                        && self.engine.borrow().terminal_panes.len() >= 2
-                    {
-                        let left_cols = {
-                            let engine = self.engine.borrow();
-                            if engine.terminal_split_left_cols > 0 {
-                                engine.terminal_split_left_cols
-                            } else {
-                                engine.terminal_panes[0].cols
-                            }
-                        };
-                        let div_x = left_cols as f64 * self.cached_char_width;
-                        if x < width - SB_W && (x - div_x).abs() < 4.0 {
+                if let BottomPanelZone::Content { .. } = zone {
+                    let split_layout = *self.engine.borrow().terminal_split_layout.borrow();
+                    if let Some(ref sl) = split_layout {
+                        let hit = sl.hit_test(x as f32, y as f32);
+                        if self.engine.borrow_mut().handle_terminal_split_click(hit) {
                             self.terminal_split_dragging = true;
-                            true
-                        } else {
-                            let mut engine = self.engine.borrow_mut();
-                            engine.terminal_active = if x < div_x { 0 } else { 1 };
-                            false
                         }
                     } else {
-                        false
-                    };
-                    if !on_divider {
                         self.terminal_resize_dragging = false;
-                        let row = row_offset;
                         let col = (x / self.cached_char_width.max(1.0)) as u16;
+                        let row_offset = match zone {
+                            BottomPanelZone::Content { row_offset } => row_offset,
+                            _ => 0,
+                        };
                         self.engine.borrow_mut().terminal_scroll_reset();
                         if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
                             term.selection = Some(crate::core::terminal::TermSelection {
-                                start_row: row,
+                                start_row: row_offset,
                                 start_col: col,
-                                end_row: row,
+                                end_row: row_offset,
                                 end_col: col,
                             });
                         }

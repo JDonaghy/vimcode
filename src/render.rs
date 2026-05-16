@@ -1855,6 +1855,7 @@ pub fn build_terminal_draw_data(
     panel: &TerminalPanel,
     area: quadraui::Rect,
     cell_width: f32,
+    cell_height: f32,
     visible_rows: usize,
     sb_width: Option<u16>,
 ) -> TerminalDrawData {
@@ -1866,8 +1867,14 @@ pub fn build_terminal_draw_data(
         width: sb_width,
     });
     if let Some(ref left_rows) = panel.split_left_rows {
-        let split =
-            quadraui::TerminalSplitLayout::new(area, panel.split_left_cols as usize, cell_width);
+        let sb_px = sb_width.unwrap_or(0) as f32;
+        let split = quadraui::TerminalSplitLayout::new(
+            area,
+            panel.split_left_cols as usize,
+            cell_width,
+            cell_height,
+            sb_px,
+        );
         let left =
             terminal_cells_to_quadraui(left_rows, quadraui::WidgetId::new("terminal:left"), None);
         let right =
@@ -2626,13 +2633,7 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
                 .iter()
                 .map(|item| {
                     if item.separator {
-                        return quadraui::ContextMenuItem {
-                            id: None,
-                            label: quadraui::StyledText::default(),
-                            detail: None,
-                            disabled: false,
-                            ..Default::default()
-                        };
+                        return quadraui::ContextMenuItem::default();
                     }
                     let shortcut = if is_vscode_mode && !item.vscode_shortcut.is_empty() {
                         item.vscode_shortcut
@@ -3599,13 +3600,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
             ..Default::default()
         });
         if item.separator_after {
-            items.push(quadraui::ContextMenuItem {
-                id: None,
-                label: quadraui::StyledText::default(),
-                detail: None,
-                disabled: false,
-                ..Default::default()
-            });
+            items.push(quadraui::ContextMenuItem::default());
         }
     }
     let selected_idx = engine_to_quadraui
