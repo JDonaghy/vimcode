@@ -174,7 +174,6 @@ impl Engine {
         });
         self.ext_registry_rx = Some(rx);
         self.ext_registry_fetching = true;
-        self.message = "Fetching extension registries...".to_string();
     }
 
     /// Non-blocking check for a completed registry fetch.
@@ -198,7 +197,12 @@ impl Engine {
                     self.message = format!("Extension registry updated ({count} extensions)");
                 }
                 None => {
-                    self.message = "Registry fetch failed — try again later".to_string();
+                    if self.ext_registry.is_some() {
+                        // Cache from a previous fetch is still available —
+                        // silently keep it rather than alarming the user.
+                    } else {
+                        self.message = "Registry fetch failed — try again later".to_string();
+                    }
                 }
             }
             true
