@@ -1,7 +1,32 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 379 archived here.
+All sessions through 380 archived here.
+
+---
+**Session 380 (May 16) — Hit-test dedup sweep + GTK audit + quadraui runtime epics:**
+
+Massive dedup session — 7 PRs landed, 8 issues closed, 12 new issues filed (6 quadraui, 6 vimcode).
+
+**PR #414** — SidebarPanel enum removal (#408/#409). Rebased onto develop, resolved 3 merge conflicts preserving both string-based panel ID refactor and develop's borrow-safety/ext-panel/focus-guard fixes.
+
+**PR #419** — Clipboard dedup (#417). Found and fixed RefCell double-borrow crash in `TerminalCopySelection` handler (Rust 2021 temporary lifetime: `if let Some(text) = borrow_mut()...` keeps RefMut alive for entire block).
+
+**PR #423** — Completion popup click-to-pick (#288). Both backends cache `CompletionsLayout` from render, use `hit_test()` for click dispatch. New `Engine::handle_completion_click(CompletionsHit) -> bool`. GTK ModalStack push/pop/dispatch removed from completion click path. Net -22 lines.
+
+**PR #425** — Context menu hit_test migration (#210). Both backends cache `ContextMenuLayout` from render, replace hand-rolled row math with `hit_test()`. New `context_menu_hit_to_idx()` helper. GTK click handler reads cache instead of rebuilding layout (~35 lines removed). `resolve_context_menu_click()` gated to `#[cfg(test)]`. Net -49 lines.
+
+**PR #424** — Terminal panel cached geometry (#418). Took over from another agent. `BottomPanelGeometry` with explicit `toolbar_y`/`content_y`/`content_row_h` offsets. Fixed GTK terminal button hit zones, TerminalCopySelection crash, ContextMenuItem compile errors. `resolve_bottom_panel_zone()` shared by both backends.
+
+**PR #431** — TUI terminal split width fix (#428). New `terminal_panel_cols()` helper computes actual editor column width (excluding sidebar + activity bar), matching GTK's `terminal_cols()`. Fixed divider hit-test using panel-relative columns. Applied to all 5 `terminal_cols` call sites.
+
+**PR #433** — TerminalSplitLayout::hit_test() (#430). First consumption of a quadraui feature (quadraui#196) shipped by another agent. Both backends cache `TerminalSplitLayout`, use `hit_test()` for divider detection, pane focus, and selection. New `Engine::handle_terminal_split_click(TerminalSplitHit)`. Fixed sb_width unit mismatch (was multiplied by cell_width, creating 51px gap in GTK).
+
+**GTK backend audit:** Reviewed all 10 files in `src/gtk/`. 4 files are vestigial re-exports (delete-ready). `click.rs` eliminated by quadraui#197/#198. `draw.rs` eliminated by quadraui#199/#200/#201. `mod.rs` (10,759 lines) eliminated by quadraui#202 (AppShell epic). Filed 6 quadraui issues: #197 (EditorLayout::hit_test), #198 (TabBarLayout::hit_test), #199 (draw_frame), #200 (SidebarSystem GTK rasteriser), #201 (CommandLine primitive), #202 (GTK runtime epic with 6 stages).
+
+**Strategic shift:** Filed parallel runtime epics for all three backends — quadraui#202 (GTK), #203 (TUI), #204 (macOS). The end-state: `quadraui::{gtk,tui,macos}::run(engine)` owns the widget tree, event loop, draw pipeline, and click dispatch. Consumer apps write ~20 lines per backend. Updated quadraui CLAUDE.md with vimcode reference consumer table mapping each epic stage to the working prototype code.
+
+**Filed:** vimcode #420 (completion viewport overflow), #421 (completion detail pane), #422 (Ctrl+Space trigger), #428 (TUI split — closed), #429 (terminal click dedup), #430 (split hit_test — closed). quadraui #196-#204.
 
 ---
 **Session 379 (May 16) — PR maintenance + clipboard dedup landing (#414, #419):**
