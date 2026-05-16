@@ -1867,7 +1867,7 @@ pub fn build_terminal_draw_data(
         width: sb_width,
     });
     if let Some(ref left_rows) = panel.split_left_rows {
-        let sb_px = sb_width.unwrap_or(0) as f32 * cell_width;
+        let sb_px = sb_width.unwrap_or(0) as f32;
         let split = quadraui::TerminalSplitLayout::new(
             area,
             panel.split_left_cols as usize,
