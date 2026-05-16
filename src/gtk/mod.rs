@@ -5220,40 +5220,19 @@ impl App {
             da.queue_draw();
         }
 
-        // In VSCode mode, Ctrl-V reads clipboard into register '+' before
-        // calling handle_key (which will read it via get_register_content).
-        if ctrl && key_name == "v" && self.engine.borrow().is_vscode_mode() {
-            if let Some(ref mut ctx) = self.clipboard {
-                let text = ctx.get_contents().unwrap_or_default();
-                let mut engine = self.engine.borrow_mut();
-                engine.registers.insert('+', (text.clone(), false));
-                engine.registers.insert('"', (text, false));
-            }
-            // Fall through to handle_key which calls vscode_paste().
-        }
-
-        // Intercept p/P to read from the system clipboard first
-        // (clipboard=unnamedplus semantics: plain p/P and "+p/"*p all read
-        // from system clipboard).  Skip for explicit named registers like "ap.
-        if !ctrl && (key_name == "p" || key_name == "P") {
-            let use_clipboard = {
-                let engine = self.engine.borrow();
-                matches!(
-                    engine.selected_register,
-                    None | Some('"') | Some('+') | Some('*')
-                )
-            };
-            if use_clipboard {
-                if let Some(ref mut ctx) = self.clipboard {
-                    let text = ctx.get_contents().unwrap_or_default();
-                    if !text.is_empty() {
-                        let mut engine = self.engine.borrow_mut();
-                        self.last_clipboard_content = Some(text.clone());
-                        engine.load_clipboard_for_paste(text);
-                    }
-                }
-                // Fall through — handle_key() will execute the paste.
-            }
+        // Pre-load system clipboard into engine registers for paste keys
+        // (p/P in normal/visual, Ctrl+V in VSCode mode). Detection and
+        // register loading are shared via engine methods (#381).
+        if self
+            .engine
+            .borrow()
+            .needs_clipboard_for_paste(&key_name, unicode, ctrl)
+        {
+            let text = self
+                .clipboard
+                .as_mut()
+                .and_then(|ctx| ctx.get_contents().ok());
+            self.engine.borrow_mut().prepare_paste_clipboard(text);
         }
 
         // Debug F-keys must reach the engine regardless of which panel

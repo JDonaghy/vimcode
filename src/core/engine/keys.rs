@@ -7834,6 +7834,43 @@ impl Engine {
         self.registers.insert('*', (text, false));
     }
 
+    /// Returns `true` if the upcoming key is a paste that needs system clipboard
+    /// contents pre-loaded into registers. Backends call this before reading the
+    /// clipboard (which may be expensive or async) so the detection logic is shared.
+    pub fn needs_clipboard_for_paste(&self, key: &str, unicode: Option<char>, ctrl: bool) -> bool {
+        if ctrl && key == "v" && self.is_vscode_mode() {
+            return true;
+        }
+        if !ctrl
+            && matches!(unicode, Some('p') | Some('P'))
+            && matches!(
+                self.mode,
+                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            )
+            && matches!(
+                self.selected_register,
+                None | Some('"') | Some('+') | Some('*')
+            )
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Load system clipboard text into the engine's paste registers, handling
+    /// VSCode mode (always charwise) vs Vim mode (preserves linewise state).
+    /// Call after `needs_clipboard_for_paste` returns `true`.
+    pub fn prepare_paste_clipboard(&mut self, clipboard_text: Option<String>) {
+        if let Some(text) = clipboard_text.filter(|t| !t.is_empty()) {
+            if self.is_vscode_mode() {
+                self.registers.insert('+', (text.clone(), false));
+                self.registers.insert('"', (text, false));
+            } else {
+                self.load_clipboard_for_paste(text);
+            }
+        }
+    }
+
     /// Feed a key sequence string into the engine, parsing special key notation.
     ///
     /// Supports: plain characters (`dw`), special keys (`<Esc>`, `<CR>`, `<BS>`,

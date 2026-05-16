@@ -801,48 +801,6 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
     }
 }
 
-/// Intercept paste keys (`p`/`P`) to load the system clipboard into registers
-/// before the engine processes the keypress (clipboard=unnamedplus semantics).
-/// Returns true if the key was intercepted and processed.
-fn intercept_paste_key(engine: &mut Engine, before: bool) -> bool {
-    use crate::core::Mode;
-    // Intercept in Normal and Visual modes with a default/clipboard register.
-    if !matches!(
-        engine.mode,
-        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-    ) {
-        return false;
-    }
-    if !matches!(
-        engine.selected_register,
-        None | Some('"') | Some('+') | Some('*')
-    ) {
-        return false;
-    }
-    // Read from system clipboard synchronously.
-    // Capture any error to show after handle_key (which clears engine.message).
-    let clip_err: Option<String> = match engine.clipboard_read {
-        None => Some("Clipboard unavailable — install xclip or xsel".to_string()),
-        Some(ref cb_read) => match cb_read() {
-            Ok(text) if !text.is_empty() => {
-                engine.load_clipboard_for_paste(text);
-                None
-            }
-            Ok(_) => None, // empty clipboard — fall through to use internal register
-            Err(e) => Some(format!("Clipboard read failed: {e}")),
-        },
-    };
-    // Let engine execute the paste from the (now-updated) register.
-    // TUI uses key_name="" for regular chars; unicode carries the actual character.
-    let uni = if before { Some('P') } else { Some('p') };
-    engine.handle_key("", uni, false);
-    // Restore error message after handle_key clears it.
-    if let Some(err) = clip_err {
-        engine.message = err;
-    }
-    true
-}
-
 /// Initialise the engine, set up the terminal, run the event loop, and restore
 /// the terminal on exit.
 pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
@@ -2687,16 +2645,12 @@ fn event_loop(
                         }
                     }
 
-                    // In VSCode mode, Ctrl-V pre-loads clipboard into register '+' before
-                    // calling handle_key (which dispatches to vscode_paste()).
-                    if ctrl && key_name == "v" && engine.is_vscode_mode() {
-                        if let Some(ref cb_read) = engine.clipboard_read {
-                            if let Ok(text) = cb_read() {
-                                engine.registers.insert('+', (text.clone(), false));
-                                engine.registers.insert('"', (text, false));
-                            }
-                        }
-                        // Fall through to handle_key which calls vscode_paste().
+                    // Pre-load system clipboard for paste keys (p/P in
+                    // normal/visual, Ctrl+V in VSCode mode). Detection and
+                    // register loading are shared via engine methods (#381).
+                    if engine.needs_clipboard_for_paste(&key_name, unicode, ctrl) {
+                        let text = engine.clipboard_read.as_ref().and_then(|cb| cb().ok());
+                        engine.prepare_paste_clipboard(text);
                     }
 
                     // Ctrl+Shift+V: paste system clipboard into editor buffer.
@@ -2815,12 +2769,6 @@ fn event_loop(
                         }
                     }
 
-                    // clipboard=unnamedplus: intercept p/P to read from system clipboard.
-                    // TUI translate_key() sets key_name="" for regular chars; check unicode.
-                    let paste_intercepted = !ctrl
-                        && matches!(unicode, Some('p') | Some('P'))
-                        && intercept_paste_key(engine, unicode == Some('P'));
-
                     // ── Context menu keyboard intercept (TUI-side) ──────────
                     // Handle here so explorer actions (new_file etc.) can be
                     // dispatched to the engine's dialog system.
@@ -2850,7 +2798,7 @@ fn event_loop(
                         }
                     }
 
-                    if !paste_intercepted {
+                    {
                         debug_log!(
                             "handle_key: key_name={:?} unicode={:?} ctrl={} groups={} active_group={:?}",
                             key_name,
