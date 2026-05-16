@@ -20,7 +20,7 @@
 - `synth_keyevent`, `synth_mouseevent` — inverse helpers
 - 19 unit tests (15 forward + 4 round-trip)
 
-## src/tui_main/mod.rs — 3,352 lines
+## src/tui_main/mod.rs — 3,321 lines
 TUI application shell using ratatui + crossterm. Contains setup, event loop, key translation, clipboard, and cell rendering helpers.
 - `run(file_path, debug_log)` — entry point; sets up terminal, runs event loop, restores terminal on exit
 - `event_loop(terminal, engine)` — main loop: poll events, dispatch keys, call draw_frame, poll async (LSP/DAP/terminal/search)

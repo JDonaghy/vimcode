@@ -1,4 +1,4 @@
-# src/render.rs — ~11,941 lines
+# src/render.rs — ~14,155 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -77,7 +77,7 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `tab_row_height_px(line_height)` — tab row height as ceil(line_height * 1.6)
 - `tab_bar_height_px(line_height, breadcrumbs)` — tab bar + optional breadcrumb row
 - `status_bar_height_px(line_height, per_window_status, has_wildmenu)` — global status bar height
-- `editor_bottom_px(total_height, ...)` — Y coordinate where editor area ends (accounts for all chrome)
+- `compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot chrome layout (#386). Returns tab_bar_h, editor_bottom, terminal_h, terminal_content_rows, terminal_max_target_rows, and all chrome heights. Both backends use this.
 - `scrollbar_click_to_scroll_top(click_pos, track_len, total_lines, viewport_lines)` — maps scrollbar click to scroll position
 - `display_col_to_buffer_col(line_text, x_offset, tabstop, scroll_left)` — tab-aware column conversion
 - `is_tab_close_click(col_in_tab, tab_width, close_cols)` — detects close button zone in tab

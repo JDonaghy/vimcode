@@ -1,7 +1,22 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 377 archived here.
+All sessions through 378 archived here.
+
+---
+**Session 378 (May 15) — macOS readiness dedup sweep (#416, #389, #386):**
+
+Continuation of Session 377. Three more issues landed, plus the Session 377 docs commit.
+
+**#416 fix (e6aa82b):** GTK sidebar sync steals keyboard focus on startup. `sync_sidebar_widgets()` unconditionally called `grab_focus()` on the active panel DA whenever sidebar visible. First poll tick (~50ms) triggered `sync_sidebar_from_engine()` → `explorer_da.grab_focus()`, overriding the deferred `drawing_area.grab_focus()`. Fixed by guarding with `engine.sidebar_has_focus()` — on startup no focus flags are set, so panel DAs don't steal focus. One-line change.
+
+**#389 fix (aa9b186):** Extension registry fetch error suppressed on startup. When background fetch fails (network race), fall back silently to cache loaded at engine init instead of showing "Registry fetch failed — try again later". Error only shown on fresh install with no prior cache. Removed "Fetching extension registries..." status message (noisy for automatic background operation).
+
+**#386 refactor (3853133):** Extract `render::compute_editor_layout()`. New `EditorLayout` struct + `compute_editor_layout(engine, total_height, line_height, menu_in_viewport)` function in `render.rs`. Computes all chrome heights (tab bar, quickfix, terminal, debug toolbar, status bar, separated status, wildmenu) via `PanelChromeDesc`. GTK: removed `gtk_editor_bottom()` body (~40 lines), `gtk_terminal_target_maximize_rows()` (~40 lines). TUI: `terminal_target_maximize_rows_tui` + `effective_terminal_panel_rows_tui` reduced to one-line wrappers. Removed unused `editor_bottom_px()`. Terminal click handlers kept pixel-exact maximize snapping (#418 filed for cached hit region migration). `terminal_content_rows` + `terminal_max_target_rows` fields on struct for callers needing row counts.
+
+**Filed:** #417 (clipboard read/write dedup across backends), #418 (terminal click handlers → cached hit regions).
+
+**macOS readiness audit:** Conducted full per-backend code audit. Remaining dedup targets: #417 (clipboard), #418 (terminal hits), #395 (native PopoverMenu → quadraui), #274 (native dialogs → quadraui). Inherently per-backend: event controller setup, key translation, draw closures, native file dialogs, clipboard provider init.
 
 ---
 **Session 377 (May 15) — Explorer scrollbar migration + clipboard dedup (#413, #415, #381):**

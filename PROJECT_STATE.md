@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 15, 2026 (Session 377 — **Explorer scrollbar migration + clipboard dedup.** 3 commits (#413/#415/#381), net ~160 lines removed. Explorer scrollbar rendering + interaction fully owned by quadraui `TreeController` (quadraui#193). Manual Cairo/ratatui scrollbar code eliminated from both backends. Clipboard-before-paste detection + register loading deduplicated into two shared engine methods. Filed #416 for pre-existing GTK startup focus issue.)
+**Last updated:** May 15, 2026 (Session 378 — **macOS readiness dedup sweep.** 6 commits (#413/#415/#381/#416/#389/#386). Explorer scrollbar → quadraui TreeController. Clipboard paste detection → shared engine methods. GTK startup focus fix. Registry fetch fallback. Editor layout arithmetic → shared `render::compute_editor_layout()`. Filed #417 clipboard read/write dedup, #418 terminal hit region migration.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -108,6 +108,7 @@ cell coalescence) remain but are tracked separately.
 - `render::picker_panel_to_palette()` + `PickerGeometry` — ALL picker types (file/symbol/command/branch, with/without preview, flat/tree) route through one adapter to `quadraui::Palette`. `PickerGeometry::compute()` + `PickerSizing` constants give a single source of truth for popup bounds. Zero per-backend picker rendering code (#402).
 - `Engine::needs_clipboard_for_paste()` + `prepare_paste_clipboard()` — paste-key detection and clipboard register loading (#381). Both backends call the same two engine methods before `handle_key()`. Zero per-backend paste detection logic.
 - `Engine::handle_explorer_mouse_event()` — single-click row dispatch (toggle dir / preview file) for explorer TreeController events (#415). Both backends route mouse events through `TreeController.handle()` → `handle_explorer_mouse_event()`.
+- `render::compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot layout computation for all chrome heights (#386). GTK passes pixel units, TUI passes `line_height=1.0` for row units. Replaces `gtk_editor_bottom`, `gtk_terminal_target_maximize_rows`, TUI `terminal_target_maximize_rows_tui`, and the unused `editor_bottom_px`. Terminal click handlers still use bespoke maximize-snap math (#418).
 - `quadraui::AppShell` + `engine::sidebar` — sidebar visibility and active panel owned by the engine (#385). TUI reads all state from `engine.app_shell`; panel switching, focus flags, and session persistence handled by engine methods (`toggle_sidebar_panel`, `focus_sidebar_panel`, `handle_nav_overflow`). GTK `sync_sidebar_from_engine()` reads engine state; `sync_sidebar_widgets()` updates GTK widget visibility. ExtPanel panels bypass AppShell — `sync_sidebar_from_engine()` checks `ext_panel_active` (#413).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
@@ -123,4 +124,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 377 and earlier in **SESSION_HISTORY.md**.
+> Sessions 378 and earlier in **SESSION_HISTORY.md**.
