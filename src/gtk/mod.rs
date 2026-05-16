@@ -9480,7 +9480,7 @@ impl App {
         if let Some(ref b) = *self.ext_dyn_panel_box.borrow() {
             b.set_visible(show && matches!(p, SidebarPanel::ExtPanel(_)));
         }
-        if show {
+        if show && self.engine.borrow().sidebar_has_focus() {
             match p {
                 SidebarPanel::Git => {
                     if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
