@@ -108,6 +108,7 @@ pub(super) fn draw_frame(
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
     debug_toolbar_interaction: &quadraui::StatusBarInteraction,
     debug_toolbar_rect_out: &mut quadraui::Rect,
+    completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
     // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
     // Set once per frame by the caller (cached theme); the migrated
     // call sites wrap their access in `backend.enter_frame_scope`.
@@ -486,6 +487,7 @@ pub(super) fn draw_frame(
                     &layout,
                     theme,
                 );
+                *completion_layout_out = Some(layout);
             }
         }
     }
@@ -1687,6 +1689,7 @@ mod tests {
         let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
         let dbg_toolbar_interaction = quadraui::StatusBarInteraction::new();
         let mut dbg_toolbar_rect = quadraui::Rect::default();
+        let mut completion_layout = None;
         let mut backend = super::backend::TuiBackend::new();
 
         terminal
@@ -1710,6 +1713,7 @@ mod tests {
                     &mut tab_visible_counts,
                     &dbg_toolbar_interaction,
                     &mut dbg_toolbar_rect,
+                    &mut completion_layout,
                     &mut backend,
                 );
             })
