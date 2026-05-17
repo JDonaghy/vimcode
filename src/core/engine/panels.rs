@@ -699,17 +699,27 @@ impl Engine {
 
     /// Notify LSP that a file was closed.
     pub(crate) fn lsp_did_close(&mut self, buffer_id: BufferId) {
-        let path = self
-            .buffer_manager
-            .get(buffer_id)
-            .and_then(|s| s.file_path.clone());
-        if let Some(ref path) = path {
-            if let Some(mgr) = &mut self.lsp_manager {
-                mgr.notify_did_close(path);
+        let (notify_path, key_path) = match self.buffer_manager.get(buffer_id) {
+            Some(s) => {
+                let notify = match &s.file_path {
+                    Some(p) => p.clone(),
+                    None => return,
+                };
+                // #208: lsp_diagnostics is keyed by the URI-derived canonical
+                // path (insertions in the Diagnostics handler use uri_to_path).
+                // Removing by the buffer's original `file_path` is a no-op
+                // when that path was relative, leaving stale diagnostics in
+                // the gutter. canonical_path is cached at file-open time.
+                let key = s.canonical_path.clone().unwrap_or_else(|| notify.clone());
+                (notify, key)
             }
-            self.lsp_diagnostics.remove(path);
-            self.invalidate_explorer_indicators();
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            mgr.notify_did_close(&notify_path);
         }
+        self.lsp_diagnostics.remove(&key_path);
+        self.invalidate_explorer_indicators();
     }
 
     /// Flush any pending didChange notifications (called from UI poll loop).
@@ -731,19 +741,31 @@ impl Engine {
         let dirty: Vec<BufferId> = self.lsp_dirty_buffers.keys().copied().collect();
         for buffer_id in dirty {
             self.lsp_dirty_buffers.remove(&buffer_id);
-            let (path, text) = {
+            // `notify_path` is what we pass to LSP calls (path_to_uri
+            // canonicalizes internally). `key_path` is the canonical path
+            // used to key our own HashMaps (lsp_diagnostics,
+            // lsp_code_actions) — they're populated by handlers that
+            // decode the URI back via uri_to_path, which always yields the
+            // canonical absolute path. Removing by a relative `file_path`
+            // was silently a no-op (#208) — stale gutter markers persisted
+            // after git discard / revert until the server re-published.
+            let (notify_path, key_path, text) = {
                 let state = match self.buffer_manager.get(buffer_id) {
                     Some(s) => s,
                     None => continue,
                 };
-                let path = match &state.file_path {
+                let notify = match &state.file_path {
                     Some(p) => p.clone(),
                     None => continue,
                 };
                 if state.lsp_language_id.is_none() {
                     continue;
                 }
-                (path, state.buffer.to_string())
+                let key = state
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| notify.clone());
+                (notify, key, state.buffer.to_string())
             };
             // Clear stale position-based data immediately — line numbers from
             // the previous buffer state would highlight/annotate wrong lines.
@@ -753,15 +775,15 @@ impl Engine {
                 state.semantic_tokens.clear();
                 state.semantic_tokens_received = false;
             }
-            self.lsp_diagnostics.remove(&path);
+            self.lsp_diagnostics.remove(&key_path);
             self.invalidate_explorer_indicators();
-            self.lsp_code_actions.remove(&path);
+            self.lsp_code_actions.remove(&key_path);
             self.lsp_code_action_last_line = None;
             if let Some(mgr) = &mut self.lsp_manager {
-                mgr.notify_did_change(&path, &text);
+                mgr.notify_did_change(&notify_path, &text);
             }
             // Re-request semantic tokens after the server processes the change.
-            self.lsp_request_semantic_tokens(&path);
+            self.lsp_request_semantic_tokens(&notify_path);
         }
     }
 

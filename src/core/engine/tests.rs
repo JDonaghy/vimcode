@@ -8222,6 +8222,92 @@ fn test_lsp_dirty_buffer_tracking() {
 }
 
 #[test]
+fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
+    // #208: lsp_diagnostics is keyed by canonical absolute path (URI →
+    // uri_to_path). lsp_flush_changes used to remove by state.file_path,
+    // which is the original (possibly relative) path the user opened
+    // with. When they differed, remove was a silent no-op and the gutter
+    // kept showing stale error markers after a git discard / revert.
+    use std::path::PathBuf;
+    let dir = std::env::temp_dir().join("vimcode_test_diag_canonical");
+    let _ = std::fs::create_dir_all(&dir);
+    let abs_path = dir.join("file.rs");
+    std::fs::write(&abs_path, "fn main() {}\n").unwrap();
+    let canonical = abs_path.canonicalize().unwrap();
+
+    // Open the file via a relative path so state.file_path != canonical.
+    let prev_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(&dir).unwrap();
+    let rel_path = PathBuf::from("file.rs");
+    assert_ne!(
+        rel_path, canonical,
+        "relative path must differ from canonical"
+    );
+
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&rel_path));
+    let buf_id = engine.active_buffer_id();
+    assert_eq!(
+        engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .file_path
+            .as_ref(),
+        Some(&rel_path),
+        "buffer kept the relative path the user opened with"
+    );
+    assert_eq!(
+        engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .canonical_path
+            .as_ref(),
+        Some(&canonical),
+        "buffer also cached the canonical path",
+    );
+
+    // Simulate a Diagnostics event for the canonical path (which is what
+    // uri_to_path produces from the server's URI).
+    engine.lsp_diagnostics.insert(
+        canonical.clone(),
+        vec![crate::core::lsp::Diagnostic {
+            range: crate::core::lsp::LspRange {
+                start: crate::core::lsp::LspPosition {
+                    line: 0,
+                    character: 0,
+                },
+                end: crate::core::lsp::LspPosition {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            severity: crate::core::lsp::DiagnosticSeverity::Error,
+            message: "stale error".to_string(),
+            source: None,
+            code: None,
+        }],
+    );
+
+    // Mark dirty (like a git discard reload would) and flush.
+    engine.ensure_lsp_manager();
+    engine.lsp_dirty_buffers.insert(buf_id, true);
+    engine.lsp_flush_changes();
+
+    assert!(
+        !engine.lsp_diagnostics.contains_key(&canonical),
+        "lsp_flush_changes must clear diagnostics under the canonical key, \
+         not the original file_path key (#208)",
+    );
+
+    if let Some(cwd) = prev_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_lsp_flush_changes_resets_semantic_tokens_received() {
     // #230: indicator was stuck on `name…` for files where the server
     // returned zero semantic tokens, because `semantic_tokens.is_empty()`
