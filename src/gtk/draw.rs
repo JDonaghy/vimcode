@@ -911,17 +911,32 @@ pub(super) fn draw_editor(
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
     dialog_popup_rect_out.set(popup_rect);
 
-    *context_menu_layout_out.borrow_mut() = draw_context_menu_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        char_width,
-        line_height,
-        mouse_pos,
+    // #426: skip the editor-DA ctx menu render when the trigger was an
+    // explorer right-click — that menu paints on the explorer DA instead
+    // (different coord system, so anchoring on the editor DA would put it
+    // at the wrong screen position).
+    let on_explorer = matches!(
+        engine.context_menu.as_ref().map(|cm| &cm.target),
+        Some(
+            core::engine::ContextMenuTarget::ExplorerFile { .. }
+                | core::engine::ContextMenuTarget::ExplorerDir { .. }
+        )
     );
+    *context_menu_layout_out.borrow_mut() = if on_explorer {
+        None
+    } else {
+        draw_context_menu_popup(
+            cr,
+            &layout,
+            &screen,
+            &theme,
+            width as f64,
+            height as f64,
+            char_width,
+            line_height,
+            mouse_pos,
+        )
+    };
 
     // Cache the ScreenLayout for click handlers (#344). Moves, not clones.
     *screen_layout_out.borrow_mut() = Some(screen);
@@ -1998,6 +2013,87 @@ pub(super) fn draw_context_menu_popup(
     // a redundant hover override here clobbered keyboard navigation: every
     // queue_draw triggered by `j`/`k` would re-snap selection back to the
     // item under the (stationary) cursor.
+
+    super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
+
+    Some(menu_layout)
+}
+
+/// Draw the engine-drawn context menu on the explorer DA (#426).
+/// Mirrors `draw_context_menu_popup` but renders only when the menu's
+/// target is `ExplorerFile/Dir` and uses explorer-DA-local coords
+/// (UI-font char_width × line_height). Returns the resolved
+/// `ContextMenuLayout` for the click/motion hit-test cache.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_explorer_context_menu_popup(
+    cr: &Context,
+    _layout: &pango::Layout,
+    engine: &Engine,
+    theme: &Theme,
+    da_width: f64,
+    da_height: f64,
+    char_width: f64,
+    line_height: f64,
+) -> Option<quadraui::ContextMenuLayout> {
+    let cm = engine.context_menu.as_ref()?;
+    if !matches!(
+        cm.target,
+        core::engine::ContextMenuTarget::ExplorerFile { .. }
+            | core::engine::ContextMenuTarget::ExplorerDir { .. }
+    ) {
+        return None;
+    }
+    if cm.items.is_empty() {
+        return None;
+    }
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
+
+    // Build the render-side panel from the engine state, then the
+    // quadraui ContextMenu via the shared adapter.
+    let panel = render::ContextMenuPanel {
+        items: cm
+            .items
+            .iter()
+            .map(|i| render::ContextMenuRenderItem {
+                label: i.label.clone(),
+                shortcut: i.shortcut.clone(),
+                separator_after: i.separator_after,
+                enabled: i.enabled,
+            })
+            .collect(),
+        selected_idx: cm.selected,
+        screen_col: cm.screen_x,
+        screen_row: cm.screen_y,
+        trigger_height: cm.trigger_height,
+    };
+    let menu = render::context_menu_panel_to_quadraui_context_menu(&panel);
+
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+
+    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
+    let menu_w = content_cols as f64 * char_width;
+
+    let anchor_x = cm.screen_x as f64 * char_width;
+    let anchor_y = cm.screen_y as f64 * line_height;
+    let trigger_height_px = cm.trigger_height as f64 * line_height;
+    let viewport = quadraui::Rect::new(0.0, 0.0, da_width as f32, da_height as f32);
+    let menu_layout = menu.layout_at(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            0.0,
+            trigger_height_px as f32,
+        ),
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
 
     super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
 

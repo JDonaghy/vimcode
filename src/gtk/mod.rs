@@ -269,6 +269,16 @@ struct App {
     /// context it renders with, so click and scroll handlers hit-test with
     /// byte-exact row math.
     explorer_row_height_cell: Rc<Cell<f64>>,
+    /// Explorer DA's UI-font line_height + char_width in pixels — cached
+    /// for the engine-drawn ctx menu (#426). The right-click handler
+    /// converts pixel coords to engine cells using these, and the
+    /// explorer-DA-side ctx menu render multiplies them back out for the
+    /// anchor pixel.
+    explorer_line_height_cell: Rc<Cell<f64>>,
+    explorer_char_width_cell: Rc<Cell<f64>>,
+    /// Cached ContextMenuLayout from the last explorer-DA paint (#426).
+    /// Click + motion handlers hit-test against this.
+    explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
     /// Fractional dy accumulator for the explorer scroll wheel. Small
     /// trackpad deltas are summed here until they exceed one row, so no
     /// scroll event is silently dropped.
@@ -437,9 +447,6 @@ struct App {
     css_provider: gtk4::CssProvider,
     /// Colorscheme name at the time the CSS was last applied.
     last_colorscheme: String,
-    /// Active context-menu popover (explorer or tab). Kept alive so we can
-    /// unparent it before creating a new one (avoids GTK CSS node assertions).
-    active_ctx_popover: Rc<RefCell<Option<gtk4::PopoverMenu>>>,
     /// Cross-backend modal-overlay tracking. Pushed to when a palette /
     /// `quadraui::Backend`-impl handle. Owns the canonical
     /// accelerators / event-queue / viewport / services / modal-stack /
@@ -1933,9 +1940,11 @@ impl SimpleComponent for App {
         let activity_bar_hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
 
         let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
-        let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
-        let active_ctx_popover_ref: Rc<RefCell<Option<gtk4::PopoverMenu>>> =
+        let explorer_line_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(20.0));
+        let explorer_char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(8.0));
+        let explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>> =
             Rc::new(RefCell::new(None));
+        let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let drawing_area_ref = Rc::new(RefCell::new(None));
         // Editor pointer cache (#240): updated by EventControllerMotion on
         // the editor DA, read by the scroll handler to route wheel events
@@ -2102,6 +2111,9 @@ impl SimpleComponent for App {
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             activity_bar_da_ref: activity_bar_da_ref.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
+            explorer_line_height_cell: explorer_line_height_cell.clone(),
+            explorer_char_width_cell: explorer_char_width_cell.clone(),
+            explorer_ctx_menu_layout: explorer_ctx_menu_layout.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
@@ -2175,7 +2187,6 @@ impl SimpleComponent for App {
             menu_dd_line_height: menu_dd_lh.clone(),
             css_provider,
             last_colorscheme,
-            active_ctx_popover: active_ctx_popover_ref.clone(),
             backend: backend.clone(),
         };
         let widgets = view_output!();
@@ -2367,6 +2378,9 @@ impl SimpleComponent for App {
         {
             let engine_d = engine.clone();
             let row_h_cell = explorer_row_height_cell.clone();
+            let lh_cell = explorer_line_height_cell.clone();
+            let cw_cell = explorer_char_width_cell.clone();
+            let ctx_menu_layout_d = explorer_ctx_menu_layout.clone();
             let backend_d = backend.clone();
             widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
                 let engine = engine_d.borrow();
@@ -2380,6 +2394,13 @@ impl SimpleComponent for App {
                     (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
                 let row_h = (line_height * 1.4).round().max(1.0);
                 row_h_cell.set(row_h);
+                lh_cell.set(line_height);
+                // Measure char width with the same pango layout used for
+                // text — keeps the right-click cell math in sync with what
+                // the rasteriser sees (#426).
+                layout.set_text("0");
+                let char_width = layout.pixel_size().0 as f64;
+                cw_cell.set(char_width.max(1.0));
                 let w = da.width() as f64;
                 let h = da.height() as f64;
 
@@ -2404,6 +2425,21 @@ impl SimpleComponent for App {
                     b.set_current_line_height(line_height);
                     engine.explorer_tree.borrow().render(b, q_rect);
                 });
+
+                // #426: render the engine-drawn ctx menu on this DA when
+                // the trigger was an explorer right-click. Painted last so
+                // it overlays the tree rows.
+                *ctx_menu_layout_d.borrow_mut() =
+                    crate::gtk::draw::draw_explorer_context_menu_popup(
+                        cr,
+                        &layout,
+                        &engine,
+                        &theme,
+                        w,
+                        h,
+                        char_width,
+                        line_height,
+                    );
             });
         }
         {
@@ -4640,9 +4676,26 @@ impl SimpleComponent for App {
         // sibling DA (sidebar, ext panel) the DA never claimed focus, so keys
         // are dead until the user clicks inside the menu. Grab focus whenever
         // a ctx menu is open — grab_focus is idempotent if already focused.
-        if self.engine.borrow().context_menu.is_some() {
-            if let Some(ref drawing) = *self.drawing_area.borrow() {
-                drawing.grab_focus();
+        //
+        // #426: do NOT do this for explorer-targeted ctx menus — those render
+        // on the explorer DA and have their own key handler. Stealing focus
+        // back to the editor DA would break keyboard nav of the explorer menu.
+        {
+            use core::engine::ContextMenuTarget;
+            let on_explorer = matches!(
+                self.engine
+                    .borrow()
+                    .context_menu
+                    .as_ref()
+                    .map(|cm| &cm.target),
+                Some(
+                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. }
+                )
+            );
+            if !on_explorer && self.engine.borrow().context_menu.is_some() {
+                if let Some(ref drawing) = *self.drawing_area.borrow() {
+                    drawing.grab_focus();
+                }
             }
         }
     }
@@ -9117,6 +9170,14 @@ impl App {
                 self.queue_explorer_draw();
             }
             Msg::ExplorerUiEvent(ev) => {
+                // #426: when an explorer ctx menu is open, intercept clicks
+                // and hover against the cached ContextMenuLayout. Returns
+                // true if the event was consumed by the menu.
+                if self.handle_explorer_ctx_menu_ui_event(&ev, sender) {
+                    self.queue_explorer_draw();
+                    self.draw_needed.set(true);
+                    return;
+                }
                 let dominated = matches!(
                     ev,
                     quadraui::UiEvent::MouseDown { .. }
@@ -9198,6 +9259,16 @@ impl App {
         ctrl: bool,
         sender: &ComponentSender<Self>,
     ) {
+        // #426: when an explorer ctx menu is open, dispatch j/k/Esc/Enter
+        // to the engine ctx menu handler. On Enter, forward the returned
+        // action via the shared dispatcher so backend-only flows
+        // (new_file, open_terminal, etc.) fire.
+        if self.handle_explorer_ctx_menu_key(&key_name, sender) {
+            self.queue_explorer_draw();
+            self.draw_needed.set(true);
+            return;
+        }
+
         // When an engine dialog is active (delete confirmation), route
         // keys to the dialog handler, not the explorer dispatch.
         if self.engine.borrow().dialog.is_some() {
@@ -9301,7 +9372,177 @@ impl App {
         }
     }
 
-    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, sender: &ComponentSender<Self>) {
+    /// #426: Intercept j/k/Enter/Esc on the explorer DA when an
+    /// engine-drawn explorer ctx menu is open. Returns true if consumed.
+    fn handle_explorer_ctx_menu_key(
+        &mut self,
+        key_name: &str,
+        sender: &ComponentSender<Self>,
+    ) -> bool {
+        use core::engine::ContextMenuTarget;
+        {
+            let eng = self.engine.borrow();
+            match eng.context_menu.as_ref().map(|cm| &cm.target) {
+                Some(
+                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. },
+                ) => {}
+                _ => return false,
+            }
+        }
+        match key_name {
+            "Escape" => {
+                self.engine.borrow_mut().close_context_menu();
+                true
+            }
+            "Return" => {
+                let target_path =
+                    self.engine
+                        .borrow()
+                        .context_menu
+                        .as_ref()
+                        .and_then(|cm| match &cm.target {
+                            ContextMenuTarget::ExplorerFile { path }
+                            | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
+                            _ => None,
+                        });
+                let action = self.engine.borrow_mut().context_menu_confirm();
+                if let (Some(action), Some(target)) = (action, target_path) {
+                    self.dispatch_explorer_ctx_action(&action, &target, sender);
+                }
+                true
+            }
+            "j" | "Down" => {
+                let mut eng = self.engine.borrow_mut();
+                if let Some(ref mut cm) = eng.context_menu {
+                    let len = cm.items.len();
+                    if len > 0 {
+                        cm.selected = (cm.selected + 1) % len;
+                    }
+                }
+                true
+            }
+            "k" | "Up" => {
+                let mut eng = self.engine.borrow_mut();
+                if let Some(ref mut cm) = eng.context_menu {
+                    let len = cm.items.len();
+                    if len > 0 {
+                        cm.selected = if cm.selected > 0 {
+                            cm.selected - 1
+                        } else {
+                            len - 1
+                        };
+                    }
+                }
+                true
+            }
+            _ => {
+                // Any other key dismisses + falls through to normal explorer
+                // handling so the user can keep navigating.
+                self.engine.borrow_mut().close_context_menu();
+                false
+            }
+        }
+    }
+
+    /// #426: Intercept UI events on the explorer DA when an engine-drawn
+    /// explorer ctx menu is open. Returns true if consumed.
+    fn handle_explorer_ctx_menu_ui_event(
+        &mut self,
+        ev: &quadraui::UiEvent,
+        sender: &ComponentSender<Self>,
+    ) -> bool {
+        use core::engine::ContextMenuTarget;
+        // Only intercept when the menu is open and targets the explorer.
+        {
+            let eng = self.engine.borrow();
+            match eng.context_menu.as_ref().map(|cm| &cm.target) {
+                Some(
+                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. },
+                ) => {}
+                _ => return false,
+            }
+        }
+        let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
+            Some(l) => l,
+            None => return false,
+        };
+        match ev {
+            quadraui::UiEvent::MouseMoved { position, .. } => {
+                let hit = layout.hit_test(position.x, position.y);
+                if let Some(idx) = core::engine::context_menu_hit_to_idx(&hit) {
+                    let mut eng = self.engine.borrow_mut();
+                    if let Some(ref mut cm) = eng.context_menu {
+                        cm.selected = idx;
+                    }
+                }
+                true
+            }
+            quadraui::UiEvent::MouseDown { position, .. } => {
+                let hit = layout.hit_test(position.x, position.y);
+                let idx = core::engine::context_menu_hit_to_idx(&hit);
+                if let Some(idx) = idx {
+                    // Pull target path BEFORE confirm consumes the menu.
+                    let target_path = self.engine.borrow().context_menu.as_ref().and_then(|cm| {
+                        match &cm.target {
+                            ContextMenuTarget::ExplorerFile { path }
+                            | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
+                            _ => None,
+                        }
+                    });
+                    let action = {
+                        let mut eng = self.engine.borrow_mut();
+                        if let Some(ref mut cm) = eng.context_menu {
+                            cm.selected = idx;
+                        }
+                        eng.context_menu_confirm()
+                    };
+                    if let (Some(action), Some(target)) = (action, target_path) {
+                        self.dispatch_explorer_ctx_action(&action, &target, sender);
+                    }
+                } else {
+                    // Click outside any item → dismiss the menu.
+                    self.engine.borrow_mut().close_context_menu();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// #426: Map the action string returned by `context_menu_confirm` for
+    /// an explorer ctx menu to the appropriate backend Msg. Engine-side
+    /// actions (copy_path, reveal, select_for_diff, etc.) were already
+    /// handled inside `context_menu_confirm`; this only covers actions
+    /// that require GTK plumbing.
+    fn dispatch_explorer_ctx_action(
+        &self,
+        action: &str,
+        target: &std::path::Path,
+        sender: &ComponentSender<Self>,
+    ) {
+        match action {
+            "new_file" | "new_folder" | "rename" | "delete" | "move_file" => {
+                sender.input(Msg::ExplorerAction(action.to_string()));
+            }
+            "open_terminal" => {
+                let dir = if target.is_dir() {
+                    target.to_path_buf()
+                } else {
+                    target
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                };
+                sender.input(Msg::OpenTerminalAt(dir));
+            }
+            "find_in_folder" => {
+                sender.input(Msg::ToggleFocusSearch);
+            }
+            _ => {} // engine-handled actions (copy_path, reveal, etc.)
+        }
+    }
+
+    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, _sender: &ComponentSender<Self>) {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.grab_focus();
         }
@@ -9320,195 +9561,19 @@ impl App {
         } else {
             (self.engine.borrow().cwd.clone(), true)
         };
-        self.queue_explorer_draw();
-        self.show_explorer_context_menu(x, y, target, is_dir, sender);
-    }
-
-    fn show_explorer_context_menu(
-        &self,
-        x: f64,
-        y: f64,
-        target: PathBuf,
-        is_dir: bool,
-        sender: &ComponentSender<Self>,
-    ) {
-        let da: gtk4::DrawingArea = match self.explorer_sidebar_da_ref.borrow().as_ref() {
-            Some(da) => da.clone(),
-            None => return,
-        };
-        // Build the engine-driven context menu items (for enabled state).
+        // #426: engine-driven ctx menu. Convert explorer-DA-local click px
+        // to cells using the explorer DA's own UI-font metrics so the
+        // ctx-menu render anchor lands at the click position. Native
+        // gtk4::PopoverMenu path is gone — render lives in the explorer
+        // DA's draw_func via `draw_explorer_context_menu_popup`.
+        let cw = self.explorer_char_width_cell.get().max(1.0);
+        let lh = self.explorer_line_height_cell.get().max(1.0);
+        let cx = (x / cw) as u16;
+        let cy = (y / lh) as u16;
         self.engine
             .borrow_mut()
-            .open_explorer_context_menu(target.clone(), is_dir, 0, 0);
-        let items: Vec<core::engine::ContextMenuItem> = self
-            .engine
-            .borrow()
-            .context_menu
-            .as_ref()
-            .map(|cm| cm.items.clone())
-            .unwrap_or_default();
-        self.engine.borrow_mut().close_context_menu();
-        let menu = build_gio_menu_from_engine_items(&items, "ctx");
-        let ctx_enabled: std::collections::HashMap<String, bool> = items
-            .iter()
-            .map(|it| (it.action.clone(), it.enabled))
-            .collect();
-
-        let actions = gtk4::gio::SimpleActionGroup::new();
-        let add_action = |actions: &gtk4::gio::SimpleActionGroup, a: &gtk4::gio::SimpleAction| {
-            if ctx_enabled.get(a.name().as_str()) == Some(&false) {
-                a.set_enabled(false);
-            }
-            actions.add_action(a);
-        };
-
-        {
-            let s = sender.input_sender().clone();
-            let a = gtk4::gio::SimpleAction::new("new_file", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::ExplorerAction("new_file".to_string())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let a = gtk4::gio::SimpleAction::new("new_folder", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::ExplorerAction("new_folder".to_string())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let a = gtk4::gio::SimpleAction::new("rename", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::ExplorerAction("rename".to_string())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let a = gtk4::gio::SimpleAction::new("delete", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::ExplorerAction("delete".to_string())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("copy_path", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::CopyPath(t.clone())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("copy_relative_path", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::CopyRelativePath(t.clone())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("reveal", None);
-            a.connect_activate(move |_, _| {
-                let dir = if t.is_dir() {
-                    t.clone()
-                } else {
-                    t.parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf()
-                };
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&dir)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("select_for_diff", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::SelectForDiff(t.clone())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("diff_with_selected", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::DiffWithSelected(t.clone())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("open_side", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::OpenSide(t.clone())).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let eng = self.engine.clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("open_side_vsplit", None);
-            a.connect_activate(move |_, _| {
-                let mut e = eng.borrow_mut();
-                e.split_window(crate::core::window::SplitDirection::Vertical, None);
-                let _ = e.open_file_with_mode(&t, crate::core::OpenMode::Permanent);
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let t = target.clone();
-            let a = gtk4::gio::SimpleAction::new("open_terminal", None);
-            a.connect_activate(move |_, _| {
-                let dir = if t.is_dir() {
-                    t.clone()
-                } else {
-                    t.parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf()
-                };
-                s.send(Msg::OpenTerminalAt(dir)).ok();
-            });
-            add_action(&actions, &a);
-        }
-        {
-            let s = sender.input_sender().clone();
-            let a = gtk4::gio::SimpleAction::new("find_in_folder", None);
-            a.connect_activate(move |_, _| {
-                s.send(Msg::ToggleFocusSearch).ok();
-            });
-            add_action(&actions, &a);
-        }
-
-        let n_rows = menu_row_count(&menu);
-        let popover_parent: gtk4::Widget = da.clone().upcast();
-        popover_parent.insert_action_group("ctx", Some(&actions));
-        swap_ctx_popover(&self.active_ctx_popover, {
-            let popover = gtk4::PopoverMenu::from_model(Some(&menu));
-            popover.set_parent(&popover_parent);
-            popover.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.set_has_arrow(false);
-            popover.set_position(gtk4::PositionType::Right);
-            popover.set_size_request(-1, n_rows * 22 + 14);
-            popover
-        });
-        if let Some(ref p) = *self.active_ctx_popover.borrow() {
-            p.popup();
-        }
+            .open_explorer_context_menu(target, is_dir, cx, cy);
+        self.queue_explorer_draw();
     }
 
     fn handle_find_replace_msg(&mut self, msg: Msg) {

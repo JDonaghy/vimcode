@@ -58,50 +58,6 @@ pub(super) fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build a `gio::Menu` from engine-generated `ContextMenuItem`s.
-/// Groups items into sections split at `separator_after` boundaries.
-pub(super) fn build_gio_menu_from_engine_items(
-    items: &[core::engine::ContextMenuItem],
-    action_prefix: &str,
-) -> gtk4::gio::Menu {
-    let menu = gtk4::gio::Menu::new();
-    let mut section = gtk4::gio::Menu::new();
-    for item in items {
-        section.append(
-            Some(&item.label),
-            Some(&format!("{action_prefix}.{}", item.action)),
-        );
-        if item.separator_after {
-            menu.append_section(None, &section);
-            section = gtk4::gio::Menu::new();
-        }
-    }
-    if section.n_items() > 0 {
-        menu.append_section(None, &section);
-    }
-    menu
-}
-
-/// Clean up any previous context-menu popover from the shared slot,
-/// then store the new one.  The old popover is popdown'd + unparented
-/// **before** the new one is set_parent'd, so there is never a moment
-/// where two popovers coexist on the same parent.
-pub(super) fn swap_ctx_popover(
-    slot: &Rc<RefCell<Option<gtk4::PopoverMenu>>>,
-    new: gtk4::PopoverMenu,
-) {
-    let mut guard = slot.borrow_mut();
-    if let Some(old) = guard.take() {
-        old.popdown();
-        // NOTE: we intentionally do NOT call old.unparent() here.
-        // GTK4 internally tears down the CSS node tree during unparent(),
-        // which triggers a non-fatal "gtk_css_node_insert_after" assertion.
-        // Letting GTK handle the lifecycle naturally avoids the assertion.
-        // The old widget will be dropped when this Option is overwritten.
-    }
-    *guard = Some(new);
-}
-
 /// Install the bundled Nerd Font icon subset to `~/.local/share/fonts/` so
 /// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
 /// The font file is embedded in the binary via `include_bytes!` and only written
@@ -201,25 +157,6 @@ pub(super) fn install_icon_and_desktop() {
     if fs::create_dir_all(&app_dir).is_ok() {
         let _ = fs::write(&desktop_path, desktop);
     }
-}
-
-/// Count total visible rows in a gio::Menu (items + section separators).
-pub(super) fn menu_row_count(menu: &gtk4::gio::Menu) -> i32 {
-    let mut rows = 0i32;
-    for i in 0..menu.n_items() {
-        if let Some(section) = menu
-            .item_link(i, "section")
-            .and_then(|m| m.downcast::<gtk4::gio::Menu>().ok())
-        {
-            if i > 0 {
-                rows += 1; // separator
-            }
-            rows += section.n_items();
-        } else {
-            rows += 1;
-        }
-    }
-    rows
 }
 
 /// GLib log handler that suppresses the known GTK4 `gtk_css_node_insert_after`
