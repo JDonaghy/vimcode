@@ -4632,6 +4632,19 @@ impl SimpleComponent for App {
         if !is_scrollbar_msg {
             self.sync_scrollbar();
         }
+
+        // #435: engine-drawn ctx menu keys (j/k/Enter/Esc) are dispatched on
+        // the editor DA's key controller. If the trigger click landed on a
+        // sibling DA (sidebar, ext panel) the DA never claimed focus, so keys
+        // are dead until the user clicks inside the menu. Grab focus whenever
+        // a ctx menu is open — idempotent if the DA is already focused.
+        if self.engine.borrow().context_menu.is_some() {
+            if let Some(ref drawing) = *self.drawing_area.borrow() {
+                if !drawing.has_focus() {
+                    drawing.grab_focus();
+                }
+            }
+        }
     }
 }
 

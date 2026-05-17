@@ -2035,17 +2035,14 @@ pub(super) fn handle_mouse(
                     match hit {
                         quadraui::TerminalSplitHit::Scrollbar => {
                             let track_start = (geom.top_y + geom.content_y) as u16;
-                            let track_len =
-                                (geom.height - geom.content_y).max(0.0) as u16;
+                            let track_len = (geom.height - geom.content_y).max(0.0) as u16;
                             let total = engine
                                 .active_terminal()
                                 .map(|t| t.history.len())
                                 .unwrap_or(0);
                             let tl = track_len as f32;
                             drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                                widget: quadraui::WidgetId::new(
-                                    "tui:terminal_scrollback",
-                                ),
+                                widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
                                 track_start: track_start as f32,
                                 track_length: tl,
                                 thumb_length: (tl / total.max(1) as f32).max(1.0),

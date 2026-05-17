@@ -212,10 +212,7 @@ impl Engine {
     /// `TerminalSplitHit` from the cached layout. Sets pane focus,
     /// starts selection, or signals a divider drag. Returns `true` if
     /// the caller should start a split-divider drag.
-    pub fn handle_terminal_split_click(
-        &mut self,
-        hit: quadraui::TerminalSplitHit,
-    ) -> bool {
+    pub fn handle_terminal_split_click(&mut self, hit: quadraui::TerminalSplitHit) -> bool {
         use quadraui::TerminalSplitHit;
         self.terminal_has_focus = true;
         match hit {
