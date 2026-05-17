@@ -3272,6 +3272,27 @@ impl Engine {
         self.lsp_request_completion();
     }
 
+    /// True when an insert-mode keypress would be consumed by completion
+    /// handling — used by backends to suppress global accelerators that
+    /// would otherwise win the dispatch race (#287). Mirrors the gates in
+    /// `handle_insert_key`:
+    ///
+    /// - `Ctrl+N` / `Ctrl+P` — always (start or cycle word completion).
+    /// - `Tab` / `Down` / `Up` — only while a display-only popup is active.
+    pub fn insert_completion_intercepts_key(&self, key_name: &str, ctrl: bool) -> bool {
+        if self.mode != Mode::Insert {
+            return false;
+        }
+        if ctrl && (key_name == "n" || key_name == "p") {
+            return true;
+        }
+        let popup_active = self.completion_display_only && self.completion_idx.is_some();
+        if !popup_active {
+            return false;
+        }
+        !ctrl && (key_name == "Tab" || key_name == "Down" || key_name == "Up")
+    }
+
     // ── Fold helpers ──────────────────────────────────────────────────────────
 
     /// Count leading whitespace characters (spaces = 1, tabs = tab_width).

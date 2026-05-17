@@ -6736,6 +6736,46 @@ fn test_auto_popup_appears_on_type() {
 }
 
 #[test]
+fn test_insert_completion_intercepts_key() {
+    // #287: predicate that backends consult to suppress global accelerators
+    // (Ctrl-P → fuzzy_finder, etc.) when insert-mode completion would
+    // otherwise consume the key. Mirrors the gates in handle_insert_key.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+
+    // Normal mode: no interception even with a popup-like state set
+    // (popup can't actually be active outside insert mode, but check
+    // the mode gate explicitly).
+    assert!(!engine.insert_completion_intercepts_key("n", true));
+    assert!(!engine.insert_completion_intercepts_key("p", true));
+
+    // Enter insert mode with no popup active.
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    // Ctrl-N / Ctrl-P always intercepted in insert (they can start completion).
+    assert!(engine.insert_completion_intercepts_key("n", true));
+    assert!(engine.insert_completion_intercepts_key("p", true));
+    // Tab / Down / Up NOT intercepted without an active popup.
+    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    assert!(!engine.insert_completion_intercepts_key("Down", false));
+    assert!(!engine.insert_completion_intercepts_key("Up", false));
+    // Non-completion keys never intercepted.
+    assert!(!engine.insert_completion_intercepts_key("a", false));
+    assert!(!engine.insert_completion_intercepts_key("f", true));
+
+    // Activate a display-only popup by typing a prefix that matches.
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    assert!(engine.completion_display_only && engine.completion_idx.is_some());
+    // Now Tab / Down / Up are intercepted.
+    assert!(engine.insert_completion_intercepts_key("Tab", false));
+    assert!(engine.insert_completion_intercepts_key("Down", false));
+    assert!(engine.insert_completion_intercepts_key("Up", false));
+    // Ctrl variants of those keys are NOT — only the bare versions cycle.
+    assert!(!engine.insert_completion_intercepts_key("Tab", true));
+}
+
+#[test]
 fn test_manual_trigger_with_empty_prefix_does_not_dismiss() {
     // #422: Ctrl+Space should fire a completion request even with no prefix
     // (VSCode parity — show all in-scope symbols). The auto path still bails
