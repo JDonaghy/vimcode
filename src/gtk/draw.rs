@@ -1956,10 +1956,15 @@ pub(super) fn draw_context_menu_popup(
 
     let anchor_x = cm.screen_col as f64 * char_width;
     let anchor_y = cm.screen_row as f64 * line_height;
+    let trigger_height_px = cm.trigger_height as f64 * line_height;
     let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
-    let menu_layout = menu.layout(
-        anchor_x as f32,
-        anchor_y as f32,
+    let menu_layout = menu.layout_at(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            0.0,
+            trigger_height_px as f32,
+        ),
         viewport,
         menu_w as f32,
         item_height,

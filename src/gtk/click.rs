@@ -324,7 +324,13 @@ pub(super) fn handle_mouse_click(
         ClickTarget::ActionMenuButton(group_id) => {
             let col = (x / char_width.max(1.0)) as u16;
             let row = (y / line_height.max(1.0)) as u16;
-            engine.open_editor_action_menu(group_id, col, row);
+            // #434: action button sits in the tab row (~1.6 line_heights tall).
+            // Pass the trigger height in cells so the engine-drawn menu opens
+            // BELOW the button instead of overlapping it. Sub-cell rounding
+            // (1.6 → 2 cells) leaves a tiny gap; same tracking as #168.
+            let trigger_h =
+                (render_mod::tab_row_height_px(line_height) / line_height.max(1.0)).ceil() as u16;
+            engine.open_editor_action_menu(group_id, col, row, trigger_h);
             (None, None)
         }
         _ => (None, None),

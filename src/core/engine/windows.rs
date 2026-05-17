@@ -691,11 +691,18 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0,
         });
     }
 
     /// Open the editor action menu ("..." button) for a tab bar group.
-    pub fn open_editor_action_menu(&mut self, group_id: GroupId, x: u16, y: u16) {
+    pub fn open_editor_action_menu(
+        &mut self,
+        group_id: GroupId,
+        x: u16,
+        y: u16,
+        trigger_height: u16,
+    ) {
         let group = match self.editor_groups.get(&group_id) {
             Some(g) => g,
             None => return,
@@ -775,6 +782,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height,
         });
     }
 
@@ -957,6 +965,7 @@ impl Engine {
             selected: 0,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0,
         });
     }
 
@@ -1041,6 +1050,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0,
         });
     }
 

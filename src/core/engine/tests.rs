@@ -18381,7 +18381,7 @@ fn test_editor_action_menu_opens() {
     let mut e = Engine::new();
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1);
     assert!(e.context_menu.is_some());
     let cm = e.context_menu.as_ref().unwrap();
     assert!(matches!(
@@ -18402,7 +18402,7 @@ fn test_editor_action_menu_close_others_disabled_with_one_tab() {
     let mut e = Engine::new();
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1);
     let cm = e.context_menu.as_ref().unwrap();
     // "Close Others" disabled with only 1 tab.
     let close_others = cm
@@ -18422,7 +18422,7 @@ fn test_editor_action_menu_toggle_wrap() {
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
     assert!(!e.settings.wrap);
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1);
     // Select "toggle_wrap" and confirm.
     if let Some(ref mut cm) = e.context_menu {
         if let Some(idx) = cm.items.iter().position(|i| i.action == "toggle_wrap") {
@@ -18442,7 +18442,7 @@ fn test_editor_action_menu_close_all() {
     e.new_tab(None);
     assert!(e.active_group().tabs.len() >= 2);
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1);
     if let Some(ref mut cm) = e.context_menu {
         if let Some(idx) = cm.items.iter().position(|i| i.action == "close_all") {
             cm.selected = idx;

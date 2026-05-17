@@ -1685,6 +1685,11 @@ pub struct ContextMenuState {
     pub selected: usize,
     pub screen_x: u16,
     pub screen_y: u16,
+    /// Height of the trigger element in cells. Non-zero values opt the
+    /// menu into `ContextMenuPlacement::Below` so it opens just below
+    /// the trigger instead of at the click point (#434). Right-click
+    /// flows leave this at 0 and use `AnchorPoint`.
+    pub trigger_height: u16,
 }
 
 /// One visible row in the flat explorer file-tree list.
