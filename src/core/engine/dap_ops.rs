@@ -963,11 +963,20 @@ impl Engine {
                         .push(format!("[dap] event: Stopped reason={reason}"));
                     self.dap_stopped_thread = Some(thread_id);
                     self.message = format!("DAP: stopped ({reason})");
-                    // Clear previous frame/variable state before populating new ones.
+                    // #212: var_refs are server-assigned per-stop; many
+                    // adapters (lldb-dap, codelldb) recycle them between
+                    // stops. Without clearing the expand state + child
+                    // cache here, a recycled var_ref makes a NEW variable
+                    // inherit the OLD variable's expand state and render
+                    // its stale children. Mirror the Continued path —
+                    // both events invalidate the same set of caches.
                     self.dap_stack_frames.clear();
                     self.dap_variables.clear();
                     self.dap_primary_scope_name.clear();
                     self.dap_primary_scope_ref = 0;
+                    self.dap_child_variables.clear();
+                    self.dap_expanded_vars.clear();
+                    self.dap_pending_vars_ref = 0;
                     // Request stack trace so we can highlight the current line.
                     if let Some(mgr) = &mut self.dap_manager {
                         if let Some(server) = &mut mgr.server {
@@ -985,6 +994,7 @@ impl Engine {
                     self.dap_primary_scope_ref = 0;
                     self.dap_child_variables.clear();
                     self.dap_expanded_vars.clear();
+                    self.dap_pending_vars_ref = 0;
                     self.dap_active_frame = 0;
                     self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
                     redraw = true;
