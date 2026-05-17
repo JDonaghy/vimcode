@@ -2068,17 +2068,11 @@ pub(super) fn handle_mouse(
                     }
                 } else {
                     drop(split_layout);
-                    engine.terminal_has_focus = true;
+                    // #429: focus + scroll reset + selection are now owned by
+                    // the engine. TUI still does the col conversion (panel
+                    // is offset by sidebar/activity-bar width on the left).
                     let term_col = col.saturating_sub(editor_left);
-                    engine.terminal_scroll_reset();
-                    if let Some(term) = engine.active_terminal_mut() {
-                        term.selection = Some(crate::core::terminal::TermSelection {
-                            start_row: row_offset,
-                            start_col: term_col,
-                            end_row: row_offset,
-                            end_col: term_col,
-                        });
-                    }
+                    engine.handle_terminal_pane_click(term_col, row_offset);
                 }
             }
             return sidebar_width;

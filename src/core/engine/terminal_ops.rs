@@ -208,6 +208,25 @@ impl Engine {
         Some(zone)
     }
 
+    /// Handle a content click on a non-split terminal pane. Focuses the
+    /// terminal, resets scrollback, and starts a zero-length selection
+    /// at `(col, row)` (0-based cells within the pane). Backends call
+    /// this when there is no `TerminalSplitLayout` cached — in the split
+    /// case, [`Self::handle_terminal_split_click`] delegates here after
+    /// setting the active pane (#429).
+    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+        self.terminal_has_focus = true;
+        self.terminal_scroll_reset();
+        if let Some(term) = self.active_terminal_mut() {
+            term.selection = Some(crate::core::terminal::TermSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+        }
+    }
+
     /// Handle a click on the terminal content area using a
     /// `TerminalSplitHit` from the cached layout. Sets pane focus,
     /// starts selection, or signals a divider drag. Returns `true` if
@@ -219,28 +238,12 @@ impl Engine {
             TerminalSplitHit::Divider => true,
             TerminalSplitHit::LeftPane { col, row } => {
                 self.terminal_active = 0;
-                self.terminal_scroll_reset();
-                if let Some(term) = self.active_terminal_mut() {
-                    term.selection = Some(crate::core::terminal::TermSelection {
-                        start_row: row,
-                        start_col: col,
-                        end_row: row,
-                        end_col: col,
-                    });
-                }
+                self.handle_terminal_pane_click(col, row);
                 false
             }
             TerminalSplitHit::RightPane { col, row } => {
                 self.terminal_active = 1;
-                self.terminal_scroll_reset();
-                if let Some(term) = self.active_terminal_mut() {
-                    term.selection = Some(crate::core::terminal::TermSelection {
-                        start_row: row,
-                        start_col: col,
-                        end_row: row,
-                        end_col: col,
-                    });
-                }
+                self.handle_terminal_pane_click(col, row);
                 false
             }
             TerminalSplitHit::Scrollbar | TerminalSplitHit::Outside => false,
