@@ -1921,7 +1921,7 @@ pub(super) fn draw_context_menu_popup(
     editor_height: f64,
     char_width: f64,
     line_height: f64,
-    mouse_pos: (f64, f64),
+    _mouse_pos: (f64, f64),
 ) -> Option<quadraui::ContextMenuLayout> {
     let Some(cm) = &screen.context_menu else {
         return None;
@@ -1938,7 +1938,7 @@ pub(super) fn draw_context_menu_popup(
     // Convert engine-side panel → quadraui::ContextMenu (synthesises
     // `context:N` ids, lifts separator_after into separator rows). Same
     // adapter TUI uses.
-    let mut menu = render::context_menu_panel_to_quadraui_context_menu(cm);
+    let menu = render::context_menu_panel_to_quadraui_context_menu(cm);
 
     // Each non-separator row is `line_height`; separators get a
     // half-line slot to render as a thin rule.
@@ -1965,21 +1965,13 @@ pub(super) fn draw_context_menu_popup(
         item_height,
     );
 
-    // Hover from mouse position via the primitive's own hit-test, then
-    // walk visible_items to find the matching idx. This eliminates the
-    // off-by-one we'd hit using the legacy `resolve_context_menu_click`
-    // (which assumed the old +1 row top-padding).
-    if mouse_pos.0 >= 0.0 {
-        let hit = menu_layout.hit_test(mouse_pos.0 as f32, mouse_pos.1 as f32);
-        if let quadraui::ContextMenuHit::Item(id) = hit {
-            for vis in &menu_layout.visible_items {
-                if menu.items[vis.item_idx].id.as_ref() == Some(&id) {
-                    menu.selected_idx = vis.item_idx;
-                    break;
-                }
-            }
-        }
-    }
+    // #435: do NOT override menu.selected_idx from mouse_pos at draw time.
+    // The motion handler in `mod.rs` already updates
+    // `engine.context_menu.selected` from mouse position on actual motion
+    // events; the adapter copies that into `menu.selected_idx` above. Doing
+    // a redundant hover override here clobbered keyboard navigation: every
+    // queue_draw triggered by `j`/`k` would re-snap selection back to the
+    // item under the (stationary) cursor.
 
     super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
 
