@@ -1410,6 +1410,27 @@ fn event_loop(
             }
         }
 
+        // #318: when the menu bar is hidden, Alt+menu_letter must still
+        // activate the corresponding menu — otherwise the bare letter
+        // falls through to engine.handle_key (which ignores Alt) and
+        // triggers a Vim motion (e.g. Alt+T → t-motion). Show the bar
+        // first so the menu intercept below catches the same event.
+        //
+        // Query the live menu system rather than hardcoding letters so
+        // the truth stays in MENU_STRUCTURE (render.rs) → MenuDef.
+        if !engine.menu_bar_visible {
+            if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = &ui_event {
+                if modifiers.alt {
+                    if let quadraui::Key::Char(c) = key {
+                        let bar = engine.menu_system.borrow().menu_bar();
+                        if bar.find_alt_target(*c).is_some() {
+                            engine.menu_bar_visible = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // ── MenuSystem intercept — handles all menu keyboard/mouse events ──
         if engine.menu_bar_visible {
             let cols = terminal.size().ok().map(|s| s.width).unwrap_or(80);

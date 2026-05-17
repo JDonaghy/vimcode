@@ -364,7 +364,7 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 ### Project Search
 
-- `Alt+F` — focus search panel (or click the search icon in the activity bar)
+- `Ctrl+Shift+F` — focus search panel (or click the search icon in the activity bar)
 - Type a query and press `Enter` to search all text files under the project root
 - Respects `.gitignore` rules (powered by the `ignore` crate — same walker as ripgrep)
 - Hidden files/directories and binary files are skipped; results capped at 10,000
@@ -413,7 +413,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 
 #### Live Grep
 
-- `Ctrl-Shift-F` or `<leader>sg` (Normal mode) — open the live grep picker
+- `Ctrl-Shift-G` or `<leader>sg` (Normal mode) — open the live grep picker
 - `<leader>sw` — open live grep pre-filled with the word under the cursor
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
@@ -497,7 +497,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 
 ### File Explorer
 
-- `Ctrl-B` — toggle sidebar; `Alt+E` — focus explorer; `Alt+F` — focus search panel
+- `Ctrl-B` — toggle sidebar; `Ctrl+Shift+E` — focus explorer; `Ctrl+Shift+F` — focus search panel
 - Tree view with Nerd Font file-type icons
 - `j` / `k` — navigate; `l` or `Enter` — open file/expand; `h` — collapse
 - `a` — create file; `A` — create folder; `D` — delete
@@ -977,7 +977,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `<leader>ca` | Show LSP code actions for current line |
 | `<leader>sf` | Open fuzzy file finder (same as Ctrl-P) |
-| `<leader>sg` | Open live grep picker (same as Ctrl-Shift-F) |
+| `<leader>sg` | Open live grep picker (same as Ctrl-Shift-G) |
 | `<leader>sw` | Grep word under cursor |
 | `<leader>sb` | Open buffer picker (fuzzy search open buffers) |
 | `<leader>sk` | Search key bindings (fuzzy-filterable reference) |
@@ -1010,7 +1010,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `Ctrl-W f` | Split and open file under cursor (`:wincmd f`) |
 | `Ctrl-W d` | Split and go to definition (LSP) (`:wincmd d`) |
 | `Ctrl-P` | Open fuzzy file finder |
-| `Ctrl-Shift-F` | Open live grep picker |
+| `Ctrl-Shift-G` | Open live grep picker |
 | `Ctrl-G` | Show file info (name, line, col, %) |
 | `Ctrl-Shift-P` / `F1` | Command palette |
 | `F5` | Start debugging / continue |
@@ -1020,8 +1020,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `F10` | Step over |
 | `F11` | Step into |
 | `Shift+F11` | Step out |
-| `Alt+E` | Focus / unfocus file explorer |
-| `Alt+F` | Focus / unfocus search panel |
+| `Ctrl+Shift+E` | Focus / unfocus file explorer |
+| `Ctrl+Shift+F` | Focus / unfocus search panel |
 | `Ctrl+\` | Split editor right (new editor group) |
 | `Ctrl+1` / `Ctrl+2` | Focus editor group 0 / 1 |
 | `Shift+Alt+F` | Format document (LSP) |
