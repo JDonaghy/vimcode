@@ -566,9 +566,11 @@ pub(super) fn draw_editor(
                             term_panel,
                             q_area,
                             char_width as f32,
+                            line_height as f32,
                             visible_rows,
                             Some(6),
                         );
+                        engine.terminal_split_layout.replace(td.split);
                         {
                             let mut b = backend.borrow_mut();
                             b.set_current_theme(q_theme);

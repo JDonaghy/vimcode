@@ -2986,6 +2986,9 @@ pub struct Engine {
     /// Written at paint time by both backends; read by `resolve_bottom_panel_zone`
     /// so click handlers don't recompute the snapped panel top (#418).
     pub bottom_panel_geometry: std::cell::RefCell<Option<BottomPanelGeometry>>,
+    /// Cached terminal split layout from the last paint. Written at paint
+    /// time; read by click handlers via `handle_terminal_split_click` (#430).
+    pub terminal_split_layout: std::cell::RefCell<Option<quadraui::TerminalSplitLayout>>,
     /// Cached layout from the last paint of the command center (nav arrows + search box).
     /// Written at paint time; read by click handlers.
     pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
@@ -3724,6 +3727,7 @@ impl Engine {
             bottom_tab_bar_hits: std::cell::RefCell::new(None),
             terminal_toolbar_hits: std::cell::RefCell::new(None),
             bottom_panel_geometry: std::cell::RefCell::new(None),
+            terminal_split_layout: std::cell::RefCell::new(None),
             command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,

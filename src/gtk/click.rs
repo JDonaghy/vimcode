@@ -322,7 +322,9 @@ pub(super) fn handle_mouse_click(
             (None, ea)
         }
         ClickTarget::ActionMenuButton(group_id) => {
-            engine.open_editor_action_menu(group_id, 0, 0);
+            let col = (x / char_width.max(1.0)) as u16;
+            let row = (y / line_height.max(1.0)) as u16;
+            engine.open_editor_action_menu(group_id, col, row);
             (None, None)
         }
         _ => (None, None),

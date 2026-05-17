@@ -2025,73 +2025,60 @@ pub(super) fn handle_mouse(
                     *dragging_terminal_resize = true;
                 }
             } else if let BottomPanelZone::Content { row_offset } = zone {
-                // Content row — focus split pane or start divider drag.
-                let panel_col = col.saturating_sub(editor_left);
-                if engine.terminal_split && engine.terminal_panes.len() >= 2 {
-                    // Mirror render.rs: use drag-override if set, else actual PTY cols.
-                    let div_col = if engine.terminal_split_left_cols > 0 {
-                        engine.terminal_split_left_cols
-                    } else {
-                        engine.terminal_panes[0].cols
-                    };
-                    // Allow clicking within ±1 column of the divider to start a resize drag.
-                    if panel_col.abs_diff(div_col) <= 1 {
-                        engine.terminal_has_focus = true;
-                        *dragging_terminal_split = true;
-                        return sidebar_width; // skip selection start
-                    } else {
-                        engine.terminal_active = if panel_col < div_col { 0 } else { 1 };
+                // Use cached TerminalSplitLayout for divider/pane/scrollbar
+                // detection (#430). Non-split fallback uses row_offset directly.
+                let split_layout = engine.terminal_split_layout.borrow();
+                if let Some(ref sl) = *split_layout {
+                    let abs_y = geom.top_y + geom.content_y + row_offset as f64;
+                    let hit = sl.hit_test(col as f32, abs_y as f32);
+                    drop(split_layout);
+                    match hit {
+                        quadraui::TerminalSplitHit::Scrollbar => {
+                            let track_start = (geom.top_y + geom.content_y) as u16;
+                            let track_len =
+                                (geom.height - geom.content_y).max(0.0) as u16;
+                            let total = engine
+                                .active_terminal()
+                                .map(|t| t.history.len())
+                                .unwrap_or(0);
+                            let tl = track_len as f32;
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: quadraui::WidgetId::new(
+                                    "tui:terminal_scrollback",
+                                ),
+                                track_start: track_start as f32,
+                                track_length: tl,
+                                thumb_length: (tl / total.max(1) as f32).max(1.0),
+                                max_scroll: total,
+                                grab_offset: 0.0,
+                                inverted: true,
+                            });
+                            apply_scrollbar_drag(
+                                drag_state,
+                                quadraui::Point {
+                                    x: col as f32,
+                                    y: row as f32,
+                                },
+                                engine,
+                                sidebar,
+                            );
+                        }
+                        _ => {
+                            if engine.handle_terminal_split_click(hit) {
+                                *dragging_terminal_split = true;
+                            }
+                        }
                     }
-                }
-                // Check for scrollbar click first.
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let sb_col = term_width.saturating_sub(1);
-                engine.terminal_has_focus = true;
-                if col == sb_col {
-                    // Scrollbar column — start drag through shared state.
-                    let track_start = (geom.top_y + geom.content_y) as u16;
-                    let track_len = (geom.height - geom.content_y).max(0.0) as u16;
-                    // Cap total to one screenful (vt100 API limit) so the drag range
-                    // [0, total] exactly matches what set_scroll_offset can deliver.
-                    let total = engine
-                        .active_terminal()
-                        .map(|t| t.history.len())
-                        .unwrap_or(0);
-                    // visible_rows: 0 — terminal's `set_scroll_offset` clamps
-                    // to `history.len()` (not `history.len() - viewport`),
-                    // and the renderer's thumb math uses `max_off = history.len()`.
-                    // Setting visible_rows = 0 makes dispatch_mouse_drag's
-                    // max_scroll = total, so inverting (`max - new_offset`)
-                    // reaches the very top of scrollback.
-                    let tl = track_len as f32;
-                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                        widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
-                        track_start: track_start as f32,
-                        track_length: tl,
-                        thumb_length: (tl / total.max(1) as f32).max(1.0),
-                        max_scroll: total,
-                        grab_offset: 0.0,
-                        inverted: true,
-                    });
-                    apply_scrollbar_drag(
-                        drag_state,
-                        quadraui::Point {
-                            x: col as f32,
-                            y: row as f32,
-                        },
-                        engine,
-                        sidebar,
-                    );
                 } else {
-                    // Content area — start a selection.
-                    let term_row = row_offset;
+                    drop(split_layout);
+                    engine.terminal_has_focus = true;
                     let term_col = col.saturating_sub(editor_left);
                     engine.terminal_scroll_reset();
                     if let Some(term) = engine.active_terminal_mut() {
                         term.selection = Some(crate::core::terminal::TermSelection {
-                            start_row: term_row,
+                            start_row: row_offset,
                             start_col: term_col,
-                            end_row: term_row,
+                            end_row: row_offset,
                             end_col: term_col,
                         });
                     }

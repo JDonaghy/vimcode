@@ -208,6 +208,48 @@ impl Engine {
         Some(zone)
     }
 
+    /// Handle a click on the terminal content area using a
+    /// `TerminalSplitHit` from the cached layout. Sets pane focus,
+    /// starts selection, or signals a divider drag. Returns `true` if
+    /// the caller should start a split-divider drag.
+    pub fn handle_terminal_split_click(
+        &mut self,
+        hit: quadraui::TerminalSplitHit,
+    ) -> bool {
+        use quadraui::TerminalSplitHit;
+        self.terminal_has_focus = true;
+        match hit {
+            TerminalSplitHit::Divider => true,
+            TerminalSplitHit::LeftPane { col, row } => {
+                self.terminal_active = 0;
+                self.terminal_scroll_reset();
+                if let Some(term) = self.active_terminal_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: row,
+                        start_col: col,
+                        end_row: row,
+                        end_col: col,
+                    });
+                }
+                false
+            }
+            TerminalSplitHit::RightPane { col, row } => {
+                self.terminal_active = 1;
+                self.terminal_scroll_reset();
+                if let Some(term) = self.active_terminal_mut() {
+                    term.selection = Some(crate::core::terminal::TermSelection {
+                        start_row: row,
+                        start_col: col,
+                        end_row: row,
+                        end_col: col,
+                    });
+                }
+                false
+            }
+            TerminalSplitHit::Scrollbar | TerminalSplitHit::Outside => false,
+        }
+    }
+
     /// Dispatch a click on the bottom panel tab bar using the cached
     /// `TabBarHits` from the last paint. Returns `true` if the click
     /// was consumed (tab switch or panel close).

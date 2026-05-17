@@ -1,7 +1,51 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 379 archived here.
+All sessions through 381 archived here.
+
+---
+**Session 381 (May 16) — Action menu engine-drawn migration landed (#395 / PR #427):**
+
+Took over PR #427 from another agent that had run on a server and couldn't smoke-test locally. PR migrates the editor tab bar `…` action menu from native `gtk4::PopoverMenu` to the engine-drawn quadraui `ContextMenu` path; also removes ~497 lines of dead `show_action_menu_popover` + `handle_tab_right_click` + `handle_editor_right_click` code (the latter two were already replaced by `Msg::TabRightClick` / `Msg::EditorRightClick` in earlier PRs but left behind under `#[allow(dead_code)]`).
+
+**Environment setup (cold-start machine):** No rust toolchain, no GTK4 dev libraries, no clipboard tooling. Installed `rustup` (1.95.0 stable), `libgtk-4-dev` + `libglib2.0-dev` + `libcairo2-dev` + `libpango1.0-dev` + `libgraphene-1.0-dev` + `build-essential`, and (later, for smoke testing) `xclip` — without xclip, copypasta_ext falls back to its `x11_fork` path which contends with GTK's X11 event loop and writes intermittently fail (`copy_path` worked by coincidence, `copy_relative_path` did not).
+
+**Drive-by build fix — PR #432 (merged):** Develop wouldn't compile because `8a53307` (in PR #424 / issue-418) had accidentally removed the `..Default::default()` lines that `a516f76` added to `src/render.rs::context_menu_panel_to_quadraui_context_menu` + `build_menu_defs` after quadraui `daed293` added three new optional fields to `ContextMenuItem` (`checked`, `key_equivalent`, `submenu`). Re-applied the 4-line fix on its own branch `fix-context-menu-item-defaults` per CLAUDE.md workflow (small standalone PR > squashing into #427).
+
+**Rebase + land:** PR #427 rebased cleanly onto fresh develop. One conflict in `SUMMARIES/gtk_mod.md` (line-count header) — resolved by updating to the post-rebase actual: 10,256 lines (develop's issue-418 work added ~84 lines, the PR removes ~507). Force-pushed with `--force-with-lease`. Smoke tested all menu surfaces, then merged.
+
+**Regressions discovered + filed (don't block #427's merge, all are follow-ups):**
+
+- **quadraui#205** — GTK `draw_context_menu` rasteriser draws selection background over both top and bottom border edges. Selection fill at `(row_x + 1.0, row_y, row_w - 2.0, row_h)` has horizontal insets but no vertical inset — first-row-selected obscures top border, last-row-selected obscures bottom. Suggested fix: stroke border in a Pass 3 after rows.
+- **vimcode#434** — Action menu opens AT the `…` button row (overlapping the tab bar), not below it. `click.rs:324-329` derives `(col, row)` from the click pixel position; quadraui defaults to `AnchorPoint` placement which puts the menu's top-left at the anchor. Proper fix: use `ContextMenuPlacement::Below` with the button's bounds via `layout_at`; quick hack is `row + 1` in click.rs.
+- **vimcode#435** — Context menu keyboard nav (j/k/Down/Up/Enter/Esc) dead until the user clicks inside the menu. Handler at `src/gtk/mod.rs:5138+` is correct but lives on the editor DA's key controller, which doesn't have keyboard focus until clicked. Same class as #273 (dialog focus). Suggested fix: call `grab_focus()` on the editor DA when `engine.context_menu` becomes `Some`. TUI is unaffected (single central key loop).
+
+**Outcome:** #427 merged (`e87d853`). #395 stays open until #426 (explorer right-click migration — split out of #395 because explorer's separate DA has its own coord system, needs cross-DA coord handling) lands. Lib tests 1963 passing throughout.
+
+---
+**Session 380 (May 16) — Hit-test dedup sweep + GTK audit + quadraui runtime epics:**
+
+Massive dedup session — 7 PRs landed, 8 issues closed, 12 new issues filed (6 quadraui, 6 vimcode).
+
+**PR #414** — SidebarPanel enum removal (#408/#409). Rebased onto develop, resolved 3 merge conflicts preserving both string-based panel ID refactor and develop's borrow-safety/ext-panel/focus-guard fixes.
+
+**PR #419** — Clipboard dedup (#417). Found and fixed RefCell double-borrow crash in `TerminalCopySelection` handler (Rust 2021 temporary lifetime: `if let Some(text) = borrow_mut()...` keeps RefMut alive for entire block).
+
+**PR #423** — Completion popup click-to-pick (#288). Both backends cache `CompletionsLayout` from render, use `hit_test()` for click dispatch. New `Engine::handle_completion_click(CompletionsHit) -> bool`. GTK ModalStack push/pop/dispatch removed from completion click path. Net -22 lines.
+
+**PR #425** — Context menu hit_test migration (#210). Both backends cache `ContextMenuLayout` from render, replace hand-rolled row math with `hit_test()`. New `context_menu_hit_to_idx()` helper. GTK click handler reads cache instead of rebuilding layout (~35 lines removed). `resolve_context_menu_click()` gated to `#[cfg(test)]`. Net -49 lines.
+
+**PR #424** — Terminal panel cached geometry (#418). Took over from another agent. `BottomPanelGeometry` with explicit `toolbar_y`/`content_y`/`content_row_h` offsets. Fixed GTK terminal button hit zones, TerminalCopySelection crash, ContextMenuItem compile errors. `resolve_bottom_panel_zone()` shared by both backends.
+
+**PR #431** — TUI terminal split width fix (#428). New `terminal_panel_cols()` helper computes actual editor column width (excluding sidebar + activity bar), matching GTK's `terminal_cols()`. Fixed divider hit-test using panel-relative columns. Applied to all 5 `terminal_cols` call sites.
+
+**PR #433** — TerminalSplitLayout::hit_test() (#430). First consumption of a quadraui feature (quadraui#196) shipped by another agent. Both backends cache `TerminalSplitLayout`, use `hit_test()` for divider detection, pane focus, and selection. New `Engine::handle_terminal_split_click(TerminalSplitHit)`. Fixed sb_width unit mismatch (was multiplied by cell_width, creating 51px gap in GTK).
+
+**GTK backend audit:** Reviewed all 10 files in `src/gtk/`. 4 files are vestigial re-exports (delete-ready). `click.rs` eliminated by quadraui#197/#198. `draw.rs` eliminated by quadraui#199/#200/#201. `mod.rs` (10,759 lines) eliminated by quadraui#202 (AppShell epic). Filed 6 quadraui issues: #197 (EditorLayout::hit_test), #198 (TabBarLayout::hit_test), #199 (draw_frame), #200 (SidebarSystem GTK rasteriser), #201 (CommandLine primitive), #202 (GTK runtime epic with 6 stages).
+
+**Strategic shift:** Filed parallel runtime epics for all three backends — quadraui#202 (GTK), #203 (TUI), #204 (macOS). The end-state: `quadraui::{gtk,tui,macos}::run(engine)` owns the widget tree, event loop, draw pipeline, and click dispatch. Consumer apps write ~20 lines per backend. Updated quadraui CLAUDE.md with vimcode reference consumer table mapping each epic stage to the working prototype code.
+
+**Filed:** vimcode #420 (completion viewport overflow), #421 (completion detail pane), #422 (Ctrl+Space trigger), #428 (TUI split — closed), #429 (terminal click dedup), #430 (split hit_test — closed). quadraui #196-#204.
 
 ---
 **Session 379 (May 16) — PR maintenance + clipboard dedup landing (#414, #419):**

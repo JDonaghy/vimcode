@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 16, 2026 (Session 379 — **PR maintenance + clipboard dedup landing.** Rebased PR #414 (SidebarPanel enum removal) onto develop, resolved 3 merge conflicts in `src/gtk/mod.rs` preserving both the string-based panel ID refactor and develop's borrow-safety/ext-panel/focus-guard fixes. Merged. Rebased PR #419 (clipboard dedup), found and fixed RefCell double-borrow crash in `TerminalCopySelection` handler (Rust 2021 temporary lifetime). Merged. Closed #408, #409, #417.)
+**Last updated:** May 16, 2026 (Session 381 — **Action menu engine-drawn migration (#395 / PR #427) landed.** Took over PR from a server-running agent; set up dev environment from scratch (rustup, GTK4 dev libs, xclip). Fixed develop build break with PR #432 — re-added `..Default::default()` on `ContextMenuItem` literals after `8a53307` accidentally dropped them. Rebased #427, smoke tested. Discovered 3 regressions vs native popover, all filed as follow-ups: quadraui#205 (selection bg obscures top/bottom border), vimcode#434 (menu opens AT button row not below — needs `Below` placement), vimcode#435 (keyboard nav dead until click — focus not claimed; same class as #273). #395 stays open until explorer follow-up #426 lands.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -8,13 +8,13 @@
 
 **All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
-**All vimcode-side milestone work is complete.** Remaining open issues in the milestone are quadraui-side infrastructure (#294, #168, #167, #149, #145, #144, #140, #139, #169) — primitives, research, and validation apps that live in the quadraui repo.
+**Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233). Remaining quadraui-side infrastructure (#294, #168, #167, #149, #145, #144, #140, #139, #169). **Strategic direction:** focus on quadraui runtime epics (#202/#203/#204) — build the framework infrastructure first, then vimcode's per-backend code shrinks to ~60 lines as each stage lands.
 
 ---
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 378 and earlier in **SESSION_HISTORY.md**.
+> Sessions 380 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -109,7 +109,11 @@ cell coalescence) remain but are tracked separately.
 - `Engine::needs_clipboard_for_paste()` + `prepare_paste_clipboard()` — paste-key detection and clipboard register loading (#381). Both backends call the same two engine methods before `handle_key()`. Zero per-backend paste detection logic.
 - `Engine::clipboard_read` + `clipboard_write` callbacks — clipboard access routed through engine-owned closures (#417). GTK `setup_gtk_clipboard()` wires `gdk4::Display` clipboard once at startup; TUI wires `copypasta` provider. Six GTK call sites (yank sync, paste prep, hover-popup copy, terminal copy/paste, AI panel Ctrl-V) consolidated. Zero per-backend clipboard logic beyond the one-time provider setup.
 - `Engine::handle_explorer_mouse_event()` — single-click row dispatch (toggle dir / preview file) for explorer TreeController events (#415). Both backends route mouse events through `TreeController.handle()` → `handle_explorer_mouse_event()`.
-- `render::compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot layout computation for all chrome heights (#386). GTK passes pixel units, TUI passes `line_height=1.0` for row units. Replaces `gtk_editor_bottom`, `gtk_terminal_target_maximize_rows`, TUI `terminal_target_maximize_rows_tui`, and the unused `editor_bottom_px`. Terminal click handlers still use bespoke maximize-snap math (#418).
+- `render::compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot layout computation for all chrome heights (#386). GTK passes pixel units, TUI passes `line_height=1.0` for row units. Replaces `gtk_editor_bottom`, `gtk_terminal_target_maximize_rows`, TUI `terminal_target_maximize_rows_tui`, and the unused `editor_bottom_px`.
+- `Engine::handle_completion_click(CompletionsHit) -> bool` — click-to-pick on completion popup (#288). Both backends cache `CompletionsLayout` from render, call `hit_test()` at click time. `Item(idx)` → apply + dismiss, `Inert` → dismiss, `Empty` → dismiss + fall through.
+- `Engine::context_menu_hit_to_idx()` + cached `ContextMenuLayout` — context menu click/hover via `hit_test()` (#210). Both backends cache layout from render. GTK motion handler + click handler + TUI click + motion handlers all replaced with shared `hit_test()`. `resolve_context_menu_click()` gated to `#[cfg(test)]`.
+- `Engine::resolve_bottom_panel_zone()` + `BottomPanelGeometry` — cached vertical geometry for bottom panel zone detection (#418). Explicit `toolbar_y`/`content_y`/`content_row_h` offsets (not uniform `row_h`) so GTK's taller tab bar gets correct zones. Both backends cache at paint time.
+- `Engine::handle_terminal_split_click(TerminalSplitHit) -> bool` + cached `TerminalSplitLayout` — terminal split divider detection, pane focus, and selection via quadraui `hit_test()` (#430, quadraui#196). Both backends cache split layout from `build_terminal_draw_data()`. Zero per-backend divider math.
 - `quadraui::AppShell` + `engine::sidebar` — sidebar visibility and active panel owned by the engine (#385). TUI reads all state from `engine.app_shell`; panel switching, focus flags, and session persistence handled by engine methods (`toggle_sidebar_panel`, `focus_sidebar_panel`, `handle_nav_overflow`). GTK `sync_sidebar_from_engine()` reads engine state; `sync_sidebar_widgets()` updates GTK widget visibility via `active_panel_id: String` + lookup-table arrays (#408/#409 removed `SidebarPanel` enum). ExtPanel panels bypass AppShell — `sync_sidebar_from_engine()` checks `ext_panel_active` (#413).
 
 **North-star ("developer doesn't need to know the backend") status after B.5:**
@@ -125,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 378 and earlier in **SESSION_HISTORY.md**.
+> Sessions 380 and earlier in **SESSION_HISTORY.md**.
