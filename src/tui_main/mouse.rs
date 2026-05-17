@@ -2544,8 +2544,12 @@ pub(super) fn handle_mouse(
                             engine.handle_tab_bar_click(group_id, target);
                         }
                     }
+                    return sidebar_width;
                 }
-                return sidebar_width;
+                // #452: matched a group's tab-bar row but no actual tab/button.
+                // For horizontal splits, the second group's tab bar IS the visual
+                // divider — fall through to the group-divider hit-test below so
+                // clicks on empty tab-bar space can start a resize drag.
             }
         }
         // Single group: check top tab bar row only.
