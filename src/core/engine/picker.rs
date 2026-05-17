@@ -1896,10 +1896,17 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::OpenWorkspace(path) => {
-                // #274: recent-workspaces picker confirm. Switch workspace
-                // and signal the explorer to rebuild — backends sync from
-                // explorer_needs_refresh on the next render.
+                // #274: recent-workspaces picker confirm. Switch workspace,
+                // focus the explorer (so the active file's row renders with
+                // the focused selection bg — surfaces visibly in GTK whose
+                // inactive_selected_bg is too close to surface_bg to read),
+                // re-reveal the active file (open_file_in_tab already did
+                // it once but explorer_needs_refresh triggers a backend
+                // rebuild that can desync the row idx), then signal the
+                // backends to refresh.
                 self.open_folder(&path);
+                self.explorer_has_focus = true;
+                self.explorer_reveal_active_file();
                 self.explorer_needs_refresh = true;
                 EngineAction::None
             }
