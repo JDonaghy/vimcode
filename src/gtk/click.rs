@@ -324,7 +324,12 @@ pub(super) fn handle_mouse_click(
         ClickTarget::ActionMenuButton(group_id) => {
             let col = (x / char_width.max(1.0)) as u16;
             let row = (y / line_height.max(1.0)) as u16;
-            engine.open_editor_action_menu(group_id, col, row);
+            // #434: pass the trigger's exact height in line_height units so
+            // the menu sits flush against the button's bottom (no sub-cell
+            // gap). GTK's tab row is ceil(1.6 * line_height).
+            let trigger_h =
+                (render_mod::tab_row_height_px(line_height) / line_height.max(1.0)) as f32;
+            engine.open_editor_action_menu(group_id, col, row, trigger_h);
             (None, None)
         }
         _ => (None, None),

@@ -3559,6 +3559,11 @@ pub struct ContextMenuPanel {
     pub selected_idx: usize,
     pub screen_col: u16,
     pub screen_row: u16,
+    /// Trigger element height in line_height units (f32; supports
+    /// sub-cell rows like GTK's 1.6× tab row). 0.0 = no trigger →
+    /// render at click coords (AnchorPoint). Non-zero opts into
+    /// `ContextMenuPlacement::Below` (#434).
+    pub trigger_height: f32,
 }
 
 /// A single rendered context menu item.
@@ -3607,12 +3612,17 @@ pub fn context_menu_panel_to_quadraui_context_menu(
         .get(panel.selected_idx)
         .copied()
         .unwrap_or(0);
+    let placement = if panel.trigger_height > 0.0 {
+        quadraui::ContextMenuPlacement::Below
+    } else {
+        quadraui::ContextMenuPlacement::AnchorPoint
+    };
     quadraui::ContextMenu {
         id: quadraui::WidgetId::new("context_menu"),
         items,
         selected_idx,
         bg: None,
-        placement: quadraui::ContextMenuPlacement::default(),
+        placement,
     }
 }
 
@@ -6215,6 +6225,7 @@ pub fn build_screen_layout(
             selected_idx: cm.selected,
             screen_col: cm.screen_x,
             screen_row: cm.screen_y,
+            trigger_height: cm.trigger_height,
         }),
         find_replace: if engine.find_replace_open {
             let match_info = if engine.search_matches.is_empty() {

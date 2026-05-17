@@ -968,9 +968,13 @@ pub(super) fn draw_frame(
             .unwrap_or(0);
         let outer_width = (max_label + max_shortcut + 6).clamp(20, 50) as f32;
         let inner_width = (outer_width - 2.0).max(1.0);
-        let layout = menu.layout(
-            ctx_menu.screen_col as f32 + 1.0,
-            ctx_menu.screen_row as f32 + 1.0,
+        let layout = menu.layout_at(
+            quadraui::Rect::new(
+                ctx_menu.screen_col as f32 + 1.0,
+                ctx_menu.screen_row as f32 + 1.0,
+                0.0,
+                ctx_menu.trigger_height,
+            ),
             inner_viewport,
             inner_width,
             |_| quadraui::ContextMenuItemMeasure::new(1.0),

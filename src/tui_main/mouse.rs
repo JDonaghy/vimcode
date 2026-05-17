@@ -2524,7 +2524,10 @@ pub(super) fn handle_mouse(
                         }
                         TabBarClickTarget::ActionMenu => {
                             engine.active_group = group_id;
-                            engine.open_editor_action_menu(group_id, col, row + 1);
+                            // #434: pass tab-row height (1.0 row in TUI) so the
+                            // engine drives Below placement; replaces the prior
+                            // `row + 1` hack.
+                            engine.open_editor_action_menu(group_id, col, row, 1.0);
                         }
                         _ => {
                             engine.handle_tab_bar_click(group_id, target);
@@ -2610,7 +2613,8 @@ pub(super) fn handle_mouse(
                             engine.open_editor_group(SplitDirection::Horizontal);
                         }
                         "tab:action_menu" => {
-                            engine.open_editor_action_menu(engine.active_group, col, row + 1);
+                            // #434: pass tab-row height (1.0 row in TUI).
+                            engine.open_editor_action_menu(engine.active_group, col, row, 1.0);
                         }
                         _ => {}
                     }
