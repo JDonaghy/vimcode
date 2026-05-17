@@ -12853,7 +12853,7 @@ mod tests {
 
     #[test]
     fn test_compute_editor_layout_basic() {
-        let engine = crate::core::engine::tests::engine_with("hello\nworld\n");
+        let engine = crate::core::engine::tests::engine_with_text("hello\nworld\n");
         let layout = compute_editor_layout(&engine, 800.0, 20.0, false);
         // per_window_status_line defaults to true → status bar = 1 cmd line (20px)
         assert_eq!(layout.status_bar_h, 20.0);
@@ -12863,7 +12863,7 @@ mod tests {
 
     #[test]
     fn test_compute_editor_layout_tui_units() {
-        let engine = crate::core::engine::tests::engine_with("hello\n");
+        let engine = crate::core::engine::tests::engine_with_text("hello\n");
         let layout = compute_editor_layout(&engine, 24.0, 1.0, true);
         // TUI: line_height=1.0, total=24 rows, menu not visible
         assert!(layout.editor_bottom > 20.0);

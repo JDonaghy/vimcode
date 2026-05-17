@@ -13881,7 +13881,9 @@ fn test_sc_stage_selected_on_changes_header_is_not_noop() {
 
 // ── Multi-cursor tests ────────────────────────────────────────────────────
 
-fn engine_with_text(text: &str) -> Engine {
+// #438: pub(crate) so render.rs's test module (and other engine sibling
+// modules) can build a populated Engine without duplicating the setup.
+pub(crate) fn engine_with_text(text: &str) -> Engine {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, text);
     engine

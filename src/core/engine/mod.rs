@@ -4786,5 +4786,7 @@ mod visual;
 mod vscode;
 mod windows;
 
+// #438: pub(crate) so render.rs's own test module can use shared
+// engine-test helpers like `engine_with_text`.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
