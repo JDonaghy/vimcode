@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 16, 2026 (Session 380 — **Hit-test dedup sweep + GTK audit + quadraui runtime epics.** 7 PRs landed (#414, #419, #423, #424, #425, #431, #433). Unified click dispatch for completions (#288), context menus (#210), terminal panel zones (#418), terminal split (#428, #430). GTK backend file audit → filed quadraui runtime epics (#202 GTK, #203 TUI, #204 macOS). Added vimcode reference consumer section to quadraui CLAUDE.md. Strategic shift: focus on quadraui infrastructure first, vimcode consumption second.)
+**Last updated:** May 16, 2026 (Session 381 — **Action menu engine-drawn migration (#395 / PR #427) landed.** Took over PR from a server-running agent; set up dev environment from scratch (rustup, GTK4 dev libs, xclip). Fixed develop build break with PR #432 — re-added `..Default::default()` on `ContextMenuItem` literals after `8a53307` accidentally dropped them. Rebased #427, smoke tested. Discovered 3 regressions vs native popover, all filed as follow-ups: quadraui#205 (selection bg obscures top/bottom border), vimcode#434 (menu opens AT button row not below — needs `Below` placement), vimcode#435 (keyboard nav dead until click — focus not claimed; same class as #273). #395 stays open until explorer follow-up #426 lands.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
 
-> Sessions 379 and earlier in **SESSION_HISTORY.md**.
+> Sessions 380 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -129,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 379 and earlier in **SESSION_HISTORY.md**.
+> Sessions 380 and earlier in **SESSION_HISTORY.md**.

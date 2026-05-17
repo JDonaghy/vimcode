@@ -1,7 +1,26 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 380 archived here.
+All sessions through 381 archived here.
+
+---
+**Session 381 (May 16) — Action menu engine-drawn migration landed (#395 / PR #427):**
+
+Took over PR #427 from another agent that had run on a server and couldn't smoke-test locally. PR migrates the editor tab bar `…` action menu from native `gtk4::PopoverMenu` to the engine-drawn quadraui `ContextMenu` path; also removes ~497 lines of dead `show_action_menu_popover` + `handle_tab_right_click` + `handle_editor_right_click` code (the latter two were already replaced by `Msg::TabRightClick` / `Msg::EditorRightClick` in earlier PRs but left behind under `#[allow(dead_code)]`).
+
+**Environment setup (cold-start machine):** No rust toolchain, no GTK4 dev libraries, no clipboard tooling. Installed `rustup` (1.95.0 stable), `libgtk-4-dev` + `libglib2.0-dev` + `libcairo2-dev` + `libpango1.0-dev` + `libgraphene-1.0-dev` + `build-essential`, and (later, for smoke testing) `xclip` — without xclip, copypasta_ext falls back to its `x11_fork` path which contends with GTK's X11 event loop and writes intermittently fail (`copy_path` worked by coincidence, `copy_relative_path` did not).
+
+**Drive-by build fix — PR #432 (merged):** Develop wouldn't compile because `8a53307` (in PR #424 / issue-418) had accidentally removed the `..Default::default()` lines that `a516f76` added to `src/render.rs::context_menu_panel_to_quadraui_context_menu` + `build_menu_defs` after quadraui `daed293` added three new optional fields to `ContextMenuItem` (`checked`, `key_equivalent`, `submenu`). Re-applied the 4-line fix on its own branch `fix-context-menu-item-defaults` per CLAUDE.md workflow (small standalone PR > squashing into #427).
+
+**Rebase + land:** PR #427 rebased cleanly onto fresh develop. One conflict in `SUMMARIES/gtk_mod.md` (line-count header) — resolved by updating to the post-rebase actual: 10,256 lines (develop's issue-418 work added ~84 lines, the PR removes ~507). Force-pushed with `--force-with-lease`. Smoke tested all menu surfaces, then merged.
+
+**Regressions discovered + filed (don't block #427's merge, all are follow-ups):**
+
+- **quadraui#205** — GTK `draw_context_menu` rasteriser draws selection background over both top and bottom border edges. Selection fill at `(row_x + 1.0, row_y, row_w - 2.0, row_h)` has horizontal insets but no vertical inset — first-row-selected obscures top border, last-row-selected obscures bottom. Suggested fix: stroke border in a Pass 3 after rows.
+- **vimcode#434** — Action menu opens AT the `…` button row (overlapping the tab bar), not below it. `click.rs:324-329` derives `(col, row)` from the click pixel position; quadraui defaults to `AnchorPoint` placement which puts the menu's top-left at the anchor. Proper fix: use `ContextMenuPlacement::Below` with the button's bounds via `layout_at`; quick hack is `row + 1` in click.rs.
+- **vimcode#435** — Context menu keyboard nav (j/k/Down/Up/Enter/Esc) dead until the user clicks inside the menu. Handler at `src/gtk/mod.rs:5138+` is correct but lives on the editor DA's key controller, which doesn't have keyboard focus until clicked. Same class as #273 (dialog focus). Suggested fix: call `grab_focus()` on the editor DA when `engine.context_menu` becomes `Some`. TUI is unaffected (single central key loop).
+
+**Outcome:** #427 merged (`e87d853`). #395 stays open until #426 (explorer right-click migration — split out of #395 because explorer's separate DA has its own coord system, needs cross-DA coord handling) lands. Lib tests 1963 passing throughout.
 
 ---
 **Session 380 (May 16) — Hit-test dedup sweep + GTK audit + quadraui runtime epics:**
