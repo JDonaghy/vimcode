@@ -4632,12 +4632,12 @@ impl Engine {
             {
                 let key_char = key_name.chars().next().unwrap_or('\0');
                 if ctrl == t_ctrl && (key_char == t_ch || (key_name == "space" && t_ch == ' ')) {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(true);
                     return;
                 }
             } else if ctrl && key_name == "space" {
                 // Fallback for default <C-Space> trigger
-                self.trigger_auto_completion();
+                self.trigger_completion(true);
                 return;
             }
         }
@@ -5222,7 +5222,7 @@ impl Engine {
                     }
                 }
                 if *changed {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(false);
                 }
             }
             "Delete" => {
@@ -5403,7 +5403,7 @@ impl Engine {
                     }
                 }
                 if *changed {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(false);
                 }
             }
         }
@@ -5470,7 +5470,7 @@ impl Engine {
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
         self.update_bracket_match();
-        self.trigger_auto_completion();
+        self.trigger_completion(false);
     }
 
     /// Insert `text` at the current command-line cursor position and advance the cursor.

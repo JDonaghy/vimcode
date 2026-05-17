@@ -3231,27 +3231,42 @@ impl Engine {
         self.lsp_pending_completion = None;
     }
 
-    /// Trigger auto-popup completion based on current cursor prefix.
-    /// Called after each text change in Insert mode.
-    pub(crate) fn trigger_auto_completion(&mut self) {
+    /// Trigger completion popup based on current cursor prefix.
+    /// Called after each text change in Insert mode (`manual = false`) or
+    /// from an explicit user gesture like Ctrl+Space (`manual = true`).
+    ///
+    /// Empty-prefix behavior differs: auto triggers dismiss the popup (typing
+    /// shouldn't drown the user in every word in scope), while manual triggers
+    /// fall through to the LSP so the user sees all in-scope symbols (VSCode
+    /// parity).
+    pub(crate) fn trigger_completion(&mut self, manual: bool) {
         let (prefix, _) = self.completion_prefix_at_cursor();
-        if prefix.is_empty() {
+        if prefix.is_empty() && !manual {
             self.dismiss_completion();
             return;
         }
-        // Use a fast nearby-lines scan instead of scanning the entire buffer.
-        // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
-        let candidates = self.word_completions_nearby(&prefix);
-        if !candidates.is_empty() {
-            self.completion_start_col = self.view().cursor.col - prefix.chars().count();
-            self.completion_candidates = candidates;
-            self.completion_idx = Some(0);
-            self.completion_display_only = true;
-        } else {
-            // No buffer-word hits yet; clear popup but keep LSP pending
+        if prefix.is_empty() {
+            // Manual trigger with no prefix: skip the buffer-word scan (it would
+            // match every word in the nearby radius) and rely on the LSP response.
+            self.completion_start_col = self.view().cursor.col;
             self.completion_candidates.clear();
             self.completion_idx = None;
             self.completion_display_only = false;
+        } else {
+            // Use a fast nearby-lines scan instead of scanning the entire buffer.
+            // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
+            let candidates = self.word_completions_nearby(&prefix);
+            if !candidates.is_empty() {
+                self.completion_start_col = self.view().cursor.col - prefix.chars().count();
+                self.completion_candidates = candidates;
+                self.completion_idx = Some(0);
+                self.completion_display_only = true;
+            } else {
+                // No buffer-word hits yet; clear popup but keep LSP pending
+                self.completion_candidates.clear();
+                self.completion_idx = None;
+                self.completion_display_only = false;
+            }
         }
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();

@@ -1356,7 +1356,7 @@ impl Engine {
                             changed = true;
                         }
                         if changed {
-                            self.trigger_auto_completion();
+                            self.trigger_completion(false);
                         }
                     }
                 }
@@ -1570,7 +1570,7 @@ impl Engine {
                                 changed = true;
                             }
                         }
-                        self.trigger_auto_completion();
+                        self.trigger_completion(false);
                     }
                 }
             }
