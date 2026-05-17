@@ -911,6 +911,22 @@ pub struct Notification {
     pub done_at: Option<std::time::Instant>,
 }
 
+/// How long toasts stay visible before `prune_toasts` drops them.
+pub const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A transient toast popup, rendered in the bottom-right corner by the
+/// backend via `quadraui::*::draw_toast_stack`. Currently used to surface
+/// LSP `$/progress` lifecycle events (#450); general-purpose for any
+/// future transient notification (build done, save error, etc.).
+#[derive(Debug, Clone)]
+pub struct EngineToast {
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+    pub severity: quadraui::ToastSeverity,
+    pub created_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PickerSource {
@@ -3328,6 +3344,15 @@ pub struct Engine {
     /// Counter for generating unique notification IDs.
     next_notification_id: u64,
 
+    // --- Toasts (transient corner notifications) ---
+    /// Active toast popups rendered in the bottom-right corner. Each one
+    /// auto-dismisses after `TOAST_LIFETIME` via `prune_toasts()` (driven
+    /// from `poll_idle`). Initially populated by `push_toast(...)` from
+    /// LSP `$/progress` events for visibility into workspace-indexing
+    /// status (#450); general-purpose for any future transient UX.
+    pub toasts: Vec<EngineToast>,
+    next_toast_id: u64,
+
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
     pub editor_hover: Option<EditorHoverPopup>,
@@ -3853,6 +3878,8 @@ impl Engine {
             ext_panel_help_bindings: HashMap::new(),
             notifications: Vec::new(),
             next_notification_id: 1,
+            toasts: Vec::new(),
+            next_toast_id: 1,
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -4007,6 +4034,9 @@ impl Engine {
         self.tick_swap_files();
         self.tick_file_watcher();
         redraw |= self.tick_git_branch();
+        if self.prune_toasts() {
+            redraw = true;
+        }
         if !self.notifications.is_empty() {
             redraw = true;
         }
@@ -4137,6 +4167,37 @@ impl Engine {
     /// Returns true if there are any completed notifications waiting to be dismissed.
     pub fn has_done_notifications(&self) -> bool {
         self.notifications.iter().any(|n| n.done)
+    }
+
+    // ── Toasts ──────────────────────────────────────────────────────────────
+
+    /// Push a transient toast popup. Auto-dismissed after `TOAST_LIFETIME`
+    /// by `prune_toasts()` (run from `poll_idle`). Returns the toast id.
+    pub fn push_toast(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+    ) -> u64 {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(EngineToast {
+            id,
+            title: title.to_string(),
+            body: body.to_string(),
+            severity,
+            created_at: std::time::Instant::now(),
+        });
+        id
+    }
+
+    /// Drop toasts older than `TOAST_LIFETIME`. Returns true if any were
+    /// removed (so the caller can request a redraw).
+    pub fn prune_toasts(&mut self) -> bool {
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
+        self.toasts.len() != before
     }
 
     // ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────

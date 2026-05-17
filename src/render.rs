@@ -10398,6 +10398,32 @@ pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::Stat
     }
 }
 
+/// Build a `quadraui::ToastStack` from `engine.toasts` for the
+/// bottom-right corner. Backends call `quadraui::*::draw_toast_stack`
+/// with the result. Returns None when there are no toasts so callers
+/// can skip the draw entirely.
+pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
+    if engine.toasts.is_empty() {
+        return None;
+    }
+    Some(quadraui::ToastStack {
+        id: quadraui::WidgetId::new("toasts"),
+        corner: quadraui::ToastCorner::BottomRight,
+        toasts: engine
+            .toasts
+            .iter()
+            .map(|t| quadraui::ToastItem {
+                id: quadraui::WidgetId::new(format!("toast-{}", t.id)),
+                title: t.title.clone(),
+                body: t.body.clone(),
+                severity: t.severity,
+                action: None,
+                accent: None,
+            })
+            .collect(),
+    })
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(

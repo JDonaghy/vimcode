@@ -1384,11 +1384,22 @@ impl Engine {
                     }
                 }
                 LspEvent::WorkProgressBegin {
-                    server_id, token, ..
+                    server_id,
+                    token,
+                    title,
                 } => {
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_begin(server_id, token);
+                        mgr.work_progress_begin(server_id, token.clone());
                     }
+                    // #450 diagnostic: surface progress lifecycle as
+                    // toasts so the user can see which phases the server
+                    // is in and why the indicator transitions when it
+                    // does. Useful for tuning the indexing gate.
+                    self.push_toast(
+                        &format!("LSP begin: {token}"),
+                        title.as_deref().unwrap_or(""),
+                        quadraui::ToastSeverity::Info,
+                    );
                     // Status indicator may change (Running → Initializing
                     // while indexing) — request a redraw (#450).
                     redraw = true;
@@ -1397,6 +1408,11 @@ impl Engine {
                     if let Some(mgr) = self.lsp_manager.as_mut() {
                         mgr.work_progress_end(server_id, &token);
                     }
+                    self.push_toast(
+                        &format!("LSP end: {token}"),
+                        "",
+                        quadraui::ToastSeverity::Success,
+                    );
                     // Status indicator may change (Initializing → Running
                     // once indexing completes) — request a redraw (#450).
                     redraw = true;

@@ -1058,6 +1058,15 @@ pub(super) fn draw_frame(
             engine.menu_system.borrow().render(b, bar_rect);
         });
     }
+
+    // Toast overlay (#450) — drawn LAST so it sits on top of every other
+    // surface. Bottom-right corner; transient (auto-dismissed after
+    // TOAST_LIFETIME via `engine.prune_toasts()` from poll_idle).
+    if let Some(stack) = render::build_toast_stack(engine) {
+        let q_theme = super::quadraui_tui::q_theme(theme);
+        let toast_area = frame.area();
+        quadraui::tui::draw_toast_stack(frame.buffer_mut(), toast_area, &stack, &q_theme);
+    }
 }
 
 /// Convert a TUI-local `FolderPickerState` into a `quadraui::Palette`.
