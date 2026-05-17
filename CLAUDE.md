@@ -24,6 +24,21 @@
 6. Run `gh issue list --state open` to see active work and priorities
 7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
+### Stale quadraui checkout — first thing to suspect on a build break
+
+Vimcode depends on `quadraui` via a **path dependency** to the sibling `~/src/quadraui` checkout (see `Cargo.toml` line ~48), not a crates.io version. There is **no version pinning** — whatever is checked out at `~/src/quadraui` is what gets compiled.
+
+If `cargo build` on a fresh `develop` (or any branch) fails with errors like "no variant named X found for enum Y", "no method named Z found", or "expected N args, found M" on a `quadraui::*` type, **the most likely cause is that your local quadraui checkout lags behind the API vimcode was written against** — not a vimcode bug.
+
+Before debugging further:
+
+```bash
+cd ~/src/quadraui && git pull && cd -
+cargo build
+```
+
+Only investigate the vimcode side if the error persists after pulling quadraui. Do not "fix" vimcode to match a stale quadraui — you'll just undo work that already shipped on the quadraui side.
+
 ## Conditional Reference Files
 
 | File | Load when |
