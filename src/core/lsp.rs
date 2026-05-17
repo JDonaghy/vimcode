@@ -989,6 +989,14 @@ impl LspServer {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                // Required for servers to emit `$/progress` notifications.
+                // rust-analyzer / gopls / pyright gate progress emission
+                // on this capability — without it they silently never
+                // send the notifications that drive the indexing
+                // indicator (#450).
+                "window": {
+                    "workDoneProgress": true
+                },
                 "workspace": {
                     "workspaceEdit": {
                         "documentChanges": true,
