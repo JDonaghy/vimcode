@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 16, 2026 (Session 381 — **Action menu engine-drawn migration (#395 / PR #427) landed.** Took over PR from a server-running agent; set up dev environment from scratch (rustup, GTK4 dev libs, xclip). Fixed develop build break with PR #432 — re-added `..Default::default()` on `ContextMenuItem` literals after `8a53307` accidentally dropped them. Rebased #427, smoke tested. Discovered 3 regressions vs native popover, all filed as follow-ups: quadraui#205 (selection bg obscures top/bottom border), vimcode#434 (menu opens AT button row not below — needs `Below` placement), vimcode#435 (keyboard nav dead until click — focus not claimed; same class as #273). #395 stays open until explorer follow-up #426 lands.)
+**Last updated:** May 17, 2026 (Session 382 — **Ctrl+Space completion with empty prefix (#422 / PR #437) landed.** Engine-side fix: renamed `trigger_auto_completion()` → `trigger_completion(manual: bool)`; manual path with empty prefix anchors `completion_start_col` to the cursor instead of bailing, so the LSP response populates the popup with in-scope symbols (VSCode parity). Auto path (typing/backspace/paste) unchanged. +2 lib tests. **Also:** added a CLAUDE.md Session Start Protocol note that a stale `~/src/quadraui` checkout is the first thing to suspect on `quadraui::*` build errors — vimcode pins quadraui by path dep with no version pin, so a stale sibling checkout silently misrepresents the API surface and looks like a vimcode bug. Bit me when develop wouldn't compile until the user pulled their quadraui checkout. **Filed #436** — extension installer UX: bundled `rust` extension installs rust-analyzer on Linux/macOS via `cargo install rust-analyzer` (10min silent compile) instead of `rustup component add` (instant); "No LSP Servers running" message tells the user nothing actionable. **Sidequest:** rustup 1.29.0 didn't create the `rust-analyzer` proxy shim in `~/.cargo/bin/` despite a successful `rustup component add` — fixed by `ln -s rustup ~/.cargo/bin/rust-analyzer`.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,9 +12,9 @@
 
 ---
 
-Vimcode at 1963 lib tests passing, 5257 total (lib+integration).
+Vimcode at 1965 lib tests passing.
 
-> Sessions 380 and earlier in **SESSION_HISTORY.md**.
+> Sessions 381 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.

@@ -1,7 +1,20 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 381 archived here.
+All sessions through 382 archived here.
+
+---
+**Session 382 (May 17) — Ctrl+Space completion with empty prefix (#422 / PR #437):**
+
+Small focused engine fix. `trigger_auto_completion()` in `motions.rs:3236` bailed when the cursor prefix was empty, so manual Ctrl+Space at a blank position produced nothing. Renamed to `trigger_completion(manual: bool)` and updated all 7 call sites — 2 Ctrl+Space handlers in `keys.rs:4635/4640` pass `true`, the 5 typing/backspace/paste/vscode-binding sites pass `false`. Auto path retains the empty-prefix early-return so typing doesn't drown the user in every nearby word. Manual path with empty prefix skips the buffer-word scan (which would match every nearby word with `"".starts_with("")`) and anchors `completion_start_col` to the cursor so the arriving LSP response populates the popup at the right position. The response handler at `panels.rs:865` was already empty-prefix-friendly (`text.starts_with("")` always true). +2 lib tests covering both branches. 1965 lib tests passing.
+
+**Drive-by CLAUDE.md addition — stale quadraui as first build-break suspect:** Develop wouldn't compile when I started — errors about `TerminalSplitHit::LeftPane { col, row }` / `RightPane { col, row }` / `Scrollbar` not being found in the enum. Turned out the user's `~/src/quadraui` checkout was behind the API vimcode was written against. Vimcode pins quadraui via path dep to a sibling checkout with no version pin (`Cargo.toml:48`), so any stale `~/src/quadraui` silently misrepresents the API surface and the error looks like a vimcode bug. Added a Session Start Protocol section telling agents to `cd ~/src/quadraui && git pull` before debugging `quadraui::*` build errors on the vimcode side. Committed as `24cdcee` directly to develop per the doc-only workflow.
+
+**Filed #436** — extension installer UX. Two-part bug: (1) on Linux/macOS the bundled `rust` extension's auto-installer runs `cargo install rust-analyzer` (a ~10-minute silent source compile) instead of `rustup component add rust-analyzer` (~30s binary download). The Windows fixup at `extensions.rs:142` should be lifted cross-platform. (2) "No LSP Servers running" is the only feedback when the binary isn't on PATH — the status indicator should say "Installing rust-analyzer…", "Install failed: <reason>", or "rust-analyzer not found. Run: rustup component add rust-analyzer" so the user knows what to do.
+
+**Sidequest — missing rustup proxy shim:** After `rustup component add rust-analyzer` succeeded, `rust-analyzer` was still "command not found". `rustup which` showed the binary at `~/.rustup/toolchains/stable-…/bin/rust-analyzer`, but `~/.cargo/bin/` was missing the proxy symlink (`cargo`, `rustc`, `clippy-driver`, etc. all had symlinks to `rustup`; `rust-analyzer` didn't). Fixed with `ln -s rustup ~/.cargo/bin/rust-analyzer`. Likely a rustup 1.29.0 quirk where component-add doesn't always create the shim — probably worth noting in the #436 fix that PATH visibility should be verified, not just package presence.
+
+**Cleanup:** #422 closed + unassigned; branch deleted local + remote. Also closed lingering #395 (the action menu migration from Session 381) and deleted its branch since PR #427 already merged.
 
 ---
 **Session 381 (May 16) — Action menu engine-drawn migration landed (#395 / PR #427):**

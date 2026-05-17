@@ -1,4 +1,4 @@
-# src/core/engine/motions.rs — 4,897 lines
+# src/core/engine/motions.rs — 5,066 lines
 
 Cursor movement, text objects, word/paragraph/sentence navigation, bracket matching, completion, code folding, indent/format, and delete operations.
 
@@ -43,7 +43,7 @@ Cursor movement, text objects, word/paragraph/sentence navigation, bracket match
 - `paste_after/before_adjusted_indent` — ]p/[p indent-adjusted paste
 
 ## Completion
-- `trigger_auto_completion` — start completion popup
+- `trigger_completion(manual: bool)` — start completion popup; `manual=true` (Ctrl+Space) bypasses the empty-prefix bail and skips the buffer-word scan when the prefix is empty so the LSP response can populate the popup with in-scope symbols (#422)
 - `apply_completion_candidate(idx)` — accept completion item
 - `dismiss_completion` — close completion popup
 - `completion_prefix_at_cursor` — extract word prefix for matching
