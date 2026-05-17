@@ -2643,18 +2643,22 @@ pub(super) fn handle_mouse(
     let editor_row = row.saturating_sub(menu_rows);
 
     // ── Group divider click — start drag ──────────────────────────────────────
+    // #452: must use the same float-to-int conversion as the divider
+    // renderer (`render_impl.rs::draw_frame` truncates with `as u16`).
+    // Using `.round()` here meant clicks on a divider at e.g. col 40.5
+    // (rendered at 40) were hit-tested at 41 and missed.
     if let Some(layout) = last_layout {
         if let Some(ref split) = layout.editor_group_split {
             for div in &split.dividers {
                 let hit = match div.direction {
                     crate::core::window::SplitDirection::Vertical => {
-                        let div_col = div.position.round() as u16;
+                        let div_col = div.position as u16;
                         rel_col == div_col
                             && (editor_row as f64) >= div.cross_start
                             && (editor_row as f64) < div.cross_start + div.cross_size
                     }
                     crate::core::window::SplitDirection::Horizontal => {
-                        let div_row = div.position.round() as u16;
+                        let div_row = div.position as u16;
                         editor_row == div_row
                             && (rel_col as f64) >= div.cross_start
                             && (rel_col as f64) < div.cross_start + div.cross_size
