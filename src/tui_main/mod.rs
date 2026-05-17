@@ -1638,6 +1638,15 @@ fn event_loop(
         };
         match crossterm_event {
             Event::Key(key_event) => {
+                // #451 diagnostic: log key events with ctx menu state.
+                debug_log!(
+                    "key event: code={:?} kind={:?} mods={:?} ctx_menu={} explorer_focus={}",
+                    key_event.code,
+                    key_event.kind,
+                    key_event.modifiers,
+                    engine.context_menu.is_some(),
+                    engine.explorer_has_focus,
+                );
                 // ── Modal dialog intercepts ALL keys ──────────────────────
                 if engine.dialog.is_some() {
                     if let Some((key_name, unicode, ctrl)) =
