@@ -3288,6 +3288,13 @@ impl Engine {
         self.workspace_root = Some(canonical.clone());
         let _ = std::env::set_current_dir(&canonical);
 
+        // Reset explorer state for the new workspace (#274). The old
+        // workspace's `explorer_expanded` paths don't apply here, and the
+        // new root needs to be in the set so `build_explorer_rows` shows
+        // top-level entries instead of just the collapsed root.
+        self.explorer_expanded.clear();
+        self.explorer_expanded.insert(canonical.clone());
+
         // Update git branch
         self.git_branch = git::current_branch(&canonical);
 
