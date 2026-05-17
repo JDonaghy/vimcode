@@ -1061,11 +1061,17 @@ pub(super) fn draw_frame(
 
     // Toast overlay (#450) — drawn LAST so it sits on top of every other
     // surface. Bottom-right corner; transient (auto-dismissed after
-    // TOAST_LIFETIME via `engine.prune_toasts()` from poll_idle).
+    // TOAST_LIFETIME via `engine.prune_toasts()` from poll_idle). The
+    // returned layout is cached on the engine so click handlers can run
+    // hit_test → handle_toast_hit (× close, action buttons).
     if let Some(stack) = render::build_toast_stack(engine) {
         let q_theme = super::quadraui_tui::q_theme(theme);
         let toast_area = frame.area();
-        quadraui::tui::draw_toast_stack(frame.buffer_mut(), toast_area, &stack, &q_theme);
+        let layout =
+            quadraui::tui::draw_toast_stack(frame.buffer_mut(), toast_area, &stack, &q_theme);
+        engine.toast_layout.replace(Some(layout));
+    } else {
+        engine.toast_layout.replace(None);
     }
 }
 

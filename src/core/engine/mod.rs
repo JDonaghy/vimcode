@@ -3019,6 +3019,10 @@ pub struct Engine {
     /// Cached layout from the last paint of the command center (nav arrows + search box).
     /// Written at paint time; read by click handlers.
     pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
+    /// Cached toast-stack layout from the last paint (#450). Written at
+    /// paint time; click handlers use it to dispatch dismiss-`×` /
+    /// action-button taps via `handle_toast_hit`.
+    pub toast_layout: std::cell::RefCell<Option<quadraui::ToastStackLayout>>,
     /// Launch arguments stored between `initialize` send and response receipt.
     /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
@@ -3764,6 +3768,7 @@ impl Engine {
             terminal_toolbar_hits: std::cell::RefCell::new(None),
             bottom_panel_geometry: std::cell::RefCell::new(None),
             terminal_split_layout: std::cell::RefCell::new(None),
+            toast_layout: std::cell::RefCell::new(None),
             command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,
@@ -4198,6 +4203,37 @@ impl Engine {
         self.toasts
             .retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
         self.toasts.len() != before
+    }
+
+    /// Dispatch a `ToastHit` from the cached `toast_layout` to the engine
+    /// (#450). Both backends call this with the result of
+    /// `layout.hit_test(x, y)` and check the bool: true = consumed (don't
+    /// let the click reach the editor underneath); false = empty hit,
+    /// fall through to whatever was below the toast.
+    pub fn handle_toast_hit(&mut self, hit: quadraui::ToastHit) -> bool {
+        match hit {
+            quadraui::ToastHit::Dismiss(widget_id) => {
+                self.dismiss_toast_by_widget(&widget_id);
+                true
+            }
+            quadraui::ToastHit::Action(_) | quadraui::ToastHit::Body(_) => {
+                // Currently no consumers use action buttons or body
+                // clicks; treat as consumed so the click doesn't leak
+                // through to the editor under the toast.
+                true
+            }
+            quadraui::ToastHit::Empty => false,
+        }
+    }
+
+    /// Remove a toast whose adapter-side widget id matches `widget_id`.
+    /// Widget ids are formatted as `toast-{id}` by `build_toast_stack`.
+    fn dismiss_toast_by_widget(&mut self, widget_id: &quadraui::WidgetId) {
+        let key = widget_id.as_str();
+        let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
+        if let Some(id) = target_id {
+            self.toasts.retain(|t| t.id != id);
+        }
     }
 
     // ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────

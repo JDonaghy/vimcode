@@ -233,6 +233,23 @@ pub(super) fn handle_mouse(
         modal_stack.pop(&quadraui::WidgetId::new("picker"));
     }
 
+    // ── Toast click (× dismiss / action) ───────────────────────────────────────
+    // #450: toasts overlay the editor in the bottom-right. Run hit_test
+    // before any underlying handler so clicking × dismisses the toast
+    // instead of falling through to whatever sits underneath.
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let toast_hit = engine
+            .toast_layout
+            .borrow()
+            .as_ref()
+            .map(|layout| layout.hit_test(col as f32, row as f32));
+        if let Some(hit) = toast_hit {
+            if engine.handle_toast_hit(hit) {
+                return sidebar_width;
+            }
+        }
+    }
+
     // ── Hover link click-to-copy ────────────────────────────────────────────────
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
