@@ -6736,6 +6736,58 @@ fn test_auto_popup_appears_on_type() {
 }
 
 #[test]
+fn test_manual_trigger_with_empty_prefix_does_not_dismiss() {
+    // #422: Ctrl+Space should fire a completion request even with no prefix
+    // (VSCode parity — show all in-scope symbols). The auto path still bails
+    // on empty prefix to avoid drowning the user in every word while typing.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o'); // open new line, insert mode, no prefix yet
+
+    // Auto trigger with empty prefix: dismisses (popup state stays cleared).
+    engine.trigger_completion(false);
+    assert!(
+        engine.completion_idx.is_none(),
+        "auto trigger with empty prefix should NOT activate popup"
+    );
+
+    // Manual trigger with empty prefix: does not bail. `completion_start_col`
+    // is anchored to the cursor so an arriving LSP response can populate the
+    // popup at the right position. (No LSP in tests, so candidates stay empty.)
+    let cursor_col = engine.view().cursor.col;
+    engine.trigger_completion(true);
+    assert_eq!(
+        engine.completion_start_col, cursor_col,
+        "manual trigger should anchor completion_start_col to the cursor"
+    );
+}
+
+#[test]
+fn test_manual_trigger_with_prefix_still_scans_buffer() {
+    // Manual trigger with a non-empty prefix should behave like the auto path:
+    // run the nearby-buffer scan and populate the popup synchronously.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    // Clear popup state to simulate a re-trigger
+    engine.dismiss_completion();
+    engine.trigger_completion(true);
+    assert!(
+        engine.completion_idx.is_some(),
+        "manual trigger with prefix should populate popup from buffer scan"
+    );
+    assert!(
+        engine.completion_candidates.iter().any(|c| c == "foobar"),
+        "buffer-scan candidates should appear, got: {:?}",
+        engine.completion_candidates
+    );
+}
+
+#[test]
 fn test_auto_popup_tab_accepts() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foobar\n");
