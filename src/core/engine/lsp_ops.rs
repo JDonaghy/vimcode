@@ -757,19 +757,23 @@ impl Engine {
             None => return LspStatus::None,
         };
         let status = mgr.lsp_status_for_language(lang);
-        // The `Initialized` LSP event marks the server as "responded" so that
-        // servers without semantic tokens (e.g. marksman) can leave the
-        // pending state immediately. For servers that DO support semantic
-        // tokens (rust-analyzer, gopls, etc.), keep the bar showing
-        // `name…` until the first semanticTokens response arrives — that's a
-        // better proxy for "workspace indexing complete" than handshake
-        // completion. #230: check the explicit `semantic_tokens_received`
-        // flag rather than `is_empty()`, otherwise files where the server
-        // returns zero tokens (empty file, file outside workspace) pin the
-        // indicator to Initializing forever.
+        // #450: keep the indicator dimmed (`name…`) while the server has
+        // any open `$/progress` work item. This is the LSP-protocol signal
+        // for "still indexing the workspace" — rust-analyzer / gopls /
+        // pyright all emit it. Previously we tried two semantic-tokens
+        // heuristics:
+        //   - `semantic_tokens.is_empty()` (Session 243) — pinned forever
+        //     for files with no tokens (#230).
+        //   - `!semantic_tokens_received` (#230 fix) — went bright on the
+        //     first empty response, well before indexing actually finished.
+        // The progress-notification gate is both. Servers that don't emit
+        // progress notifications (marksman, simple servers) brighten on
+        // handshake — same as before.
         if let LspStatus::Running(name) = &status {
-            if !buf.semantic_tokens_received && mgr.language_supports_semantic_tokens(lang) {
-                return LspStatus::Initializing(name.clone());
+            if let Some(server_id) = mgr.server_id_for_language(lang) {
+                if mgr.is_indexing(server_id) {
+                    return LspStatus::Initializing(name.clone());
+                }
             }
         }
         status

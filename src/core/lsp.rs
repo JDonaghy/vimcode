@@ -121,6 +121,20 @@ pub enum LspEvent {
         request_id: i64,
         symbols: Vec<SymbolInfo>,
     },
+    /// `$/progress` begin notification — a long-running work item started
+    /// on the server. Used by the indicator to track workspace indexing
+    /// (#450). `token` is the unique progress-token string (LSP allows
+    /// number or string; we stringify both for HashMap keying).
+    WorkProgressBegin {
+        server_id: LspServerId,
+        token: String,
+        title: Option<String>,
+    },
+    /// `$/progress` end notification — work item completed.
+    WorkProgressEnd {
+        server_id: LspServerId,
+        token: String,
+    },
 }
 
 /// A symbol returned by documentSymbol or workspace/symbol.
@@ -1498,6 +1512,16 @@ fn reader_thread(
                         let _ = tx.send(event);
                     }
                 }
+            } else if method == "$/progress" {
+                // Workspace indexing / long-running work signal (#450).
+                // We only act on begin/end; report (interim percent
+                // updates) doesn't change the binary "is indexing" state
+                // the indicator cares about.
+                if let Some(params) = json.get("params") {
+                    if let Some(event) = parse_work_progress(server_id, params) {
+                        let _ = tx.send(event);
+                    }
+                }
             }
             continue;
         }
@@ -1750,6 +1774,46 @@ fn parse_diagnostics(server_id: LspServerId, params: &serde_json::Value) -> Opti
         path,
         diagnostics,
     })
+}
+
+/// Parse a `$/progress` notification's params into a begin or end event
+/// (#450). `params` shape: `{ token, value: { kind, title?, message?,
+/// percentage? } }`. Report (interim) notifications return None — only
+/// begin/end change the "is indexing" state the indicator cares about.
+fn parse_work_progress(server_id: LspServerId, params: &serde_json::Value) -> Option<LspEvent> {
+    let token = params.get("token").and_then(token_to_key)?;
+    let value = params.get("value")?;
+    let kind = value.get("kind").and_then(|k| k.as_str())?;
+    match kind {
+        "begin" => {
+            let title = value
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            Some(LspEvent::WorkProgressBegin {
+                server_id,
+                token,
+                title,
+            })
+        }
+        "end" => Some(LspEvent::WorkProgressEnd { server_id, token }),
+        _ => None, // "report" — interim update, ignored
+    }
+}
+
+/// LSP progress tokens are `number | string`; HashMap-key them as String
+/// since we only need uniqueness, not the original type.
+fn token_to_key(token: &serde_json::Value) -> Option<String> {
+    if let Some(s) = token.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(n) = token.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = token.as_u64() {
+        return Some(n.to_string());
+    }
+    None
 }
 
 fn try_parse_completion_response(
@@ -2968,5 +3032,74 @@ bin:
         assert_eq!(symbols[0].children[1].name, "field_b");
         assert_eq!(symbols[1].name, "my_func");
         assert!(symbols[1].children.is_empty());
+    }
+
+    // #450: $/progress parsing
+    #[test]
+    fn parse_work_progress_begin_string_token() {
+        let params = serde_json::json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": {
+                "kind": "begin",
+                "title": "Indexing",
+                "percentage": 0
+            }
+        });
+        let event = super::parse_work_progress(0, &params).expect("should parse");
+        match event {
+            super::LspEvent::WorkProgressBegin { token, title, .. } => {
+                assert_eq!(token, "rustAnalyzer/Indexing");
+                assert_eq!(title.as_deref(), Some("Indexing"));
+            }
+            other => panic!("expected WorkProgressBegin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_work_progress_begin_numeric_token() {
+        // Some servers use integer tokens.
+        let params = serde_json::json!({
+            "token": 42,
+            "value": { "kind": "begin" }
+        });
+        let event = super::parse_work_progress(0, &params).expect("should parse");
+        match event {
+            super::LspEvent::WorkProgressBegin { token, .. } => assert_eq!(token, "42"),
+            other => panic!("expected WorkProgressBegin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_work_progress_end_emits_end_event() {
+        let params = serde_json::json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": { "kind": "end" }
+        });
+        let event = super::parse_work_progress(0, &params).expect("should parse");
+        match event {
+            super::LspEvent::WorkProgressEnd { token, .. } => {
+                assert_eq!(token, "rustAnalyzer/Indexing");
+            }
+            other => panic!("expected WorkProgressEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_work_progress_report_returns_none() {
+        // Interim updates between begin and end don't change the binary
+        // is_indexing state — we drop them on the floor.
+        let params = serde_json::json!({
+            "token": "t1",
+            "value": { "kind": "report", "percentage": 50, "message": "halfway" }
+        });
+        assert!(super::parse_work_progress(0, &params).is_none());
+    }
+
+    #[test]
+    fn parse_work_progress_missing_token_returns_none() {
+        let params = serde_json::json!({
+            "value": { "kind": "begin" }
+        });
+        assert!(super::parse_work_progress(0, &params).is_none());
     }
 }

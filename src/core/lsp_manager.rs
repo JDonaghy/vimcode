@@ -412,6 +412,12 @@ pub struct LspManager {
     /// Servers that have returned at least one non-empty response (symbols, hover, etc.).
     /// This indicates the server has finished indexing and is truly "ready".
     server_has_responded: HashMap<LspServerId, bool>,
+    /// In-flight `$/progress` tokens per server (#450). Populated by
+    /// WorkProgressBegin, drained by WorkProgressEnd. `is_indexing(server_id)`
+    /// returns true while any progress is open — used by the status indicator
+    /// to dim `name…` while rust-analyzer / gopls / similar servers are
+    /// indexing the workspace.
+    pending_work: HashMap<LspServerId, std::collections::HashSet<String>>,
     /// Servers that crashed or exited (for display in :LspInfo).
     crashed_servers: Vec<String>,
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
@@ -438,6 +444,37 @@ impl LspManager {
     /// Mark a server as responsive (ready for requests).
     pub fn mark_server_responded(&mut self, server_id: LspServerId) {
         self.server_has_responded.insert(server_id, true);
+    }
+
+    /// Record that a `$/progress` work item has begun on a server (#450).
+    pub fn work_progress_begin(&mut self, server_id: LspServerId, token: String) {
+        self.pending_work
+            .entry(server_id)
+            .or_default()
+            .insert(token);
+    }
+
+    /// Record that a `$/progress` work item has ended on a server (#450).
+    pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) {
+        if let Some(set) = self.pending_work.get_mut(&server_id) {
+            set.remove(token);
+        }
+    }
+
+    /// True if the given server has any open `$/progress` work item — i.e.
+    /// the server is still indexing / building / loading. The indicator
+    /// keeps `name…` dimmed while this returns true (#450).
+    pub fn is_indexing(&self, server_id: LspServerId) -> bool {
+        self.pending_work
+            .get(&server_id)
+            .is_some_and(|set| !set.is_empty())
+    }
+
+    /// Look up the server handling a given language. Public accessor so
+    /// the engine can correlate buffer-language → server_id for things
+    /// like `is_indexing` (#450).
+    pub fn server_id_for_language(&self, lang: &str) -> Option<LspServerId> {
+        self.language_to_server.get(lang).copied()
     }
 
     /// Get the LSP status for a given language identifier.
@@ -504,6 +541,7 @@ impl LspManager {
             ext_manifests: Vec::new(),
             all_ext_manifests: Vec::new(),
             server_has_responded: HashMap::new(),
+            pending_work: HashMap::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
         }
@@ -972,18 +1010,6 @@ impl LspManager {
         self.semantic_legends.get(&server_id)
     }
 
-    /// Whether the server handling `lang` advertised semanticTokens support
-    /// in its `Initialized` capabilities. Used by the per-window status bar
-    /// to keep the "…" pending indicator visible until tokens actually
-    /// arrive (workspace indexing complete) for token-supporting servers.
-    pub fn language_supports_semantic_tokens(&self, lang: &str) -> bool {
-        self.language_to_server
-            .get(lang)
-            .and_then(|sid| self.servers.get(*sid))
-            .map(|s| s.supports_semantic_tokens())
-            .unwrap_or(false)
-    }
-
     /// Find which server is handling a given file path.
     #[allow(dead_code)]
     pub fn server_id_for_path(&self, path: &Path) -> Option<LspServerId> {
@@ -1174,5 +1200,66 @@ pub fn debug_resolve(lang_id: &str, ext_manifests: &[extensions::ExtensionManife
 impl Drop for LspManager {
     fn drop(&mut self) {
         self.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #450: pending_work lifecycle. Without a real LSP server we drive the
+    // helpers directly — that's all the indicator's gate consults.
+    #[test]
+    fn work_progress_begin_marks_indexing() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        assert!(!mgr.is_indexing(sid), "no progress → not indexing");
+
+        mgr.work_progress_begin(sid, "rustAnalyzer/Indexing".to_string());
+        assert!(mgr.is_indexing(sid), "begin → indexing");
+    }
+
+    #[test]
+    fn work_progress_end_clears_indexing() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        mgr.work_progress_begin(sid, "t1".to_string());
+        mgr.work_progress_end(sid, "t1");
+        assert!(!mgr.is_indexing(sid), "begin + end → not indexing");
+    }
+
+    #[test]
+    fn work_progress_multiple_tokens_must_all_end() {
+        // rust-analyzer fires several overlapping progress tokens during
+        // workspace load (Indexing, Roots Scanned, Building, etc.). The
+        // indicator should stay dim until they all close.
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        mgr.work_progress_begin(sid, "Indexing".to_string());
+        mgr.work_progress_begin(sid, "Roots Scanned".to_string());
+        assert!(mgr.is_indexing(sid));
+
+        mgr.work_progress_end(sid, "Indexing");
+        assert!(
+            mgr.is_indexing(sid),
+            "still indexing while one token remains open"
+        );
+
+        mgr.work_progress_end(sid, "Roots Scanned");
+        assert!(!mgr.is_indexing(sid), "indexing cleared when all end");
+    }
+
+    #[test]
+    fn work_progress_unknown_end_is_noop() {
+        // Defensive: an `end` for a token we never saw `begin` for must
+        // not crash and must not flip the state.
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        mgr.work_progress_end(sid, "never-began"); // no panic
+        assert!(!mgr.is_indexing(sid));
+
+        mgr.work_progress_begin(sid, "real".to_string());
+        mgr.work_progress_end(sid, "never-began"); // also no-op
+        assert!(mgr.is_indexing(sid));
     }
 }
