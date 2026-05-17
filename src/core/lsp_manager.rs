@@ -37,59 +37,57 @@ pub fn install_log(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Cargo-bin proxy validation (Windows)
+// Cargo-bin proxy validation
 // ---------------------------------------------------------------------------
 
-/// On Windows, validate that a binary in `~/.cargo/bin/` actually works.
+/// Validate that a binary in `~/.cargo/bin/` actually works.
 /// Rustup installs proxy executables for components that aren't installed yet;
-/// these proxies exist on disk but exit with an error like "Unknown binary …
-/// in official toolchain".  A quick `--version` probe catches this.
+/// these proxies exist on disk (as symlinks to `rustup` on Linux/macOS, as
+/// shim `.exe` on Windows) but exit with an error like
+/// "Unknown binary 'rust-analyzer' in official toolchain …" when the
+/// component isn't installed.  A quick `--version` probe catches this so
+/// vimcode falls through to the install path instead of trying to spawn
+/// a broken proxy as an LSP server.
 pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (path, binary);
-        true
+    // Only probe binaries found in ~/.cargo/bin/ — that's where rustup
+    // proxies live.  Binaries elsewhere are trusted as-is.
+    let cargo_bin = super::paths::home_dir().join(".cargo").join("bin");
+    let in_cargo_bin = path.parent().map(|p| p == cargo_bin).unwrap_or(false);
+    if !in_cargo_bin {
+        return true;
     }
+
+    // Quick probe: run `<binary> --version` and check for a successful exit.
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     {
-        // Only probe binaries found in ~/.cargo/bin/ — that's where rustup
-        // proxies live.  Binaries elsewhere are trusted as-is.
-        let cargo_bin = super::paths::home_dir().join(".cargo").join("bin");
-        let in_cargo_bin = path.parent().map(|p| p == cargo_bin).unwrap_or(false);
-        if !in_cargo_bin {
-            return true;
-        }
-
-        // Quick probe: run `<binary> --version` with a 3-second timeout.
         use std::os::windows::process::CommandExt;
-        let result = std::process::Command::new(path)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .output();
-        match result {
-            Ok(output) => {
-                if output.status.success() {
-                    true
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    install_log(&format!(
-                        "[ext-check] PROBE FAILED for {binary} at {}: {}",
-                        path.display(),
-                        stderr.lines().next().unwrap_or("(no output)")
-                    ));
-                    false
-                }
-            }
-            Err(e) => {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                true
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 install_log(&format!(
-                    "[ext-check] PROBE ERROR for {binary} at {}: {e}",
-                    path.display()
+                    "[ext-check] PROBE FAILED for {binary} at {}: {}",
+                    path.display(),
+                    stderr.lines().next().unwrap_or("(no output)")
                 ));
                 false
             }
+        }
+        Err(e) => {
+            install_log(&format!(
+                "[ext-check] PROBE ERROR for {binary} at {}: {e}",
+                path.display()
+            ));
+            false
         }
     }
 }
@@ -378,7 +376,14 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
         // `where` on Windows may return multiple lines — take the first
         let first_line = path_str.lines().next()?.trim();
         if !first_line.is_empty() {
-            return Some(PathBuf::from(first_line));
+            let resolved = PathBuf::from(first_line);
+            // `which` happily resolves the rustup proxy in ~/.cargo/bin/
+            // even after `rustup component remove`; probe to skip broken
+            // proxies here too (the `tool_dirs` loop above probes only
+            // when it finds the binary itself).
+            if cargo_bin_probe_ok(&resolved, binary) {
+                return Some(resolved);
+            }
         }
     }
     None
