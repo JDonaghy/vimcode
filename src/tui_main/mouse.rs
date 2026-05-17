@@ -1568,8 +1568,19 @@ pub(super) fn handle_mouse(
 
     // ── Context menu click intercept ────────────────────────────────────────────
     if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
+        crate::tui_main::debug_log!(
+            "ctx menu click: col={} row={} layout_cached={}",
+            col,
+            row,
+            context_menu_layout.is_some(),
+        );
         if let Some(cl) = context_menu_layout {
             let hit = cl.hit_test(col as f32, row as f32);
+            crate::tui_main::debug_log!(
+                "  ctx menu hit_test result: {:?} (bounds {:?})",
+                hit,
+                cl.bounds,
+            );
             match hit {
                 quadraui::ContextMenuHit::Item(_) => {
                     if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
