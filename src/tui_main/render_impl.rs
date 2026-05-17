@@ -1676,6 +1676,14 @@ mod tests {
         e.ext_registry = None;
         e.mode = crate::core::Mode::Normal;
         e.rebuild_user_keymaps();
+        // #439: Engine::new() reads git::current_branch(cwd), so without
+        // this clear the snapshot tests leak whatever branch name the
+        // test runner happens to be on into the status bar fixture.
+        // Likewise sc_ahead/sc_behind get computed from the surrounding
+        // repo state. Reset all three so snapshots are reproducible.
+        e.git_branch = None;
+        e.sc_ahead = 0;
+        e.sc_behind = 0;
         if !text.is_empty() {
             e.buffer_mut().insert(0, text);
         }

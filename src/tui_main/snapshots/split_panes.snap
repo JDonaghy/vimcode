@@ -1,6 +1,5 @@
 ---
 source: src/tui_main/render_impl.rs
-assertion_line: 1945
 expression: "lines.join(\"\\n\")"
 ---
  󰍜   1: [No Name] ×                     ⋯  1: [No Name] ×               󰤲   ⋯
@@ -17,5 +16,5 @@ expression: "lines.join(\"\\n\")"
                                          ││
                                          ││
                                          ││
-     [No Name]                Ln 1, Col 1││NORMAL  [No Name]  issue Ln 1, Col 1
+     [No Name]                Ln 1, Col 1││NORMAL  [No Name]        Ln 1, Col 1
    Editor split
