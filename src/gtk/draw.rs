@@ -890,6 +890,7 @@ pub(super) fn draw_editor(
 
     tab_switcher_popup_rect_out.set(draw_tab_switcher_popup_list(
         &screen,
+        &theme,
         width as f64,
         height as f64,
         line_height,
@@ -1752,8 +1753,10 @@ pub(super) fn draw_picker_popup(
 /// popup's `(x, y, w, h)` if drawn, `None` otherwise — the caller
 /// caches this for `ModalStack` registration in the click handler
 /// (B.5b Stage 7).
+#[allow(clippy::too_many_arguments)]
 fn draw_tab_switcher_popup_list(
     screen: &render::ScreenLayout,
+    theme: &Theme,
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
@@ -1780,10 +1783,24 @@ fn draw_tab_switcher_popup_list(
         popup_w as f32,
         popup_h as f32,
     );
+
+    // Tab switcher is chrome — use UI font, not the editor monospace.
+    // Save the layout's current font + size so the post-popup state matches.
+    let saved_font = layout.font_description();
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
+    layout.set_font_description(Some(&ui_font_desc));
+
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         use quadraui::Backend;
+        // Explicitly set theme + line_height instead of inheriting whatever
+        // the previous enter_frame_scope left behind: defensive, matches the
+        // pattern in draw_picker_popup / draw_tab_bar.
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
         b.draw_list(q_rect, &list);
     });
+
+    layout.set_font_description(saved_font.as_ref());
 
     Some((popup_x, popup_y, popup_w, popup_h))
 }
