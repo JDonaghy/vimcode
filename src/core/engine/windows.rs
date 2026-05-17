@@ -691,7 +691,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
-            trigger_height: 0,
+            trigger_height: 0.0,
         });
     }
 
@@ -701,7 +701,7 @@ impl Engine {
         group_id: GroupId,
         x: u16,
         y: u16,
-        trigger_height: u16,
+        trigger_height: f32,
     ) {
         let group = match self.editor_groups.get(&group_id) {
             Some(g) => g,
@@ -965,7 +965,7 @@ impl Engine {
             selected: 0,
             screen_x: x,
             screen_y: y,
-            trigger_height: 0,
+            trigger_height: 0.0,
         });
     }
 
@@ -1050,7 +1050,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
-            trigger_height: 0,
+            trigger_height: 0.0,
         });
     }
 

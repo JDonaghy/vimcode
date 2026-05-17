@@ -3559,11 +3559,11 @@ pub struct ContextMenuPanel {
     pub selected_idx: usize,
     pub screen_col: u16,
     pub screen_row: u16,
-    /// Trigger element height in cells (0 = no trigger; render as
-    /// AnchorPoint at the click coords). Non-zero opts into
-    /// `ContextMenuPlacement::Below` so the menu opens below the
-    /// trigger rather than overlapping it (#434).
-    pub trigger_height: u16,
+    /// Trigger element height in line_height units (f32; supports
+    /// sub-cell rows like GTK's 1.6× tab row). 0.0 = no trigger →
+    /// render at click coords (AnchorPoint). Non-zero opts into
+    /// `ContextMenuPlacement::Below` (#434).
+    pub trigger_height: f32,
 }
 
 /// A single rendered context menu item.
@@ -3612,7 +3612,7 @@ pub fn context_menu_panel_to_quadraui_context_menu(
         .get(panel.selected_idx)
         .copied()
         .unwrap_or(0);
-    let placement = if panel.trigger_height > 0 {
+    let placement = if panel.trigger_height > 0.0 {
         quadraui::ContextMenuPlacement::Below
     } else {
         quadraui::ContextMenuPlacement::AnchorPoint

@@ -973,7 +973,7 @@ pub(super) fn draw_frame(
                 ctx_menu.screen_col as f32 + 1.0,
                 ctx_menu.screen_row as f32 + 1.0,
                 0.0,
-                ctx_menu.trigger_height as f32,
+                ctx_menu.trigger_height,
             ),
             inner_viewport,
             inner_width,
