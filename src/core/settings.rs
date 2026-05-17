@@ -532,16 +532,19 @@ fn pk_toggle_sidebar() -> String {
     "<C-b>".to_string()
 }
 fn pk_focus_explorer() -> String {
-    "<A-e>".to_string()
+    // <A-e> moved off in #318 — clashed with menu bar Alt+E (Edit menu).
+    "<C-S-e>".to_string()
 }
 fn pk_focus_search() -> String {
-    "<A-f>".to_string()
+    // <A-f> moved off in #318 — clashed with menu bar Alt+F (File menu).
+    "<C-S-f>".to_string()
 }
 fn pk_fuzzy_finder() -> String {
     "<C-p>".to_string()
 }
 fn pk_live_grep() -> String {
-    "<C-S-f>".to_string()
+    // Moved off <C-S-f> in #318 to free that combo for focus_search.
+    "<C-S-g>".to_string()
 }
 fn pk_command_palette() -> String {
     "<C-S-p>".to_string()
@@ -570,16 +573,16 @@ pub struct PanelKeys {
     /// Toggle sidebar visibility. Default: `<C-b>`
     #[serde(default = "pk_toggle_sidebar")]
     pub toggle_sidebar: String,
-    /// Focus explorer (or return to editor if already focused). Default: `<A-e>`
+    /// Focus explorer (or return to editor if already focused). Default: `<C-S-e>`
     #[serde(default = "pk_focus_explorer")]
     pub focus_explorer: String,
-    /// Open search panel in sidebar. Default: `<A-f>`
+    /// Open search panel in sidebar. Default: `<C-S-f>`
     #[serde(default = "pk_focus_search")]
     pub focus_search: String,
     /// Open fuzzy file finder. Default: `<C-p>`
     #[serde(default = "pk_fuzzy_finder")]
     pub fuzzy_finder: String,
-    /// Open live grep modal. Default: `<C-S-f>`
+    /// Open live grep modal. Default: `<C-S-g>`
     #[serde(default = "pk_live_grep")]
     pub live_grep: String,
     /// Open command palette. Default: `<C-S-p>`
@@ -2567,10 +2570,10 @@ mod tests {
     fn test_panel_keys_defaults() {
         let pk = PanelKeys::default();
         assert_eq!(pk.toggle_sidebar, "<C-b>");
-        assert_eq!(pk.focus_explorer, "<A-e>");
-        assert_eq!(pk.focus_search, "<A-f>");
+        assert_eq!(pk.focus_explorer, "<C-S-e>");
+        assert_eq!(pk.focus_search, "<C-S-f>");
         assert_eq!(pk.fuzzy_finder, "<C-p>");
-        assert_eq!(pk.live_grep, "<C-S-f>");
+        assert_eq!(pk.live_grep, "<C-S-g>");
         assert_eq!(pk.command_palette, "<C-S-p>");
         assert_eq!(pk.add_cursor, "<A-d>");
         assert_eq!(pk.select_all_matches, "<C-S-l>");
@@ -2583,7 +2586,7 @@ mod tests {
         assert_eq!(pk.fuzzy_finder, "<C-A-p>");
         // Unspecified keep defaults
         assert_eq!(pk.toggle_sidebar, "<C-b>");
-        assert_eq!(pk.focus_explorer, "<A-e>");
+        assert_eq!(pk.focus_explorer, "<C-S-e>");
     }
 
     #[test]
