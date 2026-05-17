@@ -305,6 +305,21 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :Toast <text> — push a test toast. Diagnostic for #450 toast
+        // wiring; verifies the render path independent of LSP events.
+        if let Some(body) = cmd.strip_prefix("Toast ").map(|s| s.trim()) {
+            self.push_toast("Test toast", body, quadraui::ToastSeverity::Info);
+            return EngineAction::None;
+        }
+        if cmd == "Toast" {
+            self.push_toast(
+                "Test toast",
+                "hello from :Toast",
+                quadraui::ToastSeverity::Info,
+            );
+            return EngineAction::None;
+        }
+
         // Handle :LspDebug — show binary resolution result for current language
         if cmd == "LspDebug" {
             let buf_lang = self
