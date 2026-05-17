@@ -1852,6 +1852,42 @@ fn event_loop(
                 {
                     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
+                    // #451: when an explorer ctx menu is open, intercept j/k/
+                    // Enter/Esc HERE — before the panel-specific dispatch
+                    // below sends j/k to dispatch_explorer_key. Without this,
+                    // explorer-focused mode hijacks the keys and the menu's
+                    // own selection doesn't move.
+                    if engine.context_menu.is_some() {
+                        let effective_key = match key_event.code {
+                            KeyCode::Up => "Up".to_string(),
+                            KeyCode::Down => "Down".to_string(),
+                            KeyCode::Enter => "Return".to_string(),
+                            KeyCode::Esc => "Escape".to_string(),
+                            KeyCode::Char(c) => c.to_string(),
+                            _ => String::new(),
+                        };
+                        if !effective_key.is_empty() {
+                            let ctx = engine.context_menu_target_path();
+                            let (consumed, action) = engine.handle_context_menu_key(&effective_key);
+                            if consumed {
+                                if let Some(act) = action {
+                                    if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                        handle_explorer_context_action(
+                                            &act,
+                                            engine,
+                                            &sidebar,
+                                            terminal.size().ok(),
+                                            ctx_path,
+                                            ctx_is_dir,
+                                        );
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+                        }
+                    }
+
                     // Panel navigation shortcuts (toggle_sidebar / focus_explorer
                     // / focus_search) used to live here; Phase B.4 Stage 6 routes
                     // them through `dispatch_panel_accelerator` before the legacy
