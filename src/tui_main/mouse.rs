@@ -1344,7 +1344,17 @@ pub(super) fn handle_mouse(
     }
 
     // ── Right-click: open context menus ────────────────────────────────────────
-    if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+    // #451: Alacritty + crossterm 0.28 only emit `Up(MouseButton::Right)` for a
+    // right-click (no preceding `Down(Right)` event). Other terminals send both.
+    // Matching `Up` instead of `Down` is also the standard ctx-menu trigger in
+    // most GUI toolkits — menus open on release. Either-or makes both terminal
+    // conventions work; the `close_context_menu` at the top of the handler
+    // would re-close on the Up if both fired, but in practice every terminal
+    // we've seen drops one or the other.
+    if matches!(
+        ev.kind,
+        MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
+    ) {
         crate::tui_main::debug_log!(
             "right-click: col={} row={} sb_visible={} ab_width={} sidebar_width={} \
              active_panel={:?} explorer_rows_len={}",
@@ -2254,7 +2264,11 @@ pub(super) fn handle_mouse(
             let content_start = 1 + input_rows; // header + optional input
 
             // Right-click fires panel_context_menu event.
-            if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+            // #451: accept Up(Right) too (Alacritty/crossterm-0.28 only sends Up).
+            if matches!(
+                ev.kind,
+                MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
+            ) {
                 if sidebar_row >= content_start {
                     let flat_idx =
                         engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
