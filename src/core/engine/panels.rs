@@ -747,8 +747,11 @@ impl Engine {
             };
             // Clear stale position-based data immediately — line numbers from
             // the previous buffer state would highlight/annotate wrong lines.
+            // Also reset the received flag so the indicator briefly returns
+            // to `Initializing` until the re-requested tokens arrive (#230).
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.semantic_tokens.clear();
+                state.semantic_tokens_received = false;
             }
             self.lsp_diagnostics.remove(&path);
             self.invalidate_explorer_indicators();
@@ -1293,6 +1296,12 @@ impl Engine {
                                 if let Some(state) = self.buffer_manager.get_mut(bid) {
                                     if state.file_path.as_deref() == Some(path.as_path()) {
                                         state.semantic_tokens = decoded;
+                                        // #230: record receipt even when the
+                                        // server returns zero tokens. The
+                                        // LSP status indicator uses this to
+                                        // distinguish "haven't responded
+                                        // yet" from "responded empty".
+                                        state.semantic_tokens_received = true;
                                         redraw = true;
                                         break;
                                     }

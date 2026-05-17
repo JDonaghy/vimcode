@@ -8222,6 +8222,61 @@ fn test_lsp_dirty_buffer_tracking() {
 }
 
 #[test]
+fn test_lsp_flush_changes_resets_semantic_tokens_received() {
+    // #230: indicator was stuck on `name…` for files where the server
+    // returned zero semantic tokens, because `semantic_tokens.is_empty()`
+    // was used as the gate. The fix tracks receipt explicitly via the
+    // `semantic_tokens_received` bool. lsp_flush_changes must clear that
+    // bool when it clears the cached tokens, so the indicator can briefly
+    // return to Initializing while the re-request is in flight.
+    let path = std::env::temp_dir().join("vimcode_test_sem_tokens_received.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&path));
+    let buf_id = engine.active_buffer_id();
+
+    // Fresh buffer: no response received yet.
+    assert!(
+        !engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .semantic_tokens_received
+    );
+
+    // Simulate having received a response (with one fake token).
+    if let Some(state) = engine.buffer_manager.get_mut(buf_id) {
+        state.semantic_tokens.push(crate::core::lsp::SemanticToken {
+            line: 0,
+            start_char: 0,
+            length: 2,
+            token_type: "function".to_string(),
+            modifiers: Vec::new(),
+        });
+        state.semantic_tokens_received = true;
+    }
+
+    // Trigger an edit-like flush: lsp_dirty_buffers populated, manager up.
+    engine.ensure_lsp_manager();
+    engine.lsp_dirty_buffers.insert(buf_id, true);
+    engine.lsp_flush_changes();
+
+    let state = engine.buffer_manager.get(buf_id).unwrap();
+    assert!(
+        state.semantic_tokens.is_empty(),
+        "lsp_flush_changes should clear cached semantic_tokens"
+    );
+    assert!(
+        !state.semantic_tokens_received,
+        "lsp_flush_changes must also reset semantic_tokens_received \
+         so the LSP indicator can re-show Initializing until the new \
+         response arrives (#230)"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn test_reload_marks_lsp_dirty() {
     // #222: external edits left semantic_tokens (which override
     // tree-sitter coloring for Rust) cached and stale because reload

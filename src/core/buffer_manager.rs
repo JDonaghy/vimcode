@@ -153,6 +153,14 @@ pub struct BufferState {
     pub md_rendered: Option<crate::core::markdown::MdRendered>,
     /// LSP semantic tokens (decoded, absolute positions). Overlays tree-sitter highlights.
     pub semantic_tokens: Vec<crate::core::lsp::SemanticToken>,
+    /// True once a semanticTokens response has been received for the current
+    /// buffer content (even if the response was empty). Distinguishes
+    /// "haven't responded yet" from "responded with zero tokens" — without
+    /// this, `lsp_status_for_buffer` would keep the indicator pinned to
+    /// `Initializing` forever on files where the server returns no tokens
+    /// (#230). Cleared in `lsp_flush_changes` when re-requesting after an
+    /// edit so the indicator can briefly reflect the new pending request.
+    pub semantic_tokens_received: bool,
     /// For netrw buffers: the directory currently being listed.
     pub netrw_dir: Option<PathBuf>,
     /// Whether this buffer is a keymaps editor scratch buffer.
@@ -221,6 +229,7 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            semantic_tokens_received: false,
             netrw_dir: None,
             is_keymaps_buf: false,
             is_registries_buf: false,
@@ -269,6 +278,7 @@ impl BufferState {
             read_only: false,
             md_rendered: None,
             semantic_tokens: Vec::new(),
+            semantic_tokens_received: false,
             netrw_dir: None,
             is_keymaps_buf: false,
             is_registries_buf: false,

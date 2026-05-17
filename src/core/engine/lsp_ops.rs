@@ -748,10 +748,14 @@ impl Engine {
         // servers without semantic tokens (e.g. marksman) can leave the
         // pending state immediately. For servers that DO support semantic
         // tokens (rust-analyzer, gopls, etc.), keep the bar showing
-        // `name…` until tokens actually arrive — that's a better proxy for
-        // "workspace indexing complete" than handshake completion.
+        // `name…` until the first semanticTokens response arrives — that's a
+        // better proxy for "workspace indexing complete" than handshake
+        // completion. #230: check the explicit `semantic_tokens_received`
+        // flag rather than `is_empty()`, otherwise files where the server
+        // returns zero tokens (empty file, file outside workspace) pin the
+        // indicator to Initializing forever.
         if let LspStatus::Running(name) = &status {
-            if buf.semantic_tokens.is_empty() && mgr.language_supports_semantic_tokens(lang) {
+            if !buf.semantic_tokens_received && mgr.language_supports_semantic_tokens(lang) {
                 return LspStatus::Initializing(name.clone());
             }
         }
