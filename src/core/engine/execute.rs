@@ -236,18 +236,29 @@ impl Engine {
             match crate::core::dap_manager::DapManager::adapter_for_language(lang_id) {
                 Some(info) => {
                     let adapter_name = info.name;
-                    // Look up matching extension by language_id
-                    let ext_name = self
-                        .ext_available_manifests()
-                        .into_iter()
-                        .find(|m| {
-                            m.language_ids.iter().any(|l| l == lang_id)
-                                || m.dap.adapter == adapter_name
-                        })
-                        .map(|m| m.name.clone());
+                    // Look up matching extension by language_id ONLY. The old
+                    // logic also matched on `m.dap.adapter == adapter_name`,
+                    // but multiple extensions can ship the same adapter
+                    // binary (codelldb is bundled by both `rust` and `cpp`),
+                    // so `:DapInstall rust` would route to whichever
+                    // extension was iterated first — usually `cpp`. That's a
+                    // bug — when the user types a language, the extension
+                    // claiming that language is the correct answer.
+                    let manifests = self.ext_available_manifests();
+                    let ext_name =
+                        crate::core::extensions::find_manifest_for_language_id(&manifests, lang_id)
+                            .map(|m| m.name.clone());
                     if let Some(name) = ext_name {
-                        self.message =
-                            format!("Use :ExtInstall {name} instead  (or open Extensions panel)");
+                        // Short-circuit the message-then-second-command chain:
+                        // the user said install, just install. Mirrors
+                        // `:ExtInstall <name>` exactly (including the
+                        // pending_terminal_command handoff for the install
+                        // command to run in a visible terminal pane).
+                        self.ext_install_from_registry(&name);
+                        if let Some(cmd) = self.pending_terminal_command.take() {
+                            return EngineAction::RunInTerminal(cmd);
+                        }
+                        return EngineAction::None;
                     } else {
                         // Fall back to direct adapter install
                         let dap_key = format!("dap:{adapter_name}");

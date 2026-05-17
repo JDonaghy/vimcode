@@ -349,6 +349,51 @@ mod tests {
     }
 
     #[test]
+    fn dap_install_routes_by_language_not_shared_adapter() {
+        // #212 follow-up. Both cpp and rust bundle codelldb. Previously
+        // `:DapInstall rust` matched on either language OR shared adapter
+        // and `.find()` returned whichever was iterated first (cpp wins
+        // alphabetically), telling the user to install the wrong extension.
+        // Lookup must be by language_ids exclusively.
+        let ms = vec![
+            ExtensionManifest {
+                name: "cpp".to_string(),
+                display_name: "C/C++ Language Support".to_string(),
+                file_extensions: vec![".c".to_string(), ".cpp".to_string()],
+                language_ids: vec!["c".to_string(), "cpp".to_string()],
+                dap: DapConfig {
+                    adapter: "codelldb".to_string(),
+                    binary: "codelldb".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ExtensionManifest {
+                name: "rust".to_string(),
+                display_name: "Rust Language Support".to_string(),
+                file_extensions: vec![".rs".to_string()],
+                language_ids: vec!["rust".to_string()],
+                dap: DapConfig {
+                    adapter: "codelldb".to_string(),
+                    binary: "codelldb".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+
+        let m = find_manifest_for_language_id(&ms, "rust").expect("rust must match");
+        assert_eq!(
+            m.name, "rust",
+            ":DapInstall rust must resolve to the rust extension, not cpp \
+             (both ship codelldb)",
+        );
+
+        let m = find_manifest_for_language_id(&ms, "cpp").expect("cpp must match");
+        assert_eq!(m.name, "cpp");
+    }
+
+    #[test]
     fn manifest_parse_toml() {
         let toml = r#"
 name = "test"
