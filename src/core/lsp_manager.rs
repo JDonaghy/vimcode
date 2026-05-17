@@ -388,6 +388,13 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
 // LspManager — coordinates multiple language servers
 // ---------------------------------------------------------------------------
 
+/// `$/progress` cooldown — `is_indexing` keeps returning true for this
+/// long after the last work item ends, so the indicator doesn't flicker
+/// bright during the gaps between rust-analyzer's progress phases.
+/// 3 seconds is roughly the longest gap observed between Fetching → end
+/// and Indexing → begin on a cold workspace start (#450).
+const PROGRESS_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub struct LspManager {
     root_path: PathBuf,
     /// All known server configs (built-in + user overrides).
@@ -418,6 +425,13 @@ pub struct LspManager {
     /// to dim `name…` while rust-analyzer / gopls / similar servers are
     /// indexing the workspace.
     pending_work: HashMap<LspServerId, std::collections::HashSet<String>>,
+    /// Timestamp of the last WorkProgressEnd per server. `is_indexing`
+    /// keeps reporting true for `PROGRESS_COOLDOWN` after the last end
+    /// so the indicator doesn't flicker bright between back-to-back
+    /// progress phases (rust-analyzer fires several: Fetching → Indexing
+    /// → Building proc-macros, with brief idle gaps where no token is
+    /// open but the server is NOT actually ready).
+    last_progress_end: HashMap<LspServerId, std::time::Instant>,
     /// Servers that crashed or exited (for display in :LspInfo).
     crashed_servers: Vec<String>,
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
@@ -455,19 +469,39 @@ impl LspManager {
     }
 
     /// Record that a `$/progress` work item has ended on a server (#450).
+    /// Only updates the cooldown timestamp if we actually had this token
+    /// tracked — a stray `end` for an unknown token (race / bug on the
+    /// server side) shouldn't extend the dim state.
     pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) {
-        if let Some(set) = self.pending_work.get_mut(&server_id) {
-            set.remove(token);
+        let removed = self
+            .pending_work
+            .get_mut(&server_id)
+            .is_some_and(|set| set.remove(token));
+        if removed {
+            self.last_progress_end
+                .insert(server_id, std::time::Instant::now());
         }
     }
 
-    /// True if the given server has any open `$/progress` work item — i.e.
-    /// the server is still indexing / building / loading. The indicator
-    /// keeps `name…` dimmed while this returns true (#450).
+    /// True if the given server has any open `$/progress` work item OR
+    /// finished its last progress within `PROGRESS_COOLDOWN`. The cooldown
+    /// covers the brief idle gaps between rust-analyzer's progress phases
+    /// (Fetching → Indexing → Building) where no token is currently open
+    /// but the server hasn't truly settled.
     pub fn is_indexing(&self, server_id: LspServerId) -> bool {
-        self.pending_work
+        if self
+            .pending_work
             .get(&server_id)
             .is_some_and(|set| !set.is_empty())
+        {
+            return true;
+        }
+        if let Some(end_time) = self.last_progress_end.get(&server_id) {
+            if end_time.elapsed() < PROGRESS_COOLDOWN {
+                return true;
+            }
+        }
+        false
     }
 
     /// Look up the server handling a given language. Public accessor so
@@ -542,6 +576,7 @@ impl LspManager {
             all_ext_manifests: Vec::new(),
             server_has_responded: HashMap::new(),
             pending_work: HashMap::new(),
+            last_progress_end: HashMap::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
         }
@@ -1220,19 +1255,28 @@ mod tests {
     }
 
     #[test]
-    fn work_progress_end_clears_indexing() {
+    fn work_progress_end_keeps_indexing_during_cooldown() {
+        // After all tokens end, is_indexing stays true for PROGRESS_COOLDOWN
+        // to smooth flicker between back-to-back progress phases (e.g.
+        // rust-analyzer's Fetching → gap → Indexing).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         mgr.work_progress_begin(sid, "t1".to_string());
         mgr.work_progress_end(sid, "t1");
-        assert!(!mgr.is_indexing(sid), "begin + end → not indexing");
+        assert!(
+            mgr.is_indexing(sid),
+            "still indexing within cooldown after last end"
+        );
+        // Underlying pending_work IS empty — just the cooldown extends it.
+        assert!(mgr.pending_work.get(&sid).is_none_or(|set| set.is_empty()));
     }
 
     #[test]
-    fn work_progress_multiple_tokens_must_all_end() {
+    fn work_progress_multiple_tokens_open_keep_indexing() {
         // rust-analyzer fires several overlapping progress tokens during
         // workspace load (Indexing, Roots Scanned, Building, etc.). The
-        // indicator should stay dim until they all close.
+        // indicator should stay dim until they all close — which still
+        // works directly (cooldown is irrelevant while a token is open).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         mgr.work_progress_begin(sid, "Indexing".to_string());
@@ -1244,22 +1288,24 @@ mod tests {
             mgr.is_indexing(sid),
             "still indexing while one token remains open"
         );
-
-        mgr.work_progress_end(sid, "Roots Scanned");
-        assert!(!mgr.is_indexing(sid), "indexing cleared when all end");
+        // Other token still in flight — cooldown isn't even consulted yet.
+        assert_eq!(mgr.pending_work[&sid].len(), 1);
     }
 
     #[test]
-    fn work_progress_unknown_end_is_noop() {
+    fn work_progress_unknown_end_does_not_arm_cooldown() {
         // Defensive: an `end` for a token we never saw `begin` for must
-        // not crash and must not flip the state.
+        // not crash AND must not extend the dim state via the cooldown.
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         mgr.work_progress_end(sid, "never-began"); // no panic
-        assert!(!mgr.is_indexing(sid));
-
-        mgr.work_progress_begin(sid, "real".to_string());
-        mgr.work_progress_end(sid, "never-began"); // also no-op
-        assert!(mgr.is_indexing(sid));
+        assert!(
+            !mgr.is_indexing(sid),
+            "stray end (no matching begin) must not flip state"
+        );
+        assert!(
+            mgr.last_progress_end.get(&sid).is_none(),
+            "stray end must not arm the cooldown"
+        );
     }
 }
