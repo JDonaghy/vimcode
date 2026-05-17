@@ -381,12 +381,12 @@ fn toolbar_idx_for_panel(engine: &Engine) -> u16 {
 // `tui:editor:<window_id>:vsb` / `:hsb`.
 
 /// What the folder picker should do when the user confirms a selection.
+/// #274 removed `OpenRecent` — the recent-workspaces flow now uses the
+/// engine-driven `PickerSource::RecentWorkspaces`.
 #[derive(Clone, PartialEq)]
 enum FolderPickerMode {
     /// Open as a workspace folder (`engine.open_folder()`).
     OpenFolder,
-    /// Pick from the list of recently opened workspaces.
-    OpenRecent,
 }
 
 /// TUI folder/workspace directory picker modal.
@@ -435,23 +435,6 @@ impl FolderPickerState {
     fn navigate_up(&mut self) {
         if let Some(parent) = self.root.parent() {
             self.navigate_to(parent.to_path_buf());
-        }
-    }
-
-    /// Create an Open Recent picker pre-populated with recent workspace paths.
-    fn new_recent(recents: &[std::path::PathBuf]) -> Self {
-        // Show most-recent first
-        let all_entries: Vec<PathBuf> = recents.iter().rev().cloned().collect();
-        let filtered = all_entries.clone();
-        Self {
-            mode: FolderPickerMode::OpenRecent,
-            root: PathBuf::new(), // not used for OpenRecent
-            query: String::new(),
-            all_entries,
-            filtered,
-            selected: 0,
-            scroll_top: 0,
-            show_hidden: false,
         }
     }
 
@@ -1476,9 +1459,15 @@ fn event_loop(
                                 engine.save_workspace_as(&ws_path);
                             }
                             EngineAction::OpenRecentDialog => {
-                                folder_picker = Some(FolderPickerState::new_recent(
-                                    &engine.session.recent_workspaces,
-                                ));
+                                // #274: engine-driven picker; replaces the
+                                // TUI-local FolderPickerState::new_recent.
+                                if engine.session.recent_workspaces.is_empty() {
+                                    engine.message = "No recent workspaces".to_string();
+                                } else {
+                                    engine.open_picker(
+                                        crate::core::engine::PickerSource::RecentWorkspaces,
+                                    );
+                                }
                             }
                             EngineAction::QuitWithUnsaved => {
                                 engine.show_quit_confirm();
@@ -1682,46 +1671,26 @@ fn event_loop(
                             folder_picker = None;
                         }
                         KeyCode::Enter => {
-                            let mode = picker.mode.clone();
-                            if mode == FolderPickerMode::OpenRecent {
-                                if let Some(path) = picker.filtered.get(picker.selected).cloned() {
-                                    folder_picker = None;
-                                    engine.open_folder(&path);
-                                    sidebar = TuiSidebar::new();
-                                    engine.explorer_rebuild_rows();
-                                    if let Some(fp) = engine.file_path().cloned() {
-                                        engine.explorer_reveal_path(&fp);
-                                    }
-                                }
-                            } else {
-                                // Check if ".." was selected — navigate up instead of opening
-                                let is_dotdot = picker
-                                    .filtered
-                                    .get(picker.selected)
-                                    .map(|p| p.as_os_str() == "..")
-                                    .unwrap_or(false);
-                                if is_dotdot {
-                                    picker.navigate_up();
-                                } else if let Some(path) = picker.selected_path() {
-                                    folder_picker = None;
-                                    match mode {
-                                        FolderPickerMode::OpenFolder => {
-                                            engine.open_folder(&path);
-                                        }
-                                        FolderPickerMode::OpenRecent => {}
-                                    }
-                                    sidebar = TuiSidebar::new();
-                                    engine.explorer_rebuild_rows();
-                                    if let Some(path) = engine.file_path().cloned() {
-                                        engine.explorer_reveal_path(&path);
-                                    }
+                            // Check if ".." was selected — navigate up instead of opening
+                            let is_dotdot = picker
+                                .filtered
+                                .get(picker.selected)
+                                .map(|p| p.as_os_str() == "..")
+                                .unwrap_or(false);
+                            if is_dotdot {
+                                picker.navigate_up();
+                            } else if let Some(path) = picker.selected_path() {
+                                folder_picker = None;
+                                engine.open_folder(&path);
+                                sidebar = TuiSidebar::new();
+                                engine.explorer_rebuild_rows();
+                                if let Some(path) = engine.file_path().cloned() {
+                                    engine.explorer_reveal_path(&path);
                                 }
                             }
                         }
                         // '-' navigates up to the parent directory (like vim netrw)
-                        KeyCode::Char('-')
-                            if !ctrl && picker.mode != FolderPickerMode::OpenRecent =>
-                        {
+                        KeyCode::Char('-') if !ctrl => {
                             picker.navigate_up();
                         }
                         KeyCode::Up | KeyCode::Char('k') if !ctrl => {
@@ -2888,9 +2857,15 @@ fn event_loop(
                             ));
                             needs_redraw = true;
                         } else if action == EngineAction::OpenRecentDialog {
-                            folder_picker = Some(FolderPickerState::new_recent(
-                                &engine.session.recent_workspaces,
-                            ));
+                            // #274: engine-driven picker; replaces the
+                            // TUI-local FolderPickerState::new_recent.
+                            if engine.session.recent_workspaces.is_empty() {
+                                engine.message = "No recent workspaces".to_string();
+                            } else {
+                                engine.open_picker(
+                                    crate::core::engine::PickerSource::RecentWorkspaces,
+                                );
+                            }
                             needs_redraw = true;
                         } else if action == EngineAction::OpenWorkspaceDialog {
                             // open_workspace_from_file() already ran in the engine;

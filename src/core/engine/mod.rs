@@ -931,6 +931,9 @@ pub enum PickerSource {
     Indentation,
     /// Line ending picker (LF / CRLF).
     LineEndings,
+    /// Recent workspaces (#274). Replaces the native GTK Dialog and the
+    /// TUI's `FolderPickerState::new_recent` with the engine-driven picker.
+    RecentWorkspaces,
     Custom(String),
 }
 
@@ -994,6 +997,8 @@ pub enum PickerAction {
     SetIndentation(bool, u8),
     /// Set line ending format: true = CRLF, false = LF.
     SetLineEnding(bool),
+    /// Open a workspace folder (recent-workspaces picker; #274).
+    OpenWorkspace(PathBuf),
     Custom(String),
 }
 

@@ -136,6 +136,10 @@ impl Engine {
                 self.picker_title = "Select Line Ending Sequence".to_string();
                 self.picker_populate_line_endings();
             }
+            PickerSource::RecentWorkspaces => {
+                self.picker_title = "Open Recent Workspace".to_string();
+                self.picker_populate_recent_workspaces();
+            }
             _ => {
                 self.picker_title = format!("{:?}", source);
             }
@@ -677,6 +681,38 @@ impl Engine {
                         None
                     },
                     action: PickerAction::SetLineEnding(*is_crlf),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    /// Populate the picker with recent workspace paths from the session.
+    /// Most-recent first (the session stores them oldest-first). #274.
+    fn picker_populate_recent_workspaces(&mut self) {
+        let current = self.workspace_root.clone();
+        self.picker_all_items = self
+            .session
+            .recent_workspaces
+            .iter()
+            .rev()
+            .map(|path| {
+                let display = path.display().to_string();
+                let detail = if current.as_ref() == Some(path) {
+                    Some("● current".to_string())
+                } else {
+                    None
+                };
+                PickerItem {
+                    display: display.clone(),
+                    filter_text: display,
+                    detail,
+                    action: PickerAction::OpenWorkspace(path.clone()),
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
@@ -1857,6 +1893,14 @@ impl Engine {
                     state.set_line_ending(new);
                 }
                 self.message = format!("Line endings: {}", new.as_str());
+                EngineAction::None
+            }
+            PickerAction::OpenWorkspace(path) => {
+                // #274: recent-workspaces picker confirm. Switch workspace
+                // and signal the explorer to rebuild — backends sync from
+                // explorer_needs_refresh on the next render.
+                self.open_folder(&path);
+                self.explorer_needs_refresh = true;
                 EngineAction::None
             }
             PickerAction::JumpToMark(_mark) => {

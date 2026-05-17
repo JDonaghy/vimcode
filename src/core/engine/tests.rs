@@ -9142,6 +9142,46 @@ fn test_ctrl_p_opens_picker() {
     assert_eq!(engine.picker_source, PickerSource::Files);
 }
 
+#[test]
+fn test_recent_workspaces_picker_lists_most_recent_first() {
+    // #274: engine-driven RecentWorkspaces picker. Seed three recent
+    // workspaces; opening the picker should list them most-recent first
+    // (session stores them oldest-first), wired to OpenWorkspace actions.
+    use crate::core::engine::PickerAction;
+
+    let mut engine = Engine::new();
+    let a = std::path::PathBuf::from("/tmp/vimcode-test-ws-a");
+    let b = std::path::PathBuf::from("/tmp/vimcode-test-ws-b");
+    let c = std::path::PathBuf::from("/tmp/vimcode-test-ws-c");
+    engine.session.recent_workspaces = vec![a.clone(), b.clone(), c.clone()];
+
+    engine.open_picker(PickerSource::RecentWorkspaces);
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::RecentWorkspaces);
+    assert_eq!(engine.picker_title, "Open Recent Workspace");
+
+    let actions: Vec<_> = engine
+        .picker_items
+        .iter()
+        .map(|item| item.action.clone())
+        .collect();
+    assert_eq!(actions.len(), 3, "expected 3 items, got {:?}", actions);
+
+    // Most-recent first: c, b, a.
+    match (&actions[0], &actions[1], &actions[2]) {
+        (
+            PickerAction::OpenWorkspace(p0),
+            PickerAction::OpenWorkspace(p1),
+            PickerAction::OpenWorkspace(p2),
+        ) => {
+            assert_eq!(p0, &c);
+            assert_eq!(p1, &b);
+            assert_eq!(p2, &a);
+        }
+        other => panic!("unexpected actions: {:?}", other),
+    }
+}
+
 // ── Unified picker tests ─────────────────────────────────────────────────
 
 #[test]

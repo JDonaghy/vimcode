@@ -1091,7 +1091,6 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
             };
             format!("Open Folder {}", root_display)
         }
-        FolderPickerMode::OpenRecent => "Open Recent".to_string(),
     };
 
     let folder_icon = Icon {

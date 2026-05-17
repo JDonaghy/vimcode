@@ -777,14 +777,6 @@ enum Msg {
     /// UiEvent (scroll, mouse) on the explorer DrawingArea — routed
     /// through TreeController.handle() for scrollbar interaction.
     ExplorerUiEvent(quadraui::UiEvent),
-    /// Prompt the user for a filename to rename `path` to. Dialog fallback
-    /// used by GTK since inline TextInput editing on `draw_tree` rows is
-    /// deferred until a future primitive stage.
-    PromptRenameFile(PathBuf),
-    /// Prompt the user for a filename for a new file under `parent_dir`.
-    PromptNewFile(PathBuf),
-    /// Prompt the user for a folder name under `parent_dir`.
-    PromptNewFolder(PathBuf),
     /// Show confirmation dialog before deleting.
     ConfirmDeletePath(PathBuf),
     /// Refresh the file tree from current working directory.
@@ -4608,10 +4600,7 @@ impl SimpleComponent for App {
             | Msg::ExplorerClick { .. }
             | Msg::ExplorerRightClick { .. }
             | Msg::ExplorerScroll(_)
-            | Msg::ExplorerUiEvent(_)
-            | Msg::PromptRenameFile(_)
-            | Msg::PromptNewFile(_)
-            | Msg::PromptNewFolder(_) => {
+            | Msg::ExplorerUiEvent(_) => {
                 self.handle_explorer_msg(msg, &sender);
             }
             Msg::ExtPanelKey(_, _)
@@ -9183,11 +9172,6 @@ impl App {
                     }
                 }
             }
-            Msg::PromptRenameFile(_) | Msg::PromptNewFile(_) | Msg::PromptNewFolder(_) => {
-                // Explorer CRUD now uses inline editing via TreeController.
-                // These dialog paths are kept as Msg variants for backwards
-                // compatibility but nothing sends them.
-            }
             _ => unreachable!(),
         }
     }
@@ -9527,67 +9511,6 @@ impl App {
         }
     }
 
-    /// Show a simple modal dialog with a text entry for rename /
-    /// new-file / new-folder flows. Phase A.2b-2 replaced the native
-    /// `gtk4::TreeView` inline cell editor with this fallback. On OK the
-    /// closure fires `on_confirm(name)`. Empty names close the dialog
-    /// silently.
-    #[allow(dead_code)]
-    fn prompt_for_name(
-        &self,
-        title: &str,
-        prompt: &str,
-        initial: &str,
-        on_confirm: Box<dyn Fn(String)>,
-    ) {
-        let dialog = gtk4::Dialog::with_buttons(
-            Some(title),
-            Some(&self.window),
-            gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-            &[
-                ("Cancel", gtk4::ResponseType::Cancel),
-                ("OK", gtk4::ResponseType::Ok),
-            ],
-        );
-        dialog.set_default_response(gtk4::ResponseType::Ok);
-        let content = dialog.content_area();
-        content.set_margin_top(8);
-        content.set_margin_bottom(8);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
-        content.set_spacing(6);
-        let label = gtk4::Label::new(Some(prompt));
-        label.set_halign(gtk4::Align::Start);
-        content.append(&label);
-        let entry = gtk4::Entry::new();
-        entry.set_text(initial);
-        entry.set_activates_default(true);
-        // Pre-select the stem (up to the last dot) so the user can type
-        // a new name while keeping the extension.
-        if !initial.is_empty() {
-            let stem_end = initial
-                .rfind('.')
-                .filter(|&i| i > 0)
-                .unwrap_or(initial.len()) as i32;
-            let entry_for_select = entry.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                entry_for_select.select_region(0, stem_end);
-            });
-        }
-        content.append(&entry);
-        let entry_for_response = entry.clone();
-        dialog.connect_response(move |d, resp| {
-            if resp == gtk4::ResponseType::Ok {
-                let name = entry_for_response.text().trim().to_string();
-                if !name.is_empty() {
-                    on_confirm(name);
-                }
-            }
-            d.close();
-        });
-        dialog.show();
-    }
-
     fn handle_find_replace_msg(&mut self, msg: Msg) {
         match msg {
             Msg::WindowResized { width, height } => {
@@ -9779,46 +9702,18 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::OpenRecentDialog => {
-                let paths: Vec<std::path::PathBuf> = self
-                    .engine
-                    .borrow()
-                    .session
-                    .recent_workspaces
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .collect();
-                if paths.is_empty() {
-                    self.engine.borrow_mut().message = "No recent workspaces".to_string();
+                // #274: replaced the native gtk4::Dialog with the engine's
+                // unified picker (PickerSource::RecentWorkspaces). Picker
+                // confirm calls open_folder + sets explorer_needs_refresh
+                // so the file tree rebuilds on the next render — no
+                // backend-specific Msg dispatch needed here.
+                let mut engine = self.engine.borrow_mut();
+                if engine.session.recent_workspaces.is_empty() {
+                    engine.message = "No recent workspaces".to_string();
                 } else {
-                    let engine = self.engine.clone();
-                    let sender2 = sender.input_sender().clone();
-                    let dialog = gtk4::Dialog::with_buttons(
-                        Some("Open Recent Workspace"),
-                        Some(&self.window),
-                        gtk4::DialogFlags::MODAL | gtk4::DialogFlags::DESTROY_WITH_PARENT,
-                        &[("Cancel", gtk4::ResponseType::Cancel)],
-                    );
-                    let content = dialog.content_area();
-                    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
-                    content.append(&vbox);
-                    for (idx, path) in paths.iter().enumerate() {
-                        let label = path.to_string_lossy().into_owned();
-                        let btn = gtk4::Button::with_label(&label);
-                        let dialog_clone = dialog.clone();
-                        let engine_clone = engine.clone();
-                        let sender_clone = sender2.clone();
-                        let path_clone = path.clone();
-                        btn.connect_clicked(move |_| {
-                            let _ = idx; // suppress unused var warning
-                            engine_clone.borrow_mut().open_folder(&path_clone);
-                            sender_clone.send(Msg::RefreshFileTree).ok();
-                            dialog_clone.close();
-                        });
-                        vbox.append(&btn);
-                    }
-                    dialog.show();
+                    engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
                 }
+                drop(engine);
                 self.draw_needed.set(true);
             }
 
