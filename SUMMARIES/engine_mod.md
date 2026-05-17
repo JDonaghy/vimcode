@@ -36,6 +36,9 @@ Core engine definition. Contains the `Engine` struct (all editor state), enums, 
 - `Engine::dismiss_notification(id)` — remove notification by ID
 - `Engine::dismiss_done_notifications()` — remove all completed notifications
 - `Engine::tick_notifications()` — auto-dismiss completed notifications after 5s timeout
+- `Engine::push_toast(title, body, severity)` — push transient toast popup (bottom-right, auto-dismiss after TOAST_LIFETIME=5s); rendered via `render::build_toast_stack` + `quadraui::*::draw_toast_stack` (#450)
+- `Engine::prune_toasts()` — drop toasts older than TOAST_LIFETIME, returns true on change (called from poll_idle)
+- `Engine::handle_toast_hit(ToastHit)` — dispatch dismiss-×/action clicks from cached `toast_layout`; backends call after `layout.hit_test(x,y)`
 - `compute_find_replace_hit_regions(panel_w, show_replace, match_info)` — compute hit regions for find/replace overlay in char-cell units
 - `find_word_boundaries(text, pos)` — find word boundaries around char position (re-exported from search)
 - `FR_PANEL_WIDTH` — default panel width constant (50 chars)

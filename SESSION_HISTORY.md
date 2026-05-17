@@ -1,7 +1,49 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 382 archived here.
+All sessions through 383 archived here.
+
+---
+**Session 383 (May 17) — TUI-focused bug-fix sprint, 11 issues closed:**
+
+Long parallel-agent session running TUI-only on a remote server. Other agents landed #225, #274, #426, #434, #435, #452 concurrently — rebased onto each new develop tip as they appeared. My branch closed 11 issues + filed 5 follow-ups. 1975 lib tests passing.
+
+**Closed**
+
+- **#287** GTK Ctrl-P in completion popup → opened picker. Added `Engine::insert_completion_intercepts_key(key, ctrl)` (single source of truth for which keys insert-mode completion consumes). GTK keypress handler consults it before dispatching the panel accelerator, so Ctrl-P cycles candidates instead of opening fuzzy finder when the popup is active.
+- **#318** TUI Alt+menu_letter clashed with menu bar. Two-part: (1) `tui_main/mod.rs` shows the bar when Alt+menu_letter arrives via `MenuBar::find_alt_target` so the existing intercept catches the same event; (2) rebound default panel keys off menu letters — `pk_focus_explorer: <A-e> → <C-S-e>`, `pk_focus_search: <A-f> → <C-S-f>`, `pk_live_grep: <C-S-f> → <C-S-g>` (VSCode parity for the first two).
+- **#429** Terminal pane click duplicated across backends. New `Engine::handle_terminal_pane_click(col, row)` does the focus + scroll-reset + selection. TUI consumes it in the non-split fallback; `handle_terminal_split_click`'s LeftPane/RightPane arms delegate after setting `terminal_active`.
+- **#262** Breadcrumb dropdown parent symbols weren't jumpable. `build_symbol_tree_items` now marks every symbol-tree row `expandable = false`. The Enter / click gate falls through to `picker_confirm`, which jumps via the existing `GotoSymbol` action. Children stay visible at increasing depth — only the fold-state UI is gone (acceptable trade per the issue body's option 1).
+- **#222** Syntax highlighting stale after external edits. Tree-sitter was always correct; the leftover coloring was cached `BufferState.semantic_tokens` overriding tree-sitter for Rust. All three reload paths (`check_file_changes`, `reload_file_from_disk`, `:edit!`) now insert into `lsp_dirty_buffers` so `lsp_flush_changes` clears tokens, sends `notify_did_change`, and re-requests `semanticTokens/full`.
+- **#230** Indicator stuck on `name…` when server returned zero tokens. Replaced `semantic_tokens.is_empty()` gate with explicit `BufferState.semantic_tokens_received: bool`, set true on any response (even empty). Worked correctly for files that genuinely have no tokens, but turned out to flip bright too early on cold rust-analyzer indexing — which led directly to #450.
+- **#208** Diagnostic gutter markers stale after git discard. `lsp_diagnostics` is keyed by canonical absolute path (URI-derived in handler); `lsp_flush_changes` and `lsp_did_close` were removing by `state.file_path` which is the user's original (often relative) path. Mismatch made remove a silent no-op. Switched to `state.canonical_path` (with `file_path` fallback) — same convention the render side already uses (`render.rs:8743`).
+- **#212** TUI debug panel "only `args` expandable" — DAP variable state leaked across stops. `DapEvent::Continued` cleared `dap_child_variables` + `dap_expanded_vars` + `dap_pending_vars_ref`; `DapEvent::Stopped` forgot them. Recycled var_refs from lldb-dap inherited the prior variable's expand state. Mirrored Continued's cleanup. ALSO surfaced a brutal install chain: `:DapInstall rust` → "Use `:ExtInstall cpp` instead" (the `||` clause in execute.rs:240 matched any extension with the same adapter binary — both `cpp` and `rust` ship codelldb, alphabetical wins). Then `:DapInstall rust` → "Use :ExtInstall rust" → `:ExtInstall rust` → "Extension rust installed, run :DapInstall rust to set up codelldb" → infinite loop (lsp_ops.rs:296 read `manifest.dap.install` directly, which is empty for codelldb because its install command is hardcoded in `dap_manager::install_cmd_for_adapter` for the multi-step build). Three commits to make the chain "just work".
+- **#438** Test compile broken on develop. `render.rs:12856` called `crate::core::engine::tests::engine_with(...)` which neither exists (named `engine_with_text`) nor was reachable (private `mod tests`). Fixed: `pub(crate) mod tests` + `pub(crate) fn engine_with_text` + fix the two call sites.
+- **#439** 6 stale snapshots after #438 unblocked. Root cause: `Engine::new()` reads `git::current_branch(cwd)`, so snapshots captured the contributor's branch name (`issue-385-appshell-side` was in the committed fixture). `test_engine` now clears `git_branch = None` and `sc_ahead = sc_behind = 0` for hermetic snapshots. Re-captured all 6. Added `.snap.new` to `.gitignore`.
+- **#450** LSP indicator misalignment with actual server readiness. The semantic-tokens-received gate from #230 went bright on rust-analyzer's first empty response — way before indexing actually completed. Replaced with the LSP-protocol native signal: `$/progress` notifications. Added `LspEvent::WorkProgressBegin/End`, parser for the notification shape, `LspManager.pending_work` HashMap + 3s cooldown for inter-phase smoothing, `is_indexing(server_id)` helper, gate replaced in `lsp_status_for_buffer`. After landing, indicator stayed bright through cold indexing — diagnosed via toast spam (see below) that no events were arriving. **Root cause: `capabilities.window.workDoneProgress = true` was missing from the initialize handshake**, without which rust-analyzer / gopls / pyright silently never emit progress. One-field addition to init_params and the entire chain worked. Branch ended up with 8 commits including the toast infrastructure described below.
+- **#390** TUI cursor color reverts to white after mouse-wheel scroll. Closed — quadraui#177 (`e3650cf`) fixed it upstream; vimcode is a thin delegator to `quadraui::tui::draw_editor` and the fix flows through automatically.
+
+**New shared primitive — toast notifications**
+
+Built on #450 in three layers, all shared across backends:
+
+- **Engine** (`mod.rs`): `EngineToast { id, title, body, severity, created_at }`, `Engine.toasts: Vec<EngineToast>`, `push_toast(title, body, severity)`, `prune_toasts()` called from `poll_idle` (auto-dismiss after `TOAST_LIFETIME = 5s`), `handle_toast_hit(ToastHit)` for click dispatch, `dismiss_toast_by_widget(WidgetId)` for the × close.
+- **Render adapter** (`render.rs::build_toast_stack`): converts engine queue to `quadraui::ToastStack` keyed BottomRight; returns None when empty so callers can skip the draw.
+- **TUI wiring** (`tui_main/render_impl.rs::draw_frame` + `tui_main/mouse.rs`): calls `quadraui::tui::draw_toast_stack` last (so they sit on top), caches `ToastStackLayout` to `engine.toast_layout`; left-mouse-down checks `layout.hit_test(x, y)` → `handle_toast_hit` before any underlying handler. GTK wiring tracked in **#454** — exact same pattern, ~15 lines.
+- **`:Toast <text>` command** in `execute.rs` for manual smoke testing of the render path independent of LSP events. Critical diagnostic during #450 — it's what proved the render was sound and the missing piece was the LSP capability declaration.
+
+**Filed**
+
+- **#436** Extension installer UX — Linux/macOS auto-install runs `cargo install rust-analyzer` (10 min silent compile) instead of `rustup component add` (instant); "No LSP Servers running" message doesn't tell the user what to do; rustup 1.29.0 doesn't always create proxy shim in `~/.cargo/bin/`.
+- **#444** TUI right-split terminal drag selects wrong column. Pre-existing bug: click uses pane-relative col (via quadraui hit_test), drag uses editor-relative col (`col.saturating_sub(editor_left)` at `tui_main/mouse.rs:1029`). Mismatch makes right-pane selection look like "the rest of the line." Not caused by #429; surfaced when smoke-testing it.
+- **#453** 6 `tests/z_commands.rs` failures (horizontal scroll). Preexisting, exposed when #438 unblocked the test runner. Plain assertion mismatches, not snapshot diffs.
+- **#454** GTK toast wiring. Engine + adapter + click dispatcher are shared and ready; just needs ~15 lines of `gtk/draw.rs` + `gtk/mod.rs` to call `quadraui::gtk::draw_toast_stack` and run `hit_test`.
+- **quadraui#206** Replace hardcoded `is_nerd_wide()` predicate in `tui/tab_bar.rs` with the `unicode-width` crate. Filed during #265 investigation (which is the consumer-side report).
+
+**Environment notes**
+
+- Stale `~/src/quadraui` checkout caused the initial build break this session (same hazard as Session 382); pull fixed it. CLAUDE.md already has the note.
+- This server needed `rust-analyzer` + `codelldb` installed from scratch. `rustup component add rust-analyzer` doesn't create the `~/.cargo/bin/rust-analyzer` proxy shim on rustup 1.29.0 — manual `ln -s rustup ~/.cargo/bin/rust-analyzer` works. codelldb came via vimcode's auto-install once `:DapInstall rust` was actually working after the routing fix in #212.
 
 ---
 **Session 382 (May 17) — Ctrl+Space completion with empty prefix (#422 / PR #437):**
