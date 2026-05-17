@@ -293,33 +293,46 @@ impl Engine {
             }
         }
 
+        // `install_cmd_for_adapter` needs the manifest list to look up
+        // manifest-declared installs; fetch once for the DAP block.
+        let available_manifests = self.ext_available_manifests();
+
         // ── DAP ──────────────────────────────────────────────────────────────
-        // Check PATH first (idempotent).  Only auto-install if the manifest
-        // provides an explicit dap.install command.  An empty dap.install means
-        // "this adapter needs a manual/complex install" — guide the user to run
-        // :DapInstall instead of silently attempting a potentially large download.
+        // Check PATH first (idempotent), then consult the unified resolver
+        // that knows about both manifest-declared installs AND the built-in
+        // multi-step installers (codelldb, debugpy venv, netcoredbg archive
+        // unpack). Previously this branch read `manifest.dap.install` only,
+        // which is empty for adapters with hardcoded installers — sending
+        // the user into a `:DapInstall <lang>` loop that resolved back here.
         if !manifest.dap.adapter.is_empty() {
             let dap_binary = manifest.dap.binary.as_str();
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
-            } else if !manifest.dap.install_cmd_for_platform().is_empty() {
-                let dap_key = format!("dap:{}", manifest.dap.adapter);
-                self.lsp_installing.insert(dap_key.clone());
-                install_commands.push(manifest.dap.install_cmd_for_platform().to_string());
-                // Only set install context if LSP didn't already set it.
-                if self.pending_install_context.is_none() {
-                    self.pending_install_context = Some(InstallContext {
-                        ext_name: ext_name.clone(),
-                        install_key: dap_key,
-                    });
+            } else {
+                let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
+                    manifest.dap.adapter.as_str(),
+                    &available_manifests,
+                );
+                if let Some(cmd_str) = adapter_install {
+                    let dap_key = format!("dap:{}", manifest.dap.adapter);
+                    self.lsp_installing.insert(dap_key.clone());
+                    install_commands.push(cmd_str);
+                    // Only set install context if LSP didn't already set it.
+                    if self.pending_install_context.is_none() {
+                        self.pending_install_context = Some(InstallContext {
+                            ext_name: ext_name.clone(),
+                            install_key: dap_key,
+                        });
+                    }
+                    status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
+                } else if !dap_binary.is_empty() {
+                    // Nothing knows how to install this adapter — fall back
+                    // to telling the user.
+                    status_parts.push(format!(
+                        "DAP: {dap_binary} needs manual install (no automated installer)"
+                    ));
                 }
-                status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
-            } else if !dap_binary.is_empty() {
-                // No auto-install — guide the user to :DapInstall.
-                status_parts.push(format!(
-                    "DAP: run :DapInstall {ext_name} to set up {dap_binary}"
-                ));
             }
         }
 
