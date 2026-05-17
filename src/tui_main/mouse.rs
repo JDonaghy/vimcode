@@ -1026,7 +1026,24 @@ pub(super) fn handle_mouse(
                         .is_some_and(|t| t.selection.is_some())
                 {
                     let term_row = row - term_strip_top - 1;
-                    let term_col = col.saturating_sub(editor_left);
+                    // #444: pane-relative col. Click uses
+                    // TerminalSplitLayout::hit_test which returns
+                    // 0-based col from the active pane's left edge.
+                    // Drag must match, otherwise right-pane drag
+                    // overshoots by left_pane_cols. Left pane is
+                    // unaffected because left.x == editor_left.
+                    let split_layout = engine.terminal_split_layout.borrow();
+                    let active_pane_x = if let Some(ref sl) = *split_layout {
+                        if engine.terminal_active == 1 {
+                            sl.right.x as u16
+                        } else {
+                            sl.left.x as u16
+                        }
+                    } else {
+                        editor_left
+                    };
+                    drop(split_layout);
+                    let term_col = col.saturating_sub(active_pane_x);
                     if let Some(term) = engine.active_terminal_mut() {
                         if let Some(ref mut sel) = term.selection {
                             sel.end_row = term_row;
