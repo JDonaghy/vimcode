@@ -575,7 +575,23 @@ impl Engine {
             // Remove binary from safe dirs.
             for dir in &safe_dirs {
                 let path = dir.join(bin_name);
-                if path.exists() && std::fs::remove_file(&path).is_ok() {
+                if !path.exists() {
+                    continue;
+                }
+                // #436: ~/.cargo/bin/<binary> may be a symlink to `rustup`
+                // (rustup creates these proxies for every component binary,
+                // including rust-analyzer).  Removing the proxy strands the
+                // rustup-managed binary — `rustup component add` won't
+                // recreate it, so the user has to do `ln -s rustup …` by
+                // hand.  Skip rustup proxies and leave them in place.
+                if is_rustup_proxy(&path) {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-remove] Skipping rustup proxy at {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
                     removed.push(format!("{}", path.display()));
                 }
             }
@@ -784,4 +800,97 @@ impl Engine {
         }
         status
     }
+}
+
+/// Returns true if `path` is a symlink pointing to `rustup` (the rustup
+/// proxy used to dispatch component binaries like `rust-analyzer`,
+/// `rustc`, `rustfmt`).  These proxies are created by rustup and cannot
+/// be restored by `rustup component add` once removed.
+#[cfg(not(target_os = "windows"))]
+fn is_rustup_proxy(path: &Path) -> bool {
+    match std::fs::read_link(path) {
+        Ok(target) => {
+            // Target is just `rustup` (relative symlink, the common case)
+            // or an absolute path ending in `/rustup`.
+            target == Path::new("rustup")
+                || target.file_name().map(|n| n == "rustup").unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod rustup_proxy_tests {
+    use super::is_rustup_proxy;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("vimcode-rustup-test-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn symlink_to_relative_rustup_is_proxy() {
+        // #436: rustup creates `~/.cargo/bin/rust-analyzer -> rustup`
+        // (relative symlink).  ext_remove_tools must skip these.
+        let dir = scratch_dir("relative");
+        let link = dir.join("rust-analyzer");
+        symlink("rustup", &link).unwrap();
+        assert!(is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_to_absolute_rustup_is_proxy() {
+        let dir = scratch_dir("absolute");
+        let link = dir.join("rust-analyzer");
+        symlink("/usr/local/bin/rustup", &link).unwrap();
+        assert!(is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_file_is_not_proxy() {
+        // A real binary (not a symlink) must be removed normally.
+        let dir = scratch_dir("real");
+        let bin = dir.join("codelldb");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        assert!(!is_rustup_proxy(&bin));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_to_other_target_is_not_proxy() {
+        // A symlink to a non-rustup target should still be removable.
+        let dir = scratch_dir("other");
+        let target = dir.join("some-binary");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.join("rust-analyzer");
+        symlink(&target, &link).unwrap();
+        assert!(!is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// On Windows rustup proxies are hard-linked copies of rustup.exe;
+/// detect by matching file size against the sibling `rustup.exe`.
+/// Falls back to false on any I/O error — better to over-delete than
+/// to leak unmanaged binaries.
+#[cfg(target_os = "windows")]
+fn is_rustup_proxy(path: &Path) -> bool {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let rustup_exe = parent.join("rustup.exe");
+    if !rustup_exe.exists() {
+        return false;
+    }
+    let proxy_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let rustup_len = std::fs::metadata(&rustup_exe).map(|m| m.len()).unwrap_or(0);
+    proxy_len != 0 && proxy_len == rustup_len
 }
