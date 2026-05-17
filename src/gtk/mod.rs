@@ -1571,9 +1571,22 @@ impl SimpleComponent for App {
                                     // select_all_matches / split_editor_right /
                                     // split_editor_down / nav_back /
                                     // nav_forward).
-                                    if let Some(id) = &matched_acc_id {
-                                        if dispatch_gtk_panel_accelerator(id.as_str(), &sender, &engine) {
-                                            return gtk4::glib::Propagation::Stop;
+                                    //
+                                    // #287: yield to insert-mode completion
+                                    // for the keys it consumes (Ctrl-N /
+                                    // Ctrl-P always; Tab / Down / Up when a
+                                    // display-only popup is active) so the
+                                    // global accelerator (e.g. <C-p> →
+                                    // fuzzy_finder) doesn't win over
+                                    // candidate-cycling.
+                                    let completion_intercepts = engine
+                                        .borrow()
+                                        .insert_completion_intercepts_key(&key_name, ctrl);
+                                    if !completion_intercepts {
+                                        if let Some(id) = &matched_acc_id {
+                                            if dispatch_gtk_panel_accelerator(id.as_str(), &sender, &engine) {
+                                                return gtk4::glib::Propagation::Stop;
+                                            }
                                         }
                                     }
 
