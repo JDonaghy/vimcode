@@ -47,6 +47,13 @@ Only investigate the vimcode side if the error persists after pulling quadraui. 
 | `docs/QUADRAUI_GUIDE.md` | Quadraui migrations, cross-backend rendering, paint↔click integration |
 | `docs/PATTERNS.md` | Adding new keys, commands, settings, theme colors, or clickable UI |
 | `docs/DOC_MAINTENANCE.md` | After completing any feature — lists all files to update |
+| `docs/COORDINATOR.md` | Designated as coordinator for multi-machine parallel work |
+
+## Agent Roles
+
+The default role is **developer** — read issues, write code, run tests, open PRs.
+
+If the user designates you as **coordinator**, switch to planning mode: read `docs/COORDINATOR.md` and follow that protocol. Coordinators don't write code — they track work across machines, prevent file conflicts, and assign the next issue when an agent finishes.
 
 ## Development Workflow
 
