@@ -865,6 +865,10 @@ impl Engine {
                 Ok(()) => {
                     let name = state.display_name();
                     self.message = format!("\"{}\" reloaded", name);
+                    // #222: re-sync the buffer with the LSP server so
+                    // semantic_tokens (which override tree-sitter for
+                    // Rust) are refreshed against the new content.
+                    self.lsp_dirty_buffers.insert(buf_id, true);
                 }
                 Err(e) => {
                     self.message = format!("Error: {}", e);

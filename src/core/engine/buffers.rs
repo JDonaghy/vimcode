@@ -379,6 +379,12 @@ impl Engine {
                     .unwrap_or_default();
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                     if state.reload_from_disk().is_ok() {
+                        // #222: re-sync the buffer with the LSP server so
+                        // semantic_tokens (which override tree-sitter for
+                        // Rust) are refreshed against the new content.
+                        // lsp_flush_changes clears the cached tokens,
+                        // sends notify_did_change, and re-requests them.
+                        self.lsp_dirty_buffers.insert(buf_id, true);
                         self.message = format!("\"{}\" reloaded", name);
                         any_changed = true;
                     }
@@ -3179,6 +3185,12 @@ impl Engine {
                     state.update_syntax();
                 }
                 self.refresh_git_diff(bid);
+                // #222: re-sync the buffer with the LSP server so
+                // semantic_tokens (which override tree-sitter for Rust)
+                // are refreshed against the new content. lsp_flush_changes
+                // clears the cached tokens, sends notify_did_change, and
+                // re-requests them.
+                self.lsp_dirty_buffers.insert(bid, true);
                 let display = canonical
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())

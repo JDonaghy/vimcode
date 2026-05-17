@@ -8222,6 +8222,35 @@ fn test_lsp_dirty_buffer_tracking() {
 }
 
 #[test]
+fn test_reload_marks_lsp_dirty() {
+    // #222: external edits left semantic_tokens (which override
+    // tree-sitter coloring for Rust) cached and stale because reload
+    // paths didn't mark the buffer dirty for LSP. lsp_flush_changes only
+    // runs for buffers in lsp_dirty_buffers, so the resync (clear
+    // semantic_tokens + notify_did_change + re-request semantic_tokens)
+    // never happened.
+    let path = std::env::temp_dir().join("vimcode_test_reload_lsp_dirty.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&path));
+    let buf_id = engine.active_buffer_id();
+    engine.lsp_dirty_buffers.clear();
+
+    // Mutate the file on disk to simulate `cargo fmt` / external edit.
+    std::fs::write(&path, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+
+    // :edit! triggers state.reload_from_disk(). Without #222 this leaves
+    // lsp_dirty_buffers empty and semantic_tokens stale.
+    engine.execute_command("edit!");
+    assert!(
+        engine.lsp_dirty_buffers.contains_key(&buf_id),
+        ":edit! must mark the buffer LSP-dirty so semantic_tokens get refreshed",
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn test_undo_redo_marks_lsp_dirty() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello");
