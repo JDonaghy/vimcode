@@ -2651,8 +2651,13 @@ pub(super) fn handle_mouse(
     // renderer (`render_impl.rs::draw_frame` truncates with `as u16`).
     // Using `.round()` here meant clicks on a divider at e.g. col 40.5
     // (rendered at 40) were hit-tested at 41 and missed.
+    //
+    // For horizontal splits the "visual divider" is the second group's
+    // entire tab-bar block (per render_impl.rs:359). When breadcrumbs are
+    // on the block is 2 rows tall — accept a click on either row.
     if let Some(layout) = last_layout {
         if let Some(ref split) = layout.editor_group_split {
+            let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
             for div in &split.dividers {
                 let hit = match div.direction {
                     crate::core::window::SplitDirection::Vertical => {
@@ -2663,7 +2668,8 @@ pub(super) fn handle_mouse(
                     }
                     crate::core::window::SplitDirection::Horizontal => {
                         let div_row = div.position as u16;
-                        editor_row == div_row
+                        editor_row >= div_row
+                            && editor_row < div_row + tab_bar_rows
                             && (rel_col as f64) >= div.cross_start
                             && (rel_col as f64) < div.cross_start + div.cross_size
                     }
