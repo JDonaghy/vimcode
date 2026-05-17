@@ -18060,80 +18060,50 @@ fn test_symbol_tree_sorted_by_kind_then_name() {
 }
 
 #[test]
-fn test_symbol_tree_top_level_expanded_by_default() {
-    let mut e = engine_with_text("hello");
+fn test_symbol_tree_parent_is_jumpable_not_expandable() {
+    // #262: parents (functions, structs with nested methods) must jump to
+    // their definition line on Enter/click rather than just toggling
+    // expand. We achieve that by marking every symbol-tree row
+    // non-expandable so the click/Enter dispatch always falls through to
+    // picker_confirm. Children are still emitted flat at increasing
+    // depth, so the indent still shows the hierarchy.
+    //
+    // Buffer needs at least Engine's line (10) so set_cursor_for_window
+    // doesn't clamp.
+    let mut e = engine_with_text(&"line\n".repeat(20));
     let symbols = make_hierarchical_symbols();
     e.open_picker(PickerSource::CommandCenter);
     e.picker_query = "@".to_string();
     e.picker_populate_document_symbols(symbols);
 
-    // Top-level items should be expanded
+    // Every row is non-expandable — both parents (Config, Engine) and
+    // leaves (load, handle_key, new, main) — so the
+    // `if in_tree_mode && picker_toggle_expand() { ... }` gate in the
+    // Enter handler and both backends' click handlers always falls
+    // through to picker_confirm.
     for item in &e.picker_all_items {
-        if item.depth == 0 && item.expandable {
-            assert!(item.expanded, "{} should be expanded", item.filter_text);
-        }
+        assert!(
+            !item.expandable,
+            "{} should not be expandable (would block jump on parent symbols)",
+            item.filter_text
+        );
     }
-    // All items should be visible since top-level is expanded
+
+    // All children are always visible (no fold-state hiding any row).
     assert_eq!(e.picker_items.len(), 6);
-}
 
-#[test]
-fn test_symbol_tree_collapse_hides_children() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Select "Engine" (index 2 in visible items: Config, load, Engine, ...)
-    e.picker_selected = 2; // Engine
+    // picker_toggle_expand returns false → backends fall through to confirm.
+    e.picker_selected = 2; // Engine (a parent)
     assert_eq!(e.picker_items[2].filter_text, "Engine");
-
-    // Toggle collapse
-    let toggled = e.picker_toggle_expand();
-    assert!(toggled, "Engine should be toggleable");
-
-    // Engine's children (handle_key, new) should be hidden
-    let visible_names: Vec<&str> = e
-        .picker_items
-        .iter()
-        .map(|i| i.filter_text.as_str())
-        .collect();
     assert!(
-        !visible_names.contains(&"handle_key"),
-        "handle_key should be hidden after collapse"
+        !e.picker_toggle_expand(),
+        "parent symbol must not toggle — that's the bug being fixed"
     );
-    assert!(
-        !visible_names.contains(&"new"),
-        "new should be hidden after collapse"
-    );
-    // Config + load + Engine + main = 4
-    assert_eq!(e.picker_items.len(), 4);
-}
 
-#[test]
-fn test_symbol_tree_expand_shows_children() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Collapse Engine first
-    e.picker_selected = 2;
-    e.picker_toggle_expand();
-    assert_eq!(e.picker_items.len(), 4);
-
-    // Re-expand Engine
-    // After collapse, Engine is still at index 2
-    e.picker_selected = 2;
-    let toggled = e.picker_toggle_expand();
-    assert!(toggled);
-    assert_eq!(
-        e.picker_items.len(),
-        6,
-        "All items visible again after re-expand"
-    );
+    // Confirm on the parent jumps to the parent's line (10), not a child's.
+    let action = e.picker_confirm();
+    assert!(matches!(action, EngineAction::None));
+    assert_eq!(e.view().cursor.line, 10, "should jump to Engine's line");
 }
 
 #[test]
@@ -18157,31 +18127,6 @@ fn test_symbol_tree_filter_flattens() {
 }
 
 #[test]
-fn test_symbol_tree_enter_on_expandable_toggles() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Select Config (expandable, at index 0)
-    e.picker_selected = 0;
-    assert_eq!(e.picker_items[0].filter_text, "Config");
-    assert!(e.picker_items[0].expandable);
-
-    // Press Enter — should toggle expand, not confirm
-    let action = e.handle_picker_key("Return", None, false);
-    assert!(
-        e.picker_open,
-        "Picker should stay open after toggling expand"
-    );
-    assert!(
-        matches!(action, EngineAction::None),
-        "Should return None, not navigate"
-    );
-}
-
-#[test]
 fn test_symbol_tree_enter_on_leaf_confirms() {
     let mut e = engine_with_text("line0\nline1\nline2\nline3\n");
     let symbols = make_hierarchical_symbols();
@@ -18197,57 +18142,6 @@ fn test_symbol_tree_enter_on_leaf_confirms() {
     // Press Enter — should confirm (close picker)
     let _action = e.handle_picker_key("Return", None, false);
     assert!(!e.picker_open, "Picker should close after confirming leaf");
-}
-
-#[test]
-fn test_symbol_tree_right_expands_left_collapses() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Collapse Config first
-    e.picker_selected = 0;
-    e.picker_toggle_expand();
-    assert_eq!(e.picker_items.len(), 5); // Config(collapsed), Engine, handle_key, new, main
-
-    // Right arrow on collapsed Config should expand
-    e.picker_selected = 0;
-    e.handle_picker_key("Right", None, false);
-    assert_eq!(e.picker_items.len(), 6); // All visible again
-
-    // Left arrow on expanded Config should collapse
-    e.picker_selected = 0;
-    e.handle_picker_key("Left", None, false);
-    assert_eq!(e.picker_items.len(), 5);
-}
-
-#[test]
-fn test_symbol_tree_expandable_flag() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Structs with children should be expandable
-    let config = &e.picker_all_items[0];
-    assert_eq!(config.filter_text, "Config");
-    assert!(config.expandable);
-
-    let engine = &e.picker_all_items[2];
-    assert_eq!(engine.filter_text, "Engine");
-    assert!(engine.expandable);
-
-    // Leaf items should not be expandable
-    let load = &e.picker_all_items[1];
-    assert_eq!(load.filter_text, "load");
-    assert!(!load.expandable);
-
-    let main_fn = &e.picker_all_items[5];
-    assert_eq!(main_fn.filter_text, "main");
-    assert!(!main_fn.expandable);
 }
 
 #[test]
@@ -18342,7 +18236,11 @@ fn test_symbol_tree_from_flat_container_field() {
         .iter()
         .find(|i| i.filter_text == "Engine")
         .expect("Should have Engine");
-    assert!(engine_item.expandable, "Engine should be expandable");
+    // #262: symbol-tree rows are never expandable — see
+    // test_symbol_tree_parent_is_jumpable_not_expandable. The hierarchy
+    // is still reconstructed and shown via `depth`; only the toggleable
+    // fold state is gone.
+    assert!(!engine_item.expandable, "Engine row must not be expandable");
     assert_eq!(engine_item.depth, 0);
 
     // Methods should be at depth 1
@@ -18402,7 +18300,13 @@ fn test_symbol_tree_synthetic_container() {
         .iter()
         .find(|i| i.filter_text == "ImplBlock")
         .expect("Should create synthetic ImplBlock parent");
-    assert!(parent.expandable, "Synthetic parent should be expandable");
+    // #262: synthetic parents are also non-expandable (no row is). What
+    // matters is that the synthetic parent shows up at depth 0 with its
+    // methods at depth 1, preserving the visible hierarchy.
+    assert!(
+        !parent.expandable,
+        "Synthetic parent row must not be expandable"
+    );
     assert_eq!(parent.depth, 0);
 
     // Children should be at depth 1

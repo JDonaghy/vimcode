@@ -1186,6 +1186,12 @@ impl Engine {
                 sym.line as usize,
                 sym.character as usize,
             );
+            // #262: symbol items are never expandable. Every row is a
+            // jumpable destination (GotoSymbol). Children are emitted
+            // flat at increasing depth so the indent still shows the
+            // hierarchy, but Enter / click always jumps via picker_confirm
+            // instead of taking the toggle-expand branch keyed off
+            // `expandable`. VSCode breadcrumb picker has the same shape.
             out.push(PickerItem {
                 filter_text: sym.name.clone(),
                 display,
@@ -1195,8 +1201,8 @@ impl Engine {
                 score: 0,
                 match_positions: Vec::new(),
                 depth,
-                expandable: has_children,
-                expanded: depth == 0, // Top-level items start expanded
+                expandable: false,
+                expanded: true,
             });
             if has_children {
                 Self::build_symbol_tree_items(&sym.children, path, depth + 1, out);
