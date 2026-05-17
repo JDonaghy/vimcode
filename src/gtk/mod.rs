@@ -276,9 +276,14 @@ struct App {
     /// anchor pixel.
     explorer_line_height_cell: Rc<Cell<f64>>,
     explorer_char_width_cell: Rc<Cell<f64>>,
-    /// Cached ContextMenuLayout from the last explorer-DA paint (#426).
-    /// Click + motion handlers hit-test against this.
+    /// Cached ContextMenuLayout from the last explorer-ctx-menu paint
+    /// on the window-overlay DA (#426). Capture-phase click + motion
+    /// handlers hit-test against this.
     explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
+    /// Window-level overlay DA dedicated to the explorer ctx menu (#426)
+    /// — kept here so `Msg::ExplorerRightClick` / `Esc` / item-confirm
+    /// can `queue_draw()` it.
+    ctx_menu_overlay_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Fractional dy accumulator for the explorer scroll wheel. Small
     /// trackpad deltas are summed here until they exceed one row, so no
     /// scroll event is silently dropped.
@@ -779,6 +784,13 @@ enum Msg {
         x: f64,
         y: f64,
     },
+    /// #426: click on the ctx-menu overlay DA (window coords). Routed
+    /// through the overlay's gesture so the menu can extend past the
+    /// explorer's right edge into the editor area.
+    ExplorerCtxMenuClick(f64, f64),
+    /// #426: mouse motion on the ctx-menu overlay DA (window coords).
+    /// Updates the engine's `context_menu.selected` from the cached layout.
+    ExplorerCtxMenuMotion(f64, f64),
     /// Mouse-wheel on the explorer DrawingArea. Positive dy scrolls down.
     ExplorerScroll(f64),
     /// UiEvent (scroll, mouse) on the explorer DrawingArea — routed
@@ -1944,6 +1956,8 @@ impl SimpleComponent for App {
         let explorer_char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(8.0));
         let explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>> =
             Rc::new(RefCell::new(None));
+        let ctx_menu_overlay_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
+            Rc::new(RefCell::new(None));
         let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let drawing_area_ref = Rc::new(RefCell::new(None));
         // Editor pointer cache (#240): updated by EventControllerMotion on
@@ -2114,6 +2128,7 @@ impl SimpleComponent for App {
             explorer_line_height_cell: explorer_line_height_cell.clone(),
             explorer_char_width_cell: explorer_char_width_cell.clone(),
             explorer_ctx_menu_layout: explorer_ctx_menu_layout.clone(),
+            ctx_menu_overlay_da: ctx_menu_overlay_da_ref.clone(),
             explorer_scroll_accum: explorer_scroll_accum.clone(),
             drawing_area: drawing_area_ref.clone(),
             menu_bar_da: menu_bar_da_ref.clone(),
@@ -2426,20 +2441,11 @@ impl SimpleComponent for App {
                     engine.explorer_tree.borrow().render(b, q_rect);
                 });
 
-                // #426: render the engine-drawn ctx menu on this DA when
-                // the trigger was an explorer right-click. Painted last so
-                // it overlays the tree rows.
-                *ctx_menu_layout_d.borrow_mut() =
-                    crate::gtk::draw::draw_explorer_context_menu_popup(
-                        cr,
-                        &layout,
-                        &engine,
-                        &theme,
-                        w,
-                        h,
-                        char_width,
-                        line_height,
-                    );
+                // #426: the explorer ctx menu paints on a window-level
+                // overlay DA (`ctx_menu_overlay_da`) so it can extend past
+                // the explorer's narrow width into the editor area —
+                // rendering it here would clip on the right edge.
+                let _ = (char_width, &ctx_menu_layout_d, w, h);
             });
         }
         {
@@ -2648,6 +2654,85 @@ impl SimpleComponent for App {
 
             widgets.window_overlay.add_overlay(&hover_da);
             *panel_hover_da_ref.borrow_mut() = Some(hover_da);
+        }
+
+        // ── Context-menu overlay DrawingArea (#426) ──────────────────────────
+        // Window-level overlay so explorer ctx menus can extend past the
+        // narrow sidebar into the editor area without being clipped.
+        // Editor/tab/action ctx menus stay on the editor DA (no clipping
+        // problem — editor DA is wide enough). This overlay only paints
+        // when the active ctx menu targets the explorer.
+        {
+            let ctx_overlay_da = gtk4::DrawingArea::new();
+            ctx_overlay_da.set_hexpand(true);
+            ctx_overlay_da.set_vexpand(true);
+            ctx_overlay_da.set_can_target(false);
+            ctx_overlay_da.set_focusable(false);
+
+            {
+                let engine_d = engine.clone();
+                let ctx_layout_d = explorer_ctx_menu_layout.clone();
+                ctx_overlay_da.set_draw_func(move |da, cr, _w, _h| {
+                    let engine = engine_d.borrow();
+                    let on_explorer = matches!(
+                        engine.context_menu.as_ref().map(|cm| &cm.target),
+                        Some(
+                            core::engine::ContextMenuTarget::ExplorerFile { .. }
+                                | core::engine::ContextMenuTarget::ExplorerDir { .. }
+                        )
+                    );
+                    if !on_explorer {
+                        *ctx_layout_d.borrow_mut() = None;
+                        return;
+                    }
+                    let theme = Theme::from_name(&engine.settings.colorscheme);
+                    let font_desc = FontDescription::from_string(&UI_FONT());
+                    let pango_ctx = pangocairo::create_context(cr);
+                    let layout = pango::Layout::new(&pango_ctx);
+                    layout.set_font_description(Some(&font_desc));
+                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
+                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
+                        / pango::SCALE as f64;
+                    layout.set_text("0");
+                    let char_width = layout.pixel_size().0 as f64;
+                    let w = da.width() as f64;
+                    let h = da.height() as f64;
+                    *ctx_layout_d.borrow_mut() = crate::gtk::draw::draw_explorer_context_menu_popup(
+                        cr,
+                        &layout,
+                        &engine,
+                        &theme,
+                        w,
+                        h,
+                        char_width.max(1.0),
+                        line_height.max(1.0),
+                    );
+                });
+            }
+
+            // Click handling: hit-test the cached layout. On hit, fire
+            // confirm via Msg::ExplorerCtxMenuClick. On miss, dismiss.
+            {
+                let sender_ctx = sender.input_sender().clone();
+                let gesture = gtk4::GestureClick::new();
+                gesture.set_button(1);
+                gesture.connect_pressed(move |_, _n_press, x, y| {
+                    sender_ctx.send(Msg::ExplorerCtxMenuClick(x, y)).ok();
+                });
+                ctx_overlay_da.add_controller(gesture);
+            }
+            // Motion handling: update hover idx.
+            {
+                let sender_ctx = sender.input_sender().clone();
+                let motion = gtk4::EventControllerMotion::new();
+                motion.connect_motion(move |_, x, y| {
+                    sender_ctx.send(Msg::ExplorerCtxMenuMotion(x, y)).ok();
+                });
+                ctx_overlay_da.add_controller(motion);
+            }
+
+            widgets.window_overlay.add_overlay(&ctx_overlay_da);
+            *ctx_menu_overlay_da_ref.borrow_mut() = Some(ctx_overlay_da);
 
             // Capture-phase click on the window overlay: intercept clicks on
             // popup links before they reach child widgets.
@@ -4636,7 +4721,9 @@ impl SimpleComponent for App {
             | Msg::ExplorerClick { .. }
             | Msg::ExplorerRightClick { .. }
             | Msg::ExplorerScroll(_)
-            | Msg::ExplorerUiEvent(_) => {
+            | Msg::ExplorerUiEvent(_)
+            | Msg::ExplorerCtxMenuClick(..)
+            | Msg::ExplorerCtxMenuMotion(..) => {
                 self.handle_explorer_msg(msg, &sender);
             }
             Msg::ExtPanelKey(_, _)
@@ -9169,15 +9256,13 @@ impl App {
                 self.engine.borrow_mut().explorer_scroll(step);
                 self.queue_explorer_draw();
             }
+            Msg::ExplorerCtxMenuClick(x, y) => {
+                self.handle_explorer_ctx_menu_overlay_click(x, y, sender);
+            }
+            Msg::ExplorerCtxMenuMotion(x, y) => {
+                self.handle_explorer_ctx_menu_overlay_motion(x, y);
+            }
             Msg::ExplorerUiEvent(ev) => {
-                // #426: when an explorer ctx menu is open, intercept clicks
-                // and hover against the cached ContextMenuLayout. Returns
-                // true if the event was consumed by the menu.
-                if self.handle_explorer_ctx_menu_ui_event(&ev, sender) {
-                    self.queue_explorer_draw();
-                    self.draw_needed.set(true);
-                    return;
-                }
                 let dominated = matches!(
                     ev,
                     quadraui::UiEvent::MouseDown { .. }
@@ -9392,6 +9477,7 @@ impl App {
         match key_name {
             "Escape" => {
                 self.engine.borrow_mut().close_context_menu();
+                self.dismiss_ctx_menu_overlay();
                 true
             }
             "Return" => {
@@ -9409,29 +9495,40 @@ impl App {
                 if let (Some(action), Some(target)) = (action, target_path) {
                     self.dispatch_explorer_ctx_action(&action, &target, sender);
                 }
+                self.dismiss_ctx_menu_overlay();
                 true
             }
             "j" | "Down" => {
-                let mut eng = self.engine.borrow_mut();
-                if let Some(ref mut cm) = eng.context_menu {
-                    let len = cm.items.len();
-                    if len > 0 {
-                        cm.selected = (cm.selected + 1) % len;
+                {
+                    let mut eng = self.engine.borrow_mut();
+                    if let Some(ref mut cm) = eng.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = (cm.selected + 1) % len;
+                        }
                     }
+                }
+                if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+                    overlay.queue_draw();
                 }
                 true
             }
             "k" | "Up" => {
-                let mut eng = self.engine.borrow_mut();
-                if let Some(ref mut cm) = eng.context_menu {
-                    let len = cm.items.len();
-                    if len > 0 {
-                        cm.selected = if cm.selected > 0 {
-                            cm.selected - 1
-                        } else {
-                            len - 1
-                        };
+                {
+                    let mut eng = self.engine.borrow_mut();
+                    if let Some(ref mut cm) = eng.context_menu {
+                        let len = cm.items.len();
+                        if len > 0 {
+                            cm.selected = if cm.selected > 0 {
+                                cm.selected - 1
+                            } else {
+                                len - 1
+                            };
+                        }
                     }
+                }
+                if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+                    overlay.queue_draw();
                 }
                 true
             }
@@ -9439,6 +9536,7 @@ impl App {
                 // Any other key dismisses + falls through to normal explorer
                 // handling so the user can keep navigating.
                 self.engine.borrow_mut().close_context_menu();
+                self.dismiss_ctx_menu_overlay();
                 false
             }
         }
@@ -9446,67 +9544,80 @@ impl App {
 
     /// #426: Intercept UI events on the explorer DA when an engine-drawn
     /// explorer ctx menu is open. Returns true if consumed.
-    fn handle_explorer_ctx_menu_ui_event(
-        &mut self,
-        ev: &quadraui::UiEvent,
-        sender: &ComponentSender<Self>,
-    ) -> bool {
-        use core::engine::ContextMenuTarget;
-        // Only intercept when the menu is open and targets the explorer.
-        {
-            let eng = self.engine.borrow();
-            match eng.context_menu.as_ref().map(|cm| &cm.target) {
-                Some(
-                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. },
-                ) => {}
-                _ => return false,
-            }
-        }
+    /// #426: Mouse-move on the ctx-menu overlay DA — update hover idx
+    /// from the cached layout (window coords).
+    fn handle_explorer_ctx_menu_overlay_motion(&mut self, x: f64, y: f64) {
         let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
             Some(l) => l,
-            None => return false,
+            None => return,
         };
-        match ev {
-            quadraui::UiEvent::MouseMoved { position, .. } => {
-                let hit = layout.hit_test(position.x, position.y);
-                if let Some(idx) = core::engine::context_menu_hit_to_idx(&hit) {
-                    let mut eng = self.engine.borrow_mut();
-                    if let Some(ref mut cm) = eng.context_menu {
-                        cm.selected = idx;
-                    }
-                }
-                true
+        let hit = layout.hit_test(x as f32, y as f32);
+        if let Some(idx) = core::engine::context_menu_hit_to_idx(&hit) {
+            let mut eng = self.engine.borrow_mut();
+            if let Some(ref mut cm) = eng.context_menu {
+                cm.selected = idx;
             }
-            quadraui::UiEvent::MouseDown { position, .. } => {
-                let hit = layout.hit_test(position.x, position.y);
-                let idx = core::engine::context_menu_hit_to_idx(&hit);
-                if let Some(idx) = idx {
-                    // Pull target path BEFORE confirm consumes the menu.
-                    let target_path = self.engine.borrow().context_menu.as_ref().and_then(|cm| {
-                        match &cm.target {
-                            ContextMenuTarget::ExplorerFile { path }
-                            | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
-                            _ => None,
-                        }
-                    });
-                    let action = {
-                        let mut eng = self.engine.borrow_mut();
-                        if let Some(ref mut cm) = eng.context_menu {
-                            cm.selected = idx;
-                        }
-                        eng.context_menu_confirm()
-                    };
-                    if let (Some(action), Some(target)) = (action, target_path) {
-                        self.dispatch_explorer_ctx_action(&action, &target, sender);
-                    }
-                } else {
-                    // Click outside any item → dismiss the menu.
-                    self.engine.borrow_mut().close_context_menu();
-                }
-                true
-            }
-            _ => false,
         }
+        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+            overlay.queue_draw();
+        }
+    }
+
+    /// #426: Click on the ctx-menu overlay DA — hit-test cached layout
+    /// and confirm or dismiss. On confirm, dispatch backend-only actions.
+    fn handle_explorer_ctx_menu_overlay_click(
+        &mut self,
+        x: f64,
+        y: f64,
+        sender: &ComponentSender<Self>,
+    ) {
+        use core::engine::ContextMenuTarget;
+        let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
+            Some(l) => l,
+            None => {
+                self.engine.borrow_mut().close_context_menu();
+                self.dismiss_ctx_menu_overlay();
+                return;
+            }
+        };
+        let hit = layout.hit_test(x as f32, y as f32);
+        let idx = core::engine::context_menu_hit_to_idx(&hit);
+        if let Some(idx) = idx {
+            let target_path =
+                self.engine
+                    .borrow()
+                    .context_menu
+                    .as_ref()
+                    .and_then(|cm| match &cm.target {
+                        ContextMenuTarget::ExplorerFile { path }
+                        | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
+                        _ => None,
+                    });
+            let action = {
+                let mut eng = self.engine.borrow_mut();
+                if let Some(ref mut cm) = eng.context_menu {
+                    cm.selected = idx;
+                }
+                eng.context_menu_confirm()
+            };
+            if let (Some(action), Some(target)) = (action, target_path) {
+                self.dispatch_explorer_ctx_action(&action, &target, sender);
+            }
+        } else {
+            // Click outside any item → dismiss.
+            self.engine.borrow_mut().close_context_menu();
+        }
+        self.dismiss_ctx_menu_overlay();
+    }
+
+    /// #426: Stop intercepting events on the ctx-menu overlay DA and
+    /// queue a redraw so the menu paint clears.
+    fn dismiss_ctx_menu_overlay(&self) {
+        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+            overlay.set_can_target(false);
+            overlay.queue_draw();
+        }
+        *self.explorer_ctx_menu_layout.borrow_mut() = None;
     }
 
     /// #426: Map the action string returned by `context_menu_confirm` for
@@ -9561,19 +9672,34 @@ impl App {
         } else {
             (self.engine.borrow().cwd.clone(), true)
         };
-        // #426: engine-driven ctx menu. Convert explorer-DA-local click px
-        // to cells using the explorer DA's own UI-font metrics so the
-        // ctx-menu render anchor lands at the click position. Native
-        // gtk4::PopoverMenu path is gone — render lives in the explorer
-        // DA's draw_func via `draw_explorer_context_menu_popup`.
+        // #426: engine-driven ctx menu. The menu renders on a window-
+        // level overlay DA so it can extend past the narrow explorer DA
+        // into the editor area. Translate explorer-DA-local (x, y) to
+        // window coords via `compute_point`, then divide by UI-font
+        // metrics for the engine cell storage.
+        let (win_x, win_y) = if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
+            if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+                da.compute_point(overlay, &gtk4::graphene::Point::new(x as f32, y as f32))
+                    .map(|p| (p.x() as f64, p.y() as f64))
+                    .unwrap_or((x, y))
+            } else {
+                (x, y)
+            }
+        } else {
+            (x, y)
+        };
         let cw = self.explorer_char_width_cell.get().max(1.0);
         let lh = self.explorer_line_height_cell.get().max(1.0);
-        let cx = (x / cw) as u16;
-        let cy = (y / lh) as u16;
+        let cx = (win_x / cw) as u16;
+        let cy = (win_y / lh) as u16;
         self.engine
             .borrow_mut()
             .open_explorer_context_menu(target, is_dir, cx, cy);
         self.queue_explorer_draw();
+        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
+            overlay.set_can_target(true);
+            overlay.queue_draw();
+        }
     }
 
     fn handle_find_replace_msg(&mut self, msg: Msg) {
