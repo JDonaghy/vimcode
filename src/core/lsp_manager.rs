@@ -657,9 +657,30 @@ impl LspManager {
         }
 
         // Use the resolved full path so the spawn works regardless of the process's PATH.
-        let (mut config, resolved) = candidates
+        let (mut config, resolved) = match candidates
             .into_iter()
-            .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))?;
+            .find_map(|c| resolve_command(&c.command).map(|p| (c, p)))
+        {
+            Some(pair) => pair,
+            None => {
+                // #436: surface an actionable hint instead of falling through
+                // to the generic "No LSP server found" message.  When the
+                // matching extension manifest has an install command, tell
+                // the user exactly what to run.
+                if let Some(manifest) =
+                    extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
+                {
+                    let install_cmd = manifest.lsp.install_cmd_for_platform();
+                    if !install_cmd.is_empty() && !manifest.lsp.binary.is_empty() {
+                        self.last_start_error = Some(format!(
+                            "{} not found. Run: {}",
+                            manifest.lsp.binary, install_cmd
+                        ));
+                    }
+                }
+                return None;
+            }
+        };
         config.command = resolved.to_string_lossy().into_owned();
 
         // Start the server

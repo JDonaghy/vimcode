@@ -93,6 +93,12 @@ impl Engine {
                     "No {} extension — :ExtInstall {}  (N to dismiss)",
                     manifest.display_name, name
                 );
+            } else if let Some(err) = no_server {
+                // #436: extension is installed but the LSP didn't start
+                // (binary missing, install crashed, etc.).  Surface the
+                // hint from `ensure_server_for_language` instead of
+                // silently failing.
+                self.message = err;
             }
         } else if let Some(err) = no_server {
             // Show dependency errors prominently; generic "no server" only as fallback.

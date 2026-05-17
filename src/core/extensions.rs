@@ -133,20 +133,28 @@ pub struct LspConfig {
 impl LspConfig {
     /// Return the install command for the current platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
-    /// Applies known fixups (e.g. rust-analyzer on Windows uses `rustup component add`).
+    /// Applies known fixups (e.g. rust-analyzer falls back to `rustup component add`
+    /// when rustup is available, since `cargo install rust-analyzer` compiles
+    /// from source and is slow).
     pub fn install_cmd_for_platform(&self) -> &str {
-        // On Windows, rust-analyzer should be installed via rustup, not cargo.
-        // The generic `install` field says `cargo install rust-analyzer` which
-        // compiles from source and is slow.  The rustup component is instant
-        // and is the standard approach.
-        #[cfg(target_os = "windows")]
-        if self.binary == "rust-analyzer"
-            && self.install_windows.is_empty()
-            && self.install.starts_with("cargo install")
-        {
+        self.install_cmd_with(rustup_on_path())
+    }
+
+    /// Inner helper for `install_cmd_for_platform`, parameterised over rustup
+    /// availability so the fixup can be tested without depending on the host's
+    /// PATH.
+    fn install_cmd_with(&self, rustup_available: bool) -> &str {
+        let raw = self.platform_install_cmd_raw();
+        // rust-analyzer: prefer `rustup component add` over `cargo install`.
+        // Anyone with a Rust toolchain has rustup; the component is a
+        // ~30-second binary download vs the ~10-minute source build.
+        if rustup_available && self.binary == "rust-analyzer" && raw.starts_with("cargo install") {
             return "rustup component add rust-analyzer";
         }
+        raw
+    }
 
+    fn platform_install_cmd_raw(&self) -> &str {
         let platform = platform_install_field(
             &self.install_linux,
             &self.install_macos,
@@ -158,6 +166,21 @@ impl LspConfig {
             platform
         }
     }
+}
+
+/// Returns true if `rustup` is on PATH (or `rustup.exe` on Windows).
+fn rustup_on_path() -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.join("rustup").exists() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if dir.join("rustup.exe").exists() {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -416,5 +439,66 @@ binary = "test-lsp"
         assert_eq!(back.len(), ms.len());
         assert_eq!(back[0].name, "rust");
         assert_eq!(back[1].lsp.fallback_binaries, vec!["pylsp"]);
+    }
+
+    #[test]
+    fn rust_analyzer_uses_rustup_when_available() {
+        // #436: bundled rust manifest ships `cargo install rust-analyzer`,
+        // which compiles from source (~10 min silent build).  When rustup
+        // is available, swap to `rustup component add rust-analyzer`
+        // (~30s binary download) on every platform.
+        let cfg = LspConfig {
+            binary: "rust-analyzer".to_string(),
+            install: "cargo install rust-analyzer".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_with(true),
+            "rustup component add rust-analyzer"
+        );
+    }
+
+    #[test]
+    fn rust_analyzer_falls_back_to_cargo_without_rustup() {
+        // If rustup isn't on PATH (rare — most Rust users have rustup),
+        // honour the manifest's cargo install command.
+        let cfg = LspConfig {
+            binary: "rust-analyzer".to_string(),
+            install: "cargo install rust-analyzer".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.install_cmd_with(false), "cargo install rust-analyzer");
+    }
+
+    #[test]
+    fn rust_analyzer_respects_platform_specific_override() {
+        // If the manifest sets an explicit `install_linux` / `install_macos` /
+        // `install_windows`, that wins — the fixup only fires against the
+        // generic `cargo install` fallback.
+        let cfg = LspConfig {
+            binary: "rust-analyzer".to_string(),
+            install: "cargo install rust-analyzer".to_string(),
+            install_linux: "apt install rust-analyzer".to_string(),
+            install_macos: "brew install rust-analyzer".to_string(),
+            install_windows: "winget install rust-analyzer".to_string(),
+            ..Default::default()
+        };
+        // The platform-specific field is selected (not the cargo command),
+        // so the fixup does not match `starts_with("cargo install")`.
+        assert!(!cfg.install_cmd_with(true).starts_with("rustup"));
+    }
+
+    #[test]
+    fn install_fixup_only_targets_rust_analyzer() {
+        // Other binaries that happen to use `cargo install` should be left alone.
+        let cfg = LspConfig {
+            binary: "some-other-server".to_string(),
+            install: "cargo install some-other-server".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_with(true),
+            "cargo install some-other-server"
+        );
     }
 }
