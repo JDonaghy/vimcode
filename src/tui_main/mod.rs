@@ -1638,15 +1638,6 @@ fn event_loop(
         };
         match crossterm_event {
             Event::Key(key_event) => {
-                // #451 diagnostic: log key events with ctx menu state.
-                debug_log!(
-                    "key event: code={:?} kind={:?} mods={:?} ctx_menu={} explorer_focus={}",
-                    key_event.code,
-                    key_event.kind,
-                    key_event.modifiers,
-                    engine.context_menu.is_some(),
-                    engine.explorer_has_focus,
-                );
                 // ── Modal dialog intercepts ALL keys ──────────────────────
                 if engine.dialog.is_some() {
                     if let Some((key_name, unicode, ctrl)) =
@@ -2981,16 +2972,6 @@ fn event_loop(
                 }
             }
             Event::Mouse(mut mouse_event) => {
-                // #451 diagnostic: log every mouse event so we can see if
-                // the terminal is forwarding right-clicks at all. Coalesced
-                // drags below get logged as their final position only.
-                debug_log!(
-                    "mouse event: kind={:?} col={} row={} modifiers={:?}",
-                    mouse_event.kind,
-                    mouse_event.column,
-                    mouse_event.row,
-                    mouse_event.modifiers,
-                );
                 // Coalesce consecutive drag events to avoid render-per-pixel lag
                 if matches!(mouse_event.kind, MouseEventKind::Drag(_)) {
                     while ct_event::poll(Duration::ZERO).unwrap_or(false) {

@@ -1355,20 +1355,6 @@ pub(super) fn handle_mouse(
         ev.kind,
         MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
     ) {
-        crate::tui_main::debug_log!(
-            "right-click: col={} row={} sb_visible={} ab_width={} sidebar_width={} \
-             active_panel={:?} explorer_rows_len={}",
-            col,
-            row,
-            sb_visible,
-            ab_width,
-            sidebar_width,
-            engine
-                .app_shell
-                .active_panel_id()
-                .map(|id| id.as_str().to_string()),
-            engine.explorer_rows.len(),
-        );
         // Swallow if the click landed on a focused modal that wants
         // to consume it (#216 — editor hover popup). The modal stack
         // was reconciled at the top of this function.
@@ -1379,7 +1365,6 @@ pub(super) fn handle_mouse(
             })
             .is_some()
         {
-            crate::tui_main::debug_log!("right-click: swallowed by modal_stack");
             return sidebar_width;
         }
 
@@ -1391,23 +1376,15 @@ pub(super) fn handle_mouse(
         // Right-click on explorer sidebar → open explorer context menu.
         // #451: relaxed the panel gate. The original `active_panel_is(PANEL_EXPLORER)`
         // check meant clicks in the sidebar area silently did nothing whenever
-        // the active panel wasn't the explorer (a non-explorer sidebar click).
-        // Now: if the explorer is showing (rows present) we hit-test against
-        // its rows; otherwise no-op. Backed by `active_panel_is` first to keep
-        // the fast path. Either way clicks in sidebar always consume here.
+        // the active panel wasn't the explorer. Now: if the explorer is showing
+        // (rows present) we hit-test against its rows; otherwise no-op. Either
+        // way clicks in sidebar always consume here.
         if sb_visible && col >= ab_width && col < ab_width + sidebar_width {
             let explorer_active = engine.active_panel_is(PANEL_EXPLORER);
             let has_rows = !engine.explorer_rows.is_empty();
             if explorer_active || has_rows {
                 let sidebar_row = row.saturating_sub(menu_rows);
                 let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
-                crate::tui_main::debug_log!(
-                    "right-click sidebar: explorer_active={} has_rows={} sidebar_row={} tree_row={}",
-                    explorer_active,
-                    has_rows,
-                    sidebar_row,
-                    tree_row,
-                );
                 if tree_row < engine.explorer_rows.len() {
                     engine
                         .explorer_tree
@@ -1421,10 +1398,6 @@ pub(super) fn handle_mouse(
                     let root = engine.cwd.clone();
                     engine.open_explorer_context_menu(root, true, col, row);
                 }
-            } else {
-                crate::tui_main::debug_log!(
-                    "right-click sidebar: explorer not active AND no rows — no-op"
-                );
             }
             return sidebar_width;
         }
@@ -1568,19 +1541,8 @@ pub(super) fn handle_mouse(
 
     // ── Context menu click intercept ────────────────────────────────────────────
     if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
-        crate::tui_main::debug_log!(
-            "ctx menu click: col={} row={} layout_cached={}",
-            col,
-            row,
-            context_menu_layout.is_some(),
-        );
         if let Some(cl) = context_menu_layout {
             let hit = cl.hit_test(col as f32, row as f32);
-            crate::tui_main::debug_log!(
-                "  ctx menu hit_test result: {:?} (bounds {:?})",
-                hit,
-                cl.bounds,
-            );
             match hit {
                 quadraui::ContextMenuHit::Item(_) => {
                     if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
