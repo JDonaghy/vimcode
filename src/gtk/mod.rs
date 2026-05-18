@@ -3310,30 +3310,22 @@ impl SimpleComponent for App {
             let engine_d = engine.clone();
             let hits_d = activity_bar_hits.clone();
             let hover_d = activity_bar_hover.clone();
-            let bk_ad = backend.clone();
             widgets.activity_bar.set_draw_func(move |da, cr, _w, _h| {
-                use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
                 let engine = engine_d.borrow();
                 let theme = Theme::from_name(&engine.settings.colorscheme);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
                 let bar = build_gtk_activity_bar_primitive(&engine, &theme);
                 let hovered = hover_d.get();
-                let rect = quadraui::Rect::new(0.0, 0.0, da.width() as f32, da.height() as f32);
-                let hits = bk_ad.borrow_mut().enter_frame_scope(cr, &layout, |b| {
-                    b.set_current_theme(crate::gtk::quadraui_gtk::q_theme(&theme));
-                    b.set_current_line_height(layout.pixel_size().1.max(1) as f64);
-                    let mut frame = QScreenLayout::new();
-                    frame.push(Surface::ActivityBar {
-                        rect,
-                        bar: &bar,
-                        hovered,
-                    });
-                    frame.draw(b);
-                    // Recover row hits via the post-paint layout call
-                    // (#446 / quadraui#210).
-                    b.activity_bar_layout(rect, &bar)
-                });
+                let hits = quadraui::gtk::draw_activity_bar(
+                    cr,
+                    &layout,
+                    da.width() as f64,
+                    da.height() as f64,
+                    &bar,
+                    &crate::gtk::quadraui_gtk::q_theme(&theme),
+                    hovered,
+                );
                 *hits_d.borrow_mut() = hits;
             });
         }

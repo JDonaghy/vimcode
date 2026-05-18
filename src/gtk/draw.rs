@@ -793,20 +793,16 @@ pub(super) fn draw_editor(
         if let Some(ref wm) = screen.wildmenu {
             let bar = render::wildmenu_to_status_bar(wm, &theme);
             {
-                use quadraui::{ScreenLayout as QScreenLayout, Surface};
+                use quadraui::Backend;
                 backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
                     b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
                     b.set_current_line_height(line_height);
-                    let rect =
-                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32);
-                    let mut frame = QScreenLayout::new();
-                    frame.push(Surface::StatusBar {
-                        rect,
-                        bar: &bar,
-                        hovered: None,
-                        pressed: None,
-                    });
-                    frame.draw(b);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
                 });
             }
             next_y += line_height;
@@ -824,20 +820,16 @@ pub(super) fn draw_editor(
         // No terminal: original layout with per-window or global status at bottom
         let status_y = height as f64 - status_bar_height;
         if let Some(ref bar) = screen.global_status_bar {
-            use quadraui::{ScreenLayout as QScreenLayout, Surface};
+            use quadraui::Backend;
             backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
                 b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
                 b.set_current_line_height(line_height);
-                let rect =
-                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32);
-                let mut frame = QScreenLayout::new();
-                frame.push(Surface::StatusBar {
-                    rect,
+                b.draw_status_bar(
+                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32),
                     bar,
-                    hovered: None,
-                    pressed: None,
-                });
-                frame.draw(b);
+                    None,
+                    None,
+                );
             });
         }
         let mut next_y = if per_window_status {
@@ -848,20 +840,16 @@ pub(super) fn draw_editor(
         if let Some(ref wm) = screen.wildmenu {
             let bar = render::wildmenu_to_status_bar(wm, &theme);
             {
-                use quadraui::{ScreenLayout as QScreenLayout, Surface};
+                use quadraui::Backend;
                 backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
                     b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
                     b.set_current_line_height(line_height);
-                    let rect =
-                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32);
-                    let mut frame = QScreenLayout::new();
-                    frame.push(Surface::StatusBar {
-                        rect,
-                        bar: &bar,
-                        hovered: None,
-                        pressed: None,
-                    });
-                    frame.draw(b);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
                 });
             }
             next_y += line_height;
@@ -1106,21 +1094,16 @@ pub(super) fn draw_tab_bar(
     let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
 
-    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
-    let tab_row_h = (line_height * 1.6).ceil();
-    let rect = quadraui::Rect::new(0.0, y_offset as f32, width as f32, tab_row_h as f32);
+    use quadraui::Backend;
     let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
-        let mut frame = QScreenLayout::new();
-        frame.push(Surface::TabBar {
-            rect,
+        let tab_row_h = (line_height * 1.6).ceil();
+        b.draw_tab_bar(
+            quadraui::Rect::new(0.0, y_offset as f32, width as f32, tab_row_h as f32),
             bar,
-            hovered_close: hovered_close_tab,
-        });
-        frame.draw(b);
-        // Recover hits via the post-paint layout call (#446 / quadraui#210).
-        b.tab_bar_layout(rect, bar)
+            hovered_close_tab,
+        )
     });
 
     layout.set_font_description(Some(&saved_font));
@@ -1175,13 +1158,10 @@ pub(super) fn draw_tab_bar(
     )
 }
 
-/// Draw the breadcrumb bar via the quadraui `ScreenLayout` frame pipeline.
+/// Draw the breadcrumb bar via `Backend::draw_status_bar`.
 ///
 /// The pre-built `quadraui::StatusBar` primitive comes from
-/// `render::ScreenLayout` (built by `render::build_screen_layout`).
-/// Paint pushes a `Surface::StatusBar` onto a one-shot frame; the
-/// `StatusBarLayout` used by the hit-test cache is recovered via the
-/// post-paint `status_bar_layout()` call on the backend (#446 / quadraui#210).
+/// `ScreenLayout` (built by `render::build_screen_layout`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_breadcrumb_bar(
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
@@ -1193,7 +1173,7 @@ pub(super) fn draw_breadcrumb_bar(
     line_height: f64,
     y_offset: f64,
 ) -> quadraui::StatusBarLayout {
-    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
+    use quadraui::Backend;
     let mut result = quadraui::StatusBarLayout {
         bar_width: 0.0,
         bar_height: 0.0,
@@ -1201,19 +1181,15 @@ pub(super) fn draw_breadcrumb_bar(
         hit_regions: Vec::new(),
         resolved_right_start: 0,
     };
-    let rect = quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32);
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
-        let mut frame = QScreenLayout::new();
-        frame.push(Surface::StatusBar {
-            rect,
+        result = b.draw_status_bar(
+            quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32),
             bar,
-            hovered: None,
-            pressed: None,
-        });
-        frame.draw(b);
-        result = b.status_bar_layout(rect, bar);
+            None,
+            None,
+        );
     });
     result
 }
