@@ -2672,6 +2672,7 @@ impl SimpleComponent for App {
             {
                 let engine_d = engine.clone();
                 let ctx_layout_d = explorer_ctx_menu_layout.clone();
+                let bk_ctx = backend.clone();
                 ctx_overlay_da.set_draw_func(move |da, cr, _w, _h| {
                     let engine = engine_d.borrow();
                     let on_explorer = matches!(
@@ -2698,6 +2699,7 @@ impl SimpleComponent for App {
                     let w = da.width() as f64;
                     let h = da.height() as f64;
                     *ctx_layout_d.borrow_mut() = crate::gtk::draw::draw_explorer_context_menu_popup(
+                        &bk_ctx,
                         cr,
                         &layout,
                         &engine,
