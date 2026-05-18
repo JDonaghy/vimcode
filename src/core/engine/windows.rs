@@ -21,10 +21,28 @@ impl Engine {
 
     /// Split the active window in the given direction.
     pub fn split_window(&mut self, direction: SplitDirection, file_path: Option<&Path>) {
+        // Respect splitbelow / splitright. new_first=true means the new
+        // window goes first (top / left).
+        let new_first = match direction {
+            SplitDirection::Horizontal => !self.settings.splitbelow,
+            SplitDirection::Vertical => !self.settings.splitright,
+        };
+        self.split_window_with_new_first(direction, file_path, new_first);
+    }
+
+    /// Split the active window with an explicit `new_first` placement,
+    /// ignoring splitbelow/splitright. Used by UI actions like
+    /// "Open to the Side" whose label commits to a specific side
+    /// regardless of the user's vim defaults.
+    pub fn split_window_with_new_first(
+        &mut self,
+        direction: SplitDirection,
+        file_path: Option<&Path>,
+        new_first: bool,
+    ) {
         let current_buffer_id = self.active_buffer_id();
         let current_window_id = self.active_window_id();
 
-        // Determine which buffer the new window should show
         let new_buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
                 Ok(id) => {
@@ -38,27 +56,18 @@ impl Engine {
                 }
             }
         } else {
-            // Same buffer as current window
             current_buffer_id
         };
 
-        // Create new window
         let new_window_id = self.new_window_id();
         let mut new_window = Window::new(new_window_id, new_buffer_id);
 
-        // Copy view state if same buffer
         if new_buffer_id == current_buffer_id {
             new_window.view = self.active_window().view.clone();
         }
 
         self.windows.insert(new_window_id, new_window);
 
-        // Update layout — respect splitbelow / splitright settings.
-        // new_first=true means the *new* window goes first (top / left).
-        let new_first = match direction {
-            SplitDirection::Horizontal => !self.settings.splitbelow,
-            SplitDirection::Vertical => !self.settings.splitright,
-        };
         let tab = self.active_tab_mut();
         tab.layout
             .split_at(current_window_id, direction, new_window_id, new_first);
@@ -1218,12 +1227,14 @@ impl Engine {
                     }
                     "open_side" => {
                         self.open_editor_group(crate::core::window::SplitDirection::Vertical);
-                        // Replace the cloned buffer with the target file.
-                        let path_str = path.display().to_string();
-                        self.execute_command(&format!("e {path_str}"));
+                        let _ = self.open_file_with_mode(path, OpenMode::Permanent);
                     }
                     "open_side_vsplit" => {
-                        self.split_window(SplitDirection::Vertical, None);
+                        // "Open to the Side" always places the target on the
+                        // right, regardless of splitright (#226). Split first
+                        // with new_first=false, then load the target file into
+                        // the new (right, now-active) window.
+                        self.split_window_with_new_first(SplitDirection::Vertical, None, false);
                         let _ = self.open_file_with_mode(path, OpenMode::Permanent);
                     }
                     // new_file, new_folder, rename, delete are handled by the UI backend
@@ -1292,7 +1303,7 @@ impl Engine {
                 }
                 "open_side_vsplit" => {
                     if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
-                        self.split_window(SplitDirection::Vertical, None);
+                        self.split_window_with_new_first(SplitDirection::Vertical, None, false);
                         let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
                     }
                 }
