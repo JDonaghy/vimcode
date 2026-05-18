@@ -1,9 +1,10 @@
-# src/core/engine/windows.rs — 3,396 lines
+# src/core/engine/windows.rs — 3,646 lines
 
 Window/tab/editor-group management, splits, focus, resize, tab drag-and-drop, tab navigation history, and session restore.
 
 ## Window Operations
-- `split_window(direction)` — create horizontal/vertical split
+- `split_window(direction, file_path)` — create split; derives `new_first` from splitbelow/splitright
+- `split_window_with_new_first(direction, file_path, new_first)` — explicit-placement variant for UI actions ("Open to the Side") that override the user's split direction setting (#226)
 - `close_window(id)` — close window, handle last-window logic; detects empty tab after diff pair cleanup
 - `focus_window(id)` — switch active window
 - `resize_window(direction, delta)` — resize split

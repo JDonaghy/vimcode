@@ -1,7 +1,31 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 384 archived here.
+All sessions through 385 archived here.
+
+---
+**Session 385 (May 17) — Open to the Side fix (#226) + LSP `$/progress` (#221) + #446 parked on quadraui#210:**
+
+Two PRs landed on develop; one big migration parked waiting on quadraui infrastructure. 1989 lib tests passing (+14).
+
+**Closed**
+
+- **#226** (PR #457) Right-click "Open to the Side" was actually two bugs in one. (1) `open_side` called `execute_command("e {path}")` which returns `EngineAction::OpenFile(path)` — but the action was *discarded*, so the new editor group ended up with a clone of the prior tab instead of the target file. Also broken for paths containing spaces (the `:e` form tokenises on whitespace). Replaced with a direct `open_file_with_mode(path, OpenMode::Permanent)` call after `open_editor_group`. (2) `open_side_vsplit` routed through `split_window`, which derives `new_first` from `settings.splitright`. With vim's default `splitright=false`, the target landed on the LEFT — but the menu label commits to "to the side" semantics regardless of the user's split-direction setting. Extracted `split_window`'s body into `split_window_with_new_first(direction, file_path, new_first)`; public `split_window` delegates with the splitright-derived value; both `open_side_vsplit` handlers (explorer + editor context) now call the explicit variant with `new_first=false`. Three tests added: `test_open_side_from_context_menu` strengthened (asserts target lands in active group), `test_open_side_path_with_spaces` (regression for `:e` tokenisation), `test_explorer_open_side_vsplit_target_on_right_regardless_of_splitright` (loops both `splitright` values, asserts target's `x > original's x` via `calculate_group_window_rects`).
+- **#221** (PR #455 by parallel agent — merged today) Surface LSP `$/progress` notifications in the per-window status bar as `rust-analyzer • Indexing: 99%` while indexing, falling back to dimmed `rust-analyzer…` otherwise. Replaced `pending_work: HashSet<String>` with `progress_data: Vec<(token, LspProgress)>` carrying title/message/percentage per token, preserved begin-order so `current_progress` returns the most-recently-started phase. Added parsing for `"report"` notifications (previously dropped) → new `WorkProgressReport` event routed through `panels.rs`. Width discipline (the trickiest part): rust-analyzer streams reports several times per second with varying free-text — picking `percentage` > `X/Y` prefix > drop-message keeps the segment width stable so `StatusBar::layout`'s priority-drop doesn't flap LF/indent/filetype in/out. +18 tests across `core::lsp`, `core::lsp_manager`, and `render::tests`.
+- **#436** (4 commits cherry-picked into develop in two batches by parallel agents) rust-analyzer install/probe path: use `rustup` on Linux/macOS (matched the Windows path), probe `~/.cargo/bin` rustup proxies cross-platform, skip rustup proxies during `ext_remove_tools` (so uninstall doesn't try to remove rustup-managed binaries), surface `LspServer::start` errors instead of returning silent `None`.
+
+**Filed during session**
+
+- **quadraui#210** — `Surface::StatusBar`/`TabBar`/`ActivityBar` in `ScreenLayout::draw()` discard the layout/hits return values from `Backend::draw_X`. Blocks vimcode#446 (the GTK draw → `ScreenLayout` migration). Proposed adding `status_bar_layout()` / `tab_bar_layout()` / `activity_bar_layout()` to the `Backend` trait, consistent with existing `msv_layout` / `tree_layout` / `form_layout` / `text_display_layout` / `menu_bar_layout` patterns. Open at session end.
+
+**Parked**
+
+- **#446** GTK draw → `quadraui::ScreenLayout::draw()` migration (5-surface scope: status bars, tab bars, activity bar). Branch `issue-446-screen-layout-draw` pushed empty as the parking spot. Investigation surfaced quadraui#210 above — without those `_layout()` methods, migrating tab_bar / activity_bar silently breaks tab close clicks, activity row clicks, and breadcrumb hit-tests because vimcode's click dispatch consumes `TabBarHits` / `Vec<ActivityBarRowHit>` / `StatusBarLayout`. Issue commented; resume once quadraui#210 ships.
+
+**Other notes**
+
+- Develop reached `dc6417d`. Branches `issue-446-screen-layout-draw` and `issue-456-tui-ctx-menu-dismiss` (latter by parallel agent — TUI right-click menu doesn't dismiss on first click, regression from #451) open on origin at session end.
+- During the #457 smoke test, the user reported "newly opened file in left pane" which was traced to `open_side_vsplit` respecting `splitright`. The path-traversal test (`debug_open_side_actual_rects`) ruled out `open_side` first — the engine state was correct for that path; the visible bug was in the *other* menu item.
 
 ---
 **Session 384 (May 17) — GTK / TUI bug-fix sweep, 9 issues closed:**

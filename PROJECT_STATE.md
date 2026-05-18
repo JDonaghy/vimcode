@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 17, 2026 (Session 384 — **GTK / TUI bug-fix sweep, 9 issues closed.** Highlights: GTK engine-drawn ctx menu now has proper focus on open (#435) + the draw-time hover override that clobbered keyboard nav is gone. Action menu opens BELOW the trigger button via `ContextMenuPlacement::Below` + `trigger_height: f32` threaded through engine/render (#434). Engine-driven Open Recent Workspace picker — deletes dead `prompt_for_name` GTK fn + 3 orphaned `Msg` variants, plus a workspace-switch sub-bug (stale `explorer_expanded` left old paths) and a highlight sub-bug (`inactive_selected_bg` indistinguishable from `surface_bg` on GTK) (#274). GTK tab switcher inherits quadraui's new bordered list chrome (`2d21169`) once vimcode's defensive theme/font/line_height setup landed (#225). GTK explorer ctx menu migrated from native `PopoverMenu` to engine-drawn render on a new window-level overlay DA — Option B from #426 (vs. clipping on the narrow sidebar with Option C). Deletes ~185 lines of native popover + 3 helpers. Closes #395. TUI split-terminal drag now uses pane-relative col like click does (#444). TUI editor-group divider drag works again — three sub-bugs: render/hit-test float rounding mismatch, horizontal-split tab-bar hit-test ate empty-space clicks, breadcrumb row needed to be part of the drag handle (#452). TUI explorer right-click works on Alacritty — terminal emits only `Up(Right)` (no `Down(Right)`), AND when sidebar has focus the j/k dispatch tree captured the menu's keys; added a ctx-menu intercept inside the `if sidebar.has_focus` block (#451). Smoke-tested+merged #440 (Ctrl-P completion vs accelerator, PR by parallel agent). **Filed:** quadraui#209 (ctx menu rounded corners). 1975 lib tests passing.)
+**Last updated:** May 17, 2026 (Session 385 — **Open to the Side (#226) + LSP `$/progress` (#221) + #446 parked on quadraui#210.** Highlights: `open_side` previously called `:e {path}` whose `EngineAction::OpenFile` return was discarded, so the new editor group ended up with a clone of the prior tab; replaced with direct `open_file_with_mode` and added a regression test for paths with spaces. `open_side_vsplit` always placed the target on the LEFT under vim's default `splitright=false` — extracted `split_window` body into `split_window_with_new_first(direction, file, new_first)` so the "Open to the Side" UI action can force `new_first=false` regardless of user settings (PR #457). LSP `$/progress` now surfaces in the per-window status bar as `rust-analyzer • Indexing: 99%` with width-stable formatter (percentage > X/Y prefix > drop-message) so the indicator doesn't flap LF/indent/filetype in/out — PR #455 by parallel agent (#221, +18 tests). rust-analyzer install path uses rustup on Linux/macOS, probes `~/.cargo/bin` rustup proxies cross-platform, skips proxies during `ext_remove_tools`, surfaces `LspServer::start` errors instead of silent `None` (#436, 4 commits). **Filed:** quadraui#210 (`Surface::StatusBar`/`TabBar`/`ActivityBar` discard the layout/hits return — blocks vimcode#446's GTK draw migration; proposes adding `status_bar_layout`/`tab_bar_layout`/`activity_bar_layout` to the `Backend` trait). **Parked:** vimcode#446 on branch `issue-446-screen-layout-draw` waiting for quadraui#210. 1989 lib tests passing.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -12,9 +12,9 @@
 
 ---
 
-Vimcode at 1975 lib tests passing.
+Vimcode at 1989 lib tests passing.
 
-> Sessions 383 and earlier in **SESSION_HISTORY.md**.
+> Sessions 384 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -129,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 380 and earlier in **SESSION_HISTORY.md**.
+> Sessions 384 and earlier in **SESSION_HISTORY.md**.
