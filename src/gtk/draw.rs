@@ -201,6 +201,7 @@ pub(super) fn draw_editor(
     // 3b. Draw each window (before tab bars so tabs paint on top)
     for rendered_window in &screen.windows {
         draw_window(
+            backend,
             cr,
             &layout,
             &font_metrics,
@@ -591,10 +592,19 @@ pub(super) fn draw_editor(
                             let left = td.left.as_ref().unwrap();
                             let right = td.right.as_ref().unwrap();
                             let sl = *split;
+                            // #462: route paint through quadraui::ScreenLayout.
+                            use quadraui::{ScreenLayout as QScreenLayout, Surface};
                             backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
-                                use quadraui::Backend;
-                                b.draw_terminal(sl.left, left);
-                                b.draw_terminal(sl.right, right);
+                                let mut frame = QScreenLayout::new();
+                                frame.push(Surface::Terminal {
+                                    rect: sl.left,
+                                    term: left,
+                                });
+                                frame.push(Surface::Terminal {
+                                    rect: sl.right,
+                                    term: right,
+                                });
+                                frame.draw(b);
                             });
                             quadraui::gtk::draw_terminal_divider(
                                 cr,
@@ -604,9 +614,11 @@ pub(super) fn draw_editor(
                                 &q_theme,
                             );
                         } else if let Some(ref term) = td.single {
+                            use quadraui::{ScreenLayout as QScreenLayout, Surface};
                             backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
-                                use quadraui::Backend;
-                                b.draw_terminal(q_area, term);
+                                let mut frame = QScreenLayout::new();
+                                frame.push(Surface::Terminal { rect: q_area, term });
+                                frame.draw(b);
                             });
                         }
                         // Register scroll surface for dispatch.
@@ -740,7 +752,9 @@ pub(super) fn draw_editor(
 
     // 5i. Draw horizontal scrollbars in Cairo (VSCode-style overlay on window bottom)
     draw_h_scrollbars(
+        backend,
         cr,
+        &layout,
         engine,
         &theme,
         &window_rects,
@@ -884,6 +898,7 @@ pub(super) fn draw_editor(
 
     // 8. Popups and modals — drawn last so they appear on top of everything.
     draw_find_replace_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -967,7 +982,9 @@ pub(super) fn draw_editor(
 /// `dragging_window` — window being dragged (shows the active/dragging colour).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_h_scrollbars(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
+    layout: &pango::Layout,
     engine: &Engine,
     theme: &Theme,
     window_rects: &[(core::WindowId, core::WindowRect)],
@@ -976,7 +993,9 @@ pub(super) fn draw_h_scrollbars(
     hovered: bool,
     dragging_window: Option<core::WindowId>,
 ) {
-    let q_theme = super::quadraui_gtk::q_theme(theme);
+    // #462: route paint through quadraui::ScreenLayout. One frame per
+    // window so each scrollbar is its own Surface::Scrollbar entry.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
     for (window_id, rect) in window_rects {
         let Some((track_x, track_y, track_w, sb_height, thumb_x, thumb_w, _, _)) =
             h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
@@ -998,7 +1017,17 @@ pub(super) fn draw_h_scrollbars(
             hovered,
             dragging: dragging_window == Some(*window_id),
         };
-        quadraui::gtk::draw_scrollbar(cr, &scrollbar, &q_theme);
+        let sb_rect = scrollbar.track;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            let mut frame = QScreenLayout::new();
+            frame.push(Surface::Scrollbar {
+                rect: sb_rect,
+                sb: &scrollbar,
+            });
+            frame.draw(b);
+        });
     }
 }
 
@@ -1243,25 +1272,32 @@ pub(super) fn draw_breadcrumb_bar(
 /// was lifted in Session 241).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_window(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
-    font_metrics: &pango::FontMetrics,
+    _font_metrics: &pango::FontMetrics,
     theme: &Theme,
     rw: &RenderedWindow,
     char_width: f64,
     line_height: f64,
 ) {
     let editor = render::to_q_editor(rw);
-    let q_theme = super::quadraui_gtk::q_theme(theme);
-    quadraui::gtk::draw_editor(
-        cr,
-        layout,
-        font_metrics,
-        &editor,
-        &q_theme,
-        char_width,
-        line_height,
-    );
+    let rect = editor.rect;
+    // #462: route paint through quadraui::ScreenLayout. The Backend
+    // trait method resolves FontMetrics from the cr's pango context
+    // internally — caller no longer needs to thread metrics in.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Editor {
+            rect,
+            editor: &editor,
+        });
+        frame.draw(b);
+    });
 }
 
 pub(super) fn draw_window_separators(
@@ -1779,26 +1815,33 @@ pub(super) fn draw_signature_popup(
 /// toggle-button misalignment bug can't recur by construction.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_find_replace_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
-    _editor_width: f64,
-    _editor_height: f64,
+    editor_width: f64,
+    editor_height: f64,
     line_height: f64,
     char_width: f64,
 ) {
     let Some(panel) = &screen.find_replace else {
         return;
     };
-    quadraui::gtk::draw_find_replace(
-        cr,
-        layout,
-        panel,
-        &super::quadraui_gtk::q_theme(theme),
-        line_height,
-        char_width,
-    );
+    // #462: route paint through quadraui::ScreenLayout. The GTK
+    // find_replace rasteriser ignores `rect` (positions via its own
+    // anchor logic); we still pass the full viewport rect for the
+    // FrameHitMap zone registration.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    let rect = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::FindReplace { rect, panel });
+        frame.draw(b);
+    });
 }
 
 /// Draw the unified picker modal (supports single-pane and two-pane with preview).
@@ -1825,14 +1868,18 @@ pub(super) fn draw_picker_popup(
         &render::gtk_picker_sizing(line_height as f32),
     );
     let palette = render::picker_panel_to_palette(picker);
-    use quadraui::Backend;
+    // #462: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));
         b.set_current_line_height(line_height);
-        b.draw_palette(
-            quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h),
-            &palette,
-        );
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Palette {
+            rect,
+            palette: &palette,
+        });
+        frame.draw(b);
     });
 }
 
