@@ -6641,8 +6641,14 @@ impl App {
         }
 
         // Editor hover: click on the popup focuses it; click elsewhere dismisses it
+        eprintln!("[#469] reached editor_hover check");
         {
             let engine = self.engine.borrow();
+            eprintln!(
+                "[#469]   editor_hover.is_some()={}, has_focus={}",
+                engine.editor_hover.is_some(),
+                engine.editor_hover_has_focus,
+            );
             if engine.editor_hover.is_some() {
                 let rect = self.editor_hover_popup_rect.get();
                 let on_popup = if let Some((px, py, pw, ph)) = rect {
@@ -6652,6 +6658,7 @@ impl App {
                 };
                 let has_focus = engine.editor_hover_has_focus;
                 drop(engine);
+                eprintln!("[#469]   on_popup={} rect={:?}", on_popup, rect);
                 if on_popup {
                     // Scrollbar hit-test (#215). Track click jumps to that
                     // offset and arms a drag so mouse-move updates the
@@ -6668,6 +6675,12 @@ impl App {
                             && cx < sb_hit.track.x + sb_hit.track.width
                             && cy >= sb_hit.track.y
                             && cy < sb_hit.track.y + sb_hit.track.height;
+                        eprintln!(
+                            "[#469]   sb: thumb=({},{},{},{}) track=({},{},{},{}) on_thumb={} on_track={}",
+                            sb_hit.thumb.x, sb_hit.thumb.y, sb_hit.thumb.width, sb_hit.thumb.height,
+                            sb_hit.track.x, sb_hit.track.y, sb_hit.track.width, sb_hit.track.height,
+                            on_thumb, on_track,
+                        );
                         if on_track || on_thumb {
                             if on_track {
                                 let max_scroll = sb_hit.total.saturating_sub(sb_hit.visible_rows);
@@ -6694,6 +6707,16 @@ impl App {
                         }
                     }
                     // Check if click hit a link rect.
+                    {
+                        let lr = self.editor_hover_link_rects.borrow();
+                        eprintln!("[#469]   link_rects.len()={}", lr.len());
+                        for (i, (lx, ly, lw, lh, url)) in lr.iter().enumerate() {
+                            eprintln!(
+                                "[#469]     link[{}]: ({},{},{},{}) url={}",
+                                i, lx, ly, lw, lh, url
+                            );
+                        }
+                    }
                     let link_hit = self
                         .editor_hover_link_rects
                         .borrow()
@@ -6702,6 +6725,10 @@ impl App {
                             x >= *lx && x <= lx + lw && y >= *ly && y <= ly + lh
                         })
                         .cloned();
+                    eprintln!(
+                        "[#469]   link_hit={:?}",
+                        link_hit.as_ref().map(|(_, _, _, _, url)| url.clone())
+                    );
                     if let Some((_, _, _, _, url)) = link_hit {
                         if url.starts_with("command:") {
                             self.engine.borrow_mut().execute_command_uri(&url);
