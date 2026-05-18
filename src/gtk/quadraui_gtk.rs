@@ -1,10 +1,10 @@
-//! GTK backend for `quadraui` primitives.
+//! GTK backend for `quadraui` primitives — vimcode-side helpers.
 //!
-//! Cairo + Pango equivalent of `src/tui_main/quadraui_tui.rs`. Each
-//! `draw_*` function consumes a `quadraui` primitive description and
-//! rasterises it onto the provided `cairo::Context`. Currently supports
-//! `TreeView` (A.1b), `Form` (A.3c), `ListView` (A.5b), and `Palette`
-//! (A.4b).
+//! Most primitive paint paths now go through `Backend::draw_X` via
+//! `quadraui::ScreenLayout::draw()` (#446, chunks B+D). What remains
+//! here is `q_theme()` — the theme adapter every GTK draw call uses —
+//! plus a couple of rich-text-popup constants re-exported for the
+//! click-side scrollbar geometry helper.
 
 use super::*;
 
@@ -12,92 +12,6 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
     render::to_quadraui_theme(theme)
 }
 
-// ─── Activity bar / Terminal lift (B5c.5) ───────────────────────────────────
-//
-// `draw_activity_bar` and `draw_terminal_cells` lifted to
-// `quadraui::gtk::*` (taking `quadraui::Theme`). Vimcode call sites
-// invoke them directly via `quadraui::gtk::draw_activity_bar` /
-// `quadraui::gtk::draw_terminal_cells`, building the
-// `quadraui::Theme` via `q_theme()`. The previous in-tree
-// `ActivityBarHit` struct has been replaced by
-// `quadraui::ActivityBarRowHit` (same field shape).
-
-/// Draw a `quadraui::Tooltip` at its resolved layout position.
-///
-/// Per D6, the caller computes anchor + viewport + content measurement
-/// and asks `tooltip.layout()` for the resolved bounds; this rasteriser
-/// paints the box (background + 1px border) plus either the plain
-/// `text` or per-row `styled_lines`.
-///
-/// `padding_x` is the horizontal padding (in pixels) from the left
-/// border to the start of text — consumers typically pass the same
-/// `char_width` they used when computing the tooltip's measured width.
-pub(super) fn draw_tooltip(
-    cr: &Context,
-    layout: &pango::Layout,
-    tooltip: &quadraui::Tooltip,
-    tooltip_layout: &quadraui::TooltipLayout,
-    line_height: f64,
-    padding_x: f64,
-    theme: &Theme,
-) {
-    quadraui::gtk::draw_tooltip(
-        cr,
-        layout,
-        tooltip,
-        tooltip_layout,
-        line_height,
-        padding_x,
-        &q_theme(theme),
-    );
-}
-/// Draw a `quadraui::Dialog` at its resolved layout. Returns the button
-/// hit-rectangles (in the same `(x, y, w, h)` shape the legacy renderer
-/// returned) so the caller's click handler keeps working unchanged.
-///
-/// Per D6, the caller measures title/body/buttons in pixels and asks
-/// `dialog.layout()` for the resolved sub-bounds; this rasteriser paints
-/// the box (background + 1px border), title bar, body text, optional
-/// input, and buttons (with the default-button highlight on the
-/// primary).
-pub(super) fn draw_dialog(
-    cr: &Context,
-    layout: &pango::Layout,
-    dialog: &quadraui::Dialog,
-    dialog_layout: &quadraui::DialogLayout,
-    line_height: f64,
-    theme: &Theme,
-) -> Vec<(f64, f64, f64, f64)> {
-    let ui_font_desc = pango::FontDescription::from_string(&super::draw::UI_FONT());
-    quadraui::gtk::draw_dialog(
-        cr,
-        layout,
-        &ui_font_desc,
-        dialog,
-        dialog_layout,
-        line_height,
-        &q_theme(theme),
-    )
-}
-
-/// Draw a `quadraui::ContextMenu` at its resolved layout. Returns the
-/// per-clickable-item hit-rectangles `(x, y, w, h, item_idx)` so the
-/// caller's click handler can map a click to the original
-/// `ContextMenuItem` index without re-running layout. Hover state is
-/// owned by the primitive (`menu.selected_idx`) — the highlight
-/// follows whatever the app sets, so callers update `selected_idx`
-/// from mouse motion before invoking this rasteriser.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_context_menu(
-    cr: &Context,
-    layout: &pango::Layout,
-    menu: &quadraui::ContextMenu,
-    menu_layout: &quadraui::ContextMenuLayout,
-    line_height: f64,
-    theme: &Theme,
-) -> Vec<(f64, f64, f64, f64, quadraui::WidgetId)> {
-    quadraui::gtk::draw_context_menu(cr, layout, menu, menu_layout, line_height, &q_theme(theme))
-}
 /// Visible width of the rich-text-popup scrollbar in pixels. Wider
 /// than the layout's 1px border so the bar is paint+click-friendly.
 /// Shared with `draw_editor_hover_popup` so paint and hit-test
@@ -108,22 +22,6 @@ pub(super) const RICH_TEXT_POPUP_SB_WIDTH: f64 = quadraui::gtk::RICH_TEXT_POPUP_
 /// right border. Same role as `RICH_TEXT_POPUP_SB_WIDTH`.
 pub(super) const RICH_TEXT_POPUP_SB_INSET: f64 = quadraui::gtk::RICH_TEXT_POPUP_SB_INSET;
 
-/// Draw a `quadraui::Completions` popup at its resolved
-/// `CompletionsLayout` via the lifted `quadraui::gtk::draw_completions`
-/// rasteriser (#285). Vimcode's shim role is to map the rich
-/// `render::Theme` to the smaller `quadraui::Theme` via `q_theme()` —
-/// the body of the rasteriser lives in the quadraui crate. Mirrors
-/// the TUI shim at `src/tui_main/quadraui_tui.rs::draw_completions`.
-pub(super) fn draw_completions(
-    cr: &Context,
-    layout: &pango::Layout,
-    completions: &quadraui::Completions,
-    completions_layout: &quadraui::CompletionsLayout,
-    theme: &Theme,
-) {
-    quadraui::gtk::draw_completions(cr, layout, completions, completions_layout, &q_theme(theme));
-}
-
 /// Draw a `quadraui::RichTextPopup` at its resolved layout. Returns
 /// per-link hit regions in `(x, y, w, h, url)` form. Each visible
 /// line is rendered as a SINGLE Pango call with an `AttrList` —
@@ -131,6 +29,9 @@ pub(super) fn draw_completions(
 /// attribute ranges. This avoids the per-span manual-advance bug
 /// where proportional Pango widths drift from monospace
 /// `char_width * char_count` math (#214 first-cut regression).
+///
+/// Kept as a shim while the Surface::RichTextPopup migration (#463)
+/// is investigated — paint via the trait broke click hit-test.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_rich_text_popup(
     cr: &Context,

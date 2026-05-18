@@ -372,11 +372,19 @@ pub(super) fn draw_editor(
 
     // 5b. Draw completion popup (on top of everything else). Cache
     //     the layout so the click handler can hit-test items.
-    *completion_layout_out.borrow_mut() =
-        draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    *completion_layout_out.borrow_mut() = draw_completion_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    );
 
     // 5c. Draw hover popup (on top of everything else)
     draw_hover_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -389,6 +397,7 @@ pub(super) fn draw_editor(
 
     // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
     draw_signature_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -401,6 +410,7 @@ pub(super) fn draw_editor(
 
     // 5c3. Draw diff peek popup (inline git hunk preview)
     draw_diff_peek_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -907,6 +917,7 @@ pub(super) fn draw_editor(
     ));
 
     let (btn_rects, popup_rect) = draw_dialog_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -933,6 +944,7 @@ pub(super) fn draw_editor(
         None
     } else {
         draw_context_menu_popup(
+            backend,
             cr,
             &layout,
             &screen,
@@ -1308,6 +1320,7 @@ pub(super) fn draw_window_separators(
 /// `quadraui_gtk::draw_completions` shim. Returns the resolved
 /// `CompletionsLayout` so the click handler can hit-test items.
 pub(super) fn draw_completion_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1353,13 +1366,28 @@ pub(super) fn draw_completion_popup(
         |_| quadraui::CompletionItemMeasure::new(line_height_f),
     );
 
-    super::quadraui_gtk::draw_completions(cr, layout, &completions, &q_layout, theme);
+    // #463: route paint through quadraui::ScreenLayout. The
+    // CompletionsLayout returned by `completions.layout(...)` is what
+    // both paint and click consume — one source of truth.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Completions {
+            completions: &completions,
+            layout: &q_layout,
+        });
+        frame.draw(b);
+    });
 
     Some(q_layout)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_hover_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1413,15 +1441,20 @@ pub(super) fn draw_hover_popup(
         0.0,
     );
 
-    super::quadraui_gtk::draw_tooltip(
-        cr,
-        layout,
-        &tooltip,
-        &tip_layout,
-        line_height,
-        char_width,
-        theme,
-    );
+    // #463: route paint through quadraui::ScreenLayout. Tooltip is
+    // non-interactive — no hit data to recover.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
 /// Draw the LSP/editor hover popup via the `quadraui::RichTextPopup`
@@ -1498,6 +1531,12 @@ pub(super) fn draw_editor_hover_popup(
         },
     );
 
+    // #463: rich text popup migration reverted — paint goes through
+    // the legacy quadraui_gtk shim which returns link rects directly.
+    // Migration to Surface::RichTextPopup caused click hit-test
+    // regression (links + scrollbar track/thumb fell through to editor
+    // scrollbar underneath). Needs deeper investigation; tracked under
+    // #463 follow-up.
     let link_rects = super::quadraui_gtk::draw_rich_text_popup(
         cr,
         layout,
@@ -1537,6 +1576,7 @@ pub(super) fn draw_editor_hover_popup(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_diff_peek_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1620,19 +1660,24 @@ pub(super) fn draw_diff_peek_popup(
         0.0,
     );
 
-    super::quadraui_gtk::draw_tooltip(
-        cr,
-        layout,
-        &tooltip,
-        &tip_layout,
-        line_height,
-        char_width,
-        theme,
-    );
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_signature_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1710,15 +1755,19 @@ pub(super) fn draw_signature_popup(
         0.0,
     );
 
-    super::quadraui_gtk::draw_tooltip(
-        cr,
-        layout,
-        &tooltip,
-        &tip_layout,
-        line_height,
-        char_width,
-        theme,
-    );
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
 /// Draw the inline find/replace overlay at the top-right of the editor.
@@ -1857,6 +1906,7 @@ fn draw_tab_switcher_popup_list(
 ///   click-outside-to-dismiss to mis-fire.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_dialog_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1959,8 +2009,32 @@ pub(super) fn draw_dialog_popup(
         dialog_layout.bounds.height as f64,
     );
 
-    let btn_rects =
-        super::quadraui_gtk::draw_dialog(cr, layout, &dialog, &dialog_layout, line_height, theme);
+    // #463: route paint through quadraui::ScreenLayout. Button click
+    // rectangles are already carried by `DialogLayout.visible_buttons`,
+    // so no need for a second backend call to recover them.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Dialog {
+            dialog: &dialog,
+            layout: &dialog_layout,
+        });
+        frame.draw(b);
+    });
+    let btn_rects: Vec<(f64, f64, f64, f64)> = dialog_layout
+        .visible_buttons
+        .iter()
+        .map(|vb| {
+            (
+                vb.bounds.x as f64,
+                vb.bounds.y as f64,
+                vb.bounds.width as f64,
+                vb.bounds.height as f64,
+            )
+        })
+        .collect();
     (btn_rects, Some(popup_rect))
 }
 
@@ -1968,6 +2042,7 @@ pub(super) fn draw_dialog_popup(
 /// Uses the same data as TUI/Win-GUI for visual consistency.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_context_menu_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     _layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -2037,7 +2112,18 @@ pub(super) fn draw_context_menu_popup(
     // queue_draw triggered by `j`/`k` would re-snap selection back to the
     // item under the (stationary) cursor.
 
-    super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::ContextMenu {
+            menu: &menu,
+            layout: &menu_layout,
+        });
+        frame.draw(b);
+    });
 
     Some(menu_layout)
 }
@@ -2049,6 +2135,7 @@ pub(super) fn draw_context_menu_popup(
 /// `ContextMenuLayout` for the click/motion hit-test cache.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_explorer_context_menu_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     _layout: &pango::Layout,
     engine: &Engine,
@@ -2118,7 +2205,18 @@ pub(super) fn draw_explorer_context_menu_popup(
         item_height,
     );
 
-    super::quadraui_gtk::draw_context_menu(cr, &ui_layout, &menu, &menu_layout, line_height, theme);
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::ContextMenu {
+            menu: &menu,
+            layout: &menu_layout,
+        });
+        frame.draw(b);
+    });
 
     Some(menu_layout)
 }
