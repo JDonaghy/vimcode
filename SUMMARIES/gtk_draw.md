@@ -1,6 +1,8 @@
-# src/gtk/draw.rs — 3,882 lines
+# src/gtk/draw.rs — 4,171 lines
 
 All Cairo/Pango drawing functions for the GTK backend. Each `draw_*` function renders one UI component onto a Cairo context using data from `ScreenLayout`.
+
+**Post-#446 migration (chunks A/B/C/D complete):** every surface except the rich text popup (deferred — #469) routes paint through `quadraui::ScreenLayout::draw()` by pushing a `Surface::X` entry onto a one-shot frame inside `enter_frame_scope`. Hit data for clickable surfaces is recovered via the matching `b.X_layout()` method (e.g. `b.tab_bar_layout`, `b.status_bar_layout`) or read directly from the primitive's layout struct (`DialogLayout.visible_buttons`, `RichTextPopupLayout.link_hit_regions`). Several `quadraui_gtk::draw_*` shims removed.
 
 ## Draw Functions
 - `draw_editor` — main editor area (all windows, gutters, text, cursors)
