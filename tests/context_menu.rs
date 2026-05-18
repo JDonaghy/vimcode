@@ -242,6 +242,33 @@ fn test_context_menu_confirm_close() {
     let action = e.context_menu_confirm();
     assert_eq!(action.as_deref(), Some("close"));
     assert_eq!(e.active_group().tabs.len(), 2);
+    // #456: confirm must dismiss the menu so the TUI mouse intercept's
+    // post-action state is consistent (no stale menu on screen).
+    assert!(
+        e.context_menu.is_none(),
+        "context_menu_confirm must dismiss the menu",
+    );
+}
+
+#[test]
+fn test_explorer_context_menu_confirm_dismisses() {
+    // #456: regression — every TUI ctx menu intercept path (Down(Left)
+    // and the newly-accepted Up(Left)) ends with `context_menu_confirm`
+    // taking the menu. This test pins the engine-level contract that
+    // `confirm` clears `context_menu`, so the renderer (and the next
+    // mouse event's `engine.context_menu.is_some()` gate) sees the
+    // dismiss without any extra `close_context_menu` call from the
+    // mouse handler.
+    let mut e = engine_with("hello");
+    let path = std::path::PathBuf::from("/tmp/test_dismiss.rs");
+    e.open_explorer_context_menu(path, false, 5, 10);
+    assert!(e.context_menu.is_some(), "menu should be open");
+    let action = e.context_menu_confirm();
+    assert!(action.is_some(), "confirm must return an action");
+    assert!(
+        e.context_menu.is_none(),
+        "menu must be dismissed after confirm (regression: #456)",
+    );
 }
 
 #[test]

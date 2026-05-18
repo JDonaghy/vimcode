@@ -1491,7 +1491,14 @@ fn event_loop(
         }
 
         // ── SidebarSystem intercept for mouse/scroll in debug sidebar ──
-        if engine.app_shell.sidebar_visible() && engine.active_panel_is(PANEL_DEBUG) {
+        // #456: skip when a context menu is open — the menu floats above
+        // any panel and must intercept clicks before the panel below sees
+        // them. The legacy mouse handler in `mouse.rs` has the matching
+        // ctx-menu intercept at line ~1542.
+        if engine.context_menu.is_none()
+            && engine.app_shell.sidebar_visible()
+            && engine.active_panel_is(PANEL_DEBUG)
+        {
             let rect = engine.dap_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
                 && match &ui_event {
@@ -1520,7 +1527,11 @@ fn event_loop(
         }
 
         // ── SidebarSystem intercept for mouse/scroll in extensions sidebar ──
-        if engine.app_shell.sidebar_visible() && engine.active_panel_is(PANEL_EXTENSIONS) {
+        // #456: same priority rule as the debug sidebar above.
+        if engine.context_menu.is_none()
+            && engine.app_shell.sidebar_visible()
+            && engine.active_panel_is(PANEL_EXTENSIONS)
+        {
             let rect = engine.ext_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
                 && match &ui_event {
@@ -1543,7 +1554,11 @@ fn event_loop(
         }
 
         // ── Debug toolbar hover/press via StatusBarInteraction ──
-        if engine.debug_toolbar_visible && debug_toolbar_rect.width > 0.0 {
+        // #456: skip when a context menu is open.
+        if engine.context_menu.is_none()
+            && engine.debug_toolbar_visible
+            && debug_toolbar_rect.width > 0.0
+        {
             match debug_toolbar_interaction.handle(&ui_event, debug_toolbar_rect) {
                 quadraui::StatusBarAction::Clicked(id) => {
                     if let Some(idx) = render::debug_toolbar_action_index(&id) {
@@ -1566,12 +1581,18 @@ fn event_loop(
         // built-in scrollbar (click, thumb drag, track page) works.
         // MouseDown/DoubleClick for row selection; MouseMoved (left held)
         // and MouseUp for scrollbar drag lifecycle.
+        //
+        // #456: skip the tree intercept entirely when an explorer context
+        // menu is open. The menu floats above the tree; clicks on a menu
+        // item must reach the legacy ctx-menu intercept in `mouse.rs`,
+        // not get consumed as a tree row activation underneath.
         {
             let is_explorer_event = match &ui_event {
                 quadraui::UiEvent::MouseDown { position, .. }
                 | quadraui::UiEvent::DoubleClick { position, .. } => {
                     let rect = engine.explorer_tree_rect.get();
-                    engine.app_shell.sidebar_visible()
+                    engine.context_menu.is_none()
+                        && engine.app_shell.sidebar_visible()
                         && engine.active_panel_is(PANEL_EXPLORER)
                         && rect.width > 0.0
                         && rect.contains(*position)
