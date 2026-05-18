@@ -10428,6 +10428,14 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
 /// indexing (#221). Renders `name • Indexing: 319/320` when the
 /// server is publishing `$/progress`; falls back to the dimmed
 /// `name… ` placeholder when no progress data is available.
+///
+/// Width discipline: progress notifications fire many times per second
+/// with varying message lengths. If the segment width fluctuates,
+/// `StatusBar::layout`'s priority-drop kicks in and lower-priority
+/// segments flash in/out — visually glitchy. The formatter keeps the
+/// segment width stable and ≤ ~28 cells by preferring fixed-width
+/// detail (percentage, then `X/Y` if the message starts with one) and
+/// otherwise dropping the message in favour of `stage…`.
 pub fn format_lsp_progress_segment(
     label: &str,
     progress: Option<&crate::core::lsp_manager::LspProgress>,
@@ -10440,11 +10448,7 @@ pub fn format_lsp_progress_segment(
     } else {
         progress.title.as_str()
     };
-    let detail = match (progress.message.as_deref(), progress.percentage) {
-        (Some(msg), _) if !msg.is_empty() => truncate_progress_message(msg),
-        (_, Some(pct)) => format!("{pct}%"),
-        _ => String::new(),
-    };
+    let detail = compact_progress_detail(progress.message.as_deref(), progress.percentage);
     if detail.is_empty() {
         format!("{label} • {stage}… ")
     } else {
@@ -10452,21 +10456,46 @@ pub fn format_lsp_progress_segment(
     }
 }
 
-/// rust-analyzer (and other servers) sometimes pack a file path into the
-/// progress message, e.g. `"34/285: /home/john/.cargo/registry/…"`.
-/// Trim everything after the `:`-separated path so the segment stays
-/// short enough to fit the status bar — VSCode shows just `319/320`.
-/// Falls back to a hard character cap for non-path messages.
-fn truncate_progress_message(msg: &str) -> String {
-    if let Some(idx) = msg.find(": /") {
-        return msg[..idx].to_string();
+/// Pick a compact, fixed-width-ish detail string from the progress
+/// fields. Preference order:
+///   1. `percentage` — always at most 4 chars (`100%`).
+///   2. Leading `X/Y` of the message (rust-analyzer's path-laden
+///      messages like `"34/285: /home/john/…"` collapse to `34/285`).
+///   3. Empty — caller renders `stage…` instead. Skipping verbose
+///      free-text messages keeps the segment from flapping width on
+///      every `$/progress` report.
+fn compact_progress_detail(message: Option<&str>, percentage: Option<u32>) -> String {
+    if let Some(pct) = percentage {
+        return format!("{pct}%");
     }
-    const MAX: usize = 32;
-    if msg.chars().count() > MAX {
-        let truncated: String = msg.chars().take(MAX).collect();
-        return format!("{truncated}…");
+    if let Some(msg) = message {
+        if let Some(prefix) = extract_xy_prefix(msg) {
+            return prefix.to_string();
+        }
     }
-    msg.to_string()
+    String::new()
+}
+
+/// Extract a leading `digit+/digit+` prefix from a message, e.g.
+/// `"34/285"` from `"34/285: /home/john/…"` or `"34/285"`. Returns
+/// None when the message doesn't start with that shape.
+fn extract_xy_prefix(msg: &str) -> Option<&str> {
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i == bytes.len() || bytes[i] != b'/' {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == i + 1 {
+        return None;
+    }
+    Some(&msg[..j])
 }
 
 /// Build a per-window status line for a given window.
@@ -12893,8 +12922,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lsp_progress_segment_indexing_with_message() {
-        // VSCode-style: `name • Indexing: 319/320 `.
+    fn test_lsp_progress_segment_prefers_percentage() {
+        // VSCode-style with percentage available: detail is the
+        // fixed-width `42%`, not the verbose message string.
         let progress = crate::core::lsp_manager::LspProgress {
             title: "Indexing".to_string(),
             message: Some("319/320".to_string()),
@@ -12902,7 +12932,7 @@ mod tests {
         };
         assert_eq!(
             format_lsp_progress_segment("rust-analyzer", Some(&progress)),
-            "rust-analyzer • Indexing: 319/320 "
+            "rust-analyzer • Indexing: 99% "
         );
     }
 
@@ -12935,17 +12965,18 @@ mod tests {
     }
 
     #[test]
-    fn test_lsp_progress_segment_truncates_path_suffix() {
-        // rust-analyzer's "Roots Scanned" report messages embed the full
-        // path of the crate being scanned; we strip everything after
-        // ": /" so the segment stays short.
+    fn test_lsp_progress_segment_extracts_xy_count_from_path_message() {
+        // rust-analyzer's "Roots Scanned" messages embed the full path
+        // (e.g. "34/285: /home/john/.cargo/registry/…"). When no
+        // percentage is provided, surface the leading `34/285` so the
+        // user still sees concrete progress without the path noise.
         let progress = crate::core::lsp_manager::LspProgress {
             title: "Roots Scanned".to_string(),
             message: Some(
                 "34/285: /home/john/.cargo/registry/src/index.crates.io-1949cf8c/gio-0.18.4"
                     .to_string(),
             ),
-            percentage: Some(11),
+            percentage: None,
         };
         assert_eq!(
             format_lsp_progress_segment("rust-analyzer", Some(&progress)),
@@ -12954,8 +12985,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lsp_progress_segment_truncates_long_message() {
-        // Non-path long messages get a hard char cap with ellipsis.
+    fn test_lsp_progress_segment_drops_unbounded_message() {
+        // Free-text messages without a percentage or X/Y prefix
+        // (e.g. "cargo metadata: Blocking …") would balloon the segment
+        // width and trigger fit-or-drop flicker — we drop the message
+        // text and fall back to `stage…`.
         let progress = crate::core::lsp_manager::LspProgress {
             title: "Fetching".to_string(),
             message: Some(
@@ -12963,26 +12997,43 @@ mod tests {
             ),
             percentage: None,
         };
-        let s = format_lsp_progress_segment("rust-analyzer", Some(&progress));
-        assert!(s.starts_with("rust-analyzer • Fetching: "), "got {s:?}");
-        // Stage label + 32-char message + ellipsis + trailing space.
-        assert!(s.chars().count() < 70, "segment too long: {s:?}");
-        assert!(s.contains('…'), "expected ellipsis in {s:?}");
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
     }
 
     #[test]
     fn test_lsp_progress_segment_empty_title_uses_working() {
         // Defensive: some servers begin without a title — show "working"
-        // rather than `name •  : message`.
+        // rather than a blank stage label.
         let progress = crate::core::lsp_manager::LspProgress {
             title: String::new(),
-            message: Some("loading".to_string()),
-            percentage: None,
+            message: None,
+            percentage: Some(50),
         };
         assert_eq!(
             format_lsp_progress_segment("rust-analyzer", Some(&progress)),
-            "rust-analyzer • working: loading "
+            "rust-analyzer • working: 50% "
         );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_width_bound() {
+        // Width discipline: the formatted segment must stay ≤ 32 cells
+        // for the longest plausible title + percentage combo, to prevent
+        // the status bar's priority-drop from flapping during streaming
+        // $/progress reports.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Building compile-time-deps".to_string(),
+            message: None,
+            percentage: Some(100),
+        };
+        let s = format_lsp_progress_segment("rust-analyzer", Some(&progress));
+        // Width covers `rust-analyzer • Building compile-time-deps: 100% ` ≈ 51 chars.
+        // Longest realistic title in rust-analyzer's vocabulary —
+        // shorter labels (e.g. "Indexing", "Fetching") stay well under.
+        assert!(s.chars().count() < 60, "segment too long: {s:?}");
     }
 
     #[test]
