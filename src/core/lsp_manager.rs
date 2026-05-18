@@ -700,7 +700,18 @@ impl LspManager {
                 self.servers.push(server);
                 Some(id)
             }
-            Err(_) => None,
+            Err(e) => {
+                // #436: previously the error was silently dropped, so
+                // :LspInfo just said "No LSP servers running" with no
+                // hint that the spawn failed.  Surface the error message
+                // and log it so the next debug session is one step ahead.
+                install_log(&format!(
+                    "[lsp-start] FAILED for {} (lang={language_id}): {e}",
+                    config.command
+                ));
+                self.last_start_error = Some(format!("LSP {} failed: {e}", config.command));
+                None
+            }
         }
     }
 
