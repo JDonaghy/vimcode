@@ -475,6 +475,38 @@ fn test_open_side_from_context_menu() {
     assert_eq!(action.as_deref(), Some("open_side"));
     // Should have created a new editor group
     assert!(e.editor_groups.len() >= 2);
+    // #226: the new group's active window must hold the target file's buffer,
+    // not a clone of the prior tab. open_editor_group clones the current buffer
+    // into the new group; open_side then has to replace it with the target.
+    assert_eq!(
+        e.file_path().map(|p| p.as_path()),
+        Some(path.as_path()),
+        "open_side should leave the target file in the new group's active window"
+    );
+}
+
+#[test]
+fn test_open_side_path_with_spaces() {
+    // Regression for #226: the prior implementation used `:e {path}` which
+    // tokenised on whitespace and silently dropped paths containing spaces.
+    let dir = std::env::temp_dir().join(format!("ctx_openside spaces {}", rand_name()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("my file.txt");
+    std::fs::write(&path, "content").unwrap();
+
+    let mut e = engine_with("hello");
+    e.open_explorer_context_menu(path.clone(), false, 5, 10);
+    let idx = e
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|i| i.action == "open_side")
+        .unwrap();
+    e.context_menu.as_mut().unwrap().selected = idx;
+    e.context_menu_confirm();
+    assert_eq!(e.file_path().map(|p| p.as_path()), Some(path.as_path()));
 }
 
 #[test]
@@ -1056,6 +1088,78 @@ fn test_explorer_open_side_vsplit_creates_split() {
     assert_eq!(e.file_path().unwrap(), &path);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_explorer_open_side_vsplit_target_on_right_regardless_of_splitright() {
+    // #226: "Open to the Side" must place the target on the right
+    // regardless of the user's splitright setting. With vim's default
+    // splitright=false, a plain :vsplit would put the new window on the
+    // left — but the menu label commits to "to the side" semantics.
+    use vimcode_core::core::engine::OpenMode;
+    use vimcode_core::core::window::WindowRect;
+
+    for splitright in [false, true] {
+        let dir =
+            std::env::temp_dir().join(format!("expl_vsplit_side_{}_{}", splitright, rand_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("original.txt");
+        let file_b = dir.join("target.txt");
+        std::fs::write(&file_a, "A").unwrap();
+        std::fs::write(&file_b, "B").unwrap();
+
+        let mut e = engine_with("");
+        e.settings.splitright = splitright;
+        e.open_file_with_mode(&file_a, OpenMode::Permanent).unwrap();
+
+        e.open_explorer_context_menu(file_b.clone(), false, 5, 10);
+        let idx = e
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|i| i.action == "open_side_vsplit")
+            .unwrap();
+        e.context_menu.as_mut().unwrap().selected = idx;
+        e.context_menu_confirm();
+
+        let editor_bounds = WindowRect::new(0.0, 0.0, 1000.0, 600.0);
+        let (window_rects, _) = e.calculate_group_window_rects(editor_bounds, 20.0);
+        assert_eq!(window_rects.len(), 2);
+
+        // The target window (file_b) must be at x >= the other window's x.
+        let target_x = window_rects
+            .iter()
+            .find_map(|(wid, rect)| {
+                let buf_id = e.windows.get(wid).unwrap().buffer_id;
+                let bs = e.buffer_manager.get(buf_id).unwrap();
+                if bs.file_path.as_deref() == Some(&file_b) {
+                    Some(rect.x)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let other_x = window_rects
+            .iter()
+            .find_map(|(wid, rect)| {
+                let buf_id = e.windows.get(wid).unwrap().buffer_id;
+                let bs = e.buffer_manager.get(buf_id).unwrap();
+                if bs.file_path.as_deref() == Some(&file_a) {
+                    Some(rect.x)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            target_x > other_x,
+            "splitright={splitright}: target x={target_x} should be greater than original x={other_x} (target on right)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[test]
