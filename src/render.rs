@@ -10441,7 +10441,7 @@ pub fn format_lsp_progress_segment(
         progress.title.as_str()
     };
     let detail = match (progress.message.as_deref(), progress.percentage) {
-        (Some(msg), _) if !msg.is_empty() => msg.to_string(),
+        (Some(msg), _) if !msg.is_empty() => truncate_progress_message(msg),
         (_, Some(pct)) => format!("{pct}%"),
         _ => String::new(),
     };
@@ -10450,6 +10450,23 @@ pub fn format_lsp_progress_segment(
     } else {
         format!("{label} • {stage}: {detail} ")
     }
+}
+
+/// rust-analyzer (and other servers) sometimes pack a file path into the
+/// progress message, e.g. `"34/285: /home/john/.cargo/registry/…"`.
+/// Trim everything after the `:`-separated path so the segment stays
+/// short enough to fit the status bar — VSCode shows just `319/320`.
+/// Falls back to a hard character cap for non-path messages.
+fn truncate_progress_message(msg: &str) -> String {
+    if let Some(idx) = msg.find(": /") {
+        return msg[..idx].to_string();
+    }
+    const MAX: usize = 32;
+    if msg.chars().count() > MAX {
+        let truncated: String = msg.chars().take(MAX).collect();
+        return format!("{truncated}…");
+    }
+    msg.to_string()
 }
 
 /// Build a per-window status line for a given window.
@@ -12915,6 +12932,42 @@ mod tests {
             format_lsp_progress_segment("rust-analyzer", Some(&progress)),
             "rust-analyzer • Fetching… "
         );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_truncates_path_suffix() {
+        // rust-analyzer's "Roots Scanned" report messages embed the full
+        // path of the crate being scanned; we strip everything after
+        // ": /" so the segment stays short.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Roots Scanned".to_string(),
+            message: Some(
+                "34/285: /home/john/.cargo/registry/src/index.crates.io-1949cf8c/gio-0.18.4"
+                    .to_string(),
+            ),
+            percentage: Some(11),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Roots Scanned: 34/285 "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_truncates_long_message() {
+        // Non-path long messages get a hard char cap with ellipsis.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: Some(
+                "cargo metadata: Blocking waiting for file lock on package cache".to_string(),
+            ),
+            percentage: None,
+        };
+        let s = format_lsp_progress_segment("rust-analyzer", Some(&progress));
+        assert!(s.starts_with("rust-analyzer • Fetching: "), "got {s:?}");
+        // Stage label + 32-char message + ellipsis + trailing space.
+        assert!(s.chars().count() < 70, "segment too long: {s:?}");
+        assert!(s.contains('…'), "expected ellipsis in {s:?}");
     }
 
     #[test]
