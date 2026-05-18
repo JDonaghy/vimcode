@@ -1540,7 +1540,23 @@ pub(super) fn handle_mouse(
     }
 
     // ── Context menu click intercept ────────────────────────────────────────────
-    if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
+    // #456: accept both `Down(Left)` and `Up(Left)`.  Some terminals (alacritty
+    // via SGR mouse mode + tmux, and apparently gnome-terminal in certain
+    // configurations) drop `Down(Left)` and only emit `Up(Left)` for clicks
+    // — the same quirk #451 handled for right-clicks.  Without this the
+    // menu item action never fires and the menu stays open until the user
+    // clicks somewhere outside.
+    //
+    // Safety: when the terminal sends both `Down` + `Up`, the `Down` runs
+    // first (action fires + menu closes via `context_menu_confirm` /
+    // `close_context_menu`), then the `Up` sees `context_menu.is_none()`
+    // and falls through — no double-fire.
+    if engine.context_menu.is_some()
+        && matches!(
+            ev.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
         if let Some(cl) = context_menu_layout {
             let hit = cl.hit_test(col as f32, row as f32);
             match hit {
