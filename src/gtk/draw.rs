@@ -820,16 +820,23 @@ pub(super) fn draw_editor(
         // No terminal: original layout with per-window or global status at bottom
         let status_y = height as f64 - status_bar_height;
         if let Some(ref bar) = screen.global_status_bar {
-            use quadraui::Backend;
+            // #446: route paint through quadraui's ScreenLayout. Layout return
+            // is discarded — the global status bar isn't a click target so it
+            // doesn't need the StatusBarLayout cached for hit-test.
+            use quadraui::{ScreenLayout as QScreenLayout, Surface};
             backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
                 b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
                 b.set_current_line_height(line_height);
-                b.draw_status_bar(
-                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32),
+                let rect =
+                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32);
+                let mut frame = QScreenLayout::new();
+                frame.push(Surface::StatusBar {
+                    rect,
                     bar,
-                    None,
-                    None,
-                );
+                    hovered: None,
+                    pressed: None,
+                });
+                frame.draw(b);
             });
         }
         let mut next_y = if per_window_status {
