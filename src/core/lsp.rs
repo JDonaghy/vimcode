@@ -125,10 +125,23 @@ pub enum LspEvent {
     /// on the server. Used by the indicator to track workspace indexing
     /// (#450). `token` is the unique progress-token string (LSP allows
     /// number or string; we stringify both for HashMap keying).
+    /// `message` and `percentage` are the begin payload's optional
+    /// progress fields (#221).
     WorkProgressBegin {
         server_id: LspServerId,
         token: String,
         title: Option<String>,
+        message: Option<String>,
+        percentage: Option<u32>,
+    },
+    /// `$/progress` report notification — interim update on an open
+    /// work item (#221). Drives `Indexing: 319/320` style status bar
+    /// segments. Carries the latest message + percentage.
+    WorkProgressReport {
+        server_id: LspServerId,
+        token: String,
+        message: Option<String>,
+        percentage: Option<u32>,
     },
     /// `$/progress` end notification — work item completed.
     WorkProgressEnd {
@@ -1784,14 +1797,21 @@ fn parse_diagnostics(server_id: LspServerId, params: &serde_json::Value) -> Opti
     })
 }
 
-/// Parse a `$/progress` notification's params into a begin or end event
-/// (#450). `params` shape: `{ token, value: { kind, title?, message?,
-/// percentage? } }`. Report (interim) notifications return None — only
-/// begin/end change the "is indexing" state the indicator cares about.
+/// Parse a `$/progress` notification's params into a begin, report, or
+/// end event (#450, extended by #221). `params` shape: `{ token, value:
+/// { kind, title?, message?, percentage? } }`.
 fn parse_work_progress(server_id: LspServerId, params: &serde_json::Value) -> Option<LspEvent> {
     let token = params.get("token").and_then(token_to_key)?;
     let value = params.get("value")?;
     let kind = value.get("kind").and_then(|k| k.as_str())?;
+    let message = value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let percentage = value
+        .get("percentage")
+        .and_then(|p| p.as_u64())
+        .map(|n| n.min(100) as u32);
     match kind {
         "begin" => {
             let title = value
@@ -1802,10 +1822,18 @@ fn parse_work_progress(server_id: LspServerId, params: &serde_json::Value) -> Op
                 server_id,
                 token,
                 title,
+                message,
+                percentage,
             })
         }
+        "report" => Some(LspEvent::WorkProgressReport {
+            server_id,
+            token,
+            message,
+            percentage,
+        }),
         "end" => Some(LspEvent::WorkProgressEnd { server_id, token }),
-        _ => None, // "report" — interim update, ignored
+        _ => None,
     }
 }
 
@@ -3050,14 +3078,23 @@ bin:
             "value": {
                 "kind": "begin",
                 "title": "Indexing",
-                "percentage": 0
+                "percentage": 0,
+                "message": "0/319"
             }
         });
         let event = super::parse_work_progress(0, &params).expect("should parse");
         match event {
-            super::LspEvent::WorkProgressBegin { token, title, .. } => {
+            super::LspEvent::WorkProgressBegin {
+                token,
+                title,
+                message,
+                percentage,
+                ..
+            } => {
                 assert_eq!(token, "rustAnalyzer/Indexing");
                 assert_eq!(title.as_deref(), Some("Indexing"));
+                assert_eq!(message.as_deref(), Some("0/319"));
+                assert_eq!(percentage, Some(0));
             }
             other => panic!("expected WorkProgressBegin, got {other:?}"),
         }
@@ -3093,14 +3130,42 @@ bin:
     }
 
     #[test]
-    fn parse_work_progress_report_returns_none() {
-        // Interim updates between begin and end don't change the binary
-        // is_indexing state — we drop them on the floor.
+    fn parse_work_progress_report_emits_event() {
+        // #221: report notifications carry the latest message+percentage
+        // for the status bar segment (`Indexing: 319/320`).
         let params = serde_json::json!({
             "token": "t1",
             "value": { "kind": "report", "percentage": 50, "message": "halfway" }
         });
-        assert!(super::parse_work_progress(0, &params).is_none());
+        let event = super::parse_work_progress(0, &params).expect("should parse");
+        match event {
+            super::LspEvent::WorkProgressReport {
+                token,
+                message,
+                percentage,
+                ..
+            } => {
+                assert_eq!(token, "t1");
+                assert_eq!(message.as_deref(), Some("halfway"));
+                assert_eq!(percentage, Some(50));
+            }
+            other => panic!("expected WorkProgressReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_work_progress_clamps_oversized_percentage() {
+        // Defensive: a server emitting 200 must not overflow / surprise.
+        let params = serde_json::json!({
+            "token": "t1",
+            "value": { "kind": "report", "percentage": 200 }
+        });
+        match super::parse_work_progress(0, &params).expect("should parse") {
+            super::LspEvent::WorkProgressReport { percentage, .. } => {
+                assert_eq!(percentage, Some(100));
+            }
+            other => panic!("expected WorkProgressReport, got {other:?}"),
+        }
     }
 
     #[test]

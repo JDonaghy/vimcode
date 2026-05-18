@@ -800,6 +800,21 @@ impl Engine {
         }
         status
     }
+
+    /// Return the active `$/progress` snapshot for the buffer's server
+    /// (#221). Used by the status bar to format
+    /// `name • Indexing: 319/320` segments. Returns None when no
+    /// progress is open or the manager/language isn't set up.
+    pub fn lsp_progress_for_buffer(
+        &self,
+        buffer_id: crate::core::buffer::BufferId,
+    ) -> Option<crate::core::lsp_manager::LspProgress> {
+        let buf = self.buffer_manager.get(buffer_id)?;
+        let lang = buf.lsp_language_id.as_deref()?;
+        let mgr = self.lsp_manager.as_ref()?;
+        let server_id = mgr.server_id_for_language(lang)?;
+        mgr.current_progress(server_id).cloned()
+    }
 }
 
 /// Returns true if `path` is a symlink pointing to `rustup` (the rustup

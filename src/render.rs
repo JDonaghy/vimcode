@@ -10424,6 +10424,80 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
     })
 }
 
+/// Format the LSP status segment text when the server is still
+/// indexing (#221). Renders `name • Indexing: 319/320` when the
+/// server is publishing `$/progress`; falls back to the dimmed
+/// `name… ` placeholder when no progress data is available.
+///
+/// Width discipline: progress notifications fire many times per second
+/// with varying message lengths. If the segment width fluctuates,
+/// `StatusBar::layout`'s priority-drop kicks in and lower-priority
+/// segments flash in/out — visually glitchy. The formatter keeps the
+/// segment width stable and ≤ ~28 cells by preferring fixed-width
+/// detail (percentage, then `X/Y` if the message starts with one) and
+/// otherwise dropping the message in favour of `stage…`.
+pub fn format_lsp_progress_segment(
+    label: &str,
+    progress: Option<&crate::core::lsp_manager::LspProgress>,
+) -> String {
+    let Some(progress) = progress else {
+        return format!("{label}… ");
+    };
+    let stage = if progress.title.is_empty() {
+        "working"
+    } else {
+        progress.title.as_str()
+    };
+    let detail = compact_progress_detail(progress.message.as_deref(), progress.percentage);
+    if detail.is_empty() {
+        format!("{label} • {stage}… ")
+    } else {
+        format!("{label} • {stage}: {detail} ")
+    }
+}
+
+/// Pick a compact, fixed-width-ish detail string from the progress
+/// fields. Preference order:
+///   1. `percentage` — always at most 4 chars (`100%`).
+///   2. Leading `X/Y` of the message (rust-analyzer's path-laden
+///      messages like `"34/285: /home/john/…"` collapse to `34/285`).
+///   3. Empty — caller renders `stage…` instead. Skipping verbose
+///      free-text messages keeps the segment from flapping width on
+///      every `$/progress` report.
+fn compact_progress_detail(message: Option<&str>, percentage: Option<u32>) -> String {
+    if let Some(pct) = percentage {
+        return format!("{pct}%");
+    }
+    if let Some(msg) = message {
+        if let Some(prefix) = extract_xy_prefix(msg) {
+            return prefix.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extract a leading `digit+/digit+` prefix from a message, e.g.
+/// `"34/285"` from `"34/285: /home/john/…"` or `"34/285"`. Returns
+/// None when the message doesn't start with that shape.
+fn extract_xy_prefix(msg: &str) -> Option<&str> {
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i == bytes.len() || bytes[i] != b'/' {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == i + 1 {
+        return None;
+    }
+    Some(&msg[..j])
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(
@@ -10552,6 +10626,10 @@ pub fn build_window_status_line(
         let lsp_status = window
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
+        // #221: when indexing is in flight, format `name • Indexing: 319/320`
+        // from the latest $/progress snapshot. Falls back to the plain
+        // `name…` placeholder when the server isn't reporting progress.
+        let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
         // Right side — ordered least-important → most-important (left → right
         // when right-aligned). Narrow bars drop from the front of this list,
@@ -10700,7 +10778,8 @@ pub fn build_window_status_line(
                 LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
                 LspStatus::Initializing(name) => {
                     let label = if name.is_empty() { "LSP" } else { name };
-                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
+                    let text = format_lsp_progress_segment(label, lsp_progress.as_ref());
+                    (Some(text), theme.status_inactive_fg)
                 }
                 LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
                 LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
@@ -12830,6 +12909,131 @@ mod tests {
         assert_eq!(LineEnding::detect("hello\r\nworld\r\n"), LineEnding::Crlf);
         assert_eq!(LineEnding::detect("no newline"), LineEnding::LF);
         assert_eq!(LineEnding::detect(""), LineEnding::LF);
+    }
+
+    // ─── #221: LSP progress segment formatter ───────────────────────
+    #[test]
+    fn test_lsp_progress_segment_no_progress() {
+        // Pre-#221 behaviour: no progress data → dimmed `name… `.
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", None),
+            "rust-analyzer… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_prefers_percentage() {
+        // VSCode-style with percentage available: detail is the
+        // fixed-width `42%`, not the verbose message string.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: Some("319/320".to_string()),
+            percentage: Some(99),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 99% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_falls_back_to_percentage() {
+        // No message string → use percentage as detail.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: None,
+            percentage: Some(42),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 42% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_title_only() {
+        // begin with just a title and nothing else: show stage with `…`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: None,
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_extracts_xy_count_from_path_message() {
+        // rust-analyzer's "Roots Scanned" messages embed the full path
+        // (e.g. "34/285: /home/john/.cargo/registry/…"). When no
+        // percentage is provided, surface the leading `34/285` so the
+        // user still sees concrete progress without the path noise.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Roots Scanned".to_string(),
+            message: Some(
+                "34/285: /home/john/.cargo/registry/src/index.crates.io-1949cf8c/gio-0.18.4"
+                    .to_string(),
+            ),
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Roots Scanned: 34/285 "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_drops_unbounded_message() {
+        // Free-text messages without a percentage or X/Y prefix
+        // (e.g. "cargo metadata: Blocking …") would balloon the segment
+        // width and trigger fit-or-drop flicker — we drop the message
+        // text and fall back to `stage…`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: Some(
+                "cargo metadata: Blocking waiting for file lock on package cache".to_string(),
+            ),
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_empty_title_uses_working() {
+        // Defensive: some servers begin without a title — show "working"
+        // rather than a blank stage label.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: String::new(),
+            message: None,
+            percentage: Some(50),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • working: 50% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_width_bound() {
+        // Width discipline: the formatted segment must stay ≤ 32 cells
+        // for the longest plausible title + percentage combo, to prevent
+        // the status bar's priority-drop from flapping during streaming
+        // $/progress reports.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Building compile-time-deps".to_string(),
+            message: None,
+            percentage: Some(100),
+        };
+        let s = format_lsp_progress_segment("rust-analyzer", Some(&progress));
+        // Width covers `rust-analyzer • Building compile-time-deps: 100% ` ≈ 51 chars.
+        // Longest realistic title in rust-analyzer's vocabulary —
+        // shorter labels (e.g. "Indexing", "Fetching") stay well under.
+        assert!(s.chars().count() < 60, "segment too long: {s:?}");
     }
 
     #[test]
