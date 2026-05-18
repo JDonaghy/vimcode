@@ -424,12 +424,11 @@ pub struct LspManager {
     /// Servers that have returned at least one non-empty response (symbols, hover, etc.).
     /// This indicates the server has finished indexing and is truly "ready".
     server_has_responded: HashMap<LspServerId, bool>,
-    /// In-flight `$/progress` tokens per server (#450). Populated by
-    /// WorkProgressBegin, drained by WorkProgressEnd. `is_indexing(server_id)`
-    /// returns true while any progress is open — used by the status indicator
-    /// to dim `name…` while rust-analyzer / gopls / similar servers are
-    /// indexing the workspace.
-    pending_work: HashMap<LspServerId, std::collections::HashSet<String>>,
+    /// In-flight `$/progress` tokens per server (#450, enriched in #221).
+    /// Vec preserves begin order so `current_progress` can return the
+    /// most-recently-begun work item for status-bar display. Populated
+    /// by WorkProgressBegin/Report, drained by WorkProgressEnd.
+    progress_data: HashMap<LspServerId, Vec<(String, LspProgress)>>,
     /// Timestamp of the last WorkProgressEnd per server. `is_indexing`
     /// keeps reporting true for `PROGRESS_COOLDOWN` after the last end
     /// so the indicator doesn't flicker bright between back-to-back
@@ -442,6 +441,21 @@ pub struct LspManager {
     /// Last error from `ensure_server_for_language` (dependency check failure, etc.).
     /// Engine reads and clears this after calling ensure_server.
     pub last_start_error: Option<String>,
+}
+
+/// Snapshot of a `$/progress` work item shown in the status bar (#221).
+/// Title is set at begin time (e.g. "Indexing"); message and percentage
+/// are updated by interim "report" notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspProgress {
+    /// Stage label from the begin payload (e.g. "Indexing", "Building").
+    /// Empty when the server didn't supply one.
+    pub title: String,
+    /// Latest progress detail (e.g. "319/320"). None until a report
+    /// arrives or if the server doesn't emit one.
+    pub message: Option<String>,
+    /// Latest percentage 0..=100. None when the server doesn't track it.
+    pub percentage: Option<u32>,
 }
 
 /// LSP server status for a given language (used by status bar indicator).
@@ -465,12 +479,51 @@ impl LspManager {
         self.server_has_responded.insert(server_id, true);
     }
 
-    /// Record that a `$/progress` work item has begun on a server (#450).
-    pub fn work_progress_begin(&mut self, server_id: LspServerId, token: String) {
-        self.pending_work
-            .entry(server_id)
-            .or_default()
-            .insert(token);
+    /// Record that a `$/progress` work item has begun on a server
+    /// (#450, enriched with title/message/percentage in #221).
+    /// Duplicate begin for the same token replaces the existing entry —
+    /// servers shouldn't do this, but be defensive.
+    pub fn work_progress_begin(
+        &mut self,
+        server_id: LspServerId,
+        token: String,
+        title: Option<String>,
+        message: Option<String>,
+        percentage: Option<u32>,
+    ) {
+        let progress = LspProgress {
+            title: title.unwrap_or_default(),
+            message,
+            percentage,
+        };
+        let list = self.progress_data.entry(server_id).or_default();
+        if let Some(slot) = list.iter_mut().find(|(t, _)| *t == token) {
+            slot.1 = progress;
+        } else {
+            list.push((token, progress));
+        }
+    }
+
+    /// Update an in-flight work item's message/percentage from a
+    /// `$/progress` "report" notification (#221). Silently ignored if
+    /// the token isn't tracked.
+    pub fn work_progress_report(
+        &mut self,
+        server_id: LspServerId,
+        token: &str,
+        message: Option<String>,
+        percentage: Option<u32>,
+    ) {
+        if let Some(list) = self.progress_data.get_mut(&server_id) {
+            if let Some(slot) = list.iter_mut().find(|(t, _)| t == token) {
+                if message.is_some() {
+                    slot.1.message = message;
+                }
+                if percentage.is_some() {
+                    slot.1.percentage = percentage;
+                }
+            }
+        }
     }
 
     /// Record that a `$/progress` work item has ended on a server (#450).
@@ -479,9 +532,14 @@ impl LspManager {
     /// server side) shouldn't extend the dim state.
     pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) {
         let removed = self
-            .pending_work
+            .progress_data
             .get_mut(&server_id)
-            .is_some_and(|set| set.remove(token));
+            .map(|list| {
+                let before = list.len();
+                list.retain(|(t, _)| t != token);
+                list.len() != before
+            })
+            .unwrap_or(false);
         if removed {
             self.last_progress_end
                 .insert(server_id, std::time::Instant::now());
@@ -495,9 +553,9 @@ impl LspManager {
     /// but the server hasn't truly settled.
     pub fn is_indexing(&self, server_id: LspServerId) -> bool {
         if self
-            .pending_work
+            .progress_data
             .get(&server_id)
-            .is_some_and(|set| !set.is_empty())
+            .is_some_and(|list| !list.is_empty())
         {
             return true;
         }
@@ -507,6 +565,16 @@ impl LspManager {
             }
         }
         false
+    }
+
+    /// Return the most-recently-begun progress item for a server (#221).
+    /// Used by the status bar to format `name • title: message` while
+    /// the server is indexing. Returns None when no progress is open.
+    pub fn current_progress(&self, server_id: LspServerId) -> Option<&LspProgress> {
+        self.progress_data
+            .get(&server_id)
+            .and_then(|list| list.last())
+            .map(|(_, p)| p)
     }
 
     /// Look up the server handling a given language. Public accessor so
@@ -580,7 +648,7 @@ impl LspManager {
             ext_manifests: Vec::new(),
             all_ext_manifests: Vec::new(),
             server_has_responded: HashMap::new(),
-            pending_work: HashMap::new(),
+            progress_data: HashMap::new(),
             last_progress_end: HashMap::new(),
             crashed_servers: Vec::new(),
             last_start_error: None,
@@ -1279,15 +1347,16 @@ impl Drop for LspManager {
 mod tests {
     use super::*;
 
-    // #450: pending_work lifecycle. Without a real LSP server we drive the
-    // helpers directly — that's all the indicator's gate consults.
+    // #450 / #221: progress_data lifecycle. Without a real LSP server we
+    // drive the helpers directly — that's all the indicator's gate
+    // consults.
     #[test]
     fn work_progress_begin_marks_indexing() {
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         assert!(!mgr.is_indexing(sid), "no progress → not indexing");
 
-        mgr.work_progress_begin(sid, "rustAnalyzer/Indexing".to_string());
+        mgr.work_progress_begin(sid, "rustAnalyzer/Indexing".to_string(), None, None, None);
         assert!(mgr.is_indexing(sid), "begin → indexing");
     }
 
@@ -1298,14 +1367,17 @@ mod tests {
         // rust-analyzer's Fetching → gap → Indexing).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(sid, "t1".to_string());
+        mgr.work_progress_begin(sid, "t1".to_string(), None, None, None);
         mgr.work_progress_end(sid, "t1");
         assert!(
             mgr.is_indexing(sid),
             "still indexing within cooldown after last end"
         );
-        // Underlying pending_work IS empty — just the cooldown extends it.
-        assert!(mgr.pending_work.get(&sid).is_none_or(|set| set.is_empty()));
+        // Underlying progress_data IS empty — just the cooldown extends it.
+        assert!(mgr
+            .progress_data
+            .get(&sid)
+            .is_none_or(|list| list.is_empty()));
     }
 
     #[test]
@@ -1316,8 +1388,8 @@ mod tests {
         // works directly (cooldown is irrelevant while a token is open).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(sid, "Indexing".to_string());
-        mgr.work_progress_begin(sid, "Roots Scanned".to_string());
+        mgr.work_progress_begin(sid, "Indexing".to_string(), None, None, None);
+        mgr.work_progress_begin(sid, "Roots Scanned".to_string(), None, None, None);
         assert!(mgr.is_indexing(sid));
 
         mgr.work_progress_end(sid, "Indexing");
@@ -1326,7 +1398,7 @@ mod tests {
             "still indexing while one token remains open"
         );
         // Other token still in flight — cooldown isn't even consulted yet.
-        assert_eq!(mgr.pending_work[&sid].len(), 1);
+        assert_eq!(mgr.progress_data[&sid].len(), 1);
     }
 
     #[test]
@@ -1344,5 +1416,72 @@ mod tests {
             mgr.last_progress_end.get(&sid).is_none(),
             "stray end must not arm the cooldown"
         );
+    }
+
+    // ─── #221: LspProgress accessors ────────────────────────────────────
+    #[test]
+    fn current_progress_is_none_when_idle() {
+        let mgr = LspManager::new(PathBuf::from("."), &[]);
+        assert!(mgr.current_progress(0).is_none());
+    }
+
+    #[test]
+    fn current_progress_returns_begin_payload() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        mgr.work_progress_begin(
+            sid,
+            "rustAnalyzer/Indexing".to_string(),
+            Some("Indexing".to_string()),
+            Some("0/319".to_string()),
+            Some(0),
+        );
+        let p = mgr.current_progress(sid).expect("progress exists");
+        assert_eq!(p.title, "Indexing");
+        assert_eq!(p.message.as_deref(), Some("0/319"));
+        assert_eq!(p.percentage, Some(0));
+    }
+
+    #[test]
+    fn report_updates_message_and_percentage() {
+        // rust-analyzer fires begin with no detail, then a stream of
+        // report notifications with `319/320`-style messages. Each report
+        // must overwrite the previous message + percentage.
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        let tok = "tok".to_string();
+        mgr.work_progress_begin(sid, tok.clone(), Some("Indexing".to_string()), None, None);
+        mgr.work_progress_report(sid, &tok, Some("1/320".to_string()), Some(0));
+        mgr.work_progress_report(sid, &tok, Some("319/320".to_string()), Some(99));
+        let p = mgr.current_progress(sid).expect("progress exists");
+        assert_eq!(p.title, "Indexing");
+        assert_eq!(p.message.as_deref(), Some("319/320"));
+        assert_eq!(p.percentage, Some(99));
+    }
+
+    #[test]
+    fn report_for_unknown_token_is_noop() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        // No begin for "ghost" — report must not create an entry.
+        mgr.work_progress_report(sid, "ghost", Some("x".into()), Some(50));
+        assert!(mgr.current_progress(sid).is_none());
+    }
+
+    #[test]
+    fn current_progress_returns_most_recently_begun() {
+        // When multiple tokens are open (rust-analyzer's overlapping
+        // phases) the indicator surfaces the latest one.
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        mgr.work_progress_begin(sid, "a".into(), Some("Fetching".into()), None, None);
+        mgr.work_progress_begin(sid, "b".into(), Some("Indexing".into()), None, None);
+        let p = mgr.current_progress(sid).expect("progress exists");
+        assert_eq!(p.title, "Indexing");
+
+        // After the most recent ends, fall back to the older still-open one.
+        mgr.work_progress_end(sid, "b");
+        let p = mgr.current_progress(sid).expect("progress exists");
+        assert_eq!(p.title, "Fetching");
     }
 }

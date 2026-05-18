@@ -1384,13 +1384,29 @@ impl Engine {
                     }
                 }
                 LspEvent::WorkProgressBegin {
-                    server_id, token, ..
+                    server_id,
+                    token,
+                    title,
+                    message,
+                    percentage,
                 } => {
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_begin(server_id, token);
+                        mgr.work_progress_begin(server_id, token, title, message, percentage);
                     }
                     // Status indicator may change (Running → Initializing
                     // while indexing) — request a redraw (#450).
+                    redraw = true;
+                }
+                LspEvent::WorkProgressReport {
+                    server_id,
+                    token,
+                    message,
+                    percentage,
+                } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.work_progress_report(server_id, &token, message, percentage);
+                    }
+                    // Message/percentage changed → segment text changed (#221).
                     redraw = true;
                 }
                 LspEvent::WorkProgressEnd { server_id, token } => {

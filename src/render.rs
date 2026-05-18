@@ -10424,6 +10424,34 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
     })
 }
 
+/// Format the LSP status segment text when the server is still
+/// indexing (#221). Renders `name • Indexing: 319/320` when the
+/// server is publishing `$/progress`; falls back to the dimmed
+/// `name… ` placeholder when no progress data is available.
+pub fn format_lsp_progress_segment(
+    label: &str,
+    progress: Option<&crate::core::lsp_manager::LspProgress>,
+) -> String {
+    let Some(progress) = progress else {
+        return format!("{label}… ");
+    };
+    let stage = if progress.title.is_empty() {
+        "working"
+    } else {
+        progress.title.as_str()
+    };
+    let detail = match (progress.message.as_deref(), progress.percentage) {
+        (Some(msg), _) if !msg.is_empty() => msg.to_string(),
+        (_, Some(pct)) => format!("{pct}%"),
+        _ => String::new(),
+    };
+    if detail.is_empty() {
+        format!("{label} • {stage}… ")
+    } else {
+        format!("{label} • {stage}: {detail} ")
+    }
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(
@@ -10552,6 +10580,10 @@ pub fn build_window_status_line(
         let lsp_status = window
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
+        // #221: when indexing is in flight, format `name • Indexing: 319/320`
+        // from the latest $/progress snapshot. Falls back to the plain
+        // `name…` placeholder when the server isn't reporting progress.
+        let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
         // Right side — ordered least-important → most-important (left → right
         // when right-aligned). Narrow bars drop from the front of this list,
@@ -10700,7 +10732,8 @@ pub fn build_window_status_line(
                 LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
                 LspStatus::Initializing(name) => {
                     let label = if name.is_empty() { "LSP" } else { name };
-                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
+                    let text = format_lsp_progress_segment(label, lsp_progress.as_ref());
+                    (Some(text), theme.status_inactive_fg)
                 }
                 LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
                 LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
@@ -12830,6 +12863,73 @@ mod tests {
         assert_eq!(LineEnding::detect("hello\r\nworld\r\n"), LineEnding::Crlf);
         assert_eq!(LineEnding::detect("no newline"), LineEnding::LF);
         assert_eq!(LineEnding::detect(""), LineEnding::LF);
+    }
+
+    // ─── #221: LSP progress segment formatter ───────────────────────
+    #[test]
+    fn test_lsp_progress_segment_no_progress() {
+        // Pre-#221 behaviour: no progress data → dimmed `name… `.
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", None),
+            "rust-analyzer… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_indexing_with_message() {
+        // VSCode-style: `name • Indexing: 319/320 `.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: Some("319/320".to_string()),
+            percentage: Some(99),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 319/320 "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_falls_back_to_percentage() {
+        // No message string → use percentage as detail.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: None,
+            percentage: Some(42),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 42% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_title_only() {
+        // begin with just a title and nothing else: show stage with `…`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: None,
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_empty_title_uses_working() {
+        // Defensive: some servers begin without a title — show "working"
+        // rather than `name •  : message`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: String::new(),
+            message: Some("loading".to_string()),
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • working: loading "
+        );
     }
 
     #[test]
