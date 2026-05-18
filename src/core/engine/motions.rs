@@ -3663,14 +3663,52 @@ impl Engine {
     }
 
     /// zh — scroll view left by `count` columns.
+    ///
+    /// Decreases `scroll_left`, which exposes more of the line to the left of
+    /// the viewport (cursor's visible position shifts right). The cursor is
+    /// pulled onto the new viewport if the scroll has left it off-screen — if
+    /// we didn't do that, `ensure_cursor_visible` (called after every key in
+    /// `handle_key`) would snap `scroll_left` back to track the cursor and
+    /// effectively undo the scroll.
     pub(crate) fn scroll_left_by(&mut self, count: usize) {
         let sl = self.view().scroll_left;
-        self.view_mut().scroll_left = sl.saturating_sub(count);
+        let new_sl = sl.saturating_sub(count);
+        self.view_mut().scroll_left = new_sl;
+        self.clamp_cursor_to_horizontal_viewport(new_sl);
     }
 
     /// zl — scroll view right by `count` columns.
+    ///
+    /// Increases `scroll_left`, which exposes more of the line to the right of
+    /// the viewport. The cursor is pulled onto the new viewport so that
+    /// `ensure_cursor_visible` does not snap the scroll back (see
+    /// `scroll_left_by`).
     pub(crate) fn scroll_right_by(&mut self, count: usize) {
-        self.view_mut().scroll_left += count;
+        let new_sl = self.view().scroll_left + count;
+        self.view_mut().scroll_left = new_sl;
+        self.clamp_cursor_to_horizontal_viewport(new_sl);
+    }
+
+    /// Move the cursor's column onto the horizontal viewport at `scroll_left`.
+    ///
+    /// If `viewport_cols` is 0 (uninitialised), this is a no-op so that
+    /// headless / uninitialised engines still let scroll commands shift
+    /// `scroll_left` freely. Otherwise, the cursor column is clamped to
+    /// `[scroll_left, scroll_left + viewport_cols)`. This is the cursor
+    /// adjustment Vim performs for `zh`/`zl`/`zH`/`zL` when the scroll would
+    /// leave the cursor off-screen.
+    fn clamp_cursor_to_horizontal_viewport(&mut self, scroll_left: usize) {
+        let viewport_cols = self.view().viewport_cols;
+        if viewport_cols == 0 {
+            return;
+        }
+        let right_edge = scroll_left + viewport_cols;
+        let cursor_col = self.view().cursor.col;
+        if cursor_col < scroll_left {
+            self.view_mut().cursor.col = scroll_left;
+        } else if cursor_col >= right_edge {
+            self.view_mut().cursor.col = right_edge - 1;
+        }
     }
 
     /// zH — scroll half screen width left.
