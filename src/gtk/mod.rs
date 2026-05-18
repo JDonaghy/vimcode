@@ -5980,7 +5980,16 @@ impl App {
         let engine = self.engine.borrow();
         let visible = engine.editor_hover.is_some();
         let rect = self.editor_hover_popup_rect.get();
+        let link_count = self.editor_hover_link_rects.borrow().len();
+        let sb_present = self.editor_hover_scrollbar.get().is_some();
         drop(engine);
+        // #469 debug: trace what reconcile sees so we can confirm whether
+        // the migrated paint set the popup rect / link rects / scrollbar
+        // hit correctly. Remove once root-causation lands.
+        eprintln!(
+            "[#469] reconcile_editor_hover_modal: visible={} rect={:?} links={} sb={}",
+            visible, rect, link_count, sb_present,
+        );
         let stack_rc = self.backend.borrow().modal_stack_handle();
         let mut stack = stack_rc.borrow_mut();
         match (visible, rect) {
@@ -6043,6 +6052,19 @@ impl App {
                 quadraui::MouseButton::Left,
                 Default::default(),
             );
+            // #469 debug: trace dispatch_click so we can see if the
+            // editor_hover modal is being hit at click time, or if the
+            // click is falling through to a scroll surface (the editor
+            // scrollbar). Remove once root-causation lands.
+            eprintln!(
+                "[#469] dispatch_click @({x:.0},{y:.0}) -> {} events; modal_top={:?} surfaces={}",
+                click_events.len(),
+                modal.top().map(|m| m.id.as_str().to_string()),
+                surfaces.len(),
+            );
+            for ev in &click_events {
+                eprintln!("[#469]   event: {:?}", ev);
+            }
             *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
             for cev in &click_events {
                 match cev {

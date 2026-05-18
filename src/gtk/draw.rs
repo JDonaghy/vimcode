@@ -424,7 +424,7 @@ pub(super) fn draw_editor(
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
     let (eh_rect, eh_links, eh_sb) =
-        draw_editor_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+        draw_editor_hover_popup(backend, cr, &layout, &screen, &theme, line_height, char_width);
     editor_hover_rect_out.set(eh_rect);
     *editor_hover_link_rects_out.borrow_mut() = eh_links;
     editor_hover_scrollbar_out.set(eh_sb);
@@ -1497,8 +1497,9 @@ pub(super) fn draw_hover_popup(
 /// primitive. Returns `(popup_bounds, link_rects, scrollbar_hit)` —
 /// scrollbar geometry feeds the click + drag handlers in `mod.rs`
 /// (#215).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn draw_editor_hover_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -1567,21 +1568,40 @@ pub(super) fn draw_editor_hover_popup(
         },
     );
 
-    // #463: rich text popup migration reverted — paint goes through
-    // the legacy quadraui_gtk shim which returns link rects directly.
-    // Migration to Surface::RichTextPopup caused click hit-test
-    // regression (links + scrollbar track/thumb fell through to editor
-    // scrollbar underneath). Needs deeper investigation; tracked under
-    // #463 follow-up.
-    let link_rects = super::quadraui_gtk::draw_rich_text_popup(
-        cr,
-        layout,
-        &popup,
-        &popup_layout,
-        line_height,
-        char_width,
-        theme,
-    );
+    // #469: route paint through quadraui::ScreenLayout. Recovers link
+    // hit regions from `popup_layout.link_hit_regions` (which is the
+    // same instance used by paint, so paint + click agree by
+    // construction).
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::RichTextPopup {
+            popup: &popup,
+            layout: &popup_layout,
+        });
+        frame.draw(b);
+    });
+    let link_rects: Vec<(f64, f64, f64, f64, String)> = popup_layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (
+                rect.x as f64,
+                rect.y as f64,
+                rect.width as f64,
+                rect.height as f64,
+                url,
+            )
+        })
+        .collect();
     let popup_rect = Some((
         popup_layout.bounds.x as f64,
         popup_layout.bounds.y as f64,
