@@ -1,7 +1,23 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 386 archived here.
+All sessions through 387 archived here.
+
+---
+**Session 387 (May 18) — #446 migration complete + first automated dispatch:**
+
+Final chunk of the ScreenLayout::draw() migration landed. claude-coordinator's first real autonomous dispatch succeeded (dellserver fixed #453). Coordinator tool gaps identified through real usage.
+
+**Closed:**
+- **#462** (PR #472) Chunk C: editor viewport, terminal (single + split × 3 sites), horizontal scrollbars, find/replace overlay, palette popup — all routed through `ScreenLayout::draw()`. `draw_window` and `draw_h_scrollbars` gained `backend` parameter. Backend trait's `draw_editor` resolves FontMetrics internally from frame-scope pango context. User smoke-tested all 5 surfaces.
+- **#453** (PR #473) Horizontal scroll `zh`/`zl`/`zH`/`zL` fix. Root cause: `handle_key` calls `ensure_cursor_visible()` after every keypress, which snapped `scroll_left` back to track the cursor, undoing the scroll. Added `clamp_cursor_to_horizontal_viewport()` that pulls cursor onto viewport after scroll commands. Matches Vim's documented behavior. **This was the first successful autonomous dispatch via claude-coordinator** — dellserver agent found a real engine bug (not just stale tests), fixed it, pushed the branch.
+
+**Filed:**
+- **#471** — typing in right pane of split terminal causes text to disappear (pre-existing, surfaced during #462 smoke)
+
+**#446 status:** Effectively complete. All 4 chunks (A/B/C/D) landed — every GTK surface except rich text popup (#469) routes through `ScreenLayout::draw()`.
+
+**claude-coordinator shakedown:** First real dispatch cycle exposed 5 gaps: (1) worker had no `--allowedTools`/`--permission-mode` flags → silently failed (fixed); (2) `close_merged_issues` hook fired on worker completion, not PR merge → auto-closed #206 without verifying work (hook disabled); (3) worker committed to develop instead of a feature branch → prompt strengthened; (4) reconcile didn't capture branch name from agent `/status` → `coord merge` broken (filed #44); (5) `coord status` shows "busy" but no progress details. The tool dispatches but the last mile (review, test, merge) still needs a human coordinator.
 
 ---
 **Sessions 385–386 (May 17–18) — Multi-agent coordinated sprint + ScreenLayout migration + claude-coordinator MVP:**

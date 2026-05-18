@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 18, 2026 (Sessions 385–386 — **Multi-agent coordinated sprint + ScreenLayout::draw() migration + claude-coordinator MVP.** 25+ vimcode issues closed across 3 machines. ScreenLayout::draw() migration chunks A/B/D landed — global status bar, tab bars, per-window status bars, breadcrumbs, debug toolbar, 7 popup surfaces all route through quadraui's declarative frame renderer. Chunk C (#462) in progress. quadraui#210–#215 shipped to fix layout/paint measurement parity. New project: claude-coordinator (https://github.com/JDonaghy/claude-coordinator) — multi-agent orchestration tool with CLI, agent servers, coordinator brain, GitHub issue comments as message bus, dependency tracking, merge sequencing, progress streaming, and auto-split. MVP milestone complete (10 issues). First real dispatch: dellserver working on quadraui#206 via `coord approve`. 1989+ lib tests passing.)
+**Last updated:** May 18, 2026 (Session 387 — **#446 ScreenLayout::draw() migration complete (all 4 chunks landed).** Chunk C (#462, PR #472): editor viewport, terminal (single + split), horizontal scrollbars, find/replace overlay, palette — all routed through `ScreenLayout::draw()`. Every GTK surface except rich text popup (#469) now paints through the declarative frame renderer. Also landed #453 (PR #473): horizontal scroll `zh`/`zl`/`zH`/`zL` fixed — `ensure_cursor_visible` was undoing scrolls; engine now clamps cursor to viewport after scroll commands. claude-coordinator first real dispatch: dellserver successfully fixed #453 autonomously (found real engine bug, not just stale tests). Coordinator tool gaps identified: permission flags, auto-close hook, branch capture in reconcile, progress visibility. 1989+ lib tests passing.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1989+ lib tests passing.
 
-> Sessions 385 and earlier in **SESSION_HISTORY.md**.
+> Sessions 386 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -129,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 385 and earlier in **SESSION_HISTORY.md**.
+> Sessions 386 and earlier in **SESSION_HISTORY.md**.
