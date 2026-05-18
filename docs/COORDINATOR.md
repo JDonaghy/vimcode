@@ -76,6 +76,16 @@ The quadraui agent ships infrastructure; vimcode agents consume it. Track:
 4. **Non-milestone bugs** (slot into gaps when a machine finishes early).
 5. **Enhancements/research** (only when milestone queue is empty).
 
+## Dependency Freshness Rule
+
+**After any quadraui issue closes, every subsequent vimcode assignment briefing MUST include `cd ~/src/quadraui && git pull` until the coordinator has confirmed all machines have pulled.** Track which machines have pulled in the board notes. This applies to any cross-repo dependency, not just quadraui.
+
+Signs a machine has a stale dependency:
+- Build fails with "no variant named X", "no method named Z", "expected N args, found M" on a `quadraui::*` type
+- The error references API that was recently added/changed in the dependency repo
+
+When this happens: don't debug the consumer repo. Pull the dependency first.
+
 ## Handoff Phrases
 
 Use these to keep agents oriented:

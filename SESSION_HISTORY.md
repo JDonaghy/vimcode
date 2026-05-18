@@ -1,10 +1,10 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 385 archived here.
+All sessions through 386 archived here.
 
 ---
-**Session 385 (May 17) — Open to the Side fix (#226) + LSP `$/progress` (#221) + #446 parked on quadraui#210:**
+**Sessions 385–386 (May 17–18) — Multi-agent coordinated sprint + ScreenLayout migration + claude-coordinator MVP:**
 
 Two PRs landed on develop; one big migration parked waiting on quadraui infrastructure. 1989 lib tests passing (+14).
 
@@ -26,6 +26,76 @@ Two PRs landed on develop; one big migration parked waiting on quadraui infrastr
 
 - Develop reached `dc6417d`. Branches `issue-446-screen-layout-draw` and `issue-456-tui-ctx-menu-dismiss` (latter by parallel agent — TUI right-click menu doesn't dismiss on first click, regression from #451) open on origin at session end.
 - During the #457 smoke test, the user reported "newly opened file in left pane" which was traced to `open_side_vsplit` respecting `splitright`. The path-traversal test (`debug_open_side_actual_rects`) ruled out `open_side` first — the engine state was correct for that path; the visible bug was in the *other* menu item.
+
+Landmark 2-day session: first use of a dedicated coordinator agent managing 3 machines (Desktop A / Desktop B / Server) working in parallel across vimcode, quadraui, and a new claude-coordinator project. 25+ vimcode issues closed, quadraui layout parity fixes shipped, and the claude-coordinator tool went from concept to working MVP with its first real automated dispatch.
+
+**Vimcode issues closed (coordinated across machines):**
+
+- **#422** Ctrl+Space full completion with empty prefix (Server)
+- **#287** Ctrl-P in completion popup cycles instead of opening picker (Server, PR #440)
+- **#390** TUI cursor color — closed, fixed by quadraui#177 (Server)
+- **#318** TUI Alt keybinding clashes with menu bar (Server)
+- **#429** Terminal panel click dedup — selection + pane focus (Server)
+- **#262** Breadcrumb dropdown parent symbols jumpable (Server)
+- **#208** Gutter diagnostics stale after git discard (Server)
+- **#222** Syntax highlighting stale after external edits (Server)
+- **#230** LSP indicator transitions to Running on empty response (Server)
+- **#438** Test build broken — render.rs engine_with rename (Server)
+- **#439** Stale insta snapshots hermetic fix (Server)
+- **#436** Extension install: rust-analyzer via rustup on all platforms (Server)
+- **#221** LSP $/progress in status bar — `name • Indexing: 319/320` (Server, PR #455)
+- **#453** Horizontal scroll test failures (Server)
+- **#435** GTK context menu keyboard focus (Desktop A)
+- **#434** GTK action menu placement Below trigger (Desktop A)
+- **#225** GTK tab switcher bordered list (Desktop A)
+- **#274** Replace native gtk4::Dialog — Open Recent via engine picker (Desktop A)
+- **#444** TUI split terminal drag-select pane-relative coords (Desktop A)
+- **#451** TUI explorer right-click + Alacritty Up(Right) quirk (Desktop A)
+- **#452** TUI group divider drag — 3 sub-bugs (Desktop A)
+- **#226** Open to the Side opens target on the right (Desktop A, PR #457)
+- **#456** TUI ctx menu dismiss after clicking entry (Server, PR #458)
+
+**ScreenLayout::draw() migration (#446):**
+
+- Chunk A (#460): Global status bar — scaffolding commit, `QScreenLayout` alias pattern established (PR #464)
+- Chunk B (#461): Tab bars, breadcrumbs, per-window status bars, debug toolbar — hit-test surfaces via post-paint `b.X_layout()` (PR #466). Required 3 quadraui fixes: #211 (rasteriser consumes layout), #213 (scroll offset parity), #215 (frame-scope pango layout)
+- Chunk D (#463): 7 popup surfaces — tooltips, completion, dialog, context menus (PR #470). Pre-computed layouts made this straightforward.
+- Chunk C (#462): In progress — editor viewport, scrollbars, terminal. Last chunk.
+- Filed follow-ups: #465 (breadcrumb symbol picker empty), #467 (completion fuzzy matching), #468 (hover Go to Definition), #469 (rich text popup hit-test)
+
+**quadraui issues shipped:**
+
+- **#210** Backend trait `status_bar_layout` / `tab_bar_layout` / `activity_bar_layout` methods
+- **#211** GTK rasterisers consume layout for paint (tab_bar, activity_bar)
+- **#213** `tab_bar_layout` computes `correct_scroll_offset`
+- **#215** Layout methods use frame-scope pango layout (same font as rasteriser)
+
+**claude-coordinator project created (https://github.com/JDonaghy/claude-coordinator):**
+
+New tool for multi-agent orchestration across machines and repos. MVP milestone completed in one day:
+- #1 CLI scaffold + coordinator.yml config
+- #2 Agent server — HTTP dispatcher spawning `claude -p`
+- #3 Coordinator brain — `coord plan` / `coord approve` via `claude -p`
+- #4 E2E integration tests
+- #5 Tailscale networking — parallel health checks, cross-machine dispatch
+- #6 Multi-repo dependency tracking (DAG, blocked detection)
+- #7 GitHub issue comments as message bus
+- #8 Board state persistence + `coord resume`
+- #17 Merge sequencing — auto-rebase via PR queue
+- #19 Stale dependency detection + auto-pull
+- #22 Session lifecycle hooks
+- #24 Worker progress streaming (STATUS/STUCK signals)
+- #25 Auto-split large issues
+- #35 `coord test` — pull branch locally for smoke testing
+
+First real dispatch: dellserver assigned quadraui#206 via `coord approve`. Agent server running on 2 machines (elitebook + precision), dellserver online.
+
+**Key architectural decisions documented:**
+- `docs/COORDINATOR.md` — coordinator role protocol for vimcode
+- Coordinator owns all GitHub communication; agent servers don't touch `gh`
+- Workers use `claude -p --bare --permission-mode dontAsk` (no interactive prompts)
+- GitHub issue comments for briefings/status; stream-json stdout for machine monitoring
+- Static deny-list for dangerous commands (Phase 1); Agent SDK `beforeToolUse` deferred (separate billing)
 
 ---
 **Session 384 (May 17) — GTK / TUI bug-fix sweep, 9 issues closed:**
