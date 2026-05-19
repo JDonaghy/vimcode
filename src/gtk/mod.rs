@@ -254,8 +254,6 @@ struct App {
     /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
     /// This prevents the 20/sec SearchPollTick timer from unconditionally calling queue_draw().
     draw_needed: Rc<Cell<bool>>,
-    sidebar_visible: bool,
-    active_panel_id: String,
     /// DrawingArea for the file explorer sidebar (Phase A.2b-2: native
     /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
     /// `draw_explorer_panel`).
@@ -1151,7 +1149,7 @@ impl SimpleComponent for App {
                     set_transition_duration: 200,
 
                     #[watch]
-                    set_reveal_child: model.sidebar_visible,
+                    set_reveal_child: model.current_sidebar_visible(),
 
                     // ScrolledWindow constrains children to the allocated width
                     // (hscrollbar Never prevents content from growing the sidebar).
@@ -1173,7 +1171,7 @@ impl SimpleComponent for App {
                             set_css_classes: &["sidebar"],
 
                             #[watch]
-                            set_visible: model.active_panel_id == PANEL_EXPLORER,
+                            set_visible: model.current_active_panel_id() == PANEL_EXPLORER,
 
                             #[name = "explorer_da"]
                             gtk4::DrawingArea {
@@ -1208,10 +1206,11 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel_id == PANEL_SEARCH {
+                                let id = model.current_active_panel_id();
+                                if id == PANEL_SEARCH {
                                     search_sidebar_da.queue_draw();
                                 }
-                                model.active_panel_id == PANEL_SEARCH
+                                id == PANEL_SEARCH
                             },
 
                             #[name = "search_sidebar_da"]
@@ -1228,10 +1227,11 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel_id == PANEL_DEBUG {
+                                let id = model.current_active_panel_id();
+                                if id == PANEL_DEBUG {
                                     debug_sidebar_da.queue_draw();
                                 }
-                                model.active_panel_id == PANEL_DEBUG
+                                id == PANEL_DEBUG
                             },
 
                             #[name = "debug_sidebar_da"]
@@ -1248,10 +1248,11 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel_id == PANEL_GIT {
+                                let id = model.current_active_panel_id();
+                                if id == PANEL_GIT {
                                     git_sidebar_da.queue_draw();
                                 }
-                                model.active_panel_id == PANEL_GIT
+                                id == PANEL_GIT
                             },
 
                             #[name = "git_sidebar_da"]
@@ -1268,10 +1269,11 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel_id == PANEL_EXTENSIONS {
+                                let id = model.current_active_panel_id();
+                                if id == PANEL_EXTENSIONS {
                                     ext_sidebar_da.queue_draw();
                                 }
-                                model.active_panel_id == PANEL_EXTENSIONS
+                                id == PANEL_EXTENSIONS
                             },
 
                             #[name = "ext_sidebar_da"]
@@ -1288,10 +1290,12 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if is_ext_panel_id(&model.active_panel_id) {
+                                let id = model.current_active_panel_id();
+                                let is_ext = is_ext_panel_id(&id);
+                                if is_ext {
                                     ext_dyn_panel_da.queue_draw();
                                 }
-                                is_ext_panel_id(&model.active_panel_id)
+                                is_ext
                             },
 
                             #[name = "ext_dyn_panel_da"]
@@ -1308,10 +1312,11 @@ impl SimpleComponent for App {
 
                             #[watch]
                             set_visible: {
-                                if model.active_panel_id == PANEL_AI {
+                                let id = model.current_active_panel_id();
+                                if id == PANEL_AI {
                                     ai_sidebar_da.queue_draw();
                                 }
-                                model.active_panel_id == PANEL_AI
+                                id == PANEL_AI
                             },
 
                             #[name = "ai_sidebar_da"]
@@ -1332,7 +1337,7 @@ impl SimpleComponent for App {
                     set_css_classes: &["sidebar-resize-handle"],
 
                     #[watch]
-                    set_visible: model.sidebar_visible,
+                    set_visible: model.current_sidebar_visible(),
                 },
 
                 // Editor area (DrawingArea wrapped in Overlay for scrollbars)
@@ -2073,11 +2078,11 @@ impl SimpleComponent for App {
                 Err(_) => None,
             };
 
-        // Initialize sidebar visibility from session state or settings
-        let sidebar_visible = {
-            let eng = engine.borrow();
-            eng.session.explorer_visible || eng.settings.explorer_visible_on_startup
-        };
+        // Sidebar visibility startup is owned by `Engine::new` —
+        // it inspects `session.explorer_visible` + `settings` +
+        // `autohide_panels` and calls `app_shell.hide_sidebar()` as
+        // needed before we get here. The Relm4 view! macro reads it
+        // back via `model.current_sidebar_visible()`.
 
         // Phase B.5 Stage 1: build the `quadraui::Backend` impl now,
         // before constructing the App. Both the App's modal_stack /
@@ -2119,9 +2124,7 @@ impl SimpleComponent for App {
 
         let model = App {
             engine: engine.clone(),
-            sidebar_visible,
             window: root.clone(),
-            active_panel_id: PANEL_EXPLORER.to_string(),
             explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
             activity_bar_da_ref: activity_bar_da_ref.clone(),
             explorer_row_height_cell: explorer_row_height_cell.clone(),
@@ -5606,12 +5609,13 @@ impl App {
         {
             let overflow = self.engine.borrow_mut().window_nav_overflow.take();
             if let Some(false) = overflow {
-                let panel_id = if is_ext_panel_id(&self.active_panel_id) {
-                    PANEL_EXPLORER
+                let current = self.current_active_panel_id();
+                let panel_id = if is_ext_panel_id(&current) {
+                    PANEL_EXPLORER.to_string()
                 } else {
-                    &self.active_panel_id
+                    current
                 };
-                self.engine.borrow_mut().focus_sidebar_panel(panel_id);
+                self.engine.borrow_mut().focus_sidebar_panel(&panel_id);
                 self.sync_sidebar_from_engine();
             }
         }
@@ -5827,7 +5831,8 @@ impl App {
         }
         // Explicitly redraw the debug sidebar if it's active so the
         // Run/Stop button text and section data stay in sync.
-        if self.active_panel_id == PANEL_DEBUG {
+        let active_panel = self.current_active_panel_id();
+        if active_panel == PANEL_DEBUG {
             if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -5838,8 +5843,8 @@ impl App {
             sender.input(Msg::RefreshFileTree);
         }
         // Auto-refresh SC panel periodically (gated on sidebar visibility).
-        if self.sidebar_visible
-            && (self.active_panel_id == PANEL_GIT || self.active_panel_id == PANEL_EXPLORER)
+        if self.current_sidebar_visible()
+            && (active_panel == PANEL_GIT || active_panel == PANEL_EXPLORER)
             && self.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
         {
             self.engine.borrow_mut().sc_refresh_async();
@@ -5865,15 +5870,13 @@ impl App {
                     engine.app_shell.toggle_sidebar();
                 }
                 engine.ext_panel_has_focus = true;
-                engine.ext_panel_active = Some(panel_name.clone());
+                engine.ext_panel_active = Some(panel_name);
             }
-            self.active_panel_id = format!("ext:{panel_name}");
-            self.sidebar_visible = true;
             self.sync_sidebar_widgets();
         }
         // GTK-specific: queue redraws on individual sidebar DAs whose
         // content may have changed from the polls above.
-        if self.active_panel_id == PANEL_EXPLORER {
+        if active_panel == PANEL_EXPLORER {
             if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                 da.queue_draw();
             }
@@ -5889,7 +5892,7 @@ impl App {
         // trigger a redraw on a 1 Hz cadence to pick up background changes.
         if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
             self.last_tree_indicator_update = std::time::Instant::now();
-            if self.active_panel_id == PANEL_EXPLORER {
+            if active_panel == PANEL_EXPLORER {
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -8739,7 +8742,8 @@ impl App {
             Msg::ExtPanelMouseMove(x_move, y_move) => {
                 // Determine which flat item the mouse is over (row 0 is the header).
                 let line_height = self.cached_line_height.max(1.0);
-                let panel_name = match ext_panel_name(&self.active_panel_id) {
+                let active = self.current_active_panel_id();
+                let panel_name = match ext_panel_name(&active) {
                     Some(name) => name.to_string(),
                     None => return,
                 };
@@ -8892,34 +8896,45 @@ impl App {
         }
     }
 
-    /// Sync local sidebar cache fields from engine AppShell state, then
-    /// update GTK widgets.
-    fn sync_sidebar_from_engine(&mut self) {
+    /// Effective sidebar visibility — reads directly from
+    /// `engine.app_shell` (owned by quadraui per #385). Replaces the
+    /// former `App.sidebar_visible` local cache so GTK and engine state
+    /// can never drift.
+    fn current_sidebar_visible(&self) -> bool {
+        self.engine.borrow().app_shell.sidebar_visible()
+    }
+
+    /// Effective active panel id, accounting for ext-panel synthetic IDs.
+    /// Extension panels bypass AppShell (no dynamic registration on the
+    /// quadraui side), so if `engine.ext_panel_active` is set we synthesise
+    /// `ext:{name}`; otherwise we read AppShell's active panel.
+    fn current_active_panel_id(&self) -> String {
         let engine = self.engine.borrow();
-        self.sidebar_visible = engine.app_shell.sidebar_visible();
-        // Extension panels bypass AppShell (no dynamic registration).
-        // If an ext panel is active, preserve it instead of falling back
-        // to AppShell's panel ID (which would default to Explorer).
         if let Some(ref name) = engine.ext_panel_active {
-            self.active_panel_id = format!("ext:{name}");
-        } else {
-            self.active_panel_id = engine
-                .app_shell
-                .active_panel_id()
-                .map(|id| id.as_str().to_string())
-                .unwrap_or_else(|| PANEL_EXPLORER.to_string());
+            return format!("ext:{name}");
         }
-        drop(engine);
+        engine
+            .app_shell
+            .active_panel_id()
+            .map(|id| id.as_str().to_string())
+            .unwrap_or_else(|| PANEL_EXPLORER.to_string())
+    }
+
+    /// Re-sync GTK widget tree from engine sidebar state. Was previously
+    /// `sync_sidebar_from_engine` which copied into local cache fields;
+    /// the cache is gone (engine.app_shell is the single source of truth)
+    /// so this is now just a redraw trigger.
+    fn sync_sidebar_from_engine(&mut self) {
         self.sync_sidebar_widgets();
     }
 
     /// Update GTK widget visibility (revealer + panel boxes), grab focus on
-    /// the active panel DA, and queue an activity bar redraw.
-    /// Reads from `self.sidebar_visible` and `self.active_panel_id` (local cache).
+    /// the active panel DA, and queue an activity bar redraw. Reads
+    /// effective state from `engine.app_shell` via the `current_*` helpers.
     fn sync_sidebar_widgets(&mut self) {
-        let show = self.sidebar_visible;
-        let id = &self.active_panel_id;
-        let is_ext = is_ext_panel_id(id);
+        let show = self.current_sidebar_visible();
+        let id = self.current_active_panel_id();
+        let is_ext = is_ext_panel_id(&id);
 
         if let Some(ref r) = *self.sidebar_revealer.borrow() {
             r.set_reveal_child(show);
@@ -9002,8 +9017,7 @@ impl App {
                     engine.session.explorer_visible = engine.app_shell.sidebar_visible();
                     let _ = engine.session.save();
                     drop(engine);
-                    self.sidebar_visible = self.engine.borrow().app_shell.sidebar_visible();
-                    self.active_panel_id = panel_id;
+                    let _ = panel_id; // engine.ext_panel_active drives `current_active_panel_id()`
                     self.sync_sidebar_widgets();
                 } else {
                     {
@@ -9166,9 +9180,11 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::FocusExplorer => {
-                self.sidebar_visible = true;
-                self.active_panel_id = PANEL_EXPLORER.to_string();
-                self.engine.borrow_mut().explorer_has_focus = true;
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.ext_panel_active = None;
+                    engine.focus_sidebar_panel(PANEL_EXPLORER);
+                }
                 if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                     da.grab_focus();
                     // `draw_needed` only queues the editor DA / menu bar.
@@ -9177,6 +9193,7 @@ impl App {
                     // appears now that `explorer_has_focus = true`.
                     da.queue_draw();
                 }
+                self.sync_sidebar_widgets();
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusExplorer => {
@@ -9189,28 +9206,35 @@ impl App {
                         da.queue_draw();
                     }
                 } else {
-                    self.sidebar_visible = true;
-                    self.active_panel_id = PANEL_EXPLORER.to_string();
-                    self.engine.borrow_mut().explorer_has_focus = true;
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.ext_panel_active = None;
+                        engine.focus_sidebar_panel(PANEL_EXPLORER);
+                    }
                     if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
                         da.grab_focus();
                         da.queue_draw();
                     }
+                    self.sync_sidebar_widgets();
                 }
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusSearch => {
-                if self.active_panel_id == PANEL_SEARCH && self.sidebar_visible {
+                if self.current_active_panel_id() == PANEL_SEARCH && self.current_sidebar_visible()
+                {
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
                 } else {
-                    self.active_panel_id = PANEL_SEARCH.to_string();
-                    self.sidebar_visible = true;
-                    self.engine.borrow_mut().search_set_focus(true);
+                    {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.ext_panel_active = None;
+                        engine.focus_sidebar_panel(PANEL_SEARCH);
+                    }
                     if let Some(ref drawing) = *self.drawing_area.borrow() {
                         drawing.grab_focus();
                     }
+                    self.sync_sidebar_widgets();
                 }
                 self.draw_needed.set(true);
             }
@@ -9791,7 +9815,7 @@ impl App {
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
                 engine.session.window.height = height;
-                engine.session.explorer_visible = self.sidebar_visible;
+                engine.session.explorer_visible = engine.app_shell.sidebar_visible();
                 // Save sidebar width on close too
                 if let Some(ref sb) = *self.sidebar_inner_sw.borrow() {
                     engine.session.sidebar_width = sb.width_request();
