@@ -1555,23 +1555,47 @@ pub(super) fn draw_editor_hover_popup(
         active_win.rect.height as f32,
     );
     let measure = quadraui::RichTextPopupMeasure::new(content_w as f32, line_height as f32);
-    let cw = char_width as f32;
+    // #488: measure link spans with Pango at the UI font (the rasteriser
+    // paints the popup body in `UI_FONT()`, not the editor monospace).
+    // Char-count × monospace `char_width` drifted left of the painted
+    // glyphs for proportional fonts — sometimes by hundreds of pixels on
+    // long lines, making most hyperlinks unclickable. A dedicated Layout
+    // is used so the per-line attribute swaps below don't pollute the
+    // paint-side `pango_layout` the rasteriser later restores.
+    let ui_font_desc = pango::FontDescription::from_string(&UI_FONT());
+    let measure_ctx = pangocairo::create_context(cr);
+    let measure_layout = pango::Layout::new(&measure_ctx);
+    measure_layout.set_font_description(Some(&ui_font_desc));
     let popup_layout = popup.layout(
         anchor_x as f32,
         anchor_y as f32,
         viewport,
         measure,
         |line_idx, start_byte, end_byte| {
-            popup
+            let raw = popup
                 .line_text
                 .get(line_idx)
-                .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
-                        * cw
-                })
-                .unwrap_or(0.0)
+                .map(String::as_str)
+                .unwrap_or("");
+            let lo = start_byte.min(raw.len());
+            let hi = end_byte.min(raw.len());
+            if hi <= lo {
+                return 0.0;
+            }
+            let slice = &raw[lo..hi];
+            measure_layout.set_text(slice);
+            let scale = popup.line_scales.get(line_idx).copied().unwrap_or(1.0);
+            if (scale - 1.0).abs() > 0.01 {
+                let attrs = pango::AttrList::new();
+                let mut a = pango::AttrFloat::new_scale(scale as f64);
+                a.set_start_index(0);
+                a.set_end_index(slice.len() as u32);
+                attrs.insert(a);
+                measure_layout.set_attributes(Some(&attrs));
+            } else {
+                measure_layout.set_attributes(None);
+            }
+            measure_layout.pixel_size().0 as f32
         },
     );
 
