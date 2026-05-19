@@ -132,7 +132,11 @@ pub(super) fn render_sidebar(
 
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
-        render_ext_panel(buf, area, engine, theme);
+        // Drop the buffer borrow before passing frame to render_ext_panel
+        // — the new TreeView-based renderer takes the backend + frame so it
+        // can route draw calls through quadraui primitives.
+        let _ = buf;
+        render_ext_panel(backend, frame, area, engine, theme);
         return;
     }
 
@@ -1170,14 +1174,20 @@ pub(super) fn render_source_control(
 // ─── Extension panel (plugin-provided) ───────────────────────────────────────
 
 /// Render an extension-provided sidebar panel.
+///
+/// Migrated to `quadraui::TreeView` (#476). Header + search-input chrome
+/// route through `quadraui::tui::draw_settings_chrome`; the body rows
+/// (sections + expandable tree items + badges + action labels) flow
+/// through `render::ext_panel_to_tree_view()` + `Backend::draw_tree`.
+/// The help-popup overlay and the scrollbar/scroll-surface registration
+/// are panel-specific chrome that don't fit TreeView and stay inline.
 pub(super) fn render_ext_panel(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut super::backend::TuiBackend,
+    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
-    use crate::core::plugin::ExtPanelStyle;
-
     if area.height == 0 {
         return;
     }
@@ -1186,262 +1196,101 @@ pub(super) fn render_ext_panel(
         return;
     };
 
-    let hdr_fg = rc(theme.status_fg);
-    let hdr_bg = rc(theme.status_bg);
-    let item_fg = rc(theme.foreground);
-    let dim_fg = rc(theme.line_number_fg);
-    let accent_fg = rc(theme.keyword);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let row_bg = rc(theme.tab_bar_bg);
-
-    // Clear area
-    for cy in area.y..area.y + area.height {
-        for cx in area.x..area.x + area.width {
-            set_cell(buf, cx, cy, ' ', item_fg, row_bg);
-        }
-    }
-
-    // Row 0: header
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-    }
-    let title = format!("  {}", panel.title);
-    for (i, ch) in title.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-    }
-
-    if area.height < 2 {
-        return;
-    }
-
-    // Row 1: search input field (when active or has text)
-    let input_row_count = if panel.input_active || !panel.input_text.is_empty() {
-        1
-    } else {
-        0
+    // ── Chrome: header (always) + search input (only when active or text). ─
+    let input_visible = panel.input_active || !panel.input_text.is_empty();
+    let chrome_h: u16 = (if input_visible { 2 } else { 1 }).min(area.height);
+    let header_title = format!(" {}", panel.title);
+    let chrome_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: chrome_h,
     };
-    if input_row_count > 0 {
-        let iy = area.y + 1;
-        let search_bg = rc(theme.tab_bar_bg);
-        let search_fg = if panel.input_active {
-            rc(theme.foreground)
-        } else {
-            dim_fg
-        };
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, iy, ' ', search_fg, search_bg);
-        }
-        let prefix = " / ";
-        for (i, ch) in prefix.chars().enumerate() {
-            let x = area.x + i as u16;
-            if x < area.x + area.width {
-                set_cell(buf, x, iy, ch, dim_fg, search_bg);
-            }
-        }
-        let text_start = area.x + prefix.len() as u16;
-        for (i, ch) in panel.input_text.chars().enumerate() {
-            let x = text_start + i as u16;
-            if x < area.x + area.width {
-                set_cell(buf, x, iy, ch, search_fg, search_bg);
-            }
-        }
-        if panel.input_active {
-            let cursor_x = text_start + panel.input_text.chars().count() as u16;
-            if cursor_x < area.x + area.width {
-                set_cell(buf, cursor_x, iy, '▏', rc(theme.cursor), search_bg);
-            }
-        }
-    }
+    quadraui::tui::draw_settings_chrome(
+        frame.buffer_mut(),
+        chrome_area,
+        &header_title,
+        &panel.input_text,
+        "",
+        panel.input_active,
+        &super::quadraui_tui::q_theme(theme),
+    );
 
-    // Build flat list of rows
-    let content_area_height = (area.height - 1 - input_row_count as u16) as usize;
-    let mut flat_rows: Vec<(String, String, bool, bool)> = Vec::new(); // (text, hint, is_header, is_selected)
-    let mut flat_idx = 0usize;
-    for section in &panel.sections {
-        let is_sel = flat_idx == panel.selected;
-        let arrow = if section.expanded { "▼" } else { "▶" };
-        flat_rows.push((
-            format!(" {} {}", arrow, section.name),
-            String::new(),
-            true,
-            is_sel,
-        ));
-        flat_idx += 1;
-        if section.expanded {
-            for item in &section.items {
-                if item.is_separator {
-                    flat_rows.push(("─".repeat(area.width as usize), String::new(), false, false));
-                    flat_idx += 1;
-                    continue;
-                }
-                let is_sel = flat_idx == panel.selected;
-                let indent = "  ".repeat(item.indent as usize + 1);
-                let icon_part = if item.icon.is_empty() {
-                    String::new()
-                } else {
-                    format!("{} ", item.icon)
-                };
-                // Tree chevron for expandable items
-                let chevron = if item.expandable {
-                    let tree_key = (panel.name.clone(), item.id.clone());
-                    let is_expanded = engine
-                        .ext_panel_tree_expanded
-                        .get(&tree_key)
-                        .copied()
-                        .unwrap_or(item.expanded);
-                    if is_expanded {
-                        "▼ "
-                    } else {
-                        "▶ "
-                    }
-                } else {
-                    ""
-                };
-                let fg_marker = match item.style {
-                    ExtPanelStyle::Header => 'H',
-                    ExtPanelStyle::Dim => 'D',
-                    ExtPanelStyle::Accent => 'A',
-                    ExtPanelStyle::Normal => 'N',
-                };
-                // Build hint with optional badges and action labels
-                let mut hint_parts = Vec::new();
-                for badge in &item.badges {
-                    hint_parts.push(format!("[{}]", badge.text));
-                }
-                for action in &item.actions {
-                    hint_parts.push(format!("⟨{}⟩", action.label));
-                }
-                if !item.hint.is_empty() {
-                    hint_parts.push(item.hint.clone());
-                }
-                let hint_combined = hint_parts.join(" ");
-                flat_rows.push((
-                    format!("{}{}{}{}", indent, chevron, icon_part, item.text),
-                    format!("{}|{}", fg_marker, hint_combined),
-                    false,
-                    is_sel,
-                ));
-                flat_idx += 1;
-            }
-        }
-    }
-
-    // Apply scroll
-    let scroll = panel.scroll_top;
-    let visible_rows = &flat_rows[scroll.min(flat_rows.len())..];
-
-    for (ri, (text, hint_raw, is_header, is_sel)) in
-        visible_rows.iter().enumerate().take(content_area_height)
-    {
-        let y = area.y + 1 + input_row_count as u16 + ri as u16;
-        let bg = if *is_sel && panel.has_focus {
-            sel_bg
-        } else {
-            row_bg
-        };
-        let fg = if *is_header {
-            hdr_fg
-        } else if hint_raw.starts_with('D') {
-            dim_fg
-        } else if hint_raw.starts_with('A') {
-            accent_fg
-        } else {
-            item_fg
-        };
-
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
-        }
-
-        let w = area.width as usize;
-
-        // Right-aligned hint (skip the style marker char and pipe)
-        let hint = if hint_raw.len() > 2 {
-            &hint_raw[2..]
-        } else {
-            ""
-        };
-        let hint_len = hint.chars().count();
-
-        // Truncate text before the hint area, adding "…" if clipped
-        let text_max = if !hint.is_empty() {
-            w.saturating_sub(hint_len + 2) // 1 space gap + 1 for safety
-        } else {
-            w
-        };
-        let text_char_count = text.chars().count();
-        if text_char_count > text_max && text_max > 1 {
-            for (i, ch) in text.chars().take(text_max - 1).enumerate() {
-                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-            }
-            set_cell(buf, area.x + (text_max - 1) as u16, y, '…', fg, bg);
-        } else {
-            for (i, ch) in text.chars().enumerate().take(text_max) {
-                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-            }
-        }
-
-        if !hint.is_empty() {
-            let start = w.saturating_sub(hint_len + 1);
-            for (i, ch) in hint.chars().enumerate() {
-                let x = area.x + (start + i) as u16;
-                if x < area.x + area.width {
-                    set_cell(buf, x, y, ch, dim_fg, bg);
-                }
-            }
-        }
-    }
-
-    // Scrollbar
-    let total = flat_rows.len();
-    let ext_panel_scrollbar = if total > content_area_height && content_area_height > 0 {
-        let sb_x = area.x + area.width - 1;
-        let track_h = content_area_height;
-        let thumb_h = (track_h * content_area_height / total).max(1);
-        let thumb_top = scroll * track_h / total;
-        let sb_thumb = rc(theme.scrollbar_thumb);
-        let sb_track = rc(theme.scrollbar_track);
-        let sb_bg = rc(theme.background);
-        for i in 0..track_h {
-            let y = area.y + 1 + input_row_count as u16 + i as u16;
-            let (ch, cfp) = if i >= thumb_top && i < thumb_top + thumb_h {
-                ('█', sb_thumb)
-            } else {
-                ('░', sb_track)
-            };
-            set_cell(buf, sb_x, y, ch, cfp, sb_bg);
-        }
-        let track_start_y = (area.y + 1 + input_row_count as u16) as f32;
-        Some(quadraui::SurfaceScrollbar {
-            axis: quadraui::ScrollAxis::Vertical,
-            track_bounds: quadraui::Rect::new(sb_x as f32, track_start_y, 1.0, track_h as f32),
-            thumb_bounds: quadraui::Rect::new(
-                sb_x as f32,
-                track_start_y + thumb_top as f32,
-                1.0,
-                thumb_h as f32,
-            ),
-            total_items: total,
-            visible_items: content_area_height,
-            scroll_offset: scroll,
-            inverted: false,
-        })
-    } else {
-        None
-    };
-    engine
-        .scroll_surfaces
-        .borrow_mut()
-        .push(quadraui::ScrollSurface {
-            id: quadraui::WidgetId::new("ext_panel:sb"),
-            bounds: quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            ),
-            scrollbar: ext_panel_scrollbar,
+    // ── Body: TreeView rasterised via the shared primitive. ────────────────
+    let body_h = area.height.saturating_sub(chrome_h);
+    if body_h > 0 {
+        let body_w = area.width.saturating_sub(1); // 1 col reserved for scrollbar
+        let tree = render::ext_panel_to_tree_view(panel, theme);
+        let body_q_rect = quadraui::Rect::new(
+            area.x as f32,
+            (area.y + chrome_h) as f32,
+            body_w as f32,
+            body_h as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_tree(body_q_rect, &tree);
         });
+
+        // Manual scrollbar: `draw_tree` doesn't render scrollbars yet.
+        // Total visible rows = tree.rows.len() (sections + their expanded
+        // items, separators included — same flat count the legacy renderer
+        // produced).
+        let buf = frame.buffer_mut();
+        let total = tree.rows.len();
+        let track_h = body_h as usize;
+        let ext_panel_scrollbar = if total > track_h && track_h > 0 {
+            let scroll = panel.scroll_top;
+            let sb_x = area.x + area.width - 1;
+            let thumb_h = (track_h * track_h / total).max(1);
+            let thumb_top = scroll * track_h / total;
+            let sb_thumb = rc(theme.scrollbar_thumb);
+            let sb_track = rc(theme.scrollbar_track);
+            let sb_bg = rc(theme.background);
+            for i in 0..track_h {
+                let y = area.y + chrome_h + i as u16;
+                let (ch, cfp) = if i >= thumb_top && i < thumb_top + thumb_h {
+                    ('\u{2588}', sb_thumb)
+                } else {
+                    ('\u{2591}', sb_track)
+                };
+                set_cell(buf, sb_x, y, ch, cfp, sb_bg);
+            }
+            let track_start_y = (area.y + chrome_h) as f32;
+            Some(quadraui::SurfaceScrollbar {
+                axis: quadraui::ScrollAxis::Vertical,
+                track_bounds: quadraui::Rect::new(sb_x as f32, track_start_y, 1.0, track_h as f32),
+                thumb_bounds: quadraui::Rect::new(
+                    sb_x as f32,
+                    track_start_y + thumb_top as f32,
+                    1.0,
+                    thumb_h as f32,
+                ),
+                total_items: total,
+                visible_items: track_h,
+                scroll_offset: scroll,
+                inverted: false,
+            })
+        } else {
+            None
+        };
+        engine
+            .scroll_surfaces
+            .borrow_mut()
+            .push(quadraui::ScrollSurface {
+                id: quadraui::WidgetId::new("ext_panel:sb"),
+                bounds: quadraui::Rect::new(
+                    area.x as f32,
+                    area.y as f32,
+                    area.width as f32,
+                    area.height as f32,
+                ),
+                scrollbar: ext_panel_scrollbar,
+            });
+    }
+
+    let buf = frame.buffer_mut();
 
     // ── Help popup overlay ──────────────────────────────────────────────────
     if panel.help_open && !panel.help_bindings.is_empty() {

@@ -7478,6 +7478,160 @@ pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
     }
 }
 
+/// Adapt the engine-side `ExtPanelData` (extension-provided sidebar
+/// panel) into a `quadraui::TreeView` for rendering via the shared
+/// `draw_tree` primitive (#476).
+///
+/// Tree shape:
+/// - Path `[s]` — section `s` header (`Decoration::Header`, chevron
+///   reflects `section.expanded`).
+/// - Path `[s, i]` — visible item `i` in section `s`. `indent` mirrors
+///   `ExtPanelItem.indent + 1` so children of section headers start at
+///   indent 1 (matching the legacy renderer). Tree-expandable items
+///   carry `is_expanded: Some(item.expanded)` so the primitive draws
+///   the chevron; non-expandable items leave `is_expanded` as `None`.
+///
+/// `ExtPanelStyle` maps to `Decoration` as:
+/// - `Header → Decoration::Header`
+/// - `Dim → Decoration::Muted`
+/// - `Normal → Decoration::Normal`
+/// - `Accent → Decoration::Normal` with the row text wrapped in a
+///   `StyledSpan` coloured by `theme.keyword` (no first-class accent
+///   decoration on the primitive).
+///
+/// Badges and action labels are concatenated into a single
+/// right-aligned `Badge`, matching the legacy `[badge] ⟨action⟩ hint`
+/// hint format. Separator rows (`item.is_separator`) become a single
+/// `Decoration::Muted` row with a `─` glyph; the primitive doesn't
+/// have a first-class separator decoration so this is a visual
+/// approximation rather than a full-width rule.
+///
+/// `panel.selected` is a flat row index across visible rows (section
+/// headers count, items in collapsed sections do not). The matching
+/// `selected_path` is computed by walking the same flat enumeration
+/// while emitting rows.
+///
+/// Tree-item expansion state (`engine.ext_panel_tree_expanded`) is
+/// expected to have already been resolved into `item.expanded` by
+/// `build_ext_panel_data` before this function is called.
+pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::TreeView {
+    use crate::core::plugin::ExtPanelStyle;
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let accent_color = to_quadraui_color(theme.keyword);
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut selected_path: Option<Vec<u16>> = None;
+    let mut flat_idx = 0usize;
+
+    for (s, section) in panel.sections.iter().enumerate() {
+        if panel.has_focus && flat_idx == panel.selected {
+            selected_path = Some(vec![s as u16]);
+        }
+        rows.push(TreeRow {
+            path: vec![s as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(section.name.clone()),
+            badge: None,
+            is_expanded: Some(section.expanded),
+            decoration: Decoration::Header,
+            edit: None,
+        });
+        flat_idx += 1;
+
+        if !section.expanded {
+            continue;
+        }
+
+        for (i, item) in section.items.iter().enumerate() {
+            let row_path = vec![s as u16, i as u16];
+            if panel.has_focus && flat_idx == panel.selected {
+                selected_path = Some(row_path.clone());
+            }
+
+            if item.is_separator {
+                rows.push(TreeRow {
+                    path: row_path,
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain("\u{2500}".to_string()),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Muted,
+                    edit: None,
+                });
+                flat_idx += 1;
+                continue;
+            }
+
+            let (decoration, text) = match item.style {
+                ExtPanelStyle::Header => (Decoration::Header, StyledText::plain(item.text.clone())),
+                ExtPanelStyle::Dim => (Decoration::Muted, StyledText::plain(item.text.clone())),
+                ExtPanelStyle::Accent => (
+                    Decoration::Normal,
+                    StyledText {
+                        spans: vec![StyledSpan::with_fg(item.text.clone(), accent_color)],
+                    },
+                ),
+                ExtPanelStyle::Normal => (Decoration::Normal, StyledText::plain(item.text.clone())),
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            for badge in &item.badges {
+                parts.push(format!("[{}]", badge.text));
+            }
+            for action in &item.actions {
+                parts.push(format!("\u{27e8}{}\u{27e9}", action.label));
+            }
+            if !item.hint.is_empty() {
+                parts.push(item.hint.clone());
+            }
+            let badge = if parts.is_empty() {
+                None
+            } else {
+                Some(Badge::plain(parts.join(" ")))
+            };
+
+            let icon = if item.icon.is_empty() {
+                None
+            } else {
+                Some(quadraui::Icon::new(item.icon.clone(), item.icon.clone()))
+            };
+
+            let is_expanded = if item.expandable {
+                Some(item.expanded)
+            } else {
+                None
+            };
+
+            rows.push(TreeRow {
+                path: row_path,
+                indent: item.indent as u16 + 1,
+                icon,
+                text,
+                badge,
+                is_expanded,
+                decoration,
+                edit: None,
+            });
+            flat_idx += 1;
+        }
+    }
+
+    TreeView {
+        id: WidgetId::new("ext-panel-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: panel.scroll_top,
+        style: TreeStyle::default(),
+        has_focus: panel.has_focus,
+    }
+}
+
 /// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
 /// (#293).
 ///
@@ -8022,7 +8176,22 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
             let visible_indices = engine.ext_panel_visible_indices(panel_name, &all_items);
             let items: Vec<_> = visible_indices
                 .into_iter()
-                .filter_map(|idx| all_items.get(idx).cloned())
+                .filter_map(|idx| {
+                    all_items.get(idx).cloned().map(|mut item| {
+                        // Resolve user-toggled tree expansion state into the
+                        // item so `ext_panel_to_tree_view` doesn't need engine
+                        // access. The engine map is the source of truth once
+                        // the user has toggled; `item.expanded` is the plugin
+                        // default otherwise.
+                        if item.expandable {
+                            let key = (panel_name.clone(), item.id.clone());
+                            if let Some(&v) = engine.ext_panel_tree_expanded.get(&key) {
+                                item.expanded = v;
+                            }
+                        }
+                        item
+                    })
+                })
                 .collect();
             ExtPanelSectionData {
                 name: name.clone(),
@@ -12462,6 +12631,139 @@ pub fn matches_key_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ext_panel_to_tree_view_shape() {
+        use crate::core::plugin::{ExtPanelAction, ExtPanelBadge, ExtPanelItem, ExtPanelStyle};
+        use quadraui::Decoration;
+
+        let mut item_a = ExtPanelItem {
+            text: "Item A".into(),
+            id: "a".into(),
+            indent: 0,
+            style: ExtPanelStyle::Normal,
+            expandable: true,
+            expanded: true,
+            badges: vec![ExtPanelBadge {
+                text: "main".into(),
+                color: "green".into(),
+            }],
+            actions: vec![ExtPanelAction {
+                label: "Stage".into(),
+                key: "s".into(),
+            }],
+            hint: "h".into(),
+            ..Default::default()
+        };
+        item_a.icon = "\u{f04b}".into();
+
+        let item_b_child = ExtPanelItem {
+            text: "Child".into(),
+            id: "a_child".into(),
+            indent: 1,
+            parent_id: "a".into(),
+            style: ExtPanelStyle::Accent,
+            ..Default::default()
+        };
+
+        let item_c_dim = ExtPanelItem {
+            text: "Dim".into(),
+            id: "c".into(),
+            style: ExtPanelStyle::Dim,
+            ..Default::default()
+        };
+
+        let item_sep = ExtPanelItem {
+            is_separator: true,
+            ..Default::default()
+        };
+
+        let panel = ExtPanelData {
+            name: "my_ext".into(),
+            title: "MY EXT".into(),
+            sections: vec![
+                ExtPanelSectionData {
+                    name: "Open".into(),
+                    items: vec![item_a, item_b_child, item_sep, item_c_dim],
+                    expanded: true,
+                },
+                ExtPanelSectionData {
+                    name: "Closed".into(),
+                    items: vec![ExtPanelItem {
+                        text: "Hidden".into(),
+                        ..Default::default()
+                    }],
+                    expanded: false,
+                },
+            ],
+            // Select the second visible item (`Child`, flat idx 2: header=0, item_a=1, child=2).
+            selected: 2,
+            has_focus: true,
+            scroll_top: 0,
+            input_text: String::new(),
+            input_active: false,
+            help_open: false,
+            help_bindings: vec![],
+        };
+
+        let theme = Theme::onedark();
+        let tv = ext_panel_to_tree_view(&panel, &theme);
+
+        // Expect rows: [0]=Open header, [0,0]=Item A, [0,1]=Child, [0,2]=separator,
+        // [0,3]=Dim, [1]=Closed header (collapsed → no children).
+        assert_eq!(tv.rows.len(), 6, "rows: {:?}", tv.rows.len());
+        assert_eq!(tv.rows[0].path, vec![0]);
+        assert_eq!(tv.rows[0].decoration, Decoration::Header);
+        assert_eq!(tv.rows[0].is_expanded, Some(true));
+        assert_eq!(tv.rows[1].path, vec![0, 0]);
+        assert_eq!(tv.rows[1].indent, 1);
+        assert_eq!(tv.rows[1].is_expanded, Some(true)); // expandable item
+        assert!(
+            tv.rows[1].badge.is_some(),
+            "badges + action + hint combined"
+        );
+        assert!(tv.rows[1].icon.is_some(), "icon converted");
+        assert_eq!(tv.rows[2].path, vec![0, 1]);
+        assert_eq!(tv.rows[2].indent, 2); // indent 1 + 1
+        assert_eq!(tv.rows[2].is_expanded, None); // not expandable
+                                                  // Separator is muted line glyph.
+        assert_eq!(tv.rows[3].decoration, Decoration::Muted);
+        assert_eq!(tv.rows[3].text.spans[0].text, "\u{2500}");
+        // Dim item maps to Muted.
+        assert_eq!(tv.rows[4].decoration, Decoration::Muted);
+        // Collapsed section: header only, no children.
+        assert_eq!(tv.rows[5].path, vec![1]);
+        assert_eq!(tv.rows[5].is_expanded, Some(false));
+
+        // Selection: flat idx 2 = Child → path [0, 1].
+        assert_eq!(tv.selected_path, Some(vec![0, 1]));
+        assert_eq!(tv.scroll_offset, 0);
+        assert!(tv.has_focus);
+    }
+
+    #[test]
+    fn test_ext_panel_to_tree_view_no_focus_no_selection() {
+        let panel = ExtPanelData {
+            name: "x".into(),
+            title: "X".into(),
+            sections: vec![ExtPanelSectionData {
+                name: "S".into(),
+                items: vec![],
+                expanded: true,
+            }],
+            selected: 0,
+            has_focus: false,
+            scroll_top: 5,
+            input_text: String::new(),
+            input_active: false,
+            help_open: false,
+            help_bindings: vec![],
+        };
+        let tv = ext_panel_to_tree_view(&panel, &Theme::onedark());
+        assert_eq!(tv.selected_path, None);
+        assert_eq!(tv.scroll_offset, 5);
+        assert!(!tv.has_focus);
+    }
 
     #[test]
     fn test_try_from_hex() {
