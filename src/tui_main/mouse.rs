@@ -1156,9 +1156,16 @@ pub(super) fn handle_mouse(
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let scroll_up = matches!(ev.kind, MouseEventKind::ScrollUp);
+            // When an extension panel is showing, its surface bounds (registered
+            // by `render_ext_panel`) own the sidebar area — the activity-bar
+            // `active_panel_id` is unchanged from before the ext panel opened,
+            // so without this guard the wheel scrolls whatever the underlying
+            // panel was (#485 was explorer routing).
+            let ext_panel_showing = sidebar.ext_panel_name.is_some();
             if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
+                && !ext_panel_showing
                 && engine.active_panel_is(PANEL_EXPLORER)
             {
                 let delta = if scroll_up { -3_isize } else { 3 };
@@ -1168,6 +1175,7 @@ pub(super) fn handle_mouse(
             if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
+                && !ext_panel_showing
                 && engine.active_panel_is(PANEL_GIT)
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
@@ -1181,6 +1189,7 @@ pub(super) fn handle_mouse(
             if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
+                && !ext_panel_showing
                 && engine.active_panel_is(PANEL_SEARCH)
             {
                 let scroll_ev = quadraui::UiEvent::Scroll {
@@ -1194,6 +1203,7 @@ pub(super) fn handle_mouse(
             if sb_visible
                 && col >= ab_width
                 && col < ab_width + sidebar_width
+                && !ext_panel_showing
                 && engine.active_panel_is(PANEL_SETTINGS)
             {
                 let content_start = 2_u16;
@@ -2288,9 +2298,12 @@ pub(super) fn handle_mouse(
                     *last_click_pos = (col, row);
                     if is_double {
                         engine.handle_ext_panel_double_click();
+                    } else {
+                        // Single-click toggles sections/expandable items.
+                        // Suppressed on double-click so the second Down doesn't
+                        // un-toggle what the first one just toggled (#484).
+                        engine.handle_ext_panel_key("Return", false, None);
                     }
-                    // Single-click toggles sections/expandable items
-                    engine.handle_ext_panel_key("Return", false, None);
                 }
             }
         } else if engine.active_panel_is(PANEL_EXPLORER) {

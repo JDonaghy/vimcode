@@ -1861,6 +1861,7 @@ dependencies = [
  "pangocairo",
  "ratatui",
  "serde",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
