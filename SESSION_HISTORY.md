@@ -1,7 +1,41 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 388 archived here.
+All sessions through 389 archived here.
+
+---
+**Session 389 (May 18–19) — TUI convergence backlog: audit #474 → 7 issues filed → #476 implemented → merged:**
+
+Parallel agent stream to Session 388. Worked the TUI side of the per-backend dedup theme: audit first, then implementation of the highest-confidence finding.
+
+**Audit (#474)**
+
+Audited all four large TUI files (`mod.rs` 3.4k, `mouse.rs` 3.1k, `panels.rs` 2.4k, `render_impl.rs` 2.0k) for code that duplicates `render.rs`, `core/`, or quadraui primitives. Four exploration agents ran in parallel, each scoped to one file with explicit instructions on the shared-API surface to check against. Spot-checked top findings before filing — dropped two that turned out to be already-converged or behavior-different (editor hover popup already routes through `editor_hover_to_quadraui_rich_text` + `draw_rich_text_popup`; mouse.rs scrollbar v/h "duplication" is intentional page-jump UX, not a `scrollbar_click_to_scroll_top` candidate).
+
+Backlog filed as 7 vimcode issues, tiered by unblockedness:
+
+- **Tier 1 (ready now, no quadraui gap):** [#475](https://github.com/JDonaghy/vimcode/issues/475) unify sidebar panel key translation (~80 lines), [#476](https://github.com/JDonaghy/vimcode/issues/476) Extension Panel → TreeView (~326 lines).
+- **Tier 2 (small gap):** [#477](https://github.com/JDonaghy/vimcode/issues/477) use `compute_tab_bar_hit_regions()` for drag slot bounds (~40 lines), [#478](https://github.com/JDonaghy/vimcode/issues/478) sidebar-item hover popup → shared tooltip builder (~200 lines).
+- **Tier 3 (blocked on quadraui):** [#479](https://github.com/JDonaghy/vimcode/issues/479) Settings inline-edit → FormController (needs Form text cursor), [#480](https://github.com/JDonaghy/vimcode/issues/480) Source Control commit row + branch picker + help dialog (needs TextInput, ButtonBar, Palette dual-mode, Dialog rich content), [#481](https://github.com/JDonaghy/vimcode/issues/481) window separator scrollbar + tab drop overlay (needs `Backend::draw_scrollbar` + drag-drop primitive).
+
+Plus [quadraui#218](https://github.com/JDonaghy/quadraui/issues/218) — ChatPanelView primitive for AI/chat sidebars (the AI sidebar consumer issue follows after that lands). Total addressable: ~1,440 lines of TUI-specific code identified for removal once all blockers clear.
+
+**Closed**
+
+- **#476** (PR [#482](https://github.com/JDonaghy/vimcode/pull/482)) Extension Panel → `quadraui::TreeView`. New `render::ext_panel_to_tree_view()` adapts `ExtPanelData`: section headers → `Decoration::Header` rows with `is_expanded: Some(section.expanded)`; items map indent + `ExtPanelStyle` → `Decoration` (Accent uses `StyledSpan` with `theme.keyword` since the primitive has no first-class accent); badges + action labels + hint combine into one right-aligned `Badge`; expandable items carry `is_expanded: Some(item.expanded)` for the chevron. `build_ext_panel_data()` resolves `engine.ext_panel_tree_expanded` overrides into the cloned `item.expanded` so the builder stays engine-free (matches the `ext_sidebar_to_tree_view()` pattern). TUI `render_ext_panel()` rewired: chrome via `quadraui::tui::draw_settings_chrome` (1 row when input hidden, 2 rows when visible — matching the legacy conditional), body via `Backend::draw_tree`. Scrollbar drawing + scroll-surface registration kept manual (TreeView doesn't paint scrollbars yet); help-popup overlay unchanged. Net: `panels.rs −252 / +101`, `render.rs +154` (builder + 2 unit tests covering tree shape, selection mapping, focus state). Squash-merged as `c040024`.
+
+  Known visual difference: separator rows (`item.is_separator`) render as a single `─` glyph instead of the full-width rule the legacy renderer drew. No `Decoration::Separator` on the primitive; no shipping plugin uses separators today.
+
+**Filed (pre-existing bugs surfaced during #476 smoke testing — `mouse.rs` byte-for-byte unchanged by the migration)**
+
+- **[#483](https://github.com/JDonaghy/vimcode/issues/483)** Typing in the panel search input doesn't filter visible items. Engine flips `ext_panel_input_active` and fires `panel_input` to the plugin but doesn't run a default filter — plugins must subscribe and re-emit filtered items. Suggested fix: engine-side default substring filter as a fallback in `ext_panel_visible_indices()`.
+- **[#484](https://github.com/JDonaghy/vimcode/issues/484)** Click on a section header doesn't toggle expand (Enter works). Click handler at `mouse.rs:2293` calls the exact same `handle_ext_panel_key("Return", ...)` Enter calls. Most likely a Down+Up duplication firing the toggle twice (net-zero) — parallels the [#451](https://github.com/JDonaghy/vimcode/issues/451) Alacritty/crossterm Up-only quirk.
+- **[#485](https://github.com/JDonaghy/vimcode/issues/485)** Scroll wheel doesn't scroll the panel though scrollbar drag does. Surface registration and `dispatch_scroll` routing identical to develop; instrumentation needed.
+
+**Tool / workflow notes**
+
+- Audit-by-agent with explicit "categories to flag" + "what NOT to flag" + "spot-check before filing" produced a backlog that closely matched the user's tiering instinct (they merged 6+7, moved 8 to quadraui without prompting). Worth repeating shape for the GTK side if/when that audit is needed.
+- Spot-checking 4 of the highest-impact agent findings before filing caught 2 false positives (editor hover popup, scrollbar track-click) — about a 25% false-positive rate. Time well spent.
 
 ---
 **Session 388 (May 19) — #469 rich text popup migration lands; #447 GTK AppShell parked pending quadraui infra; 5 pre-existing hover-popup bugs catalogued:**

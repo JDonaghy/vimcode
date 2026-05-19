@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 19, 2026 (Session 388 — **#469 landed (PR #487): rich text popup migration to `Surface::RichTextPopup` complete.** Every GTK surface — including the editor hover popup — now paints through `ScreenLayout::draw()`. #446's 4-chunk migration is fully closed. Also: #476 (PR #482) migrated the TUI Extension Panel to `quadraui::TreeView`. Pushed back on #447 (GTK AppShell + `run_with_shell`) — current quadraui infrastructure can't host vimcode's 14-DA + Relm4 architecture; filed `quadraui#217` cataloguing 4 prerequisites (multi-area runner, chrome slots for title/bottom/status/cmdline, multi-panel sidebar ergonomics, native-modal hooks via `PlatformServices`). 5 pre-existing hover-popup bugs surfaced during #469 smoke testing, all filed: #486 (gtk4::Scrollbar overlay z-order vs popup scrollbar), #488 (hyperlink hit-rect vs paint divergence — monospace approximation vs proportional UI font), #489 (pointer cursor missing on hover-popup links), #490 (double-click on popup passes through to editor — `MouseDoubleClick` skips modal-stack arbitration), #491 (`command:definition` link doesn't navigate — `plugin_run_command` has no handler). 1989+ lib tests passing.)
+**Last updated:** May 19, 2026 (Session 389 — **TUI convergence backlog audited and first slice landed.** #474 audit produced 7 vimcode issues (#475–#481) tiered by unblockedness + `quadraui#218` (ChatPanelView for AI sidebar). #476 implemented as the first Tier-1 slice (PR #482 merged): Extension Panel now renders through `quadraui::TreeView` via new `render::ext_panel_to_tree_view()` adapter. Net `panels.rs −252 / +101`, `render.rs +154`. ~1,440 lines of TUI-specific code identified for removal once Tier 2/3 blockers clear. 3 pre-existing ext-panel bugs surfaced during smoke testing and filed (mouse.rs byte-for-byte unchanged by the migration): #483 (search input doesn't filter — plugin/engine gap), #484 (click section header doesn't expand though Enter does — likely Down/Up duplication), #485 (scroll wheel doesn't scroll though scrollbar drag works). Session 388 (parallel agent stream same day): #469 rich text popup migration landed via PR #487; #447 GTK AppShell parked behind `quadraui#217` (multi-area runner + chrome slots + multi-panel sidebar + native-modal hooks needed first); 5 pre-existing hover-popup bugs filed (#486, #488, #489, #490, #491). 1989+ lib tests passing.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -14,7 +14,7 @@
 
 Vimcode at 1989+ lib tests passing.
 
-> Sessions 386 and earlier in **SESSION_HISTORY.md**.
+> Sessions 388 and earlier in **SESSION_HISTORY.md**.
 
 > Feature documentation lives in **README.md**.
 > **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
@@ -129,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 386 and earlier in **SESSION_HISTORY.md**.
+> Sessions 388 and earlier in **SESSION_HISTORY.md**.
