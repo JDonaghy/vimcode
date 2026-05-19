@@ -1555,13 +1555,16 @@ pub(super) fn draw_editor_hover_popup(
         active_win.rect.height as f32,
     );
     let measure = quadraui::RichTextPopupMeasure::new(content_w as f32, line_height as f32);
-    // #488: measure link spans with Pango at the UI font (the rasteriser
-    // paints the popup body in `UI_FONT()`, not the editor monospace).
-    // Char-count × monospace `char_width` drifted left of the painted
-    // glyphs for proportional fonts — sometimes by hundreds of pixels on
-    // long lines, making most hyperlinks unclickable. A dedicated Layout
-    // is used so the per-line attribute swaps below don't pollute the
-    // paint-side `pango_layout` the rasteriser later restores.
+    // #488: measure link spans with Pango at the UI font using the same
+    // shaping the rasteriser does (full-line text + line scale + per-span
+    // bold/italic), reading byte positions via `index_to_pos` so the
+    // painted glyph positions and hit rects line up by construction.
+    //
+    // The previous closure used `chars().count() * char_width` (the
+    // editor's monospace advance) — that drifted left of proportional
+    // UI-font glyphs by hundreds of pixels on long lines, making most
+    // hyperlinks unclickable. A dedicated Layout is used so attr swaps
+    // below don't pollute the paint-side `pango_layout`.
     let ui_font_desc = pango::FontDescription::from_string(&UI_FONT());
     let measure_ctx = pangocairo::create_context(cr);
     let measure_layout = pango::Layout::new(&measure_ctx);
@@ -1577,25 +1580,48 @@ pub(super) fn draw_editor_hover_popup(
                 .get(line_idx)
                 .map(String::as_str)
                 .unwrap_or("");
-            let lo = start_byte.min(raw.len());
-            let hi = end_byte.min(raw.len());
-            if hi <= lo {
+            if raw.is_empty() {
                 return 0.0;
             }
-            let slice = &raw[lo..hi];
-            measure_layout.set_text(slice);
+            measure_layout.set_text(raw);
+            // Build attrs mirroring the rasteriser's per-line setup so
+            // index_to_pos returns the same x-positions as the painted
+            // glyphs.
+            let attrs = pango::AttrList::new();
             let scale = popup.line_scales.get(line_idx).copied().unwrap_or(1.0);
             if (scale - 1.0).abs() > 0.01 {
-                let attrs = pango::AttrList::new();
                 let mut a = pango::AttrFloat::new_scale(scale as f64);
                 a.set_start_index(0);
-                a.set_end_index(slice.len() as u32);
+                a.set_end_index(raw.len() as u32);
                 attrs.insert(a);
-                measure_layout.set_attributes(Some(&attrs));
-            } else {
-                measure_layout.set_attributes(None);
             }
-            measure_layout.pixel_size().0 as f32
+            if let Some(styled) = popup.lines.get(line_idx) {
+                let mut byte_pos: usize = 0;
+                for span in &styled.spans {
+                    let len = span.text.len();
+                    let start = byte_pos as u32;
+                    let end = (byte_pos + len) as u32;
+                    if span.bold {
+                        let mut a = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        a.set_start_index(start);
+                        a.set_end_index(end);
+                        attrs.insert(a);
+                    }
+                    if span.italic {
+                        let mut a = pango::AttrInt::new_style(pango::Style::Italic);
+                        a.set_start_index(start);
+                        a.set_end_index(end);
+                        attrs.insert(a);
+                    }
+                    byte_pos += len;
+                }
+            }
+            measure_layout.set_attributes(Some(&attrs));
+            let start_clamped = start_byte.min(raw.len()) as i32;
+            let end_clamped = end_byte.min(raw.len()) as i32;
+            let start_x = measure_layout.index_to_pos(start_clamped).x();
+            let end_x = measure_layout.index_to_pos(end_clamped).x();
+            ((end_x - start_x) as f64 / pango::SCALE as f64) as f32
         },
     );
 
