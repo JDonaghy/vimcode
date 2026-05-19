@@ -4761,8 +4761,13 @@ impl Engine {
             return;
         }
 
-        // Clear completion state on any non-completion key.
-        if self.completion_idx.is_some() {
+        // Clear completion state on non-completion keys. Word characters
+        // pass through — `trigger_completion` will either narrow (prefix
+        // extension) or clear (new word) after the char is inserted. Any
+        // non-word key (space, punctuation, navigation) means the user
+        // has left the current word, so the popup should dismiss.
+        let extends_word = unicode.is_some_and(Self::is_word_char) && !ctrl;
+        if self.completion_idx.is_some() && !extends_word {
             self.dismiss_completion();
         }
 
