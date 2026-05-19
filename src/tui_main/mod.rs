@@ -2027,7 +2027,6 @@ fn event_loop(
                         if !engine.dispatch_dap_sidebar_event(sidebar_event) {
                             // Ignored — handle action keys via shared dispatch.
                             let key_name = match key_event.code {
-                                KeyCode::Esc => "Escape",
                                 KeyCode::Char(c) => match c {
                                     'q' => "q",
                                     'x' => "x",
@@ -2052,7 +2051,7 @@ fn event_loop(
                                     6 => "F6",
                                     _ => "",
                                 },
-                                _ => "",
+                                code => tui_key_to_engine_name(code).unwrap_or(""),
                             };
                             if engine.dispatch_dap_sidebar_action_key(key_name) {
                                 sidebar.has_focus = false;
@@ -2145,31 +2144,14 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
-                        let key_name = match key_event.code {
-                            KeyCode::Char(c) => {
-                                // Single-char keys: engine recognizes j/k/d/i/r/u/q//
-                                let mut buf = [0u8; 4];
-                                c.encode_utf8(&mut buf);
-                                std::str::from_utf8(&buf[..c.len_utf8()])
-                                    .unwrap_or("")
-                                    .to_string()
-                            }
-                            KeyCode::Esc => "Escape".to_string(),
-                            KeyCode::Enter => "Return".to_string(),
-                            KeyCode::Backspace => "BackSpace".to_string(),
-                            KeyCode::Tab => "Tab".to_string(),
-                            KeyCode::BackTab => "BackTab".to_string(),
-                            KeyCode::Down => "Down".to_string(),
-                            KeyCode::Up => "Up".to_string(),
-                            KeyCode::Home => "Home".to_string(),
-                            KeyCode::End => "End".to_string(),
-                            KeyCode::PageUp => "Page_Up".to_string(),
-                            KeyCode::PageDown => "Page_Down".to_string(),
-                            _ => String::new(),
-                        };
-                        let unicode = match key_event.code {
-                            KeyCode::Char(c) => Some(c),
-                            _ => None,
+                        let (key_name, unicode) = match key_event.code {
+                            KeyCode::Char(c) => (c.to_string(), Some(c)),
+                            code => (
+                                tui_key_to_engine_name(code)
+                                    .map(str::to_string)
+                                    .unwrap_or_default(),
+                                None,
+                            ),
                         };
                         use crate::core::engine::ExtSidebarKeyResult;
                         match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
@@ -2239,16 +2221,13 @@ fn event_loop(
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Char('j') | KeyCode::Down => ("j", None),
                             KeyCode::Char('k') | KeyCode::Up => ("k", None),
-                            KeyCode::Tab => ("Tab", None),
-                            KeyCode::Enter => ("Return", None),
-                            KeyCode::Char(' ') => ("Space", None),
                             KeyCode::Char('l') | KeyCode::Right => ("l", None),
                             KeyCode::Char('h') | KeyCode::Left => ("h", None),
+                            KeyCode::Char(' ') => ("Space", None),
                             KeyCode::Char('/') => ("/", None),
-                            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
-                            KeyCode::Backspace => ("BackSpace", None),
+                            KeyCode::Char('q') => ("Escape", None),
                             KeyCode::Char(ch) => ("char", Some(ch)),
-                            _ => ("", None),
+                            code => (tui_key_to_engine_name(code).unwrap_or(""), None),
                         };
                         if !key_name.is_empty() {
                             let ch = if key_name == "char" { unicode } else { None };
@@ -3235,6 +3214,33 @@ fn shift_map_us(c: char) -> char {
         c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
         _ => c,
     }
+}
+
+/// Map a crossterm `KeyCode` to the engine-facing keyname string used by the
+/// sidebar panel dispatchers (`dispatch_ext_sidebar_key_unified`,
+/// `handle_settings_key`, `dispatch_dap_sidebar_action_key`, …).
+///
+/// Covers the named navigation/control keys shared across the panels. Returns
+/// `None` for `Char(_)`, `F(_)`, and anything else — callers handle those with
+/// panel-specific remapping (e.g. Settings remaps `j`/`Down` both to `"j"`).
+fn tui_key_to_engine_name(code: KeyCode) -> Option<&'static str> {
+    Some(match code {
+        KeyCode::Esc => "Escape",
+        KeyCode::Enter => "Return",
+        KeyCode::Backspace => "BackSpace",
+        KeyCode::Delete => "Delete",
+        KeyCode::Tab => "Tab",
+        KeyCode::BackTab => "BackTab",
+        KeyCode::Up => "Up",
+        KeyCode::Down => "Down",
+        KeyCode::Left => "Left",
+        KeyCode::Right => "Right",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::PageUp => "Page_Up",
+        KeyCode::PageDown => "Page_Down",
+        _ => return None,
+    })
 }
 
 fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Option<char>, bool)> {
