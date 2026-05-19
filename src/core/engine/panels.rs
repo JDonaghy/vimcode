@@ -905,9 +905,24 @@ impl Engine {
                             if !lsp_cands.is_empty() {
                                 self.completion_start_col =
                                     self.view().cursor.col - cur_prefix.chars().count();
-                                self.completion_candidates = lsp_cands;
-                                self.completion_idx = Some(0);
+                                // #467: merge into existing candidates instead
+                                // of replacing — fresh LSP fetches at narrower
+                                // prefixes can return a smaller set than the
+                                // previous response, and items the user already
+                                // saw shouldn't silently disappear. The narrow
+                                // step in `trigger_completion` already pruned
+                                // anything that no longer matches the prefix,
+                                // so existing candidates are still valid.
+                                for cand in lsp_cands {
+                                    if !self.completion_candidates.iter().any(|c| c == &cand) {
+                                        self.completion_candidates.push(cand);
+                                    }
+                                }
+                                if self.completion_idx.is_none() {
+                                    self.completion_idx = Some(0);
+                                }
                                 self.completion_display_only = true;
+                                self.completion_filter_prefix = cur_prefix;
                                 redraw = true;
                             }
                         }

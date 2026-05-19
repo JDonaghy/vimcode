@@ -2525,6 +2525,12 @@ pub struct Engine {
     /// True when the popup was triggered automatically (typing/Ctrl-Space):
     /// Tab accepts the highlighted item. False for Ctrl-N/P (inserts immediately as before).
     pub completion_display_only: bool,
+    /// Prefix the current `completion_candidates` were last filtered against.
+    /// Used to detect when typing extends the prefix (`S` → `Sc`) so the list
+    /// can be narrowed instead of wholesale-replaced — keeps items the user
+    /// already saw from being silently dropped when a fresh LSP / buffer-word
+    /// scan happens to return a smaller set (#467).
+    pub completion_filter_prefix: String,
 
     // --- Project search state ---
     /// Current text typed in the project search input box.
@@ -3534,6 +3540,7 @@ impl Engine {
             completion_idx: None,
             completion_start_col: 0,
             completion_display_only: false,
+            completion_filter_prefix: String::new(),
             project_search_query: String::new(),
             project_search_results: Vec::new(),
             project_search_options: SearchOptions::default(),

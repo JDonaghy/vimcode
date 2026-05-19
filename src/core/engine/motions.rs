@@ -3228,6 +3228,7 @@ impl Engine {
         self.completion_candidates.clear();
         self.completion_idx = None;
         self.completion_display_only = false;
+        self.completion_filter_prefix.clear();
         self.lsp_pending_completion = None;
     }
 
@@ -3239,12 +3240,20 @@ impl Engine {
     /// shouldn't drown the user in every word in scope), while manual triggers
     /// fall through to the LSP so the user sees all in-scope symbols (VSCode
     /// parity).
+    ///
+    /// When the new prefix **extends** the previous one (`S` → `Sc`), existing
+    /// candidates are narrowed by `starts_with(new_prefix)` and merged with
+    /// new buffer-word hits, instead of being wholesale-replaced. This keeps
+    /// items the user already saw from disappearing when a fresh nearby-word
+    /// scan or LSP request happens to return a smaller set (#467).
     pub(crate) fn trigger_completion(&mut self, manual: bool) {
         let (prefix, _) = self.completion_prefix_at_cursor();
         if prefix.is_empty() && !manual {
             self.dismiss_completion();
             return;
         }
+        let prev_prefix = std::mem::take(&mut self.completion_filter_prefix);
+        let extends = !prev_prefix.is_empty() && prefix.starts_with(&prev_prefix);
         if prefix.is_empty() {
             // Manual trigger with no prefix: skip the buffer-word scan (it would
             // match every word in the nearby radius) and rely on the LSP response.
@@ -3253,21 +3262,31 @@ impl Engine {
             self.completion_idx = None;
             self.completion_display_only = false;
         } else {
+            // Narrow existing candidates by the new prefix when it extends the
+            // previous one; otherwise start fresh.
+            if extends {
+                self.completion_candidates
+                    .retain(|c| c.starts_with(&prefix));
+            } else {
+                self.completion_candidates.clear();
+            }
             // Use a fast nearby-lines scan instead of scanning the entire buffer.
             // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
-            let candidates = self.word_completions_nearby(&prefix);
-            if !candidates.is_empty() {
+            for word in self.word_completions_nearby(&prefix) {
+                if !self.completion_candidates.iter().any(|c| c == &word) {
+                    self.completion_candidates.push(word);
+                }
+            }
+            if !self.completion_candidates.is_empty() {
                 self.completion_start_col = self.view().cursor.col - prefix.chars().count();
-                self.completion_candidates = candidates;
                 self.completion_idx = Some(0);
                 self.completion_display_only = true;
             } else {
-                // No buffer-word hits yet; clear popup but keep LSP pending
-                self.completion_candidates.clear();
                 self.completion_idx = None;
                 self.completion_display_only = false;
             }
         }
+        self.completion_filter_prefix = prefix;
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();
     }

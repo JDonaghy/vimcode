@@ -6828,6 +6828,83 @@ fn test_manual_trigger_with_prefix_still_scans_buffer() {
 }
 
 #[test]
+fn test_completion_narrows_on_prefix_extension() {
+    // #467: typing more characters of an exact prefix should retain items
+    // the user already saw. Even when a fresh scan / LSP request at the
+    // narrower prefix would return fewer items, anything already in
+    // `completion_candidates` that still matches the new prefix must stay.
+    //
+    // Simulates an LSP response having populated extra items (Scrollbar,
+    // ScrollAxis) at prefix `S` that are NOT present in the buffer. When
+    // the user types `c`, the nearby-buffer scan at prefix `Sc` would
+    // return nothing — but the previously-collected items should survive
+    // the narrow step.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "let foo = ");
+    // Position cursor at end of line and enter insert mode at end.
+    press_char(&mut engine, 'A');
+    press_char(&mut engine, 'S');
+    // After typing `S`, the buffer-word scan produces no matches (the only
+    // word in the buffer is `foo`). Simulate an LSP-driven population of
+    // the popup at prefix `S` with three items.
+    engine.completion_candidates = vec![
+        "Scrollbar".to_string(),
+        "ScrollAxis".to_string(),
+        "ScreenLayout".to_string(),
+        "SomethingElse".to_string(), // matches `S` but not `Sc`
+    ];
+    engine.completion_idx = Some(0);
+    engine.completion_display_only = true;
+    engine.completion_filter_prefix = "S".to_string();
+    engine.completion_start_col = engine.view().cursor.col;
+    // Type `c` — prefix becomes `Sc`. Narrow-on-extension should retain the
+    // three `Sc*` items and drop the one that doesn't match.
+    press_char(&mut engine, 'c');
+    let cands = &engine.completion_candidates;
+    assert!(
+        cands.iter().any(|c| c == "Scrollbar"),
+        "Scrollbar should be retained, got: {cands:?}"
+    );
+    assert!(
+        cands.iter().any(|c| c == "ScrollAxis"),
+        "ScrollAxis should be retained, got: {cands:?}"
+    );
+    assert!(
+        cands.iter().any(|c| c == "ScreenLayout"),
+        "ScreenLayout should be retained, got: {cands:?}"
+    );
+    assert!(
+        !cands.iter().any(|c| c == "SomethingElse"),
+        "SomethingElse should be dropped (does not match Sc), got: {cands:?}"
+    );
+    assert_eq!(
+        engine.completion_filter_prefix, "Sc",
+        "completion_filter_prefix should track the current prefix"
+    );
+}
+
+#[test]
+fn test_completion_replaces_when_prefix_changes_unrelated() {
+    // Sanity check: when the new prefix doesn't extend the previous one
+    // (cursor moved to a new word entirely), candidates are cleared and
+    // repopulated from sources — not narrowed against the old set.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    // Simulate state from an earlier completion at prefix `S`.
+    engine.completion_candidates = vec!["Scrollbar".to_string()];
+    engine.completion_filter_prefix = "S".to_string();
+    // Now type a completely different word — prefix becomes `f`.
+    press_char(&mut engine, 'f');
+    let cands = &engine.completion_candidates;
+    assert!(
+        !cands.iter().any(|c| c == "Scrollbar"),
+        "Scrollbar should be cleared on unrelated prefix change, got: {cands:?}"
+    );
+}
+
+#[test]
 fn test_auto_popup_tab_accepts() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foobar\n");
