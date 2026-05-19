@@ -1225,6 +1225,12 @@ impl Engine {
                 true
             }
             quadraui::SidebarEvent::RowSelected { .. } => true,
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.sc_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }

@@ -755,8 +755,14 @@ impl Engine {
                 self.dispatch_dap_sidebar_row_activated(section, path);
                 true
             }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.dap_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
             quadraui::SidebarEvent::Ignored => false,
-            _ => true, // StateChanged, Consumed, ScrollChanged, HeaderActivated → redraw
+            _ => true,
         }
     }
 

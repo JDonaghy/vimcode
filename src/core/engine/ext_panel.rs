@@ -1706,6 +1706,12 @@ impl Engine {
                 self.ext_sidebar_input_active = false;
                 true
             }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.ext_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
             quadraui::SidebarEvent::Ignored => false,
             _ => true,
         }
