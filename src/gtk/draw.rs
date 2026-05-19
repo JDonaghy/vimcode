@@ -423,8 +423,15 @@ pub(super) fn draw_editor(
     );
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
-    let (eh_rect, eh_links, eh_sb) =
-        draw_editor_hover_popup(backend, cr, &layout, &screen, &theme, line_height, char_width);
+    let (eh_rect, eh_links, eh_sb) = draw_editor_hover_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    );
     editor_hover_rect_out.set(eh_rect);
     *editor_hover_link_rects_out.borrow_mut() = eh_links;
     editor_hover_scrollbar_out.set(eh_sb);
