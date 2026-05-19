@@ -6672,6 +6672,22 @@ impl App {
                         }
                     }
                     // Check if click hit a link rect.
+                    {
+                        let lr = self.editor_hover_link_rects.borrow();
+                        eprintln!(
+                            "[#469-url] click @({:.0},{:.0}); {} link rects:",
+                            x,
+                            y,
+                            lr.len()
+                        );
+                        for (i, (lx, ly, lw, lh, url)) in lr.iter().enumerate() {
+                            let hit = x >= *lx && x <= lx + lw && y >= *ly && y <= ly + lh;
+                            eprintln!(
+                                "[#469-url]   [{}] ({:.0},{:.0},{:.0},{:.0}) hit={} url={}",
+                                i, lx, ly, lw, lh, hit, url
+                            );
+                        }
+                    }
                     let link_hit = self
                         .editor_hover_link_rects
                         .borrow()
@@ -6681,9 +6697,12 @@ impl App {
                         })
                         .cloned();
                     if let Some((_, _, _, _, url)) = link_hit {
+                        eprintln!("[#469-url] LINK HIT: url={}", url);
                         if url.starts_with("command:") {
-                            self.engine.borrow_mut().execute_command_uri(&url);
+                            let res = self.engine.borrow_mut().execute_command_uri(&url);
+                            eprintln!("[#469-url]   execute_command_uri returned {}", res);
                         } else {
+                            eprintln!("[#469-url]   calling open_url({})", url);
                             open_url(&url);
                         }
                         self.engine.borrow_mut().dismiss_editor_hover();
