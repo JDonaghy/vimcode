@@ -1182,18 +1182,18 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 src/                  (~137,000 lines total)
 ├── main.rs              (~57 lines)  Thin CLI dispatcher → gtk::run() or tui_main::run()
 ├── win_gui_bin.rs       (~36 lines)  Windows native GUI entry point → win_gui::run()
-├── gtk/             (~18,156 lines)  GTK4/Relm4 UI backend (Linux + macOS)
-│   ├── mod.rs       (~10,029 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
-│   ├── draw.rs       (~5,975 lines)  All draw_* rendering functions + Pango attrs
-│   ├── click.rs        (~622 lines)  Mouse click/drag/double-click handlers
-│   ├── css.rs          (~553 lines)  Theme CSS generation + static CSS
-│   ├── util.rs         (~474 lines)  GTK key mapping, settings form builders, URL/icon helpers
-│   └── tree.rs         (~503 lines)  File tree construction, expansion tracking, name validation
-├── tui_main/        (~14,814 lines)  ratatui/crossterm TUI backend (all platforms)
-│   ├── mod.rs        (~4,173 lines)  Structs, event_loop, key translation, clipboard, run()
-│   ├── panels.rs     (~4,040 lines)  Activity bar, sidebar, status/command lines, all panel renders
-│   ├── render_impl.rs(~3,947 lines)  draw_frame orchestrator, tab bar, editor windows, popups
-│   └── mouse.rs      (~2,654 lines)  All mouse click/drag/scroll interaction handling
+├── gtk/             (~15,760 lines)  GTK4/Relm4 UI backend (Linux + macOS)
+│   ├── mod.rs       (~10,351 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
+│   ├── draw.rs       (~4,198 lines)  All draw_* rendering functions + Pango attrs (shrunk via #446 ScreenLayout migration + #469 popup migration)
+│   ├── click.rs        (~476 lines)  Mouse click/drag/double-click handlers
+│   ├── css.rs          (~507 lines)  Theme CSS generation + static CSS
+│   ├── util.rs         (~186 lines)  GTK key mapping, URL/icon helpers, log handler
+│   └── quadraui_gtk.rs  (~23 lines)  Theme adapter + RICH_TEXT_POPUP_SB_* re-exports (most rasterisers now via trait)
+├── tui_main/        (~10,864 lines)  ratatui/crossterm TUI backend (all platforms)
+│   ├── mod.rs        (~3,406 lines)  Structs, event_loop, key translation, clipboard, run()
+│   ├── mouse.rs      (~3,058 lines)  All mouse click/drag/scroll interaction handling
+│   ├── panels.rs     (~2,199 lines)  Activity bar, sidebar, status/command lines, all panel renders
+│   └── render_impl.rs(~1,996 lines)  draw_frame orchestrator, tab bar, editor windows, popups
 ├── win_gui/         (~10,877 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
 │   ├── mod.rs        (~6,263 lines)  HWND, D2D render target, event loop, DWM title bar, IME, font install
 │   ├── draw.rs       (~4,614 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar

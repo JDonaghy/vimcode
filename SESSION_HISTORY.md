@@ -1,7 +1,43 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 387 archived here.
+All sessions through 388 archived here.
+
+---
+**Session 388 (May 19) — #469 rich text popup migration lands; #447 GTK AppShell parked pending quadraui infra; 5 pre-existing hover-popup bugs catalogued:**
+
+Two streams of work this session. The first — finishing the `ScreenLayout::draw()` migration with the last popup — landed cleanly. The second — pushing on the GTK AppShell consumption — bounced off a structural mismatch and is parked behind a quadraui-side infrastructure issue.
+
+**Closed**
+
+- **#469** (PR #487) Migrate `draw_editor_hover_popup` to `Surface::RichTextPopup`. Replaces the direct `quadraui_gtk::draw_rich_text_popup` shim call with `enter_frame_scope` + `frame.push(Surface::RichTextPopup { popup, layout: &popup_layout })` + `frame.draw(b)`, matching the pattern used by the other 7 popup surfaces in #463. Link hit regions recovered from `popup_layout.link_hit_regions` directly (the same instance the rasteriser walks, so paint + click agree by construction). The dead `quadraui_gtk::draw_rich_text_popup` shim removed (40 lines); `RICH_TEXT_POPUP_SB_WIDTH` / `RICH_TEXT_POPUP_SB_INSET` re-exports kept — still consumed by the hit-test scrollbar geometry helper in `draw_editor_hover_popup`.
+
+  The migration was originally attempted as part of #463 but reverted (`850a3e9` in reflog) due to apparent click hit-test regressions. Re-investigating with targeted `eprintln` instrumentation in `reconcile_editor_hover_modal` + `dispatch_click` proved the modal-stack and dispatch paths are working correctly through the migrated paint — every click inside the popup bounds returns `MouseDown { widget: Some("editor_hover") }` and reaches the editor_hover branch at line 6643. The originally-suspected fall-through behavior turned out to be a different, pre-existing GTK widget-tree z-order issue (#486 — see below) plus paint-position vs hit-rect mismatch (#488). PR's three intermediate commits document the WIP migration → diagnostic prints → final cleanup; squash-merged into develop as `1912cd3`. **All GTK surfaces now paint through `ScreenLayout::draw()` — #446 fully closed.**
+
+- **#476** (PR #482, parallel work) Migrate TUI Extension Panel to `quadraui::TreeView`. Adapter in `render.rs`, panel drawn through the trait. Not part of this agent's work but landed during the session — noted for context.
+
+**Parked**
+
+- **#447** GTK widget-tree migration to `quadraui::gtk::run_with_shell()`. Started the work, hit a structural wall. The issue's framing ("delete ~3,392 lines from `struct App` + `fn init` + `view!` macro and swap in `run_with_shell`") understates the scope by ~10×. `run_with_shell` calls `quadraui::gtk::run()` which is a **single-DrawingArea** runner that owns Application + Window + all GDK event controllers and is not Relm4-compatible. Vimcode currently has **14 distinct `gtk4::DrawingArea`s** (per-panel sidebars × 7, activity bar, menu bar, menu dropdown, panel hover, ctx menu overlay, editor, find/replace), native GTK widgets (3 window control buttons, `gtk4::Revealer`, `gtk4::ScrolledWindow`, `gtk4::Overlay` for editor scrollbars), and a full Relm4 `SimpleComponent` with `Msg` enum + `view!` macro + `#[watch]` bindings + `sender.input()` dispatch. Adopting `run_with_shell` requires replacing Relm4 entirely, collapsing 14 DAs into 1, converting native window-control Buttons to paint primitives + hit-testing, and moving all overlays (menu dropdown, hover popups, ctx menu) into one paint pass. That's a near-total rewrite of `src/gtk/`, not a 3,392-line delete.
+
+  Filed `quadraui#217` cataloguing the four infrastructure pieces needed before #447 can be picked up: (1) a multi-area GTK runner so consumers can keep per-zone DAs (`AppLogic::AreaId` is the seam, already in the trait); (2) `AppShell` chrome slots beyond activity-bar/sidebar — title bar above, bottom panel between main and status, status bar below, command-line above status; (3) multi-panel sidebar content routing (ergonomic helpers on `ShellContext` for panel-local coords + a multi-panel demo); (4) native-modal hooks (file dialogs) via `PlatformServices` rather than ad-hoc `setup_gtk(&Window)`. Issue commented on vimcode side; branch deleted; @me unassigned.
+
+**Filed (pre-existing bugs surfaced during #469 investigation)**
+
+- **#486** Editor's vertical scrollbar is a native `gtk4::Scrollbar` widget added via `overlay.add_overlay()`. GTK widget hit-testing routes clicks to this widget BEFORE they reach the editor DA, so when the popup scrollbar visually overlaps the editor scrollbar (narrow editor), popup-scrollbar clicks go to the editor. Modal stack can't arbitrate because the click event never enters the DA dispatch path. Three fix options sketched in the issue; Option C (replace native scrollbar with Cairo `Surface::Scrollbar` + `ScrollSurface` registration, mirroring `draw_h_scrollbars`) is the long-term answer.
+
+- **#488** Most hover-popup hyperlinks don't fire on click. Root cause: `popup_layout.link_hit_regions` uses `chars().count() * char_width` (monospace) via the measure closure, but the rasteriser paints in the UI font (proportional). Visible link position drifts left/right of hit rect — sometimes by 700+ pixels on long lines. Trace data: clicked visible `use-the-set-variant-...` link at (915, 600), only hit rect at (222, 427). Fix sketch: switch the measure closure to a Pango pixel measurement at the UI font. Reproduces on develop with the shim — not migration-caused.
+
+- **#489** Pointer cursor not shown over clickable hyperlinks in the GTK hover popup. Need to add `gdk::Cursor::from_name("pointer")` toggle in the editor DA motion handler when over an `editor_hover_link_rects` entry. Composing with existing cursor logic (text-beam in editor body, resize for dividers) is the only complication.
+
+- **#490** Double-click on the editor hover popup passes through to the editor underneath (selects a word). `Msg::MouseDoubleClick` handler at `src/gtk/mod.rs:4235` skips modal-stack arbitration entirely — goes straight to `handle_mouse_double_click`. Single-click handler does the right thing (returns at the editor_hover branch). Sweep-worthy: every modal (picker, dialog, completion popup, ctx menu, hover) is probably double-click-vulnerable.
+
+- **#491** `command:definition` footer link doesn't navigate. `execute_command_uri` routes through `plugin_run_command`, which has no registered handler for `definition` / `type_definition` / `implementation` / `references`. Either register those as built-in commands routing to existing `lsp_goto_definition` etc., or change the footer URLs to a different scheme. Fix sketch in the issue (Option C — match arm in `execute_command_uri` before plugin dispatch).
+
+**Tool / workflow notes**
+
+- Twice this session I accidentally committed to `develop` because the harness shell stayed on `develop` after the user manually switched to test the shim. Each time recovered with `git reset --hard HEAD~1` + branch switch. Worth noting that "user runs a comparison test on develop" should trigger an explicit `git branch --show-current` check before any commit.
+- The #469 PR's three intermediate WIP commits made the investigation trail readable on the branch but were noise for `develop`'s log. Squash-merge was the right call; documented in the PR body up-front.
 
 ---
 **Session 387 (May 18) — #446 migration complete + first automated dispatch:**

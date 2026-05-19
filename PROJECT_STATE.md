@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 18, 2026 (Session 387 — **#446 ScreenLayout::draw() migration complete (all 4 chunks landed).** Chunk C (#462, PR #472): editor viewport, terminal (single + split), horizontal scrollbars, find/replace overlay, palette — all routed through `ScreenLayout::draw()`. Every GTK surface except rich text popup (#469) now paints through the declarative frame renderer. Also landed #453 (PR #473): horizontal scroll `zh`/`zl`/`zH`/`zL` fixed — `ensure_cursor_visible` was undoing scrolls; engine now clamps cursor to viewport after scroll commands. claude-coordinator first real dispatch: dellserver successfully fixed #453 autonomously (found real engine bug, not just stale tests). Coordinator tool gaps identified: permission flags, auto-close hook, branch capture in reconcile, progress visibility. 1989+ lib tests passing.)
+**Last updated:** May 19, 2026 (Session 388 — **#469 landed (PR #487): rich text popup migration to `Surface::RichTextPopup` complete.** Every GTK surface — including the editor hover popup — now paints through `ScreenLayout::draw()`. #446's 4-chunk migration is fully closed. Also: #476 (PR #482) migrated the TUI Extension Panel to `quadraui::TreeView`. Pushed back on #447 (GTK AppShell + `run_with_shell`) — current quadraui infrastructure can't host vimcode's 14-DA + Relm4 architecture; filed `quadraui#217` cataloguing 4 prerequisites (multi-area runner, chrome slots for title/bottom/status/cmdline, multi-panel sidebar ergonomics, native-modal hooks via `PlatformServices`). 5 pre-existing hover-popup bugs surfaced during #469 smoke testing, all filed: #486 (gtk4::Scrollbar overlay z-order vs popup scrollbar), #488 (hyperlink hit-rect vs paint divergence — monospace approximation vs proportional UI font), #489 (pointer cursor missing on hover-popup links), #490 (double-click on popup passes through to editor — `MouseDoubleClick` skips modal-stack arbitration), #491 (`command:definition` link doesn't navigate — `plugin_run_command` has no handler). 1989+ lib tests passing.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -75,7 +75,7 @@ cell coalescence) remain but are tracked separately.
 | Menu dropdown (top menu bar) | `MenuSystem` | ✅ | ✅ | #319. Owned by `MenuSystem::render()` + `MenuOverlay`. |
 | Debug toolbar | `StatusBar` | ✅ | ✅ | slice 8, `caf62a8` |
 | Breadcrumb bar | `StatusBar` | ✅ | ✅ | slice 8 |
-| Editor hover popup (markdown + code-hl + selection + scroll + links) | `RichTextPopup` | ✅ | ✅ | #214 shipped (`c8a23e9`); rasterisers lifted via #266 (`779f6e8`). Both backends consume `quadraui::{tui,gtk}::draw_rich_text_popup`. |
+| Editor hover popup (markdown + code-hl + selection + scroll + links) | `RichTextPopup` | ✅ | ✅ | #214 shipped (`c8a23e9`); rasterisers lifted via #266 (`779f6e8`); paint migrated to `Surface::RichTextPopup` via `frame.draw()` in #469 / PR #487 (`1912cd3`). Both backends consume `quadraui::{tui,gtk}::draw_rich_text_popup` through the trait. |
 | Completion popup | `Completions` | ✅ | ✅ | #285 — GTK lifted to `quadraui::gtk::draw_completions` |
 | Editor scrollbar (v + h paint) | `Scrollbar` | ✅ | ✅ | #277, `fbbc85f`+ |
 | Settings panel chrome (header + search row) | `draw_settings_chrome` | ✅ | ✅ | #278, `fd08db0` |
