@@ -1103,7 +1103,8 @@ impl Engine {
         // language-server-agnostic.
         let scoped = self.breadcrumb_scoped_parent.take();
         let scoped_line = self.breadcrumb_scoped_parent_line.take();
-        let filtered: Vec<lsp::SymbolInfo> = if let Some(parent_line) = scoped_line {
+        let is_scoped = scoped.is_some();
+        let mut filtered: Vec<lsp::SymbolInfo> = if let Some(parent_line) = scoped_line {
             // Walk the hierarchical tree to find the parent symbol at the given
             // line, then use its children as the sibling list. Falls through to
             // name-based filtering if no such symbol is found (defensive).
@@ -1129,6 +1130,17 @@ impl Engine {
         } else {
             symbols
         };
+        // In scoped mode the picker shows ONE level (the siblings of the
+        // clicked segment). Strip nested children so `build_symbol_tree_items`
+        // doesn't recurse and flatten the whole subtree below each sibling —
+        // before this, clicking a top-level `impl` segment expanded every
+        // impl's methods inline and the picker showed all ~92 symbols in the
+        // file instead of just the sibling impls/structs/free functions.
+        if is_scoped {
+            for sym in &mut filtered {
+                sym.children.clear();
+            }
+        }
         let path = self.active_buffer_path().unwrap_or_default();
 
         // Check if the symbols already have hierarchy (DocumentSymbol format)

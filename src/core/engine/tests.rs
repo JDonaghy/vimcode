@@ -18185,6 +18185,106 @@ fn test_breadcrumb_enter_on_path_opens_file_picker() {
 }
 
 #[test]
+fn test_scoped_filter_top_level_does_not_flatten_subtree() {
+    // #465 follow-up: when the user clicks the outermost symbol segment
+    // (parent_scope = None) the picker should show only the sibling
+    // top-level items, NOT recurse into their children. Pre-fix the picker
+    // showed every nested symbol in the file because `build_symbol_tree_items`
+    // recursively walked `children` on each filtered item.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking the impl block segment at the top
+    // of the symbol breadcrumb chain: parent_scope is None (no enclosing
+    // symbol) so the filter is top-level only.
+    e.breadcrumb_scoped_parent = Some(None);
+    e.breadcrumb_scoped_parent_line = None;
+    // A file with two impl blocks, each with two methods (4 nested + 2
+    // top-level = 6 symbols total).
+    let symbols = vec![
+        SymbolInfo {
+            name: "impl Alpha".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 10,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "a1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 11,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "a2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 15,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+        SymbolInfo {
+            name: "impl Beta".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 50,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "b1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 51,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "b2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 55,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+    ];
+    e.picker_populate_document_symbols(symbols);
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("impl Alpha")),
+        "expected impl Alpha at top level, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("impl Beta")),
+        "expected impl Beta at top level, got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains(" a1") || n.contains(" b1")),
+        "nested methods should be hidden in scoped top-level view, got: {names:?}"
+    );
+}
+
+#[test]
 fn test_scoped_filter_hierarchical_impl_block_name_mismatch() {
     // #465 follow-up: tree-sitter names an `impl X for Y` block as just `Y`,
     // while rust-analyzer's hierarchical DocumentSymbol names the same block
