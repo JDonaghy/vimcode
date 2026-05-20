@@ -91,6 +91,7 @@ impl Engine {
         self.picker_items.clear();
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.breadcrumb_scoped_parent_line = None;
         self.picker_history_index = None;
         self.picker_history_typing_buffer.clear();
 
@@ -220,6 +221,7 @@ impl Engine {
         self.picker_scroll_top = 0;
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.breadcrumb_scoped_parent_line = None;
     }
 
     /// Rebuild the cached breadcrumb segments from the active group's state.
@@ -307,13 +309,27 @@ impl Engine {
         // Filter to symbols whose container matches this segment's parent,
         // matching VSCode behavior (clicking a function shows sibling functions).
         //
-        // #465: `open_picker` resets `breadcrumb_scoped_parent` to None as part
-        // of its state-clear pass, so the assignment has to happen AFTER the
-        // open call — otherwise the filter is wiped before the async LSP
-        // response can read it, and the populated picker shows all symbols (or
-        // empty if rust-analyzer returns symbols with no `container`).
+        // #465: `open_picker` resets the scope filter as part of its state-clear
+        // pass, so both assignments happen AFTER the open call — otherwise the
+        // filter is wiped before the async LSP response can read it.
+        //
+        // The parent's *line* is recorded alongside its name because tree-sitter
+        // and LSP disagree on naming for impl blocks: tree-sitter's name is the
+        // type being implemented (e.g. `VsplitLayout`), while rust-analyzer's
+        // hierarchical `DocumentSymbol` names the impl block fully (e.g. `impl
+        // WindowGroupLayout for VsplitLayout`) and sets that on children's
+        // `container`. The line uniquely identifies the parent in either form
+        // without depending on name-string compatibility.
+        let parent_line = self
+            .breadcrumb_segments
+            .iter()
+            .take(self.breadcrumb_selected)
+            .rev()
+            .find(|s| s.is_symbol)
+            .and_then(|s| s.symbol_line);
         self.open_picker(PickerSource::CommandCenter);
         self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        self.breadcrumb_scoped_parent_line = parent_line;
         self.picker_query = "@".to_string();
         self.picker_filter();
         self.picker_load_preview();
@@ -1072,8 +1088,40 @@ impl Engine {
     /// When a filter query is active, the tree is flattened for fuzzy matching.
     pub(crate) fn picker_populate_document_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
         // Apply scoped parent filter if set (from breadcrumb navigation).
+        //
+        // Two filter keys can be set by `breadcrumb_open_scoped`:
+        //  * `breadcrumb_scoped_parent_line` — start line of the parent scope
+        //    in the buffer. Primary key. Set when the click came via the
+        //    breadcrumb bar (where each segment has a line).
+        //  * `breadcrumb_scoped_parent` — parent name. Fallback for callers
+        //    that don't have a line (and the existing test surface).
+        //
+        // Line-based lookup wins when available because tree-sitter and LSP
+        // disagree on naming for impl blocks (#465): tree-sitter returns just
+        // the implemented type (`VsplitLayout`), while rust-analyzer names the
+        // impl `impl WindowGroupLayout for VsplitLayout`. Lines are unique and
+        // language-server-agnostic.
         let scoped = self.breadcrumb_scoped_parent.take();
-        let filtered: Vec<lsp::SymbolInfo> = if let Some(ref parent_filter) = scoped {
+        let scoped_line = self.breadcrumb_scoped_parent_line.take();
+        let filtered: Vec<lsp::SymbolInfo> = if let Some(parent_line) = scoped_line {
+            // Walk the hierarchical tree to find the parent symbol at the given
+            // line, then use its children as the sibling list. Falls through to
+            // name-based filtering if no such symbol is found (defensive).
+            match Self::find_symbol_at_line(&symbols, parent_line) {
+                Some(parent) if !parent.children.is_empty() => parent.children.clone(),
+                Some(parent) => {
+                    // Flat SymbolInformation case: parent has no children, so
+                    // siblings have to be identified via the `container` field
+                    // using the parent's own LSP name (not tree-sitter's).
+                    let parent_name = parent.name.clone();
+                    symbols
+                        .into_iter()
+                        .filter(|s| s.container.as_deref() == Some(parent_name.as_str()))
+                        .collect()
+                }
+                None => symbols, // parent not in LSP response — best-effort: show all
+            }
+        } else if let Some(ref parent_filter) = scoped {
             symbols
                 .into_iter()
                 .filter(|sym| sym.container.as_deref() == parent_filter.as_deref())
@@ -1138,6 +1186,26 @@ impl Engine {
         self.picker_scroll_top = 0;
         self.picker_update_scroll();
         self.picker_load_preview();
+    }
+
+    /// Recursively walk a hierarchical document-symbol tree and return the
+    /// first symbol whose start line matches `target_line`. Used by the
+    /// breadcrumb scope filter to locate the clicked-on parent by line —
+    /// language-server-agnostic, unlike name matching which breaks for impl
+    /// blocks where tree-sitter and LSP disagree on naming (#465).
+    fn find_symbol_at_line(
+        symbols: &[lsp::SymbolInfo],
+        target_line: usize,
+    ) -> Option<&lsp::SymbolInfo> {
+        for sym in symbols {
+            if sym.line as usize == target_line {
+                return Some(sym);
+            }
+            if let Some(found) = Self::find_symbol_at_line(&sym.children, target_line) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Reconstruct a tree from a flat symbol list using the `container` field.

@@ -18185,6 +18185,75 @@ fn test_breadcrumb_enter_on_path_opens_file_picker() {
 }
 
 #[test]
+fn test_scoped_filter_hierarchical_impl_block_name_mismatch() {
+    // #465 follow-up: tree-sitter names an `impl X for Y` block as just `Y`,
+    // while rust-analyzer's hierarchical DocumentSymbol names the same block
+    // as `impl X for Y` and sets that on children's `container`. The fix is
+    // to use the parent's *line number* (which both agree on) to find the
+    // parent in the LSP tree, then return its children directly.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking `adjust_ratio_at_index_impl` in the
+    // breadcrumb. Tree-sitter gave us:
+    //   - parent_scope = "VsplitLayout" (the impl's type)
+    //   - parent_line  = 600 (the impl_item's start row)
+    e.breadcrumb_scoped_parent = Some(Some("VsplitLayout".to_string()));
+    e.breadcrumb_scoped_parent_line = Some(600);
+
+    // Rust-analyzer's hierarchical response for the same code. Note the
+    // parent's name uses LSP's convention, not tree-sitter's.
+    let symbols = vec![SymbolInfo {
+        name: "impl WindowGroupLayout for VsplitLayout".to_string(),
+        kind: SymbolKind::Class,
+        detail: None,
+        container: None,
+        path: None,
+        line: 600,
+        character: 0,
+        children: vec![
+            SymbolInfo {
+                name: "adjust_ratio_at_index_impl".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 601,
+                character: 0,
+                children: Vec::new(),
+            },
+            SymbolInfo {
+                name: "other_method".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 650,
+                character: 0,
+                children: Vec::new(),
+            },
+        ],
+    }];
+    e.picker_populate_document_symbols(symbols);
+    // Pre-fix: name-based filter `container == "VsplitLayout"` matched zero
+    // items because rust-analyzer's container is the full `impl X for Y` form.
+    // Post-fix: line-based lookup finds the impl block at line 600 and uses
+    // its children (the two methods) as the sibling list.
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("adjust_ratio_at_index_impl")),
+        "expected adjust_ratio_at_index_impl in sibling list, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("other_method")),
+        "expected other_method in sibling list, got: {names:?}"
+    );
+}
+
+#[test]
 fn test_breadcrumb_open_scoped_preserves_parent_through_open_picker() {
     // #465: open_picker resets breadcrumb_scoped_parent as part of its
     // state-clear pass. Setting the scope BEFORE calling open_picker meant
