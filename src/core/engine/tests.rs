@@ -18185,6 +18185,212 @@ fn test_breadcrumb_enter_on_path_opens_file_picker() {
 }
 
 #[test]
+fn test_scoped_filter_top_level_does_not_flatten_subtree() {
+    // #465 follow-up: when the user clicks the outermost symbol segment
+    // (parent_scope = None) the picker should show only the sibling
+    // top-level items, NOT recurse into their children. Pre-fix the picker
+    // showed every nested symbol in the file because `build_symbol_tree_items`
+    // recursively walked `children` on each filtered item.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking the impl block segment at the top
+    // of the symbol breadcrumb chain: parent_scope is None (no enclosing
+    // symbol) so the filter is top-level only.
+    e.breadcrumb_scoped_parent = Some(None);
+    e.breadcrumb_scoped_parent_line = None;
+    // A file with two impl blocks, each with two methods (4 nested + 2
+    // top-level = 6 symbols total).
+    let symbols = vec![
+        SymbolInfo {
+            name: "impl Alpha".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 10,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "a1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 11,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "a2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 15,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+        SymbolInfo {
+            name: "impl Beta".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 50,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "b1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 51,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "b2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 55,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+    ];
+    e.picker_populate_document_symbols(symbols);
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("impl Alpha")),
+        "expected impl Alpha at top level, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("impl Beta")),
+        "expected impl Beta at top level, got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains(" a1") || n.contains(" b1")),
+        "nested methods should be hidden in scoped top-level view, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_scoped_filter_hierarchical_impl_block_name_mismatch() {
+    // #465 follow-up: tree-sitter names an `impl X for Y` block as just `Y`,
+    // while rust-analyzer's hierarchical DocumentSymbol names the same block
+    // as `impl X for Y` and sets that on children's `container`. The fix is
+    // to use the parent's *line number* (which both agree on) to find the
+    // parent in the LSP tree, then return its children directly.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking `adjust_ratio_at_index_impl` in the
+    // breadcrumb. Tree-sitter gave us:
+    //   - parent_scope = "VsplitLayout" (the impl's type)
+    //   - parent_line  = 600 (the impl_item's start row)
+    e.breadcrumb_scoped_parent = Some(Some("VsplitLayout".to_string()));
+    e.breadcrumb_scoped_parent_line = Some(600);
+
+    // Rust-analyzer's hierarchical response for the same code. Note the
+    // parent's name uses LSP's convention, not tree-sitter's.
+    let symbols = vec![SymbolInfo {
+        name: "impl WindowGroupLayout for VsplitLayout".to_string(),
+        kind: SymbolKind::Class,
+        detail: None,
+        container: None,
+        path: None,
+        line: 600,
+        character: 0,
+        children: vec![
+            SymbolInfo {
+                name: "adjust_ratio_at_index_impl".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 601,
+                character: 0,
+                children: Vec::new(),
+            },
+            SymbolInfo {
+                name: "other_method".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 650,
+                character: 0,
+                children: Vec::new(),
+            },
+        ],
+    }];
+    e.picker_populate_document_symbols(symbols);
+    // Pre-fix: name-based filter `container == "VsplitLayout"` matched zero
+    // items because rust-analyzer's container is the full `impl X for Y` form.
+    // Post-fix: line-based lookup finds the impl block at line 600 and uses
+    // its children (the two methods) as the sibling list.
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("adjust_ratio_at_index_impl")),
+        "expected adjust_ratio_at_index_impl in sibling list, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("other_method")),
+        "expected other_method in sibling list, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_breadcrumb_open_scoped_preserves_parent_through_open_picker() {
+    // #465: open_picker resets breadcrumb_scoped_parent as part of its
+    // state-clear pass. Setting the scope BEFORE calling open_picker meant
+    // the filter was wiped before the async LSP response could read it,
+    // and the picker showed all symbols (or empty if rust-analyzer's
+    // DocumentSymbol response had no `container` field set on items).
+    // The fix moves the assignment after open_picker so the filter
+    // survives into picker_populate_document_symbols.
+    let mut e = engine_with_text("hello");
+    e.breadcrumb_segments = vec![
+        BreadcrumbSegmentInfo {
+            label: "Engine".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(10),
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "handle_key".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(20),
+            parent_scope: Some("Engine".to_string()),
+        },
+    ];
+    e.breadcrumb_selected = 1; // on "handle_key"
+    e.breadcrumb_open_scoped();
+    assert!(e.picker_open, "scoped picker should open");
+    assert_eq!(e.picker_query, "@");
+    assert_eq!(
+        e.breadcrumb_scoped_parent,
+        Some(Some("Engine".to_string())),
+        "scoped parent must survive open_picker so the async LSP response can filter siblings"
+    );
+}
+
+#[test]
 fn test_scoped_symbol_filtering() {
     let mut e = engine_with_text("hello");
     // Set the scoped parent filter to "Engine"

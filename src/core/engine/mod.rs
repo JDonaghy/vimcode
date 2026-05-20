@@ -2814,6 +2814,13 @@ pub struct Engine {
     /// When `Some`, `picker_populate_document_symbols` filters to symbols
     /// whose container matches this value. `Some(None)` = top-level only.
     pub breadcrumb_scoped_parent: Option<Option<String>>,
+    /// When `Some`, the line at which the parent scope starts in the buffer.
+    /// Used as the primary key for finding the parent in the LSP document
+    /// symbol tree, since tree-sitter's name (e.g. `"VsplitLayout"` for an
+    /// `impl X for VsplitLayout` block) doesn't match rust-analyzer's
+    /// `"impl X for VsplitLayout"` container string. Falls back to the
+    /// name-based filter when this is `None`.
+    pub breadcrumb_scoped_parent_line: Option<usize>,
 
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
@@ -3678,6 +3685,7 @@ impl Engine {
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
             breadcrumb_scoped_parent: None,
+            breadcrumb_scoped_parent_line: None,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),
