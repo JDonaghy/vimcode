@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** May 19, 2026 (Session 389 — **TUI convergence backlog audited and first slice landed.** #474 audit produced 7 vimcode issues (#475–#481) tiered by unblockedness + `quadraui#218` (ChatPanelView for AI sidebar). #476 implemented as the first Tier-1 slice (PR #482 merged): Extension Panel now renders through `quadraui::TreeView` via new `render::ext_panel_to_tree_view()` adapter. Net `panels.rs −252 / +101`, `render.rs +154`. ~1,440 lines of TUI-specific code identified for removal once Tier 2/3 blockers clear. 3 pre-existing ext-panel bugs surfaced during smoke testing and filed (mouse.rs byte-for-byte unchanged by the migration): #483 (search input doesn't filter — plugin/engine gap), #484 (click section header doesn't expand though Enter does — likely Down/Up duplication), #485 (scroll wheel doesn't scroll though scrollbar drag works). Session 388 (parallel agent stream same day): #469 rich text popup migration landed via PR #487; #447 GTK AppShell parked behind `quadraui#217` (multi-area runner + chrome slots + multi-panel sidebar + native-modal hooks needed first); 5 pre-existing hover-popup bugs filed (#486, #488, #489, #490, #491). 1989+ lib tests passing.)
+**Last updated:** May 19, 2026 (Session 389 — **Coordinator-driven 3-agent sprint.** 13 issues closed, 10 PRs merged. vimcode: #447 GTK AppShell intermediate (PR #495), #475 TUI key dedup (PR #492), #467 completion popup filtering (PR #498), #483/#485 TUI ext panel fixes (PR #501), #465 breadcrumb symbol picker (PR #502). quadraui: #206 unicode-width (PR #220), #209 rounded chrome (PR #228), #227 drop overlay (PR #229), #230 rich text link advance (PR #231), #222 TextInput primitive (PR #232). Rolled back PR #496 (platform-neutrality violation) → fixed properly via quadraui #230. Filed 7 quadraui pipeline issues (#221–#227), 2 already-implemented, 3 shipped. Unblocked vimcode #479/#480/#481/#488. Next: Server #479 (Settings FormController), Desktop A #488 (hover links — zero-code retest after quadraui pull), Quadraui #223 (ButtonBar). 1994+ lib tests passing.)
 
 ## Active milestone: Cross-Platform UI Crate
 
@@ -8,11 +8,11 @@
 
 **All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
 
-**Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233). Remaining quadraui-side infrastructure (#294, #168, #167, #149, #145, #144, #140, #139, #169). **Strategic direction:** focus on quadraui runtime epics (#202/#203/#204) — build the framework infrastructure first, then vimcode's per-backend code shrinks to ~60 lines as each stage lands.
+**Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233) **+ TUI convergence backlog** from Session 388 audit (#477, #478, #479, #480, #481 — #475 closed Session 389). **Session 389 unblocked:** #479 (Settings FormController — Form cursor already exists in quadraui), #480 (partially — TextInput primitive shipped as quadraui#222), #481 (scrollbar + drop overlay — both primitives exist). Remaining quadraui pipeline: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table). **GTK convergence chain:** #447 intermediate step landed (PR #495) → full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4) → #448 (event dispatch → UiEvent) → #449 (click dispatch → FrameHitMap).
 
 ---
 
-Vimcode at 1989+ lib tests passing.
+Vimcode at 1994+ lib tests passing.
 
 > Sessions 388 and earlier in **SESSION_HISTORY.md**.
 
@@ -129,4 +129,4 @@ cell coalescence) remain but are tracked separately.
 
 ## Recent Work
 
-> Sessions 388 and earlier in **SESSION_HISTORY.md**.
+> Sessions 389 and earlier in **SESSION_HISTORY.md**.

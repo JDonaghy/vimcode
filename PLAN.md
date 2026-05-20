@@ -6,7 +6,7 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-05-15 (Session 376 — AppShell sidebar complete. All follow-ups landed.)
+> **Last updated:** 2026-05-19 (Session 389 — #447 intermediate landed (PR #495), full migration filed as #493. TUI convergence: #475 closed, #479/#480/#481 unblocked. quadraui pipeline: #222 TextInput shipped, #227 drop overlay shipped, #230 link advance shipped. Remaining quadraui gaps: #223 ButtonBar, #224 Palette dual-mode, #225 Dialog table.)
 
 ---
 

@@ -4,74 +4,69 @@ Detailed per-session implementation notes archived from PROJECT_STATE.md.
 All sessions through 389 archived here.
 
 ---
-**Session 389 (May 18–19) — TUI convergence backlog: audit #474 → 7 issues filed → #476 implemented → merged:**
+**Session 389 (May 19) — Coordinator-driven 3-agent sprint, 10 PRs merged, 13 issues closed:**
 
-Parallel agent stream to Session 388. Worked the TUI side of the per-backend dedup theme: audit first, then implementation of the highest-confidence finding.
+Second coordinator session: 3 machines (Desktop A, Server, Quadraui agent), board-tracked with issue-comment briefings. Rolled back one platform-neutrality violation (PR #496) and re-routed through quadraui properly.
 
-**Audit (#474)**
+**vimcode closed (7):**
+- **#447** (PR #495) — GTK AppShell intermediate step. Dropped GTK-local `sidebar_visible`/`active_panel_id` copies, routes through `engine.app_shell` directly. +94/-70. Full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4).
+- **#475** (PR #492) — TUI sidebar key dedup. Extracted `tui_key_to_engine_name()` helper, collapsed 3 inline match blocks (Extensions/Settings/Debug). +39/-33.
+- **#467** (PR #498) — Completion popup filtering fix. Three-part engine-side fix: word chars no longer dismiss popup, prefix extension narrows candidates instead of replacing, LSP response merges into existing list. +133/-9. 2 regression tests.
+- **#483** + **#485** (PR #501) — TUI ext panel filter + wheel routing. Added `ext_panel_filter_matches()` for search filtering, guarded wheel events on `ext_panel_showing` to prevent explorer scroll from eating ext panel wheel events. +73/-7. Bonus: SidebarSystem `HeaderActivated` toggle fix across all 4 sidebar dispatchers.
+- **#465** (PR #502) — Breadcrumb symbol picker fix. Three compounding bugs: assignment order (scope filter wiped by `open_picker`), name-vs-line parent matching (tree-sitter vs rust-analyzer impl block naming), subtree flattening (scoped view recursed into children). Line-based `find_symbol_at_line()` for language-server-agnostic parent lookup. +302/-2. 3 regression tests.
 
-Audited all four large TUI files (`mod.rs` 3.4k, `mouse.rs` 3.1k, `panels.rs` 2.4k, `render_impl.rs` 2.0k) for code that duplicates `render.rs`, `core/`, or quadraui primitives. Four exploration agents ran in parallel, each scoped to one file with explicit instructions on the shared-API surface to check against. Spot-checked top findings before filing — dropped two that turned out to be already-converged or behavior-different (editor hover popup already routes through `editor_hover_to_quadraui_rich_text` + `draw_rich_text_popup`; mouse.rs scrollbar v/h "duplication" is intentional page-jump UX, not a `scrollbar_click_to_scroll_top` candidate).
+**quadraui closed (5):**
+- **#206** (PR #220) — `is_nerd_wide()` → `unicode-width` crate. PUA fallback for Nerd Font Supplement range added after smoke test.
+- **#209** (PR #228) — GTK context menu rounded-rect border. Extracted `rounded_rect_path` to shared `pub(crate)` helper in `gtk/mod.rs`. +19/-15.
+- **#227** (PR #229) — `Backend::draw_drop_overlay()`. TUI: tinted background + `│` insertion bar. GTK: rgba semi-transparent fill + 2px solid bar. +118/-0.
+- **#230** (PR #231) — GTK rich_text_popup link hit-rects via `index_to_pos`. Moved Pango measurement inside the rasteriser (not the consumer). Fixes hover link click accuracy for proportional fonts. +74/-22. Unblocks vimcode #488.
+- **#222** (PR #232) — Standalone `TextInput` primitive. Multi-line, cursor, auto-scroll, placeholder, hit regions. TUI + GTK rasterisers. 13 unit tests. +1106/-0. Unblocks vimcode #480 (commit input chunk).
 
-Backlog filed as 7 vimcode issues, tiered by unblockedness:
+**Platform-neutrality enforcement:** PR #496 (59 lines of Pango code in `src/gtk/draw.rs` for hover link measurement) was rolled back. Quadraui #230 filed to move the measurement inside the rasteriser. Fixed properly via quadraui PR #231.
 
-- **Tier 1 (ready now, no quadraui gap):** [#475](https://github.com/JDonaghy/vimcode/issues/475) unify sidebar panel key translation (~80 lines), [#476](https://github.com/JDonaghy/vimcode/issues/476) Extension Panel → TreeView (~326 lines).
-- **Tier 2 (small gap):** [#477](https://github.com/JDonaghy/vimcode/issues/477) use `compute_tab_bar_hit_regions()` for drag slot bounds (~40 lines), [#478](https://github.com/JDonaghy/vimcode/issues/478) sidebar-item hover popup → shared tooltip builder (~200 lines).
-- **Tier 3 (blocked on quadraui):** [#479](https://github.com/JDonaghy/vimcode/issues/479) Settings inline-edit → FormController (needs Form text cursor), [#480](https://github.com/JDonaghy/vimcode/issues/480) Source Control commit row + branch picker + help dialog (needs TextInput, ButtonBar, Palette dual-mode, Dialog rich content), [#481](https://github.com/JDonaghy/vimcode/issues/481) window separator scrollbar + tab drop overlay (needs `Backend::draw_scrollbar` + drag-drop primitive).
+**Pipeline issues filed (7):** quadraui #221–#227 for missing primitives blocking TUI convergence. #221 (Form cursor) and #226 (draw_scrollbar) discovered to already be implemented — closed. #227 shipped this session. Remaining: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table).
 
-Plus [quadraui#218](https://github.com/JDonaghy/quadraui/issues/218) — ChatPanelView primitive for AI/chat sidebars (the AI sidebar consumer issue follows after that lands). Total addressable: ~1,440 lines of TUI-specific code identified for removal once all blockers clear.
+**Unblocked:** vimcode #479 (Settings FormController), #480 (partially — TextInput landed), #481 (scrollbar + drop overlay), #488 (hover links).
 
-**Closed**
-
-- **#476** (PR [#482](https://github.com/JDonaghy/vimcode/pull/482)) Extension Panel → `quadraui::TreeView`. New `render::ext_panel_to_tree_view()` adapts `ExtPanelData`: section headers → `Decoration::Header` rows with `is_expanded: Some(section.expanded)`; items map indent + `ExtPanelStyle` → `Decoration` (Accent uses `StyledSpan` with `theme.keyword` since the primitive has no first-class accent); badges + action labels + hint combine into one right-aligned `Badge`; expandable items carry `is_expanded: Some(item.expanded)` for the chevron. `build_ext_panel_data()` resolves `engine.ext_panel_tree_expanded` overrides into the cloned `item.expanded` so the builder stays engine-free (matches the `ext_sidebar_to_tree_view()` pattern). TUI `render_ext_panel()` rewired: chrome via `quadraui::tui::draw_settings_chrome` (1 row when input hidden, 2 rows when visible — matching the legacy conditional), body via `Backend::draw_tree`. Scrollbar drawing + scroll-surface registration kept manual (TreeView doesn't paint scrollbars yet); help-popup overlay unchanged. Net: `panels.rs −252 / +101`, `render.rs +154` (builder + 2 unit tests covering tree shape, selection mapping, focus state). Squash-merged as `c040024`.
-
-  Known visual difference: separator rows (`item.is_separator`) render as a single `─` glyph instead of the full-width rule the legacy renderer drew. No `Decoration::Separator` on the primitive; no shipping plugin uses separators today.
-
-**Filed (pre-existing bugs surfaced during #476 smoke testing — `mouse.rs` byte-for-byte unchanged by the migration)**
-
-- **[#483](https://github.com/JDonaghy/vimcode/issues/483)** Typing in the panel search input doesn't filter visible items. Engine flips `ext_panel_input_active` and fires `panel_input` to the plugin but doesn't run a default filter — plugins must subscribe and re-emit filtered items. Suggested fix: engine-side default substring filter as a fallback in `ext_panel_visible_indices()`.
-- **[#484](https://github.com/JDonaghy/vimcode/issues/484)** Click on a section header doesn't toggle expand (Enter works). Click handler at `mouse.rs:2293` calls the exact same `handle_ext_panel_key("Return", ...)` Enter calls. Most likely a Down+Up duplication firing the toggle twice (net-zero) — parallels the [#451](https://github.com/JDonaghy/vimcode/issues/451) Alacritty/crossterm Up-only quirk.
-- **[#485](https://github.com/JDonaghy/vimcode/issues/485)** Scroll wheel doesn't scroll the panel though scrollbar drag does. Surface registration and `dispatch_scroll` routing identical to develop; instrumentation needed.
-
-**Tool / workflow notes**
-
-- Audit-by-agent with explicit "categories to flag" + "what NOT to flag" + "spot-check before filing" produced a backlog that closely matched the user's tiering instinct (they merged 6+7, moved 8 to quadraui without prompting). Worth repeating shape for the GTK side if/when that audit is needed.
-- Spot-checking 4 of the highest-impact agent findings before filing caught 2 false positives (editor hover popup, scrollbar track-click) — about a 25% false-positive rate. Time well spent.
+**Follow-ups filed:** vimcode #493 (full GTK run_with_shell migration), #497 (bare URL auto-link detection), #499 (git_insights header toggle remaining cases), #500 (search panel scrollbar drag).
 
 ---
-**Session 388 (May 19) — #469 rich text popup migration lands; #447 GTK AppShell parked pending quadraui infra; 5 pre-existing hover-popup bugs catalogued:**
+**Session 388 (May 18) — Coordinator-driven 5-agent sprint across 3 repos:**
 
-Two streams of work this session. The first — finishing the `ScreenLayout::draw()` migration with the last popup — landed cleanly. The second — pushing on the GTK AppShell consumption — bounced off a structural mismatch and is parked behind a quadraui-side infrastructure issue.
+First full coordinator session: 5 agents across 3 machines, 15 issues closed, 11 PRs reviewed and merged. Coordinator role operated manually via Claude Code (not the coord tool) with issue-comment briefings and board tracking.
 
-**Closed**
+**vimcode closed (4):**
+- **#446** + **#460** — draw wiring complete (all chunks landed, parent + residual closed)
+- **#469** (PR #487) — Rich text popup migration. Last popup surface routed through `ScreenLayout::draw()`. Original revert was due to pre-existing GTK scrollbar z-order bug (#486), not the migration itself.
+- **#474** — TUI dedup audit. Server agent audited `src/tui_main/` and filed 7 vimcode issues (#475–#481) + 1 quadraui issue (#218). ~1,440 lines of TUI-specific code identified for removal.
+- **#476** (PR #482) — Extension Panel → TreeView. New `render::ext_panel_to_tree_view()` builder. −252 lines from `panels.rs`.
 
-- **#469** (PR #487) Migrate `draw_editor_hover_popup` to `Surface::RichTextPopup`. Replaces the direct `quadraui_gtk::draw_rich_text_popup` shim call with `enter_frame_scope` + `frame.push(Surface::RichTextPopup { popup, layout: &popup_layout })` + `frame.draw(b)`, matching the pattern used by the other 7 popup surfaces in #463. Link hit regions recovered from `popup_layout.link_hit_regions` directly (the same instance the rasteriser walks, so paint + click agree by construction). The dead `quadraui_gtk::draw_rich_text_popup` shim removed (40 lines); `RICH_TEXT_POPUP_SB_WIDTH` / `RICH_TEXT_POPUP_SB_INSET` re-exports kept — still consumed by the hit-test scrollbar geometry helper in `draw_editor_hover_popup`.
+**quadraui closed (1):**
+- **#217** (PR #219) — AppShell gaps blocking vimcode#447. Stage 1: single-DA model locked in (zone routing via `AppShell::compute_layout` + `FrameHitMap`). Stage 2: four chrome slots added to `AppShellLayout` (title_bar, bottom_panel, command_line, status_bar) with `ShellConfig` builders. Bottom panel resize drag with min/max clamping. `full_chrome_demo` example on both backends. 12 new tests. Unblocks vimcode #447.
 
-  The migration was originally attempted as part of #463 but reverted (`850a3e9` in reflog) due to apparent click hit-test regressions. Re-investigating with targeted `eprintln` instrumentation in `reconcile_editor_hover_modal` + `dispatch_click` proved the modal-stack and dispatch paths are working correctly through the migrated paint — every click inside the popup bounds returns `MouseDown { widget: Some("editor_hover") }` and reaches the editor_hover branch at line 6643. The originally-suspected fall-through behavior turned out to be a different, pre-existing GTK widget-tree z-order issue (#486 — see below) plus paint-position vs hit-rect mismatch (#488). PR's three intermediate commits document the WIP migration → diagnostic prints → final cleanup; squash-merged into develop as `1912cd3`. **All GTK surfaces now paint through `ScreenLayout::draw()` — #446 fully closed.**
+**claude-coordinator closed (8):**
+- **#44** (PR #45) — Reconcile branch backfill fix. Two-pass approach, queries each machine once.
+- **#9** (PR #46) — Web dashboard. Single-file HTML, Starlette backend, AI chat via `claude -p`, mobile-optimized.
+- **#10** (PR #47) — SSE event source. `EventSource` pub/sub with ring buffer for `Last-Event-ID` reconnect. `stream_assignment_log` for live worker output.
+- **#11** (PR #48) — Approval flow + diff preview. Per-proposal approve/reject, briefing edit, diff via `gh pr diff`, XSS fix.
+- **#13** (PR #50) — Error handling. `ConcurrencyConfig`, rate limit detection (429 → RATE_LIMITED), `dispatch_with_retry` with exponential backoff, staggered dispatch.
+- **#15** (PR #49) — Adversarial code review. Auto-dispatches fresh `claude -p` reviewer on worker completion. `REVIEWER_SYSTEM_PROMPT`, `pick_reviewer_machine` (4-tier preference), CLAUDE.md + checklist briefing. Reviews-of-reviews blocked.
+- **#16** (PR #51) — Smoke test orchestration. Capability-based machine selection, `coord test` CLI, `capability_rules` config, auto-queue hook in reconcile.
+- **#53** (PR #55) — Issue claim detection. `find_work_claim` (board check + remote branch check), `has_active_followup` dedupe for review/smoke. Prevents duplicate dispatch.
 
-- **#476** (PR #482, parallel work) Migrate TUI Extension Panel to `quadraui::TreeView`. Adapter in `render.rs`, panel drawn through the trait. Not part of this agent's work but landed during the session — noted for context.
+**Filed (vimcode):** #475–#481 (TUI convergence backlog), #486 (GTK scrollbar z-order)
+**Filed (quadraui):** #218 (ChatPanelView primitive)
+**Filed (claude-coordinator):** #53 (claim detection — subsequently closed same session)
 
-**Parked**
+**Key architectural decisions:**
+- Single-DA model locked in for quadraui GTK runner (#217 Stage 1). `AppLogic::AreaId` retained as compatibility seam but always `()`.
+- TUI convergence backlog established: ready-now (#475, #476), small-gap (#477, #478), blocked-on-quadraui (#479, #480, #481).
+- claude-coordinator trust gap identified: dashboard + AI chat pane addresses the "completely in the dark" problem from first automated dispatch.
 
-- **#447** GTK widget-tree migration to `quadraui::gtk::run_with_shell()`. Started the work, hit a structural wall. The issue's framing ("delete ~3,392 lines from `struct App` + `fn init` + `view!` macro and swap in `run_with_shell`") understates the scope by ~10×. `run_with_shell` calls `quadraui::gtk::run()` which is a **single-DrawingArea** runner that owns Application + Window + all GDK event controllers and is not Relm4-compatible. Vimcode currently has **14 distinct `gtk4::DrawingArea`s** (per-panel sidebars × 7, activity bar, menu bar, menu dropdown, panel hover, ctx menu overlay, editor, find/replace), native GTK widgets (3 window control buttons, `gtk4::Revealer`, `gtk4::ScrolledWindow`, `gtk4::Overlay` for editor scrollbars), and a full Relm4 `SimpleComponent` with `Msg` enum + `view!` macro + `#[watch]` bindings + `sender.input()` dispatch. Adopting `run_with_shell` requires replacing Relm4 entirely, collapsing 14 DAs into 1, converting native window-control Buttons to paint primitives + hit-testing, and moving all overlays (menu dropdown, hover popups, ctx menu) into one paint pass. That's a near-total rewrite of `src/gtk/`, not a 3,392-line delete.
-
-  Filed `quadraui#217` cataloguing the four infrastructure pieces needed before #447 can be picked up: (1) a multi-area GTK runner so consumers can keep per-zone DAs (`AppLogic::AreaId` is the seam, already in the trait); (2) `AppShell` chrome slots beyond activity-bar/sidebar — title bar above, bottom panel between main and status, status bar below, command-line above status; (3) multi-panel sidebar content routing (ergonomic helpers on `ShellContext` for panel-local coords + a multi-panel demo); (4) native-modal hooks (file dialogs) via `PlatformServices` rather than ad-hoc `setup_gtk(&Window)`. Issue commented on vimcode side; branch deleted; @me unassigned.
-
-**Filed (pre-existing bugs surfaced during #469 investigation)**
-
-- **#486** Editor's vertical scrollbar is a native `gtk4::Scrollbar` widget added via `overlay.add_overlay()`. GTK widget hit-testing routes clicks to this widget BEFORE they reach the editor DA, so when the popup scrollbar visually overlaps the editor scrollbar (narrow editor), popup-scrollbar clicks go to the editor. Modal stack can't arbitrate because the click event never enters the DA dispatch path. Three fix options sketched in the issue; Option C (replace native scrollbar with Cairo `Surface::Scrollbar` + `ScrollSurface` registration, mirroring `draw_h_scrollbars`) is the long-term answer.
-
-- **#488** Most hover-popup hyperlinks don't fire on click. Root cause: `popup_layout.link_hit_regions` uses `chars().count() * char_width` (monospace) via the measure closure, but the rasteriser paints in the UI font (proportional). Visible link position drifts left/right of hit rect — sometimes by 700+ pixels on long lines. Trace data: clicked visible `use-the-set-variant-...` link at (915, 600), only hit rect at (222, 427). Fix sketch: switch the measure closure to a Pango pixel measurement at the UI font. Reproduces on develop with the shim — not migration-caused.
-
-- **#489** Pointer cursor not shown over clickable hyperlinks in the GTK hover popup. Need to add `gdk::Cursor::from_name("pointer")` toggle in the editor DA motion handler when over an `editor_hover_link_rects` entry. Composing with existing cursor logic (text-beam in editor body, resize for dividers) is the only complication.
-
-- **#490** Double-click on the editor hover popup passes through to the editor underneath (selects a word). `Msg::MouseDoubleClick` handler at `src/gtk/mod.rs:4235` skips modal-stack arbitration entirely — goes straight to `handle_mouse_double_click`. Single-click handler does the right thing (returns at the editor_hover branch). Sweep-worthy: every modal (picker, dialog, completion popup, ctx menu, hover) is probably double-click-vulnerable.
-
-- **#491** `command:definition` footer link doesn't navigate. `execute_command_uri` routes through `plugin_run_command`, which has no registered handler for `definition` / `type_definition` / `implementation` / `references`. Either register those as built-in commands routing to existing `lsp_goto_definition` etc., or change the footer URLs to a different scheme. Fix sketch in the issue (Option C — match arm in `execute_command_uri` before plugin dispatch).
-
-**Tool / workflow notes**
-
-- Twice this session I accidentally committed to `develop` because the harness shell stayed on `develop` after the user manually switched to test the shim. Each time recovered with `git reset --hard HEAD~1` + branch switch. Worth noting that "user runs a comparison test on develop" should trigger an explicit `git branch --show-current` check before any commit.
-- The #469 PR's three intermediate WIP commits made the investigation trail readable on the branch but were noise for `develop`'s log. Squash-merge was the right call; documented in the PR body up-front.
+**In-flight at session end:**
+- Desktop A: #447 (GTK widget tree → AppShell) — queued, unblocked
+- Server: #475 (TUI sidebar key translation) — queued, briefed
+- Desktop B: #18 (worker handoff) — PR #54 merged
 
 ---
 **Session 387 (May 18) — #446 migration complete + first automated dispatch:**
