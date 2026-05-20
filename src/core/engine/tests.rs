@@ -27260,3 +27260,107 @@ fn test_dialog_click_button() {
         DialogClickResult::InsideDialog
     );
 }
+
+// ─── Bare-URL hover link tests ────────────────────────────────────────────────
+
+#[test]
+fn test_bare_url_detected_as_link_url_span() {
+    // A plain paragraph containing a bare https URL should produce a LinkUrl span
+    // whose byte range extracts to the exact URL text.
+    let r = crate::core::markdown::render_markdown("See https://example.com for details.");
+    let url_texts: Vec<String> = r
+        .spans
+        .iter()
+        .enumerate()
+        .flat_map(|(li, line_spans)| {
+            line_spans
+                .iter()
+                .filter(|s| s.style == crate::core::markdown::MdStyle::LinkUrl)
+                .map(move |s| (li, s.start_byte, s.end_byte))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(li, start, end)| r.lines.get(li).map(|line| line[start..end].to_string()))
+        .collect();
+    assert!(
+        url_texts.contains(&"https://example.com".to_string()),
+        "expected LinkUrl span for bare URL, got: {:?}",
+        url_texts
+    );
+}
+
+#[test]
+fn test_bare_url_trailing_punctuation_stripped() {
+    // Trailing periods, commas, and closing parentheses must be stripped.
+    let r = crate::core::markdown::render_markdown(
+        "Visit https://example.com. Also https://other.org, and (https://third.io).",
+    );
+    // Collect (line_idx, start, end) for all LinkUrl spans, then extract text.
+    let url_texts: Vec<String> = r
+        .spans
+        .iter()
+        .enumerate()
+        .flat_map(|(li, line_spans)| {
+            line_spans
+                .iter()
+                .filter(|s| s.style == crate::core::markdown::MdStyle::LinkUrl)
+                .map(move |s| (li, s.start_byte, s.end_byte))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(li, start, end)| r.lines.get(li).map(|line| line[start..end].to_string()))
+        .collect();
+    assert!(
+        url_texts.contains(&"https://example.com".to_string()),
+        "trailing period not stripped; got: {:?}",
+        url_texts
+    );
+    assert!(
+        url_texts.contains(&"https://other.org".to_string()),
+        "trailing comma not stripped; got: {:?}",
+        url_texts
+    );
+    assert!(
+        url_texts.contains(&"https://third.io".to_string()),
+        "trailing paren+period not stripped; got: {:?}",
+        url_texts
+    );
+}
+
+#[test]
+fn test_bare_url_registers_click_region() {
+    // A hover popup with a bare URL should produce a clickable link entry.
+    let mut e = engine_with_text("hello\n");
+    e.show_panel_hover("ext_panel", "i", 0, "See https://rust-lang.org for more.");
+    let ph = e.panel_hover.as_ref().unwrap();
+    let found = ph
+        .links
+        .iter()
+        .any(|(_, _, _, url)| url == "https://rust-lang.org");
+    assert!(
+        found,
+        "expected click region for bare URL, links: {:?}",
+        ph.links
+    );
+}
+
+#[test]
+fn test_existing_markdown_link_behavior_unchanged() {
+    // Standard [label](url) markdown links must still produce a click region on
+    // the label span AND the URL display span (now both are clickable).
+    let mut e = engine_with_text("hello\n");
+    e.show_panel_hover("ext_panel", "i", 0, "[click here](https://example.com)");
+    let ph = e.panel_hover.as_ref().unwrap();
+    // At minimum the label-based click region must exist.
+    let label_click = ph
+        .links
+        .iter()
+        .any(|(_, _, _, url)| url == "https://example.com");
+    assert!(
+        label_click,
+        "expected click region for markdown link label, links: {:?}",
+        ph.links
+    );
+    // All registered URLs must pass is_safe_url.
+    for link in &ph.links {
+        assert!(is_safe_url(&link.3), "unsafe URL in links: {}", link.3);
+    }
+}

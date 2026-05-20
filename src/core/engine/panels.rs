@@ -1506,10 +1506,17 @@ impl Engine {
 
     /// Extract clickable links from rendered markdown.
     ///
-    /// Pairs each `Link` span (the label text) with the following `LinkUrl` span
-    /// (the URL) on the same line. The returned click region covers the label,
-    /// while the URL is used for dispatch. Command URIs displayed as `:Name?args`
-    /// are restored to `command:Name?args`.
+    /// Two sources of click regions are handled:
+    ///
+    /// 1. **Markdown links** — each `Link` span (the label text) is paired with
+    ///    the following `LinkUrl` span on the same line.  The click region covers
+    ///    the label; the URL drives dispatch.  Command URIs displayed as
+    ///    `:Name?args` are restored to `command:Name?args`.
+    ///
+    /// 2. **Bare URLs** — standalone `LinkUrl` spans (emitted by `render_markdown`
+    ///    for plain `http://` / `https://` text) become their own click regions.
+    ///    The span text is the URL itself, so no reconstruction is needed beyond
+    ///    the same `:` → `command:` prefix check used for markdown link URLs.
     pub(crate) fn extract_hover_links(
         rendered: &crate::core::markdown::MdRendered,
     ) -> Vec<(usize, usize, usize, String)> {
@@ -1519,11 +1526,11 @@ impl Engine {
             let Some(line) = rendered.lines.get(line_idx) else {
                 continue;
             };
-            // Find each Link span and pair it with the next LinkUrl on the same line.
+            // Walk every span on this line.
             let mut span_iter = line_spans.iter().peekable();
             while let Some(span) = span_iter.next() {
                 if span.style == MdStyle::Link {
-                    // Look for the following LinkUrl span to get the URL.
+                    // Paired markdown link: look for the following LinkUrl span.
                     let url = span_iter
                         .peek()
                         .filter(|next| next.style == MdStyle::LinkUrl)
@@ -1545,6 +1552,19 @@ impl Engine {
                             // Click region = the Link label span.
                             links.push((line_idx, span.start_byte, span.end_byte, url));
                         }
+                    }
+                } else if span.style == MdStyle::LinkUrl && span.end_byte <= line.len() {
+                    // Standalone LinkUrl span (bare URL or the URL display of a
+                    // markdown link).  Make the span itself clickable.
+                    let url_text = &line[span.start_byte..span.end_byte];
+                    // Restore command: prefix if displayed as ":Name?args".
+                    let url = if url_text.starts_with(':') {
+                        format!("command{}", url_text)
+                    } else {
+                        url_text.to_string()
+                    };
+                    if is_safe_url(&url) {
+                        links.push((line_idx, span.start_byte, span.end_byte, url));
                     }
                 }
             }
