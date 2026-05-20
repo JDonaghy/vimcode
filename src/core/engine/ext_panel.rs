@@ -42,7 +42,24 @@ impl Engine {
         }
     }
 
-    /// Count visible items in a section (accounting for collapsed tree nodes).
+    /// Whether an item passes the panel's search-input filter.
+    /// Returns true when there is no filter or when the item's text contains
+    /// the filter substring (case-insensitive). Plugins that subscribe to
+    /// `panel_input` and re-emit a filtered `set_items` still work — this is
+    /// a default fallback for panels whose plugins don't intercept.
+    pub(crate) fn ext_panel_filter_matches(
+        &self,
+        panel_name: &str,
+        item: &plugin::ExtPanelItem,
+    ) -> bool {
+        match self.ext_panel_input_text.get(panel_name) {
+            Some(s) if !s.is_empty() => item.text.to_lowercase().contains(&s.to_lowercase()),
+            _ => true,
+        }
+    }
+
+    /// Count visible items in a section (accounting for collapsed tree nodes
+    /// and the panel's search-input filter).
     pub(crate) fn ext_panel_visible_count(
         &self,
         panel_name: &str,
@@ -50,11 +67,15 @@ impl Engine {
     ) -> usize {
         items
             .iter()
-            .filter(|item| self.ext_panel_item_visible(panel_name, item, items))
+            .filter(|item| {
+                self.ext_panel_item_visible(panel_name, item, items)
+                    && self.ext_panel_filter_matches(panel_name, item)
+            })
             .count()
     }
 
-    /// Return the indices of visible items in a section.
+    /// Return the indices of visible items in a section (accounting for
+    /// collapsed tree nodes and the panel's search-input filter).
     pub fn ext_panel_visible_indices(
         &self,
         panel_name: &str,
@@ -63,7 +84,10 @@ impl Engine {
         items
             .iter()
             .enumerate()
-            .filter(|(_, item)| self.ext_panel_item_visible(panel_name, item, items))
+            .filter(|(_, item)| {
+                self.ext_panel_item_visible(panel_name, item, items)
+                    && self.ext_panel_filter_matches(panel_name, item)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -545,6 +569,8 @@ impl Engine {
                 if let Some(text) = self.ext_panel_input_text.get_mut(&panel_name) {
                     text.pop();
                 }
+                self.ext_panel_selected = 0;
+                self.ext_panel_scroll_top = 0;
                 // Fire panel_input on every change for live filtering.
                 let text = self
                     .ext_panel_input_text
@@ -561,6 +587,8 @@ impl Engine {
                             .entry(panel_name.clone())
                             .or_default()
                             .push(ch);
+                        self.ext_panel_selected = 0;
+                        self.ext_panel_scroll_top = 0;
                         // Fire panel_input on every change for live filtering.
                         let text = self
                             .ext_panel_input_text
@@ -1676,6 +1704,12 @@ impl Engine {
             }
             quadraui::SidebarEvent::RowSelected { .. } => {
                 self.ext_sidebar_input_active = false;
+                true
+            }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.ext_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
                 true
             }
             quadraui::SidebarEvent::Ignored => false,
