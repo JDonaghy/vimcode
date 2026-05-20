@@ -306,8 +306,14 @@ impl Engine {
         // Symbol segment: show siblings at the same level.
         // Filter to symbols whose container matches this segment's parent,
         // matching VSCode behavior (clicking a function shows sibling functions).
-        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        //
+        // #465: `open_picker` resets `breadcrumb_scoped_parent` to None as part
+        // of its state-clear pass, so the assignment has to happen AFTER the
+        // open call — otherwise the filter is wiped before the async LSP
+        // response can read it, and the populated picker shows all symbols (or
+        // empty if rust-analyzer returns symbols with no `container`).
         self.open_picker(PickerSource::CommandCenter);
+        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
         self.picker_query = "@".to_string();
         self.picker_filter();
         self.picker_load_preview();

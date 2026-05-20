@@ -18185,6 +18185,43 @@ fn test_breadcrumb_enter_on_path_opens_file_picker() {
 }
 
 #[test]
+fn test_breadcrumb_open_scoped_preserves_parent_through_open_picker() {
+    // #465: open_picker resets breadcrumb_scoped_parent as part of its
+    // state-clear pass. Setting the scope BEFORE calling open_picker meant
+    // the filter was wiped before the async LSP response could read it,
+    // and the picker showed all symbols (or empty if rust-analyzer's
+    // DocumentSymbol response had no `container` field set on items).
+    // The fix moves the assignment after open_picker so the filter
+    // survives into picker_populate_document_symbols.
+    let mut e = engine_with_text("hello");
+    e.breadcrumb_segments = vec![
+        BreadcrumbSegmentInfo {
+            label: "Engine".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(10),
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "handle_key".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(20),
+            parent_scope: Some("Engine".to_string()),
+        },
+    ];
+    e.breadcrumb_selected = 1; // on "handle_key"
+    e.breadcrumb_open_scoped();
+    assert!(e.picker_open, "scoped picker should open");
+    assert_eq!(e.picker_query, "@");
+    assert_eq!(
+        e.breadcrumb_scoped_parent,
+        Some(Some("Engine".to_string())),
+        "scoped parent must survive open_picker so the async LSP response can filter siblings"
+    );
+}
+
+#[test]
 fn test_scoped_symbol_filtering() {
     let mut e = engine_with_text("hello");
     // Set the scoped parent filter to "Engine"
