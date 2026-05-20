@@ -57,6 +57,59 @@ pub struct MdRendered {
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
+/// Scan a plain-text chunk for bare `http://` / `https://` URLs and push
+/// `MdStyle::LinkUrl` spans into `spans`.
+///
+/// * `chunk_bytes` — the raw bytes of the text chunk (UTF-8).
+/// * `line_offset` — byte position where this chunk starts inside `cur_line`.
+/// * `spans`       — destination span list for the current line.
+///
+/// No regex crate is used: we scan byte-by-byte for the scheme prefix, walk
+/// forward to the next ASCII whitespace, then strip trailing punctuation
+/// (`.`, `,`, `)`).
+fn scan_bare_urls(chunk_bytes: &[u8], line_offset: usize, spans: &mut Vec<MdSpan>) {
+    let len = chunk_bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        // Detect scheme prefix.
+        let scheme_len = if chunk_bytes[i..].starts_with(b"https://") {
+            8
+        } else if chunk_bytes[i..].starts_with(b"http://") {
+            7
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let url_start = i;
+
+        // Walk to next ASCII whitespace.
+        let mut j = i + scheme_len;
+        while j < len && !chunk_bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+
+        // Strip trailing punctuation characters.
+        while j > url_start + scheme_len {
+            match chunk_bytes[j - 1] {
+                b'.' | b',' | b')' => j -= 1,
+                _ => break,
+            }
+        }
+
+        if j > url_start + scheme_len {
+            spans.push(MdSpan {
+                start_byte: line_offset + url_start,
+                end_byte: line_offset + j,
+                style: MdStyle::LinkUrl,
+            });
+        }
+
+        // Advance past the URL (or at least by 1 to avoid an infinite loop).
+        i = j.max(url_start + 1);
+    }
+}
+
 /// Convert a markdown string into styled plain text.
 pub fn render_markdown(input: &str) -> MdRendered {
     let mut lines: Vec<String> = Vec::new();
@@ -431,6 +484,8 @@ pub fn render_markdown(input: &str) -> MdRendered {
                         } else if in_link {
                             MdStyle::Link
                         } else {
+                            // Plain text: scan for bare http/https URLs.
+                            scan_bare_urls(chunk.as_bytes(), start, &mut cur_spans);
                             at_line_start = false;
                             continue;
                         };
