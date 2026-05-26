@@ -371,6 +371,9 @@ struct SidebarScrollDrag {
     track_len: u16,
     /// Total number of display rows in the results list.
     total: usize,
+    /// Row offset from thumb top to the initial click position (for natural thumb tracking).
+    /// Stored as i16 to allow signed arithmetic during drag.
+    thumb_offset: i16,
 }
 
 /// State for an active drag on a debug sidebar section scrollbar.

@@ -480,6 +480,34 @@ pub(super) fn handle_mouse(
             }
             return sidebar_width;
         }
+        // ── Search-panel scrollbar thumb drag — captured globally so drag continues ──
+        // even when the cursor leaves the sidebar and enters the editor area.  This
+        // guarded arm fires before the catch-all, mirroring the sidebar-separator pattern.
+        MouseEventKind::Drag(MouseButton::Left) if dragging_sidebar_search.is_some() => {
+            if let Some(ref drag) = *dragging_sidebar_search {
+                if drag.track_len > 0 && drag.total > 0 {
+                    // Compute the target thumb-top row using the stored click offset so the
+                    // thumb follows the cursor naturally rather than jumping on every event.
+                    let raw_thumb_top =
+                        row as i16 - drag.track_abs_start as i16 - drag.thumb_offset;
+                    // Thumb size in rows (mirrors render_search_panel calculation).
+                    let thumb_size =
+                        ((drag.track_len as usize * drag.track_len as usize) / drag.total).max(1);
+                    // Clamp thumb top so it stays within the track.
+                    let max_thumb_top = (drag.track_len as usize).saturating_sub(thumb_size) as i16;
+                    let clamped_thumb_top = raw_thumb_top.clamp(0, max_thumb_top) as usize;
+                    // Map thumb position to scroll offset.
+                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
+                    let new_scroll = if max_thumb_top > 0 {
+                        (clamped_thumb_top * max_scroll) / max_thumb_top as usize
+                    } else {
+                        0
+                    };
+                    sidebar.search_scroll_top = new_scroll;
+                }
+            }
+            return sidebar_width;
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
@@ -563,18 +591,6 @@ pub(super) fn handle_mouse(
                     let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
                     engine.dap_sidebar_scroll[drag.sec_idx] =
                         (ratio * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
-            }
-            // Sidebar search-results scrollbar drag
-            if let Some(ref drag) = *dragging_sidebar_search {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let new_scroll = (ratio * drag.total as f64) as usize;
-                    sidebar.search_scroll_top =
-                        new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
                 }
                 return sidebar_width;
             }
@@ -1994,6 +2010,7 @@ pub(super) fn handle_mouse(
                     track_abs_start: content_start + menu_rows,
                     track_len: content_h as u16,
                     total: flat_len,
+                    thumb_offset: 0,
                 });
                 return sidebar_width;
             }
@@ -2037,6 +2054,7 @@ pub(super) fn handle_mouse(
                     track_abs_start: menu_rows,
                     track_len: tree_height as u16,
                     total: total_rows,
+                    thumb_offset: 0,
                 });
                 return sidebar_width;
             }
@@ -2202,11 +2220,13 @@ pub(super) fn handle_mouse(
             return sidebar_width;
         } else if sidebar.active_panel == TuiPanel::Search {
             sidebar.has_focus = true;
-            // results_height = (total height - 2 status rows) - 5 panel header rows
-            let results_height = term_height.saturating_sub(7) as usize;
+            // results_height matches the render: (sidebar area height) - 5 header rows.
+            // Sidebar area height = term_height - menu_rows (the sidebar spans the full
+            // content area, which excludes only the menu bar row).
+            let results_height = term_height.saturating_sub(menu_rows + 5) as usize;
             let results = &engine.project_search_results;
 
-            // Click on the scrollbar column in the results area → jump-scroll
+            // Click on the scrollbar column in the results area → jump-scroll + arm thumb drag.
             if col == sb_col && !results.is_empty() && sidebar_row >= 5 {
                 // Count total display rows (result rows + file header rows)
                 let total_display = {
@@ -2222,17 +2242,33 @@ pub(super) fn handle_mouse(
                     count
                 };
                 if total_display > results_height {
-                    let rel_row = sidebar_row.saturating_sub(5) as usize;
+                    // Compute the thumb position so we can derive the click offset within the thumb.
+                    // thumb_top is the 0-indexed row within the track where the thumb begins.
+                    let current_scroll = sidebar
+                        .search_scroll_top
+                        .min(total_display.saturating_sub(results_height));
+                    let thumb_top_row: u16 = ((current_scroll as f64 / total_display as f64)
+                        * results_height as f64)
+                        .floor() as u16;
+                    // rel_row: click position relative to track start (0 = first track row).
+                    let rel_row = sidebar_row.saturating_sub(5);
+                    // thumb_offset: how far into the thumb the user clicked.
+                    // Used during drag so the thumb follows the cursor naturally.
+                    let thumb_offset = rel_row as i16 - thumb_top_row as i16;
+
+                    // Jump-scroll to the position implied by click location (track-click behaviour).
                     let ratio = rel_row as f64 / results_height as f64;
                     let new_scroll = (ratio * total_display as f64) as usize;
                     sidebar.search_scroll_top =
                         new_scroll.min(total_display.saturating_sub(results_height));
-                    // Arm drag state so subsequent Drag events continue scrolling.
-                    // track_abs_start is the absolute terminal row of the track top.
+
+                    // Arm drag state so subsequent Drag events continue tracking the cursor.
+                    // track_abs_start is the absolute terminal row of the first track row.
                     *dragging_sidebar_search = Some(SidebarScrollDrag {
                         track_abs_start: 5 + menu_rows,
                         track_len: results_height as u16,
                         total: total_display,
+                        thumb_offset,
                     });
                 }
                 return sidebar_width;
@@ -2360,6 +2396,7 @@ pub(super) fn handle_mouse(
                     track_abs_start: track_start,
                     track_len,
                     total: flat_total,
+                    thumb_offset: 0,
                 });
             } else if sidebar_row == 0 {
                 // Header — no-op
@@ -2844,4 +2881,246 @@ fn status_segment_hit_test(
         width,
     );
     crate::render::resolve_status_bar_click(&regions, click_col as u16)
+}
+
+// ─── TUI mouse unit tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal, hermetic Engine suitable for mouse-event unit tests.
+    fn test_engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.extension_state = crate::core::session::ExtensionState::default();
+        e.mode = crate::core::Mode::Normal;
+        e
+    }
+
+    /// Construct a TuiSidebar pointing at the Search panel.
+    fn search_sidebar() -> TuiSidebar {
+        TuiSidebar {
+            visible: true,
+            has_focus: false,
+            active_panel: TuiPanel::Search,
+            selected: 0,
+            scroll_top: 0,
+            rows: Vec::new(),
+            root: std::path::PathBuf::from("/tmp"),
+            expanded: std::collections::HashSet::new(),
+            search_input_mode: false,
+            replace_input_focused: false,
+            search_scroll_top: 0,
+            show_hidden_files: false,
+            sort_case_insensitive: false,
+            toolbar_focused: false,
+            toolbar_selected: 1,
+            pending_ctrl_w: false,
+            ext_panel_name: None,
+        }
+    }
+
+    /// Helper: build a MouseEvent at (col, row) with the given kind and no modifiers.
+    fn mouse_ev(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Run handle_mouse with a pre-populated drag state that covers the default
+    /// argument set used in this test module.
+    #[allow(clippy::too_many_arguments)]
+    fn run_mouse(
+        ev: MouseEvent,
+        sidebar: &mut TuiSidebar,
+        engine: &mut Engine,
+        terminal_size: &Option<Size>,
+        sidebar_width: u16,
+        dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
+    ) -> u16 {
+        let mut dragging_sidebar = false;
+        let mut dragging_scrollbar: Option<ScrollDragState> = None;
+        let mut dragging_debug_sb: Option<DebugSidebarScrollDrag> = None;
+        let mut dragging_terminal_sb: Option<(u16, u16, usize)> = None;
+        let mut debug_output_scroll: usize = 0;
+        let mut dragging_debug_output_sb: Option<(u16, u16, usize)> = None;
+        let mut dragging_terminal_resize = false;
+        let mut dragging_terminal_split = false;
+        let mut dragging_group_divider: Option<usize> = None;
+        let mut dragging_settings_sb: Option<SidebarScrollDrag> = None;
+        let mut dragging_generic_sb: Option<SidebarScrollDrag> = None;
+        let mut last_click_time = std::time::Instant::now();
+        let mut last_click_pos = (0u16, 0u16);
+        let mut mouse_text_drag = false;
+        let mut folder_picker: Option<FolderPickerState> = None;
+        let mut quit_confirm = false;
+        let mut close_tab_confirm = false;
+        let mut cmd_sel: Option<(usize, usize)> = None;
+        let mut cmd_dragging = false;
+        let mut should_quit = false;
+        let mut explorer_drag_src: Option<usize> = None;
+        let mut explorer_drag_active: Option<(usize, Option<usize>)> = None;
+        let mut tab_drag_start: Option<(u16, u16)> = None;
+        let mut tab_dragging = false;
+        let hover_link_rects: Vec<(u16, u16, u16, u16, String)> = Vec::new();
+        let mut hover_selecting = false;
+        let mut fr_input_dragging = false;
+        handle_mouse(
+            ev,
+            sidebar,
+            engine,
+            terminal_size,
+            sidebar_width,
+            &mut dragging_sidebar,
+            &mut dragging_scrollbar,
+            dragging_sidebar_search,
+            &mut dragging_debug_sb,
+            &mut dragging_terminal_sb,
+            &mut debug_output_scroll,
+            &mut dragging_debug_output_sb,
+            &mut dragging_terminal_resize,
+            &mut dragging_terminal_split,
+            &mut dragging_group_divider,
+            &mut dragging_settings_sb,
+            &mut dragging_generic_sb,
+            None, // last_layout
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut mouse_text_drag,
+            &mut folder_picker,
+            &mut quit_confirm,
+            &mut close_tab_confirm,
+            &mut cmd_sel,
+            &mut cmd_dragging,
+            &mut should_quit,
+            &mut explorer_drag_src,
+            &mut explorer_drag_active,
+            &mut tab_drag_start,
+            &mut tab_dragging,
+            &hover_link_rects,
+            None, // hover_popup_rect
+            None, // editor_hover_popup_rect
+            &[],  // editor_hover_link_rects
+            &mut hover_selecting,
+            &mut fr_input_dragging,
+        )
+    }
+
+    /// The search-panel scrollbar thumb drag must continue tracking the cursor
+    /// even after it leaves the sidebar and enters the editor column, ending
+    /// only on mouse-up.
+    ///
+    /// Layout (no menu bar):
+    ///   activity bar width  = 3
+    ///   sidebar width       = 30
+    ///   sb_col (scrollbar)  = 3 + 30 - 1 = 32
+    ///   editor_left         = 3 + 30 + 1 = 34
+    ///   term height         = 30
+    ///   results_height      = 30 - 0 - 5 = 25
+    ///   total_display       = 30  (needs scrolling because 30 > 25)
+    ///   thumb_size          = 25*25/30 = 20
+    ///   max_thumb_top       = 25 - 20 = 5
+    ///   max_scroll          = 30 - 25 = 5
+    #[test]
+    fn test_search_scrollbar_drag_continues_into_editor() {
+        const TERM_W: u16 = 80;
+        const TERM_H: u16 = 30;
+        const SIDEBAR_W: u16 = 30;
+        // ACTIVITY_BAR_WIDTH = 3 (matches the const in mod.rs)
+        const AB_W: u16 = 3;
+        const SB_COL: u16 = AB_W + SIDEBAR_W - 1; // = 32
+        const EDITOR_COL: u16 = AB_W + SIDEBAR_W + 1; // = 34 (past separator)
+
+        let terminal_size = Some(Size {
+            width: TERM_W,
+            height: TERM_H,
+        });
+
+        let mut engine = test_engine();
+        let mut sidebar = search_sidebar();
+
+        // Populate project_search_results with enough results to require scrolling.
+        // 2 files × 14 matches each → 2 file-headers + 28 match rows = 30 display rows.
+        // results_height = 25, so scrolling is needed (30 > 25).
+        let results: Vec<crate::core::ProjectMatch> = (0..2)
+            .flat_map(|f| {
+                (0..14usize).map(move |i| crate::core::ProjectMatch {
+                    file: std::path::PathBuf::from(format!("/tmp/file{f}.rs")),
+                    line: i,
+                    col: 0,
+                    line_text: format!("match {i}"),
+                })
+            })
+            .collect();
+        engine.project_search_results = results;
+
+        let mut dragging_sidebar_search: Option<SidebarScrollDrag> = None;
+
+        // ── Phase 1: mouse-down on the scrollbar thumb (row 5 = first track row) ──
+        // With scroll_top=0 the thumb is at the top of the track, so clicking
+        // the first track row lands exactly on the thumb (thumb_offset = 0).
+        let down_ev = mouse_ev(MouseEventKind::Down(MouseButton::Left), SB_COL, 5);
+        run_mouse(
+            down_ev,
+            &mut sidebar,
+            &mut engine,
+            &terminal_size,
+            SIDEBAR_W,
+            &mut dragging_sidebar_search,
+        );
+
+        // The drag state must be armed after mouse-down on the scrollbar.
+        assert!(
+            dragging_sidebar_search.is_some(),
+            "drag state should be armed after thumb mouse-down"
+        );
+
+        // ── Phase 2: mouse-drag into the editor column ──
+        // col = EDITOR_COL (34) is well past the sidebar boundary (33).
+        // row = 15 → raw_thumb_top = 15 - 5 - 0 = 10 → clamped to max_thumb_top=5
+        // → new_scroll = (5 * 5) / 5 = 5.
+        let drag_ev = mouse_ev(MouseEventKind::Drag(MouseButton::Left), EDITOR_COL, 15);
+        run_mouse(
+            drag_ev,
+            &mut sidebar,
+            &mut engine,
+            &terminal_size,
+            SIDEBAR_W,
+            &mut dragging_sidebar_search,
+        );
+
+        // Scroll must have advanced — the drag continued despite cursor leaving panel.
+        assert!(
+            sidebar.search_scroll_top > 0,
+            "search_scroll_top should update when drag enters editor area, got {}",
+            sidebar.search_scroll_top
+        );
+
+        // The drag state must still be active (ended only by mouse-up, not by position).
+        assert!(
+            dragging_sidebar_search.is_some(),
+            "drag state must remain active while mouse button is held"
+        );
+
+        // ── Phase 3: mouse-up clears the drag state ──
+        let up_ev = mouse_ev(MouseEventKind::Up(MouseButton::Left), EDITOR_COL, 15);
+        run_mouse(
+            up_ev,
+            &mut sidebar,
+            &mut engine,
+            &terminal_size,
+            SIDEBAR_W,
+            &mut dragging_sidebar_search,
+        );
+
+        assert!(
+            dragging_sidebar_search.is_none(),
+            "drag state should be cleared on mouse-up"
+        );
+    }
 }
