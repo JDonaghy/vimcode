@@ -1,5 +1,11 @@
 use super::*;
 
+/// Stable `quadraui::WidgetId` strings for the SC action-button toolbar,
+/// in button-index order: 0=Commit, 1=Push, 2=Pull, 3=Sync. Shared by the
+/// `render::sc_button_toolbar` adapter and the click/hover hit-test so the
+/// id↔index mapping has a single source of truth (#505).
+pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:sync"];
+
 pub enum ScKeyResult {
     Consumed,
     Unfocused,
@@ -1172,20 +1178,27 @@ impl Engine {
         }
     }
 
-    /// Compute which SC button (0=Commit, 1=Push, 2=Pull, 3=Sync) was
-    /// clicked given a relative x position and total button-row width.
-    /// Returns `None` if the position is outside the row.
-    pub fn sc_button_hit_test(rel_x: f64, total_width: f64) -> Option<usize> {
-        if rel_x < 0.0 || rel_x >= total_width || total_width <= 0.0 {
-            return None;
+    /// Stable `quadraui::WidgetId` for SC action button `idx`
+    /// (0=Commit, 1=Push, 2=Pull, 3=Sync), or `None` if out of range.
+    pub fn sc_button_id(idx: usize) -> Option<quadraui::WidgetId> {
+        SC_BUTTON_IDS.get(idx).map(|s| quadraui::WidgetId::new(*s))
+    }
+
+    /// Inverse of [`Self::sc_button_id`] — map a toolbar `WidgetId` back to
+    /// its button index.
+    pub fn sc_button_index(id: &quadraui::WidgetId) -> Option<usize> {
+        SC_BUTTON_IDS.iter().position(|s| *s == id.as_str())
+    }
+
+    /// Resolve which SC button (if any) sits under absolute point `(x, y)`,
+    /// using the `quadraui::Toolbar` layout cached at paint time (#505).
+    /// Returns `None` for clicks in the bar's empty gutter or off the bar.
+    pub fn sc_button_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let layout = self.sc_button_layout.borrow();
+        match layout.as_ref()?.hit_test(x, y) {
+            quadraui::ToolbarHit::Button(id) => Self::sc_button_index(&id),
+            quadraui::ToolbarHit::Empty => None,
         }
-        let commit_w = total_width / 2.0;
-        Some(if rel_x < commit_w {
-            0
-        } else {
-            let icon_w = (total_width - commit_w) / 3.0;
-            ((1.0 + (rel_x - commit_w) / icon_w) as usize).min(3)
-        })
     }
 
     /// Read the active section index and selected item index from the

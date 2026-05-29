@@ -1649,9 +1649,7 @@ pub(super) fn handle_mouse(
             let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
             let btn_row = 1 + commit_rows + 1; // header + commit + pad_above
             if sidebar_row == btn_row {
-                let rel_col = col.saturating_sub(ab_width);
-                engine.sc_button_hovered =
-                    Engine::sc_button_hit_test(rel_col as f64, sidebar_width as f64);
+                engine.sc_button_hovered = engine.sc_button_hit(col as f32, row as f32);
             } else {
                 engine.sc_button_hovered = None;
                 // SC item hover dwell tracking (sections area).
@@ -2386,8 +2384,7 @@ pub(super) fn handle_mouse(
                 engine.sc_commit_cursor = engine.sc_commit_message.len();
             } else if sidebar_row == btn_row {
                 engine.sc_commit_input_active = false;
-                let rel_col = col.saturating_sub(ab_width) as f64;
-                if let Some(idx) = Engine::sc_button_hit_test(rel_col, sidebar_width as f64) {
+                if let Some(idx) = engine.sc_button_hit(col as f32, row as f32) {
                     engine.sc_activate_button(idx);
                 }
             } else if sidebar_row >= section_start {

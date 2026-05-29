@@ -6428,6 +6428,66 @@ fn to_q_color(c: Color) -> quadraui::Color {
 /// Row order mirrors `render_source_control()` in the TUI so `sc.selected`
 /// (a flat row index within the sections area) maps one-to-one onto the
 /// returned `TreeView.rows`.
+/// Build the Source Control action-button row as a `quadraui::Toolbar`
+/// (#505). Commit carries its label + `(c)` key hint and is disabled while
+/// the commit message is empty; Push/Pull/Sync are icon-only. Button ids
+/// come from [`crate::core::engine::SC_BUTTON_IDS`] so click dispatch can
+/// map the hit-test result back to a button index. Both backends call this
+/// and hand the result to `Backend::draw_toolbar`.
+pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
+    use crate::core::engine::SC_BUTTON_IDS;
+    use crate::icons;
+    use quadraui::{Toolbar, ToolbarButton, WidgetId};
+
+    let action = |idx: usize, label: &str, icon: &str, key_hint: Option<&str>, enabled: bool| {
+        ToolbarButton::Action {
+            id: WidgetId::new(SC_BUTTON_IDS[idx]),
+            label: label.to_string(),
+            icon: Some(icon.to_string()),
+            key_hint: key_hint.map(|s| s.to_string()),
+            enabled,
+            is_active: false,
+            tooltip: String::new(),
+        }
+    };
+
+    let commit_enabled = !sc.commit_message.trim().is_empty();
+    Toolbar {
+        id: WidgetId::new("sc:buttons"),
+        bg: None,
+        buttons: vec![
+            action(
+                0,
+                "Commit",
+                icons::GIT_COMMIT.s(),
+                Some("c"),
+                commit_enabled,
+            ),
+            action(1, "", icons::GIT_PUSH.s(), None, true),
+            action(2, "", icons::GIT_PULL.s(), None, true),
+            action(3, "", icons::GIT_SYNC.s(), None, true),
+        ],
+    }
+}
+
+/// Draw the SC action-button toolbar through backend `b` and cache its
+/// layout on `engine` for click/hover dispatch (#505). Both backends call
+/// this inside their frame scope; the only per-backend input is `rect`
+/// (cell units for TUI, pixels for GTK). Keyboard focus → pressed_id,
+/// mouse hover → hovered_id.
+pub fn draw_sc_button_toolbar(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    sc: &SourceControlData,
+    rect: quadraui::Rect,
+) {
+    let bar = sc_button_toolbar(sc);
+    let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
+    let pressed = sc.button_focused.and_then(Engine::sc_button_id);
+    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
+    engine.sc_button_layout.replace(Some(layout));
+}
+
 pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> quadraui::TreeView {
     use quadraui::{
         Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
@@ -12631,6 +12691,121 @@ pub fn matches_key_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_sc_data() -> SourceControlData {
+        SourceControlData {
+            branch: "main".into(),
+            ahead: 0,
+            behind: 0,
+            staged: vec![],
+            unstaged: vec![],
+            worktrees: vec![],
+            log: vec![],
+            sections_expanded: [true; 4],
+            selected: 0,
+            has_focus: false,
+            commit_message: String::new(),
+            commit_cursor: 0,
+            commit_input_active: false,
+            button_focused: None,
+            button_hovered: None,
+            branch_picker: None,
+            help_open: false,
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_ids_and_shape() {
+        use crate::core::engine::SC_BUTTON_IDS;
+        use quadraui::ToolbarButton;
+
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        assert_eq!(bar.buttons.len(), 4);
+
+        // Ids appear in button-index order and match the shared constant.
+        for (i, btn) in bar.buttons.iter().enumerate() {
+            match btn {
+                ToolbarButton::Action { id, label, .. } => {
+                    assert_eq!(id.as_str(), SC_BUTTON_IDS[i]);
+                    // Commit carries a label; Push/Pull/Sync are icon-only.
+                    if i == 0 {
+                        assert_eq!(label, "Commit");
+                    } else {
+                        assert!(label.is_empty());
+                    }
+                }
+                other => panic!("expected Action, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_commit_enabled_tracks_message() {
+        use quadraui::ToolbarButton;
+
+        let commit_enabled = |sc: &SourceControlData| match &sc_button_toolbar(sc).buttons[0] {
+            ToolbarButton::Action { enabled, .. } => *enabled,
+            _ => panic!("commit button missing"),
+        };
+
+        let mut sc = empty_sc_data();
+        assert!(!commit_enabled(&sc), "empty message → Commit disabled");
+
+        sc.commit_message = "   ".into();
+        assert!(!commit_enabled(&sc), "whitespace-only message → disabled");
+
+        sc.commit_message = "feat: x".into();
+        assert!(commit_enabled(&sc), "non-empty message → Commit enabled");
+    }
+
+    #[test]
+    fn test_sc_button_id_index_round_trip() {
+        use crate::core::engine::Engine;
+        for idx in 0..4 {
+            let id = Engine::sc_button_id(idx).expect("id for valid index");
+            assert_eq!(Engine::sc_button_index(&id), Some(idx));
+        }
+        assert!(Engine::sc_button_id(4).is_none());
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_hit_test_resolves_index() {
+        use crate::core::engine::Engine;
+        use quadraui::ToolbarHit;
+
+        // Lay the toolbar out the way the TUI backend does, then prove a
+        // click inside each button's bounds maps back to its index.
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        let area = ratatui::layout::Rect::new(0, 5, 60, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Push is button index 1 and is enabled (icon-only).
+        let push = &layout.visible_items[1];
+        let hit = layout.hit_test(push.bounds.x + 0.5, push.bounds.y);
+        match hit {
+            ToolbarHit::Button(id) => assert_eq!(Engine::sc_button_index(&id), Some(1)),
+            other => panic!("expected Button hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_disabled_commit_not_clickable() {
+        use quadraui::ToolbarHit;
+
+        // Empty message → Commit disabled → its slot hit-tests as Empty.
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        let area = ratatui::layout::Rect::new(0, 0, 60, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let commit = &layout.visible_items[0];
+        assert!(!commit.clickable, "disabled Commit must not be clickable");
+        assert_eq!(
+            layout.hit_test(commit.bounds.x + 0.5, commit.bounds.y),
+            ToolbarHit::Empty
+        );
+    }
 
     #[test]
     fn test_ext_panel_to_tree_view_shape() {

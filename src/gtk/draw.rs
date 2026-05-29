@@ -2774,7 +2774,7 @@ pub(super) fn draw_source_control_panel(
         y_commit += commit_h;
     }
 
-    // ── Action buttons (with padding above and below) ──────────────────────
+    // ── Action buttons via quadraui::Toolbar (#505) ────────────────────────
     {
         let btn_pad = gap; // same gap as after header
         let btn_y_base = y_commit + btn_pad;
@@ -2783,63 +2783,15 @@ pub(super) fn draw_source_control_panel(
         let btn_x = x + margin;
         let btn_w = w - margin * 2.0;
 
-        // Commit gets ~50% of the width (with label text).
-        // Push / Pull / Sync get equal shares of the remaining width, icon only.
-        let commit_w = btn_w / 2.0;
-        let remain_w = btn_w - commit_w;
-        let icon_w = remain_w / 3.0;
-
-        // Button background color (slightly contrasting).
-        let (btn_bg_r, btn_bg_g, btn_bg_b) = theme.status_bg.to_cairo();
-        // Hover: lighten the button bg slightly.
-        let lighten = |c: f64| (c + 0.08).min(1.0);
-        let (hover_bg_r, hover_bg_g, hover_bg_b) =
-            (lighten(btn_bg_r), lighten(btn_bg_g), lighten(btn_bg_b));
-
-        // Helper: fill and label one button segment.
-        let draw_btn = |bx: f64, seg_w: f64, text: &str, focused: bool, hovered: bool| {
-            let (fill_r, fill_g, fill_b) = if focused {
-                (hdr_r, hdr_g, hdr_b)
-            } else if hovered {
-                (hover_bg_r, hover_bg_g, hover_bg_b)
-            } else {
-                (btn_bg_r, btn_bg_g, btn_bg_b)
-            };
-            cr.set_source_rgb(fill_r, fill_g, fill_b);
-            cr.rectangle(bx, btn_y_base, seg_w, btn_h);
-            cr.fill().ok();
-            cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-            layout.set_text(text);
-            let (_, lh_btn) = layout.pixel_size();
-            cr.move_to(bx + 2.0, btn_y_base + (btn_h - lh_btn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-        };
-
-        let commit_lbl = format!(" {} Commit", icons::GIT_COMMIT.nerd);
-        let push_lbl = format!(" {}", icons::GIT_PUSH.nerd);
-        let pull_lbl = format!(" {}", icons::GIT_PULL.nerd);
-        let sync_lbl = format!(" {}", icons::GIT_SYNC.nerd);
-        for (i, (bx, bw, label)) in [
-            (btn_x, commit_w, commit_lbl.as_str()),
-            (btn_x + commit_w, icon_w, push_lbl.as_str()),
-            (btn_x + commit_w + icon_w, icon_w, pull_lbl.as_str()),
-            (
-                btn_x + commit_w + icon_w * 2.0,
-                btn_w - (commit_w + icon_w * 2.0),
-                sync_lbl.as_str(),
-            ),
-        ]
-        .iter()
-        .enumerate()
-        {
-            draw_btn(
-                *bx,
-                *bw,
-                label,
-                sc.button_focused == Some(i),
-                sc.button_hovered == Some(i),
-            );
-        }
+        // Shared builder paints both backends and caches the layout for
+        // click/hover hit-testing.
+        let btn_rect =
+            quadraui::Rect::new(btn_x as f32, btn_y_base as f32, btn_w as f32, btn_h as f32);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            render::draw_sc_button_toolbar(b, engine, sc, btn_rect);
+        });
 
         y_commit = btn_y_base + btn_h + btn_pad;
     }

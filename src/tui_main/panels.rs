@@ -867,61 +867,13 @@ pub(super) fn render_source_control(
             set_cell(buf, px, pad_below, ' ', dim_fg, row_bg);
         }
 
-        // Button background — use a distinct bg so they look like buttons.
-        let btn_bg = hdr_bg; // slightly lighter than panel_bg
-        let hover_bg = match hdr_bg {
-            RColor::Rgb(r, g, b) => RColor::Rgb(
-                r.saturating_add(20),
-                g.saturating_add(20),
-                b.saturating_add(20),
-            ),
-            other => other,
-        };
-
-        // Commit gets ~50% of the width (with label text).
-        // Push / Pull / Sync get equal shares of the remaining width, icon only.
-        let commit_w = (area.width / 2).max(1);
-        let remain = area.width.saturating_sub(commit_w);
-        let icon_w = (remain / 3).max(1);
-
-        // (x_offset_from_area_x, segment_width, display_text, button_index)
-        let buttons: [(u16, u16, &str, usize); 4] = [
-            (0, commit_w, " \u{e729} Commit", 0),
-            (commit_w, icon_w, " \u{f093}", 1),
-            (commit_w + icon_w, icon_w, " \u{f019}", 2),
-            (
-                commit_w + icon_w * 2,
-                area.width.saturating_sub(commit_w + icon_w * 2),
-                " \u{f021}",
-                3,
-            ),
-        ];
-        for (x_off, seg_w, text, btn_idx) in &buttons {
-            let bx = area.x + x_off;
-            let seg_end = if *btn_idx == 3 {
-                area.x + area.width
-            } else {
-                (bx + seg_w).min(area.x + area.width)
-            };
-            let is_focused = sc.button_focused == Some(*btn_idx);
-            let is_hovered = sc.button_hovered == Some(*btn_idx);
-            let (fg, bg) = if is_focused {
-                (hdr_bg, hdr_fg) // inverted = highlighted
-            } else if is_hovered {
-                (hdr_fg, hover_bg)
-            } else {
-                (hdr_fg, btn_bg)
-            };
-            for px in bx..seg_end {
-                set_cell(buf, px, btn_y, ' ', fg, bg);
-            }
-            for (j, ch) in text.chars().enumerate() {
-                let cx = bx + j as u16;
-                if cx < seg_end {
-                    set_cell(buf, cx, btn_y, ch, fg, bg);
-                }
-            }
-        }
+        // Action buttons via quadraui::Toolbar (#505) — shared builder paints
+        // both backends and caches the layout for click/hover hit-testing.
+        let btn_rect = quadraui::Rect::new(area.x as f32, btn_y as f32, area.width as f32, 1.0);
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            render::draw_sc_button_toolbar(b, engine, sc, btn_rect);
+        });
     }
 
     let section_start_y = area.y + 4 + commit_rows; // +2 for padding rows, +1 for btn row, +1 for next

@@ -8102,14 +8102,8 @@ impl App {
                         engine.sc_commit_cursor = engine.sc_commit_message.len();
                     } else if y >= btn_top && y < btn_bottom {
                         engine.sc_commit_input_active = false;
-                        if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                            let da_w = da.width() as f64;
-                            let margin = 4.0;
-                            let btn_w = da_w - margin * 2.0;
-                            let rel_x = x_click - margin;
-                            if let Some(idx) = Engine::sc_button_hit_test(rel_x, btn_w) {
-                                engine.sc_activate_button(idx);
-                            }
+                        if let Some(idx) = engine.sc_button_hit(x_click as f32, y as f32) {
+                            engine.sc_activate_button(idx);
                         }
                     } else if y >= section_top {
                         engine.sc_commit_input_active = false;
@@ -8149,14 +8143,8 @@ impl App {
                 let old = engine.sc_button_hovered;
                 if mx < 0.0 || my < btn_top || my >= btn_bottom {
                     engine.sc_button_hovered = None;
-                } else if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    let da_w = da.width() as f64;
-                    let margin = 4.0;
-                    let btn_w = da_w - margin * 2.0;
-                    let rel_x = mx - margin;
-                    engine.sc_button_hovered = Engine::sc_button_hit_test(rel_x, btn_w);
                 } else {
-                    engine.sc_button_hovered = None;
+                    engine.sc_button_hovered = engine.sc_button_hit(mx as f32, my as f32);
                 }
                 if engine.sc_button_hovered != old {
                     drop(engine);
