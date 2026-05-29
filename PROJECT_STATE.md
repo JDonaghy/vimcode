@@ -10,6 +10,8 @@
 
 **Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233) **+ TUI convergence backlog** from Session 388 audit (#477, #478, #479, #480, #481 — #475 closed Session 389). **Session 389 unblocked:** #479 (Settings FormController — Form cursor already exists in quadraui), #480 (partially — TextInput primitive shipped as quadraui#222), #481 (scrollbar + drop overlay — both primitives exist). Remaining quadraui pipeline: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table). **GTK convergence chain:** #447 intermediate step landed (PR #495) → full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4) → #448 (event dispatch → UiEvent) → #449 (click dispatch → FrameHitMap).
 
+**#505 landed (ff-merge `ee502f9`):** SC action-button row migrated to `quadraui::Toolbar` (unblocked by quadraui#257/#259). Both hand-painters (TUI `set_cell` + GTK Cairo/Pango) and the bespoke `sc_button_hit_test` deleted; shared `render::sc_button_toolbar` + `draw_sc_button_toolbar` builder, cached `ToolbarLayout` for click/hover hit-test. Commit button now dims + no-ops when the message is empty. Carved out of #480's four chunks. Follow-ups filed: #509 (adopt `SidebarPanel` to consolidate the SC button-row + sections Y-geometry, recomputed across 4 files) and #510 (debug toolbar → `Toolbar`, replacing the faked `StatusBar`).
+
 ---
 
 Vimcode at 1994+ lib tests passing.
