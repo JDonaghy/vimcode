@@ -1459,3 +1459,51 @@ impl Engine {
         }
     }
 }
+
+/// Stable `quadraui::WidgetId` strings for the debug toolbar buttons,
+/// in `DEBUG_BUTTONS` index order: 0=Continue, 1=Pause, 2=Stop, 3=Restart,
+/// 4=StepOver, 5=StepInto, 6=StepOut. Note: index 4 corresponds to
+/// `DEBUG_BUTTONS[4]` (Step Over) — a `ToolbarButton::Separator` is
+/// inserted between indices 3 and 4 in the built `Toolbar`, so
+/// `DEBUG_BUTTON_IDS` has exactly 7 entries (one per action, not counting
+/// the separator). Shared by `render::debug_toolbar` and the click/hover
+/// hit-test so the id↔index mapping has a single source of truth (#510).
+pub const DEBUG_BUTTON_IDS: [&str; 7] = [
+    "dbg:continue",
+    "dbg:pause",
+    "dbg:stop",
+    "dbg:restart",
+    "dbg:stepover",
+    "dbg:stepin",
+    "dbg:stepout",
+];
+
+impl Engine {
+    // ── Debug toolbar UI helpers ───────────────────────────────────────────────
+
+    /// Stable `quadraui::WidgetId` for debug button `idx`
+    /// (0=Continue … 6=StepOut), or `None` if out of range.
+    pub fn debug_button_id(idx: usize) -> Option<quadraui::WidgetId> {
+        DEBUG_BUTTON_IDS
+            .get(idx)
+            .map(|s| quadraui::WidgetId::new(*s))
+    }
+
+    /// Inverse of [`Self::debug_button_id`] — map a toolbar `WidgetId` back
+    /// to its button index (0–6).
+    pub fn debug_button_index(id: &quadraui::WidgetId) -> Option<usize> {
+        DEBUG_BUTTON_IDS.iter().position(|s| *s == id.as_str())
+    }
+
+    /// Resolve which debug button (if any) sits under absolute point `(x, y)`,
+    /// using the `quadraui::Toolbar` layout cached at paint time (#510).
+    /// Returns `None` for clicks in the bar's empty gutter, off the bar,
+    /// or over a disabled button.
+    pub fn debug_button_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let layout = self.debug_toolbar_layout.borrow();
+        match layout.as_ref()?.hit_test(x, y) {
+            quadraui::ToolbarHit::Button(id) => Self::debug_button_index(&id),
+            quadraui::ToolbarHit::Empty => None,
+        }
+    }
+}

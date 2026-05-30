@@ -2933,6 +2933,14 @@ pub struct Engine {
     pub explorer_viewport_rows: std::cell::Cell<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
+    /// Cached layout of the debug action-button `quadraui::Toolbar` from the
+    /// last paint. Click/hover dispatch reads it verbatim via `hit_test()`
+    /// (#510) — no per-backend button-row arithmetic.
+    pub debug_toolbar_layout: std::cell::RefCell<Option<quadraui::ToolbarLayout>>,
+    /// Which debug button the mouse is hovering over (0–6), or None.
+    pub debug_button_hovered: Option<usize>,
+    /// Which debug button is visually pressed (0–6), or None.
+    pub debug_button_pressed: Option<usize>,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
 
@@ -3751,6 +3759,9 @@ impl Engine {
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             explorer_viewport_rows: std::cell::Cell::new(0),
             debug_toolbar_visible: false,
+            debug_toolbar_layout: std::cell::RefCell::new(None),
+            debug_button_hovered: None,
+            debug_button_pressed: None,
             dap_session_active: false,
             dap_manager: None,
             dap_stopped_thread: None,
@@ -4881,6 +4892,7 @@ pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
 mod accessors;
 mod buffers;
 mod dap_ops;
+pub use dap_ops::DEBUG_BUTTON_IDS;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;

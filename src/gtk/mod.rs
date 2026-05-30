@@ -373,16 +373,10 @@ struct App {
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
-    /// Cached debug toolbar layout from `draw_debug_toolbar`.
-    debug_toolbar_layout: Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
     /// Pixel y-offset where the debug toolbar was last drawn.
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
     debug_toolbar_height: Rc<Cell<f64>>,
-    /// Which debug toolbar button the cursor is over (hit-tested from cached regions).
-    debug_toolbar_hovered_id: Rc<RefCell<Option<quadraui::WidgetId>>>,
-    /// Which debug toolbar button is currently pressed (mouse-down, not yet released).
-    debug_toolbar_pressed_id: Rc<RefCell<Option<quadraui::WidgetId>>>,
     /// Cached menu-dropdown hit regions from the last draw of the
     /// dropdown overlay. Each entry is `(x, y, w, h, action_id)`
     /// where `action_id` is e.g. `menu:7`. Click + motion handlers
@@ -2179,11 +2173,8 @@ impl SimpleComponent for App {
             action_btn_map: action_btn_map_cell.clone(),
             status_segment_map: status_segment_map_cell.clone(),
             cached_screen_layout: Rc::new(RefCell::new(None)),
-            debug_toolbar_layout: Rc::new(RefCell::new(None)),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
-            debug_toolbar_hovered_id: Rc::new(RefCell::new(None)),
-            debug_toolbar_pressed_id: Rc::new(RefCell::new(None)),
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             group_divider_dragging: None,
@@ -3757,11 +3748,8 @@ impl SimpleComponent for App {
         let tab_vis_for_draw = tab_visible_counts_cell.clone();
         let status_seg_for_draw = model.status_segment_map.clone();
         let screen_layout_for_draw = model.cached_screen_layout.clone();
-        let dbg_layout_for_draw = model.debug_toolbar_layout.clone();
         let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
         let dbg_h_for_draw = model.debug_toolbar_height.clone();
-        let dbg_hovered_for_draw = model.debug_toolbar_hovered_id.clone();
-        let dbg_pressed_for_draw = model.debug_toolbar_pressed_id.clone();
         let backend_for_draw = model.backend.clone();
         widgets
             .drawing_area
@@ -3799,12 +3787,9 @@ impl SimpleComponent for App {
                             &tab_vis_for_draw,
                             &status_seg_for_draw,
                             &screen_layout_for_draw,
-                            &dbg_layout_for_draw,
                             &dbg_y_for_draw,
                             &dbg_h_for_draw,
                             &backend_for_draw,
-                            dbg_hovered_for_draw.borrow().as_ref(),
-                            dbg_pressed_for_draw.borrow().as_ref(),
                         );
                     };
 
@@ -5703,23 +5688,20 @@ impl App {
                     }
                 }
 
-                // Debug toolbar hover detection — same pattern as tab_close_hover above.
+                // Debug toolbar hover detection (#510) — use cached ToolbarLayout
+                // on the engine rather than a model-local StatusBarLayout.
                 {
                     let dbg_y = self.debug_toolbar_y_offset.get();
                     let dbg_h = self.debug_toolbar_height.get();
                     let new_hover = if dbg_h > 0.0 && my >= dbg_y && my < dbg_y + dbg_h {
-                        let guard = self.debug_toolbar_layout.borrow();
-                        guard.as_ref().and_then(|l| {
-                            match l.hit_test(mx as f32, (my - dbg_y) as f32) {
-                                quadraui::StatusBarHit::Segment(id) => Some(id),
-                                quadraui::StatusBarHit::Empty => None,
-                            }
-                        })
+                        let engine = self.engine.borrow();
+                        engine.debug_button_hit(mx as f32, my as f32)
                     } else {
                         None
                     };
-                    if new_hover != *self.debug_toolbar_hovered_id.borrow() {
-                        *self.debug_toolbar_hovered_id.borrow_mut() = new_hover;
+                    let old_hover = self.engine.borrow().debug_button_hovered;
+                    if new_hover != old_hover {
+                        self.engine.borrow_mut().debug_button_hovered = new_hover;
                         self.draw_needed.set(true);
                     }
                 }
@@ -6591,30 +6573,18 @@ impl App {
             }
         }
 
-        // Debug toolbar click: resolve via cached StatusBarLayout.
-        // Each region's `id` is `debug:btn:N` — translated to the
-        // action via `render::debug_toolbar_action_index`.
+        // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
             let dbg_h = self.debug_toolbar_height.get();
             if dbg_h > 0.0 && y >= dbg_y && y < dbg_y + dbg_h {
-                *self.debug_toolbar_pressed_id.borrow_mut() =
-                    self.debug_toolbar_hovered_id.borrow().clone();
+                let idx = self.engine.borrow().debug_button_hit(x as f32, y as f32);
+                self.engine.borrow_mut().debug_button_pressed = idx;
                 self.draw_needed.set(true);
-                let guard = self.debug_toolbar_layout.borrow();
-                if let Some(ref bar_layout) = *guard {
-                    let local_x = x as f32;
-                    let local_y = (y - dbg_y) as f32;
-                    if let quadraui::StatusBarHit::Segment(ref id) =
-                        bar_layout.hit_test(local_x, local_y)
-                    {
-                        if let Some(idx) = render::debug_toolbar_action_index(id) {
-                            if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
-                                drop(guard);
-                                let _ = self.engine.borrow_mut().execute_command(btn.action);
-                                return;
-                            }
-                        }
+                if let Some(i) = idx {
+                    if let Some(btn) = render::DEBUG_BUTTONS.get(i) {
+                        let _ = self.engine.borrow_mut().execute_command(btn.action);
+                        return;
                     }
                 }
                 return;
@@ -7101,114 +7071,82 @@ impl App {
                 {
                     let mut engine = self.engine.borrow_mut();
 
-                    // ── Debug toolbar hit-test ────────────────────────────────
-                    let mut toolbar_handled = false;
-                    if engine.debug_toolbar_visible && self.cached_line_height > 0.0 {
-                        // Toolbar is the single row above status(1)+cmd(1).
-                        // It is always at a fixed position; terminal/quickfix/DAP
-                        // panels stack above it, not below it.
-                        let toolbar_y =
-                            height - 2.0 * self.cached_line_height - self.cached_line_height;
-                        if y >= toolbar_y && y < toolbar_y + self.cached_line_height {
-                            let mut cursor_x = 8.0_f64;
-                            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
-                                if idx == 4 {
-                                    cursor_x += 16.0; // visual separator gap
-                                }
-                                let text_len =
-                                    btn.icon.chars().count() + btn.key_hint.chars().count() + 4; // " (hint) "
-                                let btn_w = text_len as f64 * self.cached_char_width;
-                                if x >= cursor_x && x < cursor_x + btn_w {
-                                    let _ = engine.execute_command(btn.action);
-                                    toolbar_handled = true;
-                                    break;
-                                }
-                                cursor_x += btn_w;
-                            }
-                            if !toolbar_handled {
-                                toolbar_handled = true; // click in toolbar row, consume event
-                            }
-                        }
+                    if engine.is_vscode_mode() {
+                        engine.vscode_clear_selection();
                     }
-
-                    if !toolbar_handled {
-                        if engine.is_vscode_mode() {
-                            engine.vscode_clear_selection();
+                    let editor_pl = self.editor_pango_layout(&engine);
+                    let (click_result, engine_action) = {
+                        let layout_ref = self.cached_screen_layout.borrow();
+                        if let Some(ref layout) = *layout_ref {
+                            handle_mouse_click(
+                                &mut engine,
+                                x,
+                                y,
+                                alt,
+                                self.cached_line_height,
+                                self.cached_char_width,
+                                &editor_pl,
+                                layout,
+                                &self.tab_slot_positions.borrow(),
+                                &self.diff_btn_map.borrow(),
+                                &self.split_btn_map.borrow(),
+                                &self.action_btn_map.borrow(),
+                                &self.status_segment_map.borrow(),
+                            )
+                        } else {
+                            (None, None)
                         }
-                        let editor_pl = self.editor_pango_layout(&engine);
-                        let (click_result, engine_action) = {
-                            let layout_ref = self.cached_screen_layout.borrow();
-                            if let Some(ref layout) = *layout_ref {
-                                handle_mouse_click(
-                                    &mut engine,
-                                    x,
-                                    y,
-                                    alt,
-                                    self.cached_line_height,
-                                    self.cached_char_width,
-                                    &editor_pl,
-                                    layout,
-                                    &self.tab_slot_positions.borrow(),
-                                    &self.diff_btn_map.borrow(),
-                                    &self.split_btn_map.borrow(),
-                                    &self.action_btn_map.borrow(),
-                                    &self.status_segment_map.borrow(),
+                    };
+                    match engine_action {
+                        Some(core::engine::EngineAction::ToggleSidebar) => {
+                            drop(engine);
+                            self.sync_sidebar_from_engine();
+                            return;
+                        }
+                        Some(core::engine::EngineAction::OpenTerminal) => {
+                            // Create the terminal tab immediately (not via
+                            // async Msg::ToggleTerminal) so the panel
+                            // appears on this same draw cycle.
+                            let cols = self.terminal_cols();
+                            let rows = engine.session.terminal_panel_rows;
+                            engine.terminal_new_tab(cols, rows);
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        _ => {}
+                    }
+                    match click_result {
+                        Some(true) => {
+                            drop(engine);
+                            sender.input(Msg::ShowCloseTabConfirm);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        Some(false) => {
+                            // Buffer click — fire hooks and reveal file
+                        }
+                        None => {
+                            // Engine-drawn action menu is already opened with the
+                            // correct anchor by click.rs::handle_mouse_click. The
+                            // engine-drawn renderer at draw.rs:906 + click dispatch
+                            // at line ~6022 take over from here (#395).
+                            if engine.context_menu.as_ref().is_some_and(|cm| {
+                                matches!(
+                                    cm.target,
+                                    core::engine::ContextMenuTarget::EditorActionMenu { .. }
                                 )
-                            } else {
-                                (None, None)
-                            }
-                        };
-                        match engine_action {
-                            Some(core::engine::EngineAction::ToggleSidebar) => {
-                                drop(engine);
-                                self.sync_sidebar_from_engine();
-                                return;
-                            }
-                            Some(core::engine::EngineAction::OpenTerminal) => {
-                                // Create the terminal tab immediately (not via
-                                // async Msg::ToggleTerminal) so the panel
-                                // appears on this same draw cycle.
-                                let cols = self.terminal_cols();
-                                let rows = engine.session.terminal_panel_rows;
-                                engine.terminal_new_tab(cols, rows);
+                            }) {
                                 drop(engine);
                                 self.draw_needed.set(true);
                                 return;
                             }
-                            _ => {}
-                        }
-                        match click_result {
-                            Some(true) => {
-                                drop(engine);
-                                sender.input(Msg::ShowCloseTabConfirm);
-                                self.draw_needed.set(true);
-                                return;
-                            }
-                            Some(false) => {
-                                // Buffer click — fire hooks and reveal file
-                            }
-                            None => {
-                                // Engine-drawn action menu is already opened with the
-                                // correct anchor by click.rs::handle_mouse_click. The
-                                // engine-drawn renderer at draw.rs:906 + click dispatch
-                                // at line ~6022 take over from here (#395).
-                                if engine.context_menu.as_ref().is_some_and(|cm| {
-                                    matches!(
-                                        cm.target,
-                                        core::engine::ContextMenuTarget::EditorActionMenu { .. }
-                                    )
-                                }) {
-                                    drop(engine);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                // Tab bar / split button click — skip hooks.
-                                // Record drag start position for tab drag-and-drop.
-                                self.tab_drag_start = Some((x, y));
-                                drop(engine);
-                                self.draw_needed.set(true);
-                                return;
-                            }
+                            // Tab bar / split button click — skip hooks.
+                            // Record drag start position for tab drag-and-drop.
+                            self.tab_drag_start = Some((x, y));
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
                         }
                     }
 
@@ -7578,8 +7516,9 @@ impl App {
     }
 
     fn handle_mouse_up_msg(&mut self) {
-        if self.debug_toolbar_pressed_id.borrow().is_some() {
-            *self.debug_toolbar_pressed_id.borrow_mut() = None;
+        // Clear debug toolbar pressed state (#510).
+        if self.engine.borrow().debug_button_pressed.is_some() {
+            self.engine.borrow_mut().debug_button_pressed = None;
             self.draw_needed.set(true);
         }
 
