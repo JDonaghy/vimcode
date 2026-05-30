@@ -980,7 +980,6 @@ fn event_loop(
     let mut fr_input_dragging: bool = false;
     // Cache of the last rendered layout for mouse hit-testing
     let mut last_layout: Option<render::ScreenLayout> = None;
-    let mut debug_toolbar_interaction = quadraui::StatusBarInteraction::new();
     let mut debug_toolbar_rect = quadraui::Rect::default();
     // Double-click detection state
     let mut last_click_time = Instant::now()
@@ -1182,7 +1181,6 @@ fn event_loop(
                             &mut editor_hover_link_rects,
                             &mut editor_hover_scrollbar,
                             &mut tab_visible_counts,
-                            &debug_toolbar_interaction,
                             &mut debug_toolbar_rect,
                             &mut completion_layout,
                             &mut context_menu_layout,
@@ -1234,7 +1232,6 @@ fn event_loop(
                                     &mut editor_hover_link_rects,
                                     &mut editor_hover_scrollbar,
                                     &mut tab_visible_counts2,
-                                    &debug_toolbar_interaction,
                                     &mut debug_toolbar_rect,
                                     &mut completion_layout,
                                     &mut context_menu_layout,
@@ -1553,26 +1550,50 @@ fn event_loop(
             }
         }
 
-        // ── Debug toolbar hover/press via StatusBarInteraction ──
-        // #456: skip when a context menu is open.
+        // ── Debug toolbar hover/press via ToolbarLayout hit-test (#510) ──
+        // Skip when a context menu is open.
         if engine.context_menu.is_none()
             && engine.debug_toolbar_visible
             && debug_toolbar_rect.width > 0.0
         {
-            match debug_toolbar_interaction.handle(&ui_event, debug_toolbar_rect) {
-                quadraui::StatusBarAction::Clicked(id) => {
-                    if let Some(idx) = render::debug_toolbar_action_index(&id) {
-                        if let Some(btn) = render::DEBUG_BUTTONS.get(idx) {
-                            let _ = engine.execute_command(btn.action);
+            match &ui_event {
+                quadraui::UiEvent::MouseDown { position, .. } => {
+                    let p = *position;
+                    if p.y >= debug_toolbar_rect.y
+                        && p.y < debug_toolbar_rect.y + debug_toolbar_rect.height
+                    {
+                        let idx = engine.debug_button_hit(p.x, p.y);
+                        engine.debug_button_pressed = idx;
+                        if let Some(i) = idx {
+                            if let Some(btn) = render::DEBUG_BUTTONS.get(i) {
+                                let _ = engine.execute_command(btn.action);
+                            }
                         }
+                        needs_redraw = true;
+                        continue;
                     }
-                    needs_redraw = true;
-                    continue;
                 }
-                quadraui::StatusBarAction::Redraw => {
-                    needs_redraw = true;
+                quadraui::UiEvent::MouseMoved { position, .. } => {
+                    let p = *position;
+                    let new_hover = if p.y >= debug_toolbar_rect.y
+                        && p.y < debug_toolbar_rect.y + debug_toolbar_rect.height
+                    {
+                        engine.debug_button_hit(p.x, p.y)
+                    } else {
+                        None
+                    };
+                    if engine.debug_button_hovered != new_hover {
+                        engine.debug_button_hovered = new_hover;
+                        needs_redraw = true;
+                    }
                 }
-                quadraui::StatusBarAction::Ignored => {}
+                quadraui::UiEvent::MouseUp { .. } => {
+                    if engine.debug_button_pressed.is_some() {
+                        engine.debug_button_pressed = None;
+                        needs_redraw = true;
+                    }
+                }
+                _ => {}
             }
         }
 

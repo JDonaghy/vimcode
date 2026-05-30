@@ -1942,81 +1942,114 @@ pub struct DebugToolbarData {
     pub session_active: bool,
 }
 
-/// Convert a `DebugToolbarData` into a `quadraui::StatusBar`. Each
-/// debug button becomes two adjacent left-segments — the icon (in
-/// the active fg) and the parenthesised key hint (dimmed) — sharing
-/// a `debug:btn:N` action_id so a click on either resolves to the
-/// same button. A non-clickable separator segment (`"│ "` in dim_fg)
-/// sits between buttons 3 and 4.
+/// Build the debug action-button toolbar as a `quadraui::Toolbar` (#510).
+/// Button ids come from [`crate::core::engine::DEBUG_BUTTON_IDS`] so
+/// click dispatch can map the hit-test result back to a button index and
+/// action string. A `ToolbarButton::Separator` is inserted between the
+/// Restart (index 3) and Step Over (index 4) buttons.
 ///
-/// `bg` is the toolbar background; the rasteriser auto-fills with the
-/// first segment's bg for any cells not covered by an explicit segment.
-pub fn debug_toolbar_to_quadraui_status_bar(
-    toolbar: &DebugToolbarData,
-    theme: &Theme,
-) -> quadraui::StatusBar {
-    let bg = to_quadraui_color(theme.status_bg);
-    let primary_fg = if toolbar.session_active {
-        to_quadraui_color(theme.status_fg)
-    } else {
-        to_quadraui_color(theme.line_number_fg)
-    };
-    let dim_fg = to_quadraui_color(theme.line_number_fg);
+/// `enabled` state follows the per-button DAP rules:
+/// - Continue / Step Over / Step Into / Step Out: `dap_session_active && dap_stopped_thread.is_some()`
+/// - Pause: `dap_session_active && dap_stopped_thread.is_none()`
+/// - Stop / Restart: `dap_session_active`
+///
+/// Both backends call this and hand the result to `Backend::draw_toolbar`.
+pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
+    use crate::core::engine::DEBUG_BUTTON_IDS;
+    use crate::icons;
+    use quadraui::{Toolbar, ToolbarButton, WidgetId};
 
-    let mut left: Vec<quadraui::StatusBarSegment> = Vec::new();
+    let session = engine.dap_session_active;
+    let stopped = engine.dap_stopped_thread.is_some();
 
-    // 1-cell leading pad so the first button doesn't touch the left edge.
-    left.push(quadraui::StatusBarSegment {
-        text: " ".to_string(),
-        fg: primary_fg,
-        bg,
-        bold: false,
-        action_id: None,
-    });
-
-    for (idx, btn) in toolbar.buttons.iter().enumerate() {
-        // Insert "│ " between buttons 3 and 4 (matches legacy grouping
-        // of step controls vs other actions).
-        if idx == 4 {
-            left.push(quadraui::StatusBarSegment {
-                text: "\u{2502} ".to_string(),
-                fg: dim_fg,
-                bg,
-                bold: false,
-                action_id: None,
-            });
+    let action = |idx: usize, label: &str, icon: &str, key_hint: Option<&str>, enabled: bool| {
+        ToolbarButton::Action {
+            id: WidgetId::new(DEBUG_BUTTON_IDS[idx]),
+            label: label.to_string(),
+            icon: Some(icon.to_string()),
+            key_hint: key_hint.map(|s| s.to_string()),
+            enabled,
+            is_active: false,
+            tooltip: String::new(),
         }
-        let action_id = quadraui::WidgetId::new(format!("debug:btn:{idx}"));
-        // Icon segment — primary colour.
-        left.push(quadraui::StatusBarSegment {
-            text: btn.icon.to_string(),
-            fg: primary_fg,
-            bg,
-            bold: false,
-            action_id: Some(action_id.clone()),
-        });
-        // Parenthesised key hint + trailing space — dimmed, same action.
-        left.push(quadraui::StatusBarSegment {
-            text: format!("({}) ", btn.key_hint),
-            fg: dim_fg,
-            bg,
-            bold: false,
-            action_id: Some(action_id),
-        });
-    }
+    };
 
-    quadraui::StatusBar {
-        id: quadraui::WidgetId::new("debug_toolbar"),
-        left_segments: left,
-        right_segments: Vec::new(),
+    Toolbar {
+        id: WidgetId::new("debug:toolbar"),
+        bg: None,
+        buttons: vec![
+            // 0: Continue — enabled when session active and stopped
+            action(
+                0,
+                "Continue",
+                icons::DBG_CONTINUE.fallback,
+                Some("F5"),
+                session && stopped,
+            ),
+            // 1: Pause — enabled when session active and running (not stopped)
+            action(
+                1,
+                "Pause",
+                icons::DBG_PAUSE.fallback,
+                Some("F6"),
+                session && !stopped,
+            ),
+            // 2: Stop — enabled when session active
+            action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
+            // 3: Restart — enabled when session active
+            action(
+                3,
+                "Restart",
+                icons::DBG_RESTART.fallback,
+                Some("^⇧F5"),
+                session,
+            ),
+            // Separator between restart and step controls
+            ToolbarButton::Separator,
+            // 4: Step Over — enabled when session active and stopped
+            action(
+                4,
+                "Step Over",
+                icons::DBG_STEP_OVER.fallback,
+                Some("F10"),
+                session && stopped,
+            ),
+            // 5: Step Into — enabled when session active and stopped
+            action(
+                5,
+                "Step Into",
+                icons::DBG_RESTART.fallback,
+                Some("F11"),
+                session && stopped,
+            ),
+            // 6: Step Out — enabled when session active and stopped
+            action(
+                6,
+                "Step Out",
+                icons::DBG_STEP_OUT.fallback,
+                Some("⇧F11"),
+                session && stopped,
+            ),
+        ],
     }
 }
 
-/// Resolve a `WidgetId` produced by `debug_toolbar_to_quadraui_status_bar`
-/// back to a `DEBUG_BUTTONS` index. Returns `None` if the id doesn't
-/// match the `debug:btn:N` pattern.
-pub fn debug_toolbar_action_index(id: &quadraui::WidgetId) -> Option<usize> {
-    id.as_str().strip_prefix("debug:btn:")?.parse().ok()
+/// Draw the debug action-button toolbar through backend `b` and cache its
+/// layout on `engine` for click/hover dispatch (#510). Both backends call
+/// this inside their frame scope; the only per-backend input is `rect`
+/// (cell units for TUI, pixels for GTK). Mouse hover → `debug_button_hovered`,
+/// visual press → `debug_button_pressed`, both read from the engine.
+pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: quadraui::Rect) {
+    use crate::core::engine::Engine;
+    let bar = debug_toolbar(engine);
+    let hovered = engine
+        .debug_button_hovered
+        .and_then(Engine::debug_button_id);
+    let pressed = engine
+        .debug_button_pressed
+        .and_then(Engine::debug_button_id);
+    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
+    engine.debug_toolbar_layout.replace(Some(layout));
 }
 
 /// Build two `StatusBar` rows for the debug sidebar chrome:
@@ -12805,6 +12838,193 @@ mod tests {
             layout.hit_test(commit.bounds.x + 0.5, commit.bounds.y),
             ToolbarHit::Empty
         );
+    }
+
+    // ─── Debug toolbar tests (#510) ──────────────────────────────────────────
+
+    /// Helper: return an engine with DAP session state as specified.
+    fn engine_with_dap(session_active: bool, stopped_thread: Option<u64>) -> Engine {
+        let mut e = Engine::new();
+        e.debug_toolbar_visible = true;
+        e.dap_session_active = session_active;
+        e.dap_stopped_thread = stopped_thread;
+        e
+    }
+
+    #[test]
+    fn debug_toolbar_button_ids_round_trip() {
+        use crate::core::engine::{Engine, DEBUG_BUTTON_IDS};
+        use quadraui::ToolbarButton;
+
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+
+        // 8 entries: 7 action buttons + 1 separator after index 3.
+        assert_eq!(bar.buttons.len(), 8);
+
+        let mut action_idx = 0usize;
+        for btn in &bar.buttons {
+            match btn {
+                ToolbarButton::Action { id, .. } => {
+                    // id matches DEBUG_BUTTON_IDS[action_idx]
+                    assert_eq!(
+                        id.as_str(),
+                        DEBUG_BUTTON_IDS[action_idx],
+                        "button {action_idx} id mismatch"
+                    );
+                    // round-trip: id → index → same action_idx
+                    let idx = Engine::debug_button_index(id).expect("index for valid id");
+                    assert_eq!(idx, action_idx);
+                    action_idx += 1;
+                }
+                ToolbarButton::Separator => {
+                    // separator sits between button 3 (Restart) and button 4 (Step Over)
+                    assert_eq!(action_idx, 4, "separator must come after index 3");
+                }
+                ToolbarButton::Label { .. } => {
+                    panic!("unexpected Label variant in debug toolbar");
+                }
+            }
+        }
+        assert_eq!(action_idx, 7, "expected 7 action buttons");
+    }
+
+    #[test]
+    fn debug_toolbar_disabled_when_no_session() {
+        use quadraui::ToolbarButton;
+
+        let engine = engine_with_dap(false, None);
+        let bar = debug_toolbar(&engine);
+        for btn in &bar.buttons {
+            if let ToolbarButton::Action { enabled, label, .. } = btn {
+                assert!(
+                    !enabled,
+                    "button '{label}' should be disabled with no session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debug_toolbar_steps_disabled_while_running() {
+        use quadraui::ToolbarButton;
+
+        // Session active, not stopped (running).
+        let engine = engine_with_dap(true, None);
+        let bar = debug_toolbar(&engine);
+
+        let get_enabled = |label: &str| {
+            bar.buttons.iter().find_map(|b| {
+                if let ToolbarButton::Action {
+                    enabled, label: l, ..
+                } = b
+                {
+                    if l == label {
+                        return Some(*enabled);
+                    }
+                }
+                None
+            })
+        };
+
+        // Running → Continue/Step* disabled, Pause enabled, Stop/Restart enabled.
+        assert_eq!(get_enabled("Continue"), Some(false));
+        assert_eq!(get_enabled("Step Over"), Some(false));
+        assert_eq!(get_enabled("Step Into"), Some(false));
+        assert_eq!(get_enabled("Step Out"), Some(false));
+        assert_eq!(get_enabled("Pause"), Some(true));
+        assert_eq!(get_enabled("Stop"), Some(true));
+        assert_eq!(get_enabled("Restart"), Some(true));
+    }
+
+    #[test]
+    fn debug_toolbar_steps_enabled_when_stopped() {
+        use quadraui::ToolbarButton;
+
+        // Session active, stopped at thread 1.
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+
+        let get_enabled = |label: &str| {
+            bar.buttons.iter().find_map(|b| {
+                if let ToolbarButton::Action {
+                    enabled, label: l, ..
+                } = b
+                {
+                    if l == label {
+                        return Some(*enabled);
+                    }
+                }
+                None
+            })
+        };
+
+        // Stopped → Continue/Step* enabled, Pause disabled, Stop/Restart enabled.
+        assert_eq!(get_enabled("Continue"), Some(true));
+        assert_eq!(get_enabled("Step Over"), Some(true));
+        assert_eq!(get_enabled("Step Into"), Some(true));
+        assert_eq!(get_enabled("Step Out"), Some(true));
+        assert_eq!(get_enabled("Pause"), Some(false));
+        assert_eq!(get_enabled("Stop"), Some(true));
+        assert_eq!(get_enabled("Restart"), Some(true));
+    }
+
+    #[test]
+    fn debug_toolbar_hit_test_resolves_each_button() {
+        use crate::core::engine::Engine;
+        use quadraui::ToolbarHit;
+
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Hit-test each visible_item that is clickable and assert that it
+        // resolves back to its expected DEBUG_BUTTON_IDS entry.
+        for item in &layout.visible_items {
+            if !item.clickable {
+                continue;
+            }
+            let hit = layout.hit_test(item.bounds.x + 0.5, item.bounds.y);
+            match hit {
+                ToolbarHit::Button(ref id) => {
+                    let idx = Engine::debug_button_index(id)
+                        .unwrap_or_else(|| panic!("unknown id {:?}", id.as_str()));
+                    assert!(idx < 7, "index {idx} out of range");
+                }
+                ToolbarHit::Empty => {
+                    panic!(
+                        "clickable item hit_test returned Empty at {:?}",
+                        item.bounds
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_toolbar_disabled_button_not_clickable() {
+        use quadraui::ToolbarHit;
+
+        // No session → all buttons disabled.
+        let engine = engine_with_dap(false, None);
+        let bar = debug_toolbar(&engine);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Every visible_item must be not clickable and hit_test must return Empty.
+        for item in &layout.visible_items {
+            assert!(
+                !item.clickable,
+                "disabled button at {:?} should not be clickable",
+                item.bounds
+            );
+            assert_eq!(
+                layout.hit_test(item.bounds.x + 0.5, item.bounds.y),
+                ToolbarHit::Empty,
+                "disabled button hit_test should return Empty"
+            );
+        }
     }
 
     #[test]

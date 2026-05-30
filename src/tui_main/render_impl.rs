@@ -106,7 +106,6 @@ pub(super) fn draw_frame(
     editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
     editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
     tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
-    debug_toolbar_interaction: &quadraui::StatusBarInteraction,
     debug_toolbar_rect_out: &mut quadraui::Rect,
     completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
     context_menu_layout_out: &mut Option<quadraui::ContextMenuLayout>,
@@ -758,10 +757,9 @@ pub(super) fn draw_frame(
     }
 
     // ── Debug toolbar strip (if visible) ────────────────────────────────────
-    if let Some(ref toolbar) = screen.debug_toolbar {
-        // B5c.1: route through the `Backend` trait. `draw_status_bar`
-        // computes layout internally with the cell measurer.
-        let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
+    if screen.debug_toolbar.is_some() {
+        // Route through `Backend::draw_toolbar` (#510). Layout is cached on
+        // `engine.debug_toolbar_layout` for click/hover hit-testing.
         let q_rect = quadraui::Rect::new(
             debug_toolbar_area.x as f32,
             debug_toolbar_area.y as f32,
@@ -770,16 +768,9 @@ pub(super) fn draw_frame(
         );
         *debug_toolbar_rect_out = q_rect;
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        let hits = backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_status_bar(
-                q_rect,
-                &bar,
-                debug_toolbar_interaction.hovered_id(),
-                debug_toolbar_interaction.pressed_id(),
-            )
+        backend.enter_frame_scope(frame, |b| {
+            render::draw_debug_toolbar(b, engine, q_rect);
         });
-        debug_toolbar_interaction.set_layout(hits);
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -1726,7 +1717,6 @@ mod tests {
         let mut editor_hover_link_rects = Vec::new();
         let mut editor_hover_scrollbar = None;
         let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
-        let dbg_toolbar_interaction = quadraui::StatusBarInteraction::new();
         let mut dbg_toolbar_rect = quadraui::Rect::default();
         let mut completion_layout = None;
         let mut context_menu_layout = None;
@@ -1751,7 +1741,6 @@ mod tests {
                     &mut editor_hover_link_rects,
                     &mut editor_hover_scrollbar,
                     &mut tab_visible_counts,
-                    &dbg_toolbar_interaction,
                     &mut dbg_toolbar_rect,
                     &mut completion_layout,
                     &mut context_menu_layout,

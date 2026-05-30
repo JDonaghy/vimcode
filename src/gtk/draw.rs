@@ -61,7 +61,6 @@ pub(super) fn draw_editor(
     tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
     screen_layout_out: &Rc<RefCell<Option<render::ScreenLayout>>>,
-    debug_toolbar_layout_out: &Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
     debug_toolbar_y_offset_out: &Rc<Cell<f64>>,
     debug_toolbar_height_out: &Rc<Cell<f64>>,
     // Phase B.5 Stage 3: shared `quadraui::Backend` impl. Routed
@@ -69,8 +68,6 @@ pub(super) fn draw_editor(
     // the quickfix panel uses it as a pilot — the rest still call
     // `quadraui_gtk::draw_*` shims directly.
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
-    debug_toolbar_hovered_id: Option<&quadraui::WidgetId>,
-    debug_toolbar_pressed_id: Option<&quadraui::WidgetId>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
 
@@ -734,22 +731,27 @@ pub(super) fn draw_editor(
         engine.bottom_panel_geometry.replace(None);
     }
 
-    // 5h. Draw debug toolbar strip if visible (above status bar)
-    if let Some(ref toolbar) = screen.debug_toolbar {
+    // 5h. Draw debug toolbar strip if visible (above status bar) (#510).
+    // Route through `Backend::draw_toolbar`; layout cached on engine for
+    // click/hover hit-testing.
+    if screen.debug_toolbar.is_some() {
         let toolbar_y = height as f64 - status_bar_height - debug_toolbar_px;
-        draw_debug_toolbar(
-            backend,
-            cr,
-            toolbar,
-            &theme,
+        let rect = quadraui::Rect::new(
             0.0,
-            toolbar_y,
-            width as f64,
-            line_height,
-            debug_toolbar_layout_out,
-            debug_toolbar_hovered_id,
-            debug_toolbar_pressed_id,
+            toolbar_y as f32,
+            width as f64 as f32,
+            line_height as f32,
         );
+        // Use UI font layout so toolbar text is measured at the UI font size.
+        let pango_ctx = pangocairo::create_context(cr);
+        let ui_font_desc = FontDescription::from_string(&UI_FONT());
+        let ui_layout = pango::Layout::new(&pango_ctx);
+        ui_layout.set_font_description(Some(&ui_font_desc));
+        backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+            b.set_current_line_height(line_height);
+            render::draw_debug_toolbar(b, engine, rect);
+        });
         debug_toolbar_y_offset_out.set(toolbar_y);
         debug_toolbar_height_out.set(line_height);
     } else {
@@ -4107,44 +4109,4 @@ pub(super) fn draw_ai_sidebar(
     }
 
     let _ = row;
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_debug_toolbar(
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
-    cr: &Context,
-    toolbar: &render::DebugToolbarData,
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-    hit_layout_out: &Rc<RefCell<Option<quadraui::StatusBarLayout>>>,
-    hovered_id: Option<&quadraui::WidgetId>,
-    pressed_id: Option<&quadraui::WidgetId>,
-) {
-    let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(&UI_FONT());
-    let ui_layout = pango::Layout::new(&pango_ctx);
-    ui_layout.set_font_description(Some(&ui_font_desc));
-
-    let bar = render::debug_toolbar_to_quadraui_status_bar(toolbar, theme);
-    // #461: paint via `Surface::StatusBar`; recover layout for hover /
-    // press hit-test cache via `b.status_bar_layout`.
-    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
-    let rect = quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32);
-    let bar_layout = backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
-        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
-        b.set_current_line_height(height);
-        let mut frame = QScreenLayout::new();
-        frame.push(Surface::StatusBar {
-            rect,
-            bar: &bar,
-            hovered: hovered_id,
-            pressed: pressed_id,
-        });
-        frame.draw(b);
-        b.status_bar_layout(rect, &bar)
-    });
-    *hit_layout_out.borrow_mut() = Some(bar_layout);
 }
