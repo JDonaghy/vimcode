@@ -2941,26 +2941,6 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RCo
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn set_cell_styled(
-    buf: &mut ratatui::buffer::Buffer,
-    x: u16,
-    y: u16,
-    ch: char,
-    fg: RColor,
-    bg: RColor,
-    modifier: Modifier,
-    underline_color: Option<RColor>,
-) {
-    let area = buf.area;
-    if x < area.x + area.width && y < area.y + area.height {
-        let cell = &mut buf[(x, y)];
-        cell.set_char(ch).set_fg(fg).set_bg(bg);
-        cell.modifier = modifier;
-        cell.underline_color = underline_color.unwrap_or(RColor::Reset);
-    }
-}
-
 // ─── Tab bar ──────────────────────────────────────────────────────────────────
 // Tab/diff constants are defined in render_impl.rs and re-exported via `use render_impl::*;`.
 
