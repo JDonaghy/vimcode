@@ -1639,32 +1639,42 @@ pub(super) fn handle_mouse(
 
     // ── SC button hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         if sb_visible
             && engine.active_panel_is(PANEL_GIT)
             && col >= ab_width
             && col < ab_width + sidebar_width
         {
-            let sidebar_row = row.saturating_sub(menu_rows);
-            let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
-            let btn_row = 1 + commit_rows + 1; // header + commit + pad_above
-            if sidebar_row == btn_row {
-                engine.sc_button_hovered = engine.sc_button_hit(col as f32, row as f32);
-            } else {
-                engine.sc_button_hovered = None;
-                // SC item hover dwell tracking (sections area).
-                let section_start = 4 + commit_rows; // btn + pad_below + 1
-                if sidebar_row >= section_start {
-                    let adjusted = sidebar_row - section_start + 3;
+            // Route via cached SidebarPanelLayout (#509) — no per-frame
+            // arithmetic; hit_test uses absolute terminal coordinates.
+            let hit = {
+                let layout = engine.sc_panel_layout.borrow();
+                layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
+            };
+            match hit {
+                Some(quadraui::SidebarPanelHit::ToolbarButton(_))
+                | Some(quadraui::SidebarPanelHit::ToolbarEmpty) => {
+                    engine.sc_button_hovered = engine.sc_button_hit(col as f32, row as f32);
+                    if !mouse_on_hover_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                }
+                Some(quadraui::SidebarPanelHit::Content { y: content_y, .. }) => {
+                    engine.sc_button_hovered = None;
+                    // content_y is content-local (row 0 = first section row).
+                    let content_row = content_y as usize;
                     if let Some((flat_idx, _is_header)) =
-                        engine.sc_visual_row_to_flat(adjusted as usize, true)
+                        engine.sc_content_row_to_flat(content_row, true)
                     {
                         engine.panel_hover_mouse_move("source_control", "", flat_idx);
                     } else if !mouse_on_hover_popup {
                         engine.dismiss_panel_hover();
                     }
-                } else if !mouse_on_hover_popup {
-                    engine.dismiss_panel_hover();
+                }
+                _ => {
+                    engine.sc_button_hovered = None;
+                    if !mouse_on_hover_popup {
+                        engine.dismiss_panel_hover();
+                    }
                 }
             }
         } else {
@@ -2367,47 +2377,55 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.sc_set_focus(true);
 
-            // sidebar_row layout:
-            //   0 = header
-            //   1 .. commit_rows = commit input
-            //   1+commit_rows = pad above
-            //   2+commit_rows = button row
-            //   3+commit_rows = pad below
-            //   4+commit_rows .. = sections (rendered by SidebarSystem)
+            // sidebar_row layout after #509 (option a, no padding):
+            //   0               = header
+            //   1 .. commit_end = commit input
+            //   commit_end      = toolbar slot (button row, SidebarPanel)
+            //   commit_end+1 .. = sections (SidebarPanel content area)
             let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
             let commit_end = 1 + commit_rows;
-            let btn_row = 2 + commit_rows;
-            let section_start = 4 + commit_rows;
+
             if sidebar_row == 0 {
                 engine.sc_commit_input_active = false;
             } else if sidebar_row >= 1 && sidebar_row < commit_end {
                 engine.sc_commit_input_active = true;
                 engine.sc_commit_cursor = engine.sc_commit_message.len();
-            } else if sidebar_row == btn_row {
+            } else {
+                // Route via cached SidebarPanelLayout (#509).
                 engine.sc_commit_input_active = false;
-                if let Some(idx) = engine.sc_button_hit(col as f32, row as f32) {
-                    engine.sc_activate_button(idx);
-                }
-            } else if sidebar_row >= section_start {
-                engine.sc_commit_input_active = false;
-                let click_ev = quadraui::UiEvent::MouseDown {
-                    widget: None,
-                    button: quadraui::MouseButton::Left,
-                    position: quadraui::Point::new(col as f32, row as f32),
-                    modifiers: quadraui::Modifiers::default(),
+                let hit = {
+                    let layout = engine.sc_panel_layout.borrow();
+                    layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
                 };
-                engine.handle_sc_sidebar_ui_event(click_ev);
-                let now = Instant::now();
-                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
-                    && *last_click_pos == (col, row);
-                *last_click_time = now;
-                *last_click_pos = (col, row);
-                if is_double {
-                    let double_ev = quadraui::UiEvent::DoubleClick {
-                        widget: None,
-                        position: quadraui::Point::new(col as f32, row as f32),
-                    };
-                    engine.handle_sc_sidebar_ui_event(double_ev);
+                match hit {
+                    Some(quadraui::SidebarPanelHit::ToolbarButton(_)) => {
+                        if let Some(idx) = engine.sc_button_hit(col as f32, row as f32) {
+                            engine.sc_activate_button(idx);
+                        }
+                    }
+                    Some(quadraui::SidebarPanelHit::Content { .. }) => {
+                        let click_ev = quadraui::UiEvent::MouseDown {
+                            widget: None,
+                            button: quadraui::MouseButton::Left,
+                            position: quadraui::Point::new(col as f32, row as f32),
+                            modifiers: quadraui::Modifiers::default(),
+                        };
+                        engine.handle_sc_sidebar_ui_event(click_ev);
+                        let now = Instant::now();
+                        let is_double = now.duration_since(*last_click_time)
+                            < Duration::from_millis(400)
+                            && *last_click_pos == (col, row);
+                        *last_click_time = now;
+                        *last_click_pos = (col, row);
+                        if is_double {
+                            let double_ev = quadraui::UiEvent::DoubleClick {
+                                widget: None,
+                                position: quadraui::Point::new(col as f32, row as f32),
+                            };
+                            engine.handle_sc_sidebar_ui_event(double_ev);
+                        }
+                    }
+                    _ => {}
                 }
             }
             return sidebar_width;

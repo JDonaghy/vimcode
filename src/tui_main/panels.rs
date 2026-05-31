@@ -851,32 +851,38 @@ pub(super) fn render_source_control(
         }
     }
 
-    if area.height < 2 + commit_rows + 3 {
+    if area.height < 1 + commit_rows + 2 {
         return;
     }
 
-    // ── Button row (after commit input, with 1 row padding above and below) ──
+    // ── Bottom slab: toolbar slot + sections via SidebarPanel (#509) ──────────
+    // Passes the entire remaining area (just below commit input) to
+    // draw_sc_sidebar_panel, which reserves one toolbar-height row for the
+    // button row and returns content_bounds for the sections below. No
+    // per-side padding rows — option (a) from the issue: tighter layout,
+    // zero manual arithmetic.
     {
-        let pad_above = area.y + 1 + commit_rows;
-        let btn_y = pad_above + 1;
-        let pad_below = btn_y + 1;
-
-        // Clear padding rows.
-        for px in area.x..area.x + area.width {
-            set_cell(buf, px, pad_above, ' ', dim_fg, row_bg);
-            set_cell(buf, px, pad_below, ' ', dim_fg, row_bg);
-        }
-
-        // Action buttons via quadraui::Toolbar (#505) — shared builder paints
-        // both backends and caches the layout for click/hover hit-testing.
-        let btn_rect = quadraui::Rect::new(area.x as f32, btn_y as f32, area.width as f32, 1.0);
+        let slab_y = area.y + 1 + commit_rows;
+        let slab_h = (area.y + area.height).saturating_sub(slab_y);
+        let slab_rect = quadraui::Rect::new(
+            area.x as f32,
+            slab_y as f32,
+            area.width as f32,
+            slab_h as f32,
+        );
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
         backend.enter_frame_scope(frame, |b| {
-            render::draw_sc_button_toolbar(b, engine, sc, btn_rect);
+            render::draw_sc_sidebar_panel(b, engine, sc, slab_rect);
         });
     }
 
-    let section_start_y = area.y + 4 + commit_rows; // +2 for padding rows, +1 for btn row, +1 for next
+    // Read section-area origin from the cached layout.
+    let section_start_y = {
+        let l = engine.sc_panel_layout.borrow();
+        l.as_ref()
+            .map(|l| l.content_bounds.y as u16)
+            .unwrap_or(area.y + 2 + commit_rows) // fallback: btn row + 1
+    };
     if section_start_y >= area.y + area.height {
         return;
     }
@@ -1361,7 +1367,16 @@ pub(super) fn render_panel_hover_popup(
 
     // Vertically align with the hovered item.
     let item_row = if ph.panel_name == "source_control" {
-        let section_start: u16 = 5;
+        // Derive section_start from the cached SidebarPanelLayout (#509):
+        // content_bounds.y (absolute terminal row) minus sidebar_y gives the
+        // sidebar-relative row where sections begin. Falls back to 2 (header +
+        // btn, option-a layout) if the layout hasn't been populated yet.
+        let section_start = screen
+            .source_control
+            .as_ref()
+            .and_then(|sc| sc.sc_sections_start_y)
+            .map(|y| (y as u16).saturating_sub(sidebar_y))
+            .unwrap_or(2u16);
         section_start + ph.item_index as u16
     } else {
         ph.item_index as u16 + 1
