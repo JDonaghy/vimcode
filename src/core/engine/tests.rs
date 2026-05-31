@@ -10169,10 +10169,17 @@ fn test_command_center_help_confirm_grep_prefix() {
 #[test]
 fn test_command_center_debug_prefix_no_launch_json() {
     let mut engine = Engine::new();
-    // Set cwd to a temp dir with no launch.json
+    // Set cwd to a temp dir with no launch.json.
+    // A minimal Cargo.toml anchors find_workspace_root to this dir,
+    // preventing it from walking up to /tmp which may have stale config.
     let dir = std::env::temp_dir().join("vimcode_test_cc_debug_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     engine.cwd = dir.clone();
     engine.open_command_center();
     for ch in "debug".chars() {
@@ -10193,6 +10200,12 @@ fn test_command_center_debug_prefix_with_configs() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -10227,6 +10240,12 @@ fn test_command_center_debug_prefix_filter() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -10261,6 +10280,12 @@ fn test_command_center_debug_confirm_sets_config_index() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -10327,7 +10352,14 @@ fn test_command_center_debug_reads_vscode_fallback() {
     use std::io::Write;
     let dir = std::env::temp_dir().join("vimcode_test_cc_debug_vscode");
     let _ = std::fs::remove_dir_all(&dir);
-    // No .vimcode dir, but .vscode/launch.json exists
+    // No .vimcode dir, but .vscode/launch.json exists.
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let vscode_dir = dir.join(".vscode");
     std::fs::create_dir_all(&vscode_dir).unwrap();
     let launch_json = vscode_dir.join("launch.json");
@@ -10361,6 +10393,12 @@ fn test_command_center_task_prefix_no_tasks_json() {
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     engine.cwd = dir.clone();
     engine.open_command_center();
     for ch in "task".chars() {
@@ -10379,6 +10417,12 @@ fn test_command_center_task_prefix_with_tasks() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let tasks_json = vimcode_dir.join("tasks.json");
     let mut f = std::fs::File::create(&tasks_json).unwrap();
     write!(
@@ -10415,6 +10459,12 @@ fn test_command_center_task_prefix_filter() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let tasks_json = vimcode_dir.join("tasks.json");
     let mut f = std::fs::File::create(&tasks_json).unwrap();
     write!(
@@ -10483,6 +10533,13 @@ fn test_command_center_task_reads_vscode_fallback() {
     use std::io::Write;
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_vscode");
     let _ = std::fs::remove_dir_all(&dir);
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let vscode_dir = dir.join(".vscode");
     std::fs::create_dir_all(&vscode_dir).unwrap();
     let tasks_json = vscode_dir.join("tasks.json");
@@ -10546,6 +10603,12 @@ fn test_command_center_task_create_tasks_json() {
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_create");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
 
     let mut engine = Engine::new();
     engine.cwd = dir.clone();
@@ -18344,7 +18407,9 @@ fn test_scoped_filter_hierarchical_impl_block_name_mismatch() {
         .map(|i| i.display.as_str())
         .collect();
     assert!(
-        names.iter().any(|n| n.contains("adjust_ratio_at_index_impl")),
+        names
+            .iter()
+            .any(|n| n.contains("adjust_ratio_at_index_impl")),
         "expected adjust_ratio_at_index_impl in sibling list, got: {names:?}"
     );
     assert!(

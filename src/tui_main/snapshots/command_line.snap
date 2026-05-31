@@ -2,7 +2,7 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜   1: [No Name] ×                                 󰤲   ⋯
+ 󰍜   1: [No Name] ×                                 󰤲    ⋯
 ▎
     buffer content
  

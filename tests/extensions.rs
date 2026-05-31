@@ -2376,9 +2376,13 @@ fn git_api_repo_root_returns_path() {
     assert!(found);
     let msg = ctx.message.unwrap();
     assert!(msg.starts_with("root:"), "expected root prefix, got {msg}");
+    let root_path = msg.strip_prefix("root:").unwrap();
+    // Verify the returned path is a real directory (not hardcoding a specific
+    // path segment, since the repo may be checked out in a worktree at an
+    // arbitrary location such as .coord/worktrees/<hash>).
     assert!(
-        msg.contains("vimcode"),
-        "root should contain vimcode: {msg}"
+        std::path::Path::new(root_path).is_dir(),
+        "repo root should be an existing directory: {root_path}"
     );
 }
 
