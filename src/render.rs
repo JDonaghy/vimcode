@@ -1576,6 +1576,10 @@ pub struct SourceControlData {
     pub branch_picker: Option<BranchPickerData>,
     /// SC help dialog visible.
     pub help_open: bool,
+    /// Y coordinate (in native units) where the sections area begins —
+    /// the top of `SidebarPanelLayout.content_bounds` from the last paint
+    /// (#509). TUI: terminal rows. GTK: pixels. `None` until first paint.
+    pub sc_sections_start_y: Option<f32>,
 }
 
 /// Data for the branch picker / create popup in the SC panel.
@@ -6445,6 +6449,11 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
             None
         },
         help_open: engine.sc_help_open,
+        sc_sections_start_y: engine
+            .sc_panel_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.content_bounds.y),
     })
 }
 
@@ -6507,22 +6516,35 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
     }
 }
 
-/// Draw the SC action-button toolbar through backend `b` and cache its
-/// layout on `engine` for click/hover dispatch (#505). Both backends call
-/// this inside their frame scope; the only per-backend input is `rect`
-/// (cell units for TUI, pixels for GTK). Keyboard focus → pressed_id,
-/// mouse hover → hovered_id.
-pub fn draw_sc_button_toolbar(
+/// Build the SC `SidebarPanel` — a `quadraui::SidebarPanel` wrapping the
+/// action-button toolbar as its header slot (#509). `toolbar_height: None`
+/// defers to each backend's idiomatic default (1 cell TUI, `line_height` GTK).
+pub fn sc_sidebar_panel(sc: &SourceControlData) -> quadraui::SidebarPanel {
+    use quadraui::{SidebarPanel, WidgetId};
+    SidebarPanel {
+        id: WidgetId::new("sc:panel"),
+        toolbar: Some(sc_button_toolbar(sc)),
+        toolbar_height: None,
+    }
+}
+
+/// Draw the SC bottom slab (toolbar + sections) through backend `b` and
+/// cache the full `SidebarPanelLayout` on `engine` for click/hover dispatch
+/// (#509). `rect` covers the "bottom slab" — from just below the commit input
+/// to the bottom of the panel. Both backends call this inside their frame
+/// scope; section rendering then reads `content_bounds` from the cached
+/// layout. Keyboard focus → pressed_id, mouse hover → hovered_id.
+pub fn draw_sc_sidebar_panel(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
     sc: &SourceControlData,
     rect: quadraui::Rect,
 ) {
-    let bar = sc_button_toolbar(sc);
+    let panel = sc_sidebar_panel(sc);
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
-    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
-    engine.sc_button_layout.replace(Some(layout));
+    let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
+    engine.sc_panel_layout.replace(Some(layout));
 }
 
 pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> quadraui::TreeView {
@@ -12750,6 +12772,7 @@ mod tests {
             button_hovered: None,
             branch_picker: None,
             help_open: false,
+            sc_sections_start_y: None,
         }
     }
 
@@ -12844,6 +12867,90 @@ mod tests {
             layout.hit_test(commit.bounds.x + 0.5, commit.bounds.y),
             ToolbarHit::Empty
         );
+    }
+
+    // ─── SC SidebarPanel tests (#509) ────────────────────────────────────────
+
+    #[test]
+    fn test_sc_sidebar_panel_toolbar_slot_reserved_at_top() {
+        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
+
+        let sc = empty_sc_data();
+        let panel = sc_sidebar_panel(&sc);
+        // TUI default: toolbar_height = 1 cell, item_width = 8 cells.
+        let area = quadraui::Rect::new(0.0, 5.0, 60.0, 20.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        // Toolbar slot is reserved at the top.
+        let tb = layout.toolbar_bounds.expect("toolbar slot reserved");
+        assert_eq!(tb.y, 5.0, "toolbar slot starts at panel top");
+        assert_eq!(tb.height, 1.0, "TUI default toolbar height = 1 cell");
+        // Content starts immediately below toolbar slot (no padding — option a).
+        assert_eq!(
+            layout.content_bounds.y, 6.0,
+            "content starts at toolbar_y + 1"
+        );
+        assert_eq!(
+            layout.content_bounds.height, 19.0,
+            "content height = panel_height - 1"
+        );
+    }
+
+    #[test]
+    fn test_sc_sidebar_panel_hit_test_resolves_toolbar_button_and_content() {
+        use crate::core::engine::Engine;
+        use quadraui::{
+            primitives::toolbar::ToolbarItemMeasure, SidebarPanelHit, SidebarPanelMeasure,
+        };
+
+        let mut sc = empty_sc_data();
+        sc.commit_message = "feat: fix".into(); // non-empty → Commit enabled
+        let panel = sc_sidebar_panel(&sc);
+        let area = quadraui::Rect::new(0.0, 0.0, 60.0, 10.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        // A hit in the toolbar slot (y=0, which is the toolbar row) on a button.
+        let hit = layout.hit_test(0.5, 0.0);
+        match hit {
+            SidebarPanelHit::ToolbarButton(id) => {
+                assert_eq!(
+                    Engine::sc_button_index(&id),
+                    Some(0),
+                    "first button = Commit"
+                );
+            }
+            other => panic!("expected ToolbarButton hit, got {other:?}"),
+        }
+
+        // A hit in the content area (y=2, content starts at y=1) returns content-local coords.
+        let hit = layout.hit_test(5.0, 2.0);
+        match hit {
+            SidebarPanelHit::Content { x, y } => {
+                assert_eq!(x, 5.0);
+                assert_eq!(y, 1.0, "content-local y = abs_y - content_bounds.y = 2-1");
+            }
+            other => panic!("expected Content hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sc_sidebar_panel_content_bounds_height() {
+        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
+
+        let sc = empty_sc_data();
+        let panel = sc_sidebar_panel(&sc);
+        // Simulate a 15-row panel starting at y=3 (e.g. after 3 header/commit rows).
+        let area = quadraui::Rect::new(0.0, 3.0, 40.0, 15.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        assert_eq!(
+            layout.content_bounds.height, 14.0,
+            "content = panel_height(15) - toolbar_slot(1)"
+        );
+        assert_eq!(layout.content_bounds.y, 4.0, "content starts at y=3+1=4");
     }
 
     // ─── Debug toolbar tests (#510) ──────────────────────────────────────────

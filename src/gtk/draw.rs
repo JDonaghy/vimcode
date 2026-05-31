@@ -2778,32 +2778,32 @@ pub(super) fn draw_source_control_panel(
         y_commit += commit_h;
     }
 
-    // ── Action buttons via quadraui::Toolbar (#505) ────────────────────────
+    // ── Bottom slab: toolbar slot + sections via SidebarPanel (#509) ──────────
+    // Passes the entire remaining area (from just below commit input) to
+    // draw_sc_sidebar_panel. The backend reserves one `line_height` row for
+    // the toolbar slot; content_bounds below receives the sections. No manual
+    // btn_pad / btn_h arithmetic — option (a): tighter layout, single source
+    // of truth in the cached SidebarPanelLayout.
     {
-        let btn_pad = gap; // same gap as after header
-        let btn_y_base = y_commit + btn_pad;
-        let btn_h = line_height;
-        let margin = 4.0;
-        let btn_x = x + margin;
-        let btn_w = w - margin * 2.0;
-
-        // Shared builder paints both backends and caches the layout for
-        // click/hover hit-testing.
-        let btn_rect =
-            quadraui::Rect::new(btn_x as f32, btn_y_base as f32, btn_w as f32, btn_h as f32);
+        let slab_h = (y + h - y_commit).max(0.0);
+        let slab_rect = quadraui::Rect::new(x as f32, y_commit as f32, w as f32, slab_h as f32);
         backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
             b.set_current_theme(super::quadraui_gtk::q_theme(theme));
             b.set_current_line_height(line_height);
-            render::draw_sc_button_toolbar(b, engine, sc, btn_rect);
+            render::draw_sc_sidebar_panel(b, engine, sc, slab_rect);
         });
-
-        y_commit = btn_y_base + btn_h + btn_pad;
     }
 
     // Section rendering — migrated to SidebarSystem (#321).
+    // Read content_bounds from the layout that draw_sc_sidebar_panel just cached.
     let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
-    let sections_h = (y + h - y_commit).max(0.0);
-    let body_rect = quadraui::Rect::new(x as f32, y_commit as f32, w as f32, sections_h as f32);
+    let body_rect = {
+        let l = engine.sc_panel_layout.borrow();
+        l.as_ref().map(|l| l.content_bounds).unwrap_or(
+            // Fallback: old arithmetic for the first frame before layout is cached.
+            quadraui::Rect::new(x as f32, (y_commit + line_height) as f32, w as f32, 0.0),
+        )
+    };
     engine.sc_sidebar_body_rect.set(body_rect);
     render::populate_sc_sidebar_system(engine, theme);
     {
@@ -3553,16 +3553,24 @@ pub(super) fn draw_panel_hover_popup(
 
     // Y position: align with the hovered item row.
     let item_row_y = if hover.panel_name == "source_control" {
-        // SC layout: header(lh) + gap + commit(lh*rows) + gap + buttons(lh) + gap + sections
-        // The flat index maps into the sections area. Use SC-specific geometry.
-        let gap = (line_height * 0.3).round();
+        // SC layout after #509: section_top is read from the cached
+        // SidebarPanelLayout.content_bounds.y so we don't re-derive it.
         let item_height = (line_height * 1.4).round();
-        let commit_rows = screen
+        let section_top = screen
             .source_control
             .as_ref()
-            .map(|sc| sc.commit_message.split('\n').count().max(1))
-            .unwrap_or(1) as f64;
-        let section_top = line_height + gap + commit_rows * line_height + gap + line_height + gap;
+            .and_then(|sc| sc.sc_sections_start_y)
+            .map(|y| y as f64)
+            .unwrap_or_else(|| {
+                // Fallback: recompute from commit_rows (one frame lag is acceptable).
+                let gap = (line_height * 0.3).round();
+                let commit_rows = screen
+                    .source_control
+                    .as_ref()
+                    .map(|sc| sc.commit_message.split('\n').count().max(1))
+                    .unwrap_or(1) as f64;
+                line_height + gap + commit_rows * line_height + line_height
+            });
         // Walk sections to find the accumulated Y offset for the hovered flat_idx.
         // Headers use line_height, items use item_height.
         // Staged + Unstaged always show; Worktrees only when > 1; Log always shows.

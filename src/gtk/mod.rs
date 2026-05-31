@@ -8025,44 +8025,54 @@ impl App {
                 {
                     let mut engine = self.engine.borrow_mut();
                     engine.sc_set_focus(true);
+                    // Route via cached SidebarPanelLayout (#509).
+                    // Header / commit-input area: identified by panel-local y
+                    // (the panel starts at 0,0 in the drawing area).
                     let gap = (lh * 0.3).round();
                     let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
                     let commit_h = commit_rows as f64 * lh;
                     let header_end = lh;
                     let commit_top = header_end + gap;
                     let commit_bottom = commit_top + commit_h;
-                    let btn_top = commit_bottom + gap;
-                    let btn_bottom = btn_top + lh;
-                    let section_top = btn_bottom + gap;
 
                     if y < header_end {
                         engine.sc_commit_input_active = false;
                     } else if y >= commit_top && y < commit_bottom {
                         engine.sc_commit_input_active = true;
                         engine.sc_commit_cursor = engine.sc_commit_message.len();
-                    } else if y >= btn_top && y < btn_bottom {
-                        engine.sc_commit_input_active = false;
-                        if let Some(idx) = engine.sc_button_hit(x_click as f32, y as f32) {
-                            engine.sc_activate_button(idx);
-                        }
-                    } else if y >= section_top {
-                        engine.sc_commit_input_active = false;
-                        let click_ev = quadraui::UiEvent::MouseDown {
-                            widget: None,
-                            button: quadraui::MouseButton::Left,
-                            position: quadraui::Point::new(x_click as f32, y as f32),
-                            modifiers: quadraui::Modifiers::default(),
-                        };
-                        engine.handle_sc_sidebar_ui_event(click_ev);
-                        if n_press >= 2 {
-                            let double_ev = quadraui::UiEvent::DoubleClick {
-                                widget: None,
-                                position: quadraui::Point::new(x_click as f32, y as f32),
-                            };
-                            engine.handle_sc_sidebar_ui_event(double_ev);
-                        }
                     } else {
+                        // Bottom slab: delegate to SidebarPanelLayout hit_test.
                         engine.sc_commit_input_active = false;
+                        let hit = {
+                            let layout = engine.sc_panel_layout.borrow();
+                            layout
+                                .as_ref()
+                                .map(|l| l.hit_test(x_click as f32, y as f32))
+                        };
+                        match hit {
+                            Some(quadraui::SidebarPanelHit::ToolbarButton(_)) => {
+                                if let Some(idx) = engine.sc_button_hit(x_click as f32, y as f32) {
+                                    engine.sc_activate_button(idx);
+                                }
+                            }
+                            Some(quadraui::SidebarPanelHit::Content { .. }) => {
+                                let click_ev = quadraui::UiEvent::MouseDown {
+                                    widget: None,
+                                    button: quadraui::MouseButton::Left,
+                                    position: quadraui::Point::new(x_click as f32, y as f32),
+                                    modifiers: quadraui::Modifiers::default(),
+                                };
+                                engine.handle_sc_sidebar_ui_event(click_ev);
+                                if n_press >= 2 {
+                                    let double_ev = quadraui::UiEvent::DoubleClick {
+                                        widget: None,
+                                        position: quadraui::Point::new(x_click as f32, y as f32),
+                                    };
+                                    engine.handle_sc_sidebar_ui_event(double_ev);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
@@ -8071,33 +8081,31 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::ScSidebarMotion(mx, my) => {
-                // Determine which button (if any) the mouse is over.
+                // Route via cached SidebarPanelLayout (#509) — no per-frame
+                // button-row or section-top arithmetic.
                 let lh = self.cached_ui_line_height;
                 let mut engine = self.engine.borrow_mut();
-                let gap = (lh * 0.3).round();
-                let commit_rows = engine.sc_commit_message.split('\n').count().max(1);
-                let commit_h = commit_rows as f64 * lh;
-                // Button row Y range: after header + gap + commit + gap
-                let btn_top = lh + gap + commit_h + gap;
-                let btn_bottom = btn_top + lh;
+
+                let hit = if mx < 0.0 {
+                    // Mouse left the panel (leave event sends -1,-1).
+                    None
+                } else {
+                    let layout = engine.sc_panel_layout.borrow();
+                    layout.as_ref().map(|l| l.hit_test(mx as f32, my as f32))
+                };
+
                 let old = engine.sc_button_hovered;
-                if mx < 0.0 || my < btn_top || my >= btn_bottom {
-                    engine.sc_button_hovered = None;
-                } else {
-                    engine.sc_button_hovered = engine.sc_button_hit(mx as f32, my as f32);
-                }
-                if engine.sc_button_hovered != old {
-                    drop(engine);
-                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                        da.queue_draw();
+                match hit {
+                    Some(quadraui::SidebarPanelHit::ToolbarButton(_))
+                    | Some(quadraui::SidebarPanelHit::ToolbarEmpty) => {
+                        engine.sc_button_hovered = engine.sc_button_hit(mx as f32, my as f32);
+                        engine.dismiss_panel_hover();
                     }
-                } else {
-                    // Panel hover dwell tracking for SC items.
-                    let item_height = (lh * 1.4).round();
-                    let btn_pad = gap;
-                    let section_top = btn_bottom + btn_pad;
-                    if mx >= 0.0 && my >= section_top {
-                        // Accumulator walk matching draw_source_control_panel layout.
+                    Some(quadraui::SidebarPanelHit::Content { y: content_y, .. }) => {
+                        engine.sc_button_hovered = None;
+                        // Walk sections within the content area using content-local y.
+                        // content_y is in pixels relative to content_bounds.y.
+                        let item_height = (lh * 1.4).round();
                         let staged_count = engine
                             .sc_file_statuses
                             .iter()
@@ -8112,11 +8120,12 @@ impl App {
                         let wt_count = engine.sc_worktrees.len();
                         let log_count = engine.sc_log.len();
 
-                        let mut y_off = section_top;
+                        let my_local = content_y as f64;
+                        let mut y_off = 0.0f64;
                         let mut flat_idx = 0usize;
                         let mut hit_flat: Option<usize> = None;
 
-                        // Walk each section: header(lh) + items(item_height) if expanded
+                        // Walk each section: header(lh) + items(item_height) if expanded.
                         struct Section {
                             count: usize,
                             expanded: bool,
@@ -8132,8 +8141,7 @@ impl App {
                             },
                         ];
                         for sec in &sections {
-                            // Header
-                            if my >= y_off && my < y_off + lh {
+                            if my_local >= y_off && my_local < y_off + lh {
                                 hit_flat = Some(flat_idx);
                                 break;
                             }
@@ -8141,7 +8149,7 @@ impl App {
                             flat_idx += 1;
                             if sec.expanded {
                                 for _ in 0..sec.count {
-                                    if my >= y_off && my < y_off + item_height {
+                                    if my_local >= y_off && my_local < y_off + item_height {
                                         hit_flat = Some(flat_idx);
                                         break;
                                     }
@@ -8154,15 +8162,14 @@ impl App {
                             }
                         }
                         if hit_flat.is_none() && show_worktrees {
-                            // Worktrees header
-                            if my >= y_off && my < y_off + lh {
+                            if my_local >= y_off && my_local < y_off + lh {
                                 hit_flat = Some(flat_idx);
                             }
                             y_off += lh;
                             flat_idx += 1;
                             if hit_flat.is_none() && engine.sc_sections_expanded[2] {
                                 for _ in 0..wt_count {
-                                    if my >= y_off && my < y_off + item_height {
+                                    if my_local >= y_off && my_local < y_off + item_height {
                                         hit_flat = Some(flat_idx);
                                         break;
                                     }
@@ -8172,15 +8179,14 @@ impl App {
                             }
                         }
                         if hit_flat.is_none() {
-                            // Log header
-                            if my >= y_off && my < y_off + lh {
+                            if my_local >= y_off && my_local < y_off + lh {
                                 hit_flat = Some(flat_idx);
                             }
                             y_off += lh;
                             flat_idx += 1;
                             if hit_flat.is_none() && engine.sc_sections_expanded[3] {
                                 for _ in 0..log_count {
-                                    if my >= y_off && my < y_off + item_height {
+                                    if my_local >= y_off && my_local < y_off + item_height {
                                         hit_flat = Some(flat_idx);
                                         break;
                                     }
@@ -8189,6 +8195,7 @@ impl App {
                                 }
                             }
                         }
+                        let _ = (y_off, flat_idx); // loop accumulators only
 
                         if let Some(fi) = hit_flat {
                             if engine.panel_hover_mouse_move("source_control", "", fi) {
@@ -8196,14 +8203,24 @@ impl App {
                                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                                     da.queue_draw();
                                 }
+                                return;
                             }
                         } else {
                             engine.dismiss_panel_hover();
                         }
-                    } else if mx < 0.0 {
-                        // Mouse left the panel. Use delayed dismiss so the overlay's
-                        // motion controller can cancel it if the mouse enters the popup.
+                    }
+                    _ => {
+                        // Outside panel or mouse left — clear button hover and
+                        // dwell tracking.
+                        engine.sc_button_hovered = None;
                         engine.dismiss_panel_hover();
+                    }
+                }
+
+                if engine.sc_button_hovered != old {
+                    drop(engine);
+                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
+                        da.queue_draw();
                     }
                 }
             }

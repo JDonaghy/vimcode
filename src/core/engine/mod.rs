@@ -2680,10 +2680,11 @@ pub struct Engine {
     /// and mouse handling. Both TUI and GTK call `render()` and `handle()`.
     pub sc_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
     pub sc_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
-    /// Cached layout of the SC action-button `quadraui::Toolbar` from the
-    /// last paint. Click/hover dispatch reads it verbatim via `hit_test()`
-    /// (#505) — no per-backend button-row arithmetic.
-    pub sc_button_layout: std::cell::RefCell<Option<quadraui::ToolbarLayout>>,
+    /// Cached layout of the SC `quadraui::SidebarPanel` from the last paint.
+    /// Click/hover dispatch reads it via `hit_test()` (#509) — no per-backend
+    /// button-row or section-start arithmetic. `toolbar_layout` inside carries
+    /// the per-button bounds for `sc_button_hit`.
+    pub sc_panel_layout: std::cell::RefCell<Option<quadraui::SidebarPanelLayout>>,
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
     pub sc_behind: u32,
@@ -3650,7 +3651,7 @@ impl Engine {
                 std::rc::Rc::new(std::cell::RefCell::new(s))
             },
             sc_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
-            sc_button_layout: std::cell::RefCell::new(None),
+            sc_panel_layout: std::cell::RefCell::new(None),
             sc_ahead: 0,
             sc_behind: 0,
             sc_log: Vec::new(),

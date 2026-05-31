@@ -1191,14 +1191,31 @@ impl Engine {
     }
 
     /// Resolve which SC button (if any) sits under absolute point `(x, y)`,
-    /// using the `quadraui::Toolbar` layout cached at paint time (#505).
-    /// Returns `None` for clicks in the bar's empty gutter or off the bar.
+    /// using the `SidebarPanelLayout` cached at paint time (#509).
+    /// Returns `None` for clicks in the toolbar's empty gutter, the content
+    /// area, or outside the panel.
     pub fn sc_button_hit(&self, x: f32, y: f32) -> Option<usize> {
-        let layout = self.sc_button_layout.borrow();
-        match layout.as_ref()?.hit_test(x, y) {
+        let layout = self.sc_panel_layout.borrow();
+        match layout.as_ref()?.toolbar_layout.as_ref()?.hit_test(x, y) {
             quadraui::ToolbarHit::Button(id) => Self::sc_button_index(&id),
             quadraui::ToolbarHit::Empty => None,
         }
+    }
+
+    /// Map a content-local row index (row 0 = first section header) to a
+    /// flat `(index, is_header)` pair for the SC panel sections area (#509).
+    ///
+    /// This is the content-coordinate variant of [`Self::sc_visual_row_to_flat`]:
+    /// callers that receive content-local y from `SidebarPanelLayout::hit_test`
+    /// use this function directly instead of offsetting by 3.
+    pub fn sc_content_row_to_flat(
+        &self,
+        content_row: usize,
+        empty_section_hint: bool,
+    ) -> Option<(usize, bool)> {
+        // content_row 0 == first section header == visual_row 3 in
+        // sc_visual_row_to_flat's coordinate system.
+        self.sc_visual_row_to_flat(content_row + 3, empty_section_hint)
     }
 
     /// Read the active section index and selected item index from the
