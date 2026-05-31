@@ -1255,36 +1255,14 @@ pub(super) fn render_tab_drag_overlay(
             None => return,
         };
 
-    let highlight_bg = RColor::Indexed(24);
-    if let Some(h) = overlay.highlight {
-        let buf = frame.buffer_mut();
-        let hx = h.x as u16;
-        let hy = h.y as u16;
-        let hw = h.width as u16;
-        let hh = h.height as u16;
-        for dy in 0..hh {
-            for dx in 0..hw {
-                let cx = hx + dx;
-                let cy = hy + dy;
-                let area = buf.area;
-                if cx < area.x + area.width && cy < area.y + area.height {
-                    buf[(cx, cy)].set_bg(highlight_bg);
-                }
-            }
-        }
-    }
-
-    if let Some(bar) = overlay.insertion_bar {
-        set_cell_styled(
-            frame.buffer_mut(),
-            bar.x as u16,
-            bar.y as u16,
-            '▎',
-            RColor::Indexed(39),
-            rc(theme.tab_bar_bg),
-            Modifier::empty(),
-            None,
-        );
+    {
+        let q_theme = super::quadraui_tui::q_theme(theme);
+        let q_overlay = quadraui::DropOverlay {
+            highlight: overlay.highlight,
+            insertion_bar: overlay.insertion_bar,
+            ghost_position: Some(overlay.ghost_position),
+        };
+        quadraui::tui::draw_drop_overlay(frame.buffer_mut(), &q_overlay, &q_theme);
     }
 
     // Look up the tab label from engine using the captured drag source.
@@ -1582,8 +1560,6 @@ pub(super) fn render_separators(
         return;
     }
     let sep_fg = rc(theme.separator);
-    let thumb_fg = rc(theme.scrollbar_thumb);
-    let track_fg = sep_fg;
     let sep_bg = rc(theme.background);
 
     for i in 0..windows.len() {
@@ -1607,31 +1583,27 @@ pub(super) fn render_separators(
                 let viewport_lines = a.rect.height as usize;
                 let has_scroll = a.total_lines > viewport_lines && track_h > 0;
 
-                let (thumb_top, thumb_size) = if has_scroll {
-                    let h = track_h as f64;
-                    let size = ((viewport_lines as f64 / a.total_lines as f64) * h)
-                        .ceil()
-                        .max(1.0) as usize;
-                    let top = ((a.scroll_top as f64 / a.total_lines as f64) * h).floor() as usize;
-                    (top, size)
+                if has_scroll {
+                    let q_theme = super::quadraui_tui::q_theme(theme);
+                    let sb = quadraui::Scrollbar::vertical(
+                        "sep_sb",
+                        quadraui::Rect::new(
+                            sep_x.saturating_sub(1) as f32,
+                            y_start as f32,
+                            1.0,
+                            track_h as f32,
+                        ),
+                        a.scroll_top as f32,
+                        a.total_lines as f32,
+                        viewport_lines as f32,
+                        1.0,
+                    );
+                    quadraui::tui::draw_scrollbar(buf, &sb, &q_theme, q_theme.background);
                 } else {
-                    (0, track_h)
-                };
-
-                for dy in 0..y_end.saturating_sub(y_start) {
-                    let y = y_start + dy;
-                    let (ch, fg) = if has_scroll {
-                        let in_thumb =
-                            (dy as usize) >= thumb_top && (dy as usize) < thumb_top + thumb_size;
-                        if in_thumb {
-                            ('█', thumb_fg)
-                        } else {
-                            ('░', track_fg)
-                        }
-                    } else {
-                        ('│', sep_fg)
-                    };
-                    set_cell(buf, sep_x.saturating_sub(1), y, ch, fg, sep_bg);
+                    for dy in 0..y_end.saturating_sub(y_start) {
+                        let y = y_start + dy;
+                        set_cell(buf, sep_x.saturating_sub(1), y, '│', sep_fg, sep_bg);
+                    }
                 }
             }
 
