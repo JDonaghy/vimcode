@@ -1033,7 +1033,9 @@ pub(super) fn draw_frame(
             button_gap: 0.0,
             padding: 1.0,
         };
-        let layout = q_dialog.layout(viewport, measure);
+        let layout = q_dialog.layout(viewport, measure, |_| {
+            quadraui::ToolbarItemMeasure::new(0.0)
+        });
         super::quadraui_tui::draw_dialog(frame.buffer_mut(), &q_dialog, &layout, theme);
     }
 

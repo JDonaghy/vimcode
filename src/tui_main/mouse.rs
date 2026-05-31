@@ -1969,6 +1969,7 @@ pub(super) fn handle_mouse(
         let click_events = quadraui::dispatch_click(
             modal_stack,
             &surfaces,
+            &[],
             drag_state,
             quadraui::Point {
                 x: col as f32,

@@ -1480,6 +1480,8 @@ pub fn tab_switcher_to_quadraui_list_view(
         scroll_offset,
         has_focus: true,
         bordered: true,
+        h_scroll: 0,
+        max_content_width: None,
     }
 }
 
@@ -3727,10 +3729,12 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
         buttons,
         severity: None,
         vertical_buttons: panel.vertical_buttons,
-        input: panel.input.as_ref().map(|inp| quadraui::DialogInput {
-            value: inp.display.clone(),
-            placeholder: String::new(),
-            cursor: None,
+        input: panel.input.as_ref().map(|inp| {
+            quadraui::DialogInput::TextInput(quadraui::DialogTextInput {
+                value: inp.display.clone(),
+                placeholder: String::new(),
+                cursor: None,
+            })
         }),
     }
 }
@@ -8185,6 +8189,8 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
         scroll_offset: 0, // set by caller from local scroll_top
         has_focus: qf.has_focus,
         bordered: false,
+        h_scroll: 0,
+        max_content_width: None,
     }
 }
 
