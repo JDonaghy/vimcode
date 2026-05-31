@@ -159,28 +159,50 @@ pub(super) fn install_icon_and_desktop() {
     }
 }
 
-/// GLib log handler that suppresses the known GTK4 `gtk_css_node_insert_after`
-/// assertion while forwarding all other CRITICAL messages to the default handler.
-pub(super) unsafe extern "C" fn suppress_css_node_warning(
-    log_domain: *const std::ffi::c_char,
+/// Global GLib structured-log writer that drops a couple of benign GTK4
+/// CRITICAL messages and forwards everything else to GLib's default writer:
+///   * the `gtk_css_node_insert_after` assertion spam, and
+///   * the "Unable to register the application" D-Bus noise emitted when GTK
+///     can't reach a usable session bus (the editor runs fine regardless).
+///
+/// GTK4 logs via `g_log_structured()`, which bypasses per-domain handlers
+/// installed with `g_log_set_handler`; the writer func is the single
+/// chokepoint that sees every message, so the filtering happens here.
+pub(super) unsafe extern "C" fn gtk_log_writer(
     log_level: gtk4::glib::ffi::GLogLevelFlags,
-    message: *const std::ffi::c_char,
-    _user_data: gtk4::glib::ffi::gpointer,
-) {
-    let msg = unsafe { std::ffi::CStr::from_ptr(message) }
-        .to_str()
-        .unwrap_or("");
-    if msg.contains("gtk_css_node_insert_after") {
-        return; // suppress
+    fields: *const gtk4::glib::ffi::GLogField,
+    n_fields: usize,
+    user_data: gtk4::glib::ffi::gpointer,
+) -> gtk4::glib::ffi::GLogWriterOutput {
+    let mut msg = "";
+    if !fields.is_null() {
+        let slice = unsafe { std::slice::from_raw_parts(fields, n_fields) };
+        for field in slice {
+            if field.key.is_null() {
+                continue;
+            }
+            let key = unsafe { std::ffi::CStr::from_ptr(field.key) }
+                .to_str()
+                .unwrap_or("");
+            if key == "MESSAGE" && !field.value.is_null() {
+                msg = if field.length < 0 {
+                    unsafe { std::ffi::CStr::from_ptr(field.value as *const std::ffi::c_char) }
+                        .to_str()
+                        .unwrap_or("")
+                } else {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(field.value as *const u8, field.length as usize)
+                    };
+                    std::str::from_utf8(bytes).unwrap_or("")
+                };
+                break;
+            }
+        }
     }
-    // Forward other CRITICAL messages to stderr.
-    let domain = unsafe { std::ffi::CStr::from_ptr(log_domain) }
-        .to_str()
-        .unwrap_or("?");
-    let level_str = if log_level & gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL != 0 {
-        "CRITICAL"
-    } else {
-        "WARNING"
-    };
-    eprintln!("({domain}): Gtk-{level_str}: {msg}");
+    if msg.contains("gtk_css_node_insert_after")
+        || msg.contains("Unable to register the application")
+    {
+        return gtk4::glib::ffi::G_LOG_WRITER_HANDLED;
+    }
+    unsafe { gtk4::glib::ffi::g_log_writer_default(log_level, fields, n_fields, user_data) }
 }

@@ -10266,12 +10266,7 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
 
     install_icon_and_desktop();
     unsafe {
-        gtk4::glib::ffi::g_log_set_handler(
-            c"Gtk".as_ptr(),
-            gtk4::glib::ffi::G_LOG_LEVEL_CRITICAL,
-            Some(suppress_css_node_warning),
-            std::ptr::null_mut(),
-        );
+        gtk4::glib::ffi::g_log_set_writer_func(Some(gtk_log_writer), std::ptr::null_mut(), None);
     }
     let gtk_app = gtk4::Application::builder()
         .application_id("com.vimcode.VimCode")
