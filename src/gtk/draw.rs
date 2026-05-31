@@ -2076,7 +2076,9 @@ pub(super) fn draw_dialog_popup(
         padding: padding as f32,
     };
     let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
-    let dialog_layout = dialog.layout(viewport, measure);
+    let dialog_layout = dialog.layout(viewport, measure, |_| {
+        quadraui::ToolbarItemMeasure::new(0.0)
+    });
 
     let popup_rect = (
         dialog_layout.bounds.x as f64,

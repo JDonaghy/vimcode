@@ -6020,6 +6020,7 @@ impl App {
             let click_events = quadraui::dispatch_click(
                 &modal,
                 &surfaces,
+                &[],
                 &mut drag,
                 quadraui::Point {
                     x: x as f32,
