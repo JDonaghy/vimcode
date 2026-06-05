@@ -11267,6 +11267,7 @@ pub fn build_tab_bar_primitive(
             is_active: t.active,
             is_dirty: t.dirty,
             is_preview: t.preview,
+            is_closable: true,
         })
         .collect();
 
@@ -11372,6 +11373,7 @@ pub fn build_bottom_panel_tab_bar(
             is_active: *active == BottomPanelKind::Terminal,
             is_dirty: false,
             is_preview: false,
+            is_closable: true,
         });
     }
     if has_debug_output {
@@ -11380,6 +11382,7 @@ pub fn build_bottom_panel_tab_bar(
             is_active: *active == BottomPanelKind::DebugOutput,
             is_dirty: false,
             is_preview: false,
+            is_closable: true,
         });
     }
 
@@ -11460,6 +11463,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: i == panel.active_tab,
                 is_dirty: false,
                 is_preview: false,
+                is_closable: true,
             })
             .collect();
 
@@ -11469,6 +11473,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: false,
                 is_dirty: false,
                 is_preview: false,
+                is_closable: true,
             });
         }
 
