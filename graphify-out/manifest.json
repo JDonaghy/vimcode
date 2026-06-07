@@ -1,0 +1,362 @@
+{
+  "/home/john/src/vimcode/src/core/ai.rs": {
+    "mtime": 1778964130.6551228,
+    "ast_hash": "5190ce20f1aec40c50f60f4333636092",
+    "semantic_hash": "5190ce20f1aec40c50f60f4333636092"
+  },
+  "/home/john/src/vimcode/src/core/buffer.rs": {
+    "mtime": 1778964130.6551974,
+    "ast_hash": "9aeeb481bbe61998543f2a91c6526e23",
+    "semantic_hash": "9aeeb481bbe61998543f2a91c6526e23"
+  },
+  "/home/john/src/vimcode/src/core/buffer_manager.rs": {
+    "mtime": 1779039168.439341,
+    "ast_hash": "e48449f95c2965f047713554374585ef",
+    "semantic_hash": "e48449f95c2965f047713554374585ef"
+  },
+  "/home/john/src/vimcode/src/core/comment.rs": {
+    "mtime": 1778964130.6551974,
+    "ast_hash": "1f352f97757d8b17bd7dfa5e5628d45d",
+    "semantic_hash": "1f352f97757d8b17bd7dfa5e5628d45d"
+  },
+  "/home/john/src/vimcode/src/core/cursor.rs": {
+    "mtime": 1778964130.6551974,
+    "ast_hash": "4e2d06557c80b6341baeca877e87b446",
+    "semantic_hash": "4e2d06557c80b6341baeca877e87b446"
+  },
+  "/home/john/src/vimcode/src/core/dap.rs": {
+    "mtime": 1778964130.6551974,
+    "ast_hash": "d3fb816c86f8bf021fd9a672777b090a",
+    "semantic_hash": "d3fb816c86f8bf021fd9a672777b090a"
+  },
+  "/home/john/src/vimcode/src/core/dap_manager.rs": {
+    "mtime": 1778964130.6551974,
+    "ast_hash": "401912b859ff3fea0f96880c0ed8ec54",
+    "semantic_hash": "401912b859ff3fea0f96880c0ed8ec54"
+  },
+  "/home/john/src/vimcode/src/core/engine/accessors.rs": {
+    "mtime": 1778964141.539516,
+    "ast_hash": "d8da16b0094b13687086601c68fa17c2",
+    "semantic_hash": "d8da16b0094b13687086601c68fa17c2"
+  },
+  "/home/john/src/vimcode/src/core/engine/buffers.rs": {
+    "mtime": 1779039168.439341,
+    "ast_hash": "1cb8628166e533af700b4f0248605d3c",
+    "semantic_hash": "1cb8628166e533af700b4f0248605d3c"
+  },
+  "/home/john/src/vimcode/src/core/engine/dap_ops.rs": {
+    "mtime": 1780445186.9128952,
+    "ast_hash": "5ef7dc8ddd37325f187d2857b6437561",
+    "semantic_hash": "5ef7dc8ddd37325f187d2857b6437561"
+  },
+  "/home/john/src/vimcode/src/core/engine/execute.rs": {
+    "mtime": 1779060184.2742274,
+    "ast_hash": "7e4cb9caf3957efc948bedb87f2bb5ae",
+    "semantic_hash": "7e4cb9caf3957efc948bedb87f2bb5ae"
+  },
+  "/home/john/src/vimcode/src/core/engine/explorer_ops.rs": {
+    "mtime": 1778964141.540516,
+    "ast_hash": "10410be72d6a1ae5a8379899affd12e5",
+    "semantic_hash": "10410be72d6a1ae5a8379899affd12e5"
+  },
+  "/home/john/src/vimcode/src/core/engine/ext_panel.rs": {
+    "mtime": 1779239993.8215444,
+    "ast_hash": "190a679bb0df6272e7032e337f03e12c",
+    "semantic_hash": "190a679bb0df6272e7032e337f03e12c"
+  },
+  "/home/john/src/vimcode/src/core/engine/keys.rs": {
+    "mtime": 1779233155.3354323,
+    "ast_hash": "f9d8ed8396ff4ed6700430b6a176cbf4",
+    "semantic_hash": "f9d8ed8396ff4ed6700430b6a176cbf4"
+  },
+  "/home/john/src/vimcode/src/core/engine/lsp_ops.rs": {
+    "mtime": 1779113901.3210785,
+    "ast_hash": "a4972db868c16ce41fbfb21360278742",
+    "semantic_hash": "a4972db868c16ce41fbfb21360278742"
+  },
+  "/home/john/src/vimcode/src/core/engine/mod.rs": {
+    "mtime": 1780851920.1673598,
+    "ast_hash": "4e722562ebee30f0a54031273702d2a1",
+    "semantic_hash": "4e722562ebee30f0a54031273702d2a1"
+  },
+  "/home/john/src/vimcode/src/core/engine/motions.rs": {
+    "mtime": 1779233155.3364325,
+    "ast_hash": "774a0f5052dd00183498071234f2c1f1",
+    "semantic_hash": "774a0f5052dd00183498071234f2c1f1"
+  },
+  "/home/john/src/vimcode/src/core/engine/panels.rs": {
+    "mtime": 1780077281.9211504,
+    "ast_hash": "fbd0026164ffbcf40933a34095aa0112",
+    "semantic_hash": "fbd0026164ffbcf40933a34095aa0112"
+  },
+  "/home/john/src/vimcode/src/core/engine/picker.rs": {
+    "mtime": 1779239993.8235445,
+    "ast_hash": "24cf4cff5311c89c0eb475a5b13decae",
+    "semantic_hash": "24cf4cff5311c89c0eb475a5b13decae"
+  },
+  "/home/john/src/vimcode/src/core/engine/plugins.rs": {
+    "mtime": 1778964141.5445158,
+    "ast_hash": "6168dd5157a912e5273b2258502d8c38",
+    "semantic_hash": "6168dd5157a912e5273b2258502d8c38"
+  },
+  "/home/john/src/vimcode/src/core/engine/search.rs": {
+    "mtime": 1779239993.8235445,
+    "ast_hash": "cbd8b396a80dacee21458835f5cc8b63",
+    "semantic_hash": "cbd8b396a80dacee21458835f5cc8b63"
+  },
+  "/home/john/src/vimcode/src/core/engine/sidebar.rs": {
+    "mtime": 1778964141.5445158,
+    "ast_hash": "75a363617d6045908574960114df0b2d",
+    "semantic_hash": "75a363617d6045908574960114df0b2d"
+  },
+  "/home/john/src/vimcode/src/core/engine/source_control.rs": {
+    "mtime": 1780851920.1683598,
+    "ast_hash": "f19db9d0074d54b1e83da3e9ead759bb",
+    "semantic_hash": "f19db9d0074d54b1e83da3e9ead759bb"
+  },
+  "/home/john/src/vimcode/src/core/engine/spell_ops.rs": {
+    "mtime": 1778964130.6606803,
+    "ast_hash": "b2a405172b853de20bd40353f407e917",
+    "semantic_hash": "b2a405172b853de20bd40353f407e917"
+  },
+  "/home/john/src/vimcode/src/core/engine/terminal_ops.rs": {
+    "mtime": 1779039168.4423409,
+    "ast_hash": "2ba46829d9d782f9c7c0a1597db1b2a0",
+    "semantic_hash": "2ba46829d9d782f9c7c0a1597db1b2a0"
+  },
+  "/home/john/src/vimcode/src/core/engine/tests.rs": {
+    "mtime": 1780445186.917895,
+    "ast_hash": "2dd534fba3f0479847ada98f17f07f3c",
+    "semantic_hash": "2dd534fba3f0479847ada98f17f07f3c"
+  },
+  "/home/john/src/vimcode/src/core/engine/visual.rs": {
+    "mtime": 1778964141.5485158,
+    "ast_hash": "532f2dbfd93d328a9a043515bcfae93b",
+    "semantic_hash": "532f2dbfd93d328a9a043515bcfae93b"
+  },
+  "/home/john/src/vimcode/src/core/engine/vscode.rs": {
+    "mtime": 1778982613.821837,
+    "ast_hash": "7ec30baa50ce260b7649a2d2a63891f9",
+    "semantic_hash": "7ec30baa50ce260b7649a2d2a63891f9"
+  },
+  "/home/john/src/vimcode/src/core/engine/windows.rs": {
+    "mtime": 1779113901.3220785,
+    "ast_hash": "24781fa5b9364112b23cc0d606614e63",
+    "semantic_hash": "24781fa5b9364112b23cc0d606614e63"
+  },
+  "/home/john/src/vimcode/src/core/extensions.rs": {
+    "mtime": 1779113901.3220785,
+    "ast_hash": "66104b4a40d0d61b846a0d72ba8757b4",
+    "semantic_hash": "66104b4a40d0d61b846a0d72ba8757b4"
+  },
+  "/home/john/src/vimcode/src/core/git.rs": {
+    "mtime": 1778964141.5495157,
+    "ast_hash": "915c66b720dc796334102f56c8c9d973",
+    "semantic_hash": "915c66b720dc796334102f56c8c9d973"
+  },
+  "/home/john/src/vimcode/src/core/lsp.rs": {
+    "mtime": 1779113901.3220785,
+    "ast_hash": "5f094197d22864f5ea2e1ca2fa6c0a64",
+    "semantic_hash": "5f094197d22864f5ea2e1ca2fa6c0a64"
+  },
+  "/home/john/src/vimcode/src/core/lsp_manager.rs": {
+    "mtime": 1779113901.3220785,
+    "ast_hash": "e319531e4bf9924e2f59296daeafc26a",
+    "semantic_hash": "e319531e4bf9924e2f59296daeafc26a"
+  },
+  "/home/john/src/vimcode/src/core/markdown.rs": {
+    "mtime": 1780077281.9241505,
+    "ast_hash": "8acacab6c8b3008feb40202ecedd4572",
+    "semantic_hash": "8acacab6c8b3008feb40202ecedd4572"
+  },
+  "/home/john/src/vimcode/src/core/mod.rs": {
+    "mtime": 1778964141.5495157,
+    "ast_hash": "1012873ae9c74b2fbbc4f1422631d517",
+    "semantic_hash": "1012873ae9c74b2fbbc4f1422631d517"
+  },
+  "/home/john/src/vimcode/src/core/mode.rs": {
+    "mtime": 1778964130.67168,
+    "ast_hash": "d89886ba4ca51e007a85d0fb2d49cc0b",
+    "semantic_hash": "d89886ba4ca51e007a85d0fb2d49cc0b"
+  },
+  "/home/john/src/vimcode/src/core/paths.rs": {
+    "mtime": 1778964130.67168,
+    "ast_hash": "a0a215aa517b7df11652364f8c0e6dfc",
+    "semantic_hash": "a0a215aa517b7df11652364f8c0e6dfc"
+  },
+  "/home/john/src/vimcode/src/core/plugin.rs": {
+    "mtime": 1778964141.5505157,
+    "ast_hash": "3533729b9cfd8854043ac4334bcd02fa",
+    "semantic_hash": "3533729b9cfd8854043ac4334bcd02fa"
+  },
+  "/home/john/src/vimcode/src/core/project_search.rs": {
+    "mtime": 1778964130.67168,
+    "ast_hash": "1c9b221b19ec8b74adecf8daaf3e710c",
+    "semantic_hash": "1c9b221b19ec8b74adecf8daaf3e710c"
+  },
+  "/home/john/src/vimcode/src/core/registry.rs": {
+    "mtime": 1778964130.67168,
+    "ast_hash": "ecdf4ed898adae00a8fc7221e36da381",
+    "semantic_hash": "ecdf4ed898adae00a8fc7221e36da381"
+  },
+  "/home/john/src/vimcode/src/core/session.rs": {
+    "mtime": 1778964130.67168,
+    "ast_hash": "7e70c270cb837e23ae197dfce50275bc",
+    "semantic_hash": "7e70c270cb837e23ae197dfce50275bc"
+  },
+  "/home/john/src/vimcode/src/core/settings.rs": {
+    "mtime": 1779039168.4453406,
+    "ast_hash": "236f155c2c28840021a9285da5505a2c",
+    "semantic_hash": "236f155c2c28840021a9285da5505a2c"
+  },
+  "/home/john/src/vimcode/src/core/spell.rs": {
+    "mtime": 1778964141.5505157,
+    "ast_hash": "31bbe71593182860b25d5a25a5243775",
+    "semantic_hash": "31bbe71593182860b25d5a25a5243775"
+  },
+  "/home/john/src/vimcode/src/core/swap.rs": {
+    "mtime": 1778964130.6726801,
+    "ast_hash": "71abc6d4911186f669a8c7fae75674bc",
+    "semantic_hash": "71abc6d4911186f669a8c7fae75674bc"
+  },
+  "/home/john/src/vimcode/src/core/syntax.rs": {
+    "mtime": 1778964130.6726801,
+    "ast_hash": "d663ac6ba8b18176adc804b5cf0eb9a9",
+    "semantic_hash": "d663ac6ba8b18176adc804b5cf0eb9a9"
+  },
+  "/home/john/src/vimcode/src/core/tab.rs": {
+    "mtime": 1778964130.6726801,
+    "ast_hash": "5e58bd5cd6a0bd2e362a9b430b0fa7e7",
+    "semantic_hash": "5e58bd5cd6a0bd2e362a9b430b0fa7e7"
+  },
+  "/home/john/src/vimcode/src/core/terminal.rs": {
+    "mtime": 1778964130.6726801,
+    "ast_hash": "3e99aa203b12a535f0b896fdd4df40b5",
+    "semantic_hash": "3e99aa203b12a535f0b896fdd4df40b5"
+  },
+  "/home/john/src/vimcode/src/core/view.rs": {
+    "mtime": 1778964141.5505157,
+    "ast_hash": "0d5faf481fe087b6763f417971a9b5a9",
+    "semantic_hash": "0d5faf481fe087b6763f417971a9b5a9"
+  },
+  "/home/john/src/vimcode/src/core/window.rs": {
+    "mtime": 1778964130.67368,
+    "ast_hash": "3c687df2e1c01e02e70ea90b51792044",
+    "semantic_hash": "3c687df2e1c01e02e70ea90b51792044"
+  },
+  "/home/john/src/vimcode/src/gtk/backend.rs": {
+    "mtime": 1778964141.5505157,
+    "ast_hash": "70de490ba94b19932ec7ebad14517f1a",
+    "semantic_hash": "70de490ba94b19932ec7ebad14517f1a"
+  },
+  "/home/john/src/vimcode/src/gtk/click.rs": {
+    "mtime": 1778986783.3867567,
+    "ast_hash": "927522e6c1a738e6c951a9e878252bd3",
+    "semantic_hash": "927522e6c1a738e6c951a9e878252bd3"
+  },
+  "/home/john/src/vimcode/src/gtk/css.rs": {
+    "mtime": 1778964141.5505157,
+    "ast_hash": "159e48b084f5ae1fc346a5320f365f4d",
+    "semantic_hash": "159e48b084f5ae1fc346a5320f365f4d"
+  },
+  "/home/john/src/vimcode/src/gtk/draw.rs": {
+    "mtime": 1780851920.1683598,
+    "ast_hash": "b6c55eaea9729835230d2f74fcc9c716",
+    "semantic_hash": "b6c55eaea9729835230d2f74fcc9c716"
+  },
+  "/home/john/src/vimcode/src/gtk/events.rs": {
+    "mtime": 1778964141.5525157,
+    "ast_hash": "2b037bcaed2978ad3573dd70b74b8bec",
+    "semantic_hash": "2b037bcaed2978ad3573dd70b74b8bec"
+  },
+  "/home/john/src/vimcode/src/gtk/explorer.rs": {
+    "mtime": 1778964141.5525157,
+    "ast_hash": "545d226fb651bb21da1eb0f79917b78e",
+    "semantic_hash": "545d226fb651bb21da1eb0f79917b78e"
+  },
+  "/home/john/src/vimcode/src/gtk/mod.rs": {
+    "mtime": 1780851920.1703598,
+    "ast_hash": "515342cc224f833eae58ba5c7a69d39b",
+    "semantic_hash": "515342cc224f833eae58ba5c7a69d39b"
+  },
+  "/home/john/src/vimcode/src/gtk/quadraui_gtk.rs": {
+    "mtime": 1779218167.0948174,
+    "ast_hash": "222945b1e8cd4d41070fe980a48c420d",
+    "semantic_hash": "222945b1e8cd4d41070fe980a48c420d"
+  },
+  "/home/john/src/vimcode/src/gtk/services.rs": {
+    "mtime": 1778964141.5545156,
+    "ast_hash": "ba420b88c2732181a2e4593e0c4ca25a",
+    "semantic_hash": "ba420b88c2732181a2e4593e0c4ca25a"
+  },
+  "/home/john/src/vimcode/src/gtk/util.rs": {
+    "mtime": 1780445186.921895,
+    "ast_hash": "4ff50340c58d201b422033d1a857cbb8",
+    "semantic_hash": "4ff50340c58d201b422033d1a857cbb8"
+  },
+  "/home/john/src/vimcode/src/icons.rs": {
+    "mtime": 1778964130.67868,
+    "ast_hash": "115f76a0e0ad57324f3d8f715484c60a",
+    "semantic_hash": "115f76a0e0ad57324f3d8f715484c60a"
+  },
+  "/home/john/src/vimcode/src/lib.rs": {
+    "mtime": 1778964141.5545156,
+    "ast_hash": "7d3767c2b865a62b1419796bd18333cf",
+    "semantic_hash": "7d3767c2b865a62b1419796bd18333cf"
+  },
+  "/home/john/src/vimcode/src/main.rs": {
+    "mtime": 1778964141.5545156,
+    "ast_hash": "8ebfe739c0ecd0702e8439c8b56aa71e",
+    "semantic_hash": "8ebfe739c0ecd0702e8439c8b56aa71e"
+  },
+  "/home/john/src/vimcode/src/render.rs": {
+    "mtime": 1780851920.1723597,
+    "ast_hash": "0d3a7ea8dc2bc17257c6d8c167a50948",
+    "semantic_hash": "0d3a7ea8dc2bc17257c6d8c167a50948"
+  },
+  "/home/john/src/vimcode/src/tui_bin.rs": {
+    "mtime": 1778964130.68168,
+    "ast_hash": "add845861fb9a1d01e5bc5fb517f4789",
+    "semantic_hash": "add845861fb9a1d01e5bc5fb517f4789"
+  },
+  "/home/john/src/vimcode/src/tui_main/backend.rs": {
+    "mtime": 1778964141.5565157,
+    "ast_hash": "8324d933eb36e69df49dbe32e8e80bc7",
+    "semantic_hash": "8324d933eb36e69df49dbe32e8e80bc7"
+  },
+  "/home/john/src/vimcode/src/tui_main/events.rs": {
+    "mtime": 1778964141.5565157,
+    "ast_hash": "697edf874b66bb2a379af817593b3324",
+    "semantic_hash": "697edf874b66bb2a379af817593b3324"
+  },
+  "/home/john/src/vimcode/src/tui_main/mod.rs": {
+    "mtime": 1780445186.924895,
+    "ast_hash": "66c206b04afbb362252dce7b546680d0",
+    "semantic_hash": "66c206b04afbb362252dce7b546680d0"
+  },
+  "/home/john/src/vimcode/src/tui_main/mouse.rs": {
+    "mtime": 1780851920.1733599,
+    "ast_hash": "a778cbada85c8c7ca59f5cf76220a543",
+    "semantic_hash": "a778cbada85c8c7ca59f5cf76220a543"
+  },
+  "/home/john/src/vimcode/src/tui_main/panels.rs": {
+    "mtime": 1780851920.1743598,
+    "ast_hash": "9a9662ac5ba9b9dd378574ecff7c09f6",
+    "semantic_hash": "9a9662ac5ba9b9dd378574ecff7c09f6"
+  },
+  "/home/john/src/vimcode/src/tui_main/quadraui_tui.rs": {
+    "mtime": 1778964141.5585155,
+    "ast_hash": "9925131fc4b845816971f4ea2439affe",
+    "semantic_hash": "9925131fc4b845816971f4ea2439affe"
+  },
+  "/home/john/src/vimcode/src/tui_main/render_impl.rs": {
+    "mtime": 1780445186.925895,
+    "ast_hash": "ded5f43ec046c5ac6fd7f4829f15bf6d",
+    "semantic_hash": "ded5f43ec046c5ac6fd7f4829f15bf6d"
+  },
+  "/home/john/src/vimcode/src/tui_main/services.rs": {
+    "mtime": 1778964141.5595155,
+    "ast_hash": "a521d0e2b5e56680315b33a975412e06",
+    "semantic_hash": "a521d0e2b5e56680315b33a975412e06"
+  }
+}
