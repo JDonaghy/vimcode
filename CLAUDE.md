@@ -15,6 +15,15 @@
 
 **Never edit the quadraui repo directly.** The vimcode agent must not modify files under `~/src/quadraui/`. File a GitHub issue on `JDonaghy/quadraui` describing the gap, then wait for the user to confirm the quadraui change has landed.
 
+## Codebase navigation — query the graph first
+
+This repo ships a **graphify** knowledge graph in `graphify-out/` (`graph.json`,
+`GRAPH_REPORT.md`), kept current automatically by `post-commit` / `post-checkout`
+git hooks. For any architecture / "where is this handled" / "what calls this" /
+file-relationship question, **query the graph first** (the `graphify` skill, or the
+graphify CLI) before reaching for grep/Read. Grep/Read are for exact-string or
+line-level confirmation — not the first move.
+
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
 2. Read `PLAN.md` if present — pickup doc for in-flight multi-stage features
