@@ -1557,30 +1557,79 @@ pub(super) fn draw_editor_hover_popup(
         active_win.rect.height as f32,
     );
     let measure = quadraui::RichTextPopupMeasure::new(content_w as f32, line_height as f32);
-    let cw = char_width as f32;
+
+    // #488: measure link spans with the same proportional UI font the
+    // rasteriser paints with. The old approach counted `chars() × char_width`
+    // (editor-monospace approximation) which diverged from the proportional
+    // UI font — positions drifted by several pixels per word, so most links'
+    // hit-rects landed to the left of the actual glyph run. Using Pango's
+    // `index_to_pos` with the UI font makes `link_hit_regions` match the
+    // painted glyphs exactly.
+    let ui_font_desc_for_measure = FontDescription::from_string(&UI_FONT());
+    // Save the pango layout's current font + attrs so we can restore after the
+    // measurement calls inside the closure. Without this the rasteriser's
+    // `saved_font = pango_layout.font_description()` call would capture our
+    // temporary UI font as the "original" and "restore" the wrong font at the
+    // end of the frame — reproducing the leakage fixed in #247.
+    let saved_layout_font = layout.font_description();
     let popup_layout = popup.layout(
         anchor_x as f32,
         anchor_y as f32,
         viewport,
         measure,
-        |line_idx, start_byte, end_byte| {
-            popup
-                .line_text
-                .get(line_idx)
-                .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
-                        * cw
-                })
-                .unwrap_or(0.0)
+        |line_idx, start, end| {
+            let raw = popup.line_text.get(line_idx).map(String::as_str).unwrap_or("");
+            // Configure the shared pango layout for this line so `index_to_pos`
+            // returns the same glyph-accurate positions the rasteriser uses.
+            layout.set_text(raw);
+            layout.set_font_description(Some(&ui_font_desc_for_measure));
+            // Apply per-line font scale (markdown headings render at 1.1–1.4×)
+            // and bold/italic from styled spans — both affect glyph advance width
+            // and must match what the rasteriser sets when it paints the line.
+            let line_scale = popup.line_scales.get(line_idx).copied().unwrap_or(1.0);
+            let attrs = pango::AttrList::new();
+            if (line_scale - 1.0).abs() > 0.01 {
+                let mut a = pango::AttrFloat::new_scale(line_scale as f64);
+                a.set_start_index(0);
+                a.set_end_index(raw.len() as u32);
+                attrs.insert(a);
+            }
+            if let Some(styled) = popup.lines.get(line_idx) {
+                let mut byte_pos = 0usize;
+                for span in &styled.spans {
+                    let slen = span.text.len();
+                    let (s, e) = (byte_pos as u32, (byte_pos + slen) as u32);
+                    if span.bold {
+                        let mut a = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        a.set_start_index(s);
+                        a.set_end_index(e);
+                        attrs.insert(a);
+                    }
+                    if span.italic {
+                        let mut a = pango::AttrInt::new_style(pango::Style::Italic);
+                        a.set_start_index(s);
+                        a.set_end_index(e);
+                        attrs.insert(a);
+                    }
+                    byte_pos += slen;
+                }
+            }
+            layout.set_attributes(Some(&attrs));
+            // `link_widths(line, 0, start_byte)` → x offset of link start from
+            // line origin; `link_widths(line, start_byte, end_byte)` → span width.
+            // Both reduce to (end_pos.x - start_pos.x) / SCALE.
+            let sp = layout.index_to_pos(start.min(raw.len()) as i32);
+            let ep = layout.index_to_pos(end.min(raw.len()) as i32);
+            ((ep.x() - sp.x()) as f32 / pango::SCALE as f32).max(0.0)
         },
     );
+    // Restore the pango layout to the editor's monospace font so subsequent
+    // paints in this frame are unaffected (#247).
+    layout.set_attributes(None);
+    layout.set_font_description(saved_layout_font.as_ref());
 
-    // #469: route paint through quadraui::ScreenLayout. Recovers link
-    // hit regions from `popup_layout.link_hit_regions` (which is the
-    // same instance used by paint, so paint + click agree by
-    // construction).
+    // #469: route paint through quadraui::ScreenLayout. link_hit_regions
+    // are now glyph-accurate (Pango-measured, #488) so paint + click agree.
     use quadraui::{ScreenLayout as QScreenLayout, Surface};
     backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
         b.set_current_theme(super::quadraui_gtk::q_theme(theme));

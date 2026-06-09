@@ -15045,6 +15045,122 @@ mod tests {
         assert_eq!(styled.spans[1].fg, Some(fg));
     }
 
+    // ── editor_hover_to_quadraui_rich_text adapter tests (#488) ──────────────
+
+    /// Build a minimal `EditorHoverPopupData` with a known link on line 0 so
+    /// we can verify that `editor_hover_to_quadraui_rich_text` maps it into
+    /// `RichTextPopup.links` with the correct byte offsets.  These offsets are
+    /// exactly what the GTK `link_widths` closure indexes into via
+    /// `pango_layout.index_to_pos(start_byte)` — wrong offsets would shift the
+    /// hit-rect even if the Pango measurement itself is accurate (#488).
+    #[test]
+    fn test_editor_hover_to_quadraui_rich_text_link_offsets() {
+        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
+
+        let line = "See https://example.com for details";
+        // byte offsets of "https://example.com": starts at 4, ends at 23
+        let link_start = 4usize;
+        let link_end = 23usize;
+        assert_eq!(&line[link_start..link_end], "https://example.com");
+
+        let rendered = MdRendered {
+            lines: vec![line.to_string()],
+            spans: vec![vec![MdSpan {
+                start_byte: link_start,
+                end_byte: link_end,
+                style: MdStyle::LinkUrl,
+            }]],
+            code_highlights: vec![vec![]],
+        };
+        let eh = EditorHoverPopupData {
+            rendered,
+            links: vec![(0, link_start, link_end, "https://example.com".to_string())],
+            anchor_line: 0,
+            anchor_col: 0,
+            scroll_top: 0,
+            focused_link: None,
+            has_focus: false,
+            popup_width: 40,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        };
+        let theme = Theme::onedark();
+        let popup = editor_hover_to_quadraui_rich_text(&eh, &theme);
+
+        // Exactly one link.
+        assert_eq!(popup.links.len(), 1, "one link expected");
+        let link = &popup.links[0];
+        // Byte offsets must survive the conversion unchanged.
+        assert_eq!(link.line, 0);
+        assert_eq!(link.start_byte, link_start,
+            "start_byte mismatch — GTK index_to_pos would compute wrong x0");
+        assert_eq!(link.end_byte, link_end,
+            "end_byte mismatch — GTK index_to_pos would compute wrong x1");
+        assert_eq!(link.url, "https://example.com");
+        // line_text[0] must equal the raw line so index_to_pos byte indices are valid.
+        assert_eq!(popup.line_text.get(0).map(String::as_str), Some(line),
+            "line_text must carry the raw text unchanged");
+        // Sanity: the byte range must index valid UTF-8 within line_text.
+        let raw = &popup.line_text[0];
+        assert_eq!(&raw[link.start_byte..link.end_byte], "https://example.com");
+    }
+
+    /// Multi-link hover: two URLs on different lines.  Verifies that lines and
+    /// link indices stay in sync after the adapter — an off-by-one in `links`
+    /// would cause the GTK closure to measure the wrong line or wrong span.
+    #[test]
+    fn test_editor_hover_to_quadraui_rich_text_multi_link() {
+        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
+
+        let line0 = "Docs: https://docs.rs/foo";
+        let line1 = "Also see https://crates.io/crates/foo";
+        // "https://docs.rs/foo" starts at 6, ends at 25
+        // "https://crates.io/crates/foo" starts at 9, ends at 37
+        let (s0, e0) = (6, 25);
+        let (s1, e1) = (9, 37);
+        assert_eq!(&line0[s0..e0], "https://docs.rs/foo");
+        assert_eq!(&line1[s1..e1], "https://crates.io/crates/foo");
+
+        let rendered = MdRendered {
+            lines: vec![line0.to_string(), line1.to_string()],
+            spans: vec![
+                vec![MdSpan { start_byte: s0, end_byte: e0, style: MdStyle::LinkUrl }],
+                vec![MdSpan { start_byte: s1, end_byte: e1, style: MdStyle::LinkUrl }],
+            ],
+            code_highlights: vec![vec![], vec![]],
+        };
+        let eh = EditorHoverPopupData {
+            rendered,
+            links: vec![
+                (0, s0, e0, "https://docs.rs/foo".to_string()),
+                (1, s1, e1, "https://crates.io/crates/foo".to_string()),
+            ],
+            anchor_line: 0,
+            anchor_col: 0,
+            scroll_top: 0,
+            focused_link: None,
+            has_focus: false,
+            popup_width: 40,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        };
+        let theme = Theme::onedark();
+        let popup = editor_hover_to_quadraui_rich_text(&eh, &theme);
+
+        assert_eq!(popup.links.len(), 2);
+        assert_eq!(popup.links[0].line, 0);
+        assert_eq!(popup.links[0].start_byte, s0);
+        assert_eq!(popup.links[0].end_byte, e0);
+        assert_eq!(popup.links[1].line, 1);
+        assert_eq!(popup.links[1].start_byte, s1);
+        assert_eq!(popup.links[1].end_byte, e1);
+        // line_text must be in sync with link offsets.
+        assert_eq!(&popup.line_text[0][s0..e0], "https://docs.rs/foo");
+        assert_eq!(&popup.line_text[1][s1..e1], "https://crates.io/crates/foo");
+    }
+
     #[test]
     fn test_tab_switcher_to_list_view_dirty_and_scroll() {
         let ts = TabSwitcherPanel {
