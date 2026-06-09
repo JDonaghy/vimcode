@@ -7983,7 +7983,9 @@ impl App {
             Msg::DebugSidebarKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.dialog.is_some() {
-                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    if !util::is_modifier_only_key(&key_name) {
+                        engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    }
                     drop(engine);
                     self.focus_editor_if_needed(false);
                     self.draw_needed.set(true);
@@ -8306,7 +8308,9 @@ impl App {
             Msg::ScKey(key_name, ctrl) => {
                 let mut engine = self.engine.borrow_mut();
                 if engine.dialog.is_some() {
-                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    if !util::is_modifier_only_key(&key_name) {
+                        engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                    }
                     drop(engine);
                     self.focus_editor_if_needed(false);
                     self.draw_needed.set(true);
@@ -8397,7 +8401,9 @@ impl App {
                 let mapped = map_gtk_key_name(key_name.as_str());
                 let mut engine = self.engine.borrow_mut();
                 if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, false);
+                    if !util::is_modifier_only_key(&key_name) {
+                        engine.handle_key(mapped, unicode, false);
+                    }
                     drop(engine);
                     self.focus_editor_if_needed(false);
                     self.draw_needed.set(true);
@@ -8479,7 +8485,9 @@ impl App {
                 let mapped = map_gtk_key_name(key_name.as_str());
                 let mut engine = self.engine.borrow_mut();
                 if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, ctrl);
+                    if !util::is_modifier_only_key(&key_name) {
+                        engine.handle_key(mapped, unicode, ctrl);
+                    }
                 } else {
                     engine.handle_settings_key(mapped, ctrl, unicode);
                 }
@@ -8667,7 +8675,9 @@ impl App {
                 let mapped = map_gtk_key_name(key_name.as_str());
                 let mut engine = self.engine.borrow_mut();
                 if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, false);
+                    if !util::is_modifier_only_key(&key_name) {
+                        engine.handle_key(mapped, unicode, false);
+                    }
                     drop(engine);
                     self.focus_editor_if_needed(false);
                 } else if engine.ext_panel_input_active {
@@ -8888,9 +8898,11 @@ impl App {
         match msg {
             Msg::AiSidebarKey(key_name, ctrl, unicode) => {
                 if self.engine.borrow().dialog.is_some() {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.handle_key(&key_name, key_name.chars().next(), ctrl);
-                    drop(engine);
+                    if !util::is_modifier_only_key(&key_name) {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.handle_key(&key_name, key_name.chars().next(), ctrl);
+                        drop(engine);
+                    }
                     self.focus_editor_if_needed(false);
                     self.draw_needed.set(true);
                     return;
@@ -9439,8 +9451,10 @@ impl App {
         // When an engine dialog is active (delete confirmation), route
         // keys to the dialog handler, not the explorer dispatch.
         if self.engine.borrow().dialog.is_some() {
-            let mapped = map_gtk_key_name(&key_name);
-            self.engine.borrow_mut().handle_key(mapped, unicode, false);
+            if !util::is_modifier_only_key(&key_name) {
+                let mapped = map_gtk_key_name(&key_name);
+                self.engine.borrow_mut().handle_key(mapped, unicode, false);
+            }
             self.draw_needed.set(true);
             return;
         }
