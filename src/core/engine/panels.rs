@@ -154,10 +154,16 @@ impl Engine {
                 }
                 None
             }
-            "Tab" | "Shift_Tab" => {
+            // "Shift_Tab" is sent by the TUI backend explicitly.
+            // "ISO_Left_Tab" is GDK's key name for Shift+Tab; "BackTab" is the
+            // value produced by map_gtk_key_name("ISO_Left_Tab").  Accept all
+            // three so backward button cycling works on both backends.
+            "Tab" | "Shift_Tab" | "ISO_Left_Tab" | "BackTab" => {
                 let len = dialog.buttons.len();
                 if len > 0 {
-                    if effective == "Shift_Tab" {
+                    let go_back =
+                        matches!(effective.as_str(), "Shift_Tab" | "ISO_Left_Tab" | "BackTab");
+                    if go_back {
                         dialog.selected = if dialog.selected > 0 {
                             dialog.selected - 1
                         } else {
@@ -195,6 +201,16 @@ impl Engine {
                             input.value.push(ch);
                         }
                     }
+                    return None;
+                }
+                // Only single-character keys can be dialog hotkeys.
+                // Multi-character key names — modifier keys ("Shift_L",
+                // "Control_R"), function keys ("F5"), named keys
+                // ("Delete"), GDK nav keys ("ISO_Left_Tab") — are NOT
+                // hotkey characters.  Without this guard the first letter
+                // of e.g. "Shift_L" is 'S', which would accidentally fire
+                // a "Save" button whose hotkey is 's'.
+                if effective.chars().count() != 1 {
                     return None;
                 }
                 // Check hotkeys (case-insensitive).

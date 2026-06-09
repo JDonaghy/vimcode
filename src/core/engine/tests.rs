@@ -14773,6 +14773,91 @@ fn test_dialog_blocks_normal_keys() {
     assert_eq!(e.buffer().to_string(), "hello"); // Buffer unchanged.
 }
 
+/// Pressing a modifier-only key name (e.g. "Shift_L" from GDK) must not fire
+/// a dialog hotkey.  Before the fix, "Shift_L".chars().next() == 'S', which
+/// was lowercased to 's' and matched a "Save" button (hotkey 's'), causing an
+/// accidental dialog confirmation whenever the user pressed Shift alone (#207).
+#[test]
+fn test_dialog_modifier_only_key_does_not_fire_hotkey() {
+    let mut e = Engine::new();
+    e.show_dialog(
+        "test",
+        "Save?",
+        vec![],
+        vec![
+            DialogButton {
+                label: "Save".into(),
+                hotkey: 's',
+                action: "save".into(),
+            },
+            DialogButton {
+                label: "Cancel".into(),
+                hotkey: '\0',
+                action: "cancel".into(),
+            },
+        ],
+    );
+    // Simulate GDK modifier-only key events — these must NOT fire the hotkey.
+    e.handle_key("Shift_L", None, false);
+    assert!(e.dialog.is_some(), "Shift_L should not fire 's' hotkey");
+    e.handle_key("Shift_R", None, false);
+    assert!(e.dialog.is_some(), "Shift_R should not fire 's' hotkey");
+    e.handle_key("Control_L", None, false);
+    assert!(e.dialog.is_some(), "Control_L should not fire hotkey");
+    e.handle_key("Control_R", None, false);
+    assert!(e.dialog.is_some(), "Control_R should not fire hotkey");
+    e.handle_key("Alt_L", None, false);
+    assert!(e.dialog.is_some(), "Alt_L should not fire hotkey");
+    // A real 's' hotkey still works.
+    e.handle_key("s", Some('s'), false);
+    assert!(e.dialog.is_none(), "'s' must still fire the Save hotkey");
+}
+
+/// Shift+Tab (sent as "ISO_Left_Tab" by GDK or "BackTab" after map_gtk_key_name)
+/// must cycle the dialog selection backward (#207 side-effect).
+#[test]
+fn test_dialog_shift_tab_backward_navigation() {
+    let mut e = Engine::new();
+    e.show_dialog(
+        "test",
+        "Choose",
+        vec![],
+        vec![
+            DialogButton {
+                label: "A".into(),
+                hotkey: 'a',
+                action: "a".into(),
+            },
+            DialogButton {
+                label: "B".into(),
+                hotkey: 'b',
+                action: "b".into(),
+            },
+            DialogButton {
+                label: "C".into(),
+                hotkey: 'c',
+                action: "c".into(),
+            },
+        ],
+    );
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+    // Tab → forward (0 → 1)
+    e.handle_key("Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+    // ISO_Left_Tab (GDK's Shift+Tab) → backward (1 → 0)
+    e.handle_key("ISO_Left_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+    // Backward at start wraps to last (0 → 2)
+    e.handle_key("ISO_Left_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+    // BackTab (from map_gtk_key_name("ISO_Left_Tab")) → backward (2 → 1)
+    e.handle_key("BackTab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+    // Shift_Tab (TUI explicit) → backward (1 → 0)
+    e.handle_key("Shift_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+}
+
 #[test]
 fn test_show_error_dialog() {
     let mut e = Engine::new();
