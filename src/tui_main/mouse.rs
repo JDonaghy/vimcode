@@ -2514,7 +2514,7 @@ pub(super) fn handle_mouse(
 
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
-    sidebar.toolbar_focused = false;
+    engine.activity_bar_focused = false;
     engine.explorer_has_focus = false;
     engine.sc_set_focus(false);
     engine.dap_sidebar_has_focus = false;

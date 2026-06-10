@@ -137,3 +137,147 @@ impl Engine {
         let _ = self.session.save();
     }
 }
+
+// ─── Activity-bar keyboard focus state machine ────────────────────────────────
+
+/// Outcome of activating (l/Enter) the currently selected activity bar item.
+pub enum ActivityBarActivation {
+    /// The menu-bar visibility was toggled.
+    MenuToggled,
+    /// A named sidebar panel was focused and made visible.
+    PanelFocused,
+    /// An extension panel (plugin-provided) was focused. Field is the panel name.
+    ExtPanelFocused(String),
+    /// Index was out of range; nothing happened.
+    NoOp,
+}
+
+impl Engine {
+    /// Give the activity bar keyboard focus at a specific toolbar index.
+    ///
+    /// Index mapping: 0=menu, 1=Explorer, 2=Search, 3=Debug, 4=Git,
+    /// 5=Extensions, 6=AI, 7=Settings, 8+=extension panels (sorted by name).
+    pub fn activity_bar_focus_in_at(&mut self, idx: u16) {
+        self.activity_bar_focused = true;
+        self.activity_bar_selected = idx;
+    }
+
+    /// Return the toolbar index that corresponds to the currently active panel.
+    /// Falls back to 1 (Explorer) for unknown/extension panels.
+    pub fn activity_bar_toolbar_idx_for_active_panel(&self) -> u16 {
+        let id = self
+            .app_shell
+            .active_panel_id()
+            .map(|w| w.as_str())
+            .unwrap_or("");
+        match id {
+            PANEL_EXPLORER => 1,
+            PANEL_SEARCH => 2,
+            PANEL_DEBUG => 3,
+            PANEL_GIT => 4,
+            PANEL_EXTENSIONS => 5,
+            PANEL_AI => 6,
+            PANEL_SETTINGS => 7,
+            _ => 1,
+        }
+    }
+
+    /// Remove activity bar keyboard focus (return focus to the editor).
+    pub fn activity_bar_focus_out(&mut self) {
+        self.activity_bar_focused = false;
+    }
+
+    /// Move the keyboard cursor one position down in the activity bar.
+    pub fn activity_bar_move_down(&mut self) {
+        let ext_count = self.ext_panels.len() as u16;
+        let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
+        let sel = self.activity_bar_selected;
+        if sel < 6 {
+            self.activity_bar_selected = sel + 1;
+        } else if sel == 6 && ext_count > 0 {
+            self.activity_bar_selected = 8; // first ext panel
+        } else if sel == 6 {
+            self.activity_bar_selected = 7; // settings
+        } else if sel >= 8 && sel < max_ext {
+            self.activity_bar_selected = sel + 1;
+        } else if sel >= 8 && sel == max_ext {
+            self.activity_bar_selected = 7; // settings
+        }
+        // sel == 7 (settings) → no movement (already at bottom)
+    }
+
+    /// Move the keyboard cursor one position up in the activity bar.
+    pub fn activity_bar_move_up(&mut self) {
+        let ext_count = self.ext_panels.len() as u16;
+        let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
+        let sel = self.activity_bar_selected;
+        if sel == 7 && ext_count > 0 {
+            self.activity_bar_selected = max_ext; // settings → last ext
+        } else if sel == 7 {
+            self.activity_bar_selected = 6; // settings → AI
+        } else if sel == 8 {
+            self.activity_bar_selected = 6; // first ext → AI
+        } else if sel > 8 {
+            self.activity_bar_selected = sel - 1;
+        } else {
+            self.activity_bar_selected = sel.saturating_sub(1);
+        }
+    }
+
+    /// Activate the currently selected activity bar item (l/Enter).
+    ///
+    /// Clears `activity_bar_focused` and updates engine state to focus the
+    /// chosen panel. The backend should inspect the returned
+    /// `ActivityBarActivation` to perform any backend-specific follow-up
+    /// (e.g. setting `sidebar.has_focus`, closing TUI menu).
+    pub fn activity_bar_activate(&mut self) -> ActivityBarActivation {
+        let sel = self.activity_bar_selected;
+        self.activity_bar_focused = false;
+        match sel {
+            0 => {
+                self.toggle_menu_bar();
+                ActivityBarActivation::MenuToggled
+            }
+            1..=6 => {
+                let panel_id = match sel {
+                    1 => PANEL_EXPLORER,
+                    2 => PANEL_SEARCH,
+                    3 => PANEL_DEBUG,
+                    4 => PANEL_GIT,
+                    5 => PANEL_EXTENSIONS,
+                    _ => PANEL_AI,
+                };
+                self.ext_panel_has_focus = false;
+                self.ext_panel_active = None;
+                self.focus_sidebar_panel(panel_id);
+                ActivityBarActivation::PanelFocused
+            }
+            7 => {
+                self.ext_panel_has_focus = false;
+                self.ext_panel_active = None;
+                self.focus_sidebar_panel(PANEL_SETTINGS);
+                ActivityBarActivation::PanelFocused
+            }
+            idx => {
+                let ext_idx = (idx - 8) as usize;
+                let mut ext_names: Vec<_> = self.ext_panels.keys().cloned().collect();
+                ext_names.sort();
+                if ext_idx < ext_names.len() {
+                    let name = ext_names[ext_idx].clone();
+                    if !self.app_shell.sidebar_visible() {
+                        self.app_shell.show_panel(&quadraui::WidgetId::new(&name));
+                        self.session.explorer_visible = true;
+                        let _ = self.session.save();
+                    }
+                    self.ext_panel_active = Some(name.clone());
+                    self.ext_panel_has_focus = true;
+                    self.ext_panel_selected = 0;
+                    self.plugin_event("panel_focus", &name);
+                    ActivityBarActivation::ExtPanelFocused(name)
+                } else {
+                    ActivityBarActivation::NoOp
+                }
+            }
+        }
+    }
+}

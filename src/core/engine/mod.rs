@@ -2397,6 +2397,15 @@ pub struct Engine {
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
     pub window_nav_overflow: Option<bool>,
 
+    /// True when the activity bar (toolbar) has keyboard focus.
+    /// Shared between TUI and GTK backends; both read from this field
+    /// for key routing and rendering.
+    pub activity_bar_focused: bool,
+    /// Keyboard-cursor index within the activity bar while focused.
+    /// 0=menu, 1=Explorer, 2=Search, 3=Debug, 4=Git, 5=Extensions,
+    /// 6=AI, 7=Settings, 8+=extension panels (sorted by name).
+    pub activity_bar_selected: u16,
+
     // --- Registers (yank/delete storage) ---
     /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
     pub registers: HashMap<char, (String, bool)>,
@@ -3508,6 +3517,8 @@ impl Engine {
             keymap_buf: Vec::new(),
             keymap_replaying: false,
             window_nav_overflow: None,
+            activity_bar_focused: false,
+            activity_bar_selected: 1,
             registers: HashMap::new(),
             selected_register: None,
             marks: HashMap::new(),

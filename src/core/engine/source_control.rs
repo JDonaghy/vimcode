@@ -9,6 +9,8 @@ pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:syn
 pub enum ScKeyResult {
     Consumed,
     Unfocused,
+    /// h/Left from the SC panel moved focus to the activity bar at the Git row.
+    FocusActivityBar,
 }
 
 impl Engine {
@@ -1385,6 +1387,20 @@ impl Engine {
         unicode: Option<char>,
     ) -> ScKeyResult {
         use quadraui::{Key, NamedKey};
+
+        // h/Left: move focus to the activity bar (Git row) when not in a sub-mode.
+        if (key == "h" || key == "Left")
+            && !ctrl
+            && !self.sc_help_open
+            && !self.sc_branch_picker_open
+            && !self.sc_branch_create_mode
+            && !self.sc_commit_input_active
+            && self.sc_button_focused.is_none()
+        {
+            self.sc_set_focus(false);
+            self.activity_bar_focus_in_at(4);
+            return ScKeyResult::FocusActivityBar;
+        }
 
         if self.sc_help_open {
             self.sc_help_open = false;

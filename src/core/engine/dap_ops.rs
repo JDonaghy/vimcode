@@ -768,11 +768,16 @@ impl Engine {
 
     /// Handle action keys that `SidebarSystem` didn't consume
     /// (returned `Ignored`). Shared between TUI and GTK backends.
-    /// Returns `true` if the sidebar lost focus (q/Esc).
+    /// Returns `true` if the sidebar lost focus (q/Esc/h).
     pub fn dispatch_dap_sidebar_action_key(&mut self, key_name: &str) -> bool {
         match key_name {
             "Escape" | "q" => {
                 self.dap_sidebar_has_focus = false;
+                true
+            }
+            "h" | "Left" => {
+                self.dap_sidebar_has_focus = false;
+                self.activity_bar_focus_in_at(3);
                 true
             }
             "x" | "d" => {

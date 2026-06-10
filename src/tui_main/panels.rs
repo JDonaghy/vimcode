@@ -9,8 +9,8 @@ pub(super) fn render_activity_bar(
     engine: &Engine,
 ) {
     // A.6e: activity bar rendering delegates to the `quadraui::ActivityBar`
-    // primitive. Build the declarative state from TuiSidebar + Engine,
-    // then call `draw_activity_bar`.
+    // primitive. Build the declarative state from Engine (keyboard focus) +
+    // TuiSidebar (ext panel name), then call `draw_activity_bar`.
     let bar = build_activity_bar_primitive(sidebar, engine, theme);
     super::quadraui_tui::draw_activity_bar(buf, area, &bar, theme);
 }
@@ -29,7 +29,8 @@ fn build_activity_bar_primitive(
     engine: &Engine,
     theme: &Theme,
 ) -> quadraui::ActivityBar {
-    let kbd_sel = |idx: u16| sidebar.toolbar_focused && sidebar.toolbar_selected == idx;
+    // Keyboard highlight uses engine state (shared with GTK).
+    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
     let sb_visible = engine.app_shell.sidebar_visible();
     let has_ext_panel = sidebar.ext_panel_name.is_some();
     let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
