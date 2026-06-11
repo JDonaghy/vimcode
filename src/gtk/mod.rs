@@ -468,8 +468,9 @@ struct App {
 ///   · dynamically-registered extension panels (sorted by name)
 /// * Bottom: settings
 ///
-/// GTK has no keyboard-focused highlight (mouse-driven UX), so every
-/// `is_keyboard_selected` is false. Hover state is layered in by the
+/// `is_keyboard_selected` is set from `engine.activity_bar_focused` +
+/// `engine.activity_bar_selected` so the keyboard cursor renders on both
+/// backends using the same engine state. Hover state is layered in by the
 /// draw function via a separate `hovered_idx` parameter.
 fn build_gtk_activity_bar_primitive(
     engine: &crate::core::engine::Engine,
@@ -479,59 +480,77 @@ fn build_gtk_activity_bar_primitive(
     let sb_visible = engine.app_shell.sidebar_visible();
     let has_ext = engine.ext_panel_active.is_some();
     let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
+    // Keyboard highlight: index 1-6 map to the fixed panel items (0-based in top[]).
+    // top[0] = hamburger (idx 0), top[1]=Explorer(1), ..., top[6]=AI(6), top[7+]=ext panels.
+    // bottom[0] = settings (idx 7).
+    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
 
-    let fixed = [
+    // Note: GTK doesn't show a hamburger menu button (item 0) in the fixed list
+    // — the menu bar is toggled by keyboard only. The indices for fixed panels
+    // start at 1 (Explorer) matching the engine toolbar index.
+    let fixed: [(&str, &str, &str, &str, u16); 6] = [
         (
             PANEL_EXPLORER,
             icons::EXPLORER.nerd,
             "Explorer (Ctrl+Shift+E)",
             "activity:explorer",
+            1,
         ),
         (
             PANEL_SEARCH,
             icons::SEARCH_COD.nerd,
             "Search (Ctrl+Shift+F)",
             "activity:search",
+            2,
         ),
-        (PANEL_DEBUG, icons::DEBUG.nerd, "Debug", "activity:debug"),
+        (PANEL_DEBUG, icons::DEBUG.nerd, "Debug", "activity:debug", 3),
         (
             PANEL_GIT,
             icons::GIT_BRANCH.nerd,
             "Source Control",
             "activity:git",
+            4,
         ),
         (
             PANEL_EXTENSIONS,
             icons::EXTENSIONS.nerd,
             "Extensions",
             "activity:extensions",
+            5,
         ),
-        (PANEL_AI, icons::AI_CHAT.nerd, "AI Assistant", "activity:ai"),
+        (
+            PANEL_AI,
+            icons::AI_CHAT.nerd,
+            "AI Assistant",
+            "activity:ai",
+            6,
+        ),
     ];
 
     let mut top: Vec<quadraui::ActivityItem> = fixed
         .iter()
         .map(
-            |(panel_id, icon, tooltip, activity_id)| quadraui::ActivityItem {
+            |(panel_id, icon, tooltip, activity_id, toolbar_idx)| quadraui::ActivityItem {
                 id: quadraui::WidgetId::new(*activity_id),
                 icon: (*icon).to_string(),
                 tooltip: (*tooltip).to_string(),
                 is_active: sb_visible && !has_ext && active_id == Some(*panel_id),
-                is_keyboard_selected: false,
+                is_keyboard_selected: kbd_sel(*toolbar_idx),
             },
         )
         .collect();
 
     let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
     ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
-    for panel in ext_panels {
+    for (i, panel) in ext_panels.iter().enumerate() {
         let is_active = sb_visible && engine.ext_panel_active.as_deref() == Some(&panel.name);
+        let toolbar_idx = 8 + i as u16;
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
             icon: panel.resolved_icon().to_string(),
             tooltip: panel.title.clone(),
             is_active,
-            is_keyboard_selected: false,
+            is_keyboard_selected: kbd_sel(toolbar_idx),
         });
     }
 
@@ -540,7 +559,7 @@ fn build_gtk_activity_bar_primitive(
         icon: icons::SETTINGS.nerd.to_string(),
         tooltip: "Settings".to_string(),
         is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
-        is_keyboard_selected: false,
+        is_keyboard_selected: kbd_sel(7),
     }];
 
     quadraui::ActivityBar {
@@ -552,7 +571,11 @@ fn build_gtk_activity_bar_primitive(
             theme.cursor.g,
             theme.cursor.b,
         )),
-        selection_bg: None,
+        selection_bg: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
     }
 }
 
@@ -5358,6 +5381,14 @@ impl App {
             self.engine.borrow_mut().prepare_paste_clipboard(text);
         }
 
+        // Activity bar keyboard navigation: j/k move cursor, l/Enter activate,
+        // h/Esc return focus to the editor.
+        if self.engine.borrow().activity_bar_focused && !self.engine.borrow().picker_open {
+            self.handle_activity_bar_key(&key_name, ctrl, sender);
+            self.draw_needed.set(true);
+            return;
+        }
+
         // Debug F-keys must reach the engine regardless of which panel
         // has focus — F5 (continue), F9 (breakpoint), F10 (step over),
         // F11 (step in) are global debugger commands.
@@ -5419,8 +5450,16 @@ impl App {
                 }
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused && !has_dialog);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused && !has_dialog);
+                }
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5436,8 +5475,16 @@ impl App {
                 }
                 let still_focused = engine.settings_has_focus;
                 let has_dialog = engine.dialog.is_some();
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused && !has_dialog);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused && !has_dialog);
+                }
                 if let Some(ref da) = *self.settings_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5486,8 +5533,16 @@ impl App {
                     engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
                 }
                 let still_focused = engine.sc_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5517,8 +5572,16 @@ impl App {
                     }
                 }
                 let still_focused = engine.dap_sidebar_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5532,8 +5595,16 @@ impl App {
                     engine.handle_ai_panel_key(&key_name, ctrl, unicode);
                 }
                 let still_focused = engine.ai_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -7937,8 +8008,16 @@ impl App {
                     engine.dispatch_dap_sidebar_action_key(mapped);
                 }
                 let still_focused = engine.dap_sidebar_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -8236,8 +8315,16 @@ impl App {
                 let (mapped, unicode) = map_gtk_key_with_unicode(key_name.as_str());
                 engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, unicode);
                 let still_focused = engine.sc_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -8322,8 +8409,16 @@ impl App {
                 engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused && !has_dialog);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused && !has_dialog);
+                }
                 if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -8389,8 +8484,16 @@ impl App {
                     engine.handle_settings_key(mapped, ctrl, unicode);
                 }
                 let still_focused = engine.settings_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.settings_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -8812,8 +8915,16 @@ impl App {
                 let mut engine = self.engine.borrow_mut();
                 engine.handle_ai_panel_key(&key_name, ctrl, unicode);
                 let still_focused = engine.ai_has_focus;
+                let ab_focused = engine.activity_bar_focused;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                if ab_focused {
+                    if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                        da.grab_focus();
+                        da.queue_draw();
+                    }
+                } else {
+                    self.focus_editor_if_needed(still_focused);
+                }
                 if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -9375,7 +9486,14 @@ impl App {
                 }
             }
             ExplorerKeyResult::FocusToolbar => {
-                // GTK doesn't have a toolbar focus concept — treat as no-op
+                // engine.activity_bar_focus_in_at(1) was already called inside
+                // dispatch_explorer_key. Grab GTK focus on the activity bar DA
+                // so the visual highlight is shown and key events route there.
+                self.engine.borrow_mut().explorer_has_focus = false;
+                if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+                    da.grab_focus();
+                    da.queue_draw();
+                }
             }
             _ => {}
         }
@@ -9387,6 +9505,73 @@ impl App {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.queue_draw();
         }
+    }
+
+    /// Handle a key press while the activity bar has keyboard focus.
+    /// j/k move the cursor, l/Enter activates, h/Esc returns to the editor.
+    fn handle_activity_bar_key(
+        &mut self,
+        key_name: &str,
+        ctrl: bool,
+        sender: &ComponentSender<Self>,
+    ) {
+        let mapped = map_gtk_key_name(key_name);
+        match mapped {
+            "j" | "Down" => {
+                self.engine.borrow_mut().activity_bar_move_down();
+            }
+            "k" | "Up" => {
+                self.engine.borrow_mut().activity_bar_move_up();
+            }
+            "l" | "Right" | "Return" if !ctrl => {
+                use crate::core::engine::sidebar::ActivityBarActivation;
+                let activation = self.engine.borrow_mut().activity_bar_activate();
+                match activation {
+                    ActivityBarActivation::MenuToggled => {
+                        // Re-draw menu bar overlay.
+                        if let Some(ref da) = *self.menu_bar_da.borrow() {
+                            da.queue_draw();
+                        }
+                    }
+                    ActivityBarActivation::PanelFocused => {
+                        self.sync_sidebar_from_engine();
+                    }
+                    ActivityBarActivation::ExtPanelFocused(_) => {
+                        self.sync_sidebar_from_engine();
+                        if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
+                            da.grab_focus();
+                        }
+                    }
+                    ActivityBarActivation::NoOp => {}
+                }
+            }
+            "h" | "Left" | "Escape" if !ctrl => {
+                self.engine.borrow_mut().activity_bar_focus_out();
+                // Return keyboard focus to the editor drawing area.
+                if let Some(ref da) = *self.drawing_area.borrow() {
+                    da.grab_focus();
+                }
+            }
+            "q" => {
+                let mut engine = self.engine.borrow_mut();
+                engine.activity_bar_focus_out();
+                engine.app_shell.hide_sidebar();
+                engine.clear_sidebar_focus();
+                engine.session.explorer_visible = false;
+                let _ = engine.session.save();
+                drop(engine);
+                if let Some(ref da) = *self.drawing_area.borrow() {
+                    da.grab_focus();
+                }
+            }
+            _ => {}
+        }
+        // Always redraw the activity bar to update the selection highlight.
+        if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
+            da.queue_draw();
+        }
+        // Suppress the default engine key handler — key is consumed.
+        let _ = sender;
     }
 
     fn handle_explorer_da_click(

@@ -383,11 +383,18 @@ impl Engine {
     }
 
     fn explorer_collapse_or_parent(&mut self) -> ExplorerKeyResult {
-        let idx = match self.explorer_tree.borrow().selected_row_index() {
+        let selected_idx = self.explorer_tree.borrow().selected_row_index();
+        let idx = match selected_idx {
             Some(i) => i,
-            None => return ExplorerKeyResult::FocusToolbar,
+            None => {
+                self.explorer_has_focus = false;
+                self.activity_bar_focus_in_at(1);
+                return ExplorerKeyResult::FocusToolbar;
+            }
         };
         if idx >= self.explorer_rows.len() {
+            self.explorer_has_focus = false;
+            self.activity_bar_focus_in_at(1);
             return ExplorerKeyResult::FocusToolbar;
         }
         if self.explorer_rows[idx].is_dir && self.explorer_rows[idx].is_expanded {
@@ -407,6 +414,8 @@ impl Engine {
                 }
                 ExplorerKeyResult::Consumed
             } else {
+                self.explorer_has_focus = false;
+                self.activity_bar_focus_in_at(1);
                 ExplorerKeyResult::FocusToolbar
             }
         }

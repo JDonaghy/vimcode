@@ -329,10 +329,6 @@ use crate::core::engine::sidebar::*;
 
 struct TuiSidebar {
     has_focus: bool,
-    /// When true, the activity bar (toolbar) has keyboard focus.
-    toolbar_focused: bool,
-    /// Currently highlighted row in the activity bar (0=hamburger, 1-6=panels, 7=settings).
-    toolbar_selected: u16,
     /// True after Ctrl-W is pressed in a sidebar panel, waiting for h/j/k/l.
     pending_ctrl_w: bool,
     /// When set, sidebar renders an extension panel instead of the fixed panels.
@@ -343,29 +339,9 @@ impl TuiSidebar {
     fn new() -> Self {
         TuiSidebar {
             has_focus: false,
-            toolbar_focused: false,
-            toolbar_selected: 1,
             pending_ctrl_w: false,
             ext_panel_name: None,
         }
-    }
-}
-
-fn toolbar_idx_for_panel(engine: &Engine) -> u16 {
-    let id = engine
-        .app_shell
-        .active_panel_id()
-        .map(|w| w.as_str())
-        .unwrap_or("");
-    match id {
-        PANEL_EXPLORER => 1,
-        PANEL_SEARCH => 2,
-        PANEL_DEBUG => 3,
-        PANEL_GIT => 4,
-        PANEL_EXTENSIONS => 5,
-        PANEL_AI => 6,
-        PANEL_SETTINGS => 7,
-        _ => 1,
     }
 }
 
@@ -1762,106 +1738,44 @@ fn event_loop(
                 }
 
                 // ── Activity bar (toolbar) focused ────────────────────────────
-                if sidebar.toolbar_focused
+                if engine.activity_bar_focused
                     && !engine.picker_open
                     && key_event.kind != KeyEventKind::Release
                 {
                     match key_event.code {
                         KeyCode::Char('j') | KeyCode::Down => {
-                            // Move down: 0→1→…→6→8→9→…→(8+N-1)→7 (settings at end)
-                            let ext_count = engine.ext_panels.len() as u16;
-                            let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
-                            let sel = sidebar.toolbar_selected;
-                            if sel < 6 {
-                                sidebar.toolbar_selected = sel + 1;
-                            } else if sel == 6 && ext_count > 0 {
-                                sidebar.toolbar_selected = 8; // first ext panel
-                            } else if sel == 6 && ext_count == 0 {
-                                sidebar.toolbar_selected = 7; // settings
-                            } else if sel >= 8 && sel < max_ext {
-                                sidebar.toolbar_selected = sel + 1;
-                            } else if sel >= 8 && sel == max_ext {
-                                sidebar.toolbar_selected = 7; // settings
-                            }
-                            // sel == 7 (settings) → no movement (bottom)
+                            engine.activity_bar_move_down();
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
-                            // Move up: 7→max_ext→…→8→6→5→…→0
-                            let ext_count = engine.ext_panels.len() as u16;
-                            let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
-                            let sel = sidebar.toolbar_selected;
-                            if sel == 7 && ext_count > 0 {
-                                sidebar.toolbar_selected = max_ext; // settings → last ext
-                            } else if sel == 7 && ext_count == 0 {
-                                sidebar.toolbar_selected = 6; // settings → AI
-                            } else if sel == 8 {
-                                sidebar.toolbar_selected = 6; // first ext → AI
-                            } else if sel > 8 {
-                                sidebar.toolbar_selected = sel - 1;
-                            } else {
-                                sidebar.toolbar_selected = sel.saturating_sub(1);
-                            }
+                            engine.activity_bar_move_up();
                         }
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                            // Activate the selected panel
-                            let panel_id = match sidebar.toolbar_selected {
-                                0 => {
-                                    engine.toggle_menu_bar();
+                            use crate::core::engine::sidebar::ActivityBarActivation;
+                            let activation = engine.activity_bar_activate();
+                            match activation {
+                                ActivityBarActivation::MenuToggled => {
                                     if !engine.menu_bar_visible {
                                         engine.menu_system.borrow_mut().close(&mut backend);
                                     }
-                                    sidebar.toolbar_focused = false;
-                                    needs_redraw = true;
-                                    continue;
                                 }
-                                1 => PANEL_EXPLORER,
-                                2 => PANEL_SEARCH,
-                                3 => PANEL_DEBUG,
-                                4 => PANEL_GIT,
-                                5 => PANEL_EXTENSIONS,
-                                6 => PANEL_AI,
-                                7 => PANEL_SETTINGS,
-                                idx if idx >= 8 => {
-                                    // Extension panel activation
-                                    let ext_idx = (idx - 8) as usize;
-                                    let mut ext_names: Vec<_> =
-                                        engine.ext_panels.keys().cloned().collect();
-                                    ext_names.sort();
-                                    if ext_idx < ext_names.len() {
-                                        let name = ext_names[ext_idx].clone();
-                                        sidebar.toolbar_focused = false;
-                                        sidebar.ext_panel_name = Some(name.clone());
-                                        if !engine.app_shell.sidebar_visible() {
-                                            engine.toggle_sidebar();
-                                        }
-                                        sidebar.has_focus = true;
-                                        engine.ext_panel_active = Some(name.clone());
-                                        engine.ext_panel_has_focus = true;
-                                        engine.ext_panel_selected = 0;
-                                        engine.plugin_event("panel_focus", &name);
-                                    }
-                                    needs_redraw = true;
-                                    continue;
+                                ActivityBarActivation::PanelFocused => {
+                                    sidebar.ext_panel_name = None;
+                                    sidebar.has_focus = true;
                                 }
-                                _ => {
-                                    needs_redraw = true;
-                                    continue;
+                                ActivityBarActivation::ExtPanelFocused(name) => {
+                                    sidebar.ext_panel_name = Some(name);
+                                    sidebar.has_focus = true;
                                 }
-                            };
-                            sidebar.toolbar_focused = false;
-                            sidebar.ext_panel_name = None;
-                            engine.ext_panel_has_focus = false;
-                            engine.ext_panel_active = None;
-                            engine.focus_sidebar_panel(panel_id);
-                            sidebar.has_focus = true;
+                                ActivityBarActivation::NoOp => {}
+                            }
                         }
                         KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
                             // Leave toolbar, return focus to editor
-                            sidebar.toolbar_focused = false;
+                            engine.activity_bar_focus_out();
                         }
                         KeyCode::Char('q') => {
                             // Collapse sidebar from toolbar
-                            sidebar.toolbar_focused = false;
+                            engine.activity_bar_focus_out();
                             engine.app_shell.hide_sidebar();
                             engine.clear_sidebar_focus();
                             sidebar.has_focus = false;
@@ -1945,11 +1859,11 @@ fn event_loop(
                         sidebar.pending_ctrl_w = false;
                         match key_event.code {
                             KeyCode::Char('h') | KeyCode::Left => {
-                                // Panel → toolbar
+                                // Panel → activity bar toolbar
+                                let idx = engine.activity_bar_toolbar_idx_for_active_panel();
                                 sidebar.has_focus = false;
                                 engine.clear_sidebar_focus();
-                                sidebar.toolbar_focused = true;
-                                sidebar.toolbar_selected = toolbar_idx_for_panel(engine);
+                                engine.activity_bar_focus_in_at(idx);
                             }
                             KeyCode::Char('l') | KeyCode::Right => {
                                 // Panel → editor
@@ -2026,17 +1940,6 @@ fn event_loop(
 
                     // ── Debug panel keyboard handling ──────────────────────
                     if engine.active_panel_is(PANEL_DEBUG) {
-                        // h/Left: switch focus to toolbar
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            sidebar.has_focus = false;
-                            engine.dap_sidebar_has_focus = false;
-                            sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 3; // Debug row
-                            needs_redraw = true;
-                            continue;
-                        }
                         // Route through SidebarSystem for navigation keys.
                         render::populate_dap_sidebar_system(engine);
                         let rect = engine.dap_sidebar_body_rect.get();
@@ -2084,21 +1987,21 @@ fn event_loop(
 
                     // ── Extension panel (plugin-provided) keyboard handling ─
                     if engine.ext_panel_has_focus && sidebar.ext_panel_name.is_some() {
-                        // h/Left: switch focus to toolbar
+                        // h/Left: switch focus to activity bar toolbar.
+                        // (engine.activity_bar_focus_in_at is called inside handle_ext_panel_key)
                         if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
                             && !key_event.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            sidebar.has_focus = false;
-                            engine.ext_panel_has_focus = false;
-                            sidebar.toolbar_focused = true;
-                            // Find the toolbar row for this ext panel
+                            // Find the toolbar row index for this ext panel.
                             let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
                             ext_names.sort();
                             let idx = ext_names
                                 .iter()
                                 .position(|n| Some(n) == sidebar.ext_panel_name.as_ref())
                                 .unwrap_or(0);
-                            sidebar.toolbar_selected = 8 + idx as u16;
+                            sidebar.has_focus = false;
+                            engine.ext_panel_has_focus = false;
+                            engine.activity_bar_focus_in_at(8 + idx as u16);
                             needs_redraw = true;
                             continue;
                         }
@@ -2153,18 +2056,6 @@ fn event_loop(
 
                     // ── Extensions panel keyboard handling ──────────────────
                     if engine.active_panel_is(PANEL_EXTENSIONS) {
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !engine.ext_sidebar_input_active
-                        {
-                            sidebar.has_focus = false;
-                            engine.ext_sidebar_has_focus = false;
-                            engine.ext_sidebar_system.borrow_mut().set_has_focus(false);
-                            sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 5;
-                            needs_redraw = true;
-                            continue;
-                        }
                         let (key_name, unicode) = match key_event.code {
                             KeyCode::Char(c) => (c.to_string(), Some(c)),
                             code => (
@@ -2176,7 +2067,8 @@ fn event_loop(
                         };
                         use crate::core::engine::ExtSidebarKeyResult;
                         match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
-                            ExtSidebarKeyResult::Unfocused => {
+                            ExtSidebarKeyResult::Unfocused
+                            | ExtSidebarKeyResult::FocusActivityBar => {
                                 sidebar.has_focus = false;
                             }
                             ExtSidebarKeyResult::Consumed => {}
@@ -2187,44 +2079,8 @@ fn event_loop(
 
                     // ── Settings panel keyboard handling ──────────────────────
                     if engine.active_panel_is(PANEL_SETTINGS) {
-                        // h/Left: switch focus to toolbar (only when not editing/searching)
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !engine.settings_input_active
-                            && engine.settings_editing.is_none()
-                        {
-                            // Only if the selected row is not an enum (h/Left cycles enums)
-                            let flat = engine.settings_flat_list();
-                            let is_enum = if engine.settings_selected < flat.len() {
-                                match &flat[engine.settings_selected] {
-                                    crate::core::engine::SettingsRow::CoreSetting(idx) => {
-                                        matches!(
-                                            crate::core::settings::SETTING_DEFS[*idx].setting_type,
-                                            crate::core::settings::SettingType::Enum(_)
-                                                | crate::core::settings::SettingType::DynamicEnum(
-                                                    _
-                                                )
-                                        )
-                                    }
-                                    crate::core::engine::SettingsRow::ExtSetting(ext_name, key) => {
-                                        engine
-                                            .find_ext_setting_def(ext_name, key)
-                                            .is_some_and(|d| d.r#type == "enum")
-                                    }
-                                    _ => false,
-                                }
-                            } else {
-                                false
-                            };
-                            if !is_enum {
-                                sidebar.has_focus = false;
-                                engine.settings_has_focus = false;
-                                sidebar.toolbar_focused = true;
-                                sidebar.toolbar_selected = 7; // Settings row
-                                needs_redraw = true;
-                                continue;
-                            }
-                        }
+                        // h/Left focus-to-activity-bar logic is now inside handle_settings_key:
+                        // when the selected row is not an enum, h sets activity_bar_focused.
                         // Ctrl-V paste into search input or inline edit
                         if ctrl && key_event.code == KeyCode::Char('v') {
                             if engine.settings_input_active || engine.settings_editing.is_some() {
@@ -2280,18 +2136,7 @@ fn event_loop(
 
                     // ── AI assistant panel keyboard handling ─────────────────
                     if engine.active_panel_is(PANEL_AI) {
-                        // h/Left: switch focus to toolbar (only when not typing)
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !engine.ai_input_active
-                        {
-                            sidebar.has_focus = false;
-                            engine.ai_has_focus = false;
-                            sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 6; // AI row
-                            needs_redraw = true;
-                            continue;
-                        }
+                        // h/Left focus-to-activity-bar logic is now inside handle_ai_panel_key.
                         // Ctrl-V paste
                         if ctrl && key_event.code == KeyCode::Char('v') {
                             let text = match engine.clipboard_read {
@@ -2309,6 +2154,8 @@ fn event_loop(
                             KeyCode::Up if !engine.ai_input_active => ("k", None),
                             KeyCode::Char('j') if !engine.ai_input_active => ("j", None),
                             KeyCode::Char('k') if !engine.ai_input_active => ("k", None),
+                            KeyCode::Char('h') if !engine.ai_input_active && !ctrl => ("h", None),
+                            KeyCode::Left if !engine.ai_input_active => ("Left", None),
                             KeyCode::Char('G') if !engine.ai_input_active => ("G", None),
                             KeyCode::Char('g') if !engine.ai_input_active => ("g", None),
                             KeyCode::Char('i') | KeyCode::Char('a') if !engine.ai_input_active => {
@@ -2349,22 +2196,7 @@ fn event_loop(
 
                     // ── Source Control panel keyboard handling ──────────────
                     if engine.active_panel_is(PANEL_GIT) {
-                        // h/Left → switch focus to activity bar toolbar.
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                            && !engine.sc_commit_input_active
-                            && engine.sc_button_focused.is_none()
-                            && !engine.sc_branch_picker_open
-                            && !engine.sc_branch_create_mode
-                            && !engine.sc_help_open
-                        {
-                            sidebar.has_focus = false;
-                            engine.sc_set_focus(false);
-                            sidebar.toolbar_focused = true;
-                            sidebar.toolbar_selected = 4;
-                            needs_redraw = true;
-                            continue;
-                        }
+                        // h/Left focus-to-activity-bar logic is now inside dispatch_sc_sidebar_key_unified.
                         // Ctrl+b → toggle sidebar visibility.
                         if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
                             engine.app_shell.hide_sidebar();
@@ -2431,7 +2263,10 @@ fn event_loop(
                             use crate::core::engine::ScKeyResult;
                             let result =
                                 engine.dispatch_sc_sidebar_key_unified(key_str, ctrl, unicode);
-                            if matches!(result, ScKeyResult::Unfocused) {
+                            if matches!(
+                                result,
+                                ScKeyResult::Unfocused | ScKeyResult::FocusActivityBar
+                            ) {
                                 sidebar.has_focus = false;
                             }
                         }
@@ -2483,9 +2318,9 @@ fn event_loop(
                                     sidebar.has_focus = false;
                                 }
                                 ExplorerKeyResult::FocusToolbar => {
+                                    // engine.activity_bar_focus_in_at(1) already called
+                                    // inside dispatch_explorer_key.
                                     sidebar.has_focus = false;
-                                    sidebar.toolbar_focused = true;
-                                    sidebar.toolbar_selected = 1;
                                 }
                                 _ => {}
                             }
@@ -2947,12 +2782,16 @@ fn event_loop(
                         if engine.app_shell.sidebar_visible() {
                             sidebar.has_focus = true;
                         } else {
-                            sidebar.toolbar_focused = true;
+                            // No sidebar panel visible — focus the activity bar instead.
+                            let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+                            engine.activity_bar_focus_in_at(idx);
                         }
                     }
 
                     // Auto-hide sidebar when focus returns to editor
-                    if engine.should_autohide_sidebar() && !sidebar.toolbar_focused {
+                    // (sidebar_has_focus() includes activity_bar_focused, so autohide
+                    // is suppressed while the user navigates the toolbar).
+                    if engine.should_autohide_sidebar() {
                         engine.app_shell.hide_sidebar();
                     }
 

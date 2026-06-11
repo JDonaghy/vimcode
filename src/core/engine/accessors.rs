@@ -569,6 +569,7 @@ impl Engine {
             || self.ai_has_focus
             || self.settings_has_focus
             || self.ext_panel_has_focus
+            || self.activity_bar_focused
     }
 
     /// Clear all sidebar panel focus flags at once.

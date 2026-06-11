@@ -3,6 +3,8 @@ use super::*;
 pub enum ExtSidebarKeyResult {
     Consumed,
     Unfocused,
+    /// h/Left from the Extensions panel moved focus to the activity bar.
+    FocusActivityBar,
 }
 
 impl Engine {
@@ -1947,6 +1949,12 @@ impl Engine {
                     self.ext_sidebar_system.borrow_mut().set_has_focus(false);
                     ExtSidebarKeyResult::Unfocused
                 }
+                "h" | "Left" => {
+                    self.ext_sidebar_has_focus = false;
+                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    self.activity_bar_focus_in_at(5);
+                    ExtSidebarKeyResult::FocusActivityBar
+                }
                 "/" => {
                     self.ext_sidebar_input_active = true;
                     ExtSidebarKeyResult::Consumed
@@ -2179,7 +2187,7 @@ impl Engine {
     }
 
     /// Handle a key press while the settings panel has focus.
-    pub fn handle_settings_key(&mut self, key: &str, _ctrl: bool, unicode: Option<char>) {
+    pub fn handle_settings_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) {
         use crate::core::settings::{SettingType, SETTING_DEFS};
 
         // Search input active — route printable chars to query
@@ -2292,6 +2300,32 @@ impl Engine {
         // Normal navigation
         let flat = self.settings_flat_list();
         let total = flat.len();
+
+        // h/Left: focus the activity bar when the selected setting is not an
+        // enum type (for enums, h/Left cycles the value backward instead).
+        if (key == "h" || key == "Left") && !ctrl {
+            use crate::core::settings::{SettingType, SETTING_DEFS};
+            let is_enum = if self.settings_selected < flat.len() {
+                match &flat[self.settings_selected] {
+                    SettingsRow::CoreSetting(idx) => matches!(
+                        SETTING_DEFS[*idx].setting_type,
+                        SettingType::Enum(_) | SettingType::DynamicEnum(_)
+                    ),
+                    SettingsRow::ExtSetting(ext_name, ext_key) => self
+                        .find_ext_setting_def(ext_name, ext_key)
+                        .is_some_and(|d| d.r#type == "enum"),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !is_enum {
+                self.settings_has_focus = false;
+                self.activity_bar_focus_in_at(7);
+                return;
+            }
+            // is_enum == true: fall through so the existing match arm cycles the value.
+        }
 
         match key {
             "q" | "Escape" => {
@@ -2972,6 +3006,11 @@ impl Engine {
         match key {
             "q" | "Escape" => {
                 self.ai_has_focus = false;
+                true
+            }
+            "h" | "Left" if !ctrl => {
+                self.ai_has_focus = false;
+                self.activity_bar_focus_in_at(6);
                 true
             }
             "i" | "a" | "Return" => {
